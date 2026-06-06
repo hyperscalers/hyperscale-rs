@@ -199,7 +199,7 @@ mod tests {
 
     use hyperscale_types::{
         BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome, Verified, WeightedTimestamp,
+        Hash, ShardId, SignerBitfield, TxHash, TxOutcome, Verified, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -207,7 +207,7 @@ mod tests {
 
     fn make_wave_id(block_height: u64) -> WaveId {
         WaveId::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(block_height),
             BTreeSet::new(),
         )

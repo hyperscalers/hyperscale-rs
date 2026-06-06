@@ -243,7 +243,7 @@ where
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
             let outputs = self.io.syncs.on_remote_header_admitted(
-                certified_header.shard_group_id(),
+                certified_header.shard_id(),
                 certified_header.header().height(),
             );
             self.process_remote_header_sync_outputs(outputs);
@@ -562,7 +562,7 @@ where
                 preferred,
                 class,
             } => {
-                let source_shard = wave_id.shard_group_id();
+                let source_shard = wave_id.shard_id();
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
                     ids: vec![wave_id],
                     shard: source_shard,

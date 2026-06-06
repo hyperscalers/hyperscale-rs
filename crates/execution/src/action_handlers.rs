@@ -24,8 +24,8 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
-    RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable, Verified,
-    exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
+    RoutableTransaction, ShardId, StoredReceipt, Verifiable, Verified, exec_cert_batch_message,
+    exec_vote_batch_message, shard_for_node,
 };
 
 // ============================================================================
@@ -42,7 +42,7 @@ use hyperscale_types::{
 fn participating_shards(
     tx: &RoutableTransaction,
     num_shards: u64,
-) -> impl Iterator<Item = ShardGroupId> + '_ {
+) -> impl Iterator<Item = ShardId> + '_ {
     tx.declared_reads()
         .iter()
         .chain(tx.declared_writes().iter())
@@ -365,7 +365,7 @@ where
             let cert = Arc::unwrap_or_clone(certificate).into_inner();
             let msg = exec_cert_batch_message(
                 ctx.topology_snapshot.network(),
-                cert.shard_group_id(),
+                cert.shard_id(),
                 std::slice::from_ref(&cert),
             );
             let sig = ctx.signing_key.sign_v1(&msg);

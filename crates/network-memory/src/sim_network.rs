@@ -17,7 +17,7 @@ use hyperscale_network::{
     ResponseVerdict, compression,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkMessage, Request, ShardGroupId, ValidatorId,
+    GossipMessage, MessageClass, NetworkMessage, Request, ShardId, ValidatorId,
 };
 use sbor::{basic_decode, basic_encode};
 
@@ -25,7 +25,7 @@ use sbor::{basic_decode, basic_encode};
 #[derive(Debug, Clone)]
 pub enum BroadcastTarget {
     /// Broadcast to all peers in a specific shard.
-    Shard(ShardGroupId),
+    Shard(ShardId),
     /// Broadcast to all connected peers globally.
     Global,
 }
@@ -60,7 +60,7 @@ pub struct PendingNotification {
 pub struct PendingRequest {
     /// Shard whose committee should serve this request. The harness
     /// resolves it to a peer list from its topology view.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// Optional preferred peer (e.g., block proposer for fetch).
     pub preferred_peer: Option<ValidatorId>,
     /// Message type ID for handler lookup (e.g., "block.request").
@@ -155,7 +155,7 @@ impl Default for SimNetworkAdapter {
 }
 
 impl Network for SimNetworkAdapter {
-    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardGroupId, message: &M) {
+    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         // Tee to in-process subscribers — the harness's `accept_gossip`
         // skips the publisher's own node (matching gossipsub's no-loop
         // semantics), so colocated vnodes would otherwise miss their
@@ -216,7 +216,7 @@ impl Network for SimNetworkAdapter {
 
     fn register_request_handler<R: Request + Send + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         handler: impl RequestHandler<R>,
     ) where
         R::Response: Send + 'static,
@@ -227,7 +227,7 @@ impl Network for SimNetworkAdapter {
 
     fn request<R: Request + Clone + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         _class_override: Option<MessageClass>,
@@ -263,7 +263,7 @@ mod tests {
 
     use hyperscale_types::network::gossip::TransactionGossip;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
-    use hyperscale_types::{BlockHeight, ShardGroupId};
+    use hyperscale_types::{BlockHeight, ShardId};
 
     use super::*;
 
@@ -279,7 +279,7 @@ mod tests {
     fn test_broadcast_to_shard_creates_outbox_entry() {
         let adapter = SimNetworkAdapter::default();
         let gossip = test_gossip();
-        let shard = ShardGroupId::leaf(2, 3);
+        let shard = ShardId::leaf(2, 3);
 
         adapter.broadcast_to_shard(shard, &gossip);
 
@@ -327,7 +327,7 @@ mod tests {
 
         let registry = Arc::new(HandlerRegistry::default());
         let adapter = SimNetworkAdapter::new(registry.clone());
-        let shard = ShardGroupId::leaf(2, 0);
+        let shard = ShardId::leaf(2, 0);
 
         assert!(registry.get_request("block.request", shard).is_none());
         adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
@@ -343,7 +343,7 @@ mod tests {
         use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
-        let shard = ShardGroupId::leaf(2, 0);
+        let shard = ShardId::leaf(2, 0);
 
         adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
             GetBlockResponse::not_found()
@@ -359,7 +359,7 @@ mod tests {
 
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId::new(7));
-        let shard = ShardGroupId::leaf(2, 3);
+        let shard = ShardId::leaf(2, 3);
 
         adapter.request(
             shard,
@@ -392,7 +392,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            ShardGroupId::leaf(2, 0),
+            ShardId::leaf(2, 0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
@@ -426,7 +426,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            ShardGroupId::leaf(2, 0),
+            ShardId::leaf(2, 0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,

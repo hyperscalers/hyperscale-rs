@@ -6,14 +6,14 @@ use std::fmt::{self, Display};
 use sbor::prelude::*;
 
 use crate::primitives::bloom::BloomKey;
-use crate::{BlockHeight, BoundedBTreeSet, Hash, ShardGroupId};
+use crate::{BlockHeight, BoundedBTreeSet, Hash, ShardId};
 
 /// Cap on `WaveId.remote_shards` length at decode time.
 ///
 /// A wave's remote shard set is at most `num_shards - 1` (a wave can
 /// depend on every other shard). Real deployments run far below this
 /// cap; it exists so a peer can't claim a huge dependency set and force
-/// the decoder to insert millions of `ShardGroupId`s into a `BTreeSet`
+/// the decoder to insert millions of `ShardId`s into a `BTreeSet`
 /// before the first frame check fires.
 pub const MAX_REMOTE_SHARDS_PER_WAVE: usize = 1024;
 
@@ -30,9 +30,9 @@ pub const MAX_REMOTE_SHARDS_PER_WAVE: usize = 1024;
 /// A wave with empty `remote_shards` represents single-shard transactions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 pub struct WaveId {
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     block_height: BlockHeight,
-    remote_shards: BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE>,
+    remote_shards: BoundedBTreeSet<ShardId, MAX_REMOTE_SHARDS_PER_WAVE>,
 }
 
 impl WaveId {
@@ -43,12 +43,12 @@ impl WaveId {
     /// Panics if `remote_shards.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
     #[must_use]
     pub fn new(
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         block_height: BlockHeight,
-        remote_shards: BTreeSet<ShardGroupId>,
+        remote_shards: BTreeSet<ShardId>,
     ) -> Self {
         Self {
-            shard_group_id,
+            shard_id,
             block_height,
             remote_shards: remote_shards.into(),
         }
@@ -56,8 +56,8 @@ impl WaveId {
 
     /// The shard that committed the block containing this wave's transactions.
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.shard_group_id
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Block height at which the wave's transactions were committed.
@@ -68,9 +68,7 @@ impl WaveId {
 
     /// Set of remote shards the transactions depend on (empty for single-shard waves).
     #[must_use]
-    pub const fn remote_shards(
-        &self,
-    ) -> &BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE> {
+    pub const fn remote_shards(&self) -> &BoundedBTreeSet<ShardId, MAX_REMOTE_SHARDS_PER_WAVE> {
         &self.remote_shards
     }
 
@@ -104,14 +102,14 @@ impl Display for WaveId {
             write!(
                 f,
                 "Wave(shard={}, h={}, ∅)",
-                self.shard_group_id.inner(),
+                self.shard_id.inner(),
                 self.block_height.inner()
             )
         } else {
             write!(
                 f,
                 "Wave(shard={}, h={}, {{",
-                self.shard_group_id.inner(),
+                self.shard_id.inner(),
                 self.block_height.inner()
             )?;
             for (i, shard) in self.remote_shards.iter().enumerate() {
@@ -136,9 +134,9 @@ mod tests {
 
     fn sample_wave_id() -> WaveId {
         WaveId::new(
-            ShardGroupId::leaf(3, 3),
+            ShardId::leaf(3, 3),
             BlockHeight::new(42),
-            [ShardGroupId::leaf(3, 1), ShardGroupId::leaf(3, 7)]
+            [ShardId::leaf(3, 1), ShardId::leaf(3, 7)]
                 .into_iter()
                 .collect(),
         )
@@ -154,11 +152,7 @@ mod tests {
 
     #[test]
     fn sbor_roundtrip_empty_remote_shards() {
-        let wave = WaveId::new(
-            ShardGroupId::leaf(3, 0),
-            BlockHeight::new(1),
-            BTreeSet::new(),
-        );
+        let wave = WaveId::new(ShardId::leaf(3, 0), BlockHeight::new(1), BTreeSet::new());
         let bytes = basic_encode(&wave).unwrap();
         let decoded: WaveId = basic_decode(&bytes).unwrap();
         assert_eq!(decoded, wave);
@@ -174,10 +168,10 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId::leaf(3, 0)).unwrap();
+        enc.encode(&ShardId::leaf(3, 0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
-        enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
+        enc.write_value_kind(ShardId::value_kind()).unwrap();
         enc.write_size(MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
         let err = basic_decode::<WaveId>(&buf).unwrap_err();
         assert!(matches!(
@@ -198,13 +192,13 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId::leaf(3, 0)).unwrap();
+        enc.encode(&ShardId::leaf(3, 0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
-        enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
+        enc.write_value_kind(ShardId::value_kind()).unwrap();
         enc.write_size(2).unwrap();
-        enc.encode_deeper_body(&ShardGroupId::leaf(3, 5)).unwrap();
-        enc.encode_deeper_body(&ShardGroupId::leaf(3, 5)).unwrap();
+        enc.encode_deeper_body(&ShardId::leaf(3, 5)).unwrap();
+        enc.encode_deeper_body(&ShardId::leaf(3, 5)).unwrap();
         let err = basic_decode::<WaveId>(&buf).unwrap_err();
         assert!(matches!(err, DecodeError::DuplicateKey));
     }

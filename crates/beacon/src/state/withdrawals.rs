@@ -140,7 +140,7 @@ pub(super) fn complete_pending_withdrawals(state: &mut BeaconState) -> Withdrawa
 mod tests {
 
     use hyperscale_types::{
-        EMISSIONS_PER_EPOCH, Epoch, MIN_STAKE_FLOOR, PendingWithdrawal, ShardGroupId, Stake,
+        EMISSIONS_PER_EPOCH, Epoch, MIN_STAKE_FLOOR, PendingWithdrawal, ShardId, Stake,
         StakePoolId, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
     };
 
@@ -288,7 +288,7 @@ mod tests {
         // Shard committee shrank (the only pool has no Pooled validators
         // to refill from, so `pool_draw` returns None and the committee
         // stays at 3).
-        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert_eq!(members.len(), 3);
         assert!(!members.contains(&ValidatorId::new(3)));
     }

@@ -99,7 +99,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_types::{
-        BlockHeight, GlobalReceiptRoot, ShardGroupId, SignerBitfield, WeightedTimestamp,
+        BlockHeight, GlobalReceiptRoot, ShardId, SignerBitfield, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -107,7 +107,7 @@ mod tests {
 
     fn cert(block_height: u64) -> Arc<Verified<ExecutionCertificate>> {
         let wave_id = WaveId::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(block_height),
             BTreeSet::new(),
         );

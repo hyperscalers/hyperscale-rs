@@ -15,8 +15,8 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
-    TopologySnapshot, TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError,
+    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TopologySnapshot,
+    TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -650,7 +650,7 @@ impl VerificationPipeline {
 
         let parent_qc_raw = block.header().parent_qc();
         let parent_qc_verified = if parent_qc_raw.is_genesis() {
-            Verified::<QuorumCertificate>::genesis(parent_qc_raw.shard_group_id())
+            Verified::<QuorumCertificate>::genesis(parent_qc_raw.shard_id())
         } else {
             let Some(cached) = self.verified_qcs.get(&parent_qc_raw.block_hash()).cloned() else {
                 warn!(
@@ -1178,7 +1178,7 @@ impl VerificationPipeline {
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
         let header = block.header();
@@ -1294,7 +1294,7 @@ impl VerificationPipeline {
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology: &TopologySnapshot,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
@@ -1741,9 +1741,8 @@ impl VerificationPipeline {
 mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot,
-        LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction,
-        ShardGroupId, SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp,
-        zero_bls_signature,
+        LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardId,
+        SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -1751,10 +1750,10 @@ mod tests {
 
     fn header(height: BlockHeight, parent_block_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             parent_block_hash,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -1779,7 +1778,7 @@ mod tests {
         parent_qc: QuorumCertificate,
     ) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             parent_block_hash,
             parent_qc,
@@ -1821,7 +1820,7 @@ mod tests {
         pending: &'a PendingBlocks,
     ) -> ChainView<'a> {
         ChainView::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             committed_height,
             committed_hash,
             StateRoot::ZERO,
@@ -1856,7 +1855,7 @@ mod tests {
         let parent = bh(b"parent");
         let parent_qc = QuorumCertificate::new(
             parent,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(4),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -2002,7 +2001,7 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             &topology,
         );
 
@@ -2042,7 +2041,7 @@ mod tests {
                 &pending,
                 &accumulator,
                 BlockHash::ZERO,
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 &topology,
             );
         }
@@ -2082,7 +2081,7 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             &topology,
         );
         assert!(vp.is_beacon_witness_deferred(child_hash));
@@ -2102,13 +2101,13 @@ mod tests {
     // ─── PendingAssembly multi-slot completion ──────────────────────────
 
     fn assembly_block() -> Block {
-        Block::genesis(ShardGroupId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
+        Block::genesis(ShardId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
     }
 
     fn assembly_qc_for(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -2202,10 +2201,10 @@ mod tests {
     fn track_pending_assembly_rejects_nonzero_root_on_empty_content() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let forged_header = BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

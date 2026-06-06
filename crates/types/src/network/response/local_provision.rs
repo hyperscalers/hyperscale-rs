@@ -115,12 +115,12 @@ mod tests {
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
             CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LocalReceiptRoot,
             MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionsRoot,
-            QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot,
-            TxHash, ValidatorId, WeightedTimestamp, zero_bls_signature,
+            QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
+            ValidatorId, WeightedTimestamp, zero_bls_signature,
         };
 
-        let source_shard = ShardGroupId::leaf(1, 1);
-        let target_shard = ShardGroupId::leaf(1, 0);
+        let source_shard = ShardId::leaf(1, 1);
+        let target_shard = ShardId::leaf(1, 0);
         let source_height = BlockHeight::new(7);
         let provisions = Arc::new(Provisions::new(
             source_shard,

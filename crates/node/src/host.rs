@@ -19,7 +19,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
-use hyperscale_types::{LocalTimestamp, ShardGroupId, TransactionStatus, TxHash};
+use hyperscale_types::{LocalTimestamp, ShardId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 
 use crate::NodeStateMachine;
@@ -42,7 +42,7 @@ use crate::vnode::{Vnode, VnodeInit};
 /// plus the per-shard drivers, keyed by hosted shard id.
 pub type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
-    HashMap<ShardGroupId, ShardLoop<S, N, D>>,
+    HashMap<ShardId, ShardLoop<S, N, D>>,
 );
 
 /// Top-level node composition: process-scoped resources plus one
@@ -60,7 +60,7 @@ where
     /// One [`ShardLoop`] per hosted shard. State machines are driven
     /// exclusively through these — all `ProtocolEvent` ingestion and
     /// `Action` emission happen via per-shard `step()` dispatch.
-    pub(crate) shards: HashMap<ShardGroupId, ShardLoop<S, N, D>>,
+    pub(crate) shards: HashMap<ShardId, ShardLoop<S, N, D>>,
 
     /// Process-scoped shared resources: network adapter, dispatch pool,
     /// tx validator, topology snapshot, dispatch handles, event sender.
@@ -101,13 +101,13 @@ where
     )] // two-pass construction: build shard io, then process, then assemble
     pub fn new(
         vnodes: Vec<VnodeInit>,
-        mut storages: HashMap<ShardGroupId, S>,
+        mut storages: HashMap<ShardId, S>,
         beacon_storage: Arc<dyn BeaconStorage>,
         beacon_proposal_pool: Arc<BeaconProposalPool>,
         executor: RadixExecutor,
         network: N,
         dispatch: D,
-        shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
+        shard_event_senders: HashMap<ShardId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
@@ -116,8 +116,7 @@ where
 
         // Distinct shards this host carries, derived from the supplied
         // vnodes. Used to allocate one `ShardIo` per shard.
-        let hosted_shards: HashSet<ShardGroupId> =
-            vnodes.iter().map(|v| v.state.shard_id()).collect();
+        let hosted_shards: HashSet<ShardId> = vnodes.iter().map(|v| v.state.shard_id()).collect();
 
         let b = &config.batch;
         let network = Arc::new(network);
@@ -126,10 +125,10 @@ where
         // per-shard dispatch handles map. ShardLoop construction is deferred
         // to a second pass because each ShardLoop needs an Arc<ProcessIo>
         // that can only be built after dispatch_handles is finalized.
-        let mut shard_builds: HashMap<ShardGroupId, (ShardIo<S>, Vec<Vnode>)> = HashMap::new();
-        let mut per_shard_dispatch: HashMap<ShardGroupId, ShardDispatchHandles<S>> = HashMap::new();
+        let mut shard_builds: HashMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = HashMap::new();
+        let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
 
-        let mut by_shard: HashMap<ShardGroupId, Vec<VnodeInit>> = HashMap::new();
+        let mut by_shard: HashMap<ShardId, Vec<VnodeInit>> = HashMap::new();
         for init in vnodes {
             let shard = init.state.shard_id();
             by_shard.entry(shard).or_default().push(init);
@@ -224,7 +223,7 @@ where
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
         let tx_gossip_max = b.tx_gossip_max;
         let tx_gossip_window = b.tx_gossip_window;
-        let shards: HashMap<ShardGroupId, ShardLoop<S, N, D>> = shard_builds
+        let shards: HashMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
                 let shard_loop = ShardLoop {
@@ -288,7 +287,7 @@ where
 
     /// Number of vnodes hosted in `shard`, or `0` if `shard` isn't hosted.
     #[must_use]
-    pub fn vnodes_len(&self, shard: ShardGroupId) -> usize {
+    pub fn vnodes_len(&self, shard: ShardId) -> usize {
         self.shards.get(&shard).map_or(0, |g| g.vnodes.len())
     }
 
@@ -298,7 +297,7 @@ where
     /// # Panics
     /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
     #[must_use]
-    pub fn vnode_state(&self, shard: ShardGroupId, vnode_idx: usize) -> &NodeStateMachine {
+    pub fn vnode_state(&self, shard: ShardId, vnode_idx: usize) -> &NodeStateMachine {
         &self.shard_loop(shard).vnodes[vnode_idx].state
     }
 
@@ -307,37 +306,33 @@ where
     ///
     /// # Panics
     /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
-    pub fn vnode_state_mut(
-        &mut self,
-        shard: ShardGroupId,
-        vnode_idx: usize,
-    ) -> &mut NodeStateMachine {
+    pub fn vnode_state_mut(&mut self, shard: ShardId, vnode_idx: usize) -> &mut NodeStateMachine {
         &mut self.shard_loop_mut(shard).vnodes[vnode_idx].state
     }
 
     /// Hosted shards (one entry per `ShardLoop`). Used by call sites
     /// that fan out across every shard this host carries — batch flushes,
     /// fetch ticks, metrics aggregation.
-    pub fn hosted_shards(&self) -> impl Iterator<Item = ShardGroupId> + '_ {
+    pub fn hosted_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.shards.keys().copied()
     }
 
     /// Internal: per-shard loop (process handle + io + vnodes + scratch).
-    pub(crate) fn shard_loop(&self, shard: ShardGroupId) -> &ShardLoop<S, N, D> {
+    pub(crate) fn shard_loop(&self, shard: ShardId) -> &ShardLoop<S, N, D> {
         self.shards
             .get(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this NodeHost"))
     }
 
     /// Internal: mutable per-shard loop.
-    pub(crate) fn shard_loop_mut(&mut self, shard: ShardGroupId) -> &mut ShardLoop<S, N, D> {
+    pub(crate) fn shard_loop_mut(&mut self, shard: ShardId) -> &mut ShardLoop<S, N, D> {
         self.shards
             .get_mut(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this NodeHost"))
     }
 
     /// Internal: immutable per-shard vnode by index.
-    pub(crate) fn vnode(&self, shard: ShardGroupId, vnode_idx: usize) -> &Vnode {
+    pub(crate) fn vnode(&self, shard: ShardId, vnode_idx: usize) -> &Vnode {
         &self.shard_loop(shard).vnodes[vnode_idx]
     }
 
@@ -345,7 +340,7 @@ where
     /// fields like `storage`, `caches`, `fetches`, `syncs`, `block_commit`,
     /// `pending_chain` are read directly off the returned reference.
     #[must_use]
-    pub fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
+    pub fn shard_io(&self, shard: ShardId) -> &ShardIo<S> {
         &self.shard_loop(shard).io
     }
 
@@ -382,9 +377,7 @@ where
     /// typically hold the full set so a single-hash lookup can fan out
     /// across every hosted shard without re-entering the pinned thread.
     #[must_use]
-    pub fn tx_status_caches(
-        &self,
-    ) -> HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
+    pub fn tx_status_caches(&self) -> HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>> {
         self.shards
             .iter()
             .map(|(shard, group)| (*shard, Arc::clone(&group.io.caches.tx_status)))

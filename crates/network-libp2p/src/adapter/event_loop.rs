@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use hyperscale_metrics::record_gossipsub_publish_failure;
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::{ShardGroupId, ValidatorId};
+use hyperscale_types::{ShardId, ValidatorId};
 use libp2p::gossipsub::{IdentTopic, PublishError};
 use libp2p::identify::Event as IdentifyEvent;
 use libp2p::kad::{BootstrapOk, Event as KadEvent, QueryResult};
@@ -60,7 +60,7 @@ pub(super) async fn run(
     mut bulk_rx: mpsc::Receiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
-    local_shards: std::collections::HashSet<ShardGroupId>,
+    local_shards: std::collections::HashSet<ShardId>,
     version_interop_mode: VersionInteroperabilityMode,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,

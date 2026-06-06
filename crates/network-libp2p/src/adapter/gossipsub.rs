@@ -11,7 +11,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::compression::decompress;
 use hyperscale_network::{GossipVerdict, HandlerRegistry, parse_topic};
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 use libp2p::PeerId as Libp2pPeerId;
 use libp2p::gossipsub::{Event as GossipsubEvent, MessageAcceptance, MessageId};
 use libp2p::swarm::SwarmEvent;
@@ -106,7 +106,7 @@ const fn acceptance_label(acceptance: &MessageAcceptance) -> &'static str {
 #[allow(clippy::too_many_lines)] // single dispatch over gossipsub events; sub-events share local state
 pub(super) fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
-    local_shards: &std::collections::HashSet<ShardGroupId>,
+    local_shards: &std::collections::HashSet<ShardId>,
     registry: &Arc<HandlerRegistry>,
     validation_tx: &mpsc::UnboundedSender<ValidationReport>,
 ) {

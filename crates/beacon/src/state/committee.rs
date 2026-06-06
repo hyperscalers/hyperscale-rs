@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, SHUFFLE_INTERVAL_EPOCHS, ShardGroupId, TransitionCause,
+    BeaconState, CommitteeTransition, SHUFFLE_INTERVAL_EPOCHS, ShardId, TransitionCause,
     ValidatorId, ValidatorStatus,
 };
 use rand::RngExt;
@@ -26,7 +26,7 @@ const DOMAIN_SHUFFLE_EXIT: &[u8] = b"hyperscale-shuffle-exit-v1";
 /// [`SHUFFLE_INTERVAL_EPOCHS`] epochs, keeping per-shard composition
 /// churn uniform and bounded.
 ///
-/// Shards iterate in sorted [`ShardGroupId`] order; the victim within
+/// Shards iterate in sorted [`ShardId`] order; the victim within
 /// each shard is picked deterministically by hashing
 /// `(state.randomness, current_epoch, shard)` under a domain tag
 /// distinct from [`pool_draw`]'s. Shards whose `OnShard { ready: true }`
@@ -50,7 +50,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     if epoch.inner() == 0 || !epoch.inner().is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
         return;
     }
-    let shard_ids: Vec<ShardGroupId> = state.next_shard_committees.keys().copied().collect();
+    let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
     for shard in shard_ids {
         // Bind the candidate set to validators whose status records
         // *this* shard. The global invariant `members ⇔ status ==
@@ -161,15 +161,15 @@ pub(super) fn resample_beacon_committee(
 /// empty member list.
 pub(super) fn diff_shard_committees(
     state: &BeaconState,
-    pre_shard_members: &BTreeMap<ShardGroupId, Vec<ValidatorId>>,
-) -> BTreeMap<ShardGroupId, CommitteeTransition> {
+    pre_shard_members: &BTreeMap<ShardId, Vec<ValidatorId>>,
+) -> BTreeMap<ShardId, CommitteeTransition> {
     let epoch = state.current_epoch;
     let cause = if epoch.inner() > 0 && epoch.inner().is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
         TransitionCause::NaturalShuffle
     } else {
         TransitionCause::MembershipChange
     };
-    let mut shard_ids: BTreeSet<ShardGroupId> = pre_shard_members.keys().copied().collect();
+    let mut shard_ids: BTreeSet<ShardId> = pre_shard_members.keys().copied().collect();
     shard_ids.extend(state.next_shard_committees.keys().copied());
     let mut transitions = BTreeMap::new();
     for shard in shard_ids {
@@ -202,7 +202,7 @@ mod tests {
 
     use hyperscale_types::{
         BEACON_SIGNER_COUNT, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness,
-        SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardGroupId, Stake, StakePool, StakePoolId,
+        SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
         TransitionCause, ValidatorId, ValidatorStatus,
     };
 
@@ -221,7 +221,7 @@ mod tests {
         let mut pool_validators = BTreeSet::new();
         let mut next_id = 0u64;
         for s in 0..shard_count {
-            let shard = ShardGroupId::leaf(1, s);
+            let shard = ShardId::leaf(1, s);
             let mut members = Vec::new();
             for _ in 0..per_shard {
                 let id = ValidatorId::new(next_id);
@@ -290,7 +290,7 @@ mod tests {
             .get_mut(&StakePoolId::new(0))
             .unwrap()
             .total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        let initial_members = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+        let initial_members = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
         let initial_pool = state.pooled_validators();
@@ -298,7 +298,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
 
         assert_eq!(
-            state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members,
+            state.next_shard_committees[&ShardId::leaf(1, 0)].members,
             initial_members
         );
         assert_eq!(state.pooled_validators(), initial_pool);
@@ -315,19 +315,19 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
 
-        let initial_shard_0 = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+        let initial_shard_0 = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
-        let initial_shard_1 = state.next_shard_committees[&ShardGroupId::leaf(1, 1)]
+        let initial_shard_1 = state.next_shard_committees[&ShardId::leaf(1, 1)]
             .members
             .clone();
 
         apply_next_epoch(&mut state, &[]);
 
-        let final_shard_0 = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+        let final_shard_0 = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
-        let final_shard_1 = state.next_shard_committees[&ShardGroupId::leaf(1, 1)]
+        let final_shard_1 = state.next_shard_committees[&ShardId::leaf(1, 1)]
             .members
             .clone();
 
@@ -353,7 +353,7 @@ mod tests {
     /// `OnShard { ready: true }` validators are picked.
     #[test]
     fn shuffle_picks_only_from_ready_members() {
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let mut state = single_pool_state(4);
         // Mark validators 2 and 3 as not-yet-ready.
         for id in [2u64, 3] {
@@ -411,14 +411,14 @@ mod tests {
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
         assert!(state.pooled_validators().is_empty());
 
-        let initial_members = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+        let initial_members = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
         apply_next_epoch(&mut state, &[]);
 
         // Shard shrunk by one — empty pool, no refill possible.
         assert_eq!(
-            state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+            state.next_shard_committees[&ShardId::leaf(1, 0)]
                 .members
                 .len(),
             3
@@ -429,7 +429,7 @@ mod tests {
         let victim = pool_now[0];
         assert!(initial_members.contains(&victim));
         assert!(
-            !state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+            !state.next_shard_committees[&ShardId::leaf(1, 0)]
                 .members
                 .contains(&victim)
         );
@@ -460,7 +460,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
         let transition = effects
             .shard_committee_transitions
-            .get(&ShardGroupId::leaf(1, 0))
+            .get(&ShardId::leaf(1, 0))
             .expect("shuffle on shard 0 emits a transition");
         assert_eq!(transition.cause, TransitionCause::NaturalShuffle);
         assert_eq!(transition.at_slot, Epoch::new(SHUFFLE_INTERVAL_EPOCHS));
@@ -517,7 +517,7 @@ mod tests {
     /// not-yet-ready `OnShard` validators are all excluded.
     #[test]
     fn beacon_eligible_filters_to_on_shard_ready() {
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let mut state = empty_state();
         let ready_id = ValidatorId::new(1);
         state.validators.insert(
@@ -656,7 +656,7 @@ mod tests {
         // global invariant.
         state
             .next_shard_committees
-            .get_mut(&ShardGroupId::leaf(1, 0))
+            .get_mut(&ShardId::leaf(1, 0))
             .unwrap()
             .members
             .retain(|v| *v != ValidatorId::new(0));

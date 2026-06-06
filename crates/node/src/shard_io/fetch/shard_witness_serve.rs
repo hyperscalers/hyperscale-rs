@@ -136,14 +136,14 @@ mod tests {
         BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
         BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, Hash, InFlightCount,
         LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
+        ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
         TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
         verify_merkle_inclusion, zero_bls_signature,
     };
 
     use super::*;
 
-    const SHARD: ShardGroupId = ShardGroupId::ROOT;
+    const SHARD: ShardId = ShardId::ROOT;
 
     fn deposit(amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {

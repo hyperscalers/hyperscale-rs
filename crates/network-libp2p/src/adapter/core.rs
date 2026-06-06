@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
-use hyperscale_types::{MessageClass, NetworkDefinition, ShardGroupId, ValidatorId};
+use hyperscale_types::{MessageClass, NetworkDefinition, ShardId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
 use libp2p::gossipsub::{
     Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder, MessageAuthenticity,
@@ -48,7 +48,7 @@ pub struct Libp2pAdapter {
 
     /// Shards hosted by this peer. Drives per-shard request stream
     /// protocol registration and per-shard gossipsub topic subscription.
-    local_shards: HashSet<ShardGroupId>,
+    local_shards: HashSet<ShardId>,
 
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
@@ -110,7 +110,7 @@ impl Libp2pAdapter {
         network: NetworkDefinition,
         keypair: Keypair,
         vnodes: Vec<LocalVnodeIdentity>,
-        local_shards: HashSet<ShardGroupId>,
+        local_shards: HashSet<ShardId>,
         registry: Arc<HandlerRegistry>,
         validator_keys: Arc<ValidatorKeyMap>,
     ) -> Result<Arc<Self>, NetworkError> {
@@ -402,7 +402,7 @@ impl Libp2pAdapter {
     /// Shards hosted by this libp2p peer. Drives per-shard request stream
     /// protocol registration and per-shard gossipsub subscriptions.
     #[must_use]
-    pub const fn local_shards(&self) -> &HashSet<ShardGroupId> {
+    pub const fn local_shards(&self) -> &HashSet<ShardId> {
         &self.local_shards
     }
 
@@ -461,7 +461,7 @@ impl Libp2pAdapter {
     pub async fn open_request_stream(
         &self,
         peer: Libp2pPeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
     ) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()

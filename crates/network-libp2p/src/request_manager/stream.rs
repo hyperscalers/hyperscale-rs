@@ -3,7 +3,7 @@
 //! Delegates to the shared [`RequestStreamPool`], which multiplexes
 //! request/response pairs over a persistent stream per peer.
 
-use hyperscale_types::{MessageClass, ShardGroupId};
+use hyperscale_types::{MessageClass, ShardId};
 use libp2p::PeerId;
 
 use super::RequestManager;
@@ -18,7 +18,7 @@ impl RequestManager {
     pub(super) async fn send_request(
         &self,
         peer: &PeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
         type_id: &'static str,
         data: &[u8],
         _class: MessageClass,

@@ -44,7 +44,7 @@ pub fn validator_bind_message(
 mod tests {
     use super::*;
     use crate::signing::shard::block_vote_message;
-    use crate::{BlockHash, BlockHeight, Hash, Round, ShardGroupId};
+    use crate::{BlockHash, BlockHeight, Hash, Round, ShardId};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -83,7 +83,7 @@ mod tests {
         let bind_msg = validator_bind_message(&net(), bytes, &nonce);
         let block_msg = block_vote_message(
             &net(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::GENESIS,
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(bytes)),

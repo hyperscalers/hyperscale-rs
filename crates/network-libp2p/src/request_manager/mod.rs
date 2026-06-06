@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hyperscale_types::{MessageClass, ShardGroupId};
+use hyperscale_types::{MessageClass, ShardId};
 use libp2p::PeerId;
 use peer_health::{PeerHealthConfig, PeerHealthTracker};
 use thiserror::Error;
@@ -310,7 +310,7 @@ impl RequestManager {
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
-        shard: ShardGroupId,
+        shard: ShardId,
         request_desc: String,
         type_id: &'static str,
         sbor_data: Vec<u8>,

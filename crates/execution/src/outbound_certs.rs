@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ShardGroupId, ValidatorId, Verified, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ShardId, ValidatorId, Verified, WaveId, WeightedTimestamp,
 };
 use tracing::{debug, warn};
 
@@ -47,7 +47,7 @@ pub struct OutboundCertMemoryStats {
 /// A single tracked outbound EC for one (wave, `target_shard`) destination.
 struct OutboundCertEntry {
     certificate: Arc<Verified<ExecutionCertificate>>,
-    target_shard: ShardGroupId,
+    target_shard: ShardId,
     recipients: Vec<ValidatorId>,
     /// Hard deadline past which the EC is provably useless: every tx in the
     /// wave has expired and terminated. Computed via
@@ -62,7 +62,7 @@ struct OutboundCertEntry {
 #[derive(Debug)]
 pub struct RebroadcastDirective {
     /// Shard the EC should be re-broadcast to.
-    pub target_shard: ShardGroupId,
+    pub target_shard: ShardId,
     /// The verified execution certificate to re-broadcast.
     pub certificate: Arc<Verified<ExecutionCertificate>>,
     /// Per-shard recipients (peer pool) for the broadcast.
@@ -74,7 +74,7 @@ pub struct RebroadcastDirective {
 pub struct OutboundExecutionCertificateTracker {
     /// (`wave_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
-    entries: HashMap<(WaveId, ShardGroupId), OutboundCertEntry>,
+    entries: HashMap<(WaveId, ShardId), OutboundCertEntry>,
     now: WeightedTimestamp,
 }
 
@@ -104,7 +104,7 @@ impl OutboundExecutionCertificateTracker {
     pub fn on_broadcast(
         &mut self,
         certificate: Arc<Verified<ExecutionCertificate>>,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         recipients: Vec<ValidatorId>,
     ) {
         if recipients.is_empty() {
@@ -219,12 +219,12 @@ mod tests {
 
     fn wave(local: u64, h: u64, remote: &[u64]) -> WaveId {
         WaveId::new(
-            ShardGroupId::leaf(2, local),
+            ShardId::leaf(2, local),
             BlockHeight::new(h),
             remote
                 .iter()
                 .copied()
-                .map(|s| ShardGroupId::leaf(2, s))
+                .map(|s| ShardId::leaf(2, s))
                 .collect(),
         )
     }
@@ -250,7 +250,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vids(&[4, 5, 6, 7]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5, 6, 7]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -258,7 +258,7 @@ mod tests {
     fn on_broadcast_skips_when_no_recipients() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vec![]);
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vec![]);
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
 
@@ -266,8 +266,8 @@ mod tests {
     fn on_broadcast_is_idempotent_per_target() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w.clone()), ShardGroupId::leaf(2, 1), vids(&[4]));
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vids(&[4, 5]));
+        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -277,7 +277,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         // Just before interval — no directive.
         let directives = t.on_block_committed(ts(u64::try_from(REBROADCAST_INTERVAL.as_millis())
@@ -290,7 +290,7 @@ mod tests {
             u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX)
         ));
         assert_eq!(directives.len(), 1);
-        assert_eq!(directives[0].target_shard, ShardGroupId::leaf(2, 1));
+        assert_eq!(directives[0].target_shard, ShardId::leaf(2, 1));
         assert_eq!(directives[0].recipients, vids(&[4]));
     }
 
@@ -300,7 +300,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         let interval_ms = u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let d1 = t.on_block_committed(ts(interval_ms));
@@ -317,7 +317,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         let past = RETENTION_HORIZON + Duration::from_secs(1);
         t.on_block_committed(ts(
@@ -330,8 +330,8 @@ mod tests {
     fn wave_finalization_evicts_all_targets() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1, 2]);
-        t.on_broadcast(cert(w.clone()), ShardGroupId::leaf(2, 1), vids(&[4]));
-        t.on_broadcast(cert(w.clone()), ShardGroupId::leaf(2, 2), vids(&[8]));
+        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 2), vids(&[8]));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
 
         t.on_wave_finalized(&w);
@@ -343,7 +343,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w1 = wave(0, 100, &[1]);
         let w2 = wave(0, 101, &[1]);
-        t.on_broadcast(cert(w1), ShardGroupId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w1), ShardId::leaf(2, 1), vids(&[4]));
         t.on_wave_finalized(&w2);
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }

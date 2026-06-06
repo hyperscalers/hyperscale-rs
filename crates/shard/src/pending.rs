@@ -9,7 +9,7 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
-    ProvisionHash, Provisions, ReadySignal, Round, RoutableTransaction, ShardGroupId, TxHash,
+    ProvisionHash, Provisions, ReadySignal, Round, RoutableTransaction, ShardId, TxHash,
     ValidatorId, Verifiable, WaveId,
 };
 use tracing::{debug, warn};
@@ -381,7 +381,7 @@ impl PendingBlocks {
     pub fn check_fetches(
         &self,
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         now: LocalTimestamp,
         timeout: Duration,
         force_immediate: bool,
@@ -798,7 +798,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, BoundedVec, CertificateRoot,
         Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, Verified,
+        QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verified,
         WaveCertificate, WaveId,
     };
 
@@ -806,10 +806,10 @@ mod tests {
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -829,10 +829,10 @@ mod tests {
 
     fn make_header_round(height: BlockHeight, round: Round) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             round,
@@ -926,8 +926,8 @@ mod tests {
     #[test]
     fn test_pending_block_with_waves() {
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
-        let wave1 = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
-        let wave2 = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(2), BTreeSet::new());
+        let wave1 = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let wave2 = WaveId::new(ShardId::ROOT, BlockHeight::new(2), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let pb = PendingBlock::from_manifest(
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_add_finalized_wave() {
-        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let mut pb = PendingBlock::from_manifest(
@@ -980,7 +980,7 @@ mod tests {
     fn test_block_needs_transactions_and_waves() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let tx_hash = tx.hash();
-        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let mut pb = PendingBlock::from_manifest(
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_from_complete_block_is_complete() {
-        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
         let fw = Arc::new(FinalizedWave::new(cert, vec![]));

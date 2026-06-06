@@ -99,7 +99,7 @@ impl QueuedProvisionBuffer {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardGroupId, TxHash,
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardId, TxHash,
     };
 
     use super::*;
@@ -114,12 +114,12 @@ mod tests {
 
     fn make_provisions(
         seed: u8,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         height: BlockHeight,
     ) -> Arc<Verified<Provisions>> {
         Arc::new(Verified::new_unchecked_for_test(Provisions::new(
             source_shard,
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             height,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn enqueue_then_queued_with_zero_dwell_returns_immediately() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
-        let provisions = make_provisions(1, ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(100));
         assert_eq!(buf.queued(local(100), ts(1_000)).len(), 1);
     }
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn dwell_filter_skips_young_provisions() {
         let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
-        let provisions = make_provisions(1, ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
         assert!(buf.queued(local(100), ts(1_000)).is_empty());
         assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn deadline_filter_skips_past_deadline_provisions() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
-        let provisions = make_provisions(1, ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let source_ts = ts(1_000);
         buf.enqueue(Arc::clone(&provisions), source_ts, local(0));
         let live = provisions.deadline(source_ts);
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn on_block_committed_drops_matching_queue_entries() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
-        let provisions = make_provisions(1, ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let hash = provisions.hash();
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
 
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn drop_past_deadline_evicts_aged_provisions() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
-        let provisions = make_provisions(1, ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let source_block_ts = ts(1_000);
         buf.enqueue(Arc::clone(&provisions), source_block_ts, local(0));
 

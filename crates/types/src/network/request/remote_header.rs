@@ -7,7 +7,7 @@
 use sbor::prelude::BasicSbor;
 
 use crate::network::response::GetRemoteHeadersResponse;
-use crate::{BlockHeight, HeaderFetchCount, MessageClass, NetworkMessage, Request, ShardGroupId};
+use crate::{BlockHeight, HeaderFetchCount, MessageClass, NetworkMessage, Request, ShardId};
 
 /// Server-enforced upper bound on `count`. Sized to match the block-sync
 /// window so the two protocols share batch granularity.
@@ -23,7 +23,7 @@ pub const MAX_REMOTE_HEADERS_PER_REQUEST: HeaderFetchCount = HeaderFetchCount::n
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetRemoteHeadersRequest {
     /// Source shard producing the headers.
-    pub source_shard: ShardGroupId,
+    pub source_shard: ShardId,
     /// First height to fetch (inclusive).
     pub from_height: BlockHeight,
     /// Maximum number of consecutive headers to return.
@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetRemoteHeadersRequest {
-            source_shard: ShardGroupId::ROOT,
+            source_shard: ShardId::ROOT,
             from_height: BlockHeight::new(42),
             count: HeaderFetchCount::new(16),
         };

@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use hyperscale_types::{ShardGroupId, TxHash, WeightedTimestamp};
+use hyperscale_types::{ShardId, TxHash, WeightedTimestamp};
 
 /// Grace before mempool emits a fetch for an expected tx.
 ///
@@ -32,7 +32,7 @@ pub const EXPECTED_TX_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy)]
 struct ExpectedTx {
     first_seen_ts: WeightedTimestamp,
-    source_shard: ShardGroupId,
+    source_shard: ShardId,
 }
 
 /// Per-tx index of first-sighting `(source_shard, first_seen_ts)`.
@@ -52,7 +52,7 @@ impl ExpectedTxs {
     pub fn record(
         &mut self,
         tx_hash: TxHash,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         first_seen_ts: WeightedTimestamp,
     ) {
         self.entries.entry(tx_hash).or_insert(ExpectedTx {
@@ -80,7 +80,7 @@ impl ExpectedTxs {
     }
 
     /// Source shard recorded for `tx_hash`, if any.
-    pub fn source(&self, tx_hash: &TxHash) -> Option<ShardGroupId> {
+    pub fn source(&self, tx_hash: &TxHash) -> Option<ShardId> {
         self.entries.get(tx_hash).map(|e| e.source_shard)
     }
 
@@ -91,7 +91,7 @@ impl ExpectedTxs {
         &mut self,
         now: WeightedTimestamp,
         horizon: Duration,
-    ) -> Vec<(TxHash, ShardGroupId)> {
+    ) -> Vec<(TxHash, ShardId)> {
         let mut dropped = Vec::new();
         self.entries.retain(|tx_hash, entry| {
             if now.elapsed_since(entry.first_seen_ts) >= horizon {
@@ -107,14 +107,14 @@ impl ExpectedTxs {
     /// Tx hashes whose grace window has elapsed at `now`, grouped by the
     /// source shard whose committee should serve the fetch.
     ///
-    /// Returns groups in `ShardGroupId` order; ids within each group sorted
+    /// Returns groups in `ShardId` order; ids within each group sorted
     /// by `TxHash` — `HashMap` iteration is otherwise random.
     pub fn due_for_fetch(
         &self,
         now: WeightedTimestamp,
         grace: Duration,
-    ) -> Vec<(ShardGroupId, Vec<TxHash>)> {
-        let mut by_source: BTreeMap<ShardGroupId, Vec<TxHash>> = BTreeMap::new();
+    ) -> Vec<(ShardId, Vec<TxHash>)> {
+        let mut by_source: BTreeMap<ShardId, Vec<TxHash>> = BTreeMap::new();
         for (tx_hash, entry) in &self.entries {
             if now.elapsed_since(entry.first_seen_ts) >= grace {
                 by_source

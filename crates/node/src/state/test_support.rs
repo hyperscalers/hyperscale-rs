@@ -25,7 +25,7 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
-    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardGroupId, Stake, StakePoolId, ValidatorId,
+    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
     Verified, genesis_config_hash,
 };
 
@@ -82,7 +82,7 @@ impl TestNodeBuilder {
         let me = committee.validator_id(self.local_idx);
         // The beacon harness consolidates every validator onto the root shard,
         // so the node's home shard is the root regardless of `num_shards`.
-        let local_shard = ShardGroupId::ROOT;
+        let local_shard = ShardId::ROOT;
         let provision_store = Arc::new(ProvisionStore::new());
         let beacon_coordinator = test_beacon_coordinator(&committee, me, self.num_shards);
 
@@ -136,9 +136,9 @@ fn test_beacon_coordinator(
     // more shards declared in the topology snapshot for tx routing;
     // the beacon-state placement stays consolidated for test
     // determinism.
-    let mut initial_shard_committees: BTreeMap<ShardGroupId, Vec<_>> = BTreeMap::new();
+    let mut initial_shard_committees: BTreeMap<ShardId, Vec<_>> = BTreeMap::new();
     initial_shard_committees.insert(
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         (0..n).map(|i| committee.validator_id(i)).collect(),
     );
     let config = BeaconGenesisConfig {
@@ -157,7 +157,7 @@ fn test_beacon_coordinator(
         block,
         vec![state],
         me,
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         network,
         config_hash,
         pool,

@@ -17,8 +17,8 @@ use hyperscale_engine::sharding::expand_nodes_with_owned_at_height;
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::{
-    BlockHeight, MerkleInclusionProof, NodeId, ProvisionEntry, Provisions, ShardGroupId,
-    SubstateEntry, TxHash,
+    BlockHeight, MerkleInclusionProof, NodeId, ProvisionEntry, Provisions, ShardId, SubstateEntry,
+    TxHash,
 };
 use tracing::warn;
 
@@ -43,8 +43,8 @@ type StagedEntry = (
 /// entries matching `target_shard` participate in this build.
 pub fn build_provisions<S>(
     view: &SubstateView<S>,
-    source_shard: ShardGroupId,
-    target_shard: ShardGroupId,
+    source_shard: ShardId,
+    target_shard: ShardId,
     source_block_height: BlockHeight,
     requests: &[ProvisionsRequest],
 ) -> Option<Arc<Provisions>>

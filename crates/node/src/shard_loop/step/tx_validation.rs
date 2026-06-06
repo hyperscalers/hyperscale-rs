@@ -24,7 +24,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::TransactionGossip;
-use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, Verified};
+use hyperscale_types::{RoutableTransaction, ShardId, TxHash, Verified};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::host::NodeHost;
@@ -102,7 +102,7 @@ where
     pub(in crate::shard_loop) fn handle_admit_and_gossip_transaction(
         &mut self,
         tx: Arc<RoutableTransaction>,
-        touched_shards: &[ShardGroupId],
+        touched_shards: &[ShardId],
     ) {
         for dst in touched_shards {
             self.enqueue_tx_for_gossip(*dst, Arc::clone(&tx));
@@ -125,7 +125,7 @@ where
     pub(in crate::shard_loop) fn handle_gossip_transaction(
         &mut self,
         tx: &Arc<RoutableTransaction>,
-        touched_shards: &[ShardGroupId],
+        touched_shards: &[ShardId],
     ) {
         for dst in touched_shards {
             self.enqueue_tx_for_gossip(*dst, Arc::clone(tx));
@@ -227,7 +227,7 @@ where
     /// publishes to the destination shard's topic.
     pub(in crate::shard_loop) fn enqueue_tx_for_gossip(
         &mut self,
-        dst: ShardGroupId,
+        dst: ShardId,
         tx: Arc<RoutableTransaction>,
     ) {
         let now = self.now;
@@ -245,7 +245,7 @@ where
     /// Drain this shard's outbound gossip accumulator for destination
     /// shard `dst` and publish it as a single `TransactionGossip` batch.
     /// No-op if empty.
-    pub(crate) fn flush_tx_gossip_batch(&mut self, dst: ShardGroupId) {
+    pub(crate) fn flush_tx_gossip_batch(&mut self, dst: ShardId) {
         let Some(batch) = self.outbound_gossip_batches.get_mut(&dst) else {
             return;
         };

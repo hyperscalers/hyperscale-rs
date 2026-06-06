@@ -30,15 +30,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hyperscale_types::{
-    BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardGroupId,
-};
+use hyperscale_types::{BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardId};
 use papaya::HashMap;
 
 /// Shared content-addressed store of `Provisions` bodies.
 pub struct ProvisionStore {
     inner: HashMap<ProvisionHash, Arc<Provisions>>,
-    outbound_index: HashMap<(BlockHeight, ShardGroupId), Arc<Provisions>>,
+    outbound_index: HashMap<(BlockHeight, ShardId), Arc<Provisions>>,
 }
 
 impl ProvisionStore {
@@ -66,7 +64,7 @@ impl ProvisionStore {
     /// before regenerating from `RocksDB`. Idempotent on the
     /// `(height, shard)` slot — first writer wins, repeated inserts of
     /// the same content are no-ops.
-    pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
+    pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardId) {
         let hash = provisions.hash();
         let block_height = provisions.block_height();
         self.inner
@@ -89,7 +87,7 @@ impl ProvisionStore {
     pub fn get_outbound(
         &self,
         block_height: BlockHeight,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
     ) -> Option<Arc<Provisions>> {
         self.outbound_index
             .pin()
@@ -156,8 +154,8 @@ mod tests {
 
     fn make_provisions(tx_seed: u8, height: u64) -> Arc<Provisions> {
         Arc::new(Provisions::new(
-            ShardGroupId::leaf(1, 1),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 1),
+            ShardId::leaf(1, 0),
             BlockHeight::new(height),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(

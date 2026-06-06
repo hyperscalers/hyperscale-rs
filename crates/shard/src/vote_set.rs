@@ -339,7 +339,7 @@ impl VoteSet {
 
 #[cfg(test)]
 mod test_helpers {
-    use hyperscale_types::{Bls12381G2Signature, QuorumCertificate, ShardGroupId, SignerBitfield};
+    use hyperscale_types::{Bls12381G2Signature, QuorumCertificate, ShardId, SignerBitfield};
 
     use super::*;
 
@@ -357,7 +357,7 @@ mod test_helpers {
         pub fn build_qc(
             &mut self,
             block_hash: BlockHash,
-            shard_group_id: ShardGroupId,
+            shard_id: ShardId,
         ) -> Result<QuorumCertificate, String> {
             if self.verified_votes.is_empty() {
                 return Err("cannot build QC with no votes".to_string());
@@ -414,7 +414,7 @@ mod test_helpers {
 
             Ok(QuorumCertificate::new(
                 block_hash,
-                shard_group_id,
+                shard_id,
                 height,
                 parent_block_hash,
                 round,
@@ -433,22 +433,21 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
-        generate_bls_keypair,
+        QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId, generate_bls_keypair,
     };
 
     use super::*;
 
-    fn test_shard_group() -> ShardGroupId {
-        ShardGroupId::ROOT
+    fn test_shard_group() -> ShardId {
+        ShardId::ROOT
     }
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

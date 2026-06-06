@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, CertifiedBeaconBlock, Epoch, NetworkDefinition,
-    ShardGroupId, SlotEffects, TransitionCause, ValidatorId,
+    ShardId, SlotEffects, TransitionCause, ValidatorId,
 };
 
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
@@ -104,7 +104,7 @@ pub fn apply_epoch(
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface
     // membership changes through `SlotEffects.shard_committee_transitions`.
-    let pre_shard_members: BTreeMap<ShardGroupId, Vec<ValidatorId>> = state
+    let pre_shard_members: BTreeMap<ShardId, Vec<ValidatorId>> = state
         .next_shard_committees
         .iter()
         .map(|(s, c)| (*s, c.members.clone()))

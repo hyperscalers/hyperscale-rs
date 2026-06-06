@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, BoundedVec, CertifiedBlockHeader, Hash, LeafIndex,
-    MAX_WITNESS_PROOF_DEPTH, Round, ShardGroupId, Stake, StakePoolId, ValidatorId, Verified,
-    Verify, verify_merkle_inclusion,
+    MAX_WITNESS_PROOF_DEPTH, Round, ShardId, Stake, StakePoolId, ValidatorId, Verified, Verify,
+    verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -224,7 +224,7 @@ impl From<BeaconWitnessEvent> for ShardWitnessPayload {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ShardWitnessProof {
     /// Shard that emitted the witness.
-    pub shard_id: ShardGroupId,
+    pub shard_id: ShardId,
     /// Hash of the source shard's committed block whose header carries
     /// the accumulator root this proof verifies against.
     pub committed_block_hash: BlockHash,
@@ -253,7 +253,7 @@ pub struct ShardWitness {
 /// Failure modes of a [`ShardWitness`].
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ShardWitnessVerifyError {
-    /// `proof.shard_id != ctx.header().shard_group_id()`.
+    /// `proof.shard_id != ctx.header().shard_id()`.
     #[error("witness shard_id does not match header shard")]
     ShardIdMismatch,
     /// `proof.committed_block_hash != ctx.block_hash()`.
@@ -280,7 +280,7 @@ impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
 
     fn verify(&self, ctx: &Verified<CertifiedBlockHeader>) -> Result<Verified<Self>, Self::Error> {
         let header = ctx.header();
-        if self.proof.shard_id != header.shard_group_id() {
+        if self.proof.shard_id != header.shard_id() {
             return Err(ShardWitnessVerifyError::ShardIdMismatch);
         }
         if self.proof.committed_block_hash != ctx.block_hash() {
@@ -311,7 +311,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(1_000_000),
             },
             proof: ShardWitnessProof {
-                shard_id: ShardGroupId::ROOT,
+                shard_id: ShardId::ROOT,
                 committed_block_hash: BlockHash::ZERO,
                 leaf_index: LeafIndex::new(42),
                 siblings: Vec::new().into(),

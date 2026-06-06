@@ -15,7 +15,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BlockHeight, InFlightCount, MAX_TX_IN_FLIGHT, ShardGroupId, StateRoot, ValidatorId,
+    BlockHeight, InFlightCount, MAX_TX_IN_FLIGHT, ShardId, StateRoot, ValidatorId,
 };
 
 use crate::host::NodeHost;
@@ -36,7 +36,7 @@ pub struct ShardStatus {
 #[derive(Debug, Clone)]
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 pub struct VnodeStatus {
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     pub committed_height: BlockHeight,
     pub view: u64,
     pub state_root: StateRoot,
@@ -48,7 +48,7 @@ pub struct VnodeStatus {
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified headers.
-    pub remote_shard_in_flight: HashMap<ShardGroupId, InFlightCount>,
+    pub remote_shard_in_flight: HashMap<ShardId, InFlightCount>,
     /// Threshold for rejecting transactions due to remote shard
     /// congestion (80% of [`MAX_TX_IN_FLIGHT`]).
     pub remote_congestion_threshold: InFlightCount,
@@ -64,7 +64,7 @@ pub struct VnodeStatus {
 #[derive(Debug, Clone)]
 pub struct NodeStatusSnapshot {
     /// Per-hosted-shard readouts.
-    pub shards: HashMap<ShardGroupId, ShardStatus>,
+    pub shards: HashMap<ShardId, ShardStatus>,
     /// Per-hosted-vnode readouts.
     pub vnodes: HashMap<ValidatorId, VnodeStatus>,
 }

@@ -44,15 +44,15 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{BlockHeight, ShardGroupId};
+    use crate::{BlockHeight, ShardId};
 
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetExecutionCertsRequest {
             wave_ids: vec![WaveId::new(
-                ShardGroupId::leaf(2, 0),
+                ShardId::leaf(2, 0),
                 BlockHeight::new(42),
-                BTreeSet::from([ShardGroupId::leaf(2, 1), ShardGroupId::leaf(2, 2)]),
+                BTreeSet::from([ShardId::leaf(2, 1), ShardId::leaf(2, 2)]),
             )],
         };
 

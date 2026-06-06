@@ -12,7 +12,7 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, PreparedCommit, ShardGroupId,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, PreparedCommit, ShardId,
     TopologySnapshot, ValidatorId,
 };
 
@@ -35,7 +35,7 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub me: ValidatorId,
     /// Dispatching vnode's shard. Equal to the vnode's `local_shard`
     /// for shard-rooted handlers; beacon handlers ignore it.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
     pub pending_chain: &'a Arc<PendingChain<S>>,

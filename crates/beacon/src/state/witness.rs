@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use hyperscale_types::{
     BeaconProposal, BeaconState, JAIL_COOLDOWN_EPOCHS, JailReason, LeafIndex,
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
-    ShardGroupId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId,
-    ValidatorRecord, ValidatorStatus, Verifiable, verify_vote_equivocation,
+    ShardId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord,
+    ValidatorStatus, Verifiable, verify_vote_equivocation,
 };
 
 use crate::state::vrf::jail_validator;
@@ -71,7 +71,7 @@ pub(super) fn ingest_witnesses(
     // (it's a wire type), so we key the dedup set on the tuple
     // directly. Beacon witnesses collect without dedup; their jail
     // gate ("not already permanently jailed") provides the idempotence.
-    let mut shard_seen: BTreeSet<(ShardGroupId, LeafIndex)> = BTreeSet::new();
+    let mut shard_seen: BTreeSet<(ShardId, LeafIndex)> = BTreeSet::new();
     let mut shard_lifts: Vec<&ShardWitness> = Vec::new();
     let mut equivocations: Vec<&Verifiable<PcVoteEquivocation>> = Vec::new();
     for (_, prop) in accepted {
@@ -182,7 +182,7 @@ pub(super) fn ingest_witnesses(
 #[allow(clippy::too_many_lines)] // single dispatch over ShardWitnessPayload variants
 pub(super) fn apply_shard_payload(
     state: &mut BeaconState,
-    source_shard: ShardGroupId,
+    source_shard: ShardId,
     payload: &ShardWitnessPayload,
 ) -> Option<ShardEvent> {
     match payload {
@@ -391,7 +391,7 @@ mod tests {
     // ─── ingest_witnesses framework + stake variants ─────────────────────
     use hyperscale_types::{
         BeaconProposal, BeaconState, EMISSIONS_PER_EPOCH, Epoch, JAIL_COOLDOWN_EPOCHS, JailReason,
-        LeafIndex, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, ShardCommittee, ShardGroupId,
+        LeafIndex, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, ShardCommittee, ShardId,
         ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(pool.total_stake, Stake::from_whole_tokens(150));
         // Watermark advanced to 2 for shard 0.
         assert_eq!(
-            state.consumed_through.get(&ShardGroupId::leaf(1, 0)),
+            state.consumed_through.get(&ShardId::leaf(1, 0)),
             Some(&LeafIndex::new(2))
         );
     }
@@ -526,7 +526,7 @@ mod tests {
         // Watermark still advances on apply (the witness was consumed,
         // even though the variant rejected it).
         assert_eq!(
-            state.consumed_through.get(&ShardGroupId::leaf(1, 0)),
+            state.consumed_through.get(&ShardId::leaf(1, 0)),
             Some(&LeafIndex::new(1))
         );
     }
@@ -572,7 +572,7 @@ mod tests {
         // (gap) and another for leaf_index 5 (replay). Neither applies.
         state
             .consumed_through
-            .insert(ShardGroupId::leaf(1, 0), LeafIndex::new(5));
+            .insert(ShardId::leaf(1, 0), LeafIndex::new(5));
 
         let gap = shard_witness(
             0,
@@ -601,7 +601,7 @@ mod tests {
         assert!(!state.pools.contains_key(&StakePoolId::new(8)));
         // Watermark unchanged.
         assert_eq!(
-            state.consumed_through.get(&ShardGroupId::leaf(1, 0)),
+            state.consumed_through.get(&ShardId::leaf(1, 0)),
             Some(&LeafIndex::new(5))
         );
     }
@@ -650,7 +650,7 @@ mod tests {
         let pool = state.pools.get(&StakePoolId::new(7)).unwrap();
         assert_eq!(pool.total_stake, Stake::from_whole_tokens(6));
         assert_eq!(
-            state.consumed_through.get(&ShardGroupId::leaf(1, 0)),
+            state.consumed_through.get(&ShardId::leaf(1, 0)),
             Some(&LeafIndex::new(3))
         );
     }
@@ -760,7 +760,7 @@ mod tests {
         // Watermark still advances — the witness was consumed even
         // though the variant rejected it.
         assert_eq!(
-            state.consumed_through.get(&ShardGroupId::leaf(1, 0)),
+            state.consumed_through.get(&ShardId::leaf(1, 0)),
             Some(&LeafIndex::new(1))
         );
     }
@@ -806,7 +806,7 @@ mod tests {
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::InsufficientStake,
         );
-        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -831,7 +831,7 @@ mod tests {
             .validators
             .insert(ValidatorId::new(5));
 
-        let pre_members = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
+        let pre_members = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
 
@@ -855,7 +855,7 @@ mod tests {
         );
         // Shard committee unchanged (the validator wasn't there).
         assert_eq!(
-            state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members,
+            state.next_shard_committees[&ShardId::leaf(1, 0)].members,
             pre_members,
         );
     }
@@ -1170,7 +1170,7 @@ mod tests {
     fn ready_flips_on_shard_false_to_true() {
         let mut state = single_pool_state(0);
         state.committee = Vec::new();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let placed = Epoch::new(3);
         // Put validator 1 on shard 0 as not-yet-ready.
         let pool_id = StakePoolId::new(0);
@@ -1366,14 +1366,14 @@ mod tests {
                 10,
                 0,
                 ValidatorStatus::OnShard {
-                    shard: ShardGroupId::leaf(1, 1),
+                    shard: ShardId::leaf(1, 1),
                     ready: true,
                     placed_at_epoch: Epoch::GENESIS,
                 },
             ),
         );
         state.next_shard_committees.insert(
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 1),
             ShardCommittee {
                 members: vec![target],
             },
@@ -1484,7 +1484,7 @@ mod tests {
         // Counter cleared.
         assert!(!state.miss_counters.contains_key(&target));
         // Shard committee refilled from pool.
-        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -1614,7 +1614,7 @@ mod tests {
                 reason: JailReason::Equivocation,
             },
         );
-        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));

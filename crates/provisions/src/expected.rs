@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchRequest};
-use hyperscale_types::{BlockHeight, ShardGroupId, ValidatorId, WeightedTimestamp};
+use hyperscale_types::{BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
 use tracing::warn;
 
 /// How long to wait before falling back to peer-fetch for missing
@@ -33,7 +33,7 @@ use tracing::warn;
 /// authenticated `weighted_timestamp_ms` of locally committed blocks.
 const PROVISION_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-type Key = (ShardGroupId, BlockHeight);
+type Key = (ShardId, BlockHeight);
 
 /// Per-entry liveness state for a registered expected provisions value.
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ struct ExpectedProvision {
 /// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutEffect {
-    pub source_shard: ShardGroupId,
+    pub source_shard: ShardId,
     pub block_height: BlockHeight,
     pub proposer: ValidatorId,
 }
@@ -100,7 +100,7 @@ impl ExpectedProvisionTracker {
     /// No-op if an expectation is already registered for the same key.
     pub(crate) fn register(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         block_height: BlockHeight,
         proposer: ValidatorId,
     ) {
@@ -119,7 +119,7 @@ impl ExpectedProvisionTracker {
     /// remote-provision fetch is cancelled.
     pub(crate) fn on_provisions_verified(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         block_height: BlockHeight,
     ) -> bool {
         self.expected
@@ -247,7 +247,7 @@ mod tests {
     fn register_inserts_expectation() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -258,12 +258,12 @@ mod tests {
     fn register_is_idempotent() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(7),
         );
@@ -274,12 +274,12 @@ mod tests {
     fn on_provisions_verified_clears_entry() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
-        assert!(t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
-        assert!(!t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(!t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
         assert_eq!(t.len(), 0);
     }
 
@@ -287,7 +287,7 @@ mod tests {
     fn first_commit_retro_stamps_pregenesis_entries() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -307,7 +307,7 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(
             effects[0],
             TimeoutEffect {
-                source_shard: ShardGroupId::leaf(2, 1),
+                source_shard: ShardId::leaf(2, 1),
                 block_height: BlockHeight::new(10),
                 proposer: ValidatorId::new(3),
             }
@@ -341,13 +341,13 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
 
         // Verify before the timeout fires.
-        assert!(t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
 
         let well_past =
             ts(1_000
@@ -360,12 +360,12 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
         t.register(
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(2, 2),
             BlockHeight::new(5),
             ValidatorId::new(7),
         );
@@ -382,7 +382,7 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -394,10 +394,7 @@ mod tests {
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);
-        assert_eq!(
-            dropped,
-            vec![(ShardGroupId::leaf(2, 1), BlockHeight::new(10))]
-        );
+        assert_eq!(dropped, vec![(ShardId::leaf(2, 1), BlockHeight::new(10))]);
         assert_eq!(t.len(), 0);
     }
 
@@ -405,7 +402,7 @@ mod tests {
     fn cleanup_orphans_no_op_when_cutoff_zero() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );

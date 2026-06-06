@@ -1,6 +1,6 @@
 //! libp2p network behaviour definition.
 
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 use libp2p::StreamProtocol;
 use libp2p::connection_limits::Behaviour as ConnectionLimitsBehaviour;
 use libp2p::gossipsub::Behaviour as GossipsubBehaviour;
@@ -18,7 +18,7 @@ use libp2p_stream::Behaviour as StreamBehaviour;
 /// ...)`. The protocol identifier is the routing signal — bodies do not
 /// carry the shard.
 #[must_use]
-pub fn request_protocol(shard: ShardGroupId) -> StreamProtocol {
+pub fn request_protocol(shard: ShardId) -> StreamProtocol {
     StreamProtocol::try_from_owned(format!("/hyperscale/request/shard-{}/1.0.0", shard.inner()))
         .expect("static prefix + decimal shard id is always a valid protocol string")
 }

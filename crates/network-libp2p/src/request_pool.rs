@@ -36,7 +36,7 @@ use dashmap::DashMap;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics::record_libp2p_bandwidth;
 use hyperscale_network::compression::decompress;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
@@ -69,7 +69,7 @@ pub trait RequestPool: Send + Sync + 'static {
     fn send<'a>(
         &'a self,
         peer: PeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,
@@ -80,7 +80,7 @@ impl RequestPool for RequestStreamPool {
     fn send<'a>(
         &'a self,
         peer: PeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,
@@ -115,7 +115,7 @@ struct PeerRequestActor {
 /// Per-actor key: one persistent stream per `(peer, shard)` pair. With
 /// V=1 single-shard hosting this collapses to one entry per peer; under
 /// multi-shard hosting the key grows with hosted-shard cardinality.
-type ActorKey = (PeerId, ShardGroupId);
+type ActorKey = (PeerId, ShardId);
 
 /// Manages persistent outbound request streams, one per `(peer, shard)` pair.
 pub struct RequestStreamPool {
@@ -154,7 +154,7 @@ impl RequestStreamPool {
     pub async fn send(
         &self,
         peer: PeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,

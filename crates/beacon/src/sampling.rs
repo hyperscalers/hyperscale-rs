@@ -12,7 +12,7 @@
 //! [`BeaconState`]: crate::state::BeaconState
 
 use blake3::Hasher;
-use hyperscale_types::{Epoch, ShardGroupId, ValidatorId};
+use hyperscale_types::{Epoch, ShardId, ValidatorId};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -79,7 +79,7 @@ pub fn draw_from_pool(
     pool: &[ValidatorId],
     randomness: &[u8; 32],
     epoch: Epoch,
-    shard: ShardGroupId,
+    shard: ShardId,
 ) -> Option<ValidatorId> {
     if pool.is_empty() {
         return None;
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn draw_from_pool_returns_none_when_empty() {
         assert_eq!(
-            draw_from_pool(&[], &[0u8; 32], Epoch::new(1), ShardGroupId::leaf(1, 0)),
+            draw_from_pool(&[], &[0u8; 32], Epoch::new(1), ShardId::leaf(1, 0)),
             None
         );
     }
@@ -156,8 +156,8 @@ mod tests {
     #[test]
     fn draw_from_pool_deterministic_for_same_inputs() {
         let pool = ids(0..8);
-        let a = draw_from_pool(&pool, &[0x5A; 32], Epoch::new(7), ShardGroupId::leaf(1, 0));
-        let b = draw_from_pool(&pool, &[0x5A; 32], Epoch::new(7), ShardGroupId::leaf(1, 0));
+        let a = draw_from_pool(&pool, &[0x5A; 32], Epoch::new(7), ShardId::leaf(1, 0));
+        let b = draw_from_pool(&pool, &[0x5A; 32], Epoch::new(7), ShardId::leaf(1, 0));
         assert_eq!(a, b);
         assert!(a.is_some());
     }
@@ -170,8 +170,8 @@ mod tests {
     fn draw_from_pool_across_shards_uses_distinct_seeds() {
         let pool = ids(0..8);
         let any_differ = (0u8..16).any(|i| {
-            let a = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardGroupId::leaf(1, 0));
-            let b = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardGroupId::leaf(1, 1));
+            let a = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardId::leaf(1, 0));
+            let b = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardId::leaf(1, 1));
             a != b
         });
         assert!(any_differ);
@@ -183,8 +183,8 @@ mod tests {
     fn draw_from_pool_across_slots_uses_distinct_seeds() {
         let pool = ids(0..8);
         let any_differ = (0u8..16).any(|i| {
-            let a = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardGroupId::leaf(1, 0));
-            let b = draw_from_pool(&pool, &[i; 32], Epoch::new(6), ShardGroupId::leaf(1, 0));
+            let a = draw_from_pool(&pool, &[i; 32], Epoch::new(5), ShardId::leaf(1, 0));
+            let b = draw_from_pool(&pool, &[i; 32], Epoch::new(6), ShardId::leaf(1, 0));
             a != b
         });
         assert!(any_differ);

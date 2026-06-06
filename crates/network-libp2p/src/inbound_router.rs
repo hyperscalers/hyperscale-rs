@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use futures::{AsyncWriteExt, StreamExt};
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 use libp2p::{PeerId, Stream};
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -364,7 +364,7 @@ impl InboundRouter {
     async fn handle_request_stream(
         &self,
         peer: PeerId,
-        shard: ShardGroupId,
+        shard: ShardId,
         mut stream: Stream,
     ) -> Result<(), StreamError> {
         loop {

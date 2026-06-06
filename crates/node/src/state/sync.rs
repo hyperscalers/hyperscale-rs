@@ -51,8 +51,8 @@ mod tests {
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CertifiedBlockHeader, LocalTimestamp, QuorumCertificate, ShardGroupId, ValidatorId,
-        Verified, WaveId,
+        CertifiedBlockHeader, LocalTimestamp, QuorumCertificate, ShardId, ValidatorId, Verified,
+        WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -72,10 +72,10 @@ mod tests {
         // Seed provisions.expected via a verified remote header whose
         // wave depends on local.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::ROOT);
-        let wave = WaveId::new(ShardGroupId::leaf(1, 1), BlockHeight::new(5), remote_shards);
+        remote_shards.insert(ShardId::ROOT);
+        let wave = WaveId::new(ShardId::leaf(1, 1), BlockHeight::new(5), remote_shards);
         let mut block = make_live_block(
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 1),
             BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -84,7 +84,7 @@ mod tests {
         );
         if let Block::Live { ref mut header, .. } = block {
             *header = BlockHeader::new(
-                header.shard_group_id(),
+                header.shard_id(),
                 header.height(),
                 header.parent_block_hash(),
                 header.parent_qc().clone(),
@@ -107,7 +107,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardGroupId::leaf(1, 1)),
+                QuorumCertificate::genesis(ShardId::leaf(1, 1)),
             )));
         let _ = node.handle(
             LocalTimestamp::ZERO,
@@ -126,7 +126,7 @@ mod tests {
         assert_emits!(
             actions,
             Action::Fetch(FetchRequest::RemoteProvisions { source_shard, .. })
-                if *source_shard == ShardGroupId::leaf(1, 1)
+                if *source_shard == ShardId::leaf(1, 1)
         );
     }
 

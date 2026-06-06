@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 use crate::network::response::beacon::GetShardWitnessesResponse;
 use crate::{
     BlockHash, BlockHeight, BoundedVec, LeafIndex, MAX_WITNESSES_PER_FETCH, MessageClass,
-    NetworkMessage, Request, ShardGroupId,
+    NetworkMessage, Request, ShardId,
 };
 
 /// Fetch a batch of shard witnesses by leaf index against a specific
@@ -29,7 +29,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetShardWitnessesRequest {
     /// Shard whose witnesses are being fetched.
-    pub shard_id: ShardGroupId,
+    pub shard_id: ShardId,
     /// Height of the anchor block in `shard_id`'s chain.
     pub block_height: BlockHeight,
     /// Hash of the anchor block. The responder cross-checks this
@@ -51,7 +51,7 @@ impl GetShardWitnessesRequest {
     /// Panics if `leaf_indices.len() > MAX_WITNESSES_PER_FETCH`.
     #[must_use]
     pub fn new(
-        shard_id: ShardGroupId,
+        shard_id: ShardId,
         block_height: BlockHeight,
         committed_block_hash: BlockHash,
         leaf_indices: Vec<LeafIndex>,
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn sbor_round_trip() {
         let req = GetShardWitnessesRequest::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(42),
             BlockHash::ZERO,
             vec![LeafIndex::new(1), LeafIndex::new(7), LeafIndex::new(42)],

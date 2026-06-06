@@ -433,8 +433,8 @@ mod tests {
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BloomFilter, BoundedVec,
         CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp, zero_bls_signature,
+        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     fn create_test_block() -> Block {
@@ -442,10 +442,10 @@ mod tests {
 
         Block::Live {
             header: BlockHeader::new(
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(1),
                 BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                QuorumCertificate::genesis(ShardGroupId::ROOT),
+                QuorumCertificate::genesis(ShardId::ROOT),
                 ValidatorId::new(0),
                 ProposerTimestamp::from_millis(1_234_567_890),
                 Round::INITIAL,
@@ -470,7 +470,7 @@ mod tests {
     fn create_test_qc(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             block.height(),
             block.header().parent_block_hash(),
             block.header().round(),

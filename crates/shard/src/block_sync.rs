@@ -805,8 +805,8 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot,
-        Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round,
-        ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardId,
+        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -814,10 +814,10 @@ mod tests {
 
     fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(tag)),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -844,7 +844,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -1210,7 +1210,7 @@ mod tests {
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"qc")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::ZERO,
             Round::INITIAL,

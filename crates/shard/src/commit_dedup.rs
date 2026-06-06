@@ -143,7 +143,7 @@ mod tests {
     use hyperscale_test_helpers::make_finalized_wave;
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardGroupId,
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
         TimestampRange, TransactionDecision, routable_from_notarized_v1,
     };
 
@@ -177,8 +177,8 @@ mod tests {
     fn make_provisions(seed: u8) -> Arc<Provisions> {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
         Arc::new(Provisions::new(
-            ShardGroupId::leaf(1, 0),
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(tx_hash, vec![], vec![], vec![])],

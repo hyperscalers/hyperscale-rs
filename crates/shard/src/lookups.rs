@@ -6,7 +6,7 @@
 //! full driver fixture.
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, Round, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    Bls12381G1PublicKey, Round, ShardId, TopologySnapshot, ValidatorId, VotePower,
 };
 
 /// Recipients for a vote cast in `round`.
@@ -21,7 +21,7 @@ use hyperscale_types::{
 /// the QC on view change without re-collection.
 pub fn vote_recipients(
     topology: &TopologySnapshot,
-    shard: ShardGroupId,
+    shard: ShardId,
     me: ValidatorId,
     round: Round,
 ) -> Vec<ValidatorId> {
@@ -64,7 +64,7 @@ pub fn vote_recipients(
 /// silently wedging the shard under a corrupt snapshot.
 pub fn committee_public_keys(
     topology: &TopologySnapshot,
-    shard: ShardGroupId,
+    shard: ShardId,
 ) -> Vec<Bls12381G1PublicKey> {
     topology
         .committee_for_shard(shard)
@@ -87,7 +87,7 @@ pub fn committee_public_keys(
 ///
 /// Panics if a committee member is absent from the snapshot's validator set —
 /// same invariant as [`committee_public_keys`].
-pub fn committee_voting_powers(topology: &TopologySnapshot, shard: ShardGroupId) -> Vec<VotePower> {
+pub fn committee_voting_powers(topology: &TopologySnapshot, shard: ShardId) -> Vec<VotePower> {
     topology
         .committee_for_shard(shard)
         .iter()
@@ -129,7 +129,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
 
         // Voting in round 0:
         //   Block proposer: round 0 -> V0 (self, skipped)
@@ -160,7 +160,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         assert_eq!(
             vote_recipients(&topology, shard, me, Round::new(3)),
             vec![
@@ -179,7 +179,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         assert_eq!(
             vote_recipients(&topology, shard, me, Round::new(2)),
             vec![
@@ -195,7 +195,7 @@ mod tests {
         let committee = TestCommittee::new(1, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         assert!(vote_recipients(&topology, shard, me, Round::new(0)).is_empty());
     }
 
@@ -205,7 +205,7 @@ mod tests {
     fn committee_public_keys_returns_all_keys_in_order() {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
 
         let keys = committee_public_keys(&topology, shard);
         assert_eq!(keys.len(), 4);

@@ -27,14 +27,13 @@ use hyperscale_types::{
     CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
     Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext,
-    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SkipEpochCert,
-    SkipRequest, SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject,
-    SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed, compute_merkle_root_with_proof,
-    genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
-    spc_context, verify_skip_cert, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
-    zero_bls_signature,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SkipEpochCert, SkipRequest,
+    SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext,
+    SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, bls_keypair_from_seed, compute_merkle_root_with_proof, genesis_config_hash,
+    pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context,
+    verify_skip_cert, verify_vote1, verify_vote2, verify_vote3, vrf_sign, zero_bls_signature,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -191,7 +190,7 @@ impl CoordinatorSim {
         }
 
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let config = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: members
@@ -226,7 +225,7 @@ impl CoordinatorSim {
                     Arc::clone(&genesis_block),
                     vec![initial_state.clone()],
                     members[i].0,
-                    ShardGroupId::ROOT,
+                    ShardId::ROOT,
                     network.clone(),
                     config_hash,
                     Arc::new(BeaconProposalPool::new(next_epoch)),
@@ -308,7 +307,7 @@ impl CoordinatorSim {
     /// proposal that carries the witness.
     pub fn admissible_shard_witness(
         &mut self,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: u64,
         leaf_index: u64,
         payload: ShardWitnessPayload,
@@ -1193,7 +1192,7 @@ impl CoordinatorSim {
 /// beacon witness-admission gate reads — shard, height, witness root,
 /// leaf count, block hash — carry meaning; the rest are zeroed.
 fn make_source_header(
-    shard: ShardGroupId,
+    shard: ShardId,
     height: u64,
     witness_root: Hash,
     leaf_count: u64,

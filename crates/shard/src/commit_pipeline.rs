@@ -66,17 +66,17 @@ impl CommitPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        Block, BlockHash, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
         ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
 
     fn make_certified(height: u64, tag: u64) -> Arc<Verified<CertifiedBlock>> {
-        let block = Block::genesis(ShardGroupId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
+        let block = Block::genesis(ShardId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(height),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -135,7 +135,7 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use hyperscale_types::{
-        Block, BlockHash, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        Block, BlockHash, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
         ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
     use proptest::prelude::*;
@@ -143,10 +143,10 @@ mod properties {
     use super::*;
 
     fn make_certified(height: u64, tag: u64) -> Arc<Verified<CertifiedBlock>> {
-        let block = Block::genesis(ShardGroupId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
+        let block = Block::genesis(ShardId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(height),
             BlockHash::ZERO,
             Round::INITIAL,

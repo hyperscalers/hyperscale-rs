@@ -30,7 +30,7 @@ use hyperscale_types::{
     MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
-    PcVoteRound, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness,
+    PcVoteRound, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardId, ShardWitness,
     SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot, ValidatorId,
@@ -141,7 +141,7 @@ pub struct BeaconCoordinator {
     /// consensus, but the coordinator stamps fetch requests with the
     /// dispatching vnode's shard so the runner's network adapter has a
     /// committee handle for peer selection.
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
 
     /// Mixed into every signing helper's domain bytes; carried so
     /// per-epoch SPC instances and outbound canonical-bytes
@@ -200,7 +200,7 @@ impl BeaconCoordinator {
         latest_block: Arc<Verified<CertifiedBeaconBlock>>,
         history: Vec<BeaconState>,
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
         proposal_pool: Arc<BeaconProposalPool>,
@@ -1605,7 +1605,7 @@ impl BeaconCoordinator {
     /// no-ops there — the pool is empty by design for those nodes.
     pub fn on_shard_witnesses_received(
         &mut self,
-        shard_id: ShardGroupId,
+        shard_id: ShardId,
         witnesses: Vec<Arc<ShardWitness>>,
     ) -> Vec<Action> {
         if !self.is_on_committee() {
@@ -1674,7 +1674,7 @@ impl BeaconCoordinator {
             return Vec::new();
         }
         let header = certified_header.header();
-        let shard = header.shard_group_id();
+        let shard = header.shard_id();
         let block_height = header.height();
         let committed_block_hash = header.hash();
         let leaf_count = header.beacon_witness_leaf_count();
@@ -1765,13 +1765,13 @@ impl BeaconCoordinator {
         // advancement. Each eviction may release in-flight leaf fetches
         // whose witnesses are now stale — collect their ids so the
         // caller can hand them to `FetchAbandon::ShardWitnesses`.
-        let consumed_snapshot: Vec<(ShardGroupId, LeafIndex)> = self
+        let consumed_snapshot: Vec<(ShardId, LeafIndex)> = self
             .state
             .consumed_through
             .iter()
             .map(|(s, w)| (*s, *w))
             .collect();
-        let mut abandoned_witness_ids: Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)> =
+        let mut abandoned_witness_ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)> =
             Vec::new();
         for (shard, watermark) in consumed_snapshot {
             abandoned_witness_ids.extend(
@@ -2287,7 +2287,7 @@ mod tests {
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
         GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, Randomness, ShardCommittee,
-        ShardGroupId, ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId,
+        ShardId, ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId,
         WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2, build_qc3,
         genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
     };
@@ -2308,7 +2308,7 @@ mod tests {
     /// 4 validators, all on the beacon committee, all placed on shard 0.
     fn sample_genesis() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -2352,7 +2352,7 @@ mod tests {
             block,
             vec![state],
             me,
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2429,7 +2429,7 @@ mod tests {
             Arc::clone(&block),
             vec![state],
             ValidatorId::new(0),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2449,7 +2449,7 @@ mod tests {
             block,
             vec![state],
             ValidatorId::new(0),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2485,7 +2485,7 @@ mod tests {
             Arc::new(mismatched_block),
             vec![state],
             ValidatorId::new(0),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             NetworkDefinition::simulator(),
             GenesisConfigHash::ZERO,
             pool,
@@ -2874,7 +2874,7 @@ mod tests {
     /// on the eligibility-window filter; the test-only verified gate
     /// stands in for the proper [`Verify::verify`] admission used in
     /// production.
-    fn simple_shard_witness(shard: ShardGroupId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
+    fn simple_shard_witness(shard: ShardId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
         use hyperscale_types::{
             BlockHash, BoundedVec, LeafIndex, ShardWitnessPayload, ShardWitnessProof,
         };
@@ -2896,7 +2896,7 @@ mod tests {
     fn try_propose_drains_eligible_shard_witnesses_into_witnesses() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
 
         // Header with leaf_count_at_block_end=1; witness at leaf_index=1
         // (the protocol's 1-indexed accumulator — leaf_index 0 is the
@@ -2929,7 +2929,7 @@ mod tests {
         use hyperscale_types::MAX_SHARD_WITNESSES_PER_PROPOSER;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
 
         // Header announces `MAX + 5` accumulator leaves at block-end.
         let total = MAX_SHARD_WITNESSES_PER_PROPOSER + 5;
@@ -3627,7 +3627,7 @@ mod tests {
     /// `beacon_witness_root`. `total_leaves` controls the accumulator
     /// size; `leaf_index` picks which slot belongs to our witness.
     fn make_verifiable_witness_and_header(
-        shard: ShardGroupId,
+        shard: ShardId,
         height: u64,
         leaf_index: u64,
         total_leaves: u64,
@@ -3706,9 +3706,9 @@ mod tests {
     /// is picked up on later headers as `consumed_through` advances.
     #[test]
     fn on_verified_remote_header_caps_leaf_fetch_window() {
-        use hyperscale_types::{MAX_WITNESSES_PER_FETCH, ShardGroupId};
+        use hyperscale_types::{MAX_WITNESSES_PER_FETCH, ShardId};
         let mut coord = fresh_coord();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
 
         // Watermark is 0 (nothing consumed); the header announces a gap
         // far larger than the fetch window.
@@ -3737,9 +3737,9 @@ mod tests {
 
     #[test]
     fn on_shard_witnesses_received_admits_valid_witness() {
-        use hyperscale_types::ShardGroupId;
+        use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .witness_fetcher
@@ -3752,10 +3752,10 @@ mod tests {
 
     #[test]
     fn on_shard_witnesses_received_drops_mismatched_shard_id() {
-        use hyperscale_types::ShardGroupId;
+        use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
-        let shard = ShardGroupId::leaf(1, 0);
-        let other = ShardGroupId::leaf(1, 1);
+        let shard = ShardId::leaf(1, 0);
+        let other = ShardId::leaf(1, 1);
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .witness_fetcher
@@ -3769,9 +3769,9 @@ mod tests {
 
     #[test]
     fn on_shard_witnesses_received_drops_unknown_committed_block() {
-        use hyperscale_types::ShardGroupId;
+        use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         // Build a witness pointing at a block hash that no header
         // record exists for (we never call on_verified_remote_header).
         let (witness, _header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
@@ -3783,9 +3783,9 @@ mod tests {
 
     #[test]
     fn on_shard_witnesses_received_drops_bad_merkle_proof() {
-        use hyperscale_types::{LeafIndex, ShardGroupId};
+        use hyperscale_types::{LeafIndex, ShardId};
         let mut coord = fresh_coord();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .witness_fetcher
@@ -3806,10 +3806,10 @@ mod tests {
 
     #[test]
     fn on_shard_witnesses_received_off_committee_drops_all() {
-        use hyperscale_types::ShardGroupId;
+        use hyperscale_types::ShardId;
         // Validator 99 isn't on the committee.
         let mut observer = new_coord(ValidatorId::new(99));
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
         observer
             .witness_fetcher
@@ -3827,7 +3827,7 @@ mod tests {
         let snap = coord.current_topology_snapshot();
         // 4 validators all on shard 0.
         assert_eq!(snap.num_shards(), 1);
-        assert_eq!(snap.committee_for_shard(ShardGroupId::leaf(1, 0)).len(), 4);
+        assert_eq!(snap.committee_for_shard(ShardId::leaf(1, 0)).len(), 4);
     }
 
     // ─── topology schedule + resolver ────────────────────────────────────
@@ -3842,9 +3842,9 @@ mod tests {
             members: (0..size).map(ValidatorId::new).collect(),
         };
         s.shard_committees
-            .insert(ShardGroupId::leaf(1, 0), committee.clone());
+            .insert(ShardId::leaf(1, 0), committee.clone());
         s.next_shard_committees
-            .insert(ShardGroupId::leaf(1, 0), committee);
+            .insert(ShardId::leaf(1, 0), committee);
         s
     }
 
@@ -3859,7 +3859,7 @@ mod tests {
             block,
             history,
             ValidatorId::new(0),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             NetworkDefinition::simulator(),
             config_hash,
             Arc::new(BeaconProposalPool::new(next_epoch)),
@@ -3874,7 +3874,7 @@ mod tests {
     fn topology_schedule_resolves_active_lookahead_and_none_beyond() {
         let coord = coord_from_history(vec![state_at(1, 4), state_at(2, 3), state_at(3, 2)]);
         let ed = coord.current_state().chain_config.epoch_duration_ms;
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         let len_at = |window: u64| {
             coord
                 .topology_schedule()

@@ -8,7 +8,7 @@ use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{NodeId, ShardGroupId, shard_for_node};
+use hyperscale_types::{NodeId, ShardId, shard_for_node};
 use tracing::warn;
 
 /// Serve an inbound provision request from a target shard needing our state.
@@ -28,7 +28,7 @@ use tracing::warn;
 /// to avoid topology dependency in the I/O layer.
 pub fn serve_provision_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     num_shards: u64,
     req: &GetProvisionsRequest,
 ) -> GetProvisionResponse {

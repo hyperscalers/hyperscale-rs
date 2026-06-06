@@ -10,13 +10,13 @@ use std::collections::BTreeSet;
 
 use blake3::hash as blake3_hash;
 
-use crate::{NodeId, ShardGroupId};
+use crate::{NodeId, ShardId};
 
 /// The set of live shards, forming a complete partition of the keyspace: every
 /// infinite bit path from the root passes through exactly one leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardTrie {
-    leaves: BTreeSet<ShardGroupId>,
+    leaves: BTreeSet<ShardId>,
 }
 
 impl ShardTrie {
@@ -24,7 +24,7 @@ impl ShardTrie {
     #[must_use]
     pub fn single() -> Self {
         Self {
-            leaves: BTreeSet::from([ShardGroupId::ROOT]),
+            leaves: BTreeSet::from([ShardId::ROOT]),
         }
     }
 
@@ -33,7 +33,7 @@ impl ShardTrie {
     pub fn uniform(depth: u32) -> Self {
         let count = 1u64 << depth;
         Self {
-            leaves: (0..count).map(|p| ShardGroupId::leaf(depth, p)).collect(),
+            leaves: (0..count).map(|p| ShardId::leaf(depth, p)).collect(),
         }
     }
 
@@ -55,7 +55,7 @@ impl ShardTrie {
     /// Build a trie directly from a leaf set. The caller asserts the leaves
     /// form a complete partition.
     #[must_use]
-    pub fn from_leaves(leaves: impl IntoIterator<Item = ShardGroupId>) -> Self {
+    pub fn from_leaves(leaves: impl IntoIterator<Item = ShardId>) -> Self {
         Self {
             leaves: leaves.into_iter().collect(),
         }
@@ -67,14 +67,14 @@ impl ShardTrie {
     /// Panics if the trie is not a complete partition (a hash path descends
     /// past `depth 63` without hitting a leaf).
     #[must_use]
-    pub fn shard_for(&self, node_id: &NodeId) -> ShardGroupId {
+    pub fn shard_for(&self, node_id: &NodeId) -> ShardId {
         let hash = blake3_hash(&node_id.0);
         let bits = u64::from_be_bytes(
             hash.as_bytes()[..8]
                 .try_into()
                 .expect("blake3 output is 32 bytes"),
         );
-        let mut id = ShardGroupId::ROOT;
+        let mut id = ShardId::ROOT;
         loop {
             if self.leaves.contains(&id) {
                 return id;
@@ -89,7 +89,7 @@ impl ShardTrie {
 
     /// The live shards, in heap-index order.
     #[must_use]
-    pub fn leaves(&self) -> impl ExactSizeIterator<Item = ShardGroupId> + '_ {
+    pub fn leaves(&self) -> impl ExactSizeIterator<Item = ShardId> + '_ {
         self.leaves.iter().copied()
     }
 
@@ -107,7 +107,7 @@ impl ShardTrie {
 
     /// Whether `shard` is a live leaf.
     #[must_use]
-    pub fn contains(&self, shard: ShardGroupId) -> bool {
+    pub fn contains(&self, shard: ShardId) -> bool {
         self.leaves.contains(&shard)
     }
 
@@ -115,7 +115,7 @@ impl ShardTrie {
     ///
     /// # Panics
     /// Panics if `shard` is not a live leaf.
-    pub fn split(&mut self, shard: ShardGroupId) -> (ShardGroupId, ShardGroupId) {
+    pub fn split(&mut self, shard: ShardId) -> (ShardId, ShardId) {
         assert!(self.leaves.remove(&shard), "split of non-leaf {shard:?}");
         let (left, right) = shard.children();
         self.leaves.insert(left);
@@ -127,7 +127,7 @@ impl ShardTrie {
     ///
     /// # Panics
     /// Panics if the two shards are not live sibling leaves.
-    pub fn merge(&mut self, left: ShardGroupId, right: ShardGroupId) -> ShardGroupId {
+    pub fn merge(&mut self, left: ShardId, right: ShardId) -> ShardId {
         assert_eq!(
             left.sibling(),
             Some(right),
@@ -149,8 +149,8 @@ mod tests {
     fn single_routes_everything_to_root() {
         let trie = ShardTrie::single();
         assert_eq!(trie.len(), 1);
-        assert_eq!(trie.shard_for(&NodeId([1; 30])), ShardGroupId::ROOT);
-        assert_eq!(trie.shard_for(&NodeId([0xff; 30])), ShardGroupId::ROOT);
+        assert_eq!(trie.shard_for(&NodeId([1; 30])), ShardId::ROOT);
+        assert_eq!(trie.shard_for(&NodeId([0xff; 30])), ShardId::ROOT);
     }
 
     #[test]
@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn split_then_merge_round_trips() {
         let mut trie = ShardTrie::single();
-        let (l, r) = trie.split(ShardGroupId::ROOT);
+        let (l, r) = trie.split(ShardId::ROOT);
         assert_eq!(trie.len(), 2);
         assert!(trie.contains(l) && trie.contains(r));
         let parent = trie.merge(l, r);
-        assert_eq!(parent, ShardGroupId::ROOT);
+        assert_eq!(parent, ShardId::ROOT);
         assert_eq!(trie, ShardTrie::single());
     }
 
@@ -198,12 +198,12 @@ mod tests {
         // 1 shard → split the root → 2 → split one child → 3 leaves at mixed
         // depths: a non-power-of-two partition reached by surgical splits.
         let mut trie = ShardTrie::single();
-        let (left, right) = trie.split(ShardGroupId::ROOT);
+        let (left, right) = trie.split(ShardId::ROOT);
         let (left0, left1) = trie.split(left);
         assert_eq!(trie.len(), 3);
-        assert_eq!(right, ShardGroupId::leaf(1, 1));
-        assert_eq!(left0, ShardGroupId::leaf(2, 0));
-        assert_eq!(left1, ShardGroupId::leaf(2, 1));
+        assert_eq!(right, ShardId::leaf(1, 1));
+        assert_eq!(left0, ShardId::leaf(2, 0));
+        assert_eq!(left1, ShardId::leaf(2, 1));
 
         // Every node resolves to exactly one leaf by its hash's longest
         // matching prefix: top bit 1 → the depth-1 leaf; top bit 0 → the
@@ -212,15 +212,15 @@ mod tests {
             let node = NodeId([seed; 30]);
             let bits = u64::from_be_bytes(blake3_hash(&node.0).as_bytes()[..8].try_into().unwrap());
             let expected = if (bits >> 63) & 1 == 1 {
-                ShardGroupId::leaf(1, 1)
+                ShardId::leaf(1, 1)
             } else {
-                ShardGroupId::leaf(2, (bits >> 62) & 1)
+                ShardId::leaf(2, (bits >> 62) & 1)
             };
             assert_eq!(trie.shard_for(&node), expected, "seed {seed}");
         }
 
         // Merging the two depth-2 leaves restores the 2-shard partition.
-        assert_eq!(trie.merge(left0, left1), ShardGroupId::leaf(1, 0));
+        assert_eq!(trie.merge(left0, left1), ShardId::leaf(1, 0));
         assert_eq!(trie.len(), 2);
     }
 }

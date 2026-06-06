@@ -21,7 +21,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, NetworkDefinition, ShardGroupId, ValidatorId, generate_bls_keypair,
+    Bls12381G1PrivateKey, NetworkDefinition, ShardId, ValidatorId, generate_bls_keypair,
 };
 use libp2p::identity::Keypair;
 use serial_test::serial;
@@ -63,7 +63,7 @@ async fn test_network_adapter_starts() {
 
     let keypair = Keypair::generate_ed25519();
     let validator_id = ValidatorId::new(0);
-    let shard = ShardGroupId::ROOT;
+    let shard = ShardId::ROOT;
 
     // Use port 0 for OS-assigned port
     let config = Libp2pConfig {
@@ -113,7 +113,7 @@ async fn test_two_node_connection() {
         NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(0), bind_sig1)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo1,
     )
@@ -139,7 +139,7 @@ async fn test_two_node_connection() {
         NetworkDefinition::simulator(),
         keypair2,
         vec![(ValidatorId::new(1), bind_sig2)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo2,
     )
@@ -190,7 +190,7 @@ async fn test_topic_subscription() {
         NetworkDefinition::simulator(),
         keypair,
         vec![(ValidatorId::new(0), bind_sig)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo,
     )
@@ -228,7 +228,7 @@ async fn test_validator_bind_success() {
         NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -252,7 +252,7 @@ async fn test_validator_bind_success() {
         NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -305,7 +305,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -331,7 +331,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), wrong_signing_key)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -384,7 +384,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -408,7 +408,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
-        HashSet::from([ShardGroupId::ROOT]),
+        HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         fixtures.validator_key_map(),
     )
@@ -478,12 +478,12 @@ async fn test_production_runner_with_network() {
     let runner = ProductionRunner::builder(
         vec![VnodeConfig {
             validator_id: ValidatorId::new(0),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(0),
         }],
         fixtures.topology(),
         ShardConsensusConfig::default(),
-        HashMap::from([(ShardGroupId::ROOT, storage)]),
+        HashMap::from([(ShardId::ROOT, storage)]),
         beacon_storage,
         network_config,
     )
@@ -545,12 +545,12 @@ async fn test_graceful_shutdown() {
     let mut runner = ProductionRunner::builder(
         vec![VnodeConfig {
             validator_id: ValidatorId::new(0),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(0),
         }],
         fixtures.topology(),
         ShardConsensusConfig::default(),
-        HashMap::from([(ShardGroupId::ROOT, storage)]),
+        HashMap::from([(ShardId::ROOT, storage)]),
         beacon_storage,
         network_config,
     )
@@ -614,12 +614,12 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
     let host0_vnodes = vec![
         VnodeConfig {
             validator_id: ValidatorId::new(0),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(0),
         },
         VnodeConfig {
             validator_id: ValidatorId::new(1),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(1),
         },
     ];
@@ -629,7 +629,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
         host0_vnodes,
         fixtures.topology(),
         ShardConsensusConfig::default(),
-        HashMap::from([(ShardGroupId::ROOT, storage0)]),
+        HashMap::from([(ShardId::ROOT, storage0)]),
         beacon_storage0,
         network_config0,
     )
@@ -657,12 +657,12 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
     let host1_vnodes = vec![
         VnodeConfig {
             validator_id: ValidatorId::new(2),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(2),
         },
         VnodeConfig {
             validator_id: ValidatorId::new(3),
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             signing_key: fixtures.signing_key(3),
         },
     ];
@@ -672,7 +672,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
         host1_vnodes,
         fixtures.topology(),
         ShardConsensusConfig::default(),
-        HashMap::from([(ShardGroupId::ROOT, storage1)]),
+        HashMap::from([(ShardId::ROOT, storage1)]),
         beacon_storage1,
         network_config1,
     )
@@ -772,12 +772,12 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
     let host0_vnodes = vec![
         VnodeConfig {
             validator_id: ValidatorId::new(0),
-            local_shard: ShardGroupId::leaf(1, 0),
+            local_shard: ShardId::leaf(1, 0),
             signing_key: fixtures.signing_key(0),
         },
         VnodeConfig {
             validator_id: ValidatorId::new(2),
-            local_shard: ShardGroupId::leaf(1, 1),
+            local_shard: ShardId::leaf(1, 1),
             signing_key: fixtures.signing_key(2),
         },
     ];
@@ -788,8 +788,8 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
         fixtures.topology(),
         ShardConsensusConfig::default(),
         HashMap::from([
-            (ShardGroupId::leaf(1, 0), host0_s0),
-            (ShardGroupId::leaf(1, 1), host0_s1),
+            (ShardId::leaf(1, 0), host0_s0),
+            (ShardId::leaf(1, 1), host0_s1),
         ]),
         beacon_storage0,
         network_config0,
@@ -818,12 +818,12 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
     let host1_vnodes = vec![
         VnodeConfig {
             validator_id: ValidatorId::new(1),
-            local_shard: ShardGroupId::leaf(1, 0),
+            local_shard: ShardId::leaf(1, 0),
             signing_key: fixtures.signing_key(1),
         },
         VnodeConfig {
             validator_id: ValidatorId::new(3),
-            local_shard: ShardGroupId::leaf(1, 1),
+            local_shard: ShardId::leaf(1, 1),
             signing_key: fixtures.signing_key(3),
         },
     ];
@@ -834,8 +834,8 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
         fixtures.topology(),
         ShardConsensusConfig::default(),
         HashMap::from([
-            (ShardGroupId::leaf(1, 0), host1_s0),
-            (ShardGroupId::leaf(1, 1), host1_s1),
+            (ShardId::leaf(1, 0), host1_s0),
+            (ShardId::leaf(1, 1), host1_s1),
         ]),
         beacon_storage1,
         network_config1,

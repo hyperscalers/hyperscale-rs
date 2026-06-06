@@ -41,7 +41,7 @@
 
 use sbor::prelude::{BasicDecode, BasicEncode, BasicSbor};
 
-use crate::ShardGroupId;
+use crate::ShardId;
 
 pub mod gossip;
 pub mod notification;
@@ -215,7 +215,7 @@ pub trait GossipMessage: NetworkMessage + Clone {
     /// for [`TopicScope::Shard`] messages where the topic already pins
     /// the shard.
     #[must_use]
-    fn source_shard(&self) -> Option<ShardGroupId> {
+    fn source_shard(&self) -> Option<ShardId> {
         let _ = self;
         None
     }

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, ShardGroupId,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, ShardId,
     TopologySnapshot, ValidatorId, Verified, VotePower,
 };
 use tracing::{info, trace, warn};
@@ -181,7 +181,7 @@ impl VoteKeeper {
         &mut self,
         topology: &TopologySnapshot,
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         vote: Verified<BlockVote>,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
@@ -223,7 +223,7 @@ impl VoteKeeper {
         &mut self,
         topology: &TopologySnapshot,
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         vote: BlockVote,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
@@ -272,7 +272,7 @@ impl VoteKeeper {
     /// non-committee voter, missing public key).
     fn preflight(
         topology: &TopologySnapshot,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         vote: &BlockVote,
         committed_height: BlockHeight,
     ) -> Option<VotePreflight> {
@@ -348,7 +348,7 @@ impl VoteKeeper {
     pub fn maybe_trigger_verification(
         &mut self,
         topology: &TopologySnapshot,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         block_hash: BlockHash,
     ) -> Vec<Action> {
         let total_power = topology.voting_power_for_shard(local_shard);
@@ -384,7 +384,7 @@ impl VoteKeeper {
 
         vec![Action::VerifyAndBuildQuorumCertificate {
             block_hash,
-            shard_group_id: local_shard,
+            shard_id: local_shard,
             height,
             round,
             parent_block_hash,
@@ -524,7 +524,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
+        QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
         ValidatorSet, generate_bls_keypair,
     };
 
@@ -532,10 +532,10 @@ mod tests {
 
     fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             round,
@@ -722,7 +722,7 @@ mod tests {
             &NetworkDefinition::simulator(),
             BlockHash::from_raw(Hash::from_bytes(&height.inner().to_le_bytes())),
             BlockHash::ZERO,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             Round::INITIAL,
             ValidatorId::new(u64::try_from(voter).unwrap_or(u64::MAX)),
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn far_future_vote_height_creates_no_vote_set() {
         let (keys, topo) = keys_and_topology(4);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let me = ValidatorId::new(0);
         let committed = BlockHeight::new(10);
         let mut vk = VoteKeeper::new();

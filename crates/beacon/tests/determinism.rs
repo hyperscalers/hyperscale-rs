@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Bls12381G1PublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardGroupId, Stake, StakePool,
-    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 const V: usize = 3;
@@ -39,8 +39,8 @@ fn pubkey(seed: u64) -> Bls12381G1PublicKey {
 /// has refill stock.
 fn initial_state() -> BeaconState {
     let pool_id = StakePoolId::new(0);
-    let shard_0 = ShardGroupId::leaf(1, 0);
-    let shard_1 = ShardGroupId::leaf(1, 1);
+    let shard_0 = ShardId::leaf(1, 0);
+    let shard_1 = ShardId::leaf(1, 1);
 
     let mut validators = BTreeMap::new();
     let mut pool_validators = BTreeSet::new();
@@ -169,9 +169,8 @@ fn lookahead_committee_promotes_unchanged_to_active() {
     let mut state = initial_state();
 
     let last = SHUFFLE_INTERVAL_EPOCHS + 1;
-    let mut lookahead_after: BTreeMap<u64, BTreeMap<ShardGroupId, ShardCommittee>> =
-        BTreeMap::new();
-    let mut active_after: BTreeMap<u64, BTreeMap<ShardGroupId, ShardCommittee>> = BTreeMap::new();
+    let mut lookahead_after: BTreeMap<u64, BTreeMap<ShardId, ShardCommittee>> = BTreeMap::new();
+    let mut active_after: BTreeMap<u64, BTreeMap<ShardId, ShardCommittee>> = BTreeMap::new();
 
     for e in 1..=last {
         apply_epoch(

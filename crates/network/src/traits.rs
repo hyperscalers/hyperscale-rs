@@ -14,7 +14,7 @@ use std::sync::Arc;
 // `hyperscale_types`.
 pub use hyperscale_types::TopicScope;
 use hyperscale_types::{
-    Bls12381G1PublicKey, GossipMessage, MessageClass, NetworkMessage, Request, ShardGroupId,
+    Bls12381G1PublicKey, GossipMessage, MessageClass, NetworkMessage, Request, ShardId,
     TopologySnapshot, ValidatorId,
 };
 
@@ -101,17 +101,17 @@ pub enum ResponseVerdict {
 pub trait GossipHandler<M: GossipMessage>: Send + Sync + 'static {
     /// Process a decoded gossip message for `shard`; return whether to
     /// forward it.
-    fn on_message(&self, message: M, shard: ShardGroupId) -> GossipVerdict;
+    fn on_message(&self, message: M, shard: ShardId) -> GossipVerdict;
 }
 
-/// Blanket impl: any `Fn(M, ShardGroupId) -> GossipVerdict` can serve as
+/// Blanket impl: any `Fn(M, ShardId) -> GossipVerdict` can serve as
 /// a typed gossip handler.
 impl<M, F> GossipHandler<M> for F
 where
     M: GossipMessage,
-    F: Fn(M, ShardGroupId) -> GossipVerdict + Send + Sync + 'static,
+    F: Fn(M, ShardId) -> GossipVerdict + Send + Sync + 'static,
 {
-    fn on_message(&self, message: M, shard: ShardGroupId) -> GossipVerdict {
+    fn on_message(&self, message: M, shard: ShardId) -> GossipVerdict {
         (self)(message, shard)
     }
 }
@@ -160,7 +160,7 @@ pub trait Network: Send + Sync + 'static {
     // ── Pub/sub messaging ──
 
     /// Broadcast a shard-scoped message to all peers subscribed to that shard's topic.
-    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardGroupId, message: &M);
+    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M);
 
     /// Broadcast a message to all connected peers globally.
     fn broadcast_global<M: GossipMessage + 'static>(&self, message: &M);
@@ -194,7 +194,7 @@ pub trait Network: Send + Sync + 'static {
     /// bypass libp2p and preserve `Arc`-shared payloads on the response.
     fn register_request_handler<R: Request + Send + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         handler: impl RequestHandler<R>,
     ) where
         R::Response: Send + 'static;
@@ -258,7 +258,7 @@ pub trait Network: Send + Sync + 'static {
     /// pending-block fetches from sync / DA-backfill fetches.
     fn request<R: Request + Clone + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,
@@ -292,11 +292,11 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg, _shard: ShardGroupId| -> GossipVerdict {
+        let handler = move |_msg: TestMsg, _shard: ShardId| -> GossipVerdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             GossipVerdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42), ShardGroupId::ROOT);
+        let verdict = handler.on_message(TestMsg(42), ShardId::ROOT);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
     }

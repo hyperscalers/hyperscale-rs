@@ -19,8 +19,8 @@ use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ElidedCertifiedBlock, Epoch,
-    HeaderFetchCount, LeafIndex, ProvisionHash, RoutableTransaction, ShardGroupId, TxHash,
-    ValidatorId, Verifiable, Verified, WaveId,
+    HeaderFetchCount, LeafIndex, ProvisionHash, RoutableTransaction, ShardId, TxHash, ValidatorId,
+    Verifiable, Verified, WaveId,
 };
 
 use crate::shard_io::block_commit::QcOnlyDivergence;
@@ -146,7 +146,7 @@ pub enum ShardScopedInput {
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each — even non-hosted ones — over the destination
         /// shard's topic.
-        touched_shards: Vec<ShardGroupId>,
+        touched_shards: Vec<ShardId>,
     },
 
     /// Locally-submitted tx whose touched shards are all non-hosted on
@@ -158,7 +158,7 @@ pub enum ShardScopedInput {
         tx: Arc<RoutableTransaction>,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each over the destination shard's topic.
-        touched_shards: Vec<ShardGroupId>,
+        touched_shards: Vec<ShardId>,
     },
 
     /// Sync block response received from network callback. Carries the
@@ -225,7 +225,7 @@ pub enum ShardScopedInput {
     /// heights (responder short-capped) get re-deferred by the FSM.
     RemoteHeadersResponseReceived {
         /// Source shard the fetch targeted.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// First height of the requested range.
         from_height: BlockHeight,
         /// Number of heights the request covered.
@@ -237,7 +237,7 @@ pub enum ShardScopedInput {
     /// Remote-header range fetch failed (transport error / no peer).
     RemoteHeadersFetchFailed {
         /// Source shard the fetch targeted.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// First height of the requested range.
         from_height: BlockHeight,
         /// Number of heights the request covered.
@@ -303,7 +303,7 @@ pub enum ShardScopedInput {
     /// shard whose provisions were being fetched.
     ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Source-shard block height the provisions were anchored to.
         block_height: BlockHeight,
     },
@@ -319,7 +319,7 @@ pub enum ShardScopedInput {
     /// in-flight leaves can fail independently.
     ShardWitnessesFetchFailed {
         /// Per-leaf identities that failed to fetch.
-        ids: Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)>,
+        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
     },
 
     /// A beacon-proposal fetch failed (network error, or the peer
@@ -468,10 +468,10 @@ impl ProcessScopedInput {
 /// variant has no tag because it isn't anchored to one shard.
 #[derive(Debug, Clone)]
 pub enum ShardEvent {
-    /// Routed to the hosted shard identified by [`ShardGroupId`]. Fans
+    /// Routed to the hosted shard identified by [`ShardId`]. Fans
     /// to every vnode in that shard for state-machine events; handled
     /// once for shard-scoped pipeline fixups.
-    Shard(ShardGroupId, ShardScopedInput),
+    Shard(ShardId, ShardScopedInput),
     /// Process-scoped — not anchored to a single shard.
     Process(ProcessScopedInput),
 }
@@ -479,7 +479,7 @@ pub enum ShardEvent {
 impl ShardEvent {
     /// Construct a shard-scoped envelope.
     #[must_use]
-    pub const fn shard(shard: ShardGroupId, input: ShardScopedInput) -> Self {
+    pub const fn shard(shard: ShardId, input: ShardScopedInput) -> Self {
         Self::Shard(shard, input)
     }
 
@@ -491,7 +491,7 @@ impl ShardEvent {
 
     /// Construct a shard-scoped `Protocol` envelope for `event`.
     #[must_use]
-    pub fn protocol(shard: ShardGroupId, event: ProtocolEvent) -> Self {
+    pub fn protocol(shard: ShardId, event: ProtocolEvent) -> Self {
         Self::Shard(shard, ShardScopedInput::Protocol(Box::new(event)))
     }
 

@@ -9,12 +9,10 @@ use std::sync::Arc;
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_types::{
-    BlockHeight, Hash, ShardGroupId, TopologySchedule, TxHash, ValidatorId, WaveId,
-};
+use hyperscale_types::{BlockHeight, Hash, ShardId, TopologySchedule, TxHash, ValidatorId, WaveId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
-    ExecutionCoordinator::new(ValidatorId::new(0), ShardGroupId::ROOT)
+    ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT)
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {
@@ -100,7 +98,7 @@ fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
 fn fresh_get_finalized_wave_returns_none_for_any_id() {
     let coord = fresh_coordinator();
     let wid = WaveId::new(
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         BlockHeight::new(1),
         std::collections::BTreeSet::new(),
     );
@@ -149,12 +147,12 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
 #[test]
 fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shard() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
-    let local_shard = ShardGroupId::ROOT;
+    let local_shard = ShardId::ROOT;
     let _ = &topology;
     // A remote shard's wave that targets our local shard must register an
     // expectation. With committed_ts still ZERO the initial-deadline
     // gate is silenced, but the expectation count must reflect the header.
-    let remote_shard = ShardGroupId::leaf(8, 99);
+    let remote_shard = ShardId::leaf(8, 99);
     let wave = WaveId::new(
         remote_shard,
         BlockHeight::new(5),
@@ -172,14 +170,14 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
 #[test]
 fn on_verified_remote_header_ignores_waves_not_targeting_local_shard() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    // Wave targets ShardGroupId::leaf(3, 7) only; local is ShardGroupId::ROOT. No
+    // Wave targets ShardId::leaf(3, 7) only; local is ShardId::ROOT. No
     // expectation should land.
     let wave = WaveId::new(
-        ShardGroupId::leaf(8, 99),
+        ShardId::leaf(8, 99),
         BlockHeight::new(5),
-        std::iter::once(ShardGroupId::leaf(3, 7)).collect(),
+        std::iter::once(ShardId::leaf(3, 7)).collect(),
     );
-    coord.on_verified_remote_header(ShardGroupId::leaf(8, 99), BlockHeight::new(5), &[wave]);
+    coord.on_verified_remote_header(ShardId::leaf(8, 99), BlockHeight::new(5), &[wave]);
 
     assert_eq!(
         coord.memory_stats().expected_exec_certs,

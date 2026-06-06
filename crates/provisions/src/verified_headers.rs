@@ -22,10 +22,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardGroupId, Verified};
+use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardId, Verified};
 use papaya::HashMap;
 
-type Key = (ShardGroupId, BlockHeight);
+type Key = (ShardId, BlockHeight);
 
 /// Map of `(shard, height) → verified remote header`. Concurrent-safe so
 /// it can be `Arc`-shared between the provisions coordinator (writer) and
@@ -84,15 +84,12 @@ mod tests {
 
     use super::*;
 
-    fn make_header(
-        shard: ShardGroupId,
-        height: BlockHeight,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    fn make_header(shard: ShardId, height: BlockHeight) -> Arc<Verified<CertifiedBlockHeader>> {
         let header = BlockHeader::new(
             shard,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -129,7 +126,7 @@ mod tests {
         let buf = VerifiedHeaderBuffer::new();
         assert_eq!(buf.len(), 0);
         assert!(
-            buf.get((ShardGroupId::leaf(1, 1), BlockHeight::new(0)))
+            buf.get((ShardId::leaf(1, 1), BlockHeight::new(0)))
                 .is_none()
         );
     }
@@ -137,8 +134,8 @@ mod tests {
     #[test]
     fn insert_and_get_round_trip() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
-        let header = make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let key = (ShardId::leaf(1, 1), BlockHeight::new(10));
+        let header = make_header(ShardId::leaf(1, 1), BlockHeight::new(10));
         buf.insert(key, Arc::clone(&header));
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
@@ -148,26 +145,17 @@ mod tests {
     #[test]
     fn insert_overwrites_existing_key() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
-        buf.insert(
-            key,
-            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
-        );
-        buf.insert(
-            key,
-            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
-        );
+        let key = (ShardId::leaf(1, 1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardId::leaf(1, 1), BlockHeight::new(10)));
+        buf.insert(key, make_header(ShardId::leaf(1, 1), BlockHeight::new(10)));
         assert_eq!(buf.len(), 1);
     }
 
     #[test]
     fn remove_returns_stored_header_and_drops_entry() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
-        buf.insert(
-            key,
-            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
-        );
+        let key = (ShardId::leaf(1, 1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardId::leaf(1, 1), BlockHeight::new(10)));
         assert!(buf.remove(key).is_some());
         assert_eq!(buf.len(), 0);
         assert!(buf.remove(key).is_none());

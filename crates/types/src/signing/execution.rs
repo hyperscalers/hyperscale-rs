@@ -3,8 +3,8 @@
 use blake3::Hasher;
 
 use crate::{
-    ExecutionCertificate, ExecutionVote, GlobalReceiptRoot, NetworkDefinition, ShardGroupId,
-    WaveId, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, GlobalReceiptRoot, NetworkDefinition, ShardId, WaveId,
+    WeightedTimestamp,
 };
 
 /// Domain tag for execution votes.
@@ -20,13 +20,13 @@ pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
 /// Domain tag for execution vote batch gossip.
 ///
-/// Format: `EXEC_VOTE_BATCH` || `network.id` || `shard_group_id` ||
+/// Format: `EXEC_VOTE_BATCH` || `network.id` || `shard_id` ||
 /// `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_VOTE_BATCH: &[u8] = b"EXEC_VOTE_BATCH";
 
 /// Domain tag for execution certificate batch gossip.
 ///
-/// Format: `EXEC_CERT_BATCH` || `network.id` || `shard_group_id` ||
+/// Format: `EXEC_CERT_BATCH` || `network.id` || `shard_id` ||
 /// `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 
@@ -43,7 +43,7 @@ pub fn exec_vote_message(
     network: &NetworkDefinition,
     vote_anchor_ts: WeightedTimestamp,
     wave_id: &WaveId,
-    shard_group: ShardGroupId,
+    shard_group: ShardId,
     global_receipt_root: &GlobalReceiptRoot,
     tx_count: u32,
 ) -> Vec<u8> {
@@ -53,7 +53,7 @@ pub fn exec_vote_message(
     message.extend_from_slice(&vote_anchor_ts.as_millis().to_le_bytes());
     // WaveId is self-contained (shard + block_height + remote_shards),
     // so no separate block_hash needed in the signing message.
-    message.extend_from_slice(&wave_id.shard_group_id().to_le_bytes());
+    message.extend_from_slice(&wave_id.shard_id().to_le_bytes());
     message.extend_from_slice(&wave_id.block_height().to_le_bytes());
     message.extend_from_slice(
         &u32::try_from(wave_id.remote_shards().len())
@@ -73,7 +73,7 @@ pub fn exec_vote_message(
 #[must_use]
 pub fn exec_vote_batch_message<'a, I>(
     network: &NetworkDefinition,
-    shard_group: ShardGroupId,
+    shard_group: ShardId,
     votes: I,
 ) -> Vec<u8>
 where
@@ -97,7 +97,7 @@ where
 #[must_use]
 pub fn exec_cert_batch_message(
     network: &NetworkDefinition,
-    shard_group: ShardGroupId,
+    shard_group: ShardId,
     certificates: &[ExecutionCertificate],
 ) -> Vec<u8> {
     let mut hasher = Hasher::new();

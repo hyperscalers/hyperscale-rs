@@ -53,7 +53,7 @@ impl Display for ValidatorId {
 /// context — and orders by keyspace position (left to right), shallower
 /// ancestors before their descendants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BasicSbor)]
-pub struct ShardGroupId {
+pub struct ShardId {
     /// Trie depth; 0 is the root, at most 63. (Padded to a `u64` boundary by
     /// `path`'s alignment, so `u32` costs nothing over `u8` and avoids casts
     /// at the `leading_zeros`/`trailing_zeros` boundaries.)
@@ -63,7 +63,7 @@ pub struct ShardGroupId {
     path: u64,
 }
 
-impl ShardGroupId {
+impl ShardId {
     /// The root shard: the whole keyspace, depth 0. The sole shard before any
     /// split.
     pub const ROOT: Self = Self { depth: 0, path: 0 };
@@ -174,7 +174,7 @@ impl ShardGroupId {
     }
 }
 
-impl Ord for ShardGroupId {
+impl Ord for ShardId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Keyspace order: by the MSB-aligned path, then shallower (ancestor)
         // before deeper.
@@ -191,13 +191,13 @@ impl Ord for ShardGroupId {
     }
 }
 
-impl PartialOrd for ShardGroupId {
+impl PartialOrd for ShardId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Display for ShardGroupId {
+impl Display for ShardId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Shard(d{}p{})", self.depth, self.path)
     }

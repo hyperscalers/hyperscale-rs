@@ -1,16 +1,16 @@
 //! Domain-separated signing for shard consensus messages.
 
-use crate::{BlockHash, BlockHeight, NetworkDefinition, Round, ShardGroupId};
+use crate::{BlockHash, BlockHeight, NetworkDefinition, Round, ShardId};
 
 /// Domain tag for shard consensus block votes.
 ///
-/// Format: `BLOCK_VOTE` || `network.id` || `shard_group_id` || height || round
+/// Format: `BLOCK_VOTE` || `network.id` || `shard_id` || height || round
 /// || `block_hash`
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for block header proposal gossip.
 ///
-/// Format: `BLOCK_HEADER` || `network.id` || `shard_group_id` || height ||
+/// Format: `BLOCK_HEADER` || `network.id` || `shard_id` || height ||
 /// round || `block_hash`
 ///
 /// Signed by the proposer when broadcasting block header proposals.
@@ -20,7 +20,7 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 
 /// Domain tag for committed block header gossip.
 ///
-/// Format: `COMMITTED_BLOCK_HEADER` || `network.id` || `shard_group_id` ||
+/// Format: `COMMITTED_BLOCK_HEADER` || `network.id` || `shard_id` ||
 /// height || `block_hash`
 ///
 /// Signed by the sender (proposer) when broadcasting committed block headers
@@ -29,7 +29,7 @@ pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 
 /// Domain tag for shard consensus timeout messages.
 ///
-/// Format: `TIMEOUT` || `network.id` || `shard_group_id` || round
+/// Format: `TIMEOUT` || `network.id` || `shard_id` || round
 ///
 /// Signed by a validator when its round timer fires. The share covers only
 /// `(shard, round)` — the timeout also carries the signer's `high_qc`, but a
@@ -50,7 +50,7 @@ pub const DOMAIN_TIMEOUT: &[u8] = b"TIMEOUT";
 #[must_use]
 pub fn block_vote_message(
     network: &NetworkDefinition,
-    shard_group: ShardGroupId,
+    shard_group: ShardId,
     height: BlockHeight,
     round: Round,
     block_hash: &BlockHash,
@@ -75,7 +75,7 @@ pub fn block_vote_message(
 #[must_use]
 pub fn block_header_message(
     network: &NetworkDefinition,
-    shard_group: ShardGroupId,
+    shard_group: ShardId,
     height: BlockHeight,
     round: Round,
     block_hash: &BlockHash,
@@ -95,11 +95,7 @@ pub fn block_header_message(
 /// Covers only `(shard, round)`; the carried `high_qc` self-authenticates as a
 /// QC and is verified separately on receipt.
 #[must_use]
-pub fn timeout_message(
-    network: &NetworkDefinition,
-    shard_group: ShardGroupId,
-    round: Round,
-) -> Vec<u8> {
+pub fn timeout_message(network: &NetworkDefinition, shard_group: ShardId, round: Round) -> Vec<u8> {
     let mut message = Vec::with_capacity(DOMAIN_TIMEOUT.len() + 1 + 8 + 8);
     message.extend_from_slice(DOMAIN_TIMEOUT);
     message.push(network.id);
@@ -115,14 +111,14 @@ pub fn timeout_message(
 #[must_use]
 pub fn certified_block_header_message(
     network: &NetworkDefinition,
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     height: BlockHeight,
     block_hash: &BlockHash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(65);
     message.extend_from_slice(DOMAIN_COMMITTED_BLOCK_HEADER);
     message.push(network.id);
-    message.extend_from_slice(&shard_group_id.to_le_bytes());
+    message.extend_from_slice(&shard_id.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
     message
@@ -139,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_block_vote_message_deterministic() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
 
@@ -166,7 +162,7 @@ mod tests {
 
     #[test]
     fn block_vote_message_binds_parent_block_hash() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
         let parent_a = BlockHash::from_raw(Hash::from_bytes(b"parent_a"));
         let parent_b = BlockHash::from_raw(Hash::from_bytes(b"parent_b"));
@@ -195,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_certified_block_header_message_deterministic() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = certified_block_header_message(&net(), shard, BlockHeight::new(10), &block);
@@ -207,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_block_header_message_deterministic() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 =
@@ -221,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_block_header_differs_from_block_vote() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
@@ -242,7 +238,7 @@ mod tests {
 
     #[test]
     fn block_vote_message_differs_across_networks() {
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));

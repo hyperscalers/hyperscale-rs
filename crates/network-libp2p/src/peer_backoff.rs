@@ -25,7 +25,7 @@ pub const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Per-key backoff state. Callers store this in a `DashMap` keyed by
 /// whatever identifies the connection target (`PeerId` for the notify
-/// pool, `(PeerId, ShardGroupId)` for the per-shard request pool) and
+/// pool, `(PeerId, ShardId)` for the per-shard request pool) and
 /// clear the entry on successful reconnect to reset the series.
 pub struct BackoffState {
     pub next_attempt: Instant,

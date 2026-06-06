@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use hyperscale_types::{
     ApplicationEvent, BeaconWitnessRoot, ConsensusReceipt, EventData, EventRoot, ExecutionMetadata,
     FeeSummary, GlobalReceipt, GlobalReceiptHash, Hash, LogLevel, NodeId, RoutableTransaction,
-    ShardGroupId, TxHash, compute_merkle_root,
+    ShardId, TxHash, compute_merkle_root,
 };
 use radix_engine::transaction::{
     CommitResult, TransactionOutcome, TransactionReceipt, TransactionResult,
@@ -204,7 +204,7 @@ pub fn compute_vm_output(
 pub fn project_to_shard(
     cached: &CachedVmOutput,
     tx_hash: TxHash,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     num_shards: u64,
     ownership: &HashMap<NodeId, NodeId>,
 ) -> ExecutedTx {
@@ -250,7 +250,7 @@ pub fn build_executed_tx(
     tx: &RoutableTransaction,
     receipt: &TransactionReceipt,
     ownership: &HashMap<NodeId, NodeId>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     num_shards: u64,
 ) -> ExecutedTx {
     let cached = compute_vm_output(tx, receipt, ownership);

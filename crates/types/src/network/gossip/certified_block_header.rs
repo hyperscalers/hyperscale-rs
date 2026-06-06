@@ -7,7 +7,7 @@ use sbor::prelude::BasicSbor;
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
     Bls12381G2Signature, CertifiedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, Verifiable, certified_block_header_message,
+    ShardId, Signed, ValidatorId, Verifiable, certified_block_header_message,
 };
 
 /// Gossips a committed block header globally to all shards.
@@ -40,7 +40,7 @@ impl Signed for CertifiedBlockHeaderGossip {
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         certified_block_header_message(
             network,
-            self.certified_header.header().shard_group_id(),
+            self.certified_header.header().shard_id(),
             self.certified_header.header().height(),
             &self.certified_header.header().hash(),
         )
@@ -60,8 +60,8 @@ impl NetworkMessage for CertifiedBlockHeaderGossip {
 impl GossipMessage for CertifiedBlockHeaderGossip {
     const SCOPE: TopicScope = TopicScope::Global;
 
-    fn source_shard(&self) -> Option<ShardGroupId> {
-        Some(self.certified_header.header().shard_group_id())
+    fn source_shard(&self) -> Option<ShardId> {
+        Some(self.certified_header.header().shard_id())
     }
 
     fn dedup_key(&self) -> Option<u64> {
@@ -98,15 +98,15 @@ mod tests {
     fn test_sbor_roundtrip() {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
-            Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
-            StateRoot, TransactionRoot, ValidatorId, zero_bls_signature,
+            Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId, StateRoot,
+            TransactionRoot, ValidatorId, zero_bls_signature,
         };
 
         let header = BlockHeader::new(
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 1),
             BlockHeight::new(42),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -122,7 +122,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
-        let qc = QuorumCertificate::genesis(ShardGroupId::leaf(1, 0));
+        let qc = QuorumCertificate::genesis(ShardId::leaf(1, 0));
 
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),

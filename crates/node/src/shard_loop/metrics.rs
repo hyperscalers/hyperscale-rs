@@ -30,7 +30,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::{ShardGroupId, ValidatorId};
+use hyperscale_types::{ShardId, ValidatorId};
 
 use crate::host::NodeHost;
 
@@ -59,7 +59,7 @@ pub struct VnodeMetrics {
     /// Shard this vnode participates in. Carried alongside the consensus
     /// counts so [`record_metrics`] can label the per-vnode gauges with
     /// both `shard` and `validator_id`.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     pub shard_round: u64,
     pub view_changes: u64,
     pub view_syncs: u64,
@@ -76,7 +76,7 @@ pub struct VnodeMetrics {
 /// representative shard + vnode (see [`Self::primary`]).
 pub struct MetricsSnapshot {
     /// Per-hosted-shard infrastructure metrics.
-    pub shards: HashMap<ShardGroupId, ShardMetrics>,
+    pub shards: HashMap<ShardId, ShardMetrics>,
     /// Per-hosted-vnode consensus metrics.
     pub vnodes: HashMap<ValidatorId, VnodeMetrics>,
     /// Flat memory readouts, assembled from primary shard + primary vnode.

@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    NodeId, Provisions, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TopologySnapshot, TxHash,
+    NodeId, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, TopologySnapshot, TxHash,
     Verified, WeightedTimestamp,
 };
 
@@ -49,11 +49,11 @@ pub struct ProvisioningTracker {
 
     /// Remote shards each cross-shard tx needs provisions from. Populated
     /// at wave creation.
-    required: HashMap<TxHash, BTreeSet<ShardGroupId>>,
+    required: HashMap<TxHash, BTreeSet<ShardId>>,
 
     /// Remote shards whose provisions have been received. Populated by
     /// [`absorb_provisions`].
-    received: HashMap<TxHash, BTreeSet<ShardGroupId>>,
+    received: HashMap<TxHash, BTreeSet<ShardId>>,
 
     /// Per-tx retention deadline = the latest `now + RETENTION_HORIZON`
     /// observed at any insert point that touches the tx. Past the
@@ -117,7 +117,7 @@ impl ProvisioningTracker {
 
     /// Record the remote shards `tx_hash` needs provisions from. Overwrites
     /// any previous entry — callers set this once per wave creation.
-    pub fn record_required(&mut self, tx_hash: TxHash, remote_shards: BTreeSet<ShardGroupId>) {
+    pub fn record_required(&mut self, tx_hash: TxHash, remote_shards: BTreeSet<ShardId>) {
         self.required.insert(tx_hash, remote_shards);
         self.stamp_deadline(tx_hash);
     }
@@ -180,7 +180,7 @@ impl ProvisioningTracker {
     pub fn register_tx(
         &mut self,
         tx_hash: TxHash,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         topology: &TopologySnapshot,
         declared_reads: &[NodeId],
         declared_writes: &[NodeId],
@@ -298,12 +298,12 @@ mod tests {
 
     use super::*;
 
-    fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::leaf(2, n)
+    fn shard(n: u64) -> ShardId {
+        ShardId::leaf(2, n)
     }
 
     fn make_provisions(
-        source: ShardGroupId,
+        source: ShardId,
         block_height: BlockHeight,
         tx_hashes: Vec<TxHash>,
     ) -> Verified<Provisions> {
@@ -313,7 +313,7 @@ mod tests {
             .collect();
         Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
             source,
-            ShardGroupId::leaf(2, 0),
+            ShardId::leaf(2, 0),
             block_height,
             MerkleInclusionProof::dummy(),
             transactions,

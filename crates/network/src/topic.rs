@@ -7,20 +7,20 @@
 //!
 //! ```
 //! use hyperscale_network::Topic;
-//! use hyperscale_types::ShardGroupId;
+//! use hyperscale_types::ShardId;
 //!
 //! // Global topic (no shard)
 //! let global = Topic::global("block.header");
 //! assert_eq!(global.to_string(), "hyperscale/block.header/1.0.0");
 //!
 //! // Shard-specific topic
-//! let shard = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(5));
+//! let shard = Topic::shard("transaction.gossip", ShardId::from_heap_index(5));
 //! assert_eq!(shard.to_string(), "hyperscale/transaction.gossip/shard-5/1.0.0");
 //! ```
 
 use std::fmt::{self, Display, Formatter};
 
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 
 /// Protocol version for topic generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +56,7 @@ pub struct Topic {
     /// Message type identifier (e.g., "transaction.gossip", "block.header")
     message_type: &'static str,
     /// Optional shard targeting
-    shard: Option<ShardGroupId>,
+    shard: Option<ShardId>,
     /// Protocol version
     version: ProtocolVersion,
 }
@@ -78,7 +78,7 @@ impl Topic {
     ///
     /// Shard topics only reach validators subscribed to that shard.
     #[must_use]
-    pub const fn shard(message_type: &'static str, shard: ShardGroupId) -> Self {
+    pub const fn shard(message_type: &'static str, shard: ShardId) -> Self {
         Self {
             message_type,
             shard: Some(shard),
@@ -101,7 +101,7 @@ impl Topic {
 
     /// Get the optional shard ID.
     #[must_use]
-    pub const fn shard_id(&self) -> Option<ShardGroupId> {
+    pub const fn shard_id(&self) -> Option<ShardId> {
         self.shard
     }
 
@@ -165,7 +165,7 @@ pub struct ParsedTopic<'a> {
     /// Message type identifier extracted from the topic string.
     pub message_type: &'a str,
     /// Optional shard targeting.
-    pub shard_id: Option<ShardGroupId>,
+    pub shard_id: Option<ShardId>,
 }
 
 /// Parse a gossipsub topic string into its components.
@@ -211,7 +211,7 @@ pub fn parse_topic(topic_str: &str) -> Option<ParsedTopic<'_>> {
             let shard_id = {
                 let id_str = shard_str.strip_prefix("shard-")?;
                 let shard_id: u64 = id_str.parse().ok()?;
-                Some(ShardGroupId::from_heap_index(shard_id))
+                Some(ShardId::from_heap_index(shard_id))
             };
 
             if !validate_version(parts[3]) {
@@ -250,11 +250,11 @@ mod tests {
 
     #[test]
     fn test_shard_topic() {
-        let topic = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(5));
+        let topic = Topic::shard("transaction.gossip", ShardId::from_heap_index(5));
         assert_eq!(topic.message_type(), "transaction.gossip");
         assert!(!topic.is_global());
         assert!(topic.is_shard());
-        assert_eq!(topic.shard_id(), Some(ShardGroupId::from_heap_index(5)));
+        assert_eq!(topic.shard_id(), Some(ShardId::from_heap_index(5)));
         assert_eq!(
             topic.to_string(),
             "hyperscale/transaction.gossip/shard-5/1.0.0"
@@ -272,7 +272,7 @@ mod tests {
     fn test_parse_shard_topic() {
         let parsed = parse_topic("hyperscale/transaction.gossip/shard-3/1.0.0").unwrap();
         assert_eq!(parsed.message_type, "transaction.gossip");
-        assert_eq!(parsed.shard_id, Some(ShardGroupId::from_heap_index(3)));
+        assert_eq!(parsed.shard_id, Some(ShardId::from_heap_index(3)));
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(parsed.message_type, original.message_type());
         assert_eq!(parsed.shard_id, original.shard_id());
 
-        let original = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(42));
+        let original = Topic::shard("transaction.gossip", ShardId::from_heap_index(42));
         let string = original.to_string();
         let parsed = parse_topic(&string).unwrap();
         assert_eq!(parsed.message_type, original.message_type());

@@ -12,7 +12,7 @@ use hyperscale_spammer::config::SpammerConfig;
 use hyperscale_spammer::genesis::{generate_genesis_toml, generate_genesis_toml_for_shard};
 use hyperscale_spammer::runner::Spammer;
 use hyperscale_spammer::workloads::TransferWorkload;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::ShardId;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -421,7 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tx = workload
                 .generate_for_shard(
                     &accounts,
-                    ShardGroupId::leaf(num_shards.trailing_zeros(), target_shard as u64),
+                    ShardId::leaf(num_shards.trailing_zeros(), target_shard as u64),
                     &mut rng,
                 )
                 .expect("Failed to generate transaction for shard 0");

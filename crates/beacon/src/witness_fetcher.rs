@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlockHeader, LeafIndex, ShardGroupId,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlockHeader, LeafIndex, ShardId,
     ShardWitness, Verified, WeightedTimestamp,
 };
 
@@ -39,11 +39,10 @@ use hyperscale_types::{
 ///   Empty when off-committee.
 #[derive(Debug, Default)]
 pub struct ShardWitnessFetchTracker {
-    shard_headers:
-        BTreeMap<ShardGroupId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
-    pool: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>>,
-    pending_in_proposal: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
-    pending_fetches: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, (BlockHeight, BlockHash)>>,
+    shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
+    pool: BTreeMap<ShardId, BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>>,
+    pending_in_proposal: BTreeMap<ShardId, BTreeSet<LeafIndex>>,
+    pending_fetches: BTreeMap<ShardId, BTreeMap<LeafIndex, (BlockHeight, BlockHash)>>,
 }
 
 impl ShardWitnessFetchTracker {
@@ -61,7 +60,7 @@ impl ShardWitnessFetchTracker {
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
     ) {
         let header = certified_header.header();
-        let shard = header.shard_group_id();
+        let shard = header.shard_id();
         let height = header.height();
         self.shard_headers
             .entry(shard)
@@ -87,7 +86,7 @@ impl ShardWitnessFetchTracker {
     /// surface the exact id tuple for `FetchAbandon::ShardWitnesses`.
     pub fn register_pending_fetch(
         &mut self,
-        shard: ShardGroupId,
+        shard: ShardId,
         leaf_index: LeafIndex,
         anchor_height: BlockHeight,
         anchor_hash: BlockHash,
@@ -123,7 +122,7 @@ impl ShardWitnessFetchTracker {
     pub fn drain_for_proposal(
         &mut self,
         epoch_end_wt: WeightedTimestamp,
-        consumed_through: &BTreeMap<ShardGroupId, LeafIndex>,
+        consumed_through: &BTreeMap<ShardId, LeafIndex>,
     ) -> Vec<Arc<Verified<ShardWitness>>> {
         let mut out = Vec::new();
         for (shard, headers) in &self.shard_headers {
@@ -168,9 +167,9 @@ impl ShardWitnessFetchTracker {
     /// at-or-below the new watermark.
     pub fn notify_consumed_advanced(
         &mut self,
-        shard: ShardGroupId,
+        shard: ShardId,
         new_watermark: LeafIndex,
-    ) -> Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)> {
+    ) -> Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)> {
         let cutoff = LeafIndex::new(new_watermark.inner().saturating_add(1));
         if let Some(pool_for_shard) = self.pool.get_mut(&shard) {
             let above = pool_for_shard.split_off(&cutoff);
@@ -209,7 +208,7 @@ impl ShardWitnessFetchTracker {
     /// after `apply_epoch` advances `consumed_through`. Covers every
     /// shard with stored headers, including any not yet present in
     /// `consumed_through` (treated as watermark 0).
-    pub fn prune_stale_headers(&mut self, consumed_through: &BTreeMap<ShardGroupId, LeafIndex>) {
+    pub fn prune_stale_headers(&mut self, consumed_through: &BTreeMap<ShardId, LeafIndex>) {
         for (shard, headers) in &mut self.shard_headers {
             let Some(&latest_height) = headers.keys().next_back() else {
                 continue;
@@ -234,7 +233,7 @@ impl ShardWitnessFetchTracker {
     #[must_use]
     pub fn is_ready_to_propose(
         &self,
-        active_shards: &[ShardGroupId],
+        active_shards: &[ShardId],
         epoch_end_wt: WeightedTimestamp,
     ) -> bool {
         active_shards.iter().all(|shard| {
@@ -262,7 +261,7 @@ impl ShardWitnessFetchTracker {
     #[must_use]
     pub fn find_header_by_block_hash(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         block_hash: BlockHash,
     ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
         self.shard_headers
@@ -292,14 +291,14 @@ impl ShardWitnessFetchTracker {
     #[must_use]
     pub fn header(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
     ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
         self.shard_headers.get(&shard)?.get(&height)
     }
 
     #[must_use]
-    pub fn pool_len(&self, shard: ShardGroupId) -> usize {
+    pub fn pool_len(&self, shard: ShardId) -> usize {
         self.pool.get(&shard).map_or(0, BTreeMap::len)
     }
 
@@ -309,26 +308,26 @@ impl ShardWitnessFetchTracker {
     }
 
     #[must_use]
-    pub fn pending_fetches_len(&self, shard: ShardGroupId) -> usize {
+    pub fn pending_fetches_len(&self, shard: ShardId) -> usize {
         self.pending_fetches.get(&shard).map_or(0, BTreeMap::len)
     }
 
     #[must_use]
-    pub fn is_pending_fetch(&self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
+    pub fn is_pending_fetch(&self, shard: ShardId, leaf_index: LeafIndex) -> bool {
         self.pending_fetches
             .get(&shard)
             .is_some_and(|m| m.contains_key(&leaf_index))
     }
 
     #[must_use]
-    pub fn pending_in_proposal_len(&self, shard: ShardGroupId) -> usize {
+    pub fn pending_in_proposal_len(&self, shard: ShardId) -> usize {
         self.pending_in_proposal
             .get(&shard)
             .map_or(0, BTreeSet::len)
     }
 
     #[must_use]
-    pub fn is_pending_in_proposal(&self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
+    pub fn is_pending_in_proposal(&self, shard: ShardId, leaf_index: LeafIndex) -> bool {
         self.pending_in_proposal
             .get(&shard)
             .is_some_and(|s| s.contains(&leaf_index))
@@ -342,22 +341,22 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec,
         CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, ShardWitness,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, ShardWitness,
         ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot,
         TransactionRoot, ValidatorId, Verified, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
 
-    fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::leaf(1, n)
+    fn shard(n: u64) -> ShardId {
+        ShardId::leaf(1, n)
     }
 
     /// Build a verified `CertifiedBlockHeader` with the few fields the
     /// tracker reads — shard, height, `weighted_timestamp` (carried on
     /// the QC), witness root, leaf count.
     fn verified_header(
-        s: ShardGroupId,
+        s: ShardId,
         height: u64,
         wt_millis: u64,
         leaf_count: u64,
@@ -400,7 +399,7 @@ mod tests {
         )))
     }
 
-    fn witness(s: ShardGroupId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
+    fn witness(s: ShardId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
         Arc::new(Verified::new_unchecked_for_test(ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(0),

@@ -72,7 +72,7 @@ use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
 pub use hyperscale_types::state_key::db_node_key_to_node_id;
-use hyperscale_types::{BlockHeight, NodeId, ShardGroupId, WritesRoot, shard_for_node};
+use hyperscale_types::{BlockHeight, NodeId, ShardId, WritesRoot, shard_for_node};
 use radix_common::prelude::basic_encode;
 use radix_common::types::NodeId as RadixNodeId;
 
@@ -179,7 +179,7 @@ pub fn build_cross_shard_ownership<S: SubstateDatabase>(
     snapshot: &S,
     declared: &[NodeId],
     provisions_ownership: &HashMap<NodeId, NodeId>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     num_shards: u64,
 ) -> Result<HashMap<NodeId, NodeId>, Vec<NodeId>> {
     let mut merged: HashMap<NodeId, NodeId> = HashMap::new();
@@ -313,7 +313,7 @@ pub fn resolve_owned_nodes_at_height<S: SubstateStore>(
 #[must_use]
 pub fn filter_updates_for_shard<H1: BuildHasher, H2: BuildHasher>(
     updates: &DatabaseUpdates,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     num_shards: u64,
     declared_set: &HashSet<NodeId, H1>,
     ownership: &HashMap<NodeId, NodeId, H2>,

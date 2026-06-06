@@ -160,7 +160,7 @@ impl NodeStateMachine {
                 // Fan out the verified header to downstream consumers. Shard consensus
                 // already received the header in `RemoteHeaderQcVerified`
                 // (early insertion for deferral proof validation).
-                let shard = certified_header.shard_group_id();
+                let shard = certified_header.shard_id();
 
                 self.execution_coordinator.on_verified_remote_header(
                     shard,
@@ -454,7 +454,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
         CertifiedBlock, CertifiedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
-        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId,
+        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardId,
         TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
     };
 
@@ -472,11 +472,11 @@ mod tests {
 
         // Wave on a remote leaf shard listing the local root shard as a dependency.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::ROOT);
-        let wave = WaveId::new(ShardGroupId::leaf(1, 1), BlockHeight::new(5), remote_shards);
+        remote_shards.insert(ShardId::ROOT);
+        let wave = WaveId::new(ShardId::leaf(1, 1), BlockHeight::new(5), remote_shards);
 
         let mut block = make_live_block(
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 1),
             BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -485,7 +485,7 @@ mod tests {
         );
         if let Block::Live { ref mut header, .. } = block {
             *header = BlockHeader::new(
-                header.shard_group_id(),
+                header.shard_id(),
                 header.height(),
                 header.parent_block_hash(),
                 header.parent_qc().clone(),
@@ -508,7 +508,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardGroupId::leaf(1, 1)),
+                QuorumCertificate::genesis(ShardId::leaf(1, 1)),
             )));
 
         let pre_exec = node
@@ -646,8 +646,8 @@ mod tests {
         // Register an outbound batch (local root shard → remote leaf shard).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
         let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
-            ShardGroupId::ROOT,
-            ShardGroupId::leaf(1, 1),
+            ShardId::ROOT,
+            ShardId::leaf(1, 1),
             BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -661,7 +661,7 @@ mod tests {
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {
                 provisions,
-                target_shard: ShardGroupId::leaf(1, 1),
+                target_shard: ShardId::leaf(1, 1),
             },
         );
         assert_eq!(
@@ -680,7 +680,7 @@ mod tests {
         // Commit a block whose qc.weighted_timestamp() is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -703,7 +703,7 @@ mod tests {
         // Commit a second block whose qc.weighted_timestamp() IS past the
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(2),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -742,7 +742,7 @@ mod tests {
         // validation rejects on proposer mismatch, so the header must name the
         // round-0 leader to reach the pending-blocks insert.
         let header = make_live_block(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -798,7 +798,7 @@ mod tests {
         );
 
         let block = make_live_block(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),

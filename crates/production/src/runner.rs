@@ -52,7 +52,7 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, Block, BlockHeight, Bls12381G1PrivateKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, InFlightCount,
     LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness, RoutableTransaction,
-    ShardGroupId, Stake, StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ShardId, Stake, StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
     Verified, genesis_config_hash, shard_for_node,
 };
 use libp2p::identity::Keypair;
@@ -136,7 +136,7 @@ pub struct VnodeConfig {
     /// This vnode's validator identity.
     pub validator_id: ValidatorId,
     /// This vnode's home shard.
-    pub local_shard: ShardGroupId,
+    pub local_shard: ShardId,
     /// BLS signing key for this validator's votes, proposals, and the
     /// per-session validator-bind attestation. Held by `Arc` so the same
     /// allocation is shared between the bind service, the state machine,
@@ -173,7 +173,7 @@ pub struct ProductionRunnerBuilder {
     vnodes: Vec<VnodeConfig>,
     topology: Arc<TopologySnapshot>,
     shard_config: ShardConsensusConfig,
-    storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
+    storages: HashMap<ShardId, Arc<RocksDbShardStorage>>,
     beacon_storage: Arc<dyn BeaconStorage>,
     network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
@@ -205,7 +205,7 @@ impl ProductionRunnerBuilder {
         vnodes: Vec<VnodeConfig>,
         topology: Arc<TopologySnapshot>,
         shard_config: ShardConsensusConfig,
-        storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
+        storages: HashMap<ShardId, Arc<RocksDbShardStorage>>,
         beacon_storage: Arc<dyn BeaconStorage>,
         network_config: Libp2pConfig,
     ) -> Self {
@@ -330,7 +330,7 @@ impl ProductionRunnerBuilder {
 
         // Derive the hosted shard set from the vnodes; every shard
         // referenced by a vnode must have a matching storage entry.
-        let local_shards: HashSet<ShardGroupId> =
+        let local_shards: HashSet<ShardId> =
             vnode_configs.iter().map(|cfg| cfg.local_shard).collect();
         for shard in &local_shards {
             assert!(
@@ -373,9 +373,9 @@ impl ProductionRunnerBuilder {
         // `ProcessIo` can point at each shard's own callback channel.
         // `ShardChannels` carries the receivers; the runner keeps a clone
         // of each shutdown sender for fanout at termination.
-        let mut shard_channels: HashMap<ShardGroupId, ShardChannels> = HashMap::new();
-        let mut shard_callback_txs: HashMap<ShardGroupId, Sender<ShardEvent>> = HashMap::new();
-        let mut shard_shutdown_txs: HashMap<ShardGroupId, Sender<()>> = HashMap::new();
+        let mut shard_channels: HashMap<ShardId, ShardChannels> = HashMap::new();
+        let mut shard_callback_txs: HashMap<ShardId, Sender<ShardEvent>> = HashMap::new();
+        let mut shard_shutdown_txs: HashMap<ShardId, Sender<()>> = HashMap::new();
         for shard in &local_shards {
             let (timer_tx, timer_rx) = unbounded();
             let (callback_tx, callback_rx) = unbounded();
@@ -429,14 +429,12 @@ impl ProductionRunnerBuilder {
                 .take(beacon_committee_size)
                 .map(|v| v.id)
                 .collect();
-            let initial_shard_committees: std::collections::BTreeMap<
-                ShardGroupId,
-                Vec<ValidatorId>,
-            > = shared_topology
-                .shard_trie()
-                .leaves()
-                .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
-                .collect();
+            let initial_shard_committees: std::collections::BTreeMap<ShardId, Vec<ValidatorId>> =
+                shared_topology
+                    .shard_trie()
+                    .leaves()
+                    .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
+                    .collect();
             let config = BeaconGenesisConfig {
                 chain_config,
                 initial_validators,
@@ -475,19 +473,19 @@ impl ProductionRunnerBuilder {
         // every acknowledged EC, and a host-wide store lets that eviction
         // delete entries the inbound coordinator on the target shard
         // still needs to verify proposals against.
-        let provision_stores: HashMap<ShardGroupId, Arc<ProvisionStore>> = local_shards
+        let provision_stores: HashMap<ShardId, Arc<ProvisionStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(ProvisionStore::new())))
             .collect();
-        let tx_stores: HashMap<ShardGroupId, Arc<TxStore>> = local_shards
+        let tx_stores: HashMap<ShardId, Arc<TxStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(TxStore::new())))
             .collect();
-        let exec_cert_stores: HashMap<ShardGroupId, Arc<ExecCertStore>> = local_shards
+        let exec_cert_stores: HashMap<ShardId, Arc<ExecCertStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(ExecCertStore::new())))
             .collect();
-        let finalized_wave_stores: HashMap<ShardGroupId, Arc<FinalizedWaveStore>> = local_shards
+        let finalized_wave_stores: HashMap<ShardId, Arc<FinalizedWaveStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(FinalizedWaveStore::new())))
             .collect();
@@ -565,10 +563,10 @@ impl ProductionRunnerBuilder {
             .collect();
 
         // Wrap each per-shard `RocksDbShardStorage` in a `SharedStorage` for
-        // `NodeHost::new`'s `HashMap<ShardGroupId, S>` argument; the
+        // `NodeHost::new`'s `HashMap<ShardId, S>` argument; the
         // runner keeps the bare `Arc<RocksDbShardStorage>`s alive for GC +
         // metrics.
-        let shared_storages: HashMap<ShardGroupId, SharedStorage> = storages
+        let shared_storages: HashMap<ShardId, SharedStorage> = storages
             .iter()
             .map(|(shard, st)| (*shard, SharedStorage::new(Arc::clone(st))))
             .collect();
@@ -596,7 +594,7 @@ impl ProductionRunnerBuilder {
         // shard's own pinned-thread callback channel — callbacks,
         // network handlers, and RPC fanout for that shard land on its
         // thread directly.
-        let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> = shard_callback_txs
+        let shard_event_senders: HashMap<ShardId, Sender<ShardEvent>> = shard_callback_txs
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();
@@ -662,17 +660,17 @@ pub struct ProductionRunner {
 
     /// Per-shard receivers (timer + callback + shutdown), built at
     /// construction and consumed when `run()` spawns the shard threads.
-    shard_channels: Option<HashMap<ShardGroupId, ShardChannels>>,
+    shard_channels: Option<HashMap<ShardId, ShardChannels>>,
 
     /// Per-shard callback senders, kept alive on the runner so the
     /// channels survive until shutdown. The same `Sender` clones live
     /// inside [`ProcessIo::shard_event_senders`] for off-thread callers.
     #[allow(dead_code)]
-    shard_callback_txs: HashMap<ShardGroupId, Sender<ShardEvent>>,
+    shard_callback_txs: HashMap<ShardId, Sender<ShardEvent>>,
 
     /// Per-shard shutdown signals. `shutdown()` fans these to every
     /// shard thread in parallel.
-    shard_shutdown_txs: HashMap<ShardGroupId, Sender<()>>,
+    shard_shutdown_txs: HashMap<ShardId, Sender<()>>,
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
@@ -683,12 +681,12 @@ pub struct ProductionRunner {
     /// loop's [`PinnedLoopConfig::storages`] for per-shard JMT GC and
     /// storage-memory metrics.
     #[allow(dead_code)]
-    storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
+    storages: HashMap<ShardId, Arc<RocksDbShardStorage>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for.
     #[allow(dead_code)]
-    local_shards: HashSet<ShardGroupId>,
+    local_shards: HashSet<ShardId>,
 
     /// Shared RPC `NodeStatusState` updated by the metrics tick.
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
@@ -707,7 +705,7 @@ pub struct ProductionRunner {
     /// lock-free RPC queries. One entry per hosted shard; the RPC
     /// handler probes every entry on a status lookup since a tx may
     /// have landed on any of the hosted shards.
-    tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
+    tx_status_caches: HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>>,
 
     /// Shutdown signal receiver (external shutdown request).
     shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -726,7 +724,7 @@ impl ProductionRunner {
         vnodes: Vec<VnodeConfig>,
         topology: Arc<TopologySnapshot>,
         shard_config: ShardConsensusConfig,
-        storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
+        storages: HashMap<ShardId, Arc<RocksDbShardStorage>>,
         beacon_storage: Arc<dyn BeaconStorage>,
         network_config: Libp2pConfig,
     ) -> ProductionRunnerBuilder {
@@ -759,9 +757,7 @@ impl ProductionRunner {
     /// which probes every entry on a status lookup since a tx may have
     /// landed on any of the hosted shards.
     #[must_use]
-    pub fn tx_status_caches(
-        &self,
-    ) -> HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
+    pub fn tx_status_caches(&self) -> HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>> {
         self.tx_status_caches
             .iter()
             .map(|(s, c)| (*s, Arc::clone(c)))
@@ -824,7 +820,7 @@ impl ProductionRunner {
         // hosted shard. Each shard has its own RocksDB store, its own
         // committed height, and its own genesis block.
         let mut timer_ops = Vec::new();
-        let local_shards: Vec<ShardGroupId> = host.hosted_shards().collect();
+        let local_shards: Vec<ShardId> = host.hosted_shards().collect();
         let topology = Arc::clone(&self.topology_snapshot);
         // The host's `GenesisConfig` enumerates every account across every
         // hosted shard. Each shard's storage only gets the accounts whose
@@ -961,7 +957,7 @@ impl ProductionRunner {
             .expect("shard_channels already taken");
 
         // Split genesis-emitted timer ops by shard.
-        let mut timer_ops_by_shard: HashMap<ShardGroupId, Vec<TimerOp>> = HashMap::new();
+        let mut timer_ops_by_shard: HashMap<ShardId, Vec<TimerOp>> = HashMap::new();
         for op in initial_timer_ops {
             let shard = match &op {
                 TimerOp::Set { shard, .. } | TimerOp::Cancel { shard, .. } => *shard,
@@ -1079,7 +1075,7 @@ impl ProductionRunner {
     /// passes on top of each other.
     fn schedule_jmt_gc(&self, in_flight: &Arc<std::sync::atomic::AtomicBool>) {
         in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-        let storages: Vec<(ShardGroupId, Arc<RocksDbShardStorage>)> = self
+        let storages: Vec<(ShardId, Arc<RocksDbShardStorage>)> = self
             .storages
             .iter()
             .map(|(s, st)| (*s, Arc::clone(st)))
@@ -1114,7 +1110,7 @@ struct NetworkBuildArgs {
     ed25519_keypair: Keypair,
     /// Shards hosted by this host. Drives per-shard request stream
     /// protocols and gossipsub subscriptions on the adapter.
-    local_shards: HashSet<ShardGroupId>,
+    local_shards: HashSet<ShardId>,
     /// One `(validator_id, signing_key)` per hosted vnode. The bind
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
@@ -1188,7 +1184,7 @@ struct ShardChannels {
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<ShardEvent>,
-    active: HashMap<(ShardGroupId, TimerId), JoinHandle<()>>,
+    active: HashMap<(ShardId, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
@@ -1246,7 +1242,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// that consensus on that shard never owns.
 fn filter_genesis_for_shard(
     mut config: GenesisConfig,
-    shard: ShardGroupId,
+    shard: ShardId,
     num_shards: u64,
 ) -> GenesisConfig {
     config
@@ -1257,7 +1253,7 @@ fn filter_genesis_for_shard(
 
 /// Compute the shard a [`ComponentAddress`] belongs to. Mirrors the helper
 /// the spammer uses for the same purpose (`crates/spammer/src/accounts.rs`).
-fn shard_for_address(address: &ComponentAddress, num_shards: u64) -> ShardGroupId {
+fn shard_for_address(address: &ComponentAddress, num_shards: u64) -> ShardId {
     let radix_node_id = address.into_node_id();
     let det_node_id = NodeId(
         radix_node_id.0[..30]

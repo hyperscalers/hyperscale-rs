@@ -10,7 +10,7 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, ShardGroupId};
+use hyperscale_types::{BlockHeight, ShardId};
 
 /// Serve an inbound remote-header range request.
 ///
@@ -32,7 +32,7 @@ use hyperscale_types::{BlockHeight, ShardGroupId};
 /// stalling sync until rotation.
 pub fn serve_remote_headers_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     req: &GetRemoteHeadersRequest,
 ) -> GetRemoteHeadersResponse {
     if req.source_shard != local_shard {

@@ -17,7 +17,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, ShardStorage};
-use hyperscale_types::{Block, ShardGroupId, StateRoot};
+use hyperscale_types::{Block, ShardId, StateRoot};
 
 use crate::host::NodeHost;
 
@@ -33,7 +33,7 @@ where
     /// cross-shard hosts call this once per shard with that shard's
     /// genesis block.
     pub fn initialize_shard_genesis(&mut self, genesis_block: &Block) {
-        let shard = genesis_block.header().shard_group_id();
+        let shard = genesis_block.header().shard_id();
         let count = self.vnodes_len(shard);
         for vnode_idx in 0..count {
             let actions = self
@@ -52,11 +52,7 @@ where
     /// Independent of network-handler registration — runners call
     /// [`Self::register_inbound_handlers`] once their genesis-or-resume
     /// decision is settled.
-    pub fn install_engine_genesis(
-        &mut self,
-        shard: ShardGroupId,
-        config: &GenesisConfig,
-    ) -> StateRoot
+    pub fn install_engine_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> StateRoot
     where
         S: GenesisCommit,
     {

@@ -12,7 +12,7 @@ use hyperscale_network_memory::{HostingMode, NetworkConfig};
 use hyperscale_node::shard_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, NetworkDefinition, Round, ShardGroupId, TransactionStatus,
+    BlockHeight, LocalTimestamp, NetworkDefinition, Round, ShardId, TransactionStatus,
 };
 use tracing_test::traced_test;
 
@@ -53,7 +53,7 @@ fn test_schedule_initial_events() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -80,7 +80,7 @@ fn test_determinism_same_seed() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -92,7 +92,7 @@ fn test_determinism_same_seed() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -128,7 +128,7 @@ fn test_different_seeds_diverge() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -139,7 +139,7 @@ fn test_different_seeds_diverge() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -176,7 +176,7 @@ fn test_multi_shard_simulation() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::leaf(1, 0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::leaf(1, 0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -203,7 +203,7 @@ fn test_round_advancement_via_view_change_timer() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -256,7 +256,7 @@ fn test_extended_simulation_determinism() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(5));
@@ -268,7 +268,7 @@ fn test_extended_simulation_determinism() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(5));
@@ -1584,8 +1584,8 @@ fn test_cross_shard_transaction_detection() {
 
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ShardGroupId, TopologySnapshot, ValidatorId, ValidatorInfo,
-        ValidatorSet, VotePower, generate_bls_keypair,
+        Bls12381G1PrivateKey, ShardId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+        VotePower, generate_bls_keypair,
     };
 
     // Create a 2-shard network with 2 validators per shard
@@ -1602,13 +1602,13 @@ fn test_cross_shard_transaction_detection() {
     let validator_set = ValidatorSet::new(validators);
 
     // Build shard committees
-    let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+    let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
     shard_committees.insert(
-        ShardGroupId::leaf(1, 0),
+        ShardId::leaf(1, 0),
         vec![ValidatorId::new(0), ValidatorId::new(1)],
     );
     shard_committees.insert(
-        ShardGroupId::leaf(1, 1),
+        ShardId::leaf(1, 1),
         vec![ValidatorId::new(2), ValidatorId::new(3)],
     );
 
@@ -1635,7 +1635,7 @@ fn test_cross_shard_transaction_detection() {
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
         .map(test_node)
-        .filter(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 0))
+        .filter(|n| topology.shard_for_node_id(n) == ShardId::leaf(1, 0))
         .take(2)
         .collect();
 
@@ -1653,10 +1653,10 @@ fn test_cross_shard_transaction_detection() {
     // Create a cross-shard transaction (nodes in different shards)
     let shard0_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 0));
+        .find(|n| topology.shard_for_node_id(n) == ShardId::leaf(1, 0));
     let shard1_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 1));
+        .find(|n| topology.shard_for_node_id(n) == ShardId::leaf(1, 1));
 
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);

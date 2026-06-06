@@ -34,7 +34,7 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, Epoch, ExecutionCertificate, FinalizedWave, LeafIndex, MessageClass,
-    ProvisionHash, ShardGroupId, ShardWitness, TxHash, ValidatorId, Verifiable, WaveId,
+    ProvisionHash, ShardId, ShardWitness, TxHash, ValidatorId, Verifiable, WaveId,
 };
 
 use super::Fetch;
@@ -55,12 +55,12 @@ pub type ExecCertFetch = Fetch<WaveId>;
 /// `(source_shard, target_shard, block_height)`. `source_shard` selects
 /// the responding committee; `target_shard` rides in the body for
 /// response filtering on the responder.
-pub type ProvisionFetch = Fetch<(ShardGroupId, ShardGroupId, BlockHeight)>;
+pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, leaf_index)`.
 /// Each id is a single leaf in the source shard's accumulator at the
 /// named committed block.
-pub type ShardWitnessFetch = Fetch<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)>;
+pub type ShardWitnessFetch = Fetch<(ShardId, BlockHeight, BlockHash, LeafIndex)>;
 /// Missing-proposal fetch keyed by `(epoch, validator)` — one entry
 /// per beacon-committee member whose proposal SPC's `OutputHigh`
 /// committed but the local pool never observed.
@@ -97,8 +97,8 @@ pub trait FetchBinding: 'static {
     /// which selects the *target* committee).
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -172,8 +172,8 @@ impl FetchBinding for TransactionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<TxHash>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -240,8 +240,8 @@ impl FetchBinding for LocalProvisionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -326,8 +326,8 @@ impl FetchBinding for FinalizedWaveBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -401,8 +401,8 @@ impl FetchBinding for ExecCertBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -467,7 +467,7 @@ impl FetchBinding for ExecCertBinding {
 pub struct ProvisionBinding;
 
 impl FetchBinding for ProvisionBinding {
-    type Id = (ShardGroupId, ShardGroupId, BlockHeight);
+    type Id = (ShardId, ShardId, BlockHeight);
 
     const NAME: &'static str = "provision";
 
@@ -480,9 +480,9 @@ impl FetchBinding for ProvisionBinding {
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<(ShardGroupId, ShardGroupId, BlockHeight)>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        ids: Vec<(ShardId, ShardId, BlockHeight)>,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -566,7 +566,7 @@ impl FetchBinding for ProvisionBinding {
 pub struct ShardWitnessBinding;
 
 impl FetchBinding for ShardWitnessBinding {
-    type Id = (ShardGroupId, BlockHeight, BlockHash, LeafIndex);
+    type Id = (ShardId, BlockHeight, BlockHash, LeafIndex);
 
     const NAME: &'static str = "shard_witness";
 
@@ -582,8 +582,8 @@ impl FetchBinding for ShardWitnessBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -663,8 +663,8 @@ impl FetchBinding for BeaconProposalBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardGroupId,
-        shard: ShardGroupId,
+        local_shard: ShardId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
@@ -803,12 +803,11 @@ mod tests {
         // before signature/merkle verification — so unsolicited deliveries
         // must be dropped at the response boundary.
         use hyperscale_types::{
-            BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardGroupId,
-            TxHash,
+            BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TxHash,
         };
         let asked = Arc::new(Provisions::new(
-            ShardGroupId::leaf(2, 1),
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -819,8 +818,8 @@ mod tests {
             )],
         ));
         let extra = Arc::new(Provisions::new(
-            ShardGroupId::leaf(2, 3),
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(2, 3),
+            ShardId::leaf(2, 2),
             BlockHeight::new(11),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(

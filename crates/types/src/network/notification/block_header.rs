@@ -64,7 +64,7 @@ impl Signed for BlockHeaderNotification {
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         block_header_message(
             network,
-            self.header.shard_group_id(),
+            self.header.shard_id(),
             self.header.height(),
             self.header.round(),
             &self.header.hash(),
@@ -90,15 +90,15 @@ mod tests {
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        Round, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId,
+        Round, ShardId, StateRoot, TransactionRoot, TxHash, ValidatorId,
     };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

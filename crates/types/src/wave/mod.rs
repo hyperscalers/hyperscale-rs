@@ -44,7 +44,7 @@ mod tests {
         Attempt, BlockHeight, Bls12381G2Signature, ConsensusReceipt, DatabaseUpdates,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NetworkDefinition, NodeId, ProvisionTxRoot, ProvisionTxRootsMap,
-        RETENTION_HORIZON, ReceiptValidationError, ShardGroupId, SignerBitfield, StoredReceipt,
+        RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StoredReceipt,
         TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, VotePower, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
@@ -69,7 +69,7 @@ mod tests {
     }
 
     /// Find a node seed that routes to `target_shard` under 2-way sharding.
-    fn node_on_shard(topology: &TopologySnapshot, target_shard: ShardGroupId) -> NodeId {
+    fn node_on_shard(topology: &TopologySnapshot, target_shard: ShardId) -> NodeId {
         for seed in 0u8..=255 {
             let node = NodeId([seed; 30]);
             if topology.shard_for_node_id(&node) == target_shard {
@@ -90,9 +90,9 @@ mod tests {
 
     fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
         WaveId::new(
-            ShardGroupId::leaf(3, shard),
+            ShardId::leaf(3, shard),
             height,
-            remote.iter().map(|&s| ShardGroupId::leaf(3, s)).collect(),
+            remote.iter().map(|&s| ShardId::leaf(3, s)).collect(),
         )
     }
 
@@ -134,30 +134,28 @@ mod tests {
     #[test]
     fn test_compute_provision_tx_roots_empty() {
         let topology = two_shard_topology();
-        let map =
-            Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::leaf(1, 0), &topology, &[]);
+        let map = Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology, &[]);
         assert!(map.is_empty());
     }
 
     #[test]
     fn test_compute_provision_tx_roots_single_shard_excluded() {
         let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardGroupId::leaf(1, 0));
+        let local_node = node_on_shard(&topology, ShardId::leaf(1, 0));
         let tx = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![local_node],
             vec![local_node],
         )));
-        let map =
-            Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::leaf(1, 0), &topology, &[tx]);
+        let map = Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology, &[tx]);
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
 
     #[test]
     fn test_compute_provision_tx_roots_covers_all_touched_targets() {
         let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardGroupId::leaf(1, 0));
-        let remote_node = node_on_shard(&topology, ShardGroupId::leaf(1, 1));
+        let local_node = node_on_shard(&topology, ShardId::leaf(1, 0));
+        let remote_node = node_on_shard(&topology, ShardId::leaf(1, 1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
         let tx_a = Arc::new(Verifiable::from(test_transaction_with_nodes(
@@ -172,20 +170,20 @@ mod tests {
         )));
 
         let roots = Verified::<ProvisionTxRootsMap>::compute(
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             &topology,
             &[tx_a.clone(), tx_b.clone()],
         );
 
         // Local shard excluded; only shard 1 receives provisions.
         assert_eq!(roots.len(), 1);
-        assert!(roots.contains_key(&ShardGroupId::leaf(1, 1)));
+        assert!(roots.contains_key(&ShardId::leaf(1, 1)));
 
         let expected = ProvisionTxRoot::from_raw(compute_merkle_root(&[
             tx_a.hash().into_raw(),
             tx_b.hash().into_raw(),
         ]));
-        assert_eq!(roots[&ShardGroupId::leaf(1, 1)], expected);
+        assert_eq!(roots[&ShardId::leaf(1, 1)], expected);
     }
 
     #[test]
@@ -310,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_receipt_hash_changes_with_ec() {
-        // `receipt_hash` commits to `(shard_group_id, wave_id)` pairs, so two
+        // `receipt_hash` commits to `(shard_id, wave_id)` pairs, so two
         // ECs with distinct wave_ids must produce distinct receipt hashes.
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let wc1 = WaveCertificate::new(wave_id.clone(), vec![make_test_wave_ec(0, 1)]);

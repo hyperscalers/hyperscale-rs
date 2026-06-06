@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyperscale_types::{
-    RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
+    RoutableTransaction, ShardId, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -96,9 +96,9 @@ impl TransferWorkload {
         let depth = accounts.num_shards().trailing_zeros();
         let shard = if self.selection_mode == SelectionMode::NoContention {
             let counter = self.shard_counter.fetch_add(1, Ordering::Relaxed);
-            ShardGroupId::leaf(depth, counter % accounts.num_shards())
+            ShardId::leaf(depth, counter % accounts.num_shards())
         } else {
-            ShardGroupId::leaf(depth, rng.random_range(0..accounts.num_shards()))
+            ShardId::leaf(depth, rng.random_range(0..accounts.num_shards()))
         };
         let (from, to) = accounts.pair_for_shard(shard, rng, self.selection_mode)?;
         self.build_transfer(from, to)
@@ -173,7 +173,7 @@ impl TransferWorkload {
     fn generate_same_shard_for<R: Rng + ?Sized>(
         &self,
         accounts: &AccountPool,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         let shard_accounts = accounts.accounts_for_shard(target_shard)?;
@@ -195,7 +195,7 @@ impl TransferWorkload {
     fn generate_cross_shard_for<R: Rng + ?Sized>(
         &self,
         accounts: &AccountPool,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         if accounts.num_shards() < 2 {
@@ -204,9 +204,9 @@ impl TransferWorkload {
 
         // Pick another shard randomly (different from target)
         let depth = accounts.num_shards().trailing_zeros();
-        let mut other_shard = ShardGroupId::leaf(depth, rng.random_range(0..accounts.num_shards()));
+        let mut other_shard = ShardId::leaf(depth, rng.random_range(0..accounts.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId::leaf(depth, rng.random_range(0..accounts.num_shards()));
+            other_shard = ShardId::leaf(depth, rng.random_range(0..accounts.num_shards()));
         }
 
         // Randomly decide if target shard is sender or receiver
@@ -229,7 +229,7 @@ impl TransferWorkload {
     pub fn generate_for_shard<R: Rng + ?Sized>(
         &self,
         accounts: &AccountPool,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         let is_cross_shard =
@@ -249,7 +249,7 @@ impl TransferWorkload {
     pub fn generate_batch_for_shard<R: Rng + ?Sized>(
         &self,
         accounts: &AccountPool,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         count: usize,
         rng: &mut R,
     ) -> Vec<RoutableTransaction> {
@@ -331,7 +331,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate transactions targeting shard 2
-        let target_shard = ShardGroupId::leaf(2, 2);
+        let target_shard = ShardId::leaf(2, 2);
         for _ in 0..20 {
             let tx = workload
                 .generate_for_shard(&accounts, target_shard, &mut rng)
@@ -357,7 +357,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate transactions targeting shard 1
-        let target_shard = ShardGroupId::leaf(2, 1);
+        let target_shard = ShardId::leaf(2, 1);
         for _ in 0..20 {
             let tx = workload
                 .generate_for_shard(&accounts, target_shard, &mut rng)
@@ -391,7 +391,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate a batch targeting shard 0
-        let target_shard = ShardGroupId::leaf(2, 0);
+        let target_shard = ShardId::leaf(2, 0);
         let batch = workload.generate_batch_for_shard(&accounts, target_shard, 50, &mut rng);
 
         assert!(!batch.is_empty(), "Should generate transactions");

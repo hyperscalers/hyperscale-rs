@@ -14,8 +14,8 @@ use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BlockHash, BoundedVec, Epoch, LeafIndex, PcValueElement, PcVector,
-    PcVoteEquivocation, PcVoteRound, ShardGroupId, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, SpcView, ValidatorId, ValidatorStatus, zero_bls_signature,
+    PcVoteEquivocation, PcVoteRound, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+    SpcView, ValidatorId, ValidatorStatus, zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -237,7 +237,7 @@ fn inject_topology_change_splices_witnesses_into_epoch_one_proposal() {
     // helper delivers a source header committing the witness's leaf root
     // to all replicas first.
     let witness = sim.admissible_shard_witness(
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         1,
         0,
         ShardWitnessPayload::Ready {
@@ -362,7 +362,7 @@ fn injected_topology_witness_mutates_state_at_commit() {
     // delivers a source header so the witness-admission gate accepts the
     // deposit on every peer.
     let witness = sim.admissible_shard_witness(
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         1,
         1,
         ShardWitnessPayload::StakeDeposit {
@@ -467,7 +467,7 @@ fn forged_shard_witness_never_reaches_committed_block() {
             amount: Stake::from_whole_tokens(500),
         },
         proof: ShardWitnessProof {
-            shard_id: ShardGroupId::ROOT,
+            shard_id: ShardId::ROOT,
             committed_block_hash: BlockHash::ZERO,
             leaf_index: LeafIndex::new(1),
             siblings: BoundedVec::new(),

@@ -9,7 +9,7 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, QcVerifyError, QuorumCertificate, ShardGroupId, StateRoot,
+    BlockHash, BlockHeader, BlockHeight, QcVerifyError, QuorumCertificate, ShardId, StateRoot,
     Verifiable, Verified,
 };
 
@@ -84,8 +84,8 @@ impl CertifiedBlockHeader {
 
     /// Get the shard group this block belongs to.
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.header.shard_group_id()
+    pub const fn shard_id(&self) -> ShardId {
+        self.header.shard_id()
     }
 
     /// Get the state root committed by this block.

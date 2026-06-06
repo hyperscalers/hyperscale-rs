@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
-    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardId,
     TopologySnapshot, TxHash, Verifiable, VotePower, WaveId, compute_waves,
 };
 
@@ -31,7 +31,7 @@ use crate::commit_dedup::CommitDedupIndex;
 #[must_use]
 pub fn qc_has_local_quorum_power(
     topology: &TopologySnapshot,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     qc: &QuorumCertificate,
 ) -> bool {
     let committee = topology.committee_for_shard(local_shard);
@@ -81,7 +81,7 @@ pub fn qc_weighted_timestamp_too_far_ahead(qc: &QuorumCertificate, now: LocalTim
 pub fn validate_header(
     proposer_committee: &TopologySnapshot,
     parent_committee: Option<&TopologySnapshot>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     header: &BlockHeader,
     committed_height: BlockHeight,
     now: LocalTimestamp,
@@ -232,7 +232,7 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 /// waves exist.
 pub fn validate_waves(
     topology: &TopologySnapshot,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     block: &Block,
 ) -> Result<(), String> {
     let expected = compute_waves(local_shard, topology, block.height(), block.transactions());
@@ -353,7 +353,7 @@ pub fn validate_no_duplicate_provisions(
 /// caller can log once.
 pub fn validate_block_for_vote(
     topology: &TopologySnapshot,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
     qc_chain_cert_ids: &HashSet<WaveId>,
@@ -415,10 +415,10 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BoundedVec,
         CertificateRoot, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
-        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
-        SignerBitfield, StateRoot, TransactionDecision, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp, bls_keypair_from_seed,
-        compute_waves, test_utils, zero_bls_signature,
+        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
+        StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
+        Verifiable, WeightedTimestamp, bls_keypair_from_seed, compute_waves, test_utils,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -439,16 +439,16 @@ mod tests {
         )
     }
 
-    fn local_shard() -> ShardGroupId {
-        ShardGroupId::ROOT
+    fn local_shard() -> ShardId {
+        ShardId::ROOT
     }
 
     fn header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
             Round::new(0),
@@ -474,7 +474,7 @@ mod tests {
         proposer: Option<ValidatorId>,
     ) -> BlockHeader {
         BlockHeader::new(
-            base.shard_group_id(),
+            base.shard_id(),
             base.height(),
             parent_block_hash.unwrap_or_else(|| base.parent_block_hash()),
             base.parent_qc().clone(),
@@ -497,10 +497,10 @@ mod tests {
 
     fn block_with_waves(height: BlockHeight, waves: Vec<WaveId>) -> Block {
         let header = BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -539,7 +539,7 @@ mod tests {
         let block = block_with_waves(
             BlockHeight::new(1),
             vec![WaveId::new(
-                ShardGroupId::leaf(8, 99),
+                ShardId::leaf(8, 99),
                 BlockHeight::new(1),
                 BTreeSet::new(),
             )],
@@ -684,7 +684,7 @@ mod tests {
         signers.set(2);
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"parent_block")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
@@ -701,7 +701,7 @@ mod tests {
         let round = Round::new(1);
         let proposer = topology().proposer_for(local_shard(), round);
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(2),
             parent_qc.block_hash(),
             parent_qc,
@@ -825,7 +825,7 @@ mod tests {
         signers.set(0);
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"parent_block")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
@@ -844,7 +844,7 @@ mod tests {
         now: LocalTimestamp,
     ) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(2),
             parent_qc.block_hash(),
             parent_qc,
@@ -1137,8 +1137,8 @@ mod tests {
     fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
         Arc::new(Provisions::new(
-            ShardGroupId::leaf(1, 0),
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(tx_hash, vec![], vec![], vec![])],

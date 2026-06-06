@@ -51,7 +51,7 @@ impl NetworkMessage for BlockVoteNotification {
 mod tests {
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, Hash, ProposerTimestamp, Round, ShardGroupId, ValidatorId,
+        BlockHash, BlockHeight, Hash, ProposerTimestamp, Round, ShardId, ValidatorId,
         zero_bls_signature,
     };
 
@@ -59,7 +59,7 @@ mod tests {
     fn test_block_vote_gossip_creation() {
         let vote = BlockVote::from_parts(
             BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(10),
             Round::INITIAL,
             ValidatorId::new(2),
@@ -75,7 +75,7 @@ mod tests {
     fn test_block_vote_gossip_into_vote() {
         let vote = BlockVote::from_parts(
             BlockHash::from_raw(Hash::from_bytes(b"test")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(5),
             Round::INITIAL,
             ValidatorId::new(1),

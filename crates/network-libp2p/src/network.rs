@@ -15,8 +15,8 @@ use hyperscale_network::{
     ResponseVerdict, Topic, ValidatorKeyMap,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkMessage, Request, ShardGroupId, TopicScope,
-    TopologySnapshot, ValidatorId,
+    GossipMessage, MessageClass, NetworkMessage, Request, ShardId, TopicScope, TopologySnapshot,
+    ValidatorId,
 };
 use libp2p::PeerId;
 use sbor::{basic_decode, basic_encode};
@@ -67,7 +67,7 @@ pub struct Libp2pNetwork {
     registry: Arc<HandlerRegistry>,
     /// Shards hosted by this host. Drives per-shard gossipsub
     /// subscriptions on `register_gossip_handler`.
-    local_shards: HashSet<ShardGroupId>,
+    local_shards: HashSet<ShardId>,
     /// Topology snapshot used to resolve shard → committee for outbound
     /// requests. Updated lock-free via [`Self::update_topology`].
     topology: Arc<ArcSwap<TopologySnapshot>>,
@@ -159,7 +159,7 @@ impl Network for Libp2pNetwork {
         self.topology.store(snapshot);
     }
 
-    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardGroupId, message: &M) {
+    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         debug_assert_eq!(
             M::SCOPE,
             TopicScope::Shard,
@@ -272,7 +272,7 @@ impl Network for Libp2pNetwork {
 
     fn register_request_handler<R: Request + Send + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         handler: impl RequestHandler<R>,
     ) where
         R::Response: Send + 'static,
@@ -284,7 +284,7 @@ impl Network for Libp2pNetwork {
     #[allow(clippy::too_many_lines)] // single dispatch over the request lifecycle (local-serve → wire)
     fn request<R: Request + Clone + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,

@@ -20,7 +20,7 @@ use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
-use hyperscale_types::{RoutableTransaction, ShardGroupId, shard_for_node};
+use hyperscale_types::{RoutableTransaction, ShardId, shard_for_node};
 
 use crate::event::{ShardEvent, ShardScopedInput};
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
@@ -55,7 +55,7 @@ where
     /// hosted-shard tag), routed to the shard's sender so the right
     /// driver picks them up on its next iteration. Inbound network
     /// handlers route by the shard tag inside the decoded payload.
-    pub(crate) shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
+    pub(crate) shard_event_senders: HashMap<ShardId, Sender<ShardEvent>>,
 
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs. The pinned thread is the sole writer
@@ -103,7 +103,7 @@ where
     pub(crate) fn new(
         network: Arc<N>,
         dispatch: D,
-        shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
+        shard_event_senders: HashMap<ShardId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         tx_validator: Arc<TransactionValidation>,
@@ -127,7 +127,7 @@ where
     ///
     /// # Panics
     /// Panics if `shard` isn't hosted by this `ProcessIo`.
-    pub(crate) fn shard_sender(&self, shard: ShardGroupId) -> &Sender<ShardEvent> {
+    pub(crate) fn shard_sender(&self, shard: ShardId) -> &Sender<ShardEvent> {
         self.shard_event_senders
             .get(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this ProcessIo"))
@@ -147,7 +147,7 @@ where
     /// hosted shard, but no shard admits or takes ownership.
     pub(crate) fn compute_submit_fanout(&self, tx: &RoutableTransaction) -> SubmitFanout {
         let num_shards = self.topology_snapshot.load().num_shards();
-        let touched_shards: Vec<ShardGroupId> = tx
+        let touched_shards: Vec<ShardId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())
@@ -252,21 +252,21 @@ pub enum SubmitFanout {
     Admit {
         /// First hosted touched shard — source of outbound gossip and
         /// sole owner of the `locally_submitted` flag for this tx.
-        source: ShardGroupId,
+        source: ShardId,
         /// Hosted touched shards other than the source — admit-only.
-        passive: Vec<ShardGroupId>,
+        passive: Vec<ShardId>,
         /// Every shard the tx touches (declared reads ∪ writes).
         /// Carried to the source so it can enqueue outbound gossip
         /// for each destination.
-        touched_shards: Vec<ShardGroupId>,
+        touched_shards: Vec<ShardId>,
     },
     /// No hosted shard is touched by this tx. Pick any hosted shard to
     /// flush outbound gossip; no admission, no `locally_submitted`
     /// entry.
     GossipOnly {
         /// Arbitrary hosted shard chosen to enqueue outbound gossip.
-        host: ShardGroupId,
+        host: ShardId,
         /// Every shard the tx touches (declared reads ∪ writes).
-        touched_shards: Vec<ShardGroupId>,
+        touched_shards: Vec<ShardId>,
     },
 }

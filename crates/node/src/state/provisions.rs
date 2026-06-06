@@ -61,7 +61,7 @@ mod tests {
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
-        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardGroupId, Verified,
+        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardId, Verified,
         WeightedTimestamp,
     };
 
@@ -80,8 +80,8 @@ mod tests {
 
         let provisions = Arc::new(
             Verified::new_unchecked_for_test(Provisions::new(
-                ShardGroupId::leaf(1, 1), // source
-                ShardGroupId::ROOT,       // target (local)
+                ShardId::leaf(1, 1), // source
+                ShardId::ROOT,       // target (local)
                 BlockHeight::new(1),
                 MerkleInclusionProof::dummy(),
                 vec![],

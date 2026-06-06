@@ -12,7 +12,7 @@ use serde::Serialize;
 /// process-level field — derived from the libp2p adapter's connected
 /// peer set, not per-shard.
 ///
-/// The map is keyed by [`hyperscale_types::ShardGroupId::inner`] (a
+/// The map is keyed by [`hyperscale_types::ShardId::inner`] (a
 /// `u64`) so the type derives `Serialize` directly — JSON object keys
 /// must be string-stringifiable, and `u64` satisfies that.
 #[derive(Debug, Clone, Default, Serialize)]

@@ -34,7 +34,7 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
-    LocalTimestamp, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash,
+    LocalTimestamp, RoutableTransaction, ShardId, TopologySnapshot, TransactionStatus, TxHash,
 };
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
@@ -76,7 +76,7 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: RadixExecutor,
     pub(crate) network: Arc<N>,
     pub(crate) execution_cache: Arc<ProcessExecutionCache>,
-    pub(crate) per_shard: HashMap<ShardGroupId, ShardDispatchHandles<S>>,
+    pub(crate) per_shard: HashMap<ShardId, ShardDispatchHandles<S>>,
 }
 
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
@@ -93,14 +93,14 @@ pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
 ///
 /// `shard` is the hosted shard that owns the timer. Every timer is
 /// shard-scoped — the runner's timer driver keys handles by
-/// `(TimerId, ShardGroupId)`, and the firing path produces a
+/// `(TimerId, ShardId)`, and the firing path produces a
 /// [`ShardScopedInput`] envelope targeting that shard.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
     Set {
         /// Hosted shard that owns this timer.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Logical timer identifier (state-machine-side).
         id: TimerId,
         /// How long until the timer should fire.
@@ -109,7 +109,7 @@ pub enum TimerOp {
     /// Cancel a previously set timer.
     Cancel {
         /// Hosted shard that owns this timer.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Logical timer identifier to cancel.
         id: TimerId,
     },
@@ -119,7 +119,7 @@ pub enum TimerOp {
 /// pushes onto its event channel. Every variant produces a
 /// [`ShardEvent::Shard`] envelope tagged with the owning shard.
 #[must_use]
-pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> ShardEvent {
+pub fn timer_event(id: &TimerId, shard: ShardId) -> ShardEvent {
     match id {
         TimerId::ViewChange => ShardEvent::protocol(shard, ProtocolEvent::ViewChangeTimer),
         TimerId::Cleanup => ShardEvent::protocol(shard, ProtocolEvent::CleanupTimer),
@@ -143,11 +143,7 @@ pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> ShardEvent {
 /// failure is silently ignored by design (the only failure mode is the
 /// receiver having been dropped at shutdown, in which case there's
 /// nothing to do).
-pub(crate) fn push_shard_input(
-    tx: &Sender<ShardEvent>,
-    shard: ShardGroupId,
-    input: ShardScopedInput,
-) {
+pub(crate) fn push_shard_input(tx: &Sender<ShardEvent>, shard: ShardId, input: ShardScopedInput) {
     let _ = tx.send(ShardEvent::shard(shard, input));
 }
 
@@ -155,11 +151,7 @@ pub(crate) fn push_shard_input(
 /// [`ShardScopedInput::Protocol`]) into the event channel.
 /// The receiver fans the event across every hosted vnode in `shard`.
 /// See [`push_shard_input`] for the drop-on-shutdown convention.
-pub(crate) fn push_protocol_event(
-    tx: &Sender<ShardEvent>,
-    shard: ShardGroupId,
-    event: ProtocolEvent,
-) {
+pub(crate) fn push_protocol_event(tx: &Sender<ShardEvent>, shard: ShardId, event: ProtocolEvent) {
     let _ = tx.send(ShardEvent::protocol(shard, event));
 }
 
@@ -203,7 +195,7 @@ where
     /// Shard this loop drives. Mirrors the key in `NodeHost::shards`;
     /// held inline so methods on `ShardLoop` can self-identify without a
     /// parent-map lookup.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// Process-scoped resources shared with every other hosted shard:
     /// network adapter, dispatch pool, tx validator, topology snapshot,
     /// dispatch handles, event sender. Cloned `Arc` so off-thread
@@ -238,7 +230,7 @@ where
     /// fills until its count cap or time window expires, then flushes
     /// as a single batched gossip message published to the destination
     /// shard's topic.
-    pub outbound_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
+    pub outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<RoutableTransaction>>>,
     /// Size cap for new tx-gossip accumulators.
     pub tx_gossip_max: usize,
     /// Time window for new tx-gossip accumulators.
@@ -491,7 +483,7 @@ where
         if self.io.certified_header_batch.is_expired(now) {
             self.flush_certified_header_verifications();
         }
-        let expired_dsts: Vec<ShardGroupId> = self
+        let expired_dsts: Vec<ShardId> = self
             .outbound_gossip_batches
             .iter()
             .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
@@ -507,7 +499,7 @@ where
         self.flush_block_commits();
         self.flush_validation_batch();
         self.flush_certified_header_verifications();
-        let dsts: Vec<ShardGroupId> = self.outbound_gossip_batches.keys().copied().collect();
+        let dsts: Vec<ShardId> = self.outbound_gossip_batches.keys().copied().collect();
         for dst in dsts {
             self.flush_tx_gossip_batch(dst);
         }

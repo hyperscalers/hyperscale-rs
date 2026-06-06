@@ -295,15 +295,15 @@ mod tests {
 
     use hyperscale_types::{
         BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        NetworkDefinition, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
+        NetworkDefinition, RETENTION_HORIZON, ShardId, SignerBitfield, TxHash, TxOutcome,
         ValidatorId, bls_keypair_from_seed, exec_vote_message, zero_bls_signature,
     };
     use proptest::collection::vec as prop_vec;
 
     use super::*;
 
-    fn shard() -> ShardGroupId {
-        ShardGroupId::ROOT
+    fn shard() -> ShardId {
+        ShardId::ROOT
     }
 
     fn wave(height: u64) -> WaveId {
@@ -350,7 +350,7 @@ mod tests {
             &NetworkDefinition::simulator(),
             anchor_ts,
             &wave_id,
-            wave_id.shard_group_id(),
+            wave_id.shard_id(),
             &global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
         );

@@ -259,8 +259,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BlockHash, LeafIndex, ShardGroupId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        Stake, StakePoolId,
+        BlockHash, LeafIndex, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, Stake,
+        StakePoolId,
     };
 
     fn sample_witness(leaf_index: u64) -> ShardWitness {
@@ -270,7 +270,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(1_000),
             },
             proof: ShardWitnessProof {
-                shard_id: ShardGroupId::ROOT,
+                shard_id: ShardId::ROOT,
                 committed_block_hash: BlockHash::ZERO,
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: Vec::new().into(),

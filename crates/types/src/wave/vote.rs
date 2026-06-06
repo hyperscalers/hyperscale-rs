@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    BoundedVec, GlobalReceiptRoot, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardGroupId, TxOutcome,
+    BoundedVec, GlobalReceiptRoot, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TxOutcome,
     ValidatorId, Verified, Verify, VotePower, WaveId, WeightedTimestamp,
     batch_verify_bls_same_message, compute_global_receipt_root, exec_vote_message,
     verify_bls12381_v1,
@@ -28,7 +28,7 @@ pub struct ExecutionVote {
     block_height: BlockHeight,
     vote_anchor_ts: WeightedTimestamp,
     wave_id: WaveId,
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     global_receipt_root: GlobalReceiptRoot,
     tx_count: u32,
     tx_outcomes: BoundedVec<TxOutcome, MAX_TXS_PER_BLOCK>,
@@ -49,7 +49,7 @@ impl ExecutionVote {
         block_height: BlockHeight,
         vote_anchor_ts: WeightedTimestamp,
         wave_id: WaveId,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         global_receipt_root: GlobalReceiptRoot,
         tx_count: u32,
         tx_outcomes: Vec<TxOutcome>,
@@ -61,7 +61,7 @@ impl ExecutionVote {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             global_receipt_root,
             tx_count,
             tx_outcomes: tx_outcomes.into(),
@@ -101,8 +101,8 @@ impl ExecutionVote {
 
     /// Which shard produced this vote.
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.shard_group_id
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Merkle root over per-tx outcome leaves.
@@ -151,7 +151,7 @@ impl ExecutionVote {
         BlockHeight,
         WeightedTimestamp,
         WaveId,
-        ShardGroupId,
+        ShardId,
         GlobalReceiptRoot,
         u32,
         Vec<TxOutcome>,
@@ -163,7 +163,7 @@ impl ExecutionVote {
             self.block_height,
             self.vote_anchor_ts,
             self.wave_id,
-            self.shard_group_id,
+            self.shard_id,
             self.global_receipt_root,
             self.tx_count,
             self.tx_outcomes.into_inner(),
@@ -182,7 +182,7 @@ impl ExecutionVote {
             network,
             self.vote_anchor_ts,
             &self.wave_id,
-            self.shard_group_id,
+            self.shard_id,
             &self.global_receipt_root,
             self.tx_count,
         )
@@ -274,7 +274,7 @@ impl Verified<ExecutionVote> {
         block_height: BlockHeight,
         vote_anchor_ts: WeightedTimestamp,
         wave_id: WaveId,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         tx_outcomes: Vec<TxOutcome>,
         validator: ValidatorId,
         signing_key: &Bls12381G1PrivateKey,
@@ -285,7 +285,7 @@ impl Verified<ExecutionVote> {
             network,
             vote_anchor_ts,
             &wave_id,
-            shard_group_id,
+            shard_id,
             &global_receipt_root,
             tx_count,
         );
@@ -300,7 +300,7 @@ impl Verified<ExecutionVote> {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             global_receipt_root,
             tx_count,
             tx_outcomes,
@@ -410,11 +410,11 @@ mod tests {
             BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             WaveId::new(
-                ShardGroupId::leaf(1, 0),
+                ShardId::leaf(1, 0),
                 BlockHeight::new(7),
-                std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
+                std::iter::once(ShardId::leaf(1, 1)).collect(),
             ),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
             u32::try_from(outcomes.len()).unwrap(),
             outcomes,
@@ -441,18 +441,18 @@ mod tests {
         let block_height = BlockHeight::new(7);
         let vote_anchor_ts = WeightedTimestamp::from_millis(11);
         let wave_id = WaveId::new(
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             BlockHeight::new(7),
-            std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
+            std::iter::once(ShardId::leaf(1, 1)).collect(),
         );
-        let shard_group_id = ShardGroupId::leaf(1, 0);
+        let shard_id = ShardId::leaf(1, 0);
         let global_receipt_root = compute_global_receipt_root(&outcomes);
         let tx_count = u32::try_from(outcomes.len()).unwrap();
         let message = exec_vote_message(
             network,
             vote_anchor_ts,
             &wave_id,
-            shard_group_id,
+            shard_id,
             &global_receipt_root,
             tx_count,
         );
@@ -462,7 +462,7 @@ mod tests {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             global_receipt_root,
             tx_count,
             outcomes,
@@ -504,7 +504,7 @@ mod tests {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             _root,
             tx_count,
             tx_outcomes,
@@ -518,7 +518,7 @@ mod tests {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             bogus_root,
             tx_count,
             tx_outcomes,
@@ -615,7 +615,7 @@ mod tests {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             _root,
             tx_count,
             tx_outcomes,
@@ -627,7 +627,7 @@ mod tests {
             block_height,
             vote_anchor_ts,
             wave_id,
-            shard_group_id,
+            shard_id,
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"bogus")),
             tx_count,
             tx_outcomes,
@@ -663,11 +663,11 @@ mod tests {
             BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             WaveId::new(
-                ShardGroupId::leaf(1, 0),
+                ShardId::leaf(1, 0),
                 BlockHeight::new(7),
-                std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
+                std::iter::once(ShardId::leaf(1, 1)).collect(),
             ),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             vec![sample_outcome(1)],
             ValidatorId::new(3),
             &sk,
@@ -697,7 +697,7 @@ mod tests {
         enc.encode(&vote.block_height).unwrap();
         enc.encode(&vote.vote_anchor_ts).unwrap();
         enc.encode(&vote.wave_id).unwrap();
-        enc.encode(&vote.shard_group_id).unwrap();
+        enc.encode(&vote.shard_id).unwrap();
         enc.encode(&vote.global_receipt_root).unwrap();
         enc.encode(&vote.tx_count).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();

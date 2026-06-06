@@ -15,7 +15,7 @@ use sbor::prelude::*;
 
 use crate::{
     BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, GenesisConfigHash, Hash,
-    NetworkDefinition, Randomness, SHARD_CAPACITY, ShardGroupId, Stake, StakePoolId, ValidatorId,
+    NetworkDefinition, Randomness, SHARD_CAPACITY, ShardId, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -116,7 +116,7 @@ pub struct BeaconGenesisConfig {
     /// Explicit initial per-shard committees. Members of each shard
     /// get `OnShard { ready: true, placed_at_epoch: GENESIS }` —
     /// presumed synced by construction at chain bootstrap.
-    pub initial_shard_committees: BTreeMap<ShardGroupId, Vec<ValidatorId>>,
+    pub initial_shard_committees: BTreeMap<ShardId, Vec<ValidatorId>>,
     /// Seed for the very first epoch's randomness. Mixed straight into
     /// `state.randomness`; subsequent slots roll it through accepted
     /// VRF outputs.
@@ -167,7 +167,7 @@ mod tests {
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let validators = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),

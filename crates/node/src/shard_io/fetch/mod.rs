@@ -19,7 +19,7 @@ use std::time::Instant;
 use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
 };
-use hyperscale_types::{MessageClass, ShardGroupId, ValidatorId};
+use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use tracing::{debug, trace};
 
 pub mod beacon_proposal_serve;
@@ -67,7 +67,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
         /// Shard whose committee answers — forwarded as the routing
         /// argument to `Network::request`.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Canonical-source hint passed to `Network::request`. `None` lets
         /// the network's health-weighted rotation pick freely.
         preferred: Option<ValidatorId>,
@@ -110,7 +110,7 @@ pub enum FetchOutput<Id> {
         ids: Vec<Id>,
         /// Shard whose committee answers — forwarded as the routing
         /// argument to `Network::request`.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Canonical-source hint forwarded to the network layer.
         preferred: Option<ValidatorId>,
         /// Class override shared by every id in this chunk; chunks are
@@ -121,7 +121,7 @@ pub enum FetchOutput<Id> {
 
 #[derive(Debug)]
 struct Entry {
-    shard: ShardGroupId,
+    shard: ShardId,
     preferred: Option<ValidatorId>,
     class: Option<MessageClass>,
     in_flight: bool,
@@ -147,7 +147,7 @@ enum DropKind {
 /// separate `Send`s (different shards route to different committees,
 /// different preferreds bias different peers, different classes carry
 /// different network urgencies).
-type GroupKey = (ShardGroupId, Option<ValidatorId>, Option<MessageClass>);
+type GroupKey = (ShardId, Option<ValidatorId>, Option<MessageClass>);
 
 /// Id-keyed fetch state machine.
 pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
@@ -221,7 +221,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     fn handle_request(
         &mut self,
         ids: Vec<Id>,
-        shard: ShardGroupId,
+        shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
     ) -> Vec<FetchOutput<Id>> {
@@ -373,7 +373,7 @@ mod tests {
         }
     }
 
-    const SHARD: ShardGroupId = ShardGroupId::ROOT;
+    const SHARD: ShardId = ShardId::ROOT;
 
     #[test]
     fn request_emits_chunked_sends() {

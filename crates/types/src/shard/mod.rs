@@ -45,7 +45,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
         Bls12381G2Signature, BoundedVec, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
         StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
         WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
         routable_from_notarized_v1, sign_and_notarize,
@@ -54,10 +54,10 @@ mod tests {
     #[test]
     fn test_block_header_hash_deterministic() {
         let header = BlockHeader::new(
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -81,11 +81,7 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(
-            ShardGroupId::leaf(1, 0),
-            ValidatorId::new(0),
-            StateRoot::ZERO,
-        );
+        let genesis = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight::new(0));
@@ -93,7 +89,7 @@ mod tests {
         assert_eq!(genesis.header().transaction_root(), TransactionRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc(),
-            &QuorumCertificate::genesis(ShardGroupId::leaf(1, 0))
+            &QuorumCertificate::genesis(ShardId::leaf(1, 0))
         );
     }
 
@@ -134,9 +130,9 @@ mod tests {
         let make_fw = |seed: u8| -> Arc<Verifiable<FinalizedWave>> {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(
-                    ShardGroupId::leaf(1, 0),
+                    ShardId::leaf(1, 0),
                     BlockHeight::new(10),
-                    BTreeSet::from([ShardGroupId::leaf(1, 1)]),
+                    BTreeSet::from([ShardId::leaf(1, 1)]),
                 ),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
@@ -155,9 +151,9 @@ mod tests {
                 FinalizedWave::new(
                     Arc::new(WaveCertificate::new(
                         WaveId::new(
-                            ShardGroupId::leaf(1, 0),
+                            ShardId::leaf(1, 0),
                             BlockHeight::new(10),
-                            BTreeSet::from([ShardGroupId::leaf(1, 1)]),
+                            BTreeSet::from([ShardId::leaf(1, 1)]),
                         ),
                         vec![ec],
                     )),
@@ -177,11 +173,7 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_single_cert() {
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(
-                ShardGroupId::leaf(1, 0),
-                BlockHeight::new(10),
-                BTreeSet::new(),
-            ),
+            WaveId::new(ShardId::leaf(1, 0), BlockHeight::new(10), BTreeSet::new()),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome::new(
@@ -194,11 +186,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate::new(
-            WaveId::new(
-                ShardGroupId::leaf(1, 0),
-                BlockHeight::new(10),
-                BTreeSet::new(),
-            ),
+            WaveId::new(ShardId::leaf(1, 0), BlockHeight::new(10), BTreeSet::new()),
             vec![ec],
         ));
         let expected_receipt_hash = cert.receipt_hash();
@@ -211,11 +199,7 @@ mod tests {
 
     #[test]
     fn test_genesis_certificate_root_is_zero() {
-        let genesis = Block::genesis(
-            ShardGroupId::leaf(1, 0),
-            ValidatorId::new(0),
-            StateRoot::ZERO,
-        );
+        let genesis = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
         assert_eq!(genesis.header().certificate_root(), CertificateRoot::ZERO);
     }
 
@@ -228,16 +212,13 @@ mod tests {
         // Forge a non-genesis block paired with a genesis QC. Without the
         // pairing check at decode this slips past the synced-block apply
         // path's `qc.is_genesis()` quorum-power bypass.
-        let mut bad_block = Block::genesis(
-            ShardGroupId::leaf(1, 0),
-            ValidatorId::new(0),
-            StateRoot::ZERO,
-        )
-        .into_sealed()
-        .into_live(Arc::new(BoundedVec::new()));
+        let mut bad_block =
+            Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO)
+                .into_sealed()
+                .into_live(Arc::new(BoundedVec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
             *header = BlockHeader::new(
-                header.shard_group_id(),
+                header.shard_id(),
                 BlockHeight::new(7),
                 header.parent_block_hash(),
                 header.parent_qc().clone(),
@@ -257,7 +238,7 @@ mod tests {
                 header.beacon_witness_leaf_count(),
             );
         }
-        let genesis_qc = QuorumCertificate::genesis(ShardGroupId::leaf(1, 0));
+        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0));
         let bytes = basic_encode(&CertifiedBlockWire {
             block: bad_block,
             qc: genesis_qc,

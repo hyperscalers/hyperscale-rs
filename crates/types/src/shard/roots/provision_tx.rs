@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     BoundedBTreeMap, Hash, MAX_REMOTE_SHARDS_PER_WAVE, ProvisionTxRoot, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, Verifiable, Verified, Verify, compute_merkle_root,
+    ShardId, TopologySnapshot, Verifiable, Verified, Verify, compute_merkle_root,
 };
 
 /// Inputs the provision-tx-roots verifier reads against.
@@ -16,7 +16,7 @@ pub struct ProvisionTxRootsContext<'a> {
     /// Source shard the block belongs to — excluded from the per-target
     /// fan-out so each shard's own provision-tx root isn't included in
     /// its own map.
-    pub local_shard: ShardGroupId,
+    pub local_shard: ShardId,
     /// Topology snapshot anchoring shard routing — drives which target
     /// shards each cross-shard tx contributes to.
     pub topology: &'a TopologySnapshot,
@@ -29,7 +29,7 @@ pub struct ProvisionTxRootsContext<'a> {
 /// Type alias rather than a separate newtype because the bound `MAX_REMOTE_SHARDS_PER_WAVE`
 /// is invariant across every site that touches this map.
 pub type ProvisionTxRootsMap =
-    BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>;
+    BoundedBTreeMap<ShardId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>;
 
 /// Failure modes of provision-tx-roots verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -39,9 +39,9 @@ pub enum ProvisionTxRootsVerifyError {
     #[error("computed provision_tx_roots {computed:?} ≠ claimed {expected:?}")]
     Mismatch {
         /// Header's claimed per-target-shard provision-tx roots.
-        expected: BTreeMap<ShardGroupId, ProvisionTxRoot>,
+        expected: BTreeMap<ShardId, ProvisionTxRoot>,
         /// Map computed from the supplied transactions.
-        computed: BTreeMap<ShardGroupId, ProvisionTxRoot>,
+        computed: BTreeMap<ShardId, ProvisionTxRoot>,
     },
 }
 
@@ -72,11 +72,11 @@ impl Verified<ProvisionTxRootsMap> {
     /// more shards than the consensus configuration allows.
     #[must_use]
     pub fn compute(
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         topology: &TopologySnapshot,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Self {
-        let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
+        let mut per_target: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
 
         for tx in transactions {
             if topology.is_single_shard_transaction(tx) {
@@ -93,7 +93,7 @@ impl Verified<ProvisionTxRootsMap> {
             }
         }
 
-        let map: BTreeMap<ShardGroupId, ProvisionTxRoot> = per_target
+        let map: BTreeMap<ShardId, ProvisionTxRoot> = per_target
             .into_iter()
             .map(|(shard, hashes)| {
                 (

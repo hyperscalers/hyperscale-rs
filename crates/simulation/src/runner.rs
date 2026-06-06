@@ -30,7 +30,7 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, LocalTimestamp,
-    MIN_STAKE_FLOOR, NodeId, Randomness, ShardGroupId, Stake, StakePoolId, TopologySnapshot,
+    MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified, VotePower,
     bls_keypair_from_seed, genesis_config_hash, shard_for_node,
 };
@@ -89,7 +89,7 @@ pub struct SimulationRunner {
 
     /// Timer registry for cancellation support.
     /// Maps `(node, timer_id) -> event_key` for removal.
-    timers: HashMap<(NodeIndex, ShardGroupId, TimerId), EventKey>,
+    timers: HashMap<(NodeIndex, ShardId, TimerId), EventKey>,
 
     /// Statistics.
     stats: SimulationStats,
@@ -191,10 +191,10 @@ impl SimulationRunner {
         let global_validator_set = ValidatorSet::new(global_validators);
 
         // Build per-shard committee mappings
-        let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
         let shard_depth = network_config.num_shards.trailing_zeros();
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
+            let shard = ShardId::leaf(shard_depth, u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
             let shard_end = shard_start + network_config.validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
@@ -236,11 +236,10 @@ impl SimulationRunner {
                 u64::from(total_validators.min(chain_config.beacon_committee_size));
             let initial_beacon_committee: Vec<ValidatorId> =
                 (0..beacon_committee_size).map(ValidatorId::new).collect();
-            let initial_shard_committees: BTreeMap<ShardGroupId, Vec<ValidatorId>> =
-                shard_committees
-                    .iter()
-                    .map(|(s, v)| (*s, v.clone()))
-                    .collect();
+            let initial_shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = shard_committees
+                .iter()
+                .map(|(s, v)| (*s, v.clone()))
+                .collect();
             let config = BeaconGenesisConfig {
                 chain_config,
                 initial_validators,
@@ -268,7 +267,7 @@ impl SimulationRunner {
             // Group this host's vnodes by shard. For cross-shard
             // hosting each group has one vnode; for same-shard hosting
             // there's one group per host with `vnodes_per_host` entries.
-            let mut by_shard: BTreeMap<ShardGroupId, Vec<u32>> = BTreeMap::new();
+            let mut by_shard: BTreeMap<ShardId, Vec<u32>> = BTreeMap::new();
             for &(validator_idx, shard) in host_vnodes {
                 by_shard.entry(shard).or_default().push(validator_idx);
             }
@@ -279,7 +278,7 @@ impl SimulationRunner {
             // `OutboundProvisionTracker` from evicting entries the target
             // shard's inbound coordinator still needs to verify proposals
             // against.
-            let mut shard_stores: HashMap<ShardGroupId, ShardStoreBundle> = HashMap::new();
+            let mut shard_stores: HashMap<ShardId, ShardStoreBundle> = HashMap::new();
             for shard in by_shard.keys() {
                 shard_stores.insert(
                     *shard,
@@ -366,14 +365,14 @@ impl SimulationRunner {
             let executor = RadixExecutor::new(network_def);
 
             // One `SimShardStorage` per hosted shard on this host.
-            let storages: HashMap<ShardGroupId, SimShardStorage> = by_shard
+            let storages: HashMap<ShardId, SimShardStorage> = by_shard
                 .keys()
                 .map(|s| (*s, SimShardStorage::new()))
                 .collect();
             // Single receiver per host: every hosted shard's sender is a
             // clone of the same `event_tx`, and the harness drains all
             // shards through `event_rx` deterministically.
-            let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> =
+            let shard_event_senders: HashMap<ShardId, Sender<ShardEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
                 vnode_inits,
@@ -601,7 +600,7 @@ impl SimulationRunner {
             self.network.config().validators_per_shard / self.network.config().vnodes_per_host;
 
         // Pre-group balances by shard so we don't re-filter for every node.
-        let mut balances_by_shard: HashMap<ShardGroupId, Vec<_>> = HashMap::new();
+        let mut balances_by_shard: HashMap<ShardId, Vec<_>> = HashMap::new();
         for (address, balance) in balances {
             let radix_node_id = address.into_node_id();
             let det_node_id = NodeId(radix_node_id.0[..30].try_into().unwrap());
@@ -615,7 +614,7 @@ impl SimulationRunner {
         // Each node receives only its own shard's balances. Build one
         // GenesisConfig per shard up-front; the engine cache then memoizes
         // the merged DatabaseUpdates per unique config across the process.
-        let configs_by_shard: HashMap<ShardGroupId, GenesisConfig> = balances_by_shard
+        let configs_by_shard: HashMap<ShardId, GenesisConfig> = balances_by_shard
             .into_iter()
             .map(|(shard_id, shard_balances)| {
                 let config = GenesisConfig {
@@ -629,11 +628,10 @@ impl SimulationRunner {
 
         let shard_depth = self.network.config().num_shards.trailing_zeros();
         for shard_idx in 0..self.network.config().num_shards {
-            let shard_id = ShardGroupId::leaf(shard_depth, u64::from(shard_idx));
+            let shard_id = ShardId::leaf(shard_depth, u64::from(shard_idx));
             let config = configs_by_shard.get(&shard_id).unwrap_or(&empty_config);
             self.install_engine_genesis(config, |node_idx| {
-                ShardGroupId::leaf(shard_depth, node_idx as u64 / u64::from(hosts_per_shard))
-                    == shard_id
+                ShardId::leaf(shard_depth, node_idx as u64 / u64::from(hosts_per_shard)) == shard_id
             });
         }
 
@@ -659,7 +657,7 @@ impl SimulationRunner {
             if self.genesis_executed[node_idx] || !select(node_idx) {
                 continue;
             }
-            let hosted: Vec<ShardGroupId> = self.hosts[node_idx].hosted_shards().collect();
+            let hosted: Vec<ShardId> = self.hosts[node_idx].hosted_shards().collect();
             for shard in hosted {
                 self.hosts[node_idx].install_engine_genesis(shard, config);
             }
@@ -682,7 +680,7 @@ impl SimulationRunner {
         let shard_depth = num_shards.trailing_zeros();
 
         for shard_id in 0..num_shards {
-            let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
+            let shard = ShardId::leaf(shard_depth, u64::from(shard_id));
 
             // Hosts that carry at least one vnode in this shard.
             let num_hosts =
@@ -972,7 +970,7 @@ impl SimulationRunner {
 /// - [`HostingMode::CrossShard`]: hosts are `validators_per_shard`.
 ///   Host `h` carries one validator from every shard — specifically
 ///   `{s * validators_per_shard + h : s in 0..num_shards}`.
-fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
+fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardId)>> {
     match config.hosting_mode {
         HostingMode::SameShardBundled => {
             assert_eq!(
@@ -984,11 +982,11 @@ fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
             let shard_depth = config.num_shards.trailing_zeros();
             let mut layout = Vec::with_capacity((config.num_shards * hosts_per_shard) as usize);
             for shard_id in 0..config.num_shards {
-                let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
+                let shard = ShardId::leaf(shard_depth, u64::from(shard_id));
                 for h in 0..hosts_per_shard {
                     let host_first_validator =
                         shard_id * config.validators_per_shard + h * config.vnodes_per_host;
-                    let host_vnodes: Vec<(u32, ShardGroupId)> = (0..config.vnodes_per_host)
+                    let host_vnodes: Vec<(u32, ShardId)> = (0..config.vnodes_per_host)
                         .map(|v| (host_first_validator + v, shard))
                         .collect();
                     layout.push(host_vnodes);
@@ -1000,10 +998,10 @@ fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
             let shard_depth = config.num_shards.trailing_zeros();
             let mut layout = Vec::with_capacity(config.validators_per_shard as usize);
             for h in 0..config.validators_per_shard {
-                let host_vnodes: Vec<(u32, ShardGroupId)> = (0..config.num_shards)
+                let host_vnodes: Vec<(u32, ShardId)> = (0..config.num_shards)
                     .map(|s| {
                         let validator_idx = s * config.validators_per_shard + h;
-                        (validator_idx, ShardGroupId::leaf(shard_depth, u64::from(s)))
+                        (validator_idx, ShardId::leaf(shard_depth, u64::from(s)))
                     })
                     .collect();
                 layout.push(host_vnodes);

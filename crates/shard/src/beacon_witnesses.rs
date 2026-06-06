@@ -13,7 +13,7 @@
 //! and let proposer + verifier share them verbatim.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, Hash, ShardGroupId, ShardWitnessPayload,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, Hash, ShardId, ShardWitnessPayload,
     StoredReceipt, TopologySnapshot, compute_merkle_root, derive_leaves,
     missed_proposals_since_prev_commit,
 };
@@ -129,7 +129,7 @@ pub fn prospective_parent_witness_leaves(
     committed_hash: BlockHash,
     parent_block_hash: BlockHash,
     pending_blocks: &PendingBlocks,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     topology: &TopologySnapshot,
 ) -> Result<Vec<Hash>, BlockHash> {
     let committed_leaves = accumulator.leaves();
@@ -263,7 +263,7 @@ mod tests {
     fn missed_proposals_empty_when_no_skipped_rounds() {
         let topo = topology();
         let missed = missed_proposals_since_prev_commit(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(5),
             Round::INITIAL,
             Round::INITIAL.next(),
@@ -278,7 +278,7 @@ mod tests {
         let parent_round = Round::INITIAL;
         let committed_round = Round::new(parent_round.inner() + 3);
         let missed = missed_proposals_since_prev_commit(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(5),
             parent_round,
             committed_round,
@@ -305,7 +305,7 @@ mod tests {
     fn derive_leaves_orders_sources_canonically() {
         let topo = topology();
         let missed = missed_proposals_since_prev_commit(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(5),
             Round::INITIAL,
             Round::new(Round::INITIAL.inner() + 2),
@@ -333,7 +333,7 @@ mod tests {
     fn derive_leaves_byte_identical_across_runs() {
         let topo = topology();
         let missed = missed_proposals_since_prev_commit(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(9),
             Round::INITIAL,
             Round::new(Round::INITIAL.inner() + 4),

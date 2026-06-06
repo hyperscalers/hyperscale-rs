@@ -17,9 +17,7 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{
-    BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
-};
+use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardId, ValidatorId};
 
 use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
@@ -39,7 +37,7 @@ where
     /// shard whose certified headers we're catching up on.
     pub(in crate::shard_loop) fn process_start_remote_header_sync(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         target: BlockHeight,
     ) {
         let outputs = self
@@ -62,7 +60,7 @@ where
     /// it can defer the short-capped tail.
     pub(in crate::shard_loop) fn handle_remote_headers_response_received(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
         headers: Vec<CertifiedBlockHeader>,
@@ -89,10 +87,10 @@ where
                 );
                 continue;
             }
-            if header.shard_group_id() != source_shard {
+            if header.shard_id() != source_shard {
                 tracing::warn!(
                     source_shard = source_shard.inner(),
-                    response_shard = header.shard_group_id().inner(),
+                    response_shard = header.shard_id().inner(),
                     height = h.inner(),
                     "remote-header sync: response contained wrong-shard header — discarding"
                 );
@@ -124,7 +122,7 @@ where
     /// Network callback: a range fetch failed.
     pub(in crate::shard_loop) fn handle_remote_headers_fetch_failed(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
         kind: FetchFailureKind,

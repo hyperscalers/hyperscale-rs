@@ -7,7 +7,7 @@ use std::sync::Arc;
 use sbor::prelude::*;
 
 use crate::{
-    Attempt, BlockHeight, Hash, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId,
+    Attempt, BlockHeight, Hash, RoutableTransaction, ShardId, TopologySnapshot, ValidatorId,
     Verifiable, WaveId,
 };
 
@@ -22,18 +22,18 @@ use crate::{
 /// Used in both block proposal (to populate `BlockHeader::waves`) and
 /// validation (to verify the header's waves field).
 pub fn compute_waves(
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     topology: &TopologySnapshot,
     block_height: BlockHeight,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
 ) -> Vec<WaveId> {
-    let mut remote_shard_sets: BTreeSet<BTreeSet<ShardGroupId>> = BTreeSet::new();
+    let mut remote_shard_sets: BTreeSet<BTreeSet<ShardId>> = BTreeSet::new();
 
     for tx in transactions {
         if topology.is_single_shard_transaction(tx) {
             continue;
         }
-        let remote_shards: BTreeSet<ShardGroupId> = topology
+        let remote_shards: BTreeSet<ShardId> = topology
             .all_shards_for_transaction(tx)
             .into_iter()
             .filter(|&s| s != local_shard)

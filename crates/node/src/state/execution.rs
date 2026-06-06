@@ -92,11 +92,11 @@ impl NodeStateMachine {
                 // If the EC is for a remote wave where we were a source, the
                 // target shard's tx_outcomes acknowledge outbound batches we
                 // sent. Surface the ACK to the outbound tracker.
-                if certificate.shard_group_id() != local_shard
+                if certificate.shard_id() != local_shard
                     && certificate.wave_id().remote_shards().contains(&local_shard)
                 {
                     actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
-                        target_shard: certificate.shard_group_id(),
+                        target_shard: certificate.shard_id(),
                         tx_outcomes: certificate.tx_outcomes().clone(),
                     }));
                 }
@@ -120,16 +120,16 @@ mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
         BlockHeight, Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome,
-        GlobalReceiptRoot, LocalTimestamp, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
-        Verified, WaveId, WeightedTimestamp,
+        GlobalReceiptRoot, LocalTimestamp, ShardId, SignerBitfield, TxHash, TxOutcome, Verified,
+        WaveId, WeightedTimestamp,
     };
 
     use super::super::test_support::TestNode;
     use crate::{assert_no_emit, extract_one};
 
     fn make_ec(
-        shard: ShardGroupId,
-        remote_shards: BTreeSet<ShardGroupId>,
+        shard: ShardId,
+        remote_shards: BTreeSet<ShardId>,
         height: BlockHeight,
         outcomes: Vec<TxOutcome>,
     ) -> Arc<Verified<ExecutionCertificate>> {
@@ -155,9 +155,9 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::ROOT);
+        remote_shards.insert(ShardId::ROOT);
         let ec = make_ec(
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 1),
             remote_shards,
             BlockHeight::new(1),
             vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
@@ -177,26 +177,21 @@ mod tests {
             tx_outcomes,
         }) = cont
         {
-            assert_eq!(*target_shard, ShardGroupId::leaf(1, 1));
+            assert_eq!(*target_shard, ShardId::leaf(1, 1));
             assert_eq!(tx_outcomes.len(), 1);
         } else {
             unreachable!()
         }
     }
 
-    /// Same-shard EC: the EC's `shard_group_id` matches local, so the
+    /// Same-shard EC: the EC's `shard_id` matches local, so the
     /// "remote ack" path doesn't apply and no `OutboundEcObserved`
     /// continuation must be emitted.
     #[test]
     fn execution_certificate_admitted_skips_continuation_for_same_shard_ec() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let ec = make_ec(
-            ShardGroupId::ROOT,
-            BTreeSet::new(),
-            BlockHeight::new(1),
-            vec![],
-        );
+        let ec = make_ec(ShardId::ROOT, BTreeSet::new(), BlockHeight::new(1), vec![]);
 
         let actions = node.handle(
             LocalTimestamp::ZERO,
@@ -219,9 +214,9 @@ mod tests {
         // EC on one leaf, dependencies on its sibling; the local root shard
         // is not in the set.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::leaf(1, 1));
+        remote_shards.insert(ShardId::leaf(1, 1));
         let ec = make_ec(
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             remote_shards,
             BlockHeight::new(1),
             vec![],

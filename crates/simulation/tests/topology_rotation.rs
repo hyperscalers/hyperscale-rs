@@ -20,9 +20,7 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Epoch, SHUFFLE_INTERVAL_EPOCHS, ShardGroupId,
-};
+use hyperscale_types::{BeaconChainConfig, BlockHeight, Epoch, SHUFFLE_INTERVAL_EPOCHS, ShardId};
 use tracing_test::traced_test;
 
 /// 2-second epochs: short enough to reach the shuffle within the run window,
@@ -64,7 +62,7 @@ const fn shard_hosts(shard: u32) -> Range<u32> {
 fn highest_verified_committee_epoch(
     runner: &SimulationRunner,
     verifier_hosts: Range<u32>,
-    source_shard: ShardGroupId,
+    source_shard: ShardId,
     max_height: u64,
 ) -> Option<u64> {
     let mut best: Option<u64> = None;
@@ -151,7 +149,7 @@ fn cross_shard_verification_survives_a_committee_rotation() {
     // proves every verifier resolved the rotated set from the header's WT (the
     // pre-shuffle set's signer bitfield would misalign) across a real rotation.
     for (verifier, source) in [(1u32, 0u32), (0u32, 1u32)] {
-        let source_shard = ShardGroupId::leaf(1, u64::from(source));
+        let source_shard = ShardId::leaf(1, u64::from(source));
         let source_tip = max_committed_height(&runner, shard_hosts(source));
         let epoch = highest_verified_committee_epoch(
             &runner,

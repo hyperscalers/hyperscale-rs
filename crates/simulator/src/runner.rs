@@ -18,7 +18,7 @@ use hyperscale_spammer::{
     WorkloadGenerator,
 };
 use hyperscale_types::{
-    RoutableTransaction, ShardGroupId, TransactionDecision, TransactionStatus, TxHash,
+    RoutableTransaction, ShardId, TransactionDecision, TransactionStatus, TxHash,
     WeightedTimestamp, shard_for_node,
 };
 use radix_common::math::Decimal;
@@ -55,7 +55,7 @@ pub struct Simulator {
     rng: ChaCha8Rng,
 
     /// Tracks in-flight transactions: `hash -> (submit_time, target_shard)`.
-    in_flight: HashMap<TxHash, (Duration, ShardGroupId)>,
+    in_flight: HashMap<TxHash, (Duration, ShardId)>,
 
     /// Simulated millisecond clock shared with workload `ValidityClock`s so
     /// generated transactions sit inside the chain's `weighted_timestamp`
@@ -226,7 +226,7 @@ impl Simulator {
     /// Submit funding transactions in batches and wait for completion.
     fn submit_funding_transactions(
         &mut self,
-        txs_by_shard: HashMap<ShardGroupId, Vec<RoutableTransaction>>,
+        txs_by_shard: HashMap<ShardId, Vec<RoutableTransaction>>,
     ) {
         let batch_size = 500;
         let mut total_submitted = 0u64;
@@ -243,7 +243,7 @@ impl Simulator {
             .collect();
 
         for chunk in all_txs.chunks(batch_size) {
-            let mut pending: HashMap<TxHash, ShardGroupId> = HashMap::new();
+            let mut pending: HashMap<TxHash, ShardId> = HashMap::new();
 
             for (shard, tx) in chunk {
                 let hash = tx.hash();
@@ -444,21 +444,21 @@ impl Simulator {
     }
 
     /// Determine the target shard for a transaction.
-    fn get_target_shard(&self, tx: &RoutableTransaction) -> ShardGroupId {
+    fn get_target_shard(&self, tx: &RoutableTransaction) -> ShardId {
         tx.declared_writes().first().map_or_else(
-            || ShardGroupId::leaf(self.config.num_shards.trailing_zeros(), 0),
+            || ShardId::leaf(self.config.num_shards.trailing_zeros(), 0),
             |node_id| shard_for_node(node_id, u64::from(self.config.num_shards)),
         )
     }
 
     /// Get a node index for submitting to a shard (for status checks).
-    fn get_node_for_shard(&self, shard: ShardGroupId) -> u32 {
+    fn get_node_for_shard(&self, shard: ShardId) -> u32 {
         // The shard's flat index in a uniform partition is its trie path.
         u32::try_from(shard.path()).unwrap_or(u32::MAX) * self.config.validators_per_shard
     }
 
     /// Get all node indices in a shard.
-    fn nodes_for_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
+    fn nodes_for_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
         let start =
             u32::try_from(shard.path()).unwrap_or(u32::MAX) * self.config.validators_per_shard;
         let end = start + self.config.validators_per_shard;

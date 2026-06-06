@@ -21,7 +21,7 @@ use hyperscale_types::{
     FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
     NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, StateRoot,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, StateRoot,
     StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot, TransactionRoot,
     TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
     WeightedTimestamp, block_header_message, block_vote_message, certified_block_header_message,
@@ -60,7 +60,7 @@ pub struct QcVerificationResult {
 pub fn verify_and_build_qc(
     network: &NetworkDefinition,
     block_hash: BlockHash,
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     height: BlockHeight,
     round: Round,
     parent_block_hash: BlockHash,
@@ -71,7 +71,7 @@ pub fn verify_and_build_qc(
 ) -> QcVerificationResult {
     let signing_message = block_vote_message(
         network,
-        shard_group_id,
+        shard_id,
         height,
         round,
         &block_hash,
@@ -96,7 +96,7 @@ pub fn verify_and_build_qc(
 
     let qc = Verified::<QuorumCertificate>::from_verified_votes(
         block_hash,
-        shard_group_id,
+        shard_id,
         height,
         round,
         parent_block_hash,
@@ -202,7 +202,7 @@ pub fn build_proposal<S: ShardChainWriter>(
     parent_block_height: BlockHeight,
     transactions: Vec<Arc<Verified<RoutableTransaction>>>,
     certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     topology: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     parent_in_flight: InFlightCount,
@@ -330,7 +330,7 @@ where
     match action {
         Action::VerifyAndBuildQuorumCertificate {
             block_hash,
-            shard_group_id,
+            shard_id,
             height,
             round,
             parent_block_hash,
@@ -343,7 +343,7 @@ where
             let result = verify_and_build_qc(
                 ctx.topology_snapshot.network(),
                 block_hash,
-                shard_group_id,
+                shard_id,
                 height,
                 round,
                 parent_block_hash,
@@ -637,7 +637,7 @@ where
         }
 
         Action::BuildProposal {
-            shard_group_id,
+            shard_id,
             proposer,
             height,
             round,
@@ -673,7 +673,7 @@ where
                 parent_block_height,
                 transactions,
                 finalized_waves.clone(),
-                shard_group_id,
+                shard_id,
                 ctx.topology_snapshot,
                 provisions.clone(),
                 parent_in_flight,
@@ -708,7 +708,7 @@ where
             let block_hash = header.hash();
             let msg = block_header_message(
                 ctx.topology_snapshot.network(),
-                header.shard_group_id(),
+                header.shard_id(),
                 header.height(),
                 header.round(),
                 &block_hash,
@@ -794,7 +794,7 @@ where
         Action::BroadcastCertifiedBlockHeader { certified_header } => {
             let msg = certified_block_header_message(
                 ctx.topology_snapshot.network(),
-                certified_header.header().shard_group_id(),
+                certified_header.header().shard_id(),
                 certified_header.header().height(),
                 &certified_header.header().hash(),
             );
@@ -824,8 +824,8 @@ mod tests {
 
     use super::*;
 
-    fn shard() -> ShardGroupId {
-        ShardGroupId::ROOT
+    fn shard() -> ShardId {
+        ShardId::ROOT
     }
 
     fn net() -> NetworkDefinition {

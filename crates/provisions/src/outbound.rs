@@ -21,8 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, ProvisionHash, Provisions, ShardGroupId, TxHash, TxOutcome, Verified,
-    WeightedTimestamp,
+    BlockHeight, ProvisionHash, Provisions, ShardId, TxHash, TxOutcome, Verified, WeightedTimestamp,
 };
 use tracing::{debug, warn};
 
@@ -37,7 +36,7 @@ pub struct OutboundMemoryStats {
 }
 
 struct OutboundEntry {
-    target_shard: ShardGroupId,
+    target_shard: ShardId,
     source_block_height: BlockHeight,
     pending_txs: HashSet<TxHash>,
     /// Hard deadline past which the provisions are provably useless: every
@@ -94,11 +93,7 @@ impl OutboundProvisionTracker {
     /// local JMT view so the merkle predicate holds. The shared
     /// [`ProvisionStore`] holds raw bodies (wire-serving doesn't carry
     /// the marker), so the body is cloned once at the seam.
-    pub fn on_broadcast(
-        &mut self,
-        provisions: &Arc<Verified<Provisions>>,
-        target_shard: ShardGroupId,
-    ) {
+    pub fn on_broadcast(&mut self, provisions: &Arc<Verified<Provisions>>, target_shard: ShardId) {
         let provision_hash = provisions.hash();
         if self.entries.contains_key(&provision_hash) {
             return;
@@ -142,7 +137,7 @@ impl OutboundProvisionTracker {
     /// Drain every outbound entry awaiting any of `tx_outcomes` from
     /// `target_shard`. Entries whose pending set empties are evicted from
     /// the shared store.
-    pub fn on_ec_observed(&mut self, target_shard: ShardGroupId, tx_outcomes: &[TxOutcome]) {
+    pub fn on_ec_observed(&mut self, target_shard: ShardId, tx_outcomes: &[TxOutcome]) {
         let mut to_evict: Vec<ProvisionHash> = Vec::new();
 
         for outcome in tx_outcomes {
@@ -259,8 +254,8 @@ mod tests {
             .map(|h| ProvisionEntry::new(*h, vec![], vec![], vec![]))
             .collect();
         Arc::new(Verified::new_unchecked_for_test(Provisions::new(
-            ShardGroupId::leaf(2, 0),
-            ShardGroupId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
             source_block,
             MerkleInclusionProof::dummy(),
             transactions,
@@ -289,12 +284,12 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
 
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
         assert!(store.get(provision_hash).is_some());
-        let hit = store.get_outbound(BlockHeight::new(10), ShardGroupId::leaf(2, 1));
+        let hit = store.get_outbound(BlockHeight::new(10), ShardId::leaf(2, 1));
         assert!(hit.is_some());
     }
 
@@ -307,13 +302,13 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
 
-        tracker.on_ec_observed(ShardGroupId::leaf(2, 1), &[executed(a)]);
+        tracker.on_ec_observed(ShardId::leaf(2, 1), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert!(store.get(provision_hash).is_some());
 
-        tracker.on_ec_observed(ShardGroupId::leaf(2, 1), &[executed(b)]);
+        tracker.on_ec_observed(ShardId::leaf(2, 1), &[executed(b)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
         assert!(store.get(provision_hash).is_none());
     }
@@ -326,9 +321,9 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(7), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 2));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 2));
 
-        tracker.on_ec_observed(ShardGroupId::leaf(2, 2), &[aborted(a)]);
+        tracker.on_ec_observed(ShardId::leaf(2, 2), &[aborted(a)]);
         assert!(store.get(provision_hash).is_none());
     }
 
@@ -339,10 +334,10 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(5), &[a]);
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
 
         // EC from a different target shard must not acknowledge these provisions.
-        tracker.on_ec_observed(ShardGroupId::leaf(2, 2), &[executed(a)]);
+        tracker.on_ec_observed(ShardId::leaf(2, 2), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
     }
 
@@ -355,7 +350,7 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(5), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
 
         let past_max = RETENTION_HORIZON + Duration::from_secs(1);
         tracker.on_block_committed(ts(
@@ -372,8 +367,8 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(10), &[a]);
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
-        tracker.on_broadcast(&provisions, ShardGroupId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 1);
     }

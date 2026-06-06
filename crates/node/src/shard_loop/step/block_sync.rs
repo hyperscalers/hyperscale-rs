@@ -439,9 +439,9 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
         Bls12381G2Signature, BoundedVec, CertificateRoot, ConsensusReceipt, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-        Verifiable, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
+        WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -450,10 +450,10 @@ mod tests {
 
     fn header() -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             HEIGHT,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_000),
             Round::INITIAL,
@@ -479,7 +479,7 @@ mod tests {
         local_receipt_root: Option<LocalReceiptRoot>,
     ) -> BlockHeader {
         BlockHeader::new(
-            h.shard_group_id(),
+            h.shard_id(),
             h.height(),
             h.parent_block_hash(),
             h.parent_qc().clone(),
@@ -503,7 +503,7 @@ mod tests {
     fn qc_for(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             block.height(),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -525,11 +525,7 @@ mod tests {
         CertificateRoot,
     ) {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        let wave_id = WaveId::new(
-            ShardGroupId::ROOT,
-            HEIGHT,
-            std::collections::BTreeSet::new(),
-        );
+        let wave_id = WaveId::new(ShardId::ROOT, HEIGHT, std::collections::BTreeSet::new());
         let outcome = TxOutcome::new(
             tx_hash,
             if success {
@@ -615,7 +611,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             block.height(),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -636,7 +632,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(99),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -719,11 +715,7 @@ mod tests {
         // certificate_root and local_receipt_root are computed off the
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx_divergent"));
-        let wave_id = WaveId::new(
-            ShardGroupId::ROOT,
-            HEIGHT,
-            std::collections::BTreeSet::new(),
-        );
+        let wave_id = WaveId::new(ShardId::ROOT, HEIGHT, std::collections::BTreeSet::new());
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),

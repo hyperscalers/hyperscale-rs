@@ -73,7 +73,7 @@ use hyperscale_storage_rocksdb::{
     RocksDbShardStorage,
 };
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, TopologySnapshot, ValidatorId,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardId, TopologySnapshot, ValidatorId,
     ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed, generate_bls_keypair,
 };
 use igd_next::aio::tokio::search_gateway;
@@ -675,7 +675,7 @@ fn build_topology(
     num_shards: u64,
     genesis: &GenesisConfig,
     local_keypairs: &[(ValidatorId, Arc<Bls12381G1PrivateKey>)],
-    fallback_shard: ShardGroupId,
+    fallback_shard: ShardId,
 ) -> Result<Arc<TopologySnapshot>> {
     let lookup_local = |id: ValidatorId| -> Option<&Arc<Bls12381G1PrivateKey>> {
         local_keypairs
@@ -728,9 +728,9 @@ fn build_topology(
     let has_shard_assignments = genesis.validators.iter().any(|v| v.shard.is_some());
 
     if has_shard_assignments {
-        let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
         for v in &genesis.validators {
-            let shard = ShardGroupId::leaf(
+            let shard = ShardId::leaf(
                 num_shards.trailing_zeros(),
                 v.shard.unwrap_or(v.id % num_shards),
             );
@@ -1173,7 +1173,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let hosted_shards: std::collections::BTreeSet<u64> =
         config.vnodes.iter().map(|v| v.shard).collect();
     let shard_depth = config.node.num_shards.trailing_zeros();
-    let mut storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>> = HashMap::new();
+    let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
     for shard in &hosted_shards {
         let db_path = config
             .node
@@ -1183,7 +1183,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         let storage = RocksDbShardStorage::open_with_config(&db_path, &rocksdb_config)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
         info!(shard = shard, path = %db_path.display(), "Storage opened");
-        storages.insert(ShardGroupId::leaf(shard_depth, *shard), Arc::new(storage));
+        storages.insert(ShardId::leaf(shard_depth, *shard), Arc::new(storage));
     }
 
     // Process-level beacon storage, shared across every hosted vnode's
@@ -1213,7 +1213,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     }
 
     // Build the host's single identity-agnostic topology snapshot.
-    let fallback_shard = ShardGroupId::leaf(shard_depth, config.vnodes[0].shard);
+    let fallback_shard = ShardId::leaf(shard_depth, config.vnodes[0].shard);
     let topology = build_topology(
         config.node.network.clone(),
         config.node.num_shards,
@@ -1226,7 +1226,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let mut vnode_configs: Vec<VnodeConfig> = Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
         let validator_id = ValidatorId::new(entry.validator_id);
-        let local_shard = ShardGroupId::leaf(shard_depth, entry.shard);
+        let local_shard = ShardId::leaf(shard_depth, entry.shard);
         let signing_key = hosted_keypairs
             .iter()
             .find_map(|(vid, k)| (*vid == validator_id).then(|| Arc::clone(k)))

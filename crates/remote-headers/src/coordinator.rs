@@ -17,8 +17,8 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardGroupId,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
+    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardId, TopologySchedule,
+    TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -94,7 +94,7 @@ pub struct RemoteHeaderCoordinator {
     /// Inner key: `sender` — one slot per validator. Multiple senders may
     /// gossip the same header; we keep all candidates until QC verification
     /// picks the valid one.
-    pending: HashMap<(ShardGroupId, BlockHeight), HashMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
+    pending: HashMap<(ShardId, BlockHeight), HashMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Verified Headers
@@ -102,13 +102,13 @@ pub struct RemoteHeaderCoordinator {
     /// Verified committed block headers — one per `(shard, height)`.
     /// Holds the BFT-transitive trust composite produced by
     /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-    verified: HashMap<(ShardGroupId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
+    verified: HashMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
 
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
     /// so pruning stays meaningful when remote block cadence varies.
-    tips: HashMap<ShardGroupId, (BlockHeight, WeightedTimestamp)>,
+    tips: HashMap<ShardId, (BlockHeight, WeightedTimestamp)>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Liveness Tracking (drives header-sync staleness detection)
@@ -116,7 +116,7 @@ pub struct RemoteHeaderCoordinator {
     /// Per-shard liveness tracking. Populated when topology tells us
     /// remote shards exist. Drives `Action::StartRemoteHeaderSync` when a
     /// shard hasn't sent headers within `HEADER_LIVENESS_TIMEOUT`.
-    expected: HashMap<ShardGroupId, ExpectedHeader>,
+    expected: HashMap<ShardId, ExpectedHeader>,
 
     /// Current local committed height (updated on each block commit).
     local_committed_height: BlockHeight,
@@ -129,7 +129,7 @@ pub struct RemoteHeaderCoordinator {
 
     /// This validator's home shard. Headers tagged with `local_shard` are
     /// ignored (we cert-verify our own headers through the shard pipeline).
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
 
     // ═══════════════════════════════════════════════════════════════════
     // Beacon-sync-lag buffer
@@ -147,7 +147,7 @@ pub struct RemoteHeaderCoordinator {
 impl RemoteHeaderCoordinator {
     /// Create a new remote header coordinator.
     #[must_use]
-    pub fn new(local_shard: ShardGroupId) -> Self {
+    pub fn new(local_shard: ShardId) -> Self {
         Self {
             pending: HashMap::new(),
             verified: HashMap::new(),
@@ -176,7 +176,7 @@ impl RemoteHeaderCoordinator {
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
         sender: ValidatorId,
     ) -> Vec<Action> {
-        let shard = certified_header.shard_group_id();
+        let shard = certified_header.shard_id();
         let height = certified_header.height();
 
         if shard == self.local_shard {
@@ -224,7 +224,7 @@ impl RemoteHeaderCoordinator {
         certified_header: Arc<CertifiedBlockHeader>,
         sender: ValidatorId,
     ) -> Vec<Action> {
-        let shard = certified_header.shard_group_id();
+        let shard = certified_header.shard_id();
         let height = certified_header.height();
 
         // Ignore headers from our own shard.
@@ -250,13 +250,13 @@ impl RemoteHeaderCoordinator {
         }
 
         // Structural pre-check: QC shard must match header shard.
-        if certified_header.qc().shard_group_id() != shard {
+        if certified_header.qc().shard_id() != shard {
             warn!(
                 shard = shard.inner(),
                 height = height.inner(),
                 sender = sender.inner(),
-                qc_shard = certified_header.qc().shard_group_id().inner(),
-                "Rejected remote header: QC shard_group_id does not match header shard"
+                qc_shard = certified_header.qc().shard_id().inner(),
+                "Rejected remote header: QC shard_id does not match header shard"
             );
             return vec![];
         }
@@ -320,7 +320,7 @@ impl RemoteHeaderCoordinator {
     pub fn on_remote_header_qc_verified(
         &mut self,
         topology: &TopologySchedule,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
         sender: ValidatorId,
         result: Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
@@ -537,7 +537,7 @@ impl RemoteHeaderCoordinator {
     #[must_use]
     pub fn get_verified(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
     ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
         self.verified.get(&(shard, height))
@@ -550,7 +550,7 @@ impl RemoteHeaderCoordinator {
     #[must_use]
     pub fn get_pending(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
     ) -> Option<&HashMap<ValidatorId, Arc<CertifiedBlockHeader>>> {
         self.pending.get(&(shard, height))
@@ -558,7 +558,7 @@ impl RemoteHeaderCoordinator {
 
     /// Check if a verified header exists for (shard, height).
     #[must_use]
-    pub fn has_verified(&self, shard: ShardGroupId, height: BlockHeight) -> bool {
+    pub fn has_verified(&self, shard: ShardId, height: BlockHeight) -> bool {
         self.verified.contains_key(&(shard, height))
     }
 
@@ -567,7 +567,7 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardGroupId, InFlightCount> {
+    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, InFlightCount> {
         self.tips
             .iter()
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
@@ -614,7 +614,7 @@ impl RemoteHeaderCoordinator {
     /// Update the per-shard tip and prune old pending entries.
     fn update_tip_and_prune(
         &mut self,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
         header_ts: WeightedTimestamp,
     ) {
@@ -653,7 +653,7 @@ impl RemoteHeaderCoordinator {
     /// Emit a `VerifyRemoteHeaderQc` action for the given header.
     fn emit_verify_qc(
         topology: &TopologySnapshot,
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
         sender: ValidatorId,
         certified_header: Arc<CertifiedBlockHeader>,
@@ -694,7 +694,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot, Epoch,
         Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
         TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
         zero_bls_signature,
     };
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_new_coordinator_is_empty() {
-        let coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
+        let coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
         let stats = coord.memory_stats();
         assert_eq!(stats.pending_headers, 0);
         assert_eq!(stats.verified_headers, 0);
@@ -717,10 +717,10 @@ mod tests {
     fn test_structural_precheck_rejects_mismatched_qc_hash() {
         // This test verifies the structural pre-check without needing a real topology.
         let header = BlockHeader::new(
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::leaf(2, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(2, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -739,7 +739,7 @@ mod tests {
         // Deliberately set wrong block_hash
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -749,7 +749,7 @@ mod tests {
         );
 
         let committed = CertifiedBlockHeader::new(header, qc);
-        let _coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
+        let _coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
 
         // The structural check happens inside on_remote_header_received which
         // needs a topology. We test the logic directly here by checking the
@@ -759,13 +759,13 @@ mod tests {
 
     #[test]
     fn test_get_verified_returns_none_when_empty() {
-        let coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
+        let coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
         assert!(
             coord
-                .get_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(5))
+                .get_verified(ShardId::leaf(2, 1), BlockHeight::new(5))
                 .is_none()
         );
-        assert!(!coord.has_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(5)));
+        assert!(!coord.has_verified(ShardId::leaf(2, 1), BlockHeight::new(5)));
     }
 
     /// A snapshot over `ids` across `num_shards` (`shard = id % num_shards`).
@@ -796,7 +796,7 @@ mod tests {
     /// parent QC at `parent_qc_wt` (the committee anchor) and an outer QC that
     /// passes the structural pre-checks.
     fn remote_header(
-        shard: ShardGroupId,
+        shard: ShardId,
         height: BlockHeight,
         parent_qc_wt: u64,
     ) -> Arc<CertifiedBlockHeader> {
@@ -859,7 +859,7 @@ mod tests {
         // epoch 1. A header whose parent QC weighted timestamp is in epoch 1
         // must dispatch verification against the epoch-1 keys, not the head's.
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::leaf(1, 1);
+        let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is the odd ids {1, 3}
 
         let snap_a = shard_snapshot(2, &ids, 0);
@@ -873,7 +873,7 @@ mod tests {
         let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), ED); // parent WT in epoch 1
         let actions = coord.on_remote_header_received(&schedule, header, ValidatorId::new(1));
 
@@ -887,13 +887,13 @@ mod tests {
     #[test]
     fn remote_header_buffers_when_beacon_behind_then_drains_on_catch_up() {
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::leaf(1, 1);
+        let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
 
         // Schedule holds only epoch 5; a header anchored in epoch 0 can't resolve.
         let behind =
             TopologySchedule::new(ED, 1, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let actions =
@@ -922,13 +922,13 @@ mod tests {
         // — none left in `pending` with no verification in flight — so a beacon
         // catch-up re-dispatches one rather than the whole height wedging.
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::leaf(1, 1);
+        let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is {1, 3}
         let snap = || Arc::new(shard_snapshot(2, &ids, 0));
 
         // Epoch 0 is in the schedule when the headers arrive.
         let present = TopologySchedule::new(ED, 100, Epoch::new(0), snap());
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let dispatched =

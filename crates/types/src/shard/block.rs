@@ -15,7 +15,7 @@ use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
     FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash,
+    QuorumCertificate, RoutableTransaction, ShardId, StateRoot, TransactionRoot, TxHash,
     ValidatorId, Verifiable, Verified,
 };
 
@@ -165,13 +165,9 @@ impl Block {
     /// Genesis is born `Live` with no provisions — the temporality machinery
     /// activates only once there are cross-shard waves in flight.
     #[must_use]
-    pub fn genesis(
-        shard_group_id: ShardGroupId,
-        proposer: ValidatorId,
-        state_root: StateRoot,
-    ) -> Self {
+    pub fn genesis(shard_id: ShardId, proposer: ValidatorId, state_root: StateRoot) -> Self {
         Self::Live {
-            header: BlockHeader::genesis(shard_group_id, proposer, state_root),
+            header: BlockHeader::genesis(shard_id, proposer, state_root),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),

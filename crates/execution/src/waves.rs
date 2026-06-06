@@ -396,15 +396,15 @@ impl WaveRegistry {
 mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, ShardGroupId,
-        SignerBitfield, Verifiable, zero_bls_signature,
+        BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, ShardId, SignerBitfield,
+        Verifiable, zero_bls_signature,
     };
     use proptest::collection::vec as prop_vec;
 
     use super::*;
 
-    fn shard() -> ShardGroupId {
-        ShardGroupId::ROOT
+    fn shard() -> ShardId {
+        ShardId::ROOT
     }
 
     fn wave(height: u64) -> WaveId {

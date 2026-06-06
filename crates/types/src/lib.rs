@@ -4,7 +4,7 @@
 //! implementation:
 //!
 //! - **Primitives**: Hash, cryptographic keys and signatures
-//! - **Identifiers**: `ValidatorId`, `ShardGroupId`, `BlockHeight`, etc.
+//! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
 //! - **Wave types**: `WaveId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
 //! - **Network traits**: Message markers for serialization
@@ -92,8 +92,8 @@ pub use primitives::hash_kinds::{
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,
-    LeafIndex, NodeId, PartitionNumber, Round, ShardGroupId, SpcView, Stake, StakePoolId,
-    ValidatorId, VotePower,
+    LeafIndex, NodeId, PartitionNumber, Round, ShardId, SpcView, Stake, StakePoolId, ValidatorId,
+    VotePower,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,

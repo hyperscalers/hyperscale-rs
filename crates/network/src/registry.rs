@@ -21,7 +21,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardGroupId, TopicScope};
+use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicScope};
 use quick_cache::sync::Cache as QuickCache;
 use sbor::{basic_decode, basic_encode};
 
@@ -30,7 +30,7 @@ use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHa
 /// Type-erased gossip handler: receives decompressed SBOR bytes plus the
 /// shard the topic encoded (`None` for global-scoped topics), returns
 /// verdict.
-pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardGroupId>) -> GossipVerdict + Send + Sync;
+pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> GossipVerdict + Send + Sync;
 
 /// Type-erased notification handler: receives decompressed SBOR bytes, no return value.
 pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
@@ -62,7 +62,7 @@ pub trait LocalGossipDispatcher: Send + Sync {
     /// to the typed handler. The handler consumes `M`, so the dispatcher
     /// clones internally. `shard` is the broadcast target shard for
     /// shard-scoped messages and `None` for global-scoped messages.
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardGroupId>) -> GossipVerdict;
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> GossipVerdict;
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for fire-and-forget notifications.
@@ -94,7 +94,7 @@ const DEDUP_CACHE_CAPACITY: usize = 1024;
 
 struct TypedGossipDispatcher<M, H> {
     handler: Arc<H>,
-    hosted_shards: Arc<HashSet<ShardGroupId>>,
+    hosted_shards: Arc<HashSet<ShardId>>,
     /// Content-key dedup cache (see [`GossipMessage::dedup_key`]). Idle
     /// for types whose `dedup_key` returns `None`.
     dedup: QuickCache<u64, ()>,
@@ -110,7 +110,7 @@ where
     ///
     /// - `Shard` messages: the topic's shard, if hosted.
     /// - `Global` messages: every hosted shard except [`GossipMessage::source_shard`].
-    fn target_shards(&self, msg: &M, topic_shard: Option<ShardGroupId>) -> Vec<ShardGroupId> {
+    fn target_shards(&self, msg: &M, topic_shard: Option<ShardId>) -> Vec<ShardId> {
         match M::SCOPE {
             TopicScope::Shard => match topic_shard {
                 Some(s) if self.hosted_shards.contains(&s) => vec![s],
@@ -147,7 +147,7 @@ where
         }
     }
 
-    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardGroupId]) -> GossipVerdict {
+    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> GossipVerdict {
         let mut verdict = GossipVerdict::Accept;
         for &target in targets {
             if self.handler.on_message(typed.clone(), target) == GossipVerdict::Reject {
@@ -163,7 +163,7 @@ where
     M: GossipMessage + 'static,
     H: GossipHandler<M>,
 {
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardGroupId>) -> GossipVerdict {
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> GossipVerdict {
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
@@ -221,7 +221,7 @@ where
 /// Three maps: `gossip`, `request`, and `notification`. A message type
 /// can be registered in multiple maps simultaneously.
 ///
-/// Requests are keyed by `(type_id, ShardGroupId)`: a multi-shard host
+/// Requests are keyed by `(type_id, ShardId)`: a multi-shard host
 /// registers one handler per hosted shard so each closure can capture
 /// its own `ShardIo`'s storage. Gossip and notifications stay flat
 /// because the registry computes the per-vnode fan-out itself, using
@@ -236,26 +236,26 @@ where
 pub struct HandlerRegistry {
     /// Shards hosted by the owning process. Drives the per-vnode
     /// fan-out inside [`TypedGossipDispatcher`].
-    hosted_shards: Arc<HashSet<ShardGroupId>>,
+    hosted_shards: Arc<HashSet<ShardId>>,
     gossip: ArcSwap<HashMap<&'static str, Arc<RawGossipHandler>>>,
-    request: ArcSwap<HashMap<(&'static str, ShardGroupId), Arc<RawRequestHandler>>>,
+    request: ArcSwap<HashMap<(&'static str, ShardId), Arc<RawRequestHandler>>>,
     notification: ArcSwap<HashMap<&'static str, Arc<RawNotificationHandler>>>,
     /// Typed gossip dispatchers keyed by message `TypeId` for
     /// zero-encode local delivery to colocated subscribers.
     local_gossip: ArcSwap<HashMap<TypeId, Arc<dyn LocalGossipDispatcher>>>,
     /// Typed notification dispatchers (same role as `local_gossip`).
     local_notification: ArcSwap<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
-    /// Typed request dispatchers keyed by `(TypeId, ShardGroupId)` for
+    /// Typed request dispatchers keyed by `(TypeId, ShardId)` for
     /// in-process request serving. Used when a host carries a vnode in
     /// the target shard — bypasses libp2p and preserves `Arc`-shared
     /// payloads on the response.
-    local_request: ArcSwap<HashMap<(TypeId, ShardGroupId), Arc<dyn LocalRequestDispatcher>>>,
+    local_request: ArcSwap<HashMap<(TypeId, ShardId), Arc<dyn LocalRequestDispatcher>>>,
 }
 
 impl HandlerRegistry {
     /// Create a registry serving the given hosted shards.
     #[must_use]
-    pub fn new(hosted_shards: Arc<HashSet<ShardGroupId>>) -> Self {
+    pub fn new(hosted_shards: Arc<HashSet<ShardId>>) -> Self {
         Self {
             hosted_shards,
             gossip: ArcSwap::from_pointee(HashMap::new()),
@@ -269,7 +269,7 @@ impl HandlerRegistry {
 
     /// Shards hosted by the registry's owner.
     #[must_use]
-    pub const fn hosted_shards(&self) -> &Arc<HashSet<ShardGroupId>> {
+    pub const fn hosted_shards(&self) -> &Arc<HashSet<ShardId>> {
         &self.hosted_shards
     }
 
@@ -300,7 +300,7 @@ impl HandlerRegistry {
 
         let bytes_dispatcher = Arc::clone(&dispatcher);
         let raw: Arc<RawGossipHandler> =
-            Arc::new(move |payload: Vec<u8>, shard: Option<ShardGroupId>| {
+            Arc::new(move |payload: Vec<u8>, shard: Option<ShardId>| {
                 match basic_decode::<M>(&payload) {
                     Ok(msg) => {
                         if !bytes_dispatcher.admit(&msg) {
@@ -350,7 +350,7 @@ impl HandlerRegistry {
     /// error.
     pub fn register_request<R: Request + Send + 'static>(
         &self,
-        shard: ShardGroupId,
+        shard: ShardId,
         handler: impl RequestHandler<R>,
     ) where
         R::Response: Send + 'static,
@@ -457,7 +457,7 @@ impl HandlerRegistry {
     pub fn register_raw_request(
         &self,
         type_id: &'static str,
-        shard: ShardGroupId,
+        shard: ShardId,
         handler: Arc<RawRequestHandler>,
     ) {
         arcswap_insert(&self.request, (type_id, shard), handler);
@@ -488,7 +488,7 @@ impl HandlerRegistry {
     pub fn get_request(
         &self,
         message_type_id: &str,
-        shard: ShardGroupId,
+        shard: ShardId,
     ) -> Option<Arc<RawRequestHandler>> {
         self.request.load().get(&(message_type_id, shard)).cloned()
     }
@@ -507,11 +507,7 @@ impl HandlerRegistry {
     /// for global publishes — the handler receives the same value the
     /// inbound libp2p path supplies.
     #[must_use]
-    pub fn local_dispatch_gossip<M>(
-        &self,
-        msg: &M,
-        shard: Option<ShardGroupId>,
-    ) -> Option<GossipVerdict>
+    pub fn local_dispatch_gossip<M>(&self, msg: &M, shard: Option<ShardId>) -> Option<GossipVerdict>
     where
         M: NetworkMessage + 'static,
     {
@@ -551,7 +547,7 @@ impl HandlerRegistry {
     /// doesn't downcast to `R::Response`. The registry slot is keyed by
     /// `(TypeId::of::<R>(), shard)`, so this only fires on a programmer
     /// error in registration — not on a runtime input.
-    pub fn local_dispatch_request<R>(&self, shard: ShardGroupId, req: R) -> Option<R::Response>
+    pub fn local_dispatch_request<R>(&self, shard: ShardId, req: R) -> Option<R::Response>
     where
         R: Request + Send + 'static,
         R::Response: Send + 'static,
@@ -599,26 +595,24 @@ mod tests {
             const SCOPE: TopicScope = TopicScope::Shard;
         }
 
-        let hosted = Arc::new(std::iter::once(ShardGroupId::leaf(1, 0)).collect());
+        let hosted = Arc::new(std::iter::once(ShardId::leaf(1, 0)).collect());
         let registry = HandlerRegistry::new(hosted);
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        registry.register_gossip(
-            move |_msg: TestMsg, _shard: ShardGroupId| -> GossipVerdict {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-                GossipVerdict::Accept
-            },
-        );
+        registry.register_gossip(move |_msg: TestMsg, _shard: ShardId| -> GossipVerdict {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Accept
+        });
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = basic_encode(&TestMsg(42)).unwrap();
-        let verdict = handler(encoded, Some(ShardGroupId::leaf(1, 0)));
+        let verdict = handler(encoded, Some(ShardId::leaf(1, 0)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
 
         // SBOR decode failure should return Reject.
-        let verdict = handler(vec![0xFF, 0xFE], Some(ShardGroupId::leaf(1, 0)));
+        let verdict = handler(vec![0xFF, 0xFE], Some(ShardId::leaf(1, 0)));
         assert_eq!(verdict, GossipVerdict::Reject);
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
@@ -651,7 +645,7 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
 
         registry.register_request(shard, |req: TestReq| TestResp(req.0 * 2));
 
@@ -664,7 +658,7 @@ mod tests {
         assert!(registry.get_request("unknown.request", shard).is_none());
         assert!(
             registry
-                .get_request("test.request", ShardGroupId::leaf(1, 1))
+                .get_request("test.request", ShardId::leaf(1, 1))
                 .is_none()
         );
     }
@@ -687,10 +681,10 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        registry.register_gossip(|_: TestMsg, _shard: ShardGroupId| -> GossipVerdict {
+        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> GossipVerdict {
             GossipVerdict::Accept
         });
-        registry.register_gossip(|_: TestMsg, _shard: ShardGroupId| -> GossipVerdict {
+        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> GossipVerdict {
             GossipVerdict::Accept
         });
     }
@@ -721,24 +715,22 @@ mod tests {
             const SCOPE: TopicScope = TopicScope::Shard;
         }
 
-        let hosted: Arc<HashSet<ShardGroupId>> =
-            Arc::new(std::iter::once(ShardGroupId::leaf(1, 0)).collect());
+        let hosted: Arc<HashSet<ShardId>> =
+            Arc::new(std::iter::once(ShardId::leaf(1, 0)).collect());
         let registry = HandlerRegistry::new(hosted);
 
         let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));
         let observed_clone = Arc::clone(&observed);
 
-        registry.register_gossip(
-            move |msg: VTestMsg, _shard: ShardGroupId| -> GossipVerdict {
-                *observed_clone.lock().unwrap() = Some(msg.payload);
-                GossipVerdict::Accept
-            },
-        );
+        registry.register_gossip(move |msg: VTestMsg, _shard: ShardId| -> GossipVerdict {
+            *observed_clone.lock().unwrap() = Some(msg.payload);
+            GossipVerdict::Accept
+        });
 
         let verified_msg = VTestMsg {
             payload: Verified::new_unchecked_for_test(42u32).into(),
         };
-        let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::leaf(1, 0)));
+        let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardId::leaf(1, 0)));
         assert_eq!(verdict, Some(GossipVerdict::Accept));
 
         let received = observed

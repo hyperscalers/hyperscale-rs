@@ -13,15 +13,15 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
-    ShardGroupId, StateRoot, TxHash, Verified, WaveId,
+    BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate, ShardId,
+    StateRoot, TxHash, Verified, WaveId,
 };
 use tracing::warn;
 
 use crate::pending::{PendingBlock, PendingBlocks};
 
 pub struct ChainView<'a> {
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
@@ -31,7 +31,7 @@ pub struct ChainView<'a> {
 
 impl<'a> ChainView<'a> {
     pub const fn new(
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
@@ -156,19 +156,18 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
         CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
-        TransactionRoot, ValidatorId, Verifiable, WeightedTimestamp, test_utils,
-        zero_bls_signature,
+        QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield, TransactionRoot,
+        ValidatorId, Verifiable, WeightedTimestamp, test_utils, zero_bls_signature,
     };
 
     use super::*;
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1000),
             Round::INITIAL,
@@ -206,7 +205,7 @@ mod tests {
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
-            local_shard: ShardGroupId::ROOT,
+            local_shard: ShardId::ROOT,
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
@@ -266,7 +265,7 @@ mod tests {
         let header = make_header(3, BlockHash::ZERO);
         let block_hash = header.hash();
         let wave = WaveId::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(2),
             std::collections::BTreeSet::new(),
         );
@@ -432,7 +431,7 @@ mod tests {
         let qc_block = bh(b"qc_block");
         let qc = QuorumCertificate::new(
             qc_block,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,

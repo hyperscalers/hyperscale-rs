@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    NetworkDefinition, ProposerTimestamp, Round, ShardGroupId, ValidatorId, Verified, Verify,
+    NetworkDefinition, ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify,
     batch_verify_bls_same_message, block_vote_message, verify_bls12381_v1,
 };
 
@@ -17,7 +17,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct BlockVote {
     block_hash: BlockHash,
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     height: BlockHeight,
     round: Round,
     voter: ValidatorId,
@@ -33,7 +33,7 @@ impl BlockVote {
         network: &NetworkDefinition,
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
@@ -42,7 +42,7 @@ impl BlockVote {
     ) -> Self {
         let message = block_vote_message(
             network,
-            shard_group_id,
+            shard_id,
             height,
             round,
             &block_hash,
@@ -51,7 +51,7 @@ impl BlockVote {
         let signature = signing_key.sign_v1(&message);
         Self {
             block_hash,
-            shard_group_id,
+            shard_id,
             height,
             round,
             voter,
@@ -65,7 +65,7 @@ impl BlockVote {
     #[must_use]
     pub const fn from_parts(
         block_hash: BlockHash,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
@@ -74,7 +74,7 @@ impl BlockVote {
     ) -> Self {
         Self {
             block_hash,
-            shard_group_id,
+            shard_id,
             height,
             round,
             voter,
@@ -91,8 +91,8 @@ impl BlockVote {
 
     /// Shard group this vote belongs to (prevents cross-shard replay).
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.shard_group_id
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Height of the block.
@@ -132,7 +132,7 @@ impl BlockVote {
         self,
     ) -> (
         BlockHash,
-        ShardGroupId,
+        ShardId,
         BlockHeight,
         Round,
         ValidatorId,
@@ -141,7 +141,7 @@ impl BlockVote {
     ) {
         (
             self.block_hash,
-            self.shard_group_id,
+            self.shard_id,
             self.height,
             self.round,
             self.voter,
@@ -165,7 +165,7 @@ impl BlockVote {
     ) -> Vec<u8> {
         block_vote_message(
             network,
-            self.shard_group_id,
+            self.shard_id,
             self.height,
             self.round,
             &self.block_hash,
@@ -238,7 +238,7 @@ impl Verified<BlockVote> {
         network: &NetworkDefinition,
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
@@ -253,7 +253,7 @@ impl Verified<BlockVote> {
             network,
             block_hash,
             parent_block_hash,
-            shard_group_id,
+            shard_id,
             height,
             round,
             voter,
@@ -267,7 +267,7 @@ impl Verified<BlockVote> {
     ///
     /// Every vote in the batch must have been signed over `signing_message`
     /// (the canonical [`block_vote_message`] for some `block_hash`,
-    /// `height`, `round`, `shard_group_id`). The caller is responsible
+    /// `height`, `round`, `shard_id`). The caller is responsible
     /// for assembling the batch with matching messages — mismatched
     /// votes will simply fail to verify.
     ///
@@ -329,7 +329,7 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let message = block_vote_message(
             &net,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
@@ -342,7 +342,7 @@ mod tests {
                 let pk = sk.public_key();
                 let vote = BlockVote::from_parts(
                     BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
-                    ShardGroupId::ROOT,
+                    ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     ValidatorId::new(i),
@@ -366,7 +366,7 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let message = block_vote_message(
             &net,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
@@ -379,7 +379,7 @@ mod tests {
             let pk = sk.public_key();
             let vote = BlockVote::from_parts(
                 BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(1),
                 Round::INITIAL,
                 ValidatorId::new(i),

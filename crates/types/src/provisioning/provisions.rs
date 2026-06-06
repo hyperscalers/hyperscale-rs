@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::state_key::{DB_NODE_KEY_LEN, jmt_leaf_key, jmt_value_hash};
 use crate::{
     BlockHeight, BoundedVec, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
-    NodeId, ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxHash,
+    NodeId, ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash,
     Verified, Verify, WeightedTimestamp,
 };
 
@@ -35,8 +35,8 @@ use crate::{
 /// cached for the lifetime of the value.
 #[derive(BasicSbor)]
 pub struct Provisions {
-    source_shard: ShardGroupId,
-    target_shard: ShardGroupId,
+    source_shard: ShardId,
+    target_shard: ShardId,
     block_height: BlockHeight,
     proof: MerkleInclusionProof,
     transactions: BoundedVec<ProvisionEntry, MAX_TXS_PER_BLOCK>,
@@ -93,8 +93,8 @@ impl Provisions {
     /// Panics if `transactions.len() > MAX_TXS_PER_BLOCK`.
     #[must_use]
     pub fn new(
-        source_shard: ShardGroupId,
-        target_shard: ShardGroupId,
+        source_shard: ShardId,
+        target_shard: ShardId,
         block_height: BlockHeight,
         proof: MerkleInclusionProof,
         transactions: Vec<ProvisionEntry>,
@@ -111,13 +111,13 @@ impl Provisions {
 
     /// Source shard that committed this block.
     #[must_use]
-    pub const fn source_shard(&self) -> ShardGroupId {
+    pub const fn source_shard(&self) -> ShardId {
         self.source_shard
     }
 
     /// Target shard the bundle is destined for.
     #[must_use]
-    pub const fn target_shard(&self) -> ShardGroupId {
+    pub const fn target_shard(&self) -> ShardId {
         self.target_shard
     }
 
@@ -168,8 +168,8 @@ impl Provisions {
     }
 
     fn compute_hash(
-        source_shard: ShardGroupId,
-        target_shard: ShardGroupId,
+        source_shard: ShardId,
+        target_shard: ShardId,
         block_height: BlockHeight,
         proof: &MerkleInclusionProof,
         transactions: &[ProvisionEntry],
@@ -177,10 +177,10 @@ impl Provisions {
         // Encode the content fields (excluding the hash itself) for hashing.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(
-            &basic_encode(&source_shard).expect("ShardGroupId serialization should never fail"),
+            &basic_encode(&source_shard).expect("ShardId serialization should never fail"),
         );
         bytes.extend_from_slice(
-            &basic_encode(&target_shard).expect("ShardGroupId serialization should never fail"),
+            &basic_encode(&target_shard).expect("ShardId serialization should never fail"),
         );
         bytes.extend_from_slice(
             &basic_encode(&block_height).expect("BlockHeight serialization should never fail"),
@@ -226,11 +226,7 @@ impl Provisions {
     /// Create a dummy `Provisions` for testing.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn dummy(
-        source_shard: ShardGroupId,
-        target_shard: ShardGroupId,
-        block_height: BlockHeight,
-    ) -> Self {
+    pub fn dummy(source_shard: ShardId, target_shard: ShardId, block_height: BlockHeight) -> Self {
         Self::new(
             source_shard,
             target_shard,
@@ -369,8 +365,8 @@ mod tests {
     #[test]
     fn test_provision_deadline_is_source_ts_plus_retention_horizon() {
         let provisions = Provisions::new(
-            ShardGroupId::leaf(1, 1),
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(1, 1),
+            ShardId::leaf(2, 2),
             BlockHeight::new(100),
             MerkleInclusionProof::new(vec![]),
             vec![],
@@ -385,8 +381,8 @@ mod tests {
     #[test]
     fn test_provisions_fields_roundtrip() {
         let original = Provisions::new(
-            ShardGroupId::leaf(1, 1),
-            ShardGroupId::leaf(2, 2),
+            ShardId::leaf(1, 1),
+            ShardId::leaf(2, 2),
             BlockHeight::new(42),
             MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
@@ -395,7 +391,7 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: Provisions = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
-        assert_eq!(decoded.target_shard(), ShardGroupId::leaf(2, 2));
+        assert_eq!(decoded.target_shard(), ShardId::leaf(2, 2));
     }
 
     #[test]
@@ -415,8 +411,8 @@ mod tests {
     #[test]
     fn test_provisions_roundtrip() {
         let provisions = Provisions::new(
-            ShardGroupId::leaf(1, 0),
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -436,8 +432,8 @@ mod tests {
     fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
         let provisions = Provisions::new(
-            ShardGroupId::leaf(1, 0),
-            ShardGroupId::leaf(1, 1),
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![
@@ -476,7 +472,7 @@ mod tests {
         use super::*;
         use crate::state_key::{jmt_leaf_key, jmt_value_hash};
         use crate::{
-            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, StateRoot, ValidatorId,
+            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardId, StateRoot, ValidatorId,
         };
 
         type Jmt = Tree<Blake3Hasher, 1>;
@@ -511,7 +507,7 @@ mod tests {
         }
 
         fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
-            let shard = ShardGroupId::leaf(1, 0);
+            let shard = ShardId::leaf(1, 0);
             let header = BlockHeader::genesis(shard, ValidatorId::new(0), state_root);
             Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
                 header,
@@ -538,8 +534,8 @@ mod tests {
                 })
                 .collect();
             Provisions::new(
-                ShardGroupId::leaf(1, 1),
-                ShardGroupId::leaf(1, 0),
+                ShardId::leaf(1, 1),
+                ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 proof,
                 tx_entries,
@@ -593,8 +589,8 @@ mod tests {
             let state_root = StateRoot::ZERO;
             let verified_header = header_with_state_root(state_root);
             let provisions = Provisions::new(
-                ShardGroupId::leaf(1, 1),
-                ShardGroupId::leaf(1, 0),
+                ShardId::leaf(1, 1),
+                ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 MerkleInclusionProof::new(vec![]),
                 vec![],
@@ -648,8 +644,8 @@ mod tests {
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
             enc.write_size(5).unwrap();
-            enc.encode(&ShardGroupId::leaf(1, 1)).unwrap();
-            enc.encode(&ShardGroupId::leaf(2, 2)).unwrap();
+            enc.encode(&ShardId::leaf(1, 1)).unwrap();
+            enc.encode(&ShardId::leaf(2, 2)).unwrap();
             enc.encode(&BlockHeight::new(10)).unwrap();
             enc.encode(&MerkleInclusionProof::dummy()).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();

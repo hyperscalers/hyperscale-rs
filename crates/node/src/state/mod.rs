@@ -41,9 +41,7 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::{
-    Block, LocalTimestamp, ShardGroupId, StateRoot, TopologySnapshot, ValidatorId,
-};
+use hyperscale_types::{Block, LocalTimestamp, ShardId, StateRoot, TopologySnapshot, ValidatorId};
 use tracing::instrument;
 
 /// Combined node state machine.
@@ -90,7 +88,7 @@ pub struct NodeStateMachine {
     me: ValidatorId,
 
     /// This validator's home shard.
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -115,7 +113,7 @@ impl NodeStateMachine {
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
         recovered: RecoveredState,
         beacon_coordinator: BeaconCoordinator,
@@ -162,7 +160,7 @@ impl NodeStateMachine {
 
     /// Get this node's shard.
     #[must_use]
-    pub const fn shard_id(&self) -> ShardGroupId {
+    pub const fn shard_id(&self) -> ShardId {
         self.local_shard
     }
 

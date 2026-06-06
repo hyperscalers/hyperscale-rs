@@ -16,7 +16,7 @@ use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, ReadySignal,
-    ShardGroupId, StoredReceipt, WaveId, WeightedTimestamp,
+    ShardId, StoredReceipt, WaveId, WeightedTimestamp,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -279,7 +279,7 @@ pub struct ShardCoordinator {
     me: ValidatorId,
 
     /// This validator's home shard.
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -303,7 +303,7 @@ impl ShardCoordinator {
     #[must_use]
     pub fn new(
         me: ValidatorId,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
         config: ShardConsensusConfig,
         recovered: RecoveredState,
     ) -> Self {
@@ -3127,7 +3127,7 @@ impl ShardCoordinator {
                 height = certified.block().height().inner(),
                 "Synced block has genesis QC, applying directly"
             );
-            let shard = certified.qc().shard_group_id();
+            let shard = certified.qc().shard_id();
             let (block, _) = certified.into_parts();
             let verified_qc = Verified::<QuorumCertificate>::genesis(shard);
             return self.apply_synced_block(block, verified_qc);
@@ -3531,7 +3531,7 @@ impl ShardCoordinator {
         topology: &TopologySchedule,
         timeout: &Timeout,
     ) -> Vec<Action> {
-        if timeout.shard_group_id() != self.local_shard {
+        if timeout.shard_id() != self.local_shard {
             return Vec::new();
         }
         // The pacemaker is driven by the in-progress committee. Absent it
@@ -3923,7 +3923,7 @@ impl ShardCoordinator {
     /// that supplies the chain view and pending-block map.
     pub fn drain_ready_state_root_verifications(
         &mut self,
-        local_shard: ShardGroupId,
+        local_shard: ShardId,
     ) -> Vec<ReadyStateRootVerification> {
         let chain = ChainView::new(
             local_shard,
@@ -4189,7 +4189,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, BoundedVec,
         CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
-        ProvisionsRoot, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySchedule,
+        ProvisionsRoot, RoutableTransaction, ShardId, SignerBitfield, TopologySchedule,
         TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
         WeightedTimestamp, generate_bls_keypair, test_utils, zero_bls_signature,
     };
@@ -4234,7 +4234,7 @@ mod tests {
 
         let state = ShardCoordinator::new(
             ValidatorId::new(0),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             config,
             RecoveredState::default(),
         );
@@ -4245,7 +4245,7 @@ mod tests {
     fn test_proposer_rotation() {
         // proposer_for = round % committee_size
         let (_state, topology) = make_test_state();
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         assert_eq!(
             topology.head().proposer_for(shard, Round::new(0)),
             ValidatorId::new(0)
@@ -4324,7 +4324,7 @@ mod tests {
         signers.set(2);
         let parent_qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"anchor_parent")),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
             Round::new(0),
@@ -4333,7 +4333,7 @@ mod tests {
             WeightedTimestamp::from_millis(parent_weighted_ms),
         );
         let header = BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             parent_qc.block_hash(),
             parent_qc,
@@ -4370,7 +4370,7 @@ mod tests {
         // verify a boundary-straddling block under committee_(N-1), and its
         // successor (parent QC at the boundary) under committee_N.
         const ED: u64 = 1_000;
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
@@ -4418,10 +4418,10 @@ mod tests {
         // the proposer is then committee[round % 4] = committee[height % 4].
         let round = Round::new(height.inner());
         BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
             round,
@@ -4443,7 +4443,7 @@ mod tests {
         // SAFETY: synthetic test fixture, no real signature.
         Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
             block_hash,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::ZERO,
             Round::new(0),
@@ -4475,7 +4475,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -4487,7 +4487,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -4527,10 +4527,10 @@ mod tests {
     /// committed tip under a genesis parent QC — so the round gap is `round`.
     fn empty_block_at_round(committed_hash: BlockHash, round: u64) -> Block {
         let header = BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(1),
             committed_hash,
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(round % 4),
             ProposerTimestamp::from_millis(100_000),
             Round::new(round),
@@ -4604,10 +4604,10 @@ mod tests {
         // distinct headers all validly attributed to that proposer.
         for i in 0..(MAX_HEADERS_PER_HEIGHT_ROUND + 3) {
             let header = BlockHeader::new(
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(1),
                 committed_hash,
-                QuorumCertificate::genesis(ShardGroupId::ROOT),
+                QuorumCertificate::genesis(ShardId::ROOT),
                 ValidatorId::new(1),
                 ProposerTimestamp::from_millis(100_000),
                 Round::new(1),
@@ -4655,10 +4655,10 @@ mod tests {
 
         let round_header = |round: u64| {
             BlockHeader::new(
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(1),
                 committed_hash,
-                QuorumCertificate::genesis(ShardGroupId::ROOT),
+                QuorumCertificate::genesis(ShardId::ROOT),
                 ValidatorId::new(round % 4),
                 ProposerTimestamp::from_millis(100_000),
                 Round::new(round),
@@ -4722,7 +4722,7 @@ mod tests {
             let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"forged_parent"));
             let parent_qc = QuorumCertificate::new(
                 parent_block_hash,
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(height - 1),
                 BlockHash::ZERO,
                 Round::new(round),
@@ -4731,7 +4731,7 @@ mod tests {
                 WeightedTimestamp::from_millis(now_ms - 5_000),
             );
             BlockHeader::new(
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 BlockHeight::new(height),
                 parent_block_hash,
                 parent_qc,
@@ -4806,7 +4806,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -4818,7 +4818,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -4877,7 +4877,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -4889,7 +4889,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -4961,7 +4961,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -4973,7 +4973,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -5067,7 +5067,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -5079,7 +5079,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -5130,7 +5130,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(1), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 BlockHash::ZERO,
                 __h.parent_qc().clone(),
@@ -5227,7 +5227,7 @@ mod tests {
         // A globally-signed timeout from outside the committee must be dropped,
         // exactly as the vote path drops non-committee votes.
         let (mut state, topology) = make_test_state();
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let round = state.view();
         let net = NetworkDefinition::simulator();
         let mk = |voter: u64| {
@@ -5267,7 +5267,7 @@ mod tests {
         // rather than verified and stored — otherwise a Byzantine member could
         // grow the keeper without bound with rounds the view never reaches.
         let (mut state, topology) = make_test_state();
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let net = NetworkDefinition::simulator();
         // high_qc is genesis, so the ceiling is `MAX_ROUND_GAP`.
         let far = Round::new(MAX_ROUND_GAP + 1);
@@ -5291,7 +5291,7 @@ mod tests {
         // stale rounds, and already-tallied voters are dropped before delegating
         // — no pairing check is spent on a share that would be discarded.
         let (mut state, topology) = make_test_state();
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let round = state.view();
         let net = NetworkDefinition::simulator();
         let mk = |voter: u64, round: Round| {
@@ -5394,7 +5394,7 @@ mod tests {
         let topology = TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set);
         let state = ShardCoordinator::new(
             ValidatorId::new(u64::from(local_idx)),
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         );
@@ -5414,7 +5414,7 @@ mod tests {
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"legitimate_block"));
         let vote = BlockVote::from_parts(
             block_b,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             Round::new(0),
             voter,
@@ -5471,7 +5471,7 @@ mod tests {
         let header = {
             let __h = make_header_at_height(BlockHeight::new(1), state.now.as_millis());
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 __h.parent_block_hash(),
                 __h.parent_qc().clone(),
@@ -5535,7 +5535,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -5574,7 +5574,7 @@ mod tests {
         let child_hash = BlockHash::from_raw(Hash::from_bytes(b"child"));
         let qc = QuorumCertificate::new(
             child_hash,
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             BlockHeight::new(4),
             committable_hash,
             Round::new(0),
@@ -5674,7 +5674,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -5687,7 +5687,7 @@ mod tests {
         let header1 = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc.clone(),
@@ -5732,7 +5732,7 @@ mod tests {
         let header2 = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_001);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 parent_qc,
@@ -5790,7 +5790,7 @@ mod tests {
             let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -5817,7 +5817,7 @@ mod tests {
             let __qc = honest_qc;
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -5829,7 +5829,7 @@ mod tests {
         let forged_header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
             BlockHeader::new(
-                __h.shard_group_id(),
+                __h.shard_id(),
                 __h.height(),
                 parent_block_hash,
                 forged_qc,
@@ -5911,7 +5911,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -5968,7 +5968,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -6076,7 +6076,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_4")),
                 __qc.round(),
@@ -6108,7 +6108,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(1), 1000);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     BlockHash::ZERO,
                     __h.parent_qc().clone(),
@@ -6138,7 +6138,7 @@ mod tests {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -6177,7 +6177,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(1), 1000);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     BlockHash::from_raw(Hash::from_bytes(b"wrong-parent")),
                     __h.parent_qc().clone(),
@@ -6222,7 +6222,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(1), 1000);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     BlockHash::ZERO,
                     __h.parent_qc().clone(),
@@ -6250,7 +6250,7 @@ mod tests {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
             QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
@@ -6282,7 +6282,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -6320,7 +6320,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -6383,7 +6383,7 @@ mod tests {
             // SAFETY: synthetic test fixture, no real signature.
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
-                __qc.shard_group_id(),
+                __qc.shard_id(),
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
@@ -6416,7 +6416,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(5), 100_000);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
                     __h.parent_qc().clone(),
@@ -6450,7 +6450,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(6), 100_001);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     ancestor_hash,
                     __h.parent_qc().clone(),
@@ -6496,7 +6496,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(5), 100_000);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
                     __h.parent_qc().clone(),
@@ -6528,7 +6528,7 @@ mod tests {
             header: {
                 let __h = make_header_at_height(BlockHeight::new(6), 100_001);
                 BlockHeader::new(
-                    __h.shard_group_id(),
+                    __h.shard_id(),
                     __h.height(),
                     ancestor_hash,
                     __h.parent_qc().clone(),

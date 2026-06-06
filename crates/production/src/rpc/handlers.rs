@@ -409,7 +409,7 @@ mod tests {
     use axum::routing::{get, post};
     use hyperscale_node::BlockSyncStateKind;
     use hyperscale_types::test_utils::test_transaction;
-    use hyperscale_types::{BlockHeight, ShardGroupId, TransactionDecision};
+    use hyperscale_types::{BlockHeight, ShardId, TransactionDecision};
     use quick_cache::sync::Cache;
     use sbor::prelude::basic_encode;
     use serde_json::{from_slice, to_string};
@@ -428,7 +428,7 @@ mod tests {
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_caches: std::iter::once((ShardGroupId::ROOT, Arc::new(Cache::new(1000))))
+            tx_status_caches: std::iter::once((ShardId::ROOT, Arc::new(Cache::new(1000))))
                 .collect(),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
@@ -662,7 +662,7 @@ mod tests {
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_caches: std::iter::once((ShardGroupId::ROOT, Arc::new(Cache::new(1000))))
+            tx_status_caches: std::iter::once((ShardId::ROOT, Arc::new(Cache::new(1000))))
                 .collect(),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
@@ -716,7 +716,7 @@ mod tests {
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_caches: std::iter::once((ShardGroupId::ROOT, Arc::new(Cache::new(1000))))
+            tx_status_caches: std::iter::once((ShardId::ROOT, Arc::new(Cache::new(1000))))
                 .collect(),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),

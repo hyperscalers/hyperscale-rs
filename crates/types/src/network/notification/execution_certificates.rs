@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Bls12381G2Signature, ExecutionCertificate, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, exec_cert_batch_message,
+    ShardId, Signed, ValidatorId, exec_cert_batch_message,
 };
 
 /// Batched execution certificates proving quorum for execution waves.
@@ -79,7 +79,7 @@ impl Signed for ExecutionCertificatesNotification {
         let shard = self
             .certificates
             .first()
-            .map_or(ShardGroupId::ROOT, ExecutionCertificate::shard_group_id);
+            .map_or(ShardId::ROOT, ExecutionCertificate::shard_id);
         exec_cert_batch_message(network, shard, &self.certificates)
     }
 }

@@ -16,7 +16,7 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, ShardWitness,
     SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
@@ -233,7 +233,7 @@ pub enum ProtocolEvent {
     /// Remote header QC verification completed.
     RemoteHeaderQcVerified {
         /// Remote shard that produced the header.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Remote block height (for correlation).
         height: BlockHeight,
         /// Sender of the candidate header — needed by the coordinator to
@@ -417,7 +417,7 @@ pub enum ProtocolEvent {
         /// merkle-proof predicate holds by construction.
         provisions: Arc<Verified<Provisions>>,
         /// Shard the batch was broadcast to.
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
     },
 
     /// An execution certificate from a remote shard — for a wave that
@@ -426,7 +426,7 @@ pub enum ProtocolEvent {
     /// outbound batches; `Executed` and `Aborted` are both terminal.
     OutboundEcObserved {
         /// Shard whose EC was observed.
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         /// Per-tx outcomes from the EC, used to drain matching outbound entries.
         tx_outcomes: Vec<TxOutcome>,
     },
@@ -493,7 +493,7 @@ pub enum ProtocolEvent {
 
     /// Execution certificates delivered from any source — fetch response or
     /// peer broadcast (post sender-sig check). Each cert carries its own
-    /// `(shard_group_id, block_height, wave_id)`. The state machine iterates
+    /// `(shard_id, block_height, wave_id)`. The state machine iterates
     /// the batch and routes each cert to `ExecutionCoordinator::on_wave_certificate`,
     /// which dispatches signature verification. The fetch protocol drain
     /// hooks this event by `wave_id`.
@@ -663,7 +663,7 @@ pub enum ProtocolEvent {
     /// [`RemoteHeaderSync`]: ../../node/io_loop/sync/remote_header/type.RemoteHeaderSync.html
     RemoteHeaderSyncComplete {
         /// Source shard whose chain caught up.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Height the sync caught up to.
         height: BlockHeight,
     },
@@ -852,7 +852,7 @@ pub enum ProtocolEvent {
     /// `shard_header_records` entry and admits to the witness pool.
     ShardWitnessesReceived {
         /// Source shard that served the response.
-        shard_id: ShardGroupId,
+        shard_id: ShardId,
         /// Witnesses returned by the peer.
         witnesses: Vec<Arc<ShardWitness>>,
     },

@@ -18,8 +18,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, Provisions, ProvisionsContext, ShardGroupId, ValidatorId, Verifiable, Verified,
-    Verify, state_provisions_message,
+    BlockHeight, Provisions, ProvisionsContext, ShardId, ValidatorId, Verifiable, Verified, Verify,
+    state_provisions_message,
 };
 use tracing::warn;
 
@@ -38,10 +38,10 @@ pub type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
 /// action complete.
 pub fn fetch_and_broadcast_provision<S, H>(
     view: &SubstateView<S>,
-    source_shard: ShardGroupId,
+    source_shard: ShardId,
     block_height: BlockHeight,
     requests: &[ProvisionsRequest],
-    shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
+    shard_recipients: &HashMap<ShardId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,

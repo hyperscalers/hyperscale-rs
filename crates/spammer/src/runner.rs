@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use hyperscale_types::{
-    RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
+    RoutableTransaction, ShardId, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -191,7 +191,7 @@ impl Spammer {
 
             let depth = self.config.num_shards.trailing_zeros();
             for shard_idx in 0..num_shards {
-                let target_shard = ShardGroupId::leaf(depth, shard_idx as u64);
+                let target_shard = ShardId::leaf(depth, shard_idx as u64);
 
                 let batch = workload.generate_batch_for_shard(
                     &self.accounts,
@@ -517,7 +517,7 @@ impl Worker {
 
             let depth = self.config.num_shards.trailing_zeros();
             for shard_idx in 0..num_shards {
-                let target_shard = ShardGroupId::leaf(depth, shard_idx as u64);
+                let target_shard = ShardId::leaf(depth, shard_idx as u64);
 
                 let batch = workload.generate_batch_for_shard(
                     &mut self.partition,
@@ -608,7 +608,7 @@ impl PartitionWorkload {
     fn generate_batch_for_shard(
         &self,
         partition: &mut AccountPartition,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         count: usize,
         rng: &mut impl Rng,
     ) -> Vec<RoutableTransaction> {
@@ -620,7 +620,7 @@ impl PartitionWorkload {
     fn generate_for_shard(
         &self,
         partition: &mut AccountPartition,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut impl Rng,
     ) -> Option<RoutableTransaction> {
         let is_cross_shard =
@@ -636,7 +636,7 @@ impl PartitionWorkload {
     fn generate_same_shard_for(
         &self,
         partition: &mut AccountPartition,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut impl Rng,
     ) -> Option<RoutableTransaction> {
         let (from, to) = partition.pair_for_shard(target_shard, rng, self.selection_mode)?;
@@ -646,7 +646,7 @@ impl PartitionWorkload {
     fn generate_cross_shard_for(
         &self,
         partition: &mut AccountPartition,
-        target_shard: ShardGroupId,
+        target_shard: ShardId,
         rng: &mut impl Rng,
     ) -> Option<RoutableTransaction> {
         if partition.num_shards() < 2 {
@@ -654,10 +654,9 @@ impl PartitionWorkload {
         }
 
         let depth = partition.num_shards().trailing_zeros();
-        let mut other_shard =
-            ShardGroupId::leaf(depth, rng.random_range(0..partition.num_shards()));
+        let mut other_shard = ShardId::leaf(depth, rng.random_range(0..partition.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId::leaf(depth, rng.random_range(0..partition.num_shards()));
+            other_shard = ShardId::leaf(depth, rng.random_range(0..partition.num_shards()));
         }
 
         let target_is_sender = rng.random_bool(0.5);

@@ -13,8 +13,7 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec,
     CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
     MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify,
-    WaveId,
+    Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -27,7 +26,7 @@ use crate::{
 /// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     height: BlockHeight,
     parent_block_hash: BlockHash,
     parent_qc: Verifiable<QuorumCertificate>,
@@ -41,7 +40,7 @@ pub struct BlockHeader {
     local_receipt_root: LocalReceiptRoot,
     provision_root: ProvisionsRoot,
     waves: BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
-    provision_tx_roots: BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
+    provision_tx_roots: BoundedBTreeMap<ShardId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
     in_flight: InFlightCount,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
@@ -57,7 +56,7 @@ impl BlockHeader {
     #[allow(clippy::too_many_arguments)] // mirrors the 18 stored fields
     #[must_use]
     pub fn new(
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         height: BlockHeight,
         parent_block_hash: BlockHash,
         parent_qc: impl Into<Verifiable<QuorumCertificate>>,
@@ -71,13 +70,13 @@ impl BlockHeader {
         local_receipt_root: LocalReceiptRoot,
         provision_root: ProvisionsRoot,
         waves: Vec<WaveId>,
-        provision_tx_roots: BTreeMap<ShardGroupId, ProvisionTxRoot>,
+        provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
         in_flight: InFlightCount,
         beacon_witness_root: BeaconWitnessRoot,
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
     ) -> Self {
         Self {
-            shard_group_id,
+            shard_id,
             height,
             parent_block_hash,
             parent_qc: parent_qc.into(),
@@ -100,20 +99,16 @@ impl BlockHeader {
 
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
     #[must_use]
-    pub fn genesis(
-        shard_group_id: ShardGroupId,
-        proposer: ValidatorId,
-        state_root: StateRoot,
-    ) -> Self {
+    pub fn genesis(shard_id: ShardId, proposer: ValidatorId, state_root: StateRoot) -> Self {
         Self {
-            shard_group_id,
+            shard_id,
             height: BlockHeight::new(0),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             // Genesis QC carries no signature and is valid by definition;
             // `Verified::<QuorumCertificate>::genesis` is the only path to a
             // verified genesis value (the predicate's signer check would
             // reject the zero-signers genesis bitfield).
-            parent_qc: Verified::<QuorumCertificate>::genesis(shard_group_id).into(),
+            parent_qc: Verified::<QuorumCertificate>::genesis(shard_id).into(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -136,8 +131,8 @@ impl BlockHeader {
     /// Makes headers self-describing for cross-shard verification. A remote shard
     /// needs to know which shard's committee to verify the QC against.
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.shard_group_id
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Block height in the chain (genesis = 0).
@@ -276,7 +271,7 @@ impl BlockHeader {
     #[must_use]
     pub const fn provision_tx_roots(
         &self,
-    ) -> &BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE> {
+    ) -> &BoundedBTreeMap<ShardId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE> {
         &self.provision_tx_roots
     }
 
@@ -328,7 +323,7 @@ impl BlockHeader {
     pub fn into_parts(
         self,
     ) -> (
-        ShardGroupId,
+        ShardId,
         BlockHeight,
         BlockHash,
         Verifiable<QuorumCertificate>,
@@ -342,13 +337,13 @@ impl BlockHeader {
         LocalReceiptRoot,
         ProvisionsRoot,
         BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
-        BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
+        BoundedBTreeMap<ShardId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
         InFlightCount,
         BeaconWitnessRoot,
         BeaconWitnessLeafCount,
     ) {
         (
-            self.shard_group_id,
+            self.shard_id,
             self.height,
             self.parent_block_hash,
             self.parent_qc,
@@ -373,7 +368,7 @@ impl BlockHeader {
     ///
     /// Returns the sorted set of all remote shards that need provisions from this block.
     #[must_use]
-    pub fn provision_targets(&self) -> Vec<ShardGroupId> {
+    pub fn provision_targets(&self) -> Vec<ShardId> {
         let mut set = BTreeSet::new();
         for wave in self.waves.iter() {
             set.extend(wave.remote_shards().iter().copied());
@@ -519,7 +514,7 @@ mod tests {
     use super::*;
 
     fn sample_header() -> BlockHeader {
-        BlockHeader::genesis(ShardGroupId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
+        BlockHeader::genesis(ShardId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
     }
 
     /// Hand-roll a `BlockHeader` whose `waves` length prefix exceeds the cap.
@@ -535,7 +530,7 @@ mod tests {
             enc.write_value_kind(ValueKind::Tuple).unwrap();
             // BlockHeader has 18 fields.
             enc.write_size(18).unwrap();
-            enc.encode(&h.shard_group_id).unwrap();
+            enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();
             enc.encode(&h.parent_qc).unwrap();
@@ -574,7 +569,7 @@ mod tests {
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
             enc.write_size(18).unwrap();
-            enc.encode(&h.shard_group_id).unwrap();
+            enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();
             enc.encode(&h.parent_qc).unwrap();
@@ -591,7 +586,7 @@ mod tests {
             enc.encode(&Vec::<WaveId>::new()).unwrap();
             // Oversized provision_tx_roots map.
             enc.write_value_kind(ValueKind::Map).unwrap();
-            enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
+            enc.write_value_kind(ShardId::value_kind()).unwrap();
             enc.write_value_kind(ProvisionTxRoot::value_kind()).unwrap();
             enc.write_size(MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
         }
@@ -634,7 +629,7 @@ mod tests {
     fn with_verified_parent_qc_upgrades_matching_header() {
         let mut header = sample_header();
         header.parent_qc = header.parent_qc.as_unverified().clone().into();
-        let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_group_id());
+        let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_id());
         let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
             .expect("matching parent_qc accepted");
         assert!(verified.parent_qc_verified().is_genesis());
@@ -645,7 +640,7 @@ mod tests {
     #[test]
     fn with_verified_parent_qc_rejects_mismatched_witness() {
         let header = sample_header();
-        let other_shard = ShardGroupId::from_heap_index(header.shard_group_id().inner() + 1);
+        let other_shard = ShardId::from_heap_index(header.shard_id().inner() + 1);
         let mismatched = Verified::<QuorumCertificate>::genesis(other_shard);
         let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
             .expect_err("mismatched parent_qc rejected");

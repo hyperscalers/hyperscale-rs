@@ -18,9 +18,9 @@ use thiserror::Error;
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
     BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionVote, GlobalReceiptRoot, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardGroupId, SignerBitfield,
-    TxOutcome, ValidatorId, Verified, Verify, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId, SignerBitfield, TxOutcome,
+    ValidatorId, Verified, Verify, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    exec_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
 /// Aggregated certificate for an execution wave.
@@ -218,8 +218,8 @@ impl ExecutionCertificate {
 
     /// The shard that produced this certificate.
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.wave_id.shard_group_id()
+    pub const fn shard_id(&self) -> ShardId {
+        self.wave_id.shard_id()
     }
 
     /// Deadline past which this certificate is provably useless on every shard.
@@ -280,7 +280,7 @@ impl ExecutionCertificate {
             network,
             self.vote_anchor_ts,
             &self.wave_id,
-            self.shard_group_id(),
+            self.shard_id(),
             &self.global_receipt_root,
             u32::try_from(self.tx_outcomes.len()).unwrap_or(u32::MAX),
         )
@@ -316,7 +316,7 @@ pub enum ExecutionCertificateVerifyError {
 /// Construction asserts: the aggregated BLS signature validates against
 /// the public key formed by aggregating `public_keys[i]` for every `i`
 /// set in `signers`, over the canonical [`exec_vote_message`] derived
-/// from the certificate's `(vote_anchor_ts, wave_id, shard_group_id,
+/// from the certificate's `(vote_anchor_ts, wave_id, shard_id,
 /// global_receipt_root, tx_count)`. Empty signer sets must carry the
 /// zero signature.
 ///
@@ -368,7 +368,7 @@ impl Verified<ExecutionCertificate> {
     /// only asserts the predicate (signature aggregation + signer-bit
     /// mapping). Every input vote is assumed to share the same signing
     /// message — the `VoteTracker` bucketing key `(global_receipt_root,
-    /// vote_anchor_ts)` plus the per-wave `wave_id` and `shard_group_id`
+    /// vote_anchor_ts)` plus the per-wave `wave_id` and `shard_id`
     /// uniquely determine that message, so a single bucket's contents
     /// satisfy this contract by construction.
     ///
@@ -430,7 +430,7 @@ impl Verified<ExecutionCertificate> {
         // SAFETY: every input vote satisfies the `ExecutionVote`
         // predicate against its own pubkey for the shared signing
         // message determined by `(vote_anchor_ts, wave_id,
-        // shard_group_id, global_receipt_root, tx_count)`. Aggregating
+        // shard_id, global_receipt_root, tx_count)`. Aggregating
         // those signatures and mirroring the committee indices in
         // `signers` produces an EC whose predicate is structurally
         // equivalent: the aggregated pubkey at verify time recombines
@@ -481,9 +481,9 @@ mod tests {
 
     fn wave_id() -> WaveId {
         WaveId::new(
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             BlockHeight::new(7),
-            std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
+            std::iter::once(ShardId::leaf(1, 1)).collect(),
         )
     }
 
@@ -502,7 +502,7 @@ mod tests {
             BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             wave_id(),
-            ShardGroupId::leaf(1, 0),
+            ShardId::leaf(1, 0),
             outcomes,
             ValidatorId::new(validator),
             sk,

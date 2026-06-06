@@ -24,7 +24,7 @@ use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
     CertifiedBlock, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
     GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
     StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
     ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, VotePower, WaveCertificate, WaveId,
     WeightedTimestamp, bls_keypair_from_seed,
@@ -209,7 +209,7 @@ impl TestCommittee {
 /// Build a minimal `Block::Live` fixture for driving state machines.
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
-/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId::ROOT)`, `round`
+/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardId::ROOT)`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
 ///
@@ -222,7 +222,7 @@ impl TestCommittee {
 /// holding `Verified` entries.
 #[must_use]
 pub fn make_live_block(
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     height: BlockHeight,
     timestamp_ms: u64,
     proposer: ValidatorId,
@@ -230,10 +230,10 @@ pub fn make_live_block(
     certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
 ) -> Block {
     let header = BlockHeader::new(
-        shard_group_id,
+        shard_id,
         height,
         BlockHash::ZERO,
-        QuorumCertificate::genesis(ShardGroupId::ROOT),
+        QuorumCertificate::genesis(ShardId::ROOT),
         proposer,
         ProposerTimestamp::from_millis(timestamp_ms),
         Round::INITIAL,
@@ -269,10 +269,10 @@ pub fn make_live_block(
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardGroupId::ROOT);
+        let __qc = QuorumCertificate::genesis(ShardId::ROOT);
         QuorumCertificate::new(
             block.hash(),
-            __qc.shard_group_id(),
+            __qc.shard_id(),
             __qc.height(),
             __qc.parent_block_hash(),
             __qc.round(),
@@ -286,7 +286,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
 
 /// Build a minimal `FinalizedWave` carrying a single tx decision.
 ///
-/// The wave is anchored on `ShardGroupId::ROOT` with `block_height` as its
+/// The wave is anchored on `ShardId::ROOT` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
 /// effects. The inner EC carries a zeroed BLS signature and a 4-seat
@@ -305,7 +305,7 @@ pub fn make_finalized_wave(
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
-    let wave_id = WaveId::new(ShardGroupId::ROOT, block_height, BTreeSet::new());
+    let wave_id = WaveId::new(ShardId::ROOT, block_height, BTreeSet::new());
     let ec = ExecutionCertificate::new(
         wave_id.clone(),
         WeightedTimestamp::from_millis(block_height.inner() + 1),

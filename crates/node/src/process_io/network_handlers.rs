@@ -27,7 +27,7 @@ use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardGroupId, Verifiable, ready_signal_message};
+use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, ready_signal_message};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -371,7 +371,7 @@ where
         self.process
             .network
             .register_gossip_handler::<TransactionGossip>(
-                move |gossip: TransactionGossip, shard: ShardGroupId| -> GossipVerdict {
+                move |gossip: TransactionGossip, shard: ShardId| -> GossipVerdict {
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
                             shard = shard.inner(),
@@ -401,9 +401,7 @@ where
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
-                move |gossip: CertifiedBlockHeaderGossip,
-                      target_shard: ShardGroupId|
-                      -> GossipVerdict {
+                move |gossip: CertifiedBlockHeaderGossip, target_shard: ShardId| -> GossipVerdict {
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
@@ -412,7 +410,7 @@ where
                         return GossipVerdict::Reject;
                     };
                     let sender = gossip.sender;
-                    let header_shard = gossip.certified_header.header().shard_group_id();
+                    let header_shard = gossip.certified_header.header().shard_id();
                     let topo = topology.load();
 
                     let Some(public_key) =
@@ -446,7 +444,7 @@ where
         self.process
             .network
             .register_gossip_handler::<BeaconBlockGossip>(
-                move |gossip: BeaconBlockGossip, target_shard: ShardGroupId| -> GossipVerdict {
+                move |gossip: BeaconBlockGossip, target_shard: ShardId| -> GossipVerdict {
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
@@ -470,7 +468,7 @@ where
         self.process
             .network
             .register_gossip_handler::<SkipRequestGossip>(
-                move |gossip: SkipRequestGossip, target_shard: ShardGroupId| -> GossipVerdict {
+                move |gossip: SkipRequestGossip, target_shard: ShardId| -> GossipVerdict {
                     let Some(tx) = senders.get(&target_shard) else {
                         return GossipVerdict::Reject;
                     };
@@ -490,7 +488,7 @@ where
         self.process
             .network
             .register_gossip_handler::<SkipCertGossip>(
-                move |gossip: SkipCertGossip, target_shard: ShardGroupId| -> GossipVerdict {
+                move |gossip: SkipCertGossip, target_shard: ShardId| -> GossipVerdict {
                     let Some(tx) = senders.get(&target_shard) else {
                         return GossipVerdict::Reject;
                     };
@@ -510,7 +508,7 @@ where
     pub(crate) fn register_notification_handlers(&self) {
         // ── block.vote → ProtocolEvent::{Verified,Unverified}BlockVoteReceived ──
         //
-        // `BlockVote.shard_group_id()` is the shard whose consensus the
+        // `BlockVote.shard_id()` is the shard whose consensus the
         // vote is for; with cross-shard hosting that selects which of
         // this host's vnodes the event fans out to. Drop early if the
         // vote targets a shard we don't host.
@@ -524,7 +522,7 @@ where
             .network
             .register_notification_handler::<BlockVoteNotification>(
                 move |gossip: BlockVoteNotification| {
-                    let shard = gossip.vote.shard_group_id();
+                    let shard = gossip.vote.shard_id();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
                             target_shard = shard.inner(),
@@ -546,7 +544,7 @@ where
             .network
             .register_notification_handler::<TimeoutNotification>(
                 move |gossip: TimeoutNotification| {
-                    let shard = gossip.timeout.shard_group_id();
+                    let shard = gossip.timeout.shard_id();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
                             target_shard = shard.inner(),
@@ -570,7 +568,7 @@ where
             .network
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
-                    let shard = gossip.header.shard_group_id();
+                    let shard = gossip.header.shard_id();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
                             target_shard = shard.inner(),
@@ -664,7 +662,7 @@ where
                     // local shard) by construction. Use the first vote's
                     // shard to identify the target hosted shard and gate
                     // before paying the BLS verification cost.
-                    let target_shard = batch.votes[0].shard_group_id();
+                    let target_shard = batch.votes[0].shard_id();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
@@ -700,7 +698,7 @@ where
 
         // ── execution.cert.batch → verify sender sig, then ProtocolEvent::ExecutionCertificatesReceived ─
         //
-        // The cert's `shard_group_id` is the *source* shard (sender's
+        // The cert's `shard_id` is the *source* shard (sender's
         // shard). With cross-shard hosting we may consume an EC for any
         // of our hosted shards as the destination, so the relevant
         // "target hosted shard" is determined later by the state machine.
@@ -718,15 +716,15 @@ where
                     }
 
                     let sender = batch.sender;
-                    let source_shard = batch.certificates[0].shard_group_id();
+                    let source_shard = batch.certificates[0].shard_id();
                     if batch
                         .certificates
                         .iter()
-                        .any(|c| c.shard_group_id() != source_shard)
+                        .any(|c| c.shard_id() != source_shard)
                     {
                         warn!(
                             sender = sender.inner(),
-                            "Execution certificate batch contains mixed shard_group_ids — dropping"
+                            "Execution certificate batch contains mixed shard_ids — dropping"
                         );
                         return;
                     }

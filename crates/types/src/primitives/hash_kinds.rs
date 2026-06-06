@@ -120,7 +120,7 @@ hash_newtype!(
 hash_newtype!(
     /// Content identity of a [`WaveCertificate`](crate::WaveCertificate).
     ///
-    /// Computed from the ordered `(shard_group_id, wave_id)` pairs of
+    /// Computed from the ordered `(shard_id, wave_id)` pairs of
     /// its execution certificates — identifies the set of ECs a wave
     /// committed to.
     pub WaveReceiptHash,

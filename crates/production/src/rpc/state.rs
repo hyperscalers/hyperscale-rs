@@ -6,9 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use hyperscale_types::{
-    InFlightCount, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash,
-};
+use hyperscale_types::{InFlightCount, RoutableTransaction, ShardId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +49,7 @@ pub struct RpcState {
     /// Status lookup probes every entry: a tx may have landed on any
     /// hosted shard, and under cross-shard packed a single primary
     /// entry would hide half the txs.
-    pub tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
+    pub tx_status_caches: HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
@@ -109,7 +107,7 @@ pub struct VnodeMempoolSnapshot {
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
-    pub remote_shard_in_flight: HashMap<ShardGroupId, InFlightCount>,
+    pub remote_shard_in_flight: HashMap<ShardId, InFlightCount>,
     /// Threshold for rejecting transactions due to remote shard congestion
     /// (80% of [`hyperscale_types::MAX_TX_IN_FLIGHT`]).
     pub remote_congestion_threshold: InFlightCount,

@@ -12,7 +12,7 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount,
     LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
     PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId,
     ShardWitness, SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, StateRoot,
     SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
@@ -51,7 +51,7 @@ pub struct ProvisionsRequest {
     pub local_nodes: Vec<NodeId>,
     /// Per-target-shard nodes this tx reads from each remote shard.
     /// Used to populate `ProvisionEntry::target_nodes` for conflict detection.
-    pub target_nodes: Vec<(ShardGroupId, Vec<NodeId>)>,
+    pub target_nodes: Vec<(ShardId, Vec<NodeId>)>,
 }
 
 /// Actions the state machine wants to perform.
@@ -145,7 +145,7 @@ pub enum Action {
     /// EC since they don't aggregate) and remote participating shard committees.
     BroadcastExecutionCertificate {
         /// Target shard receiving the EC.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Aggregated execution certificate.
         certificate: Arc<Verified<ExecutionCertificate>>,
         /// Target shard peers (excluding self) for the broadcast.
@@ -166,11 +166,11 @@ pub enum Action {
         /// One entry per cross-shard tx that needs provisioning.
         requests: Vec<ProvisionsRequest>,
         /// Shard producing the provisions (this validator's shard).
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Source-shard block height the provisions are anchored to.
         block_height: BlockHeight,
         /// Per-shard recipients for provision broadcasts (excluding self).
-        shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
+        shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
     },
 
     /// Sign and broadcast a committed block header globally to all shards.
@@ -248,7 +248,7 @@ pub enum Action {
         /// Block hash the QC would be for.
         block_hash: BlockHash,
         /// Shard group this QC belongs to.
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         /// Block height.
         height: BlockHeight,
         /// Round number.
@@ -292,7 +292,7 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
     AggregateExecutionCertificate {
-        /// Wave identifier. The producing shard is `wave_id.shard_group_id`.
+        /// Wave identifier. The producing shard is `wave_id.shard_id`.
         wave_id: WaveId,
         /// Global receipt root (merkle root over per-tx outcome leaves).
         global_receipt_root: GlobalReceiptRoot,
@@ -355,7 +355,7 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
     VerifyQcSignature {
-        /// The QC to verify (carries `shard_group_id` for self-contained
+        /// The QC to verify (carries `shard_id` for self-contained
         /// verification). When the wrapper is already
         /// [`Verifiable::Verified`] — e.g. the caller hit a cached
         /// verified value — the handler short-circuits and emits the
@@ -409,7 +409,7 @@ pub enum Action {
         /// Quorum threshold for the remote shard.
         quorum_threshold: VotePower,
         /// Remote shard ID (for correlation in callback).
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Remote block height (for correlation in callback).
         height: BlockHeight,
     },
@@ -581,7 +581,7 @@ pub enum Action {
     /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
     BuildProposal {
         /// Local shard producing this proposal.
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         /// Validator id of the proposer (this node).
         proposer: ValidatorId,
         /// Height of the new block.
@@ -820,7 +820,7 @@ pub enum Action {
     /// [`crate::ProtocolEvent::RemoteHeaderReceived`].
     StartRemoteHeaderSync {
         /// Remote shard whose certified header chain we're catching up to.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Highest known target height for that shard's chain.
         target: BlockHeight,
     },

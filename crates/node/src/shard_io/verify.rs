@@ -2,8 +2,8 @@
 
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, ShardGroupId, Signed, SignedContext,
-    TopologySnapshot, ValidatorId, verify_bls12381_v1,
+    Bls12381G1PublicKey, Bls12381G2Signature, ShardId, Signed, SignedContext, TopologySnapshot,
+    ValidatorId, verify_bls12381_v1,
 };
 use tracing::warn;
 
@@ -27,7 +27,7 @@ pub fn verify_bls_with_metrics(
 pub fn resolve_sender_key(
     topology: &TopologySnapshot,
     sender: ValidatorId,
-    shard: ShardGroupId,
+    shard: ShardId,
     context: &str,
 ) -> Option<Bls12381G1PublicKey> {
     let committee = topology.committee_for_shard(shard);
@@ -94,7 +94,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
 /// Returns `false` (with warnings) on any failure.
 pub fn verify_signed_by_committee<T: Signed>(
     topology: &TopologySnapshot,
-    shard: ShardGroupId,
+    shard: ShardId,
     notification: &T,
     metric_label: &str,
     context: &str,

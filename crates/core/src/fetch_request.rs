@@ -6,8 +6,8 @@
 //! calls into the corresponding `instances/*.rs` module.
 //!
 //! Peer selection is the network layer's job: the runner derives the
-//! `ShardGroupId` from the variant (local shard for intra-shard variants;
-//! `source_shard` or `wave_id.shard_group_id()` for cross-shard variants)
+//! `ShardId` from the variant (local shard for intra-shard variants;
+//! `source_shard` or `wave_id.shard_id()` for cross-shard variants)
 //! and hands it to `Network::request` along with `preferred`. Coordinators
 //! never reach into the topology for committee membership when emitting
 //! fetches.
@@ -18,7 +18,7 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ProvisionHash, ShardGroupId, TxHash,
+    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ProvisionHash, ShardId, TxHash,
     ValidatorId, WaveId,
 };
 
@@ -42,7 +42,7 @@ pub enum FetchRequest {
         /// Transaction hashes to fetch.
         ids: Vec<TxHash>,
         /// Committee shard serving the request.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
@@ -53,7 +53,7 @@ pub enum FetchRequest {
         /// Provision hashes to fetch.
         ids: Vec<ProvisionHash>,
         /// Always the local shard for this variant.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
@@ -64,7 +64,7 @@ pub enum FetchRequest {
         /// Wave ids whose finalized waves are missing.
         ids: Vec<WaveId>,
         /// Always the local shard for this variant.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
@@ -75,7 +75,7 @@ pub enum FetchRequest {
     /// proposer that originated the provisions.
     RemoteProvisions {
         /// Source shard whose provisions are missing.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Source-shard block height the missing provisions are anchored to.
         block_height: BlockHeight,
         /// Canonical-source hint, when one exists.
@@ -84,7 +84,7 @@ pub enum FetchRequest {
         class: Option<MessageClass>,
     },
     /// Cross-shard execution-cert fetch by `WaveId`. Routing shard is
-    /// `wave_id.shard_group_id()` (the shard that committed the source
+    /// `wave_id.shard_id()` (the shard that committed the source
     /// block). `preferred` is `None` — the wave's designated broadcaster
     /// role is computable but health-weighted selection works equally
     /// well empirically.
@@ -102,7 +102,7 @@ pub enum FetchRequest {
     /// witness accumulator).
     ShardWitnesses {
         /// Source shard whose witnesses we want.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Height of the anchor block in the source-shard chain.
         block_height: BlockHeight,
         /// Hash of the anchor block; binds responses to the right
@@ -124,7 +124,7 @@ pub enum FetchRequest {
         /// Local shard the requesting vnode belongs to; threaded so
         /// the network layer has a valid committee handle for peer
         /// selection. `preferred` pins the actual destination.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Epoch the proposal targets.
         epoch: Epoch,
         /// Validator whose proposal we're fetching.

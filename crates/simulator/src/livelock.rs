@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
-    NodeId, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash, Verified, shard_for_node,
+    NodeId, RoutableTransaction, ShardId, TransactionStatus, TxHash, Verified, shard_for_node,
 };
 
 /// Information about a stuck transaction.
@@ -43,11 +43,11 @@ pub struct StuckTransaction {
     /// The transaction itself
     pub transaction: std::sync::Arc<Verified<RoutableTransaction>>,
     /// Shard this transaction was found on
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// All shards this transaction writes to
-    pub write_shards: Vec<ShardGroupId>,
+    pub write_shards: Vec<ShardId>,
     /// All shards this transaction reads from (cross-shard provisions)
-    pub read_shards: Vec<ShardGroupId>,
+    pub read_shards: Vec<ShardId>,
     /// Whether this is a cross-shard transaction
     pub is_cross_shard: bool,
 }
@@ -60,7 +60,7 @@ pub struct LivelockCycle {
     /// Addresses (`NodeIds`) that form the contention
     pub contended_addresses: Vec<NodeId>,
     /// Shards involved in the cycle
-    pub involved_shards: Vec<ShardGroupId>,
+    pub involved_shards: Vec<ShardId>,
 }
 
 /// Report of livelock analysis.
@@ -71,7 +71,7 @@ pub struct LivelockReport {
     /// Transactions stuck in each status
     pub by_status: HashMap<String, Vec<StuckTransaction>>,
     /// Transactions grouped by shard
-    pub by_shard: HashMap<ShardGroupId, Vec<StuckTransaction>>,
+    pub by_shard: HashMap<ShardId, Vec<StuckTransaction>>,
     /// Potential livelock cycles detected
     pub potential_cycles: Vec<LivelockCycle>,
     /// Cross-shard transactions that are stuck
@@ -188,7 +188,7 @@ impl LivelockAnalyzer {
         // Collect from first validator of each shard (all validators see same mempool)
         let depth = num_shards.trailing_zeros();
         for shard_idx in 0..num_shards {
-            let shard = ShardGroupId::leaf(depth, shard_idx);
+            let shard = ShardId::leaf(depth, shard_idx);
             let first_node_idx =
                 u32::try_from(shard_idx).unwrap_or(u32::MAX) * validators_per_shard;
 
@@ -248,7 +248,7 @@ impl LivelockAnalyzer {
         }
 
         // Group by shard
-        let mut by_shard: HashMap<ShardGroupId, Vec<StuckTransaction>> = HashMap::new();
+        let mut by_shard: HashMap<ShardId, Vec<StuckTransaction>> = HashMap::new();
         for tx in &self.stuck_transactions {
             by_shard.entry(tx.shard).or_default().push(tx.clone());
         }

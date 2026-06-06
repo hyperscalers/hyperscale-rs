@@ -1,14 +1,14 @@
 //! Remote-header sync binding for the generic [`Sync`] state machine.
 //!
 //! [`RemoteHeaderSyncBinding`] declares per-binding type info: per-shard
-//! scope (`Scope = ShardGroupId`) and no payload-private state
+//! scope (`Scope = ShardId`) and no payload-private state
 //! (`State = ()`).
 //!
 //! The `NodeHost` remote-header-sync handlers own request dispatch, response
 //! decoding, and forward delivered headers through the existing
 //! `RemoteHeaderReceived` path.
 
-use hyperscale_types::{BlockHeight, ShardGroupId};
+use hyperscale_types::{BlockHeight, ShardId};
 
 use super::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
@@ -40,7 +40,7 @@ pub type RemoteHeaderSyncOutput = SyncOutput<RemoteHeaderSyncBinding>;
 pub struct RemoteHeaderSyncBinding;
 
 impl SyncBinding for RemoteHeaderSyncBinding {
-    type Scope = ShardGroupId;
+    type Scope = ShardId;
     type Key = BlockHeight;
     type State = ();
     const NAME: &'static str = "remote_header_sync";

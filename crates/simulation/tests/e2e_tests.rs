@@ -18,7 +18,7 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TransactionStatus,
     ed25519_keypair_from_seed, routable_from_notarized_v1, shard_for_node, sign_and_notarize,
 };
 use radix_common::constants::XRD;
@@ -594,9 +594,9 @@ fn test_e2e_cross_shard_transaction() {
         let hs_node_id = NodeId(node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node_id, num_shards);
 
-        if shard == ShardGroupId::leaf(1, 0) && shard0_keypair.is_none() {
+        if shard == ShardId::leaf(1, 0) && shard0_keypair.is_none() {
             shard0_keypair = Some((seed, kp, account));
-        } else if shard == ShardGroupId::leaf(1, 1) && shard1_keypair.is_none() {
+        } else if shard == ShardId::leaf(1, 1) && shard1_keypair.is_none() {
             shard1_keypair = Some((seed, kp, account));
         }
 

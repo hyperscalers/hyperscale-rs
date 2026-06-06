@@ -3,8 +3,8 @@
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, Verifiable, exec_vote_batch_message,
+    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage, ShardId,
+    Signed, ValidatorId, Verifiable, exec_vote_batch_message,
 };
 
 /// Batched execution votes within a shard.
@@ -77,10 +77,7 @@ impl Signed for ExecutionVotesNotification {
     /// signature; the `IoLoop` also early-drops empty batches before
     /// verification, so this branch is defensive only.
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
-        let shard = self
-            .votes
-            .first()
-            .map_or(ShardGroupId::ROOT, |v| v.shard_group_id());
+        let shard = self.votes.first().map_or(ShardId::ROOT, |v| v.shard_id());
         exec_vote_batch_message(
             network,
             shard,

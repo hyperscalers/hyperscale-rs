@@ -156,7 +156,7 @@ pub(super) fn jail_validator(
 mod tests {
 
     use hyperscale_types::{
-        JailReason, MIN_STAKE_FLOOR, ShardGroupId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
+        JailReason, MIN_STAKE_FLOOR, ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
     use super::super::test_fixtures::{
@@ -285,7 +285,7 @@ mod tests {
         );
         // Shard committee size stays at 4 — validator 4 drawn from
         // pool to refill the freed epoch.
-        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -293,7 +293,7 @@ mod tests {
         let refill_status = state.validators.get(&ValidatorId::new(4)).unwrap().status;
         assert!(matches!(
             refill_status,
-            ValidatorStatus::OnShard { shard, ready: false, .. } if shard == ShardGroupId::leaf(1, 0),
+            ValidatorStatus::OnShard { shard, ready: false, .. } if shard == ShardId::leaf(1, 0),
         ));
     }
 

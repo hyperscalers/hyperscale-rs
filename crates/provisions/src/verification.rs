@@ -15,15 +15,14 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardGroupId, Verified,
-    compute_merkle_root,
+    CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified, compute_merkle_root,
 };
 use tracing::warn;
 
 /// Validate the tx-root and emit a `VerifyProvisions` action, or `None` if
 /// the provisions don't match the source header's commitment.
 pub fn build_verify_action(
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     provisions: Provisions,
     certified_header: Arc<Verified<CertifiedBlockHeader>>,
 ) -> Option<Action> {

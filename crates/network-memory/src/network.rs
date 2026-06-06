@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
-use hyperscale_types::{BeaconChainConfig, ShardGroupId, ShardTrie, ValidatorId};
+use hyperscale_types::{BeaconChainConfig, ShardId, ShardTrie, ValidatorId};
 use rand::RngExt;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
@@ -177,7 +177,7 @@ struct ScheduledGossip {
     /// global-scoped messages. Threaded through to the typed handler so
     /// cross-shard hosting can route the resulting `NodeInput` to the
     /// right hosted shard.
-    shard: Option<ShardGroupId>,
+    shard: Option<ShardId>,
 }
 
 // Only (delivery_time, sequence) matters for ordering/identity — `sequence` is a
@@ -360,10 +360,10 @@ impl SimulatedNetwork {
         let registries = (0..num_hosts)
             .map(|host_index| {
                 let host_index = u32::try_from(host_index).expect("host_index fits u32");
-                let hosted: HashSet<ShardGroupId> = match config.hosting_mode {
+                let hosted: HashSet<ShardId> = match config.hosting_mode {
                     HostingMode::SameShardBundled => {
                         let hosts_per_shard = config.validators_per_shard / config.vnodes_per_host;
-                        std::iter::once(ShardGroupId::leaf(
+                        std::iter::once(ShardId::leaf(
                             num_shards.trailing_zeros(),
                             u64::from(host_index / hosts_per_shard),
                         ))
@@ -579,19 +579,19 @@ impl SimulatedNetwork {
     ///   "all hosts share every shard" to intra-shard for all
     ///   inter-host gossip.
     #[must_use]
-    pub fn shard_for_node(&self, node: NodeIndex) -> ShardGroupId {
+    pub fn shard_for_node(&self, node: NodeIndex) -> ShardId {
         match self.config.hosting_mode {
             HostingMode::SameShardBundled => {
                 let hosts_per_shard =
                     self.config.validators_per_shard / self.config.vnodes_per_host;
                 let num_shards = u64::from(self.config.num_shards);
-                ShardGroupId::leaf(
+                ShardId::leaf(
                     num_shards.trailing_zeros(),
                     u64::from(node / hosts_per_shard),
                 )
             }
             HostingMode::CrossShard => {
-                ShardGroupId::leaf(u64::from(self.config.num_shards).trailing_zeros(), 0)
+                ShardId::leaf(u64::from(self.config.num_shards).trailing_zeros(), 0)
             }
         }
     }
@@ -603,7 +603,7 @@ impl SimulatedNetwork {
     /// - [`HostingMode::CrossShard`]: every host serves every shard, so
     ///   returns all hosts.
     #[must_use]
-    pub fn peers_in_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
+    pub fn peers_in_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
         match self.config.hosting_mode {
             HostingMode::SameShardBundled => {
                 let hosts_per_shard =
@@ -1185,12 +1185,12 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(network.shard_for_node(0), ShardGroupId::leaf(1, 0));
-        assert_eq!(network.shard_for_node(1), ShardGroupId::leaf(1, 0));
-        assert_eq!(network.shard_for_node(2), ShardGroupId::leaf(1, 0));
-        assert_eq!(network.shard_for_node(3), ShardGroupId::leaf(1, 0));
-        assert_eq!(network.shard_for_node(4), ShardGroupId::leaf(1, 1));
-        assert_eq!(network.shard_for_node(5), ShardGroupId::leaf(1, 1));
+        assert_eq!(network.shard_for_node(0), ShardId::leaf(1, 0));
+        assert_eq!(network.shard_for_node(1), ShardId::leaf(1, 0));
+        assert_eq!(network.shard_for_node(2), ShardId::leaf(1, 0));
+        assert_eq!(network.shard_for_node(3), ShardId::leaf(1, 0));
+        assert_eq!(network.shard_for_node(4), ShardId::leaf(1, 1));
+        assert_eq!(network.shard_for_node(5), ShardId::leaf(1, 1));
     }
 
     #[test]
@@ -1418,7 +1418,7 @@ mod tests {
     /// Registers directly on the shared registry since these tests exercise
     /// the `SimulatedNetwork` infrastructure (partitions, latency), not the
     /// typed handler registration API.
-    fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str, shard: ShardGroupId) {
+    fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str, shard: ShardId) {
         let handler: Arc<RawRequestHandler> =
             Arc::new(|payload: &[u8]| -> Vec<u8> { payload.to_vec() });
         adapter
@@ -1428,7 +1428,7 @@ mod tests {
 
     /// Helper: build a `PendingRequest` with a callback that captures the result.
     fn make_request_with_capture(
-        shard: ShardGroupId,
+        shard: ShardId,
         preferred_peer: Option<ValidatorId>,
     ) -> (PendingRequest, SharedRequestResult) {
         let result = Arc::new(std::sync::Mutex::new(None));
@@ -1457,10 +1457,10 @@ mod tests {
 
         // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
 
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
@@ -1488,13 +1488,13 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_partition, 1);
@@ -1516,10 +1516,10 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_loss, 1);
@@ -1543,7 +1543,7 @@ mod tests {
         let _adapter1 = network.create_adapter(1);
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1565,10 +1565,10 @@ mod tests {
         let handler: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { vec![] });
         adapter1
             .registry
-            .register_raw_request("test.request", ShardGroupId::leaf(1, 0), handler);
+            .register_raw_request("test.request", ShardId::leaf(1, 0), handler);
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1588,13 +1588,13 @@ mod tests {
         // Register handlers on all nodes
         for i in 0..4 {
             let adapter = network.create_adapter(i);
-            register_echo(&adapter, "test.request", ShardGroupId::leaf(1, 0));
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
 
         // No preferred peer — should pick a random peer from the shard
         // committee (validators 1..=3 after the requester at index 0
         // filters itself out).
-        let (request, result) = make_request_with_capture(ShardGroupId::leaf(1, 0), None);
+        let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
@@ -1615,10 +1615,10 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter0 = network.create_adapter(0);
-        register_echo(&adapter0, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter0, "test.request", ShardId::leaf(1, 0));
 
         // No preferred peer, and empty peer list
-        let (request, result) = make_request_with_capture(ShardGroupId::leaf(1, 0), None);
+        let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1637,10 +1637,10 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
 
         network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
 
@@ -1712,7 +1712,7 @@ mod tests {
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
                 let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardGroupId>| {
+                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
                         GossipVerdict::Accept
                     });
@@ -1737,7 +1737,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
-        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId::leaf(1, 0)));
+        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardId::leaf(1, 0)));
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
         network.flush_gossip(FAR_FUTURE);
 
@@ -1989,11 +1989,11 @@ mod tests {
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request", ShardGroupId::leaf(1, 0));
+        register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         // accept_requests should be able to find the handler
         let (request, result) =
-            make_request_with_capture(ShardGroupId::leaf(1, 0), Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
@@ -2006,7 +2006,7 @@ mod tests {
     fn test_full_gossip_roundtrip() {
         use hyperscale_network::GossipVerdict;
         use hyperscale_network::registry::RawGossipHandler;
-        use hyperscale_types::ShardGroupId;
+        use hyperscale_types::ShardId;
         use hyperscale_types::network::gossip::TransactionGossip;
         use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
 
@@ -2026,7 +2026,7 @@ mod tests {
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
                 let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardGroupId>| {
+                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
                         GossipVerdict::Accept
                     });
@@ -2045,7 +2045,7 @@ mod tests {
             vec![test_node(1)],
             vec![test_node(2)],
         ))]);
-        Network::broadcast_to_shard(&adapter0, ShardGroupId::leaf(1, 0), &gossip);
+        Network::broadcast_to_shard(&adapter0, ShardId::leaf(1, 0), &gossip);
 
         // Drain and deliver via accept_gossip + flush_gossip
         let entries = adapter0.drain_outbox();

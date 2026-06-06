@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use hyperscale_types::{BlockHeight, ShardGroupId};
+use hyperscale_types::{BlockHeight, ShardId};
 
 use super::beacon_block::{
     BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, beacon_block_sync_config,
@@ -84,7 +84,7 @@ impl SyncHost {
     /// admitted a header at `height` for `source_shard`.
     pub fn on_remote_header_admitted(
         &mut self,
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         height: BlockHeight,
     ) -> Vec<RemoteHeaderSyncOutput> {
         self.remote_header.handle(RemoteHeaderSyncInput::Admitted {

@@ -3,7 +3,7 @@
 use sbor::prelude::BasicSbor;
 
 use crate::network::response::GetProvisionResponse;
-use crate::{BlockHeight, MessageClass, NetworkMessage, Request, ShardGroupId};
+use crate::{BlockHeight, MessageClass, NetworkMessage, Request, ShardId};
 
 /// Request to fetch missing provisions from a source shard.
 ///
@@ -17,7 +17,7 @@ pub struct GetProvisionsRequest {
     pub block_height: BlockHeight,
     /// The shard requesting provisions (so the source knows which
     /// state entries to include in the response).
-    pub target_shard: ShardGroupId,
+    pub target_shard: ShardId,
 }
 
 impl NetworkMessage for GetProvisionsRequest {
@@ -48,7 +48,7 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetProvisionsRequest {
             block_height: BlockHeight::new(42),
-            target_shard: ShardGroupId::ROOT,
+            target_shard: ShardId::ROOT,
         };
 
         let encoded = basic_encode(&request).unwrap();

@@ -14,7 +14,7 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId, TransactionDecision,
+    Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TransactionDecision,
     TransactionStatus, TxHash, ed25519_keypair_from_seed, routable_from_notarized_v1,
     shard_for_node, sign_and_notarize,
 };
@@ -71,9 +71,9 @@ fn accounts_on_different_shards(
         let hs_node = NodeId(node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node, num_shards);
 
-        if shard == ShardGroupId::leaf(1, 0) && shard0.is_none() {
+        if shard == ShardId::leaf(1, 0) && shard0.is_none() {
             shard0 = Some((kp, acc));
-        } else if shard == ShardGroupId::leaf(1, 1) && shard1.is_none() {
+        } else if shard == ShardId::leaf(1, 1) && shard1.is_none() {
             shard1 = Some((kp, acc));
         }
         if shard0.is_some() && shard1.is_some() {

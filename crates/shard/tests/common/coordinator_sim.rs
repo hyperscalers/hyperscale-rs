@@ -5,7 +5,7 @@
 //! the result into envelopes on a two-queue delivery model
 //! (network-first, loopback-second).
 //!
-//! Single-shard by construction (`ShardGroupId::ROOT`), with no
+//! Single-shard by construction (`ShardId::ROOT`), with no
 //! provisions, no remote headers, no execution waves. The full
 //! simulator covers those concerns; this sim pins HotStuff-2
 //! safety + liveness machinery in isolation.
@@ -39,8 +39,8 @@ use hyperscale_types::{
     LocalReceiptRootContext, LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition,
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext,
+    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, StateRoot,
+    StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext,
     TopologySchedule, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError,
     ValidatorId, Verifiable, Verified, Verify, VotePower, ready_signal_message,
 };
@@ -270,7 +270,7 @@ pub struct ShardCoordinatorSim {
     /// Network definition used as the BLS signing domain.
     network: NetworkDefinition,
     /// The single shard this sim hosts.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// Per-replica capture log: one push per `CommitBlock` / `CommitBlockByQcOnly`.
     pub commits: Vec<Vec<CapturedCommit>>,
     /// Per-replica counter of inbound envelopes to silently drop on
@@ -317,7 +317,7 @@ impl ShardCoordinatorSim {
         let committee = TestCommittee::new(n, seed);
         let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let network = NetworkDefinition::simulator();
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
 
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
@@ -964,7 +964,7 @@ impl ShardCoordinatorSim {
             // nothing to deliver it to. Folds into the no-op
             // bucket below.
             Action::BuildProposal {
-                shard_group_id,
+                shard_id,
                 proposer,
                 height,
                 round,
@@ -999,7 +999,7 @@ impl ShardCoordinatorSim {
                     parent_block_height,
                     transactions,
                     finalized_waves.clone(),
-                    shard_group_id,
+                    shard_id,
                     self.topology.head(),
                     provisions.clone(),
                     parent_in_flight,
@@ -1038,7 +1038,7 @@ impl ShardCoordinatorSim {
             }
             Action::VerifyAndBuildQuorumCertificate {
                 block_hash,
-                shard_group_id,
+                shard_id,
                 height,
                 round,
                 parent_block_hash,
@@ -1050,7 +1050,7 @@ impl ShardCoordinatorSim {
                 let result = verify_and_build_qc(
                     &self.network,
                     block_hash,
-                    shard_group_id,
+                    shard_id,
                     height,
                     round,
                     parent_block_hash,
@@ -1346,7 +1346,7 @@ fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         .map(|(k, v)| (*k, *v))
         .collect();
     BlockHeader::new(
-        h.shard_group_id(),
+        h.shard_id(),
         h.height(),
         h.parent_block_hash(),
         h.parent_qc_verifiable().clone(),

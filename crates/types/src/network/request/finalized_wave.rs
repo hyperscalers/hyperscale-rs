@@ -50,14 +50,14 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{BlockHeight, ShardGroupId};
+    use crate::{BlockHeight, ShardId};
 
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetFinalizedWavesRequest {
             wave_ids: vec![
-                WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new()),
-                WaveId::new(ShardGroupId::ROOT, BlockHeight::new(2), BTreeSet::new()),
+                WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new()),
+                WaveId::new(ShardId::ROOT, BlockHeight::new(2), BTreeSet::new()),
             ],
         };
         let encoded = basic_encode(&request).unwrap();

@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
-    Round, ShardGroupId, ShardWitnessPayload, StoredReceipt, TopologySnapshot, Verified, Verify,
+    Round, ShardId, ShardWitnessPayload, StoredReceipt, TopologySnapshot, Verified, Verify,
     compute_merkle_root,
 };
 
@@ -28,7 +28,7 @@ pub struct BeaconWitnessRootContext<'a> {
     pub parent_round: Round,
     /// Shard the block belongs to — anchors the proposer-rotation
     /// rule for the missed-round walk.
-    pub shard: ShardGroupId,
+    pub shard: ShardId,
     /// Height of the block being verified.
     pub height: BlockHeight,
     /// Round at which the block was proposed.
@@ -74,7 +74,7 @@ pub enum BeaconWitnessRootVerifyError {
 /// both sides simultaneously.
 #[must_use]
 pub fn missed_proposals_since_prev_commit(
-    shard: ShardGroupId,
+    shard: ShardId,
     height: BlockHeight,
     parent_round: Round,
     committed_round: Round,

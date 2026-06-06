@@ -15,10 +15,10 @@ use hyperscale_types::{
     CertifiedBlock, ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata,
     ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
     InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector,
-    PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round,
-    ShardGroupId, SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot,
-    TxHash, TxOutcome, ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, zero_bls_signature,
+    PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardId,
+    SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
+    ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -104,7 +104,7 @@ pub fn make_mapped_database_update(
 /// invariant enforced at decode time (one EC per wave whose `wave_id` matches
 /// `wc.wave_id`).
 #[must_use]
-pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> WaveCertificate {
+pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCertificate {
     let wave_id = WaveId::new(shard, height, BTreeSet::new());
     let local_ec = Arc::new(ExecutionCertificate::new(
         wave_id.clone(),
@@ -125,10 +125,10 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block::Live {
         header: BlockHeader::new(
-            ShardGroupId::ROOT,
+            ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            QuorumCertificate::genesis(ShardGroupId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(height.inner() * 1000),
             Round::INITIAL,
@@ -162,7 +162,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
     // SAFETY: synthetic test fixture, no real signature.
     Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
         block.hash(),
-        ShardGroupId::ROOT,
+        ShardId::ROOT,
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
@@ -339,9 +339,9 @@ pub fn make_test_execution_certificate(
     )];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
     let mut remote_shards = BTreeSet::new();
-    remote_shards.insert(ShardGroupId::leaf(8, u64::from(seed) + 1));
+    remote_shards.insert(ShardId::leaf(8, u64::from(seed) + 1));
     ExecutionCertificate::new(
-        WaveId::new(ShardGroupId::ROOT, block_height, remote_shards),
+        WaveId::new(ShardId::ROOT, block_height, remote_shards),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
         outcomes,
@@ -470,7 +470,7 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter
     assert_eq!(batch.len(), 3);
 
     let missing_wave_id = WaveId::new(
-        known[0].shard_group_id(),
+        known[0].shard_id(),
         BlockHeight::new(999),
         known[0].remote_shards().iter().copied().collect(),
     );

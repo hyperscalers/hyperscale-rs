@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use hyperscale_types::{
-    RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
+    RoutableTransaction, ShardId, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -62,8 +62,8 @@ impl FundingWorkload {
         &self,
         accounts: &AccountPool,
         plan: &[FundingOp],
-    ) -> HashMap<ShardGroupId, Vec<RoutableTransaction>> {
-        let mut by_shard: HashMap<ShardGroupId, Vec<RoutableTransaction>> = HashMap::new();
+    ) -> HashMap<ShardId, Vec<RoutableTransaction>> {
+        let mut by_shard: HashMap<ShardId, Vec<RoutableTransaction>> = HashMap::new();
         let mut generated = 0u64;
         let mut failed = 0u64;
 

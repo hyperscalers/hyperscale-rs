@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition,
-    QuorumCertificate, Round, ShardGroupId, ValidatorId, Verified, Verify, timeout_message,
+    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, timeout_message,
     verify_bls12381_v1,
 };
 
@@ -27,7 +27,7 @@ use crate::{
 /// that keeps voters synchronised.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct Timeout {
-    shard_group_id: ShardGroupId,
+    shard_id: ShardId,
     round: Round,
     high_qc: QuorumCertificate,
     voter: ValidatorId,
@@ -39,16 +39,16 @@ impl Timeout {
     #[must_use]
     pub fn new(
         network: &NetworkDefinition,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
         signing_key: &Bls12381G1PrivateKey,
     ) -> Self {
-        let message = timeout_message(network, shard_group_id, round);
+        let message = timeout_message(network, shard_id, round);
         let signature = signing_key.sign_v1(&message);
         Self {
-            shard_group_id,
+            shard_id,
             round,
             high_qc,
             voter,
@@ -60,14 +60,14 @@ impl Timeout {
     /// responsible for the signature being valid for the other fields.
     #[must_use]
     pub const fn from_parts(
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
         signature: Bls12381G2Signature,
     ) -> Self {
         Self {
-            shard_group_id,
+            shard_id,
             round,
             high_qc,
             voter,
@@ -77,8 +77,8 @@ impl Timeout {
 
     /// Shard group this timeout belongs to (prevents cross-shard replay).
     #[must_use]
-    pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.shard_group_id
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
     }
 
     /// Round the validator timed out on.
@@ -117,14 +117,14 @@ impl Timeout {
     pub fn into_parts(
         self,
     ) -> (
-        ShardGroupId,
+        ShardId,
         Round,
         QuorumCertificate,
         ValidatorId,
         Bls12381G2Signature,
     ) {
         (
-            self.shard_group_id,
+            self.shard_id,
             self.round,
             self.high_qc,
             self.voter,
@@ -135,7 +135,7 @@ impl Timeout {
     /// Build the canonical signing message for this timeout.
     #[must_use]
     pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
-        timeout_message(network, self.shard_group_id, self.round)
+        timeout_message(network, self.shard_id, self.round)
     }
 }
 
@@ -195,7 +195,7 @@ impl Verified<Timeout> {
     #[must_use]
     pub fn sign_local(
         network: &NetworkDefinition,
-        shard_group_id: ShardGroupId,
+        shard_id: ShardId,
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
@@ -206,7 +206,7 @@ impl Verified<Timeout> {
         // predicate's check against this voter's matching pubkey.
         Self::new_unchecked(Timeout::new(
             network,
-            shard_group_id,
+            shard_id,
             round,
             high_qc,
             voter,
@@ -223,7 +223,7 @@ mod tests {
         zero_bls_signature,
     };
 
-    const SHARD: ShardGroupId = ShardGroupId::ROOT;
+    const SHARD: ShardId = ShardId::ROOT;
 
     fn high_qc_at(round: u64) -> QuorumCertificate {
         QuorumCertificate::new(

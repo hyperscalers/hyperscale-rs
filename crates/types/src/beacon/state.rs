@@ -36,8 +36,8 @@ use crate::beacon::genesis::BeaconChainConfig;
 use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardGroupId, Stake, StakePoolId,
-    ValidatorId, VotePower,
+    Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
+    VotePower,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ pub enum ValidatorStatus {
     /// committee epoch but doesn't sign.
     OnShard {
         /// Shard the validator is on.
-        shard: ShardGroupId,
+        shard: ShardId,
         /// Whether the validator has signalled sync-completion.
         ready: bool,
         /// Epoch when the placement happened.
@@ -228,7 +228,7 @@ pub struct BeaconState {
     /// (so it leaves the committee one epoch out) but stays listed here,
     /// because it was a member for this window. The shard's `2f+1` quorum
     /// tolerates the absent member.
-    pub shard_committees: BTreeMap<ShardGroupId, ShardCommittee>,
+    pub shard_committees: BTreeMap<ShardId, ShardCommittee>,
     /// Lookahead per-shard committee — governs the **next** epoch's
     /// window and is finalized here, one epoch before it takes effect,
     /// so every shard holds it well before its window opens (one-epoch
@@ -240,7 +240,7 @@ pub struct BeaconState {
     /// slots that just opened). The `members ⇔ status == OnShard{shard}`
     /// invariant holds here. At the start of the next `apply_epoch` this
     /// value is promoted into `shard_committees`.
-    pub next_shard_committees: BTreeMap<ShardGroupId, ShardCommittee>,
+    pub next_shard_committees: BTreeMap<ShardId, ShardCommittee>,
     /// Per-shard high-water mark over each shard's beacon-witness
     /// accumulator: the largest [`LeafIndex`] this beacon has lifted
     /// from that shard. A `ShardWitness` with `proof.leaf_index !=
@@ -251,7 +251,7 @@ pub struct BeaconState {
     /// `PcVoteEquivocation` is not tracked here — it has no shard
     /// provenance and re-application is idempotent once the validator
     /// is `Jailed { Equivocation }`.
-    pub consumed_through: BTreeMap<ShardGroupId, LeafIndex>,
+    pub consumed_through: BTreeMap<ShardId, LeafIndex>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -349,7 +349,7 @@ pub struct SlotEffects {
     pub beacon_committee_transition: Option<CommitteeTransition>,
     /// Per-shard transitions emitted for any shard whose `members`
     /// list changed this epoch.
-    pub shard_committee_transitions: BTreeMap<ShardGroupId, CommitteeTransition>,
+    pub shard_committee_transitions: BTreeMap<ShardId, CommitteeTransition>,
     /// Committee members whose `vrf_reveal` failed verification —
     /// their reveal did not contribute to the new randomness and their
     /// witnesses were also dropped (a malformed reveal is treated as a
@@ -523,7 +523,7 @@ impl BeaconState {
 
     fn derive_topology_from(
         &self,
-        committees: &BTreeMap<ShardGroupId, ShardCommittee>,
+        committees: &BTreeMap<ShardId, ShardCommittee>,
         network: NetworkDefinition,
     ) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = self
@@ -537,7 +537,7 @@ impl BeaconState {
             .collect();
         let validator_set = ValidatorSet::new(validators);
 
-        let shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = committees
+        let shard_committees: HashMap<ShardId, Vec<ValidatorId>> = committees
             .iter()
             .map(|(sid, sc)| (*sid, sc.members.clone()))
             .collect();
@@ -725,7 +725,7 @@ mod tests {
     fn single_pool_state(n_active: u64) -> BeaconState {
         let mut state = empty_state();
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
 
         let mut pool_validators = BTreeSet::new();
         let mut members = Vec::new();

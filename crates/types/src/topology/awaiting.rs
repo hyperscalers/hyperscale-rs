@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::ShardGroupId;
+use crate::ShardId;
 
 /// Per-shard cap on artifacts buffered awaiting their committee's epoch.
 /// Drop-oldest past this bound; a node this far behind re-fetches the dropped
@@ -25,7 +25,7 @@ const MAX_AWAITING_TOPOLOGY_PER_SHARD: usize = 256;
 /// [`drain`](Self::drain) flattens every per-shard queue for replay and
 /// discards the shard key, which replay re-derives.
 pub struct AwaitingTopologyBuffer<V> {
-    by_shard: HashMap<ShardGroupId, VecDeque<V>>,
+    by_shard: HashMap<ShardId, VecDeque<V>>,
 }
 
 impl<V> Default for AwaitingTopologyBuffer<V> {
@@ -45,7 +45,7 @@ impl<V> AwaitingTopologyBuffer<V> {
 
     /// Buffer `value` under `shard`, evicting the oldest entries while the
     /// shard's queue exceeds the per-shard cap.
-    pub fn push(&mut self, shard: ShardGroupId, value: V) {
+    pub fn push(&mut self, shard: ShardId, value: V) {
         let queue = self.by_shard.entry(shard).or_default();
         queue.push_back(value);
         while queue.len() > MAX_AWAITING_TOPOLOGY_PER_SHARD {
@@ -79,9 +79,9 @@ mod tests {
     #[test]
     fn push_then_drain_returns_all_values_across_shards() {
         let mut buf: AwaitingTopologyBuffer<u32> = AwaitingTopologyBuffer::new();
-        buf.push(ShardGroupId::leaf(1, 0), 1);
-        buf.push(ShardGroupId::leaf(1, 0), 2);
-        buf.push(ShardGroupId::leaf(1, 1), 3);
+        buf.push(ShardId::leaf(1, 0), 1);
+        buf.push(ShardId::leaf(1, 0), 2);
+        buf.push(ShardId::leaf(1, 1), 3);
         assert_eq!(buf.len(), 3);
         assert!(!buf.is_empty());
 
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn push_drops_oldest_past_the_per_shard_cap() {
         let mut buf: AwaitingTopologyBuffer<usize> = AwaitingTopologyBuffer::new();
-        let shard = ShardGroupId::leaf(1, 0);
+        let shard = ShardId::leaf(1, 0);
         for i in 0..MAX_AWAITING_TOPOLOGY_PER_SHARD + 5 {
             buf.push(shard, i);
         }
@@ -112,8 +112,8 @@ mod tests {
     fn cap_is_independent_per_shard() {
         let mut buf: AwaitingTopologyBuffer<usize> = AwaitingTopologyBuffer::new();
         for i in 0..MAX_AWAITING_TOPOLOGY_PER_SHARD + 10 {
-            buf.push(ShardGroupId::leaf(1, 0), i);
-            buf.push(ShardGroupId::leaf(1, 1), i);
+            buf.push(ShardId::leaf(1, 0), i);
+            buf.push(ShardId::leaf(1, 1), i);
         }
         // Each shard is capped on its own; the cap doesn't pool across shards.
         assert_eq!(buf.len(), 2 * MAX_AWAITING_TOPOLOGY_PER_SHARD);

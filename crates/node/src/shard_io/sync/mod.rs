@@ -192,7 +192,7 @@ impl SyncKey for Epoch {
 /// Trait carrying the per-binding type info the generic needs.
 ///
 /// `Scope` is the per-instance key (e.g. `()` for single-instance sync,
-/// `ShardGroupId` for multi-instance). `Key` is the watermark type the
+/// `ShardId` for multi-instance). `Key` is the watermark type the
 /// scope syncs over ([`BlockHeight`] or [`Epoch`]). `State` is
 /// binding-private mutable state owned by [`Sync`].
 pub trait SyncBinding: 'static {

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
-use hyperscale_types::{RETENTION_HORIZON, ShardGroupId, TxHash, WeightedTimestamp};
+use hyperscale_types::{RETENTION_HORIZON, ShardId, TxHash, WeightedTimestamp};
 
 use crate::receipt::CachedVmOutput;
 
@@ -69,7 +69,7 @@ struct Entry {
     value: Slot,
     /// Hosted shards (intersection of `participating` and `hosted_shards`)
     /// that still need to ack this tx via a finalised wave. Empty → evict.
-    pending_shards: HashSet<ShardGroupId>,
+    pending_shards: HashSet<ShardId>,
     /// Set to the cache's `now` at insertion. Compared against
     /// `now - RETENTION_HORIZON` during sweep.
     inserted_at_ts: WeightedTimestamp,
@@ -117,7 +117,7 @@ pub struct ProcessExecutionCache {
     /// Shards this process hosts. Used to narrow each tx's participating
     /// shard set down to the slice this cache can actually observe
     /// finalising via [`Self::on_finalized_wave`].
-    hosted_shards: HashSet<ShardGroupId>,
+    hosted_shards: HashSet<ShardId>,
     entries: DashMap<TxHash, Entry>,
     timeline: Mutex<Timeline>,
 }
@@ -128,7 +128,7 @@ impl ProcessExecutionCache {
     /// [`Self::on_finalized_wave`]; the retention sweep cleans up
     /// anything missed.
     #[must_use]
-    pub fn new(hosted_shards: HashSet<ShardGroupId>) -> Self {
+    pub fn new(hosted_shards: HashSet<ShardId>) -> Self {
         Self {
             hosted_shards,
             entries: DashMap::new(),
@@ -154,7 +154,7 @@ impl ProcessExecutionCache {
     pub fn try_acquire(
         &self,
         tx_hash: TxHash,
-        participating: impl IntoIterator<Item = ShardGroupId>,
+        participating: impl IntoIterator<Item = ShardId>,
     ) -> SlotStatus {
         // Fast path: lookup without taking any write lock. The slot is
         // an `Arc<OnceLock<_>>` so we can release the per-key shard
@@ -182,7 +182,7 @@ impl ProcessExecutionCache {
                 )
             }
             DashEntry::Vacant(vac) => {
-                let pending_shards: HashSet<ShardGroupId> = participating
+                let pending_shards: HashSet<ShardId> = participating
                     .into_iter()
                     .filter(|s| self.hosted_shards.contains(s))
                     .collect();
@@ -217,11 +217,7 @@ impl ProcessExecutionCache {
     /// admitting shard's `ShardLoop`; the wave's local EC supplies the
     /// shard identity and tx-hash list. Idempotent — calling twice
     /// with the same shard is a no-op.
-    pub fn on_finalized_wave(
-        &self,
-        shard: ShardGroupId,
-        tx_hashes: impl IntoIterator<Item = TxHash>,
-    ) {
+    pub fn on_finalized_wave(&self, shard: ShardId, tx_hashes: impl IntoIterator<Item = TxHash>) {
         for tx_hash in tx_hashes {
             // Decrement under the per-key shard guard, then release
             // it before calling `remove_if` — re-entering the same
@@ -309,7 +305,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use hyperscale_types::{Hash, ShardGroupId, TxHash, WeightedTimestamp};
+    use hyperscale_types::{Hash, ShardId, TxHash, WeightedTimestamp};
 
     use super::*;
 
@@ -317,11 +313,11 @@ mod tests {
         TxHash::from_raw(Hash::from_bytes(&[byte]))
     }
 
-    fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::leaf(3, n)
+    fn shard(n: u64) -> ShardId {
+        ShardId::leaf(3, n)
     }
 
-    fn hosted(shards: &[u64]) -> HashSet<ShardGroupId> {
+    fn hosted(shards: &[u64]) -> HashSet<ShardId> {
         shards.iter().copied().map(shard).collect()
     }
 
@@ -331,7 +327,7 @@ mod tests {
     fn populate(
         cache: &ProcessExecutionCache,
         tx: TxHash,
-        participating: impl IntoIterator<Item = ShardGroupId>,
+        participating: impl IntoIterator<Item = ShardId>,
     ) {
         match cache.try_acquire(tx, participating) {
             SlotStatus::Claimed(slot) => {

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, Epoch, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE,
-    MIN_STAKE_FLOOR, ShardCommittee, ShardGroupId, Stake, StakePool, StakePoolId, ValidatorId,
+    MIN_STAKE_FLOOR, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
     ValidatorRecord, ValidatorStatus,
 };
 
@@ -91,7 +91,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     // `ShardCommittee.members` order is incidental at runtime (status
     // is what gates signing, not list position), so the input order
     // carries through verbatim.
-    let next_shard_committees: BTreeMap<ShardGroupId, ShardCommittee> = config
+    let next_shard_committees: BTreeMap<ShardId, ShardCommittee> = config
         .initial_shard_committees
         .iter()
         .map(|(shard, members)| {
@@ -133,7 +133,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 /// Walk every invariant the builder relies on, panicking on the first
 /// violation. Returns the `validator_id → shard` placement map for the
 /// builder to read on its second pass.
-fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardGroupId> {
+fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardId> {
     // No duplicate validator or pool ids.
     let mut validator_ids: BTreeSet<ValidatorId> = BTreeSet::new();
     for v in &config.initial_validators {
@@ -204,7 +204,7 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardG
     // Shard committee members exist, each shard fits, no validator
     // sits on two shards.
     let shard_cap = config.chain_config.shard_size as usize;
-    let mut placed: BTreeMap<ValidatorId, ShardGroupId> = BTreeMap::new();
+    let mut placed: BTreeMap<ValidatorId, ShardId> = BTreeMap::new();
     for (shard, members) in &config.initial_shard_committees {
         assert!(
             members.len() <= shard_cap,
@@ -290,7 +290,7 @@ mod tests {
         n_beacon_members: u64,
     ) -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let validators: Vec<GenesisValidator> = (0..n_validators)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -335,7 +335,7 @@ mod tests {
             assert_eq!(
                 status,
                 ValidatorStatus::OnShard {
-                    shard: ShardGroupId::ROOT,
+                    shard: ShardId::ROOT,
                     ready: true,
                     placed_at_epoch: Epoch::GENESIS,
                 },
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn genesis_seeds_both_windows_then_apply_epoch_promotes_unchanged() {
         let cfg = sample_config(4, 4, 4);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let configured: Vec<ValidatorId> = [0u64, 1, 2, 3].map(ValidatorId::new).to_vec();
 
         let mut state = build_genesis_beacon_state(&cfg);
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn beacon_committee_stored_sorted() {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::ROOT;
+        let shard = ShardId::ROOT;
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -532,8 +532,8 @@ mod tests {
             }],
             initial_beacon_committee: vec![],
             initial_shard_committees: [
-                (ShardGroupId::leaf(1, 0), vec![ValidatorId::new(0)]),
-                (ShardGroupId::leaf(1, 1), vec![ValidatorId::new(0)]),
+                (ShardId::leaf(1, 0), vec![ValidatorId::new(0)]),
+                (ShardId::leaf(1, 1), vec![ValidatorId::new(0)]),
             ]
             .into_iter()
             .collect(),

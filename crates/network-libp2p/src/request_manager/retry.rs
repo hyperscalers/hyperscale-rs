@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hyperscale_metrics::{increment_dispatch_failures, record_request_retry};
-use hyperscale_types::{MessageClass, ShardGroupId};
+use hyperscale_types::{MessageClass, ShardId};
 use libp2p::PeerId;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
@@ -22,7 +22,7 @@ impl RequestManager {
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
-        shard: ShardGroupId,
+        shard: ShardId,
         request_desc: &str,
         type_id: &'static str,
         data: &[u8],
@@ -219,7 +219,7 @@ mod tests {
         fn send<'a>(
             &'a self,
             peer: PeerId,
-            _shard: ShardGroupId,
+            _shard: ShardId,
             type_id: &'static str,
             _data: Vec<u8>,
             _timeout: Duration,
@@ -275,7 +275,7 @@ mod tests {
             .request(
                 peers,
                 preferred,
-                ShardGroupId::ROOT,
+                ShardId::ROOT,
                 "test".to_string(),
                 "test.req",
                 vec![1, 2, 3],

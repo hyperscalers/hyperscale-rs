@@ -10,16 +10,16 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, ValidatorId, Verifiable, VotePower, WaveId,
+    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction, ShardId,
+    TopologySnapshot, ValidatorId, Verifiable, VotePower, WaveId,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
-pub type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
+pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 
 /// A single tx's layout within a wave: the transaction plus the set of shards
 /// that participate in its execution (local + any remote provision sources).
-pub type WaveTxEntry = (Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>);
+pub type WaveTxEntry = (Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardId>);
 
 /// Deterministic grouping of a block's transactions into waves.
 pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
@@ -33,7 +33,7 @@ pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
 pub fn peers_excluding_self(
     topology: &TopologySnapshot,
     me: ValidatorId,
-    shard: ShardGroupId,
+    shard: ShardId,
 ) -> Vec<ValidatorId> {
     topology
         .committee_for_shard(shard)
@@ -44,12 +44,12 @@ pub fn peers_excluding_self(
 }
 
 /// True if `ec.signers()` represents at least 2f+1 of the voting power on
-/// `ec.shard_group_id()`. Mirrors `qc_has_local_quorum_power` (in the shard consensus
+/// `ec.shard_id()`. Mirrors `qc_has_local_quorum_power` (in the shard consensus
 /// crate) but resolves committee + voting power for the EC's own shard,
 /// since cross-shard ECs are signed by remote committees.
 #[must_use]
 pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCertificate) -> bool {
-    let shard = ec.shard_group_id();
+    let shard = ec.shard_id();
     let committee = topology.committee_for_shard(shard);
     let signers_power: VotePower = ec
         .signers()
@@ -71,7 +71,7 @@ pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCert
 /// proceed with a partial key set.
 pub fn committee_public_keys_for_shard(
     topology: &TopologySnapshot,
-    shard: ShardGroupId,
+    shard: ShardId,
 ) -> Option<Vec<Bls12381G1PublicKey>> {
     let committee = topology.committee_for_shard(shard);
     let mut pubkeys = Vec::with_capacity(committee.len());
@@ -90,7 +90,7 @@ pub fn committee_public_keys_for_shard(
 /// block order within each wave.
 pub fn assign_waves(
     topology: &TopologySnapshot,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
     block_height: BlockHeight,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
 ) -> WaveAssignments {
@@ -98,12 +98,12 @@ pub fn assign_waves(
 
     for tx in transactions {
         // Compute provision dependency set = remote shards needed
-        let all_shards: BTreeSet<ShardGroupId> = topology
+        let all_shards: BTreeSet<ShardId> = topology
             .all_shards_for_transaction(tx)
             .into_iter()
             .collect();
 
-        let remote_shards: BTreeSet<ShardGroupId> = all_shards
+        let remote_shards: BTreeSet<ShardId> = all_shards
             .iter()
             .filter(|&&s| s != local_shard)
             .copied()
@@ -127,7 +127,7 @@ pub fn build_provision_requests(
     topology: &TopologySnapshot,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
     me: ValidatorId,
-    local_shard: ShardGroupId,
+    local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
     let local_vid = me;
 
@@ -156,7 +156,7 @@ pub fn build_provision_requests(
         }
 
         // Per-target-shard node needs for conflict detection on the remote side.
-        let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
+        let mut target_nodes: Vec<(ShardId, Vec<NodeId>)> = Vec::new();
         for target_shard in topology
             .all_shards_for_transaction(tx)
             .into_iter()
@@ -230,7 +230,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::ROOT);
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::ROOT);
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&ValidatorId::new(0)));
         assert!(peers.contains(&ValidatorId::new(1)));
@@ -245,7 +245,7 @@ mod tests {
 
         // Shard 99 has no committee — filter returns an empty vec regardless
         // of who the local validator is.
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::leaf(8, 99));
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::leaf(8, 99));
         assert!(peers.is_empty());
     }
 
@@ -254,7 +254,7 @@ mod tests {
         let committee = TestCommittee::new(1, 42);
         let topology = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::ROOT);
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::ROOT);
         assert!(peers.is_empty());
     }
 
@@ -265,7 +265,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = single_shard_topology(&committee);
 
-        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::ROOT)
+        let keys = committee_public_keys_for_shard(&topology, ShardId::ROOT)
             .expect("well-formed topology resolves every key");
         assert_eq!(keys.len(), 4);
 
@@ -281,7 +281,7 @@ mod tests {
 
         // An unknown shard has an empty committee, so the result is
         // `Some(vec![])` — not `None` (which is reserved for corruption).
-        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::leaf(8, 99))
+        let keys = committee_public_keys_for_shard(&topology, ShardId::leaf(8, 99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
     }

@@ -17,7 +17,7 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId, TxHash,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TxHash,
     ed25519_keypair_from_seed, routable_from_notarized_v1, shard_for_node, sign_and_notarize,
 };
 use radix_common::constants::XRD;
@@ -79,9 +79,9 @@ fn find_accounts_on_each_shard(
         let radix_node_id = acc.into_node_id();
         let hs_node_id = NodeId(radix_node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node_id, num_shards);
-        if shard == ShardGroupId::leaf(1, 0) && shard0.is_none() {
+        if shard == ShardId::leaf(1, 0) && shard0.is_none() {
             shard0 = Some((kp, acc));
-        } else if shard == ShardGroupId::leaf(1, 1) && shard1.is_none() {
+        } else if shard == ShardId::leaf(1, 1) && shard1.is_none() {
             shard1 = Some((kp, acc));
         }
         if shard0.is_some() && shard1.is_some() {
@@ -260,7 +260,7 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
             routable_from_notarized_v1(notarized, test_validity_range()).expect("valid tx");
         let tx_hash = tx.hash();
 
-        let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
+        let touched_shards: std::collections::BTreeSet<ShardId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())

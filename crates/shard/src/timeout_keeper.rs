@@ -106,13 +106,13 @@ impl TimeoutKeeper {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHash, BlockHeight, NetworkDefinition, ShardGroupId, SignerBitfield, Timeout,
+        BlockHash, BlockHeight, NetworkDefinition, ShardId, SignerBitfield, Timeout,
         WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
 
-    const SHARD: ShardGroupId = ShardGroupId::ROOT;
+    const SHARD: ShardId = ShardId::ROOT;
 
     fn high_qc_at(round: u64) -> QuorumCertificate {
         QuorumCertificate::new(

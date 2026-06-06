@@ -11,8 +11,7 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardGroupId, TxHash, ValidatorId,
-    WaveId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardId, TxHash, ValidatorId, WaveId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -34,7 +33,7 @@ pub enum FetchAbandon {
     /// source block aged past its deadline.
     RemoteProvisions {
         /// Source shard whose provisions fetch is being cancelled.
-        source_shard: ShardGroupId,
+        source_shard: ShardId,
         /// Source-shard block height for the cancelled fetch.
         block_height: BlockHeight,
     },
@@ -87,6 +86,6 @@ pub enum FetchAbandon {
     /// pool would only evict.
     ShardWitnesses {
         /// Anchor + leaf ids whose in-flight fetch should be cancelled.
-        ids: Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)>,
+        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
     },
 }

@@ -465,8 +465,7 @@ mod tests {
     use super::*;
     use crate::{
         BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, ExecutionVote, Hash,
-        ShardGroupId, ValidatorId, WeightedTimestamp, compute_global_receipt_root,
-        generate_bls_keypair,
+        ShardId, ValidatorId, WeightedTimestamp, compute_global_receipt_root, generate_bls_keypair,
     };
 
     fn make_outcome(seed: u8) -> TxOutcome {
@@ -480,9 +479,9 @@ mod tests {
 
     fn wave_id(shard: u64, height: u64, remote: &[u64]) -> WaveId {
         WaveId::new(
-            ShardGroupId::leaf(3, shard),
+            ShardId::leaf(3, shard),
             BlockHeight::new(height),
-            remote.iter().map(|&s| ShardGroupId::leaf(3, s)).collect(),
+            remote.iter().map(|&s| ShardId::leaf(3, s)).collect(),
         )
     }
 
@@ -508,7 +507,7 @@ mod tests {
                     wave_id.block_height(),
                     WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
                     wave_id.clone(),
-                    wave_id.shard_group_id(),
+                    wave_id.shard_id(),
                     outcomes.to_vec(),
                     ValidatorId::new(u64::try_from(i).unwrap()),
                     sk,

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use axum::serve;
-use hyperscale_types::{ShardGroupId, TransactionStatus, TxHash};
+use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -67,7 +67,7 @@ pub struct RpcServerHandle {
     node_status: Arc<ArcSwap<NodeStatusState>>,
     /// Per-shard transaction status caches (shared from `IoLoop`'s
     /// `QuickCache` instances, one per hosted shard).
-    tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
+    tx_status_caches: HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
 }
@@ -94,7 +94,7 @@ impl RpcServerHandle {
     #[must_use]
     pub const fn tx_status_caches(
         &self,
-    ) -> &HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
+    ) -> &HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>> {
         &self.tx_status_caches
     }
 
@@ -137,7 +137,7 @@ impl RpcServer {
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
+        tx_status_caches: HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
@@ -165,7 +165,7 @@ impl RpcServer {
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<ArcSwap<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
+        tx_status_caches: HashMap<ShardId, Arc<QuickCache<TxHash, TransactionStatus>>>,
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
@@ -247,7 +247,7 @@ mod tests {
         let config = RpcServerConfig::default();
         let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
         let tx_status_caches =
-            std::iter::once((ShardGroupId::ROOT, Arc::new(QuickCache::new(1000)))).collect();
+            std::iter::once((ShardId::ROOT, Arc::new(QuickCache::new(1000)))).collect();
         let server = RpcServer::new(config, tx_submission_tx, tx_status_caches);
 
         // Server should be created successfully
