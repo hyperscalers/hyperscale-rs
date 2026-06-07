@@ -12,14 +12,13 @@ use blake3::hash as blake3_hash;
 
 use crate::{
     Bls12381G1PublicKey, NetworkDefinition, NodeId, Round, RoutableTransaction, ShardId, ShardTrie,
-    ValidatorId, ValidatorSet, VotePower,
+    ValidatorId, ValidatorSet, VoteCount,
 };
 
 /// Per-shard committee membership.
 #[derive(Debug, Clone)]
 struct ShardCommittee {
     active_validators: Vec<ValidatorId>,
-    total_voting_power: VotePower,
 }
 
 /// Hash a `NodeId` to a u64 using blake3 (first 8 bytes, little-endian).
@@ -50,13 +49,6 @@ pub fn uniform_shard_for_node(node_id: &NodeId, num_shards: u64) -> ShardId {
     ShardTrie::uniform_from_count(num_shards).shard_for(node_id)
 }
 
-/// Per-validator info (voting power + public key).
-#[derive(Debug, Clone)]
-struct ValidatorInfoEntry {
-    voting_power: VotePower,
-    public_key: Bls12381G1PublicKey,
-}
-
 /// Immutable topology snapshot — all query methods, no mutation.
 ///
 /// Identity-agnostic: callers carry their own `(validator_id, shard)` and
@@ -69,18 +61,17 @@ struct ValidatorInfoEntry {
 /// # Invariants
 ///
 /// Every validator listed in any committee's `active_validators` is present
-/// in `validator_info` (with the same voting power that contributed to
-/// `total_voting_power`). Constructors enforce this — `with_shard_committees`
-/// panics on a missing entry, `build_modulo` and `single_shard` derive
-/// committees from the same `ValidatorSet` that seeds `validator_info`.
-/// Downstream code relies on this to call `voting_power(committee_member)`
-/// and `public_key(committee_member)` with `expect` rather than fallback.
+/// in `validator_pubkeys`. Constructors enforce this — `with_shard_committees`
+/// panics on a missing entry, `new` and `single_shard` derive committees from
+/// the same `ValidatorSet` that seeds `validator_pubkeys`. Downstream code
+/// relies on this to call `public_key(committee_member)` with `expect` rather
+/// than fallback.
 #[derive(Clone)]
 pub struct TopologySnapshot {
     network: NetworkDefinition,
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
-    validator_info: HashMap<ValidatorId, ValidatorInfoEntry>,
+    validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
 
@@ -99,7 +90,7 @@ impl TopologySnapshot {
     /// Validators are assigned to shards by `id % num_shards`.
     #[must_use]
     pub fn new(network: NetworkDefinition, num_shards: u64, validator_set: ValidatorSet) -> Self {
-        let validator_info = build_validator_info(&validator_set);
+        let validator_pubkeys = build_validator_pubkeys(&validator_set);
 
         let mut shard_committees = empty_committees(num_shards);
 
@@ -107,7 +98,6 @@ impl TopologySnapshot {
             let shard = uniform_leaf(num_shards, v.validator_id.inner() % num_shards);
             if let Some(committee) = shard_committees.get_mut(&shard) {
                 committee.active_validators.push(v.validator_id);
-                committee.total_voting_power += v.voting_power;
             }
         }
 
@@ -115,7 +105,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            validator_info,
+            validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
     }
@@ -134,7 +124,7 @@ impl TopologySnapshot {
         num_shards: u64,
         validator_set: ValidatorSet,
     ) -> Self {
-        let validator_info = build_validator_info(&validator_set);
+        let validator_pubkeys = build_validator_pubkeys(&validator_set);
 
         let mut shard_committees = empty_committees(num_shards);
 
@@ -143,14 +133,13 @@ impl TopologySnapshot {
             .expect("shard should be within num_shards");
         for v in &validator_set.validators {
             committee.active_validators.push(v.validator_id);
-            committee.total_voting_power += v.voting_power;
         }
 
         Self {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            validator_info,
+            validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
     }
@@ -163,8 +152,8 @@ impl TopologySnapshot {
     ///
     /// Panics if a committee references a validator that is not present in
     /// `global_validator_set`. Snapshots must be internally consistent so
-    /// downstream code can look up `public_key`/`voting_power` for any
-    /// committee member without a fallback.
+    /// downstream code can look up `public_key` for any committee member
+    /// without a fallback.
     #[must_use]
     pub fn with_shard_committees(
         network: NetworkDefinition,
@@ -172,21 +161,19 @@ impl TopologySnapshot {
         global_validator_set: &ValidatorSet,
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
     ) -> Self {
-        let validator_info = build_validator_info(global_validator_set);
+        let validator_pubkeys = build_validator_pubkeys(global_validator_set);
 
         let mut committees = empty_committees(num_shards);
 
         for (shard, validators) in shard_committees {
             if let Some(committee) = committees.get_mut(&shard) {
                 for validator_id in validators {
-                    let info = validator_info.get(&validator_id).unwrap_or_else(|| {
-                        panic!(
-                            "committee for shard {shard:?} references validator {validator_id:?} \
-                             that is not in the global validator set",
-                        )
-                    });
+                    assert!(
+                        validator_pubkeys.contains_key(&validator_id),
+                        "committee for shard {shard:?} references validator {validator_id:?} \
+                         that is not in the global validator set",
+                    );
                     committee.active_validators.push(validator_id);
-                    committee.total_voting_power += info.voting_power;
                 }
             }
         }
@@ -195,7 +182,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
-            validator_info,
+            validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
     }
@@ -218,24 +205,21 @@ impl TopologySnapshot {
         global_validator_set: &ValidatorSet,
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
     ) -> Self {
-        let validator_info = build_validator_info(global_validator_set);
+        let validator_pubkeys = build_validator_pubkeys(global_validator_set);
         let shard_trie = ShardTrie::from_leaves(shard_committees.keys().copied());
         let committees: HashMap<ShardId, ShardCommittee> = shard_committees
             .into_iter()
             .map(|(shard, validators)| {
                 let mut committee = ShardCommittee {
                     active_validators: Vec::new(),
-                    total_voting_power: VotePower::ZERO,
                 };
                 for validator_id in validators {
-                    let info = validator_info.get(&validator_id).unwrap_or_else(|| {
-                        panic!(
-                            "committee for shard {shard:?} references validator {validator_id:?} \
-                             that is not in the global validator set",
-                        )
-                    });
+                    assert!(
+                        validator_pubkeys.contains_key(&validator_id),
+                        "committee for shard {shard:?} references validator {validator_id:?} \
+                         that is not in the global validator set",
+                    );
                     committee.active_validators.push(validator_id);
-                    committee.total_voting_power += info.voting_power;
                 }
                 (shard, committee)
             })
@@ -245,7 +229,7 @@ impl TopologySnapshot {
             network,
             shard_trie,
             shard_committees: committees,
-            validator_info,
+            validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
     }
@@ -287,26 +271,29 @@ impl TopologySnapshot {
             .map_or(&[][..], |c| c.active_validators.as_slice())
     }
 
-    /// Get total voting power for a shard's committee.
+    /// Total votes a shard's committee can cast — one per member.
     #[must_use]
-    pub fn voting_power_for_shard(&self, shard: ShardId) -> VotePower {
+    pub fn committee_votes(&self, shard: ShardId) -> VoteCount {
         self.shard_committees
             .get(&shard)
-            .map_or(VotePower::ZERO, |c| c.total_voting_power)
+            .map_or(VoteCount::ZERO, |c| {
+                VoteCount::of(c.active_validators.len())
+            })
     }
 
-    /// Get voting power for a specific validator.
+    /// The votes a validator contributes — one if it is known to this
+    /// snapshot, `None` otherwise.
     #[must_use]
-    pub fn voting_power(&self, validator_id: ValidatorId) -> Option<VotePower> {
-        self.validator_info
-            .get(&validator_id)
-            .map(|v| v.voting_power)
+    pub fn vote_of(&self, validator_id: ValidatorId) -> Option<VoteCount> {
+        self.validator_pubkeys
+            .contains_key(&validator_id)
+            .then_some(VoteCount::MIN)
     }
 
     /// Get the public key for a validator.
     #[must_use]
     pub fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
-        self.validator_info.get(&validator_id).map(|v| v.public_key)
+        self.validator_pubkeys.get(&validator_id).copied()
     }
 
     /// Get the global validator set.
@@ -335,16 +322,16 @@ impl TopologySnapshot {
             .position(|v| *v == validator_id)
     }
 
-    /// Check if the given voting power meets quorum for a shard (> 2/3).
+    /// Check if the given vote count meets quorum for a shard (> 2/3).
     #[must_use]
-    pub fn has_quorum_for_shard(&self, shard: ShardId, voting_power: VotePower) -> bool {
-        VotePower::has_quorum(voting_power, self.voting_power_for_shard(shard))
+    pub fn has_quorum_for_shard(&self, shard: ShardId, votes: VoteCount) -> bool {
+        VoteCount::has_quorum(votes, self.committee_votes(shard))
     }
 
-    /// Get the minimum voting power required for quorum in a shard.
+    /// Get the minimum vote count required for quorum in a shard.
     #[must_use]
-    pub fn quorum_threshold_for_shard(&self, shard: ShardId) -> VotePower {
-        VotePower::quorum_threshold(self.voting_power_for_shard(shard))
+    pub fn quorum_threshold_for_shard(&self, shard: ShardId) -> VoteCount {
+        VoteCount::quorum_threshold(self.committee_votes(shard))
     }
 
     // ── Proposer selection ───────────────────────────────────────────────
@@ -434,19 +421,13 @@ impl std::fmt::Debug for TopologySnapshot {
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_validator_info(validator_set: &ValidatorSet) -> HashMap<ValidatorId, ValidatorInfoEntry> {
+fn build_validator_pubkeys(
+    validator_set: &ValidatorSet,
+) -> HashMap<ValidatorId, Bls12381G1PublicKey> {
     validator_set
         .validators
         .iter()
-        .map(|v| {
-            (
-                v.validator_id,
-                ValidatorInfoEntry {
-                    voting_power: v.voting_power,
-                    public_key: v.public_key,
-                },
-            )
-        })
+        .map(|v| (v.validator_id, v.public_key))
         .collect()
 }
 
@@ -458,7 +439,6 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
                 shard,
                 ShardCommittee {
                     active_validators: Vec::new(),
-                    total_voting_power: VotePower::ZERO,
                 },
             )
         })
@@ -474,18 +454,15 @@ mod tests {
     use super::*;
     use crate::{ValidatorInfo, generate_bls_keypair};
 
-    fn make_test_validator(id: u64, power: u64) -> ValidatorInfo {
+    fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId::new(id),
             public_key: generate_bls_keypair().public_key(),
-            voting_power: VotePower::new(power),
         }
     }
 
     fn make_snapshot(num_validators: u64) -> TopologySnapshot {
-        let validators: Vec<_> = (0..num_validators)
-            .map(|i| make_test_validator(i, 1))
-            .collect();
+        let validators: Vec<_> = (0..num_validators).map(make_test_validator).collect();
         TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
@@ -506,15 +483,15 @@ mod tests {
         let snapshot = make_snapshot(4);
         let shard = ShardId::ROOT;
 
-        assert_eq!(snapshot.voting_power_for_shard(shard), VotePower::new(4));
+        assert_eq!(snapshot.committee_votes(shard), VoteCount::new(4));
         assert_eq!(
             snapshot.quorum_threshold_for_shard(shard),
-            VotePower::new(3)
+            VoteCount::new(3)
         );
 
-        assert!(!snapshot.has_quorum_for_shard(shard, VotePower::new(2)));
-        assert!(snapshot.has_quorum_for_shard(shard, VotePower::new(3)));
-        assert!(snapshot.has_quorum_for_shard(shard, VotePower::new(4)));
+        assert!(!snapshot.has_quorum_for_shard(shard, VoteCount::new(2)));
+        assert!(snapshot.has_quorum_for_shard(shard, VoteCount::new(3)));
+        assert!(snapshot.has_quorum_for_shard(shard, VoteCount::new(4)));
     }
 
     #[test]
@@ -543,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_single_shard() {
-        let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
+        let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let shard = ShardId::leaf(1, 1);
         let snapshot = TopologySnapshot::single_shard(
             NetworkDefinition::simulator(),
@@ -559,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_with_shard_committees() {
-        let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
+        let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
         committees.insert(
@@ -588,7 +565,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "committee for shard")]
     fn test_with_shard_committees_panics_on_unknown_validator() {
-        let validators: Vec<_> = (0..2).map(|i| make_test_validator(i, 1)).collect();
+        let validators: Vec<_> = (0..2).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
         // ValidatorId::new(99) isn't in `vs`; constructor must reject.
@@ -604,14 +581,10 @@ mod tests {
         );
     }
 
-    /// Sum-of-voting-power invariant — committee `total_voting_power`
-    /// matches the sum of constituent members' `voting_power`. Locked at
-    /// constructor exit by `debug_assert_invariants` so any drift
-    /// (e.g. a future constructor populating one but not the other)
-    /// fires in development.
+    /// A committee's vote count is its member count — one vote each.
     #[test]
-    fn test_total_voting_power_matches_sum_of_members() {
-        let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 7)).collect();
+    fn test_committee_votes_is_member_count() {
+        let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
         committees.insert(
@@ -628,15 +601,12 @@ mod tests {
             &vs,
             committees,
         );
-        assert_eq!(
-            snapshot.voting_power_for_shard(ShardId::ROOT),
-            VotePower::new(21)
-        );
+        assert_eq!(snapshot.committee_votes(ShardId::ROOT), VoteCount::of(3));
     }
 
     #[test]
     fn test_multi_shard_modulo_assignment() {
-        let validators: Vec<_> = (0..8).map(|i| make_test_validator(i, 1)).collect();
+        let validators: Vec<_> = (0..8).map(make_test_validator).collect();
         let snapshot = TopologySnapshot::new(
             NetworkDefinition::simulator(),
             2,

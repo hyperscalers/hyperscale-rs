@@ -26,7 +26,7 @@ use hyperscale_types::{
     GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
     StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, VotePower, WaveCertificate, WaveId,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WaveCertificate, WaveId,
     WeightedTimestamp, bls_keypair_from_seed,
 };
 
@@ -198,7 +198,6 @@ impl TestCommittee {
             .map(|i| ValidatorInfo {
                 validator_id: self.validator_id(i),
                 public_key: *self.public_key(i),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);

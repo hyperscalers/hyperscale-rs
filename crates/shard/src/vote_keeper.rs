@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use hyperscale_core::Action;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, ShardId,
-    TopologySnapshot, ValidatorId, Verified, VotePower,
+    TopologySnapshot, ValidatorId, Verified,
 };
 use tracing::{info, trace, warn};
 
@@ -65,7 +65,6 @@ const MAX_VOTE_HEIGHT_LOOKAHEAD: u64 = 256;
 /// Shared per-vote lookup result from [`VoteKeeper::preflight`].
 struct VotePreflight {
     voter_index: usize,
-    voting_power: VotePower,
     public_key: Bls12381G1PublicKey,
 }
 
@@ -208,7 +207,7 @@ impl VoteKeeper {
             is_own_vote,
             "Admitting pre-verified vote"
         );
-        vote_set.add_verified_vote(prep.voter_index, vote, prep.voting_power);
+        vote_set.add_verified_vote(prep.voter_index, vote);
 
         self.maybe_trigger_verification(topology, local_shard, block_hash)
     }
@@ -253,8 +252,8 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let total_power = topology.voting_power_for_shard(local_shard);
-        vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key, prep.voting_power);
+        let total_power = topology.committee_votes(local_shard);
+        vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key);
         trace!(
             validator = ?me,
             block_hash = ?block_hash,
@@ -311,13 +310,6 @@ impl VoteKeeper {
             return None;
         };
 
-        // `committee_index_for_shard` returning `Some` means the voter is in
-        // the committee, and the topology snapshot invariant guarantees every
-        // committee member has a positive voting power entry.
-        let voting_power = topology
-            .voting_power(voter)
-            .expect("committee member has voting power (TopologySnapshot invariant)");
-
         let Some(public_key) = topology.public_key(voter) else {
             warn!("No public key for validator {:?}", voter);
             return None;
@@ -325,7 +317,6 @@ impl VoteKeeper {
 
         Some(VotePreflight {
             voter_index,
-            voting_power,
             public_key,
         })
     }
@@ -351,7 +342,7 @@ impl VoteKeeper {
         local_shard: ShardId,
         block_hash: BlockHash,
     ) -> Vec<Action> {
-        let total_power = topology.voting_power_for_shard(local_shard);
+        let total_power = topology.committee_votes(local_shard);
 
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             return vec![];
@@ -391,7 +382,7 @@ impl VoteKeeper {
             parent_weighted_timestamp,
             votes_to_verify,
             verified_votes,
-            total_voting_power: total_power,
+            total_votes: total_power,
         }]
     }
 
@@ -433,7 +424,7 @@ impl VoteKeeper {
     pub fn finalize_pending_batch(
         &mut self,
         block_hash: BlockHash,
-        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
     ) {
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             warn!(
@@ -706,7 +697,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::try_from(i).unwrap_or(u64::MAX)),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let topo = TopologySnapshot::new(

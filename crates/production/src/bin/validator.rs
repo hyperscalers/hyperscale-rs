@@ -74,8 +74,7 @@ use hyperscale_storage_rocksdb::{
 };
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardId, TopologySnapshot, ValidatorId,
-    ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed, generate_bls_keypair,
-    shard_prefix_path,
+    ValidatorInfo, ValidatorSet, bls_keypair_from_seed, generate_bls_keypair, shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -551,14 +550,6 @@ pub struct ValidatorEntry {
 
     /// Hex-encoded public key
     pub public_key: String,
-
-    /// Voting power (default: 1)
-    #[serde(default = "default_voting_power")]
-    pub voting_power: u64,
-}
-
-const fn default_voting_power() -> u64 {
-    1
 }
 
 impl ValidatorConfig {
@@ -690,7 +681,6 @@ fn build_topology(
         vec![ValidatorInfo {
             validator_id: *validator_id,
             public_key: keypair.public_key(),
-            voting_power: VotePower::new(1),
         }]
     } else {
         genesis
@@ -718,7 +708,6 @@ fn build_topology(
                 Ok(ValidatorInfo {
                     validator_id,
                     public_key,
-                    voting_power: VotePower::new(v.voting_power),
                 })
             })
             .collect::<Result<Vec<_>>>()?

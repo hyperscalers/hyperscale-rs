@@ -11,7 +11,7 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction, ShardId,
-    TopologySnapshot, ValidatorId, Verifiable, VotePower, WaveId,
+    TopologySnapshot, ValidatorId, Verifiable, VoteCount, WaveId,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -51,17 +51,17 @@ pub fn peers_excluding_self(
 pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCertificate) -> bool {
     let shard = ec.shard_id();
     let committee = topology.committee_for_shard(shard);
-    let signers_power: VotePower = ec
+    let signers_power: VoteCount = ec
         .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
             topology
-                .voting_power(vid)
+                .vote_of(vid)
                 .expect("committee member has voting power (TopologySnapshot invariant)")
         })
         .sum();
-    VotePower::has_quorum(signers_power, topology.voting_power_for_shard(shard))
+    VoteCount::has_quorum(signers_power, topology.committee_votes(shard))
 }
 
 /// Public keys for a shard's committee, in canonical committee order.
@@ -207,7 +207,7 @@ pub fn build_provision_requests(
 #[cfg(test)]
 mod tests {
     use hyperscale_test_helpers::TestCommittee;
-    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet, VotePower};
+    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
 
     use super::*;
 
@@ -216,7 +216,6 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: committee.validator_id(i),
                 public_key: *committee.public_key(i),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);

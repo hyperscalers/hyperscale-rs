@@ -16,7 +16,7 @@ use hyperscale_types::{
     ShardWitness, SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, StateRoot,
     SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -256,19 +256,19 @@ pub enum Action {
         /// Parent block hash (from the block's header).
         parent_block_hash: BlockHash,
         /// Parent QC's `weighted_timestamp` — monotonicity floor applied to
-        /// every vote timestamp during stake-weighted aggregation. Without
-        /// this, slow-clocked or Byzantine voters can drag the aggregated
-        /// `weighted_timestamp` back below the parent's, breaking deadline
-        /// pruning and validity-window monotonicity.
+        /// every vote timestamp during the (uniform) weighted-time aggregation.
+        /// Without this, slow-clocked or Byzantine voters can drag the
+        /// aggregated `weighted_timestamp` back below the parent's, breaking
+        /// deadline pruning and validity-window monotonicity.
         parent_weighted_timestamp: WeightedTimestamp,
         /// Votes to verify and potentially aggregate.
-        /// Each tuple is (`committee_index`, vote, `public_key`, `voting_power`).
-        votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
+        /// Each tuple is (`committee_index`, vote, `public_key`).
+        votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
         /// Already-verified votes (e.g., our own vote).
-        /// Each tuple is (`committee_index`, vote, `voting_power`).
-        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
-        /// Total voting power in the committee (for quorum calculation).
-        total_voting_power: VotePower,
+        /// Each tuple is (`committee_index`, vote).
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
+        /// Total votes in the committee (the quorum denominator).
+        total_votes: VoteCount,
     },
 
     /// Verify provisions' merkle inclusion proofs.
@@ -312,8 +312,8 @@ pub enum Action {
         wave_id: WaveId,
         /// Block hash for correlation.
         block_hash: BlockHash,
-        /// Votes to verify with their public keys and voting power.
-        votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>,
+        /// Votes to verify with their public keys.
+        votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
     },
 
     /// Verify an execution certificate's aggregated signature.
@@ -363,10 +363,8 @@ pub enum Action {
         qc: Verifiable<QuorumCertificate>,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
-        /// Voting power for each committee member (parallel to `public_keys`).
-        voting_powers: Vec<VotePower>,
         /// Quorum threshold for the QC's shard.
-        quorum_threshold: VotePower,
+        quorum_threshold: VoteCount,
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as `parent_qc`.
         block_hash: BlockHash,
@@ -404,10 +402,8 @@ pub enum Action {
         sender: ValidatorId,
         /// Public keys for the remote shard's committee (from topology).
         committee_public_keys: Vec<Bls12381G1PublicKey>,
-        /// Voting power for each committee member (parallel to `committee_public_keys`).
-        committee_voting_power: Vec<VotePower>,
         /// Quorum threshold for the remote shard.
-        quorum_threshold: VotePower,
+        quorum_threshold: VoteCount,
         /// Remote shard ID (for correlation in callback).
         shard: ShardId,
         /// Remote block height (for correlation in callback).

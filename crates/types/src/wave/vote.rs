@@ -12,9 +12,8 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
     BoundedVec, GlobalReceiptRoot, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TxOutcome,
-    ValidatorId, Verified, Verify, VotePower, WaveId, WeightedTimestamp,
-    batch_verify_bls_same_message, compute_global_receipt_root, exec_vote_message,
-    verify_bls12381_v1,
+    ValidatorId, Verified, Verify, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
+    compute_global_receipt_root, exec_vote_message, verify_bls12381_v1,
 };
 
 /// A validator's vote on all transactions in an execution wave.
@@ -328,53 +327,51 @@ impl Verified<ExecutionVote> {
     /// here (rather than defending at aggregation) keeps the
     /// verified-vote invariant tight.
     ///
-    /// Returns `(verified_vote, power)` pairs for every vote that
-    /// passed both predicate halves. Output order is implementation-
-    /// defined (groupings are hashed, not the input order).
+    /// Returns the verified votes that passed both predicate halves. Output
+    /// order is implementation-defined (groupings are hashed, not the input
+    /// order).
     #[must_use]
     pub fn verify_batch(
         network: &NetworkDefinition,
-        votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>,
-    ) -> Vec<(Self, VotePower)> {
+        votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
+    ) -> Vec<Self> {
         let votes: Vec<_> = votes
             .into_iter()
-            .filter(|(v, _, _)| {
-                compute_global_receipt_root(v.tx_outcomes()) == v.global_receipt_root
-            })
+            .filter(|(v, _)| compute_global_receipt_root(v.tx_outcomes()) == v.global_receipt_root)
             .collect();
 
         if votes.is_empty() {
             return Vec::new();
         }
 
-        let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>> =
+        let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, Bls12381G1PublicKey)>> =
             HashMap::new();
-        for (vote, pk, power) in votes {
+        for (vote, pk) in votes {
             let msg = vote.signing_message(network);
-            by_message.entry(msg).or_default().push((vote, pk, power));
+            by_message.entry(msg).or_default().push((vote, pk));
         }
 
-        let mut verified: Vec<(Self, VotePower)> = Vec::new();
+        let mut verified: Vec<Self> = Vec::new();
 
         for (message, group) in by_message {
             let signatures: Vec<Bls12381G2Signature> =
-                group.iter().map(|(v, _, _)| v.signature()).collect();
-            let pubkeys: Vec<Bls12381G1PublicKey> = group.iter().map(|(_, pk, _)| *pk).collect();
+                group.iter().map(|(v, _)| v.signature()).collect();
+            let pubkeys: Vec<Bls12381G1PublicKey> = group.iter().map(|(_, pk)| *pk).collect();
 
             if group.len() >= 2 && batch_verify_bls_same_message(&message, &signatures, &pubkeys) {
                 // SAFETY: outcomes-root binding was filtered above;
                 // BLS same-message batch verify just confirmed every
                 // signature in this group against its paired pubkey.
-                for (vote, _, power) in group {
-                    verified.push((Self::new_unchecked(vote), power));
+                for (vote, _) in group {
+                    verified.push(Self::new_unchecked(vote));
                 }
             } else {
-                for (vote, pk, power) in group {
+                for (vote, pk) in group {
                     if verify_bls12381_v1(&message, &pk, &vote.signature()) {
                         // SAFETY: outcomes-root binding was filtered
                         // above; individual BLS verify just ran the
                         // signature half of the predicate.
-                        verified.push((Self::new_unchecked(vote), power));
+                        verified.push(Self::new_unchecked(vote));
                     }
                 }
             }
@@ -568,7 +565,7 @@ mod tests {
                 let sk = generate_bls_keypair();
                 let pk = sk.public_key();
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &sk);
-                (vote, pk, VotePower::new(1))
+                (vote, pk)
             })
             .collect();
 
@@ -584,12 +581,12 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let outcomes = vec![sample_outcome(9), sample_outcome(10)];
 
-        let mut votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)> = (0..3u64)
+        let mut votes: Vec<(ExecutionVote, Bls12381G1PublicKey)> = (0..3u64)
             .map(|i| {
                 let sk = generate_bls_keypair();
                 let pk = sk.public_key();
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &sk);
-                (vote, pk, VotePower::new(1))
+                (vote, pk)
             })
             .collect();
 
@@ -635,8 +632,7 @@ mod tests {
             signature,
         );
 
-        let verified =
-            Verified::<ExecutionVote>::verify_batch(&net, vec![(tampered, pk, VotePower::new(1))]);
+        let verified = Verified::<ExecutionVote>::verify_batch(&net, vec![(tampered, pk)]);
         assert!(verified.is_empty());
     }
 

@@ -37,7 +37,6 @@ use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
-    VotePower,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -505,7 +504,7 @@ impl BeaconState {
     /// global validator set. Re-derived on every epoch commit and
     /// shared via `ArcSwap` with the `io_loop`.
     ///
-    /// All validators are assigned uniform [`VotePower::new(1)`].
+    /// All validators are assigned uniform [`VoteCount::new(1)`].
     #[must_use]
     pub fn derive_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
         self.derive_topology_from(&self.shard_committees, network)
@@ -532,7 +531,6 @@ impl BeaconState {
             .map(|r| ValidatorInfo {
                 validator_id: r.id,
                 public_key: r.pubkey,
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);

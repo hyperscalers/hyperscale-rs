@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, Verified,
-    VotePower, WaveId, WeightedTimestamp,
+    VoteCount, WaveId, WeightedTimestamp,
 };
 
 /// Key for grouping votes: `(global_receipt_root, vote_anchor_ts)`.
@@ -43,7 +43,7 @@ pub struct VoteTracker {
     /// Block hash this wave belongs to.
     block_hash: BlockHash,
     /// Quorum threshold (2f+1 voting power).
-    quorum: VotePower,
+    quorum: VoteCount,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
@@ -51,16 +51,16 @@ pub struct VoteTracker {
     /// Verified votes grouped by (`global_receipt_root`, `vote_anchor_ts`).
     votes_by_key: BTreeMap<VoteKey, Vec<Verified<ExecutionVote>>>,
     /// Voting power per (`global_receipt_root`, `vote_anchor_ts`) (verified votes only).
-    power_by_key: BTreeMap<VoteKey, VotePower>,
+    power_by_key: BTreeMap<VoteKey, VoteCount>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
-    /// Each entry is (vote, `public_key`, `voting_power`).
-    unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>,
-    /// Total voting power of unverified votes.
-    unverified_power: VotePower,
+    /// Each entry is (vote, `public_key`).
+    unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
+    /// Number of unverified votes buffered.
+    unverified_power: VoteCount,
     /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
     /// Key is (`validator_id`, `vote_anchor_ts`).
     seen: HashSet<(ValidatorId, WeightedTimestamp)>,
@@ -71,7 +71,7 @@ pub struct VoteTracker {
 impl VoteTracker {
     /// Create a new execution vote tracker.
     #[must_use]
-    pub fn new(wave_id: WaveId, block_hash: BlockHash, quorum: VotePower) -> Self {
+    pub fn new(wave_id: WaveId, block_hash: BlockHash, quorum: VoteCount) -> Self {
         Self {
             wave_id,
             block_hash,
@@ -79,7 +79,7 @@ impl VoteTracker {
             votes_by_key: BTreeMap::new(),
             power_by_key: BTreeMap::new(),
             unverified_votes: Vec::new(),
-            unverified_power: VotePower::ZERO,
+            unverified_power: VoteCount::ZERO,
             seen: HashSet::new(),
             pending_verification: false,
         }
@@ -110,7 +110,6 @@ impl VoteTracker {
         &mut self,
         vote: ExecutionVote,
         public_key: Bls12381G1PublicKey,
-        voting_power: VotePower,
     ) -> bool {
         let dedup_key = (vote.validator(), vote.vote_anchor_ts());
 
@@ -119,8 +118,8 @@ impl VoteTracker {
         }
 
         self.seen.insert(dedup_key);
-        self.unverified_votes.push((vote, public_key, voting_power));
-        self.unverified_power += voting_power;
+        self.unverified_votes.push((vote, public_key));
+        self.unverified_power += VoteCount::MIN;
         true
     }
 
@@ -141,7 +140,7 @@ impl VoteTracker {
             .values()
             .max()
             .copied()
-            .unwrap_or(VotePower::ZERO);
+            .unwrap_or(VoteCount::ZERO);
 
         let total_potential = best_verified_power + self.unverified_power;
         total_potential >= self.quorum
@@ -150,11 +149,9 @@ impl VoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(
-        &mut self,
-    ) -> Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, Bls12381G1PublicKey)> {
         self.pending_verification = true;
-        self.unverified_power = VotePower::ZERO;
+        self.unverified_power = VoteCount::ZERO;
         std::mem::take(&mut self.unverified_votes)
     }
 
@@ -167,7 +164,7 @@ impl VoteTracker {
     // Verified Vote Methods
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Add a verified vote and its voting power.
+    /// Add a verified vote, counting it toward its quorum bucket.
     ///
     /// Idempotent per `(validator, vote_anchor_ts)`: redundant calls (e.g.
     /// own-vote re-feeds from leader-rotation retries that land on `self`)
@@ -175,7 +172,7 @@ impl VoteTracker {
     /// Dedup scans [`Self::votes_by_key`] — a validator may have voted on
     /// any `global_receipt_root` at this anchor, so the check spans every
     /// bucket sharing the incoming `vote_anchor_ts`.
-    pub fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>, power: VotePower) {
+    pub fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>) {
         let validator = vote.validator();
         let anchor_ts = vote.vote_anchor_ts();
         let already_counted = self
@@ -188,7 +185,7 @@ impl VoteTracker {
         }
         let key = (vote.global_receipt_root(), anchor_ts);
         self.votes_by_key.entry(key).or_default().push(vote);
-        *self.power_by_key.entry(key).or_insert(VotePower::ZERO) += power;
+        *self.power_by_key.entry(key).or_insert(VoteCount::ZERO) += VoteCount::MIN;
     }
 
     /// Check if quorum is reached for any (`global_receipt_root`, `vote_anchor_ts`) pair.
@@ -196,8 +193,8 @@ impl VoteTracker {
     /// Returns `Some((global_receipt_root, vote_anchor_ts, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest `vote_anchor_ts`.
     #[must_use]
-    pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, VotePower)> {
-        let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, VotePower)> = None;
+    pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> {
+        let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> = None;
         for (&(global_receipt_root, vote_anchor_ts), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
@@ -225,10 +222,10 @@ impl VoteTracker {
     /// already cap at the topology's voting-power total, so a saturated
     /// reading still gives a correct "well above quorum" answer.
     #[must_use]
-    pub fn total_verified_power(&self) -> VotePower {
+    pub fn total_verified_power(&self) -> VoteCount {
         self.power_by_key
             .values()
-            .fold(VotePower::ZERO, |acc, &p| acc.saturating_add(p))
+            .fold(VoteCount::ZERO, |acc, &p| acc.saturating_add(p))
     }
 
     /// Return the number of distinct receipt roots across all verified vote groups.
@@ -244,10 +241,10 @@ impl VoteTracker {
     /// Return a summary of verified voting power per global receipt root (summed across vote heights).
     /// Used for diagnostics when quorum cannot be reached.
     #[must_use]
-    pub fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, VotePower)> {
-        let mut by_root: BTreeMap<GlobalReceiptRoot, VotePower> = BTreeMap::new();
+    pub fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, VoteCount)> {
+        let mut by_root: BTreeMap<GlobalReceiptRoot, VoteCount> = BTreeMap::new();
         for (&(root, _), &power) in &self.power_by_key {
-            *by_root.entry(root).or_insert(VotePower::ZERO) += power;
+            *by_root.entry(root).or_insert(VoteCount::ZERO) += power;
         }
         by_root.into_iter().collect()
     }
@@ -314,24 +311,24 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt_root"));
 
-        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_verified_vote(1, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(1, root));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_verified_vote(2, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(2, root));
         let result = tracker.check_quorum();
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
         assert_eq!(vh, WeightedTimestamp::from_millis(11)); // vote_anchor_ts from make_vote
-        assert_eq!(power, VotePower::new(3));
+        assert_eq!(power, VoteCount::new(3));
         assert_eq!(tracker.votes_for_global_receipt_root(root).len(), 3);
     }
 
@@ -340,19 +337,19 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
         let root_a = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_a"));
         let root_b = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_b"));
 
-        tracker.add_verified_vote(make_verified_vote(0, root_a), VotePower::new(1));
-        tracker.add_verified_vote(make_verified_vote(1, root_b), VotePower::new(1));
-        tracker.add_verified_vote(make_verified_vote(2, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root_a));
+        tracker.add_verified_vote(make_verified_vote(1, root_b));
+        tracker.add_verified_vote(make_verified_vote(2, root_a));
         // 2 for root_a, 1 for root_b — no quorum
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_verified_vote(3, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(3, root_a));
         let result = tracker.check_quorum().unwrap();
         assert_eq!(result.0, root_a);
     }
@@ -364,16 +361,16 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
         // Buffer 2 votes — not enough for quorum
-        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
-        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower::new(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk));
         assert!(!tracker.should_trigger_verification());
 
         // Buffer 3rd — now enough
-        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower::new(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk));
         assert!(tracker.should_trigger_verification());
 
         // Take votes
@@ -394,11 +391,11 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
-        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
-        assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
+        assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk));
     }
 
     #[test]
@@ -410,14 +407,14 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
-        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
-        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
-        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root));
+        tracker.add_verified_vote(make_verified_vote(0, root));
+        tracker.add_verified_vote(make_verified_vote(0, root));
 
-        assert_eq!(tracker.total_verified_power(), VotePower::new(1));
+        assert_eq!(tracker.total_verified_power(), VoteCount::MIN);
         assert!(tracker.check_quorum().is_none());
     }
 
@@ -428,15 +425,15 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower::new(3),
+            VoteCount::new(3),
         );
 
         // 1 verified + 2 unverified = 3 → should trigger
-        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
-        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower::new(1)));
+        tracker.add_verified_vote(make_verified_vote(0, root));
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk));
         assert!(!tracker.should_trigger_verification());
 
-        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower::new(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk));
         assert!(tracker.should_trigger_verification());
     }
 }

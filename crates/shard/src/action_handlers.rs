@@ -23,7 +23,7 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, StateRoot,
     StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot, TransactionRoot,
-    TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
+    TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
     WeightedTimestamp, block_header_message, block_vote_message, certified_block_header_message,
     compute_waves,
 };
@@ -42,7 +42,7 @@ pub struct QcVerificationResult {
     pub qc: Option<Verified<QuorumCertificate>>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
-    pub verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
+    pub verified_votes: Vec<(usize, Verified<BlockVote>)>,
 }
 
 /// Verify block votes and build a quorum certificate if quorum is reached.
@@ -65,9 +65,9 @@ pub fn verify_and_build_qc(
     round: Round,
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
-    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, Verified<BlockVote>, VotePower)>,
-    total_voting_power: VotePower,
+    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+    already_verified: Vec<(usize, Verified<BlockVote>)>,
+    total_votes: VoteCount,
 ) -> QcVerificationResult {
     let signing_message = block_vote_message(
         network,
@@ -85,8 +85,8 @@ pub fn verify_and_build_qc(
         already_verified,
     );
 
-    let verified_power: VotePower = all_verified.iter().map(|(_, _, power)| *power).sum();
-    if all_verified.is_empty() || !VotePower::has_quorum(verified_power, total_voting_power) {
+    let verified_votes_count = VoteCount::of(all_verified.len());
+    if all_verified.is_empty() || !VoteCount::has_quorum(verified_votes_count, total_votes) {
         return QcVerificationResult {
             block_hash,
             qc: None,
@@ -116,38 +116,36 @@ pub fn verify_and_build_qc(
 /// `already_verified` and returning the combined verified set.
 ///
 /// Wraps [`Verified::<BlockVote>::verify_batch`] with the committee
-/// bookkeeping (`(idx, vote, pubkey, power)` tuples → `(idx, verified,
-/// power)`); the typed batch verifier owns the BLS work and the
-/// individual-verify fallback.
+/// bookkeeping (`(idx, vote, pubkey)` tuples → `(idx, verified)`); the typed
+/// batch verifier owns the BLS work and the individual-verify fallback.
 pub fn verify_vote_batch(
     block_hash: BlockHash,
     signing_message: &[u8],
-    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, Verified<BlockVote>, VotePower)>,
-) -> Vec<(usize, Verified<BlockVote>, VotePower)> {
+    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+    already_verified: Vec<(usize, Verified<BlockVote>)>,
+) -> Vec<(usize, Verified<BlockVote>)> {
     let mut all_verified = already_verified;
 
     if votes_to_verify.is_empty() {
         return all_verified;
     }
 
-    // Capture per-vote bookkeeping (`idx`, `power`, and the raw vote for
+    // Capture per-vote bookkeeping (`idx` and the raw vote's voter for
     // failure logging) alongside the `(vote, pubkey)` pairs the typed
     // verifier consumes.
-    let mut bookkeeping: Vec<(usize, VotePower, ValidatorId)> =
-        Vec::with_capacity(votes_to_verify.len());
+    let mut bookkeeping: Vec<(usize, ValidatorId)> = Vec::with_capacity(votes_to_verify.len());
     let mut to_verify: Vec<(BlockVote, Bls12381G1PublicKey)> =
         Vec::with_capacity(votes_to_verify.len());
-    for (idx, vote, pk, power) in votes_to_verify {
-        bookkeeping.push((idx, power, vote.voter()));
+    for (idx, vote, pk) in votes_to_verify {
+        bookkeeping.push((idx, vote.voter()));
         to_verify.push((vote, pk));
     }
 
     let results = Verified::<BlockVote>::verify_batch(signing_message, to_verify);
 
-    for ((idx, power, voter), result) in bookkeeping.into_iter().zip(results) {
+    for ((idx, voter), result) in bookkeeping.into_iter().zip(results) {
         if let Some(verified) = result {
-            all_verified.push((idx, verified, power));
+            all_verified.push((idx, verified));
         } else {
             tracing::warn!(?voter, ?block_hash, "Invalid vote signature detected");
         }
@@ -337,7 +335,7 @@ where
             parent_weighted_timestamp,
             votes_to_verify,
             verified_votes,
-            total_voting_power,
+            total_votes,
         } => {
             let start = std::time::Instant::now();
             let result = verify_and_build_qc(
@@ -350,7 +348,7 @@ where
                 parent_weighted_timestamp,
                 votes_to_verify,
                 verified_votes,
-                total_voting_power,
+                total_votes,
             );
             record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
             ctx.notify_protocol(ProtocolEvent::QuorumCertificateResult {
@@ -363,14 +361,12 @@ where
         Action::VerifyQcSignature {
             qc,
             public_keys,
-            voting_powers,
             quorum_threshold,
             block_hash,
         } => {
             let qc_ctx = QcContext {
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
-                voting_powers: &voting_powers,
                 quorum_threshold,
             };
             // The verified arm short-circuits inside `upgrade`; only the
@@ -390,7 +386,6 @@ where
             certified_header,
             sender,
             committee_public_keys,
-            committee_voting_power,
             quorum_threshold,
             shard,
             height,
@@ -399,7 +394,6 @@ where
             let qc_ctx = QcContext {
                 network: ctx.topology_snapshot.network(),
                 public_keys: &committee_public_keys,
-                voting_powers: &committee_voting_power,
                 quorum_threshold,
             };
             // SAFETY for `from_qc_attestation`: the verified QC's source
@@ -871,11 +865,7 @@ mod tests {
             Round::INITIAL,
             1000,
         );
-        let already = vec![(
-            0usize,
-            Verified::<BlockVote>::new_unchecked_for_test(v),
-            VotePower::new(1),
-        )];
+        let already = vec![(0usize, Verified::<BlockVote>::new_unchecked_for_test(v))];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
         assert_eq!(out.len(), already.len());
     }
@@ -898,7 +888,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key(), VotePower::new(1))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 
@@ -941,19 +931,17 @@ mod tests {
                 0usize,
                 make_vote(&keys, 0, block_hash, height, round, 1000),
                 keys[0].public_key(),
-                VotePower::new(1),
             ),
-            (1usize, bad_vote, keys[1].public_key(), VotePower::new(1)),
+            (1usize, bad_vote, keys[1].public_key()),
             (
                 2usize,
                 make_vote(&keys, 2, block_hash, height, round, 1000),
                 keys[2].public_key(),
-                VotePower::new(1),
             ),
         ];
 
         let out = verify_vote_batch(block_hash, &msg, to_verify, Vec::new());
-        let indices: Vec<_> = out.iter().map(|(i, _, _)| *i).collect();
+        let indices: Vec<_> = out.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![0, 2]);
     }
 
@@ -972,7 +960,7 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (i, vote, keys[i].public_key(), VotePower::new(1))
+                (i, vote, keys[i].public_key())
             })
             .collect();
         let out = verify_vote_batch(block_hash, wrong_msg, to_verify, Vec::new());
@@ -994,11 +982,7 @@ mod tests {
         let verified: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (
-                    i,
-                    Verified::<BlockVote>::new_unchecked_for_test(vote),
-                    VotePower::new(1),
-                )
+                (i, Verified::<BlockVote>::new_unchecked_for_test(vote))
             })
             .collect();
 
@@ -1018,13 +1002,11 @@ mod tests {
         // returned QC must round-trip through the Verify impl when fed
         // back its committee context.
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); keys.len()];
         let net = net();
         let qc_ctx = QcContext {
             network: &net,
             public_keys: &pubs,
-            voting_powers: &powers,
-            quorum_threshold: VotePower::new(3),
+            quorum_threshold: VoteCount::new(3),
         };
         qc.as_ref()
             .verify(&qc_ctx)
@@ -1050,11 +1032,7 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (
-                    i,
-                    Verified::<BlockVote>::new_unchecked_for_test(vote),
-                    VotePower::new(1),
-                )
+                (i, Verified::<BlockVote>::new_unchecked_for_test(vote))
             })
             .collect();
 
@@ -1074,10 +1052,11 @@ mod tests {
     }
 
     #[test]
-    fn build_qc_from_verified_computes_stake_weighted_timestamp() {
+    fn build_qc_from_verified_computes_mean_timestamp() {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        // Votes with different timestamps and powers; weighted mean = (1000*1 + 2000*2 + 3000*3) / 6 = 14000/6 ≈ 2333.
+        // Each vote weighs one, so the aggregate is the plain mean of the
+        // vote timestamps: (1000 + 2000 + 3000) / 3 = 2000.
         let verified = vec![
             (
                 0usize,
@@ -1089,7 +1068,6 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 )),
-                VotePower::new(1),
             ),
             (
                 1,
@@ -1101,7 +1079,6 @@ mod tests {
                     Round::INITIAL,
                     2000,
                 )),
-                VotePower::new(2),
             ),
             (
                 2,
@@ -1113,7 +1090,6 @@ mod tests {
                     Round::INITIAL,
                     3000,
                 )),
-                VotePower::new(3),
             ),
         ];
 
@@ -1128,7 +1104,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2000);
     }
 
     #[test]
@@ -1150,7 +1126,6 @@ mod tests {
                     Round::INITIAL,
                     500,
                 )),
-                VotePower::new(1),
             ),
             (
                 1,
@@ -1162,7 +1137,6 @@ mod tests {
                     Round::INITIAL,
                     800,
                 )),
-                VotePower::new(1),
             ),
             (
                 2,
@@ -1174,7 +1148,6 @@ mod tests {
                     Round::INITIAL,
                     3000,
                 )),
-                VotePower::new(1),
             ),
         ];
 
@@ -1199,7 +1172,7 @@ mod tests {
     #[test]
     fn verify_and_build_qc_returns_none_without_quorum() {
         // 3 votes of power 1 each, total 4 → 3/4 = quorum only if 2f+1 where f=1 (3/4 OK).
-        // Use total_voting_power=10 to force failure (3 < 2/3*10 = 6.67).
+        // Use total_votes=10 to force failure (3 < 2/3*10 = 6.67).
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let height = BlockHeight::new(1);
@@ -1207,7 +1180,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key(), VotePower::new(1))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 
@@ -1221,7 +1194,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             to_verify,
             Vec::new(),
-            VotePower::new(10),
+            VoteCount::new(10),
         );
 
         assert!(result.qc.is_none());
@@ -1237,7 +1210,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key(), VotePower::new(1))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 
@@ -1251,7 +1224,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             to_verify,
             Vec::new(),
-            VotePower::new(4),
+            VoteCount::new(4),
         );
 
         let qc = result.qc.expect("quorum reached, QC expected");

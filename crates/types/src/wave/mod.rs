@@ -46,7 +46,7 @@ mod tests {
         GlobalReceiptRoot, Hash, NetworkDefinition, NodeId, ProvisionTxRoot, ProvisionTxRootsMap,
         RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StoredReceipt,
         TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, VotePower, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
+        Verified, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
         generate_bls_keypair, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
         wave_leader_at,
@@ -58,7 +58,6 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
                 public_key: generate_bls_keypair().public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(

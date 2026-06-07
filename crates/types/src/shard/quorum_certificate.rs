@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition,
-    Round, ShardId, SignerBitfield, Verified, Verify, VotePower, WeightedTimestamp,
+    Round, ShardId, SignerBitfield, Verified, Verify, VoteCount, WeightedTimestamp,
     block_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
@@ -215,20 +215,18 @@ impl QuorumCertificate {
 /// Inputs the QC verifier reads against. The verifier borrows everything;
 /// nothing in here is consumed.
 ///
-/// `public_keys` and `voting_powers` are indexed parallel to the QC's
-/// signer bitfield — `public_keys[i]` and `voting_powers[i]` correspond to
-/// the validator whose bit `i` may be set in `qc.signers()`.
+/// `public_keys` is indexed parallel to the QC's signer bitfield —
+/// `public_keys[i]` corresponds to the validator whose bit `i` may be set in
+/// `qc.signers()`. The committee size (`public_keys.len()`) bounds which set
+/// bits count as votes.
 #[derive(Debug, Clone, Copy)]
 pub struct QcContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
     /// BLS public keys for every validator in this QC's committee.
     pub public_keys: &'a [Bls12381G1PublicKey],
-    /// Stake-weighted voting power for every validator in this QC's
-    /// committee. Same indexing as `public_keys`.
-    pub voting_powers: &'a [VotePower],
-    /// Minimum aggregate voting power required to constitute a quorum.
-    pub quorum_threshold: VotePower,
+    /// Minimum vote count required to constitute a quorum.
+    pub quorum_threshold: VoteCount,
 }
 
 /// Failure modes of [`QuorumCertificate`] verification.
@@ -252,9 +250,9 @@ pub enum QcVerifyError {
     #[error("insufficient quorum power: have {have:?}, need {need:?}")]
     InsufficientQuorumPower {
         /// Voting power held by the signers in the QC's bitfield.
-        have: VotePower,
+        have: VoteCount,
         /// Voting power required to constitute a quorum.
-        need: VotePower,
+        need: VoteCount,
     },
 }
 
@@ -317,21 +315,20 @@ impl Verified<QuorumCertificate> {
         round: Round,
         parent_block_hash: BlockHash,
         parent_weighted_timestamp: WeightedTimestamp,
-        verified_votes: &[(usize, Verified<BlockVote>, VotePower)],
+        verified_votes: &[(usize, Verified<BlockVote>)],
     ) -> Option<Self> {
         let mut sorted: Vec<_> = verified_votes.to_vec();
-        sorted.sort_by_key(|(idx, _, _)| *idx);
+        sorted.sort_by_key(|(idx, _)| *idx);
 
         let signatures: Vec<Bls12381G2Signature> =
-            sorted.iter().map(|(_, v, _)| v.signature()).collect();
+            sorted.iter().map(|(_, v)| v.signature()).collect();
         let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true).ok()?;
 
         let floor_ms = parent_weighted_timestamp.as_millis();
-        let max_idx = sorted.iter().map(|(idx, _, _)| *idx).max().unwrap_or(0);
+        let max_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
         let mut signers = SignerBitfield::new(max_idx + 1);
-        let mut timestamp_weight_sum: u128 = 0;
-        let mut verified_power = VotePower::ZERO;
-        for (idx, vote, power) in &sorted {
+        let mut timestamp_sum: u128 = 0;
+        for (idx, vote) in &sorted {
             signers.set(*idx);
             // Per-vote monotonicity clamp: a vote timestamp below
             // parent's `weighted_timestamp` (slow honest clock or
@@ -339,17 +336,15 @@ impl Verified<QuorumCertificate> {
             // aggregation, so the resulting QC's `weighted_timestamp`
             // is guaranteed >= parent's.
             let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
-            timestamp_weight_sum += u128::from(clamped_ms) * u128::from(power.inner());
-            verified_power += *power;
+            timestamp_sum += u128::from(clamped_ms);
         }
 
-        let weighted_timestamp_ms = if verified_power == VotePower::ZERO {
+        // Every vote weighs one, so the aggregate timestamp is the mean of
+        // the clamped vote timestamps.
+        let weighted_timestamp_ms = if sorted.is_empty() {
             0
         } else {
-            // Mean of u64 timestamps weighted by u64 powers always
-            // fits in u64.
-            u64::try_from(timestamp_weight_sum / u128::from(verified_power.inner()))
-                .unwrap_or(u64::MAX)
+            u64::try_from(timestamp_sum / sorted.len() as u128).unwrap_or(u64::MAX)
         };
 
         // SAFETY: every vote in `verified_votes` carries a type-level
@@ -415,14 +410,12 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
             return Err(QcVerifyError::InvalidSignature);
         }
 
-        let total_power: VotePower = self
-            .signers
-            .set_indices()
-            .filter_map(|idx| ctx.voting_powers.get(idx).copied())
-            .fold(VotePower::ZERO, VotePower::saturating_add);
-        if total_power < ctx.quorum_threshold {
+        // `signer_keys` holds exactly the set bits within the committee, so its
+        // length is the number of validators that signed.
+        let total_votes = VoteCount::of(signer_keys.len());
+        if total_votes < ctx.quorum_threshold {
             return Err(QcVerifyError::InsufficientQuorumPower {
-                have: total_power,
+                have: total_votes,
                 need: ctx.quorum_threshold,
             });
         }
@@ -520,13 +513,11 @@ mod tests {
     fn ctx<'a>(
         net: &'a NetworkDefinition,
         public_keys: &'a [Bls12381G1PublicKey],
-        voting_powers: &'a [VotePower],
-        quorum_threshold: VotePower,
+        quorum_threshold: VoteCount,
     ) -> QcContext<'a> {
         QcContext {
             network: net,
             public_keys,
-            voting_powers,
             quorum_threshold,
         }
     }
@@ -535,7 +526,6 @@ mod tests {
     fn verify_accepts_valid_qc_with_quorum_signers() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); 4];
 
         let qc = signed_qc(
             &keys,
@@ -547,9 +537,7 @@ mod tests {
         );
 
         let net = NetworkDefinition::simulator();
-        let verified = qc
-            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
-            .unwrap();
+        let verified = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap();
         assert_eq!(verified.signer_count(), 3);
     }
 
@@ -557,7 +545,6 @@ mod tests {
     fn verify_rejects_tampered_signature() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); 4];
 
         let mut qc = signed_qc(
             &keys,
@@ -589,9 +576,7 @@ mod tests {
             block_hash, shard, height, parent, round, signers, bad_agg, ts,
         );
 
-        let err = qc
-            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
-            .unwrap_err();
+        let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap_err();
         assert_eq!(err, QcVerifyError::InvalidSignature);
     }
 
@@ -602,7 +587,6 @@ mod tests {
         // must fail verification now that the field is in the signed message.
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); 4];
 
         // `signed_qc` signs over parent = ZERO; keep the genuine signature but
         // repoint the parent at a sibling block.
@@ -628,7 +612,7 @@ mod tests {
 
         let net = NetworkDefinition::simulator();
         let err = forged
-            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
+            .verify(&ctx(&net, &pubs, VoteCount::new(3)))
             .unwrap_err();
         assert_eq!(err, QcVerifyError::InvalidSignature);
     }
@@ -637,7 +621,6 @@ mod tests {
     fn verify_rejects_under_quorum_signer_set() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); 4];
 
         // Only two of four sign — quorum is three. Signatures themselves
         // are valid; the stake total falls short.
@@ -651,14 +634,12 @@ mod tests {
         );
 
         let net = NetworkDefinition::simulator();
-        let err = qc
-            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
-            .unwrap_err();
+        let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap_err();
         assert_eq!(
             err,
             QcVerifyError::InsufficientQuorumPower {
-                have: VotePower::new(2),
-                need: VotePower::new(3),
+                have: VoteCount::new(2),
+                need: VoteCount::new(3),
             }
         );
     }
@@ -667,7 +648,6 @@ mod tests {
     fn verify_rejects_qc_with_no_signers() {
         let keys: Vec<_> = (0..2).map(|_| generate_bls_keypair()).collect();
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        let powers = vec![VotePower::new(1); 2];
 
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"b")),
@@ -681,9 +661,7 @@ mod tests {
         );
 
         let net = NetworkDefinition::simulator();
-        let err = qc
-            .verify(&ctx(&net, &pubs, &powers, VotePower::new(1)))
-            .unwrap_err();
+        let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(1))).unwrap_err();
         assert_eq!(err, QcVerifyError::NoSigners);
     }
 }

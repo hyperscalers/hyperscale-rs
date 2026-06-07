@@ -85,7 +85,7 @@ use hyperscale_types::{
     Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round,
     RoutableTransaction, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
     TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, Verify, VotePower, derive_leaves, missed_proposals_since_prev_commit,
+    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -99,7 +99,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
-use crate::lookups::{committee_public_keys, committee_voting_powers, vote_recipients};
+use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
@@ -1597,10 +1597,8 @@ impl ShardCoordinator {
             // both halves of the QC's predicate (signature + quorum
             // power) need them.
             let public_keys = committee_public_keys(parent_committee, self.local_shard);
-            let voting_powers = committee_voting_powers(parent_committee, self.local_shard);
-            let quorum_threshold = VotePower::quorum_threshold(
-                parent_committee.voting_power_for_shard(self.local_shard),
-            );
+            let quorum_threshold =
+                VoteCount::quorum_threshold(parent_committee.committee_votes(self.local_shard));
 
             // Store pending verification info
             self.verification
@@ -1613,7 +1611,6 @@ impl ShardCoordinator {
             return vec![Action::VerifyQcSignature {
                 qc: header.parent_qc_verifiable().clone(),
                 public_keys,
-                voting_powers,
                 quorum_threshold,
                 block_hash,
             }];
@@ -1971,7 +1968,7 @@ impl ShardCoordinator {
         topology: &TopologySchedule,
         block_hash: BlockHash,
         qc: Option<Verified<QuorumCertificate>>,
-        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
     ) -> Vec<Action> {
         if let Some(qc) = qc {
             info!(
@@ -1993,7 +1990,7 @@ impl ShardCoordinator {
         // verified votes so a forged vote can't pre-empt a legitimate one.
         let validator_id = self.me;
         let high_qc_round = self.high_qc_round();
-        for (_, vote, _) in &verified_votes {
+        for (_, vote) in &verified_votes {
             let old_view = self.view_change.view;
             if self
                 .view_change
@@ -3173,16 +3170,13 @@ impl ShardCoordinator {
         }
 
         let public_keys = committee_public_keys(committee, self.local_shard);
-        let voting_powers = committee_voting_powers(committee, self.local_shard);
         let quorum_threshold =
-            VotePower::quorum_threshold(committee.voting_power_for_shard(self.local_shard));
+            VoteCount::quorum_threshold(committee.committee_votes(self.local_shard));
 
-        vec![self.block_sync.register_for_verification(
-            certified,
-            public_keys,
-            voting_powers,
-            quorum_threshold,
-        )]
+        vec![
+            self.block_sync
+                .register_for_verification(certified, public_keys, quorum_threshold),
+        ]
     }
 
     /// Try to drain buffered synced blocks in sequential order. Asks
@@ -3499,16 +3493,16 @@ impl ShardCoordinator {
     /// # Panics
     ///
     /// Panics if `voter` is in the committee but has no voting power — a
-    /// `BeaconState` invariant violation, as in [`committee_voting_powers`].
+    /// `BeaconState` invariant violation, as in [`committee_public_keys`].
     fn committee_timeout_power(
         &self,
         committee: &TopologySnapshot,
         voter: ValidatorId,
-    ) -> Option<VotePower> {
+    ) -> Option<VoteCount> {
         committee.committee_index_for_shard(self.local_shard, voter)?;
         // Membership is confirmed above, so the power resolves; a miss is the
         // same invariant violation the committee-key lookups assert on.
-        Some(committee.voting_power(voter).unwrap_or_else(|| {
+        Some(committee.vote_of(voter).unwrap_or_else(|| {
             panic!(
                 "committee member {voter:?} has no voting power — \
                  BeaconState invariant (committees subset of validators) violated"
@@ -3605,17 +3599,17 @@ impl ShardCoordinator {
             return Vec::new();
         }
 
-        let total = committee.voting_power_for_shard(self.local_shard);
+        let total = committee.committee_votes(self.local_shard);
         let seen = self.timeouts.power(round);
         let mut actions = Vec::new();
 
         // Bracha amplification: f+1 timeouts seen → broadcast our own.
-        if VotePower::has_one_third(seen, total) {
+        if VoteCount::has_one_third(seen, total) {
             actions.extend(self.amplify_timeout(topology, round));
         }
 
         // 2f+1 timeouts → adopt the quorum-max high_qc and advance together.
-        if VotePower::has_quorum(seen, total) {
+        if VoteCount::has_quorum(seen, total) {
             actions.extend(self.advance_on_timeout_quorum(topology, round));
         }
 
@@ -3702,11 +3696,9 @@ impl ShardCoordinator {
         // would.
         let committee = self.committee_of_block(topology, qc.block_hash())?;
         let public_keys = committee_public_keys(committee, self.local_shard);
-        let voting_powers = committee_voting_powers(committee, self.local_shard);
         let ctx = QcContext {
             network: committee.network(),
             public_keys: &public_keys,
-            voting_powers: &voting_powers,
             quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
         };
         qc.verify(&ctx).ok()
@@ -4190,7 +4182,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, BoundedVec,
         CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
         ProvisionsRoot, RoutableTransaction, ShardId, SignerBitfield, TopologySchedule,
-        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
         WeightedTimestamp, generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
@@ -4226,7 +4218,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -4305,7 +4296,6 @@ mod tests {
             .map(|&id| ValidatorInfo {
                 validator_id: ValidatorId::new(id),
                 public_key: generate_bls_keypair().public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(
@@ -5243,11 +5233,11 @@ mod tests {
 
         // Outsider (not in the 4-member committee): dropped, nothing recorded.
         assert!(state.on_verified_timeout(&topology, mk(9)).is_empty());
-        assert_eq!(state.timeouts.power(round), VotePower::ZERO);
+        assert_eq!(state.timeouts.power(round), VoteCount::ZERO);
 
         // Committee member: recorded, power accrues.
         assert!(state.on_verified_timeout(&topology, mk(1)).is_empty());
-        assert_eq!(state.timeouts.power(round), VotePower::new(1));
+        assert_eq!(state.timeouts.power(round), VoteCount::new(1));
 
         // A second committee member reaches f+1 and amplifies. Had the outsider
         // counted, this threshold would have tripped one timeout earlier.
@@ -5281,7 +5271,7 @@ mod tests {
         );
 
         assert!(state.on_verified_timeout(&topology, far_timeout).is_empty());
-        assert_eq!(state.timeouts.power(far), VotePower::ZERO);
+        assert_eq!(state.timeouts.power(far), VoteCount::ZERO);
     }
 
     #[test]
@@ -5347,7 +5337,7 @@ mod tests {
                 ValidatorId::new(2),
                 &generate_bls_keypair(),
             ),
-            VotePower::new(1),
+            VoteCount::new(1),
         );
         assert!(
             state
@@ -5387,7 +5377,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -5426,11 +5415,7 @@ mod tests {
             &topology,
             block_b,
             None,
-            vec![(
-                0,
-                Verified::<BlockVote>::new_unchecked_for_test(vote),
-                VotePower::new(1),
-            )],
+            vec![(0, Verified::<BlockVote>::new_unchecked_for_test(vote))],
         );
 
         let (recorded_hash, _) = state

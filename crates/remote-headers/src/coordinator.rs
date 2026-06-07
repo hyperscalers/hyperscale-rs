@@ -18,7 +18,7 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardId, TopologySchedule,
-    TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
+    TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -667,21 +667,12 @@ impl RemoteHeaderCoordinator {
                     .expect("committee member must have public key")
             })
             .collect();
-        let committee_voting_power: Vec<VotePower> = committee
-            .iter()
-            .map(|v| {
-                topology
-                    .voting_power(*v)
-                    .expect("committee member must have voting power")
-            })
-            .collect();
         let quorum_threshold = topology.quorum_threshold_for_shard(shard);
 
         vec![Action::VerifyRemoteHeaderQc {
             certified_header,
             sender,
             committee_public_keys,
-            committee_voting_power,
             quorum_threshold,
             shard,
             height,
@@ -781,7 +772,6 @@ mod tests {
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
                     public_key: bls_keypair_from_seed(&seed).public_key(),
-                    voting_power: VotePower::new(1),
                 }
             })
             .collect();

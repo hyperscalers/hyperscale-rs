@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use hyperscale_types::{
     Attempt, BlockHash, BlockHeight, ExecutionCertificate, GlobalReceiptRoot, TxHash, TxOutcome,
-    VotePower, WaveId, WeightedTimestamp,
+    VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::vote_tracker::VoteTracker;
@@ -343,7 +343,7 @@ impl WaveRegistry {
                     global_receipt_root_split = ?summary,
                     "Pruning vote tracker that never reached quorum — global receipt roots were split"
                 );
-            } else if tracker.total_verified_power() > VotePower::ZERO {
+            } else if tracker.total_verified_power() > VoteCount::ZERO {
                 tracing::warn!(
                     wave = %key,
                     verified_power = tracker.total_verified_power().inner(),
@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn make_tracker(wave_id: WaveId, block_hash: BlockHash) -> VoteTracker {
-        VoteTracker::new(wave_id, block_hash, VotePower::new(3))
+        VoteTracker::new(wave_id, block_hash, VoteCount::new(3))
     }
 
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {

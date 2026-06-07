@@ -42,7 +42,7 @@ use hyperscale_types::{
     QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, StateRoot,
     StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext,
     TopologySchedule, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError,
-    ValidatorId, Verifiable, Verified, Verify, VotePower, ready_signal_message,
+    ValidatorId, Verifiable, Verified, Verify, VoteCount, ready_signal_message,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -170,7 +170,7 @@ enum SimEvent {
     QcResult {
         block_hash: BlockHash,
         qc: Option<Verified<QuorumCertificate>>,
-        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
     },
     QcSignatureVerified {
         block_hash: BlockHash,
@@ -1045,7 +1045,7 @@ impl ShardCoordinatorSim {
                 parent_weighted_timestamp,
                 votes_to_verify,
                 verified_votes,
-                total_voting_power,
+                total_votes,
             } => {
                 let result = verify_and_build_qc(
                     &self.network,
@@ -1057,7 +1057,7 @@ impl ShardCoordinatorSim {
                     parent_weighted_timestamp,
                     votes_to_verify,
                     verified_votes,
-                    total_voting_power,
+                    total_votes,
                 );
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
@@ -1071,14 +1071,12 @@ impl ShardCoordinatorSim {
             Action::VerifyQcSignature {
                 qc,
                 public_keys,
-                voting_powers,
                 quorum_threshold,
                 block_hash,
             } => {
                 let qc_ctx = QcContext {
                     network: &self.network,
                     public_keys: &public_keys,
-                    voting_powers: &voting_powers,
                     quorum_threshold,
                 };
                 let result = qc.upgrade(&qc_ctx).map_err(|(_, e)| e);

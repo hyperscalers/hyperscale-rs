@@ -5,9 +5,7 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use hyperscale_types::{
-    Bls12381G1PublicKey, Round, ShardId, TopologySnapshot, ValidatorId, VotePower,
-};
+use hyperscale_types::{Bls12381G1PublicKey, Round, ShardId, TopologySnapshot, ValidatorId};
 
 /// Recipients for a vote cast in `round`.
 ///
@@ -80,32 +78,10 @@ pub fn committee_public_keys(
         .collect()
 }
 
-/// Resolve voting power for every member of the local shard's committee,
-/// indexed parallel to [`committee_public_keys`].
-///
-/// # Panics
-///
-/// Panics if a committee member is absent from the snapshot's validator set —
-/// same invariant as [`committee_public_keys`].
-pub fn committee_voting_powers(topology: &TopologySnapshot, shard: ShardId) -> Vec<VotePower> {
-    topology
-        .committee_for_shard(shard)
-        .iter()
-        .map(|&validator_id| {
-            topology.voting_power(validator_id).unwrap_or_else(|| {
-                panic!(
-                    "committee member {validator_id:?} absent from validator set — \
-                     BeaconState invariant (committees subset of validators) violated"
-                )
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use hyperscale_test_helpers::TestCommittee;
-    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet, VotePower};
+    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
 
     use super::*;
 
@@ -114,7 +90,6 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: committee.validator_id(i),
                 public_key: *committee.public_key(i),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);

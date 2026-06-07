@@ -287,7 +287,7 @@ mod tests {
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, NetworkDefinition, NodeId, ProvisionEntry,
         ShardId, SubstateEntry, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        VotePower, bls_keypair_from_seed, uniform_shard_for_node,
+        bls_keypair_from_seed, uniform_shard_for_node,
     };
 
     use super::*;
@@ -329,7 +329,6 @@ mod tests {
         let vs = ValidatorSet::new(vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
             public_key: kp.public_key(),
-            voting_power: VotePower::new(1),
         }]);
         // Local shard = 0, 2 shards total
         TopologySnapshot::single_shard(NetworkDefinition::simulator(), ShardId::leaf(1, 0), 2, vs)

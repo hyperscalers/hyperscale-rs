@@ -20,8 +20,8 @@ use hyperscale_types::{
     SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
-    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
-    WaveId, WeightedTimestamp,
+    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -217,7 +217,7 @@ pub enum ProtocolEvent {
         /// The verified QC if quorum was reached, or `None` if not.
         qc: Option<Verified<QuorumCertificate>>,
         /// Verified votes, returned for accumulation when no QC was built.
-        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
     },
 
     /// QC signature verification completed. The payload carries the
@@ -479,8 +479,8 @@ pub enum ProtocolEvent {
         wave_id: WaveId,
         /// Source block hash for correlation.
         block_hash: BlockHash,
-        /// Verified votes paired with their voting power.
-        verified_votes: Vec<(Verified<ExecutionVote>, VotePower)>,
+        /// Verified votes.
+        verified_votes: Vec<Verified<ExecutionVote>>,
     },
 
     /// Execution certificate aggregation completed.

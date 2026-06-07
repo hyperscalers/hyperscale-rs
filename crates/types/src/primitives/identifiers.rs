@@ -746,32 +746,44 @@ impl Display for Attempt {
     }
 }
 
-/// Vote power (stake weight).
+/// A tally of votes.
+///
+/// Every validator on a committee is worth exactly one vote
+/// ([`VoteCount::MIN`]); this is the unit consensus counts in — signers toward
+/// a quorum, committee size as the denominator. It is a count, not a stake
+/// weight: stake gates how many validators a pool may run, not how much any one
+/// validator's vote is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
-pub struct VotePower(u64);
+pub struct VoteCount(u64);
 
-impl VotePower {
-    /// Zero vote power — used as an accumulator initial value.
+impl VoteCount {
+    /// No votes — the accumulator initial value.
     pub const ZERO: Self = Self(0);
 
-    /// Minimum positive vote power.
+    /// A single vote — every validator contributes exactly this.
     pub const MIN: Self = Self(1);
 
-    /// Construct vote power from a raw `u64`.
+    /// Construct a vote count from a raw `u64`.
     ///
-    /// Most call sites should use the `Add`/`Sub` operators or
-    /// [`VotePower::saturating_add`] instead — this constructor is the escape
-    /// hatch for boundaries (topology decode, tests) where the power genuinely
-    /// originates as a raw integer. Use [`VotePower::ZERO`] / [`VotePower::MIN`]
-    /// for the obvious sentinels rather than `new(0)` / `new(1)`.
+    /// Most call sites should use [`VoteCount::of`], the `Add`/`Sub` operators,
+    /// or [`VoteCount::ZERO`] / [`VoteCount::MIN`]. This is the escape hatch for
+    /// boundaries (decode, tests) where the count originates as a raw integer.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Vote count for a collection of `len` voters — one vote each. The
+    /// idiomatic way to turn a committee size or signer count into a
+    /// `VoteCount`.
+    #[must_use]
+    pub const fn of(len: usize) -> Self {
+        Self(len as u64)
+    }
+
     /// Inner `u64`. Use sparingly — at boundaries (display, hashing,
-    /// stake-weighted timestamp arithmetic that needs `u128` widening) only.
+    /// weighted-timestamp arithmetic that needs `u128` widening) only.
     #[must_use]
     pub const fn inner(self) -> u64 {
         self.0
@@ -797,7 +809,7 @@ impl VotePower {
         (voted.0 as u128) * 3 > (total.0 as u128)
     }
 
-    /// Minimum voting power required for 2f+1 quorum out of `total`.
+    /// Minimum vote count required for 2f+1 quorum out of `total`.
     ///
     /// Equivalent to `total * 2 / 3 + 1` but divides first so the multiply
     /// cannot overflow when `total` is near `u64::MAX`.
@@ -807,59 +819,59 @@ impl VotePower {
     }
 }
 
-impl Add for VotePower {
+impl Add for VoteCount {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         Self(
             self.0
                 .checked_add(rhs.0)
-                .expect("VotePower + VotePower overflowed"),
+                .expect("VoteCount + VoteCount overflowed"),
         )
     }
 }
 
-impl AddAssign for VotePower {
+impl AddAssign for VoteCount {
     fn add_assign(&mut self, rhs: Self) {
         self.0 = self
             .0
             .checked_add(rhs.0)
-            .expect("VotePower += VotePower overflowed");
+            .expect("VoteCount += VoteCount overflowed");
     }
 }
 
-impl Sub for VotePower {
+impl Sub for VoteCount {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         Self(
             self.0
                 .checked_sub(rhs.0)
-                .expect("VotePower - VotePower underflowed"),
+                .expect("VoteCount - VoteCount underflowed"),
         )
     }
 }
 
-impl SubAssign for VotePower {
+impl SubAssign for VoteCount {
     fn sub_assign(&mut self, rhs: Self) {
         self.0 = self
             .0
             .checked_sub(rhs.0)
-            .expect("VotePower -= VotePower underflowed");
+            .expect("VoteCount -= VoteCount underflowed");
     }
 }
 
-impl Sum for VotePower {
+impl Sum for VoteCount {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Self::ZERO, Add::add)
     }
 }
 
-impl<'a> Sum<&'a Self> for VotePower {
+impl<'a> Sum<&'a Self> for VoteCount {
     fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
         iter.copied().fold(Self::ZERO, Add::add)
     }
 }
 
-impl Display for VotePower {
+impl Display for VoteCount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -1031,34 +1043,34 @@ mod tests {
     }
 
     #[test]
-    fn test_vote_power_quorum() {
-        let total = VotePower::new(4);
+    fn test_vote_count_quorum() {
+        let total = VoteCount::new(4);
 
-        assert!(!VotePower::has_quorum(VotePower::new(2), total)); // 2/4 = 50% (not enough)
-        assert!(VotePower::has_quorum(VotePower::new(3), total)); // 3/4 = 75% (quorum!)
-        assert!(VotePower::has_quorum(VotePower::new(4), total)); // 4/4 = 100% (quorum!)
+        assert!(!VoteCount::has_quorum(VoteCount::new(2), total)); // 2/4 = 50% (not enough)
+        assert!(VoteCount::has_quorum(VoteCount::new(3), total)); // 3/4 = 75% (quorum!)
+        assert!(VoteCount::has_quorum(VoteCount::new(4), total)); // 4/4 = 100% (quorum!)
     }
 
     #[test]
-    fn test_vote_power_one_third() {
+    fn test_vote_count_one_third() {
         // f+1 (Bracha) threshold: strictly greater than 1/3 of total.
-        let total = VotePower::new(4);
+        let total = VoteCount::new(4);
 
-        assert!(!VotePower::has_one_third(VotePower::new(1), total)); // 1/4 = 25% (not enough)
-        assert!(VotePower::has_one_third(VotePower::new(2), total)); // 2/4 = 50% (≥ f+1)
-        assert!(VotePower::has_one_third(VotePower::new(3), total)); // 3/4 (quorum implies f+1)
+        assert!(!VoteCount::has_one_third(VoteCount::new(1), total)); // 1/4 = 25% (not enough)
+        assert!(VoteCount::has_one_third(VoteCount::new(2), total)); // 2/4 = 50% (≥ f+1)
+        assert!(VoteCount::has_one_third(VoteCount::new(3), total)); // 3/4 (quorum implies f+1)
 
         // Exactly 1/3 is not enough — need strictly greater.
-        let q = |v, t| VotePower::has_one_third(VotePower::new(v), VotePower::new(t));
+        let q = |v, t| VoteCount::has_one_third(VoteCount::new(v), VoteCount::new(t));
         assert!(!q(3, 9), "exactly 1/3 should not clear the f+1 threshold");
         assert!(q(4, 9), "just over 1/3 should clear the f+1 threshold");
     }
 
     #[test]
-    fn test_vote_power_quorum_boundary_conditions() {
+    fn test_vote_count_quorum_boundary_conditions() {
         // BFT safety requires STRICTLY GREATER than 2/3
         // Formula: voted * 3 > total * 2
-        let q = |v, t| VotePower::has_quorum(VotePower::new(v), VotePower::new(t));
+        let q = |v, t| VoteCount::has_quorum(VoteCount::new(v), VoteCount::new(t));
 
         // Exact 2/3 should NOT be quorum (need > 2/3)
         // 6/9 = 2/3 exactly: 6*3 = 18, 9*2 = 18, 18 > 18 is false
@@ -1103,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vote_power_quorum_large_values() {
+    fn test_vote_count_quorum_large_values() {
         // Test with large values to ensure no overflow issues
         // The formula is: voted * 3 > total * 2
         // Maximum safe values before overflow: u64::MAX / 3 for voted
@@ -1116,9 +1128,9 @@ mod tests {
         // total * 2 = (max/3 + 1) * 2 = 2*max/3 + 2
         // max > 2*max/3 + 2 is true
         assert!(
-            VotePower::has_quorum(
-                VotePower::new(max_safe_voted),
-                VotePower::new(max_safe_voted + 1)
+            VoteCount::has_quorum(
+                VoteCount::new(max_safe_voted),
+                VoteCount::new(max_safe_voted + 1)
             ),
             "Large values near u64::MAX/3 should work"
         );
@@ -1127,21 +1139,21 @@ mod tests {
         // voting powers near u64::MAX cannot overflow. This guard pins the
         // edge case so a future regression to plain u64 multiplication
         // would surface here.
-        assert!(VotePower::has_quorum(
-            VotePower::new(u64::MAX),
-            VotePower::new(u64::MAX)
+        assert!(VoteCount::has_quorum(
+            VoteCount::new(u64::MAX),
+            VoteCount::new(u64::MAX)
         ));
-        assert!(!VotePower::has_quorum(
-            VotePower::ZERO,
-            VotePower::new(u64::MAX)
+        assert!(!VoteCount::has_quorum(
+            VoteCount::ZERO,
+            VoteCount::new(u64::MAX)
         ));
     }
 
     #[test]
-    fn test_vote_power_quorum_unequal_distribution() {
+    fn test_vote_count_quorum_unequal_distribution() {
         // Test quorum with realistic unequal voting power distributions
         // In practice, validators may have different stakes
-        let q = |v, t| VotePower::has_quorum(VotePower::new(v), VotePower::new(t));
+        let q = |v, t| VoteCount::has_quorum(VoteCount::new(v), VoteCount::new(t));
 
         // Scenario: 4 validators with powers [3, 2, 2, 1] = 8 total
         // Need > 16/3 = 5.33, so need 6 power for quorum

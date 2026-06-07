@@ -2,7 +2,7 @@
 
 use sbor::prelude::*;
 
-use crate::{Bls12381G1PublicKey, ValidatorId, VotePower};
+use crate::{Bls12381G1PublicKey, ValidatorId, VoteCount};
 
 /// Information about a validator.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -12,9 +12,6 @@ pub struct ValidatorInfo {
 
     /// Public key for signature verification (BLS for aggregatable consensus).
     pub public_key: Bls12381G1PublicKey,
-
-    /// Voting power (stake weight).
-    pub voting_power: VotePower,
 }
 
 /// A set of validators.
@@ -44,10 +41,10 @@ impl ValidatorSet {
         self.validators.is_empty()
     }
 
-    /// Get total voting power.
+    /// Total votes the set can cast — one per validator.
     #[must_use]
-    pub fn total_voting_power(&self) -> VotePower {
-        self.validators.iter().map(|v| v.voting_power).sum()
+    pub const fn total_votes(&self) -> VoteCount {
+        VoteCount::of(self.validators.len())
     }
 
     /// Find a validator by ID.
@@ -84,21 +81,16 @@ mod tests {
     use super::*;
     use crate::generate_bls_keypair;
 
-    fn make_validator(id: u64, power: u64) -> ValidatorInfo {
+    fn make_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId::new(id),
             public_key: generate_bls_keypair().public_key(),
-            voting_power: VotePower::new(power),
         }
     }
 
     #[test]
     fn test_validator_set_sorted() {
-        let validators = vec![
-            make_validator(3, 1),
-            make_validator(1, 1),
-            make_validator(2, 1),
-        ];
+        let validators = vec![make_validator(3), make_validator(1), make_validator(2)];
 
         let set = ValidatorSet::new(validators);
 
@@ -109,19 +101,15 @@ mod tests {
 
     #[test]
     fn test_validator_set_lookup() {
-        let validators = vec![
-            make_validator(0, 10),
-            make_validator(1, 20),
-            make_validator(2, 30),
-        ];
+        let validators = vec![make_validator(0), make_validator(1), make_validator(2)];
 
         let set = ValidatorSet::new(validators);
 
         assert_eq!(set.len(), 3);
-        assert_eq!(set.total_voting_power(), VotePower::new(60));
+        assert_eq!(set.total_votes(), VoteCount::of(3));
 
         let v1 = set.get(ValidatorId::new(1)).unwrap();
-        assert_eq!(v1.voting_power, VotePower::new(20));
+        assert_eq!(v1.validator_id, ValidatorId::new(1));
 
         assert_eq!(set.index_of(ValidatorId::new(2)), Some(2));
         assert_eq!(set.index_of(ValidatorId::new(99)), None);

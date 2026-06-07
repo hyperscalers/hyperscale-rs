@@ -31,7 +31,7 @@ use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, LocalTimestamp,
     MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified, VotePower,
+    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
     bls_keypair_from_seed, genesis_config_hash, shard_prefix_path, uniform_shard_for_node,
 };
 use radix_common::math::Decimal;
@@ -185,7 +185,6 @@ impl SimulationRunner {
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::from(i)),
                 public_key: public_keys[i as usize],
-                voting_power: VotePower::new(1),
             })
             .collect();
         let global_validator_set = ValidatorSet::new(global_validators);

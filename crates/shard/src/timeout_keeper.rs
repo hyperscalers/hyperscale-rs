@@ -15,19 +15,19 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperscale_types::{QuorumCertificate, Round, Timeout, ValidatorId, Verified, VotePower};
+use hyperscale_types::{QuorumCertificate, Round, Timeout, ValidatorId, Verified, VoteCount};
 
 /// Per-round tally of verified timeout shares, deduplicated by voter.
 struct RoundTimeouts {
-    by_voter: HashMap<ValidatorId, (Verified<Timeout>, VotePower)>,
-    total_power: VotePower,
+    by_voter: HashMap<ValidatorId, (Verified<Timeout>, VoteCount)>,
+    total_power: VoteCount,
 }
 
 impl Default for RoundTimeouts {
     fn default() -> Self {
         Self {
             by_voter: HashMap::new(),
-            total_power: VotePower::ZERO,
+            total_power: VoteCount::ZERO,
         }
     }
 }
@@ -47,7 +47,7 @@ impl TimeoutKeeper {
 
     /// Record a verified timeout, deduplicated by voter. Returns `true` if it
     /// was newly recorded (a fresh voter for its round).
-    pub fn record(&mut self, timeout: Verified<Timeout>, power: VotePower) -> bool {
+    pub fn record(&mut self, timeout: Verified<Timeout>, power: VoteCount) -> bool {
         let round = timeout.round();
         let voter = timeout.voter();
         let entry = self.rounds.entry(round).or_default();
@@ -61,10 +61,10 @@ impl TimeoutKeeper {
 
     /// Combined voting power of the timeouts seen for `round`.
     #[must_use]
-    pub fn power(&self, round: Round) -> VotePower {
+    pub fn power(&self, round: Round) -> VoteCount {
         self.rounds
             .get(&round)
-            .map_or(VotePower::ZERO, |r| r.total_power)
+            .map_or(VoteCount::ZERO, |r| r.total_power)
     }
 
     /// Whether `voter`'s timeout for `round` is already tallied. Lets callers
@@ -145,14 +145,14 @@ mod tests {
         let mut keeper = TimeoutKeeper::new();
         let r = Round::new(5);
 
-        assert!(keeper.record(timeout(5, 1, 7), VotePower::new(1)));
+        assert!(keeper.record(timeout(5, 1, 7), VoteCount::new(1)));
         // Same voter, same round: rejected, power counted once.
-        assert!(!keeper.record(timeout(5, 2, 7), VotePower::new(1)));
-        assert_eq!(keeper.power(r), VotePower::new(1));
+        assert!(!keeper.record(timeout(5, 2, 7), VoteCount::new(1)));
+        assert_eq!(keeper.power(r), VoteCount::new(1));
 
         // Distinct voter: accepted, power accumulates.
-        assert!(keeper.record(timeout(5, 1, 9), VotePower::new(1)));
-        assert_eq!(keeper.power(r), VotePower::new(2));
+        assert!(keeper.record(timeout(5, 1, 9), VoteCount::new(1)));
+        assert_eq!(keeper.power(r), VoteCount::new(2));
     }
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
         let r = Round::new(5);
 
         assert!(!keeper.contains(r, ValidatorId::new(7)));
-        keeper.record(timeout(5, 1, 7), VotePower::new(1));
+        keeper.record(timeout(5, 1, 7), VoteCount::new(1));
         assert!(keeper.contains(r, ValidatorId::new(7)));
 
         // A different voter or round is not present.
@@ -172,20 +172,20 @@ mod tests {
     #[test]
     fn power_is_per_round() {
         let mut keeper = TimeoutKeeper::new();
-        keeper.record(timeout(5, 1, 7), VotePower::new(1));
-        keeper.record(timeout(6, 1, 7), VotePower::new(1));
+        keeper.record(timeout(5, 1, 7), VoteCount::new(1));
+        keeper.record(timeout(6, 1, 7), VoteCount::new(1));
 
-        assert_eq!(keeper.power(Round::new(5)), VotePower::new(1));
-        assert_eq!(keeper.power(Round::new(6)), VotePower::new(1));
-        assert_eq!(keeper.power(Round::new(7)), VotePower::ZERO);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
+        assert_eq!(keeper.power(Round::new(6)), VoteCount::new(1));
+        assert_eq!(keeper.power(Round::new(7)), VoteCount::ZERO);
     }
 
     #[test]
     fn high_qcs_sorted_by_round_desc() {
         let mut keeper = TimeoutKeeper::new();
-        keeper.record(timeout(9, 3, 0), VotePower::new(1));
-        keeper.record(timeout(9, 7, 1), VotePower::new(1));
-        keeper.record(timeout(9, 4, 2), VotePower::new(1));
+        keeper.record(timeout(9, 3, 0), VoteCount::new(1));
+        keeper.record(timeout(9, 7, 1), VoteCount::new(1));
+        keeper.record(timeout(9, 4, 2), VoteCount::new(1));
 
         // Highest first, so the pacemaker tries the quorum-max before falling
         // back to lower candidates when one fails verification.
@@ -201,14 +201,14 @@ mod tests {
     #[test]
     fn prune_below_drops_old_rounds() {
         let mut keeper = TimeoutKeeper::new();
-        keeper.record(timeout(5, 1, 0), VotePower::new(1));
-        keeper.record(timeout(6, 1, 0), VotePower::new(1));
-        keeper.record(timeout(7, 1, 0), VotePower::new(1));
+        keeper.record(timeout(5, 1, 0), VoteCount::new(1));
+        keeper.record(timeout(6, 1, 0), VoteCount::new(1));
+        keeper.record(timeout(7, 1, 0), VoteCount::new(1));
 
         keeper.prune_below(Round::new(6));
 
-        assert_eq!(keeper.power(Round::new(5)), VotePower::ZERO);
-        assert_eq!(keeper.power(Round::new(6)), VotePower::new(1));
-        assert_eq!(keeper.power(Round::new(7)), VotePower::new(1));
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::ZERO);
+        assert_eq!(keeper.power(Round::new(6)), VoteCount::new(1));
+        assert_eq!(keeper.power(Round::new(7)), VoteCount::new(1));
     }
 }

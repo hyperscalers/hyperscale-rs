@@ -46,7 +46,7 @@ use hyperscale_types::{
     CertifiedBlock, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
     RoutableTransaction, ShardId, StoredReceipt, TopologySchedule, TopologySnapshot, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    TxOutcome, ValidatorId, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
@@ -839,14 +839,10 @@ impl ExecutionCoordinator {
         };
 
         // Committee membership was confirmed above; the topology snapshot
-        // invariant guarantees both the public key and the voting power
-        // resolve.
+        // invariant guarantees the public key resolves.
         let public_key = committee
             .public_key(validator_id)
             .expect("committee member has public key (TopologySnapshot invariant)");
-        let voting_power = committee
-            .voting_power(validator_id)
-            .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let tracker = self
             .waves
@@ -855,7 +851,7 @@ impl ExecutionCoordinator {
 
         // buffer_unverified_vote handles dedup per (validator, vote_anchor_ts).
         // Same validator can vote at multiple heights (round voting).
-        if !tracker.buffer_unverified_vote(vote, public_key, voting_power) {
+        if !tracker.buffer_unverified_vote(vote, public_key) {
             return vec![];
         }
 
@@ -899,25 +895,18 @@ impl ExecutionCoordinator {
         vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
-        // Power resolves against the committee seated at the vote's anchor — the
-        // same committee `dispatch_execution_vote` already confirmed this
-        // validator belongs to before delegating here. `at` returning `None`
-        // would mean the beacon hasn't reached that epoch (drop and let the
-        // sender retry), but the membership gate guarantees the validator's
-        // power resolves — a missing power is a TopologySnapshot invariant
-        // violation, not lag, so fail loud rather than silently undercount.
-        let Some(committee) = topology.at(vote.vote_anchor_ts()) else {
+        // The vote anchors to a committee the beacon has reached: `at` returning
+        // `None` means the beacon hasn't committed that epoch yet (drop and let
+        // the sender retry). Membership was confirmed before delegating here.
+        if topology.at(vote.vote_anchor_ts()).is_none() {
             return vec![];
-        };
-        let voting_power = committee
-            .voting_power(vote.validator())
-            .expect("committee member has voting power (TopologySnapshot invariant)");
+        }
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
         };
 
-        tracker.add_verified_vote(vote, voting_power);
+        tracker.add_verified_vote(vote);
 
         let mut actions = self.check_vote_quorum(topology, wave_id.clone());
         actions.extend(self.maybe_trigger_vote_verification(wave_id));
@@ -930,13 +919,13 @@ impl ExecutionCoordinator {
         topology: &TopologySchedule,
         wave_id: WaveId,
         block_hash: BlockHash,
-        verified_votes: Vec<(Verified<ExecutionVote>, VotePower)>,
+        verified_votes: Vec<Verified<ExecutionVote>>,
     ) -> Vec<Action> {
         // Diagnostic quorum threshold for the split-root warning below, keyed
         // on the votes' anchor before they're consumed into the tracker.
         let warn_quorum = verified_votes
             .first()
-            .and_then(|(v, _)| topology.at(v.vote_anchor_ts()))
+            .and_then(|v| topology.at(v.vote_anchor_ts()))
             .map(|s| s.quorum_threshold_for_shard(self.local_shard));
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
@@ -945,8 +934,8 @@ impl ExecutionCoordinator {
 
         tracker.on_verification_complete();
 
-        for (vote, power) in verified_votes {
-            tracker.add_verified_vote(vote, power);
+        for vote in verified_votes {
+            tracker.add_verified_vote(vote);
         }
 
         // Warn if we have enough total power for quorum but it's split
@@ -2138,8 +2127,7 @@ mod tests {
     use hyperscale_types::{
         Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
-        SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
-        zero_bls_signature,
+        SignerBitfield, ValidatorInfo, ValidatorSet, generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
@@ -2153,7 +2141,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2247,7 +2234,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -3272,7 +3258,6 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySchedule::single(Arc::new(TopologySnapshot::new(
@@ -3292,7 +3277,6 @@ mod tests {
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
                     public_key: k.public_key(),
-                    voting_power: VotePower::new(1),
                 }
             })
             .collect();

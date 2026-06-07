@@ -19,7 +19,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
     MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardId,
-    TopologySnapshot, TxHash, Verifiable, VotePower, WaveId, compute_waves,
+    TopologySnapshot, TxHash, Verifiable, VoteCount, WaveId, compute_waves,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -35,17 +35,17 @@ pub fn qc_has_local_quorum_power(
     qc: &QuorumCertificate,
 ) -> bool {
     let committee = topology.committee_for_shard(local_shard);
-    let qc_power: VotePower = qc
+    let qc_power: VoteCount = qc
         .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
             topology
-                .voting_power(vid)
+                .vote_of(vid)
                 .expect("committee member has voting power (TopologySnapshot invariant)")
         })
         .sum();
-    VotePower::has_quorum(qc_power, topology.voting_power_for_shard(local_shard))
+    VoteCount::has_quorum(qc_power, topology.committee_votes(local_shard))
 }
 
 /// True if `qc`'s `weighted_timestamp` is implausibly far ahead of `now`.
@@ -429,7 +429,6 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: committee.validator_id(i),
                 public_key: *committee.public_key(i),
-                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(
@@ -807,7 +806,6 @@ mod tests {
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
                     public_key: bls_keypair_from_seed(&seed).public_key(),
-                    voting_power: VotePower::new(1),
                 }
             })
             .collect();
