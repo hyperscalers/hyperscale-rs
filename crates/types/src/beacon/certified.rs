@@ -27,8 +27,9 @@ use thiserror::Error;
 
 use crate::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, Bls12381G1PublicKey, Epoch,
-    GenesisConfigHash, NetworkDefinition, PcValueElement, SpcCert, ValidatorId, Verified, Verify,
-    spc_context, verify_block_cert, verify_skip_cert, verify_vote_equivocation,
+    GenesisConfigHash, NetworkDefinition, PcValueElement, ShardEpochContribution, ShardId, SpcCert,
+    ValidatorId, Verified, Verify, spc_context, verify_block_cert, verify_skip_cert,
+    verify_vote_equivocation,
 };
 
 /// A beacon block paired with the cert that authenticates it.
@@ -373,13 +374,19 @@ impl Verified<CertifiedBeaconBlock> {
         epoch: Epoch,
         prev_block_hash: BeaconBlockHash,
         committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
+        shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
         cert: Verified<SpcCert>,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {
         let proposals: Vec<(ValidatorId, BeaconProposal)> = committed
             .into_iter()
             .map(|(id, proposal)| (id, proposal.into_inner()))
             .collect();
-        let block = BeaconBlock::new(epoch, prev_block_hash, proposals);
+        let block = BeaconBlock::new_with_contributions(
+            epoch,
+            prev_block_hash,
+            proposals,
+            shard_contributions,
+        );
         CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(cert.into_inner())))
             .map(Self::new_unchecked)
     }

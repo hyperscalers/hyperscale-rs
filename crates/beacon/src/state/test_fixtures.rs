@@ -134,7 +134,15 @@ pub fn apply_next_epoch(
     committed: &[(ValidatorId, BeaconProposal)],
 ) -> SlotEffects {
     let next = state.current_epoch.next();
-    apply_epoch(state, &net(), next, ApplyEpochInput::Normal { committed })
+    apply_epoch(
+        state,
+        &net(),
+        next,
+        ApplyEpochInput::Normal {
+            committed,
+            shard_contributions: &BTreeMap::new(),
+        },
+    )
 }
 
 /// Build a VRF-signed proposal for `id` at `epoch` carrying the given

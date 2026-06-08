@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, CertifiedBeaconBlock, Epoch, NetworkDefinition,
-    ShardId, SlotEffects, TransitionCause, ValidatorId,
+    ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, TransitionCause, ValidatorId,
+    Verifiable, WeightedTimestamp,
 };
 
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
@@ -32,6 +33,10 @@ pub enum ApplyEpochInput<'a> {
     Normal {
         /// Committed proposals from SPC's Agreement output.
         committed: &'a [(ValidatorId, BeaconProposal)],
+        /// Per-shard canonical boundary contributions assembled for this
+        /// block. Bound to the committed `boundary_qcs` by block hash and
+        /// folded into [`BeaconState::boundaries`].
+        shard_contributions: &'a BTreeMap<ShardId, ShardEpochContribution>,
     },
     /// Skip epoch — pool-quorum abandonment of the epoch. Pipeline
     /// runs over an empty proposal set; committee resamples under
@@ -50,6 +55,7 @@ pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
     match block.cert() {
         BeaconCert::Normal(_) => ApplyEpochInput::Normal {
             committed: block.block().committed_proposals(),
+            shard_contributions: block.block().shard_contributions(),
         },
         BeaconCert::Skip(_) => ApplyEpochInput::Skip,
         BeaconCert::Genesis(_) => panic!("apply_input_for called on Genesis block"),
@@ -111,9 +117,21 @@ pub fn apply_epoch(
         .collect();
 
     let (committed, transition_cause): (&[_], TransitionCause) = match input {
-        ApplyEpochInput::Normal { committed } => (committed, TransitionCause::NaturalShuffle),
+        ApplyEpochInput::Normal { committed, .. } => (committed, TransitionCause::NaturalShuffle),
         ApplyEpochInput::Skip => (&[], TransitionCause::Skip),
     };
+
+    // Fold this epoch's per-shard boundaries. A `Skip` carries every
+    // prior boundary forward untouched (no record, no miss bump); a
+    // Normal epoch records fresh boundaries and bumps the miss counter
+    // for any active shard with no qualifying contribution.
+    if let ApplyEpochInput::Normal {
+        committed,
+        shard_contributions,
+    } = input
+    {
+        record_boundaries(state, epoch, committed, shard_contributions);
+    }
 
     let vrf = filter_and_roll_randomness(state, network, epoch, committed);
     let witness = ingest_witnesses(state, network, &vrf.accepted);
@@ -149,13 +167,251 @@ pub fn apply_epoch(
     }
 }
 
+/// Canonical end-of-epoch [`WeightedTimestamp`] derived from `epoch` and
+/// the chain's configured epoch duration. Beacon blocks carry no explicit
+/// `weighted_timestamp` field; the value is `epoch.inner() ×
+/// epoch_duration_ms` by construction, matching how shards stamp their
+/// accumulators' eligibility windows. Both the boundary fold and the
+/// proposer's boundary sourcing read the cut from here.
+pub const fn epoch_end_weighted_timestamp(
+    epoch: Epoch,
+    epoch_duration_ms: u64,
+) -> WeightedTimestamp {
+    WeightedTimestamp::from_millis(epoch.inner().saturating_mul(epoch_duration_ms))
+}
+
+/// The largest epoch-boundary weighted timestamp strictly below `wt`
+/// (`k × epoch_duration_ms` for the greatest `k ≥ 1`), or `None` when no
+/// boundary lies below it. The boundary block's predecessor must sit
+/// at/before this for the block to be the first across the boundary.
+const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
+    if epoch_duration_ms == 0 || wt == 0 {
+        return None;
+    }
+    let k = (wt - 1) / epoch_duration_ms;
+    if k == 0 {
+        None
+    } else {
+        Some(k * epoch_duration_ms)
+    }
+}
+
+/// Record each shard's epoch boundary from the committed contributions.
+///
+/// A contribution's boundary header is authenticated by a committed
+/// boundary QC. For each shard, some committed proposal must carry a QC
+/// that (1) names this exact block (`hash(boundary_header) ==
+/// qc.block_hash`), (2) is a valid `2f+1` quorum of the shard's committee,
+/// and (3) places the boundary as the first block across the epoch cut —
+/// the predecessor at/before the cut, the boundary across it
+/// (`header.parent_qc.wt ≤ epoch_end_wt < qc.wt`), unique by chain
+/// monotonicity. A shard with a qualifying boundary records its
+/// `state_root` and witness leaf count and resets its miss counter; an
+/// active shard with none carries its prior record forward and bumps
+/// `consecutive_misses` (the "not observed crossing" signal). A forged QC
+/// fails the quorum check, so its shard simply reads as missed —
+/// identically on every node.
+fn record_boundaries(
+    state: &mut BeaconState,
+    epoch: Epoch,
+    committed: &[(ValidatorId, BeaconProposal)],
+    shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
+) {
+    let dur = state.chain_config.epoch_duration_ms;
+
+    let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
+    for (shard, contribution) in shard_contributions {
+        let header = &contribution.boundary_header;
+        let block_hash = header.hash();
+        // Find a committed boundary QC that names this block. The QC's
+        // quorum was checked by the remote-header pipeline that admitted
+        // the boundary header, so the fold binds rather than re-verifies.
+        let Some(qc) = committed.iter().find_map(|(_, proposal)| {
+            proposal
+                .boundary_qcs()
+                .get(shard)
+                .and_then(|opt| opt.as_ref())
+                .map(Verifiable::as_unverified)
+                .filter(|qc| qc.block_hash() == block_hash)
+        }) else {
+            continue;
+        };
+        // Require a genuine epoch crossing: the boundary block (whose
+        // weighted timestamp is `qc.wt`) is the first across some epoch
+        // boundary, so its predecessor sits in an earlier epoch.
+        let Some(cut) = epoch_boundary_below(qc.weighted_timestamp().as_millis(), dur) else {
+            continue;
+        };
+        let leaf_count = header.beacon_witness_leaf_count();
+        let monotone = state
+            .boundaries
+            .get(shard)
+            .is_none_or(|prior| leaf_count.inner() >= prior.witness_leaf_count.inner());
+        if header.parent_qc().weighted_timestamp().as_millis() <= cut && monotone {
+            state.boundaries.insert(
+                *shard,
+                ShardBoundary {
+                    state_root: header.state_root(),
+                    block_hash,
+                    witness_leaf_count: leaf_count,
+                    last_live_epoch: epoch,
+                    consecutive_misses: 0,
+                },
+            );
+            refreshed.insert(*shard);
+        }
+    }
+
+    // Active shards with no fresh boundary carry their prior record
+    // forward and bump the miss counter (the "not observed crossing"
+    // signal). The shard set is fixed here, so every tracked boundary
+    // belongs to an active shard.
+    for (shard, boundary) in &mut state.boundaries {
+        if !refreshed.contains(shard) {
+            boundary.consecutive_misses = boundary.consecutive_misses.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use hyperscale_types::{Epoch, TransitionCause, ValidatorId};
+    use std::collections::BTreeMap;
+
+    use hyperscale_types::{
+        BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        BlockHeight, CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardBoundary, ShardId,
+        SignerBitfield, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
+        WeightedTimestamp, zero_bls_signature,
+    };
 
     use super::super::test_fixtures::{net, single_pool_state};
     use super::*;
+
+    // ─── boundary fold ──────────────────────────────────────────────────────
+
+    /// A shard block header at `height` whose predecessor's weighted
+    /// timestamp (on its parent QC) is `pred_wt`, carrying `state_root` and
+    /// witness `leaf_count`.
+    fn boundary_block(
+        shard: ShardId,
+        height: u64,
+        pred_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> BlockHeader {
+        let parent_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            shard,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(pred_wt),
+        );
+        BlockHeader::new(
+            shard,
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            state_root,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::new(leaf_count),
+        )
+    }
+
+    /// A QC naming `header` with weighted timestamp `wt`.
+    fn qc_over(header: &BlockHeader, wt: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            header.hash(),
+            header.shard_id(),
+            header.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(wt),
+        )
+    }
+
+    /// A boundary block (predecessor wt 900 ≤ the 1000 cut, own wt 1500
+    /// past it) bound to a committed proposal's QC and seated as a
+    /// contribution records the shard's anchor and clears its miss counter.
+    #[test]
+    fn record_boundaries_records_an_epoch_crossing() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
+        let b = boundary_block(shard, 5, 900, anchor, 7);
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            Vec::new(),
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> =
+            std::iter::once((shard, ShardEpochContribution { boundary_header: b })).collect();
+
+        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+
+        let recorded = state.boundaries.get(&shard).expect("boundary recorded");
+        assert_eq!(recorded.state_root, anchor);
+        assert_eq!(recorded.witness_leaf_count, BeaconWitnessLeafCount::new(7));
+        assert_eq!(recorded.last_live_epoch, Epoch::new(1));
+        assert_eq!(recorded.consecutive_misses, 0);
+    }
+
+    /// A contribution whose predecessor sits past the cut (1200 > 1000) is
+    /// not a crossing, so the active shard's miss counter advances instead.
+    #[test]
+    fn record_boundaries_bumps_miss_when_no_crossing() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::GENESIS,
+                consecutive_misses: 0,
+            },
+        );
+
+        let b = boundary_block(shard, 5, 1_200, StateRoot::ZERO, 0);
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            Vec::new(),
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> =
+            std::iter::once((shard, ShardEpochContribution { boundary_header: b })).collect();
+
+        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+
+        assert_eq!(state.boundaries.get(&shard).unwrap().consecutive_misses, 1,);
+    }
 
     // ─── apply_epoch regression check + epoch advance ──────────────────────
 
@@ -172,7 +428,10 @@ mod tests {
             &mut state,
             &net(),
             Epoch::new(5),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
         // Replay of epoch 5: current_epoch is now 5, so epoch=5 is
         // neither advance nor regression — must panic.
@@ -180,7 +439,10 @@ mod tests {
             &mut state,
             &net(),
             Epoch::new(5),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
     }
 
@@ -193,13 +455,19 @@ mod tests {
             &mut state,
             &net(),
             Epoch::new(5),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
         apply_epoch(
             &mut state,
             &net(),
             Epoch::new(3),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
     }
 
@@ -211,7 +479,10 @@ mod tests {
             &mut state,
             &net(),
             Epoch::new(7),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
         assert_eq!(state.current_epoch, Epoch::new(7));
     }
@@ -255,7 +526,10 @@ mod tests {
             &mut normal_state,
             &net(),
             next,
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
 
         let mut skip_state = baseline_state;

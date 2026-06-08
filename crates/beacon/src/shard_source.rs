@@ -1,17 +1,56 @@
-//! Per-shard witness tracking for beacon proposals.
+//! Per-shard source tracking for beacon proposals.
 //!
-//! Holds the per-shard verified headers a beacon proposer needs to
-//! decide eligibility (which leaves are includable in epoch E) and
-//! readiness (have all active shards crossed E's time boundary?), plus
-//! the pool of verified witnesses ready for proposal inclusion.
+//! Holds the beacon's verified view of each source shard, everything a
+//! proposer draws on to build a `BeaconProposal`:
+//!
+//! - recent verified headers — witness eligibility, readiness, and the
+//!   verify context for inbound `BeaconBlock`s and `ShardWitness`es;
+//! - observed epoch-boundary crossings — the per-shard anchors the
+//!   proposer reports in `boundary_qcs`;
+//! - the pool of verified witnesses ready for proposal inclusion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlockHeader, LeafIndex,
-    QuorumCertificate, ShardId, ShardWitness, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch,
+    LeafIndex, QuorumCertificate, ShardId, ShardWitness, Verified, WeightedTimestamp,
 };
+
+/// How many recent epoch-boundary crossings to retain per shard. The
+/// proposer reports the latest; a small history covers the spread of
+/// "latest observed" across beacon committee members so a node can seat
+/// the contribution for whichever crossing committed.
+const MAX_RETAINED_CROSSINGS_PER_SHARD: usize = 4;
+
+/// A shard's observed crossing of an epoch boundary.
+///
+/// `boundary_header` is the first committed block `B` whose weighted
+/// timestamp lands past the boundary; `canonical_qc` is the QC over `B`
+/// read from `B`'s committed child (`C.parent_qc`) — hash-pinned, so every
+/// node that observes the crossing selects the identical QC. Recorded when
+/// the `(B, C)` pair is fresh near the shard tip, so it survives header
+/// pruning.
+#[derive(Debug, Clone)]
+pub struct ObservedCrossing {
+    boundary_header: Arc<Verified<CertifiedBlockHeader>>,
+    canonical_qc: QuorumCertificate,
+}
+
+impl ObservedCrossing {
+    /// The boundary block's header — its `state_root` is the snap-sync
+    /// anchor.
+    #[must_use]
+    pub fn boundary_header(&self) -> &BlockHeader {
+        self.boundary_header.header()
+    }
+
+    /// The canonical QC over the boundary block.
+    #[must_use]
+    pub const fn canonical_qc(&self) -> &QuorumCertificate {
+        &self.canonical_qc
+    }
+}
 
 /// Per-shard witness tracking.
 ///
@@ -38,14 +77,19 @@ use hyperscale_types::{
 ///   eviction can hand the matching ids to `FetchAbandon::ShardWitnesses`.
 ///   Empty when off-committee.
 #[derive(Debug, Default)]
-pub struct ShardWitnessFetchTracker {
+pub struct ShardSourceTracker {
     shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
+    /// Observed epoch-boundary crossings per shard, keyed by the crossed
+    /// epoch. Recorded as `(B, C)` pairs become visible near the tip and
+    /// retained (bounded by [`MAX_RETAINED_CROSSINGS_PER_SHARD`]) so the
+    /// proposer can report a crossing long after its headers are pruned.
+    boundary_crossings: BTreeMap<ShardId, BTreeMap<Epoch, ObservedCrossing>>,
     pool: BTreeMap<ShardId, BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>>,
     pending_in_proposal: BTreeMap<ShardId, BTreeSet<LeafIndex>>,
     pending_fetches: BTreeMap<ShardId, BTreeMap<LeafIndex, (BlockHeight, BlockHash)>>,
 }
 
-impl ShardWitnessFetchTracker {
+impl ShardSourceTracker {
     /// Empty tracker.
     #[must_use]
     pub fn new() -> Self {
@@ -249,41 +293,65 @@ impl ShardWitnessFetchTracker {
         })
     }
 
-    /// The shard's **canonical** boundary QC for an epoch whose time
-    /// window ends at `epoch_end_wt`: the `parent_qc` of the committed
-    /// child of the boundary block — the first block across the cut.
-    ///
-    /// Selects the unique boundary block `B` whose predecessor sits
-    /// at/before the cut and whose own weighted timestamp sits past it,
-    /// reading `B`'s timestamp **canonically** from its committed child
-    /// `C`'s `parent_qc` (hash-pinned, so every beacon validator that has
-    /// synced the crossing selects the identical QC). Returns that
-    /// `C.parent_qc` — the canonical QC, whose `block_hash` is `B`'s.
-    ///
-    /// `None` when the crossing hasn't been observed: no header pair
-    /// `(B, C)` at consecutive heights where `B.parent_qc.wt ≤
-    /// epoch_end_wt < C.parent_qc.wt`. By chain monotonicity at most one
-    /// such `B` exists, so the result is unambiguous.
-    #[must_use]
-    pub fn canonical_boundary(
-        &self,
+    /// Record any epoch-boundary crossing made visible by the verified
+    /// header just inserted at `(shard, height)`. The inserted header can
+    /// be the child `C` of an earlier `B`, or the parent `B` of a `C` that
+    /// arrived first, so both consecutive pairs are checked. A detected
+    /// crossing is stored keyed by the crossed epoch and retained past
+    /// header pruning (bounded by [`MAX_RETAINED_CROSSINGS_PER_SHARD`]),
+    /// so the proposer can report it well after `(B, C)` leave the window.
+    pub fn observe_crossing(
+        &mut self,
         shard: ShardId,
-        epoch_end_wt: WeightedTimestamp,
-    ) -> Option<QuorumCertificate> {
-        let headers = self.shard_headers.get(&shard)?;
-        for (height, b) in headers {
-            let Some(c) = headers.get(&height.next()) else {
-                continue;
+        height: BlockHeight,
+        epoch_duration_ms: u64,
+    ) {
+        let found: Vec<(Epoch, ObservedCrossing)> = {
+            let Some(headers) = self.shard_headers.get(&shard) else {
+                return;
             };
-            let b_wt = c.header().parent_qc().weighted_timestamp();
-            let b_pred_wt = b.header().parent_qc().weighted_timestamp();
-            if b_pred_wt.as_millis() <= epoch_end_wt.as_millis()
-                && epoch_end_wt.as_millis() < b_wt.as_millis()
-            {
-                return Some(c.header().parent_qc().clone());
+            let prev = height.inner().checked_sub(1).map(BlockHeight::new);
+            [(prev, height), (Some(height), height.next())]
+                .into_iter()
+                .filter_map(|(b_height, c_height)| {
+                    let b = headers.get(&b_height?)?;
+                    let c = headers.get(&c_height)?;
+                    detect_crossing(b, c, epoch_duration_ms)
+                })
+                .collect()
+        };
+        for (epoch, crossing) in found {
+            let per_shard = self.boundary_crossings.entry(shard).or_default();
+            per_shard.insert(epoch, crossing);
+            while per_shard.len() > MAX_RETAINED_CROSSINGS_PER_SHARD {
+                let Some(oldest) = per_shard.keys().next().copied() else {
+                    break;
+                };
+                per_shard.remove(&oldest);
             }
         }
-        None
+    }
+
+    /// The shard's most recently observed epoch-boundary crossing, if any.
+    /// The proposer reports this in its `boundary_qcs`.
+    #[must_use]
+    pub fn latest_crossing(&self, shard: ShardId) -> Option<&ObservedCrossing> {
+        self.boundary_crossings.get(&shard)?.values().next_back()
+    }
+
+    /// A retained crossing for `shard` whose canonical QC names `block_hash`
+    /// — used by the assembler to seat a committed boundary QC's header
+    /// even after that header has left the sliding window.
+    #[must_use]
+    pub fn crossing_by_block_hash(
+        &self,
+        shard: ShardId,
+        block_hash: BlockHash,
+    ) -> Option<&ObservedCrossing> {
+        self.boundary_crossings
+            .get(&shard)?
+            .values()
+            .find(|c| c.canonical_qc.block_hash() == block_hash)
     }
 
     /// Called when the local validator is removed from the beacon
@@ -328,9 +396,45 @@ fn max_eligible_leaf_count(
         .max()
 }
 
+/// If `c` is `b`'s committed child and `b` is the first block across an
+/// epoch boundary — its predecessor at/before the boundary, `b` itself
+/// past it — return that crossing keyed by the crossed epoch. `b`'s own
+/// weighted timestamp is read canonically from `c.parent_qc`, so the
+/// crossed epoch and QC are identical on every node that sees the pair.
+fn detect_crossing(
+    b: &Arc<Verified<CertifiedBlockHeader>>,
+    c: &Arc<Verified<CertifiedBlockHeader>>,
+    epoch_duration_ms: u64,
+) -> Option<(Epoch, ObservedCrossing)> {
+    if epoch_duration_ms == 0 {
+        return None;
+    }
+    let canonical_qc = c.header().parent_qc();
+    if canonical_qc.block_hash() != b.block_hash() {
+        return None;
+    }
+    let b_wt = canonical_qc.weighted_timestamp().as_millis();
+    let b_pred_wt = b.header().parent_qc().weighted_timestamp().as_millis();
+    // The largest epoch boundary strictly below `b`'s weighted timestamp.
+    let k = b_wt.checked_sub(1)? / epoch_duration_ms;
+    if k == 0 {
+        return None;
+    }
+    let cut = k * epoch_duration_ms;
+    (b_pred_wt <= cut).then(|| {
+        (
+            Epoch::new(k),
+            ObservedCrossing {
+                boundary_header: Arc::clone(b),
+                canonical_qc: canonical_qc.clone(),
+            },
+        )
+    })
+}
+
 // Flat accessors; names are the documentation.
 #[allow(missing_docs)]
-impl ShardWitnessFetchTracker {
+impl ShardSourceTracker {
     #[must_use]
     pub fn header(
         &self,
@@ -454,6 +558,69 @@ mod tests {
         )))
     }
 
+    /// Build a verified header that links to its parent: its `parent_qc`
+    /// names `parent_hash` and carries `parent_wt` (the parent's canonical
+    /// weighted timestamp). Chaining two of these lets `detect_crossing`
+    /// recognise a real `(B, C)` parent/child pair.
+    fn linked_header(
+        s: ShardId,
+        height: u64,
+        parent_hash: BlockHash,
+        parent_wt: u64,
+        leaf_count: u64,
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            s,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(parent_wt),
+        );
+        let header = BlockHeader::new(
+            s,
+            BlockHeight::new(height),
+            parent_hash,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("r-{s:?}-{height}").as_bytes())),
+            BeaconWitnessLeafCount::new(leaf_count),
+        );
+        let block_hash = header.hash();
+        let qc = QuorumCertificate::new(
+            block_hash,
+            s,
+            BlockHeight::new(height),
+            parent_hash,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(parent_wt),
+        );
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header, qc,
+        )))
+    }
+
+    /// Record a verified header and detect any crossing it completes.
+    fn note(t: &mut ShardSourceTracker, h: &Arc<Verified<CertifiedBlockHeader>>, dur: u64) {
+        t.on_verified_remote_header(Arc::clone(h));
+        t.observe_crossing(h.header().shard_id(), h.header().height(), dur);
+    }
+
     fn witness(s: ShardId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
         Arc::new(Verified::new_unchecked_for_test(ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
@@ -471,7 +638,7 @@ mod tests {
 
     #[test]
     fn empty_after_new() {
-        let t = ShardWitnessFetchTracker::new();
+        let t = ShardSourceTracker::new();
         assert!(t.header(shard(0), BlockHeight::new(0)).is_none());
         assert_eq!(t.pool_len(shard(0)), 0);
         assert_eq!(t.pending_fetches_len(shard(0)), 0);
@@ -479,7 +646,7 @@ mod tests {
 
     #[test]
     fn on_verified_remote_header_inserts_header() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 7));
         let h = t.header(shard(0), BlockHeight::new(1)).unwrap();
         assert_eq!(
@@ -494,7 +661,7 @@ mod tests {
 
     #[test]
     fn admit_witness_lands_in_pool_and_clears_pending_fetch() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         assert!(t.register_pending_fetch(
             shard(0),
             LeafIndex::new(3),
@@ -509,7 +676,7 @@ mod tests {
 
     #[test]
     fn register_pending_fetch_is_idempotent() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         assert!(t.register_pending_fetch(
             shard(0),
             LeafIndex::new(3),
@@ -526,7 +693,7 @@ mod tests {
 
     #[test]
     fn register_pending_fetch_rejects_when_already_pooled() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.admit_witness(witness(shard(0), 5));
         assert!(!t.register_pending_fetch(
             shard(0),
@@ -538,7 +705,7 @@ mod tests {
 
     #[test]
     fn drain_for_proposal_returns_witnesses_inside_wt_and_above_watermark() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         // One header at WT 1_000 with leaf_count 5 — leaves 1..=5 are
         // eligible for any epoch with t_end ≥ 1_000.
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
@@ -568,7 +735,7 @@ mod tests {
     /// shards.
     #[test]
     fn drain_is_idempotent_when_watermark_unchanged() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
         t.admit_witness(witness(shard(0), 4));
@@ -586,7 +753,7 @@ mod tests {
     /// `leaf_index ≤ w` and retains those with `leaf_index > w`.
     #[test]
     fn notify_consumed_advanced_evicts_at_or_below_watermark() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.admit_witness(witness(shard(0), 1));
         t.admit_witness(witness(shard(0), 2));
         t.admit_witness(witness(shard(0), 3));
@@ -615,7 +782,7 @@ mod tests {
     /// dropped, leaves above are retained.
     #[test]
     fn notify_consumed_advanced_evicts_pending_in_proposal() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         for leaf in 1..=5u64 {
             t.admit_witness(witness(shard(0), leaf));
@@ -636,7 +803,7 @@ mod tests {
     /// `consumed_through` for this shard doesn't disturb the pool.
     #[test]
     fn notify_consumed_advanced_is_idempotent() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.admit_witness(witness(shard(0), 4));
         t.admit_witness(witness(shard(0), 5));
 
@@ -650,7 +817,7 @@ mod tests {
     /// each shard's latest header.
     #[test]
     fn prune_stale_headers_drops_consumed_keeps_unconsumed_and_latest() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         // Heights 1..=4; leaf counts 2, 4, 6, 6 (height 4 added no leaves).
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 2));
         t.on_verified_remote_header(verified_header(shard(0), 2, 2_000, 4));
@@ -674,7 +841,7 @@ mod tests {
     /// epoch boundary.
     #[test]
     fn prune_stale_headers_keeps_latest_even_when_fully_consumed() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.on_verified_remote_header(verified_header(shard(0), 2, 2_000, 5));
         let mut consumed = BTreeMap::new();
@@ -688,7 +855,7 @@ mod tests {
     /// only its zero-leaf headers (below the latest) are dropped.
     #[test]
     fn prune_stale_headers_treats_absent_shard_as_watermark_zero() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 0));
         t.on_verified_remote_header(verified_header(shard(0), 2, 2_000, 3));
         let consumed = BTreeMap::new();
@@ -699,7 +866,7 @@ mod tests {
 
     #[test]
     fn drain_excludes_leaves_above_wt_eligible_count() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 3));
         // Pool has leaf 5 which is above the WT-eligible count of 3.
         t.admit_witness(witness(shard(0), 5));
@@ -711,7 +878,7 @@ mod tests {
 
     #[test]
     fn drain_with_no_headers_for_shard_returns_nothing() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.admit_witness(witness(shard(0), 1));
         let consumed = BTreeMap::new();
         let drained = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
@@ -720,7 +887,7 @@ mod tests {
 
     #[test]
     fn is_ready_to_propose_true_when_all_shards_crossed() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         // Both shards have observed a header past t_end = 1_000.
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_500, 0));
         t.on_verified_remote_header(verified_header(shard(1), 1, 2_000, 0));
@@ -731,7 +898,7 @@ mod tests {
 
     #[test]
     fn is_ready_to_propose_false_when_a_shard_hasnt_crossed() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_500, 0));
         // shard(1) only has a header at WT 500 — not past t_end = 1_000.
         t.on_verified_remote_header(verified_header(shard(1), 1, 500, 0));
@@ -742,58 +909,64 @@ mod tests {
 
     #[test]
     fn is_ready_to_propose_false_when_shard_has_no_headers() {
-        let t = ShardWitnessFetchTracker::new();
+        let t = ShardSourceTracker::new();
         assert!(!t.is_ready_to_propose(&[shard(0)], WeightedTimestamp::from_millis(1_000),));
     }
 
-    /// `canonical_boundary` selects the first block across the cut and
-    /// returns its child's `parent_qc` (carrying the boundary's own
-    /// canonical weighted timestamp). With `parent_qc.wt` = 500/1000/1500
-    /// at heights 1/2/3, the block at height 2 is the first whose wt
-    /// (1500, read from height 3's `parent_qc`) is past a 1200 cut while
-    /// its predecessor (1000) sits at/before it.
+    /// A `(B, C)` parent/child pair straddling an epoch boundary records a
+    /// crossing: `B` at predecessor-wt 900 (≤ the 1000 boundary) and own
+    /// canonical wt 1500 (read from `C.parent_qc`, past 1000) is the first
+    /// block across epoch 1. The crossing carries `B`'s header and that
+    /// canonical QC.
     #[test]
-    fn canonical_boundary_selects_first_block_across_cut() {
-        let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(verified_header(shard(0), 1, 500, 0));
-        t.on_verified_remote_header(verified_header(shard(0), 2, 1_000, 0));
-        t.on_verified_remote_header(verified_header(shard(0), 3, 1_500, 0));
-        let qc = t
-            .canonical_boundary(shard(0), WeightedTimestamp::from_millis(1_200))
-            .expect("crossing observed");
+    fn observe_crossing_records_first_block_across_boundary() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, BlockHash::ZERO, 900, 7);
+        let c = linked_header(shard(0), 3, b.block_hash(), 1_500, 7);
+        note(&mut t, &b, 1_000);
+        note(&mut t, &c, 1_000);
+        let crossing = t.latest_crossing(shard(0)).expect("crossing observed");
         assert_eq!(
-            qc.weighted_timestamp(),
-            WeightedTimestamp::from_millis(1_500)
+            crossing.canonical_qc().weighted_timestamp(),
+            WeightedTimestamp::from_millis(1_500),
         );
+        assert_eq!(crossing.canonical_qc().block_hash(), b.block_hash());
+        assert_eq!(crossing.boundary_header().hash(), b.block_hash());
     }
 
-    /// `canonical_boundary` is `None` until the crossing's child header
-    /// arrives: with headers only up to height 2, the beacon can't read
-    /// height 2's canonical wt, so the crossing isn't demonstrably
-    /// observed.
+    /// A pair wholly inside one epoch (predecessor 1200 and own wt 1500,
+    /// both past the 1000 boundary) is not a crossing — `B` is not the
+    /// first block across.
     #[test]
-    fn canonical_boundary_none_when_child_unobserved() {
-        let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(verified_header(shard(0), 1, 500, 0));
-        t.on_verified_remote_header(verified_header(shard(0), 2, 1_000, 0));
-        assert!(
-            t.canonical_boundary(shard(0), WeightedTimestamp::from_millis(1_200))
-                .is_none()
-        );
+    fn observe_crossing_ignores_within_epoch_pair() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, BlockHash::ZERO, 1_200, 0);
+        let c = linked_header(shard(0), 3, b.block_hash(), 1_500, 0);
+        note(&mut t, &b, 1_000);
+        note(&mut t, &c, 1_000);
+        assert!(t.latest_crossing(shard(0)).is_none());
     }
 
+    /// A recorded crossing is retrievable by the canonical QC's block hash
+    /// (used by the assembler), and absent for unknown shards/hashes.
     #[test]
-    fn canonical_boundary_none_for_unknown_shard() {
-        let t = ShardWitnessFetchTracker::new();
+    fn crossing_by_block_hash_finds_retained_crossing() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, BlockHash::ZERO, 900, 0);
+        let c = linked_header(shard(0), 3, b.block_hash(), 1_500, 0);
+        note(&mut t, &b, 1_000);
+        note(&mut t, &c, 1_000);
+        assert!(t.crossing_by_block_hash(shard(0), b.block_hash()).is_some());
         assert!(
-            t.canonical_boundary(shard(0), WeightedTimestamp::from_millis(1_000))
+            t.crossing_by_block_hash(shard(0), BlockHash::ZERO)
                 .is_none()
         );
+        assert!(t.crossing_by_block_hash(shard(1), b.block_hash()).is_none());
     }
 
     #[test]
     fn evicted_from_committee_clears_pool_and_pending_keeps_headers() {
-        let mut t = ShardWitnessFetchTracker::new();
+        let mut t = ShardSourceTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
         t.register_pending_fetch(

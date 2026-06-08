@@ -137,7 +137,10 @@ fn fifty_epochs_byte_identical_across_replicas() {
                 replica,
                 &network,
                 target,
-                ApplyEpochInput::Normal { committed: &[] },
+                ApplyEpochInput::Normal {
+                    committed: &[],
+                    shard_contributions: &BTreeMap::new(),
+                },
             );
         }
         for i in 1..V {
@@ -178,7 +181,10 @@ fn lookahead_committee_promotes_unchanged_to_active() {
             &mut state,
             &network,
             Epoch::new(e),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
         lookahead_after.insert(e, state.next_shard_committees.clone());
         active_after.insert(e, state.shard_committees.clone());

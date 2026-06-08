@@ -75,6 +75,27 @@ impl BeaconBlock {
         }
     }
 
+    /// Build a `BeaconBlock` carrying per-shard boundary contributions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `committed_proposals.len() > MAX_BEACON_COMMITTEE` or
+    /// `shard_contributions.len() > MAX_SHARDS`.
+    #[must_use]
+    pub fn new_with_contributions(
+        epoch: Epoch,
+        prev_block_hash: BeaconBlockHash,
+        committed_proposals: Vec<(ValidatorId, BeaconProposal)>,
+        shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
+    ) -> Self {
+        Self {
+            epoch,
+            prev_block_hash,
+            committed_proposals: committed_proposals.into(),
+            shard_contributions: shard_contributions.into(),
+        }
+    }
+
     /// Bare genesis-shaped block: epoch 0, zero parent, no proposals.
     /// Pair with [`BeaconCert::Genesis`](crate::BeaconCert::Genesis) via
     /// [`CertifiedBeaconBlock::genesis`](crate::CertifiedBeaconBlock::genesis).

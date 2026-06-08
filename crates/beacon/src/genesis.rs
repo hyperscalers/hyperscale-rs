@@ -393,7 +393,10 @@ mod tests {
             &mut state,
             &NetworkDefinition::simulator(),
             Epoch::new(1),
-            ApplyEpochInput::Normal { committed: &[] },
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
         );
         assert_eq!(state.current_epoch, Epoch::new(1));
         assert_eq!(
