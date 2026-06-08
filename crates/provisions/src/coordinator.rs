@@ -220,7 +220,7 @@ impl ProvisionCoordinator {
     pub fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
-        let new_ts = certified.qc().weighted_timestamp();
+        let new_ts = certified.block().header().parent_qc().weighted_timestamp();
         self.expected.record_block_committed(new_ts);
         let local_ts = self.expected.local_ts();
 
@@ -397,7 +397,7 @@ impl ProvisionCoordinator {
                 "Found buffered provisions for verified header"
             );
             let local_ts = self.expected.local_ts();
-            let source_block_ts = certified_header.qc().weighted_timestamp();
+            let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
             for provisions in drained {
                 let provisions_hash = provisions.hash();
                 if self.committed_tombstones.contains(&provisions_hash) {
@@ -488,7 +488,8 @@ impl ProvisionCoordinator {
         let key = (source_shard, block_height);
 
         if let Some(verified_header) = self.headers.get(key) {
-            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp());
+            let deadline =
+                provisions.deadline(verified_header.header().parent_qc().weighted_timestamp());
             if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.inner(),
@@ -588,7 +589,8 @@ impl ProvisionCoordinator {
         if let Some(verified_header) = self.headers.get(key) {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
-            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp());
+            let deadline =
+                provisions.deadline(verified_header.header().parent_qc().weighted_timestamp());
             if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.inner(),
@@ -658,7 +660,7 @@ impl ProvisionCoordinator {
                 return actions;
             }
         };
-        let source_block_ts = certified_header.qc().weighted_timestamp();
+        let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
         let provisions_hash = verified.hash();
         let source_shard = verified.source_shard();
 
@@ -1407,14 +1409,31 @@ mod tests {
     /// old "block count" intuition when reading the tests.
     const TEST_BLOCK_INTERVAL_MS: u64 = 500;
 
+    /// A genesis-shaped QC carrying `weighted_ts_ms`. The commit clock reads a
+    /// block's `parent_qc` weighted timestamp, so fixtures anchor their time
+    /// there while keeping the QC genesis-shaped (so `is_genesis()` holds).
+    fn genesis_qc_at(shard: ShardId, weighted_ts_ms: u64) -> QuorumCertificate {
+        let g = QuorumCertificate::genesis(shard);
+        QuorumCertificate::new(
+            g.block_hash(),
+            g.shard_id(),
+            g.height(),
+            g.parent_block_hash(),
+            g.round(),
+            g.signers().clone(),
+            g.aggregated_signature(),
+            WeightedTimestamp::from_millis(weighted_ts_ms),
+        )
+    }
+
     /// Make a minimal `Block` at the given height for `on_block_committed` calls.
-    /// The attached QC's `weighted_timestamp_ms` is `height * TEST_BLOCK_INTERVAL_MS`.
+    /// The block's `parent_qc` weighted timestamp is `height * TEST_BLOCK_INTERVAL_MS`.
     fn make_block(height: BlockHeight) -> CertifiedBlock {
         let header = BlockHeader::new(
             ShardId::leaf(2, 0),
             height,
             BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            QuorumCertificate::genesis(ShardId::leaf(2, 0)),
+            genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS),
             ValidatorId::new(0),
             ProposerTimestamp::ZERO,
             Round::INITIAL,
@@ -1716,7 +1735,7 @@ mod tests {
             ShardId::leaf(2, 0),
             height,
             BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            QuorumCertificate::genesis(ShardId::leaf(2, 0)),
+            genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS),
             ValidatorId::new(0),
             ProposerTimestamp::ZERO,
             Round::INITIAL,

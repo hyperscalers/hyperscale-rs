@@ -1459,7 +1459,7 @@ impl ExecutionCoordinator {
         let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts = certified.qc().weighted_timestamp();
+            self.committed_ts = certified.block().header().parent_qc().weighted_timestamp();
         }
         self.provisioning.advance_clock(self.committed_ts);
 

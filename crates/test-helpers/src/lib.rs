@@ -263,10 +263,14 @@ pub fn make_live_block(
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
 /// the `CertifiedBlock` pairing invariant.
 ///
-/// `weighted_timestamp_ms` stamps the shard consensus-authenticated time anchor; pass
-/// `0` when retention-window behavior doesn't matter.
+/// `weighted_timestamp_ms` stamps the block's time anchor. The commit clock
+/// reads the block's `parent_qc` weighted timestamp (the hash-pinned anchor),
+/// so the value is stamped there — kept genesis-shaped so `is_genesis()` still
+/// holds — and mirrored onto the certifying QC for callers that read it
+/// directly. Pass `0` when retention-window behavior doesn't matter.
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
+    let block = stamp_parent_qc_weighted_timestamp(block, weighted_timestamp_ms);
     let qc = {
         let __qc = QuorumCertificate::genesis(ShardId::ROOT);
         QuorumCertificate::new(
@@ -281,6 +285,89 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
         )
     };
     CertifiedBlock::new_unchecked(block, qc)
+}
+
+/// Re-stamp a block's `parent_qc` weighted timestamp, keeping the QC
+/// genesis-shaped. The commit clock anchors on `parent_qc().weighted_timestamp()`,
+/// so fixtures that want a committed block "at time T" must carry T there.
+fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) -> Block {
+    let restamp = |header: BlockHeader| -> BlockHeader {
+        let (
+            shard_id,
+            height,
+            parent_block_hash,
+            parent_qc,
+            proposer,
+            timestamp,
+            round,
+            is_fallback,
+            state_root,
+            transaction_root,
+            certificate_root,
+            local_receipt_root,
+            provision_root,
+            waves,
+            provision_tx_roots,
+            in_flight,
+            beacon_witness_root,
+            beacon_witness_leaf_count,
+        ) = header.into_parts();
+        let pqc = parent_qc.as_unverified();
+        let stamped = QuorumCertificate::new(
+            pqc.block_hash(),
+            pqc.shard_id(),
+            pqc.height(),
+            pqc.parent_block_hash(),
+            pqc.round(),
+            pqc.signers().clone(),
+            pqc.aggregated_signature(),
+            WeightedTimestamp::from_millis(weighted_timestamp_ms),
+        );
+        BlockHeader::new(
+            shard_id,
+            height,
+            parent_block_hash,
+            stamped,
+            proposer,
+            timestamp,
+            round,
+            is_fallback,
+            state_root,
+            transaction_root,
+            certificate_root,
+            local_receipt_root,
+            provision_root,
+            waves.0,
+            provision_tx_roots.0,
+            in_flight,
+            beacon_witness_root,
+            beacon_witness_leaf_count,
+        )
+    };
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+        } => Block::Live {
+            header: restamp(header),
+            transactions,
+            certificates,
+            provisions,
+        },
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+        } => Block::Sealed {
+            header: restamp(header),
+            transactions,
+            certificates,
+            provision_hashes,
+        },
+    }
 }
 
 /// Build a minimal `FinalizedWave` carrying a single tx decision.

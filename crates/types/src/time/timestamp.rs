@@ -26,12 +26,17 @@ use std::time::Duration;
 
 use sbor::prelude::*;
 
-/// BFT-authenticated, stake-weighted block timestamp in milliseconds.
+/// BFT-authenticated block timestamp in milliseconds.
 ///
-/// Derived from the QC: `sum(timestamp_i * stake_i) / sum(stake_i)` over the
-/// 2f+1 voters that formed the QC. Because every honest validator aggregates
-/// the same vote set, every validator derives the same `WeightedTimestamp`
-/// for the same committed block.
+/// Each QC carries the mean of the timestamps of the 2f+1 votes that formed
+/// it (every node is one vote), clamped so it never precedes the parent QC's
+/// value. Two aggregators collecting different quorum subsets for the same
+/// block can therefore produce different means, and the field rides outside
+/// the QC's signed message — so a QC's own `weighted_timestamp` is neither
+/// unique nor unforgeable on its own. The canonical, hash-pinned timestamp
+/// for a block is the one its committing child embeds as `parent_qc`: anchor
+/// deterministic deadlines on `header.parent_qc().weighted_timestamp()`,
+/// never on a received block's own `qc().weighted_timestamp()`.
 ///
 /// This is the only timestamp type safe to anchor consensus deadlines on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor, Default)]

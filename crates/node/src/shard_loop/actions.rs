@@ -467,7 +467,7 @@ where
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
 
-                let weighted_ts = certified.qc_verified().weighted_timestamp();
+                let weighted_ts = certified.block().header().parent_qc().weighted_timestamp();
                 let block_hash = certified.block().hash();
                 self.io
                     .pending_chain

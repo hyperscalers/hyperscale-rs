@@ -30,10 +30,11 @@ use tracing::{trace, warn};
 /// must learn those hashes too. Past the horizon, the dedup entries are
 /// gone everywhere and the `Sealed` block is safe to serve.
 ///
-/// The horizon check is based on the shard consensus-authenticated
-/// `weighted_timestamp` of the committing QC and the serving peer's own
-/// latest QC timestamp — both quantities are deterministic and don't
-/// depend on the requester's view.
+/// The horizon check is based on the block's `parent_qc` weighted timestamp
+/// (hash-pinned in the header, so every peer reads the same value for a given
+/// block — the same anchor the requester's commit path uses) and the serving
+/// peer's own latest QC timestamp as the "now" reference. Neither depends on
+/// the requester's view.
 ///
 /// Inside the horizon for a `Sealed` block, a local cache miss returns
 /// `not_found`. The invariant downstream commit hooks rely on —
@@ -61,7 +62,7 @@ pub fn serve_block_request<S: ShardStorage>(
         return GetBlockResponse::not_found();
     };
 
-    let block_ts = qc.weighted_timestamp();
+    let block_ts = block.header().parent_qc().weighted_timestamp();
     let tip_ts = pending_chain
         .latest_qc()
         .map_or(block_ts, |q| q.weighted_timestamp());

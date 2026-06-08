@@ -315,25 +315,26 @@ impl ShardCoordinator {
             .as_deref()
             .map_or(Round::INITIAL, QuorumCertificate::round);
         let initial_view = high_qc_round.next();
+        // The committed tip's committee was keyed on its parent QC's weighted
+        // timestamp, and the live commit path anchors `committed_ts` on that
+        // same value; storage recovers it from the tip's stored header. When it
+        // didn't (fresh start, or genesis tip), fall back to the tip's own WT —
+        // identical except when the recovered tip is an epoch's first block, and
+        // exact again after the next commit. Restoring both `committed_ts` and
+        // `committed_anchor_ts` from it keeps a restarted node's BFT clock equal
+        // to a non-restarted peer's rather than one to two blocks ahead.
+        let committed_anchor_ts = recovered.committed_anchor_ts.unwrap_or_else(|| {
+            recovered.latest_qc.as_deref().map_or(
+                WeightedTimestamp::ZERO,
+                QuorumCertificate::weighted_timestamp,
+            )
+        });
         Self {
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts: recovered.latest_qc.as_deref().map_or(
-                WeightedTimestamp::ZERO,
-                QuorumCertificate::weighted_timestamp,
-            ),
-            // The committed tip's committee was keyed on its parent QC's
-            // weighted timestamp; storage recovers it from the tip's stored
-            // header. When it didn't (fresh start, or genesis tip), fall back
-            // to the tip's own WT — identical except when the recovered tip is
-            // an epoch's first block, and exact again after the next commit.
-            committed_anchor_ts: recovered.committed_anchor_ts.unwrap_or_else(|| {
-                recovered.latest_qc.as_deref().map_or(
-                    WeightedTimestamp::ZERO,
-                    QuorumCertificate::weighted_timestamp,
-                )
-            }),
+            committed_ts: committed_anchor_ts,
+            committed_anchor_ts,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: DeferredQc::new(),
@@ -3041,12 +3042,18 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
-        // The QC's `weighted_timestamp` rides outside the signed message, so a
-        // forged network QC could carry one below the chain's clock. Clamp it to
-        // the prior committed value: the deadlines keyed off `committed_ts`
-        // (dedup retention, validity windows) must never run backwards.
+        // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
+        // this block's header, so every validator reads the identical value —
+        // unlike the block's own QC, whose timestamp rides outside the signed
+        // message and can be rewritten by a relay. It is still not
+        // monotonicity-guaranteed (the field is unsigned, with no lower-bound
+        // check at vote time), so clamp to the prior committed value: deadlines
+        // keyed off `committed_ts` (dedup retention, validity windows) must
+        // never run backwards.
         let weighted_ts = certified
-            .qc_verified()
+            .block()
+            .header()
+            .parent_qc()
             .weighted_timestamp()
             .max(self.committed_ts);
 

@@ -227,9 +227,12 @@ impl ShardWitnessFetchTracker {
 
     /// Whether the local proposer can build an epoch's contribution:
     /// every shard in `active_shards` must have at least one observed
-    /// header whose `weighted_timestamp` is strictly past
+    /// header whose parent-QC `weighted_timestamp` is strictly past
     /// `epoch_end_wt`, which proves no further headers from that shard
-    /// can land inside the current epoch's window.
+    /// can land inside the current epoch's window. The anchor is the
+    /// parent QC's timestamp — hash-pinned in the header, so every
+    /// beacon validator cuts the window at the same place — not the
+    /// block's own QC timestamp, which rides outside the signed message.
     #[must_use]
     pub fn is_ready_to_propose(
         &self,
@@ -238,9 +241,10 @@ impl ShardWitnessFetchTracker {
     ) -> bool {
         active_shards.iter().all(|shard| {
             self.shard_headers.get(shard).is_some_and(|headers| {
-                headers
-                    .values()
-                    .any(|h| h.qc().weighted_timestamp().as_millis() > epoch_end_wt.as_millis())
+                headers.values().any(|h| {
+                    h.header().parent_qc().weighted_timestamp().as_millis()
+                        > epoch_end_wt.as_millis()
+                })
             })
         })
     }
@@ -271,7 +275,7 @@ impl ShardWitnessFetchTracker {
     }
 }
 
-/// Largest `beacon_witness_leaf_count` from headers whose
+/// Largest `beacon_witness_leaf_count` from headers whose parent-QC
 /// `weighted_timestamp` is at or before `epoch_end_wt`. `None` if no
 /// such header exists yet.
 fn max_eligible_leaf_count(
@@ -280,7 +284,9 @@ fn max_eligible_leaf_count(
 ) -> Option<BeaconWitnessLeafCount> {
     headers
         .values()
-        .filter(|h| h.qc().weighted_timestamp().as_millis() <= epoch_end_wt.as_millis())
+        .filter(|h| {
+            h.header().parent_qc().weighted_timestamp().as_millis() <= epoch_end_wt.as_millis()
+        })
         .map(|h| h.header().beacon_witness_leaf_count())
         .max()
 }
@@ -353,15 +359,27 @@ mod tests {
     }
 
     /// Build a verified `CertifiedBlockHeader` with the few fields the
-    /// tracker reads — shard, height, `weighted_timestamp` (carried on
-    /// the QC), witness root, leaf count.
+    /// tracker reads — shard, height, `weighted_timestamp` (carried on the
+    /// parent QC, which is the hash-pinned anchor the tracker reads),
+    /// witness root, leaf count.
     fn verified_header(
         s: ShardId,
         height: u64,
         wt_millis: u64,
         leaf_count: u64,
     ) -> Arc<Verified<CertifiedBlockHeader>> {
-        let parent_qc = QuorumCertificate::genesis(s);
+        // The tracker anchors on the parent QC's weighted timestamp, so
+        // that's where the header's nominal time must live.
+        let parent_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            s,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(wt_millis),
+        );
         let parent_block_hash = BlockHash::ZERO;
         let header = BlockHeader::new(
             s,

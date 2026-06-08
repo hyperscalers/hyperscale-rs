@@ -525,7 +525,7 @@ impl MempoolCoordinator {
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts = certified.qc().weighted_timestamp();
+        self.current_ts = block.header().parent_qc().weighted_timestamp();
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block

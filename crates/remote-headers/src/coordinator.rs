@@ -196,7 +196,7 @@ impl RemoteHeaderCoordinator {
             "Admitting verified remote header (local-dispatch fast path)"
         );
 
-        let header_ts = certified_header.qc().weighted_timestamp();
+        let header_ts = certified_header.header().parent_qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
         self.verified.insert(key, Arc::clone(&certified_header));
         self.pending.remove(&key);
@@ -298,7 +298,7 @@ impl RemoteHeaderCoordinator {
         sender_map.insert(sender, Arc::clone(&certified_header));
 
         // Update tip and prune old entries.
-        let header_ts = certified_header.qc().weighted_timestamp();
+        let header_ts = certified_header.header().parent_qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
 
         if first_for_key {
@@ -420,7 +420,7 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let new_ts = certified.qc().weighted_timestamp();
+        let new_ts = certified.block().header().parent_qc().weighted_timestamp();
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
         self.local_committed_height = certified.block().height();
         self.local_committed_ts = new_ts;
@@ -601,8 +601,9 @@ impl RemoteHeaderCoordinator {
         for (&shard, &(_, tip_ts)) in &self.tips {
             let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
             if cutoff > WeightedTimestamp::ZERO {
-                self.verified
-                    .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp() >= cutoff);
+                self.verified.retain(|&(s, _), hdr| {
+                    s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
+                });
             }
         }
     }
@@ -631,10 +632,11 @@ impl RemoteHeaderCoordinator {
                 s != shard
                     || sender_map
                         .values()
-                        .any(|h| h.qc().weighted_timestamp() >= cutoff)
+                        .any(|h| h.header().parent_qc().weighted_timestamp() >= cutoff)
             });
-            self.verified
-                .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp() >= cutoff);
+            self.verified.retain(|&(s, _), hdr| {
+                s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
+            });
         }
     }
 
