@@ -23,7 +23,7 @@ use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
     BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
     BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
+    BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
     Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext,
@@ -334,6 +334,165 @@ impl CoordinatorSim {
                 siblings: siblings.into(),
             },
         }
+    }
+
+    /// Deliver a two-block epoch-boundary crossing for `shard` to every
+    /// replica's shard-source tracker, so each on-committee proposer reports
+    /// the shard's canonical boundary QC in its next proposal.
+    ///
+    /// Block `B` at `b_height` carries `state_root` and `leaf_count` and is
+    /// the first block across the cut: its predecessor's weighted timestamp
+    /// is `pred_wt` (at or before the cut) and its own canonical timestamp
+    /// `b_wt` (past it) is read from its committed child `C`'s parent QC.
+    /// Returns `B`'s block hash so the caller can assert the recorded
+    /// boundary's `block_hash`. Deliver before [`Self::kick_off`] so the
+    /// crossing is observed when the committee builds its proposals.
+    pub fn deliver_boundary_crossing(
+        &mut self,
+        shard: ShardId,
+        b_height: u64,
+        pred_wt: u64,
+        b_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> BlockHash {
+        let b = make_linked_source_header(
+            shard,
+            b_height,
+            BlockHash::ZERO,
+            pred_wt,
+            state_root,
+            leaf_count,
+        );
+        // `C`'s parent QC is the canonical QC over `B` — a genuine `2f+1`
+        // of the governing shard committee, the form the beacon's
+        // boundary-QC verification authenticates.
+        let canonical_qc = self.genuine_boundary_qc(shard, &b, b_wt);
+        self.deliver_crossing_pair(shard, &b, b_height, canonical_qc, leaf_count)
+    }
+
+    /// Like [`Self::deliver_boundary_crossing`], but `C`'s parent QC over
+    /// `B` carries a **forged** aggregate signature — signer bits set, but
+    /// a zero BLS aggregate that no committee actually produced. The
+    /// crossing detector still records it (linkage and timestamps are
+    /// well-formed), so a proposer reports it, but the beacon's `2f+1`
+    /// admission check rejects every peer's proposal carrying it. Models a
+    /// Byzantine committee member fabricating a boundary QC.
+    pub fn deliver_forged_boundary_crossing(
+        &mut self,
+        shard: ShardId,
+        b_height: u64,
+        pred_wt: u64,
+        b_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> BlockHash {
+        let b = make_linked_source_header(
+            shard,
+            b_height,
+            BlockHash::ZERO,
+            pred_wt,
+            state_root,
+            leaf_count,
+        );
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let forged_qc = QuorumCertificate::new(
+            b.block_hash(),
+            shard,
+            BlockHeight::new(b_height),
+            b.header().parent_block_hash(),
+            Round::INITIAL,
+            signers,
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(b_wt),
+        );
+        self.deliver_crossing_pair(shard, &b, b_height, forged_qc, leaf_count)
+    }
+
+    /// Seat boundary block `B` and its child `C` (carrying `canonical_qc`
+    /// as its parent QC) into every replica's shard-source tracker.
+    fn deliver_crossing_pair(
+        &mut self,
+        shard: ShardId,
+        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b_height: u64,
+        canonical_qc: QuorumCertificate,
+        leaf_count: u64,
+    ) -> BlockHash {
+        let b_hash = b.block_hash();
+        let c = make_source_header_with_parent_qc(
+            shard,
+            b_height + 1,
+            canonical_qc,
+            StateRoot::ZERO,
+            leaf_count,
+        );
+        for idx in 0..self.coordinators.len() {
+            let a_b = self.coordinators[idx].on_verified_remote_header(b);
+            self.absorb(idx, a_b);
+            let a_c = self.coordinators[idx].on_verified_remote_header(&c);
+            self.absorb(idx, a_c);
+        }
+        b_hash
+    }
+
+    /// Build a genuine canonical QC over boundary block `b` — a real
+    /// `2f+1` BLS aggregate of `shard`'s committee, the form the beacon's
+    /// boundary-QC admission verification authenticates. The committee is
+    /// resolved at `b`'s parent-QC weighted timestamp (the window `b` was
+    /// produced in), matching how the beacon resolves it. Every member
+    /// votes at timestamp `b_wt`, so the aggregate weighted timestamp lands
+    /// at `b_wt` — `b`'s own canonical timestamp.
+    fn genuine_boundary_qc(
+        &self,
+        shard: ShardId,
+        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b_wt: u64,
+    ) -> QuorumCertificate {
+        let header = b.header();
+        let b_hash = b.block_hash();
+        let height = header.height();
+        let parent_block_hash = header.parent_block_hash();
+        let pred_wt = header.parent_qc().weighted_timestamp();
+        let snapshot = self.coordinators[0]
+            .topology_schedule()
+            .at(pred_wt)
+            .expect("committee resolvable at the boundary block's parent wt")
+            .clone();
+        let votes: Vec<(usize, Verified<BlockVote>)> = snapshot
+            .committee_for_shard(shard)
+            .iter()
+            .enumerate()
+            .map(|(idx, validator)| {
+                let sk = &self.sks[self.idx_of(*validator)];
+                let vote = BlockVote::new(
+                    &self.network,
+                    b_hash,
+                    parent_block_hash,
+                    shard,
+                    height,
+                    Round::INITIAL,
+                    *validator,
+                    sk,
+                    ProposerTimestamp::from_millis(b_wt),
+                );
+                (idx, Verified::<BlockVote>::new_unchecked_for_test(vote))
+            })
+            .collect();
+        Verified::<QuorumCertificate>::from_verified_votes(
+            b_hash,
+            shard,
+            height,
+            Round::INITIAL,
+            parent_block_hash,
+            pred_wt,
+            &votes,
+        )
+        .expect("aggregate boundary QC over a non-empty committee")
+        .into_inner()
     }
 
     /// Hand `block` directly to `replica_idx` via
@@ -1234,6 +1393,85 @@ fn make_source_header(
     Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
         header, qc,
     )))
+}
+
+/// Build a verified source-shard `CertifiedBlockHeader` over an explicit
+/// `parent_qc`. The header's `parent_block_hash` is taken from the QC, so
+/// `parent_qc` doubles as the chain link and the timestamp anchor. Used
+/// to seat a child whose `parent_qc` is a genuine canonical QC over its
+/// predecessor — the form the beacon's crossing detector and boundary-QC
+/// verification read.
+fn make_source_header_with_parent_qc(
+    shard: ShardId,
+    height: u64,
+    parent_qc: QuorumCertificate,
+    state_root: StateRoot,
+    leaf_count: u64,
+) -> Arc<Verified<CertifiedBlockHeader>> {
+    let parent_hash = parent_qc.block_hash();
+    let parent_wt = parent_qc.weighted_timestamp();
+    let header = BlockHeader::new(
+        shard,
+        BlockHeight::new(height),
+        parent_hash,
+        parent_qc,
+        ValidatorId::new(0),
+        ProposerTimestamp::ZERO,
+        Round::INITIAL,
+        false,
+        state_root,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        BTreeMap::new(),
+        InFlightCount::ZERO,
+        BeaconWitnessRoot::from_raw(Hash::from_bytes(
+            format!("bw-{shard:?}-{height}").as_bytes(),
+        )),
+        BeaconWitnessLeafCount::new(leaf_count),
+    );
+    let block_hash = header.hash();
+    let qc = QuorumCertificate::new(
+        block_hash,
+        shard,
+        BlockHeight::new(height),
+        parent_hash,
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        zero_bls_signature(),
+        parent_wt,
+    );
+    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+        header, qc,
+    )))
+}
+
+/// Build a verified source-shard `CertifiedBlockHeader` whose `parent_qc`
+/// names `parent_hash` and carries `parent_wt`, the parent's canonical
+/// weighted timestamp — a placeholder parent QC (not BLS-genuine) used for
+/// the boundary block `B`, whose own QC the beacon doesn't verify (only
+/// the canonical QC over `B`, supplied as its child's `parent_qc`, is).
+fn make_linked_source_header(
+    shard: ShardId,
+    height: u64,
+    parent_hash: BlockHash,
+    parent_wt: u64,
+    state_root: StateRoot,
+    leaf_count: u64,
+) -> Arc<Verified<CertifiedBlockHeader>> {
+    let parent_qc = QuorumCertificate::new(
+        parent_hash,
+        shard,
+        BlockHeight::new(height.saturating_sub(1)),
+        BlockHash::ZERO,
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        zero_bls_signature(),
+        WeightedTimestamp::from_millis(parent_wt),
+    );
+    make_source_header_with_parent_qc(shard, height, parent_qc, state_root, leaf_count)
 }
 
 /// Build a `PcVector` guaranteed to differ from `v`. Used for round-1

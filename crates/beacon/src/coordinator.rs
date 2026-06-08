@@ -30,7 +30,7 @@ use hyperscale_types::{
     MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
-    PcVoteRound, QuorumCertificate, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
+    PcVoteRound, QcContext, QuorumCertificate, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
     ShardEpochContribution, ShardId, ShardWitness, SkipEpochCert, SkipRequest,
     SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
@@ -43,7 +43,9 @@ use crate::proposal_pool::BeaconProposalPool;
 use crate::shard_source::ShardSourceTracker;
 use crate::skip_tracker::SkipTracker;
 use crate::spc::{MAX_PENDING_EMPTY_VIEW_AHEAD, SpcEffect, SpcEvent, SpcInstance};
-use crate::state::{apply_epoch, apply_input_for, epoch_end_weighted_timestamp};
+use crate::state::{
+    apply_epoch, apply_input_for, epoch_boundary_below, epoch_end_weighted_timestamp,
+};
 use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
 
 /// Depth of the coordinator's queryable committee-history window.
@@ -954,6 +956,14 @@ impl BeaconCoordinator {
                 );
                 return Vec::new();
             };
+            if !self.boundary_qcs_admissible(&upgraded) {
+                trace!(
+                    ?from,
+                    epoch = epoch.inner(),
+                    "BeaconProposalReceived carries an unverifiable boundary QC — dropping",
+                );
+                return Vec::new();
+            }
             Arc::new(upgraded)
         };
         if !self.proposal_pool.admit(from, epoch, proposal) {
@@ -1016,6 +1026,101 @@ impl BeaconCoordinator {
             .clone()
             .with_verified_witnesses(shard_witnesses.into(), equivocations.into())
             .ok()
+    }
+
+    /// Whether every boundary QC a peer proposes is admissible. A `Some`
+    /// entry must name a boundary block this node has synced, that block's
+    /// canonical QC must be a genuine `2f+1` of the governing shard
+    /// committee, and the block must be a real epoch-boundary crossing.
+    /// Unverifiable entries make the whole proposal inadmissible — this
+    /// vnode abstains, exactly as it does for an unverifiable witness, and
+    /// the one-honest-reporter rule covers a crossing this node hasn't yet
+    /// seen. Gating the vote keeps forged QCs out of the committed set: a
+    /// committed boundary QC carries `≥ f+1` honest verifiers, so the fold
+    /// trusts what commits.
+    fn boundary_qcs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
+        proposal.boundary_qcs().iter().all(|(shard, opt)| {
+            opt.as_ref()
+                .is_none_or(|qc| self.boundary_qc_admissible(*shard, qc.as_unverified()))
+        })
+    }
+
+    /// Whether a single peer-proposed boundary QC clears admission: the
+    /// local node holds the boundary block, the QC authenticates as a
+    /// genuine `2f+1` of the governing shard committee, and the block is a
+    /// real epoch-boundary crossing.
+    fn boundary_qc_admissible(&self, shard: ShardId, qc: &QuorumCertificate) -> bool {
+        let Some(header) = self.boundary_header_for(shard, qc.block_hash()) else {
+            return false;
+        };
+        self.boundary_qc_authentic(shard, header, qc) && self.is_boundary_crossing(header, qc)
+    }
+
+    /// Whether `boundary_header` is the first block across the epoch cut
+    /// `qc` attests: its predecessor sits at or before the largest epoch
+    /// boundary below the block's own weighted timestamp (`qc.wt`). Pure
+    /// over the chain's epoch duration — the fold applies the same test.
+    fn is_boundary_crossing(&self, boundary_header: &BlockHeader, qc: &QuorumCertificate) -> bool {
+        let dur = self.state.chain_config.epoch_duration_ms;
+        let Some(cut) = epoch_boundary_below(qc.weighted_timestamp().as_millis(), dur) else {
+            return false;
+        };
+        boundary_header.parent_qc().weighted_timestamp().as_millis() <= cut
+    }
+
+    /// The locally-held header for `block_hash` in `shard`: a retained
+    /// epoch-boundary crossing first (kept past header pruning), then the
+    /// sliding header window. `None` when the node hasn't synced the block.
+    fn boundary_header_for(&self, shard: ShardId, block_hash: BlockHash) -> Option<&BlockHeader> {
+        if let Some(crossing) = self.shard_source.crossing_by_block_hash(shard, block_hash) {
+            return Some(crossing.boundary_header());
+        }
+        self.shard_source
+            .find_header_by_block_hash(shard, block_hash)
+            .map(|h| h.header())
+    }
+
+    /// Whether `qc` is a genuine `2f+1` quorum of the committee that
+    /// governed `boundary_header`, and commits exactly that block.
+    ///
+    /// The committee is resolved at the boundary block's parent-QC
+    /// weighted timestamp — the window the block was produced in — through
+    /// the [`TopologySchedule`], which retains historical committees the
+    /// live `BeaconState` no longer holds (a tracked crossing can lag the
+    /// tip by up to a few epochs). `None` resolution (the epoch fell out
+    /// of the retention window) fails closed.
+    fn boundary_qc_authentic(
+        &self,
+        shard: ShardId,
+        boundary_header: &BlockHeader,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        if qc.block_hash() != boundary_header.hash() {
+            return false;
+        }
+        let Some(snapshot) = self
+            .topology
+            .at(boundary_header.parent_qc().weighted_timestamp())
+        else {
+            return false;
+        };
+        let committee = snapshot.committee_for_shard(shard);
+        if committee.is_empty() {
+            return false;
+        }
+        let mut public_keys = Vec::with_capacity(committee.len());
+        for id in committee {
+            let Some(pk) = snapshot.public_key(*id) else {
+                return false;
+            };
+            public_keys.push(pk);
+        }
+        qc.verify(&QcContext {
+            network: &self.network,
+            public_keys: &public_keys,
+            quorum_threshold: snapshot.quorum_threshold_for_shard(shard),
+        })
+        .is_ok()
     }
 
     /// Whether the current SPC instance is ready to receive its
@@ -1546,6 +1651,20 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
+        // The SPC cert authenticates `committed_proposals`, not the
+        // `shard_contributions` projected from them. Re-derive the
+        // canonical projection and require the block to match it, so a
+        // Byzantine assembler's variant (fabricated, stale, extra, or
+        // omitted contribution) can't fork the boundary fold off the
+        // committed inputs.
+        if !self.contributions_well_formed(block.block()) {
+            warn!(
+                epoch = block.epoch().inner(),
+                "Verified BeaconBlock has malformed shard contributions — dropping",
+            );
+            self.verification.forget_block(block_hash);
+            return Vec::new();
+        }
         self.verification.forget_block(block_hash);
         self.adopt_block(block)
     }
@@ -1937,7 +2056,14 @@ impl BeaconCoordinator {
         committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
         cert: Verified<SpcCert>,
     ) -> Vec<Action> {
-        let shard_contributions = self.build_shard_contributions(&committed);
+        let Some(shard_contributions) = self.build_shard_contributions(&committed) else {
+            trace!(
+                epoch = epoch.inner(),
+                "Deferring beacon assembly — a committed boundary's source header isn't synced \
+                 locally; awaiting a fully-synced peer's gossiped block",
+            );
+            return Vec::new();
+        };
         let prev_block_hash = self.latest_block.block_hash();
         let certified = Verified::<CertifiedBeaconBlock>::assemble(
             epoch,
@@ -1954,44 +2080,55 @@ impl BeaconCoordinator {
         actions
     }
 
-    /// Assemble this epoch's per-shard boundary contributions from the
-    /// committed proposals' boundary QCs and the locally observed
-    /// crossings.
+    /// Assemble this epoch's per-shard boundary contributions — the
+    /// canonical projection of the committed proposals' boundary QCs.
     ///
-    /// Per shard, the contribution seats the **latest** committed boundary
-    /// QC — the highest weighted timestamp among the QCs that name a
-    /// crossing this node has recorded. The crossing's header was verified
-    /// by the remote-header pipeline when it synced, so naming one is the
-    /// authentication; a QC over a block this node never observed crossing
-    /// is skipped. The header comes from the crossing tracker, retained
-    /// past header pruning.
+    /// Per shard, [`canonical_boundary_qcs`] selects the highest-weighted
+    /// committed QC, and this seats the header for the block it names,
+    /// pulled from the local crossing tracker or header window. Every
+    /// committed boundary QC is a genuine `2f+1` crossing (enforced at
+    /// proposal admission), so the projection is a pure function of the
+    /// cert-bound committed proposals — every honest assembler that can
+    /// back it builds the byte-identical map.
+    ///
+    /// Returns `None` to **defer** when a committed boundary's source
+    /// header isn't held locally: a block that omitted that shard would
+    /// diverge from a fully-synced peer's, so the local node waits for the
+    /// peer's gossiped block rather than assemble an incomplete one.
     fn build_shard_contributions(
         &self,
         committed: &[(ValidatorId, Verified<BeaconProposal>)],
-    ) -> BTreeMap<ShardId, ShardEpochContribution> {
-        let mut best: BTreeMap<ShardId, (u64, BlockHeader)> = BTreeMap::new();
-        for (_, proposal) in committed {
-            for (shard, opt_qc) in proposal.boundary_qcs().iter() {
-                let Some(qc) = opt_qc.as_ref().map(Verifiable::as_unverified) else {
-                    continue;
-                };
-                let Some(crossing) = self
-                    .shard_source
-                    .crossing_by_block_hash(*shard, qc.block_hash())
-                else {
-                    continue;
-                };
-                let wt = qc.weighted_timestamp().as_millis();
-                if best.get(shard).is_none_or(|(cur, _)| wt > *cur) {
-                    best.insert(*shard, (wt, crossing.boundary_header().clone()));
-                }
-            }
+    ) -> Option<BTreeMap<ShardId, ShardEpochContribution>> {
+        let canonical = canonical_boundary_qcs(committed.iter().map(|(_, p)| &**p));
+        let mut contributions = BTreeMap::new();
+        for (shard, qc) in canonical {
+            let boundary_header = self.boundary_header_for(shard, qc.block_hash())?.clone();
+            contributions.insert(shard, ShardEpochContribution { boundary_header });
         }
-        best.into_iter()
-            .map(|(shard, (_, boundary_header))| {
-                (shard, ShardEpochContribution { boundary_header })
+        Some(contributions)
+    }
+
+    /// Whether `block`'s shard contributions are the faithful canonical
+    /// projection of its cert-bound committed boundary QCs: exactly one
+    /// contribution per shard that has a committed QC, each binding by hash
+    /// to that shard's highest-weighted committed QC and forming a genuine
+    /// epoch-boundary crossing. Deterministic — a pure function of the
+    /// committed proposals and contributions, with no topology lookup — so
+    /// every honest node reaches the same verdict on the same block and a
+    /// Byzantine assembler's variant (a fabricated, stale, extra, or
+    /// omitted contribution) is rejected identically everywhere.
+    fn contributions_well_formed(&self, block: &BeaconBlock) -> bool {
+        let canonical = canonical_boundary_qcs(block.committed_proposals().iter().map(|(_, p)| p));
+        let contributions = block.shard_contributions();
+        if contributions.len() != canonical.len() {
+            return false;
+        }
+        canonical.into_iter().all(|(shard, qc)| {
+            contributions.get(&shard).is_some_and(|contribution| {
+                let header = &contribution.boundary_header;
+                header.hash() == qc.block_hash() && self.is_boundary_crossing(header, qc)
             })
-            .collect()
+        })
     }
 
     /// Read the committed `BeaconProposal` list from the proposal
@@ -2327,6 +2464,39 @@ impl BeaconCoordinator {
     }
 }
 
+/// Per-shard canonical boundary QC across a committed proposal set: the
+/// entry with the highest `(weighted_timestamp, block_hash)`, breaking
+/// ties on the hash so the choice is total and identical on every node.
+///
+/// Pure over the cert-bound committed proposals — the shared selection the
+/// assembler projects into `shard_contributions` and the receiver
+/// re-derives to validate one. Every committed boundary QC is a genuine
+/// crossing (enforced at proposal admission), so the highest-timestamp
+/// pick can't be inflated by a forged entry.
+fn canonical_boundary_qcs<'a>(
+    proposals: impl Iterator<Item = &'a BeaconProposal>,
+) -> BTreeMap<ShardId, &'a QuorumCertificate> {
+    let mut canonical: BTreeMap<ShardId, &QuorumCertificate> = BTreeMap::new();
+    for proposal in proposals {
+        for (shard, opt) in proposal.boundary_qcs().iter() {
+            let Some(qc) = opt.as_ref().map(Verifiable::as_unverified) else {
+                continue;
+            };
+            canonical
+                .entry(*shard)
+                .and_modify(|cur| {
+                    if (qc.weighted_timestamp().as_millis(), qc.block_hash())
+                        > (cur.weighted_timestamp().as_millis(), cur.block_hash())
+                    {
+                        *cur = qc;
+                    }
+                })
+                .or_insert(qc);
+        }
+    }
+    canonical
+}
+
 impl std::fmt::Debug for BeaconCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BeaconCoordinator")
@@ -2350,12 +2520,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, Bls12381G1PrivateKey,
-        Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
-        GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, Randomness, ShardCommittee,
-        ShardId, ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId,
+        BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+        CertificateRoot, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
+        GenesisValidator, Hash, InFlightCount, LocalReceiptRoot, MIN_STAKE_FLOOR,
+        NetworkDefinition, PcVector, ProposerTimestamp, ProvisionsRoot, Randomness, Round,
+        ShardCommittee, ShardEpochContribution, ShardId, ShardWitness, SignerBitfield, SpcCert,
+        SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof,
         WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2, build_qc3,
         genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -2427,6 +2601,166 @@ mod tests {
 
     fn fresh_coord() -> BeaconCoordinator {
         new_coord(ValidatorId::new(0))
+    }
+
+    // ─── boundary-QC contribution hardening ─────────────────────────────
+
+    /// A verified source-shard header whose parent QC carries `pred_wt`,
+    /// carrying `state_root` and `leaf_count`. Only the fields the boundary
+    /// projection and verification read carry meaning; the rest are zeroed.
+    fn boundary_block_header(
+        shard: ShardId,
+        height: u64,
+        pred_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
+        let parent_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            shard,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(pred_wt),
+        );
+        let header = BlockHeader::new(
+            shard,
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            state_root,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("bw-{height}").as_bytes())),
+            BeaconWitnessLeafCount::new(leaf_count),
+        );
+        let block_hash = header.hash();
+        let qc = QuorumCertificate::new(
+            block_hash,
+            shard,
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(pred_wt),
+        );
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header, qc,
+        )))
+    }
+
+    /// A structural QC naming `block_hash` at weighted timestamp `wt`.
+    /// `build_shard_contributions` and `contributions_well_formed` project
+    /// and bind cert-bound QCs without re-running BLS (the `2f+1` is the
+    /// admission gate's job), so a structural QC suffices for them.
+    fn qc_naming(block_hash: BlockHash, shard: ShardId, height: u64, wt: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            block_hash,
+            shard,
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(wt),
+        )
+    }
+
+    fn proposal_with_boundary(shard: ShardId, qc: QuorumCertificate) -> BeaconProposal {
+        BeaconProposal::new(
+            Vec::new(),
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        )
+    }
+
+    /// The assembler defers (returns `None`, awaiting a synced peer's
+    /// block) when it can't back a committed boundary QC's block locally,
+    /// and seats the canonical projection once that block syncs.
+    #[test]
+    fn build_shard_contributions_defers_until_boundary_synced() {
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"unit-anchor"));
+        let b = boundary_block_header(shard, 5, 299_000, anchor, 3);
+        let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
+        let committed = vec![(
+            ValidatorId::new(0),
+            Verified::new_unchecked_for_test(proposal_with_boundary(shard, qc)),
+        )];
+
+        // The boundary block isn't synced — defer rather than omit it.
+        assert!(coord.build_shard_contributions(&committed).is_none());
+
+        // Once synced, the contribution seats.
+        coord.on_verified_remote_header(&b);
+        let built = coord
+            .build_shard_contributions(&committed)
+            .expect("contribution seats once the boundary block syncs");
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[&shard].boundary_header.hash(), b.block_hash());
+    }
+
+    /// `contributions_well_formed` accepts the canonical projection of the
+    /// committed boundary QCs and rejects an incomplete, extra, or unbound
+    /// contribution set — the Byzantine-variant gate on received blocks.
+    #[test]
+    fn contributions_well_formed_enforces_canonical_projection() {
+        let coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let other = ShardId::leaf(1, 1);
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"wf-anchor"));
+        let b = boundary_block_header(shard, 5, 299_000, anchor, 3);
+        let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
+        let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
+        let contribution = ShardEpochContribution {
+            boundary_header: b.header().clone(),
+        };
+        let block_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
+            BeaconBlock::new_with_contributions(
+                Epoch::new(1),
+                BeaconBlockHash::ZERO,
+                committed.clone(),
+                contribs,
+            )
+        };
+
+        // Canonical projection — accepted.
+        let good = block_with(std::iter::once((shard, contribution.clone())).collect());
+        assert!(coord.contributions_well_formed(&good));
+
+        // Omits the committed shard's contribution — rejected.
+        assert!(!coord.contributions_well_formed(&block_with(BTreeMap::new())));
+
+        // Extra contribution for a shard with no committed QC — rejected.
+        let mut extra: BTreeMap<ShardId, ShardEpochContribution> = BTreeMap::new();
+        extra.insert(shard, contribution.clone());
+        extra.insert(other, contribution);
+        assert!(!coord.contributions_well_formed(&block_with(extra)));
+
+        // A contribution binding to no committed QC — rejected.
+        let wrong = boundary_block_header(shard, 9, 299_000, StateRoot::ZERO, 3);
+        let tampered = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: wrong.header().clone(),
+            },
+        ))
+        .collect();
+        assert!(!coord.contributions_well_formed(&block_with(tampered)));
     }
 
     /// Drive any beacon-verify actions in `actions` through to their

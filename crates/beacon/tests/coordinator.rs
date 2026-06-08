@@ -13,9 +13,10 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconCert, BlockHash, BoundedVec, Epoch, LeafIndex, PcValueElement, PcVector,
-    PcVoteEquivocation, PcVoteRound, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-    SpcView, ValidatorId, ValidatorStatus, zero_bls_signature,
+    BeaconCert, BeaconWitnessLeafCount, BlockHash, BoundedVec, Epoch, Hash, LeafIndex,
+    PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, ShardId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SpcView, StateRoot, ValidatorId, ValidatorStatus,
+    zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -112,6 +113,131 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
             sim.coordinators[r].verifications_in_flight(),
             0,
             "replica {r} leaked verify slots",
+        );
+    }
+}
+
+#[test]
+fn observed_crossing_records_shard_boundary_through_full_commit() {
+    // Drives the whole boundary chain end to end: a shard's observed
+    // epoch-boundary crossing → every proposer's `boundary_qcs` → the
+    // committed `committed_proposals` → the assembler's `shard_contributions`
+    // → the fold's `record_boundaries`. The genesis seed leaves
+    // `boundaries[ROOT]` at the `StateRoot::ZERO` placeholder; a real
+    // crossing must advance it past that with no recorded miss.
+    let mut sim = CoordinatorSim::new(4, 0xB0_4D);
+
+    // ROOT is the single genesis shard. With the default 300_000 ms epoch,
+    // a block whose predecessor sits at 299_000 ms and whose own canonical
+    // timestamp is 301_000 ms is the first block across the epoch-1 cut.
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    let boundary_hash =
+        sim.deliver_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
+
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let commit = &sim.commits[0][0];
+    assert!(
+        matches!(commit.block.cert(), BeaconCert::Normal(_)),
+        "honest-path commit unexpectedly carries a non-Normal cert",
+    );
+    assert!(
+        !commit.block.block().committed_proposals().is_empty(),
+        "committed block carries no proposals — boundary QCs never reach the fold",
+    );
+    assert!(
+        commit
+            .block
+            .block()
+            .shard_contributions()
+            .contains_key(&ShardId::ROOT),
+        "committed block has no ROOT contribution — assembler dropped the boundary",
+    );
+
+    let boundary = commit
+        .state
+        .boundaries
+        .get(&ShardId::ROOT)
+        .expect("ROOT keeps a boundary record");
+    assert_eq!(
+        boundary.state_root, anchor,
+        "boundary anchor not advanced to the crossing block's state root",
+    );
+    assert_ne!(
+        boundary.state_root,
+        StateRoot::ZERO,
+        "boundary still sitting at the genesis placeholder",
+    );
+    assert_eq!(boundary.block_hash, boundary_hash);
+    assert_eq!(boundary.witness_leaf_count, BeaconWitnessLeafCount::new(3));
+    assert_eq!(boundary.last_live_epoch, Epoch::new(1));
+    assert_eq!(
+        boundary.consecutive_misses, 0,
+        "a live crossing must not register as a miss",
+    );
+
+    // Every replica folds to the same boundary record.
+    for r in 1..sim.n() {
+        let other = sim.commits[r][0]
+            .state
+            .boundaries
+            .get(&ShardId::ROOT)
+            .expect("replica keeps a ROOT boundary");
+        assert_eq!(
+            *other, *boundary,
+            "replica {r} diverged on the recorded ROOT boundary",
+        );
+    }
+}
+
+#[test]
+fn forged_boundary_qc_records_no_shard_boundary() {
+    // A Byzantine committee member's fabricated boundary QC (signer bits
+    // set, signature bogus) must never advance the anchor. Without the
+    // admission gate it would: the crossing detector records it, the
+    // assembler can back it, and the fold's hash binding accepts it — so a
+    // forged QC would write `state_root = anchor`. The 2f+1 admission check
+    // makes every honest verifier drop the proposal carrying it, so it
+    // can't reach the committed set, and the shard reads as a miss.
+    let mut sim = CoordinatorSim::new(4, 0xF0_4D);
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"forged-anchor"));
+    sim.deliver_forged_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let commit = &sim.commits[0][0];
+    let boundary = commit
+        .state
+        .boundaries
+        .get(&ShardId::ROOT)
+        .expect("ROOT boundary stays seeded");
+    assert_eq!(
+        boundary.state_root,
+        StateRoot::ZERO,
+        "a forged boundary QC must not advance the anchor",
+    );
+    assert!(
+        boundary.consecutive_misses >= 1,
+        "a shard with no admissible crossing reads as a miss",
+    );
+    assert!(
+        !commit
+            .block
+            .block()
+            .shard_contributions()
+            .contains_key(&ShardId::ROOT),
+        "no contribution should seat for a rejected boundary QC",
+    );
+    for r in 1..sim.n() {
+        let other = sim.commits[r][0]
+            .state
+            .boundaries
+            .get(&ShardId::ROOT)
+            .expect("replica keeps a ROOT boundary");
+        assert_eq!(
+            *other, *boundary,
+            "replica {r} diverged on the forged-QC boundary",
         );
     }
 }

@@ -29,8 +29,8 @@ mod vrf;
 mod withdrawals;
 mod witness;
 
-pub(crate) use epoch::epoch_end_weighted_timestamp;
 pub use epoch::{ApplyEpochInput, apply_epoch, apply_input_for};
+pub(crate) use epoch::{epoch_boundary_below, epoch_end_weighted_timestamp};
 pub use pool::pool_draw;
 
 #[cfg(test)]

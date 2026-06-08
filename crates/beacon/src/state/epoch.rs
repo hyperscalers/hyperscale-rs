@@ -184,7 +184,7 @@ pub const fn epoch_end_weighted_timestamp(
 /// (`k × epoch_duration_ms` for the greatest `k ≥ 1`), or `None` when no
 /// boundary lies below it. The boundary block's predecessor must sit
 /// at/before this for the block to be the first across the boundary.
-const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
+pub const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
     if epoch_duration_ms == 0 || wt == 0 {
         return None;
     }
