@@ -187,4 +187,64 @@ mod tests {
         assert_eq!(trie.len(), 3);
         assert_identity(&trie, 10);
     }
+
+    /// Degenerate / one-sided split coverage that `assert_identity` skips (it
+    /// populates both children of every split). The split identity
+    /// `r_p == hash_internal(r_p0, r_p1)`:
+    ///
+    /// - **holds** when `p`'s prefix-rooted root is an *internal* node (≥2 keys),
+    ///   even if every key is on one side of the split bit — the empty child
+    ///   contributes `EMPTY` and the root still materializes at `p`'s depth;
+    /// - **fails (fail-closed)** when `p` collapses to a single leaf (≤1 key):
+    ///   JMT path compression bubbles the leaf past the prefix depth, so `r_p`
+    ///   *is* the leaf (`== r_p0`) and `hash_internal(r_p0, EMPTY) != r_p`.
+    ///
+    /// This pins the precondition the resharding split-trigger enforces (reject a
+    /// <2-key split). If a JMT change ever made a one-sided ≥2-key root collapse,
+    /// this catches it.
+    #[test]
+    fn split_identity_holds_one_sided_internal_but_not_collapsed_leaf() {
+        let p = ShardId::leaf(1, 0);
+        let (p0, _p1) = p.children();
+        let empty = *StateRoot::ZERO.as_bytes();
+
+        // All keys under p0 → one-sided at p's split bit; p1 is empty.
+        let root_over = |root_path: &NibblePath, n: u64| -> [u8; 32] {
+            let mut updates: BTreeMap<[u8; 32], Option<[u8; 32]>> = BTreeMap::new();
+            for i in 0..n {
+                let key = key_in_shard(p0, i);
+                updates.insert(key, Some(*blake3_hash(&key).as_bytes()));
+            }
+            jmt_root_at(root_path, &updates)
+        };
+
+        // ≥2 one-sided keys: the root materializes at p as a one-child internal
+        // node, so r_p == hash_internal(r_p0, EMPTY) and r_p != r_p0.
+        let r_p = root_over(&shard_prefix_path(p), 2);
+        let r_p0 = root_over(&shard_prefix_path(p0), 2);
+        assert_ne!(
+            r_p, r_p0,
+            "one-sided ≥2-key root must materialize at the prefix, not collapse"
+        );
+        assert_eq!(
+            Blake3Hasher::hash_internal(&[r_p0, empty]),
+            r_p,
+            "one-sided identity must hold for an internal root"
+        );
+
+        // 1 key: p collapses to the bare leaf (== the child root), so the naive
+        // identity fails-closed — exactly what the split-trigger's <2-key guard
+        // prevents.
+        let collapsed = root_over(&shard_prefix_path(p), 1);
+        let solo_child = root_over(&shard_prefix_path(p0), 1);
+        assert_eq!(
+            collapsed, solo_child,
+            "single-key shard collapses the prefix root to the leaf"
+        );
+        assert_ne!(
+            Blake3Hasher::hash_internal(&[solo_child, empty]),
+            collapsed,
+            "single-key shard must fail the naive identity (precondition: ≥2 keys)"
+        );
+    }
 }
