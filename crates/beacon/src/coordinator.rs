@@ -24,9 +24,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
-    BeaconState, BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION, Epoch,
-    GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    BeaconState, BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, BoundedVec,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION,
+    Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
     MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
@@ -2103,7 +2103,13 @@ impl BeaconCoordinator {
         let mut contributions = BTreeMap::new();
         for (shard, qc) in canonical {
             let boundary_header = self.boundary_header_for(shard, qc.block_hash())?.clone();
-            contributions.insert(shard, ShardEpochContribution { boundary_header });
+            contributions.insert(
+                shard,
+                ShardEpochContribution {
+                    boundary_header,
+                    witnesses: BoundedVec::new(),
+                },
+            );
         }
         Some(contributions)
     }
@@ -2728,6 +2734,7 @@ mod tests {
         let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
         let contribution = ShardEpochContribution {
             boundary_header: b.header().clone(),
+            witnesses: BoundedVec::new(),
         };
         let block_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
             BeaconBlock::new_with_contributions(
@@ -2757,6 +2764,7 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: wrong.header().clone(),
+                witnesses: BoundedVec::new(),
             },
         ))
         .collect();

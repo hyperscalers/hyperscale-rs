@@ -280,7 +280,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        BlockHeight, CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot,
+        BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardBoundary, ShardId,
         SignerBitfield, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
         WeightedTimestamp, zero_bls_signature,
@@ -366,8 +366,14 @@ mod tests {
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
-        let contributions: BTreeMap<ShardId, ShardEpochContribution> =
-            std::iter::once((shard, ShardEpochContribution { boundary_header: b })).collect();
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: BoundedVec::new(),
+            },
+        ))
+        .collect();
 
         record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
 
@@ -405,8 +411,14 @@ mod tests {
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
-        let contributions: BTreeMap<ShardId, ShardEpochContribution> =
-            std::iter::once((shard, ShardEpochContribution { boundary_header: b })).collect();
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: BoundedVec::new(),
+            },
+        ))
+        .collect();
 
         record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
 

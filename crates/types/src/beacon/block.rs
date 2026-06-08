@@ -14,21 +14,30 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconBlockHash, BeaconProposal, BlockHeader, BoundedBTreeMap, BoundedVec, Epoch, Hash,
-    MAX_BEACON_COMMITTEE, MAX_SHARDS, ShardId, ValidatorId,
+    MAX_BEACON_COMMITTEE, MAX_SHARDS, MAX_WITNESSES_PER_SHARD, ShardId, ShardWitness, ValidatorId,
 };
 
 /// One shard's contribution to an epoch's beacon block: its canonical
-/// boundary block header.
+/// boundary block header and the witnesses the boundary block added.
 ///
 /// The header is a verifiable projection — bound to a committed
 /// proposal's canonical boundary QC by `hash(boundary_header) ==
 /// qc.block_hash` — not a second source of truth. Carries the boundary's
 /// `state_root` and witness `leaf_count`, which the cert-bound QC
 /// authenticates but does not itself contain.
+///
+/// `witnesses` are the governance leaves the boundary block appended to
+/// its beacon-witness accumulator — the contiguous range
+/// `[boundaries[shard].witness_leaf_count, boundary_header.beacon_witness_leaf_count)`
+/// in leaf-index order, proven against `boundary_header.beacon_witness_root`.
+/// Like the header, they carry no standalone verification marker: the fold
+/// re-checks merkle inclusion + count every time.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ShardEpochContribution {
     /// The shard's canonical boundary block header for this epoch.
     pub boundary_header: BlockHeader,
+    /// The witnesses the boundary block appended, in leaf-index order.
+    pub witnesses: BoundedVec<ShardWitness, MAX_WITNESSES_PER_SHARD>,
 }
 
 /// One epoch's committed-proposal record.
