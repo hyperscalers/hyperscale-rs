@@ -15,8 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconGenesisConfig, BeaconState, Epoch, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE,
-    MIN_STAKE_FLOOR, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
+    BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash, Epoch,
+    MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
+    ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StateRoot, ValidatorId,
     ValidatorRecord, ValidatorStatus,
 };
 
@@ -112,6 +113,26 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     let mut committee = config.initial_beacon_committee.clone();
     committee.sort();
 
+    // Seed a boundary record for every genesis shard so `boundaries` is
+    // never empty for an active shard. The `state_root` is a placeholder
+    // until the shard's first observed crossing refreshes it in the fold
+    // — genesis carries no per-shard root.
+    let boundaries: BTreeMap<ShardId, ShardBoundary> = next_shard_committees
+        .keys()
+        .map(|shard| {
+            (
+                *shard,
+                ShardBoundary {
+                    state_root: StateRoot::ZERO,
+                    block_hash: BlockHash::ZERO,
+                    witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    last_live_epoch: Epoch::GENESIS,
+                    consecutive_misses: 0,
+                },
+            )
+        })
+        .collect();
+
     BeaconState {
         chain_config: config.chain_config,
         current_epoch: Epoch::GENESIS,
@@ -126,6 +147,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         shard_committees: next_shard_committees.clone(),
         next_shard_committees,
         consumed_through: BTreeMap::new(),
+        boundaries,
         miss_counters: BTreeMap::new(),
     }
 }
@@ -255,6 +277,12 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
         beacon_committee_cap <= MAX_VOTE_VECTOR_LEN,
         "chain_config.beacon_committee_size ({beacon_committee_cap}) exceeds \
          MAX_VOTE_VECTOR_LEN ({MAX_VOTE_VECTOR_LEN}); SPC view-input vectors can't hold it",
+    );
+    assert!(
+        beacon_committee_cap <= MAX_BEACON_COMMITTEE,
+        "chain_config.beacon_committee_size ({beacon_committee_cap}) exceeds \
+         MAX_BEACON_COMMITTEE ({MAX_BEACON_COMMITTEE}); a block's committed_proposals \
+         wire cap can't hold it",
     );
     assert!(
         config.initial_beacon_committee.len() <= beacon_committee_cap,

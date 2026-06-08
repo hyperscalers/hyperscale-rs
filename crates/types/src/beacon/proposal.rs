@@ -11,9 +11,10 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, Epoch, MAX_EQUIVOCATIONS_PER_PROPOSER,
-    MAX_SHARD_WITNESSES_PER_PROPOSER, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-    PcVoteEquivocation, ShardWitness, Verifiable, Verified, Verify, VrfOutput, VrfProof,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedBTreeMap, BoundedVec, Epoch,
+    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_SHARDS,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVoteEquivocation,
+    QuorumCertificate, ShardId, ShardWitness, Verifiable, Verified, Verify, VrfOutput, VrfProof,
     vrf_output_from_proof, vrf_sign, vrf_verify,
 };
 
@@ -26,6 +27,13 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconProposal {
     shard_witnesses: BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER>,
+    /// This proposer's view of where each live shard's chain sits at the
+    /// epoch boundary: the **canonical** boundary QC per shard (the
+    /// `parent_qc` of the boundary block's committed child), or `None`
+    /// for a live shard whose crossing this proposer hasn't yet observed.
+    /// One honest reporter is enough to mark a shard live, so partial
+    /// coverage is fine.
+    boundary_qcs: BoundedBTreeMap<ShardId, Option<Verifiable<QuorumCertificate>>, MAX_SHARDS>,
     equivocations: BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER>,
     /// The VRF proof for this slot. The output is `vrf_output()`, a pure
     /// function of the proof — never stored, so it can't disagree.
@@ -50,6 +58,7 @@ impl BeaconProposal {
                 .map(Verifiable::from)
                 .collect::<Vec<_>>()
                 .into(),
+            boundary_qcs: BoundedBTreeMap::new(),
             equivocations: equivocations
                 .into_iter()
                 .map(Verifiable::from)
@@ -66,6 +75,7 @@ impl BeaconProposal {
     pub const fn vrf_only(vrf_proof: VrfProof) -> Self {
         Self {
             shard_witnesses: BoundedVec::new(),
+            boundary_qcs: BoundedBTreeMap::new(),
             equivocations: BoundedVec::new(),
             vrf_proof,
         }
@@ -79,6 +89,17 @@ impl BeaconProposal {
         &self,
     ) -> &BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER> {
         &self.shard_witnesses
+    }
+
+    /// Per-shard canonical boundary QCs this proposer observed (or `None`
+    /// for a live shard it hasn't seen cross). Each rides as
+    /// `Verifiable<QuorumCertificate>`: wire-decoded proposals land
+    /// `Unverified`; the fold verifies them against the shard committee.
+    #[must_use]
+    pub const fn boundary_qcs(
+        &self,
+    ) -> &BoundedBTreeMap<ShardId, Option<Verifiable<QuorumCertificate>>, MAX_SHARDS> {
+        &self.boundary_qcs
     }
 
     /// Equivocation evidence observed this slot. Same `Verifiable`
@@ -316,8 +337,8 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BeaconProposal has 3 fields.
-            enc.write_size(3).unwrap();
+            // BeaconProposal has 4 fields.
+            enc.write_size(4).unwrap();
             // Oversized shard-witnesses array (the first field).
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(ShardWitness::value_kind()).unwrap();

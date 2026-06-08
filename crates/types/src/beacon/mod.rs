@@ -45,7 +45,7 @@ pub mod spc;
 pub mod state;
 pub mod witness;
 
-pub use block::BeaconBlock;
+pub use block::{BeaconBlock, ShardEpochContribution};
 pub use cert::BeaconCert;
 pub use certified::{
     CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
@@ -61,9 +61,10 @@ pub use genesis::{
     BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
 };
 pub use limits::{
-    MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_PREFIX_SIGS,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SHARD_WITNESSES_PER_PROPOSER,
-    MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
+    MAX_BEACON_COMMITTEE, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS,
+    MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_SHARDS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH,
+    MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD,
 };
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
@@ -92,8 +93,8 @@ pub use spc::{
     verify_empty_view_msg, verify_proposal_object,
 };
 pub use state::{
-    BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,
-    StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+    BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardBoundary, ShardCommittee,
+    SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };
 pub use witness::{
     BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitness, ShardWitnessPayload,

@@ -12,24 +12,47 @@
 
 use sbor::prelude::*;
 
-use crate::primitives::signer_bitfield::MAX_SIGNERS;
-use crate::{BeaconBlockHash, BeaconProposal, BoundedVec, Epoch, Hash, ValidatorId};
+use crate::{
+    BeaconBlockHash, BeaconProposal, BlockHeader, BoundedBTreeMap, BoundedVec, Epoch, Hash,
+    MAX_BEACON_COMMITTEE, MAX_SHARDS, ShardId, ValidatorId,
+};
+
+/// One shard's contribution to an epoch's beacon block: its canonical
+/// boundary block header.
+///
+/// The header is a verifiable projection — bound to a committed
+/// proposal's canonical boundary QC by `hash(boundary_header) ==
+/// qc.block_hash` — not a second source of truth. Carries the boundary's
+/// `state_root` and witness `leaf_count`, which the cert-bound QC
+/// authenticates but does not itself contain.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct ShardEpochContribution {
+    /// The shard's canonical boundary block header for this epoch.
+    pub boundary_header: BlockHeader,
+}
 
 /// One epoch's committed-proposal record.
 ///
-/// `block_hash` is the canonical SBOR-hash of the three flat fields. The
+/// `block_hash` is the canonical SBOR-hash of the flat fields. The
 /// cert that authenticates this block sits on the wrapping
 /// [`CertifiedBeaconBlock`](crate::CertifiedBeaconBlock) — chain
 /// linkage via `prev_block_hash` references the block hash, never the
 /// wrapper.
 ///
-/// Skip and Genesis blocks have empty `committed_proposals`; the
-/// authenticating cert kind distinguishes them.
+/// `committed_proposals` are the cert-bound per-proposer inputs;
+/// `shard_contributions` is the per-shard reduction (one canonical
+/// boundary header per live shard), a verifiable projection re-checked
+/// against the committed canonical QCs every fold.
+///
+/// Skip and Genesis blocks have empty `committed_proposals` and
+/// `shard_contributions`; the authenticating cert kind distinguishes
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconBlock {
     epoch: Epoch,
     prev_block_hash: BeaconBlockHash,
-    committed_proposals: BoundedVec<(ValidatorId, BeaconProposal), MAX_SIGNERS>,
+    committed_proposals: BoundedVec<(ValidatorId, BeaconProposal), MAX_BEACON_COMMITTEE>,
+    shard_contributions: BoundedBTreeMap<ShardId, ShardEpochContribution, MAX_SHARDS>,
 }
 
 impl BeaconBlock {
@@ -37,7 +60,7 @@ impl BeaconBlock {
     ///
     /// # Panics
     ///
-    /// Panics if `committed_proposals.len() > MAX_SIGNERS`.
+    /// Panics if `committed_proposals.len() > MAX_BEACON_COMMITTEE`.
     #[must_use]
     pub fn new(
         epoch: Epoch,
@@ -48,6 +71,7 @@ impl BeaconBlock {
             epoch,
             prev_block_hash,
             committed_proposals: committed_proposals.into(),
+            shard_contributions: BoundedBTreeMap::new(),
         }
     }
 
@@ -60,6 +84,7 @@ impl BeaconBlock {
             epoch: Epoch::GENESIS,
             prev_block_hash: BeaconBlockHash::ZERO,
             committed_proposals: BoundedVec::new(),
+            shard_contributions: BoundedBTreeMap::new(),
         }
     }
 
@@ -72,6 +97,7 @@ impl BeaconBlock {
             epoch,
             prev_block_hash,
             committed_proposals: BoundedVec::new(),
+            shard_contributions: BoundedBTreeMap::new(),
         }
     }
 
@@ -93,6 +119,13 @@ impl BeaconBlock {
     #[must_use]
     pub fn committed_proposals(&self) -> &[(ValidatorId, BeaconProposal)] {
         &self.committed_proposals
+    }
+
+    /// Per-shard canonical boundary contributions for this epoch — one
+    /// header per live shard. Empty for Genesis and Skip blocks.
+    #[must_use]
+    pub fn shard_contributions(&self) -> &BTreeMap<ShardId, ShardEpochContribution> {
+        &self.shard_contributions
     }
 
     /// Canonical SBOR-hash of the block — the chain-linkage identity.

@@ -72,6 +72,7 @@ pub fn empty_state() -> BeaconState {
         shard_committees: BTreeMap::new(),
         next_shard_committees: BTreeMap::new(),
         consumed_through: BTreeMap::new(),
+        boundaries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     }
 }

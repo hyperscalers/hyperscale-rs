@@ -36,7 +36,8 @@ use crate::beacon::genesis::BeaconChainConfig;
 use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
+    BeaconWitnessLeafCount, BlockHash, Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardId,
+    Stake, StakePoolId, StateRoot, ValidatorId,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -189,6 +190,33 @@ pub struct ShardCommittee {
 
 // ─── beacon state ────────────────────────────────────────────────────────────
 
+/// Per-shard boundary record: where a shard's chain sat at the epoch
+/// boundary, plus its liveness history.
+///
+/// The `state_root` is the snap-sync anchor a re-tasked node reconstructs
+/// against; `witness_leaf_count` is the high-water mark over the shard's
+/// beacon-witness accumulator at that boundary. `consecutive_misses` is
+/// the per-*shard* counter (distinct from the per-*validator*
+/// [`BeaconState::miss_counters`]) bumped each epoch the beacon committee
+/// observes no boundary crossing for this shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct ShardBoundary {
+    /// Subtree root at the shard's most recent committed boundary block —
+    /// the snap-sync anchor.
+    pub state_root: StateRoot,
+    /// Hash of that boundary block — the checkpoint identifier.
+    pub block_hash: BlockHash,
+    /// Beacon-witness accumulator high-water mark at the boundary.
+    pub witness_leaf_count: BeaconWitnessLeafCount,
+    /// Epoch in which this boundary was last refreshed by an observed
+    /// crossing — the anchor's freshness.
+    pub last_live_epoch: Epoch,
+    /// Epochs in a row the beacon committee observed no crossing for this
+    /// shard. Reset to `0` on a refresh; carried forward (not reset) on a
+    /// `Skip` epoch.
+    pub consecutive_misses: u32,
+}
+
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
 ///
 /// Cross-validator agreement on every field at every epoch follows from
@@ -251,6 +279,12 @@ pub struct BeaconState {
     /// provenance and re-application is idempotent once the validator
     /// is `Jailed { Equivocation }`.
     pub consumed_through: BTreeMap<ShardId, LeafIndex>,
+    /// Per-shard boundary record: the snap-sync anchor (`state_root` /
+    /// `block_hash`), the witness high-water mark, and the liveness
+    /// history. Seeded for every genesis shard so it is never empty for
+    /// an active shard; a shard gains its entry when it first appears in
+    /// the trie. Refreshed by the boundary fold each epoch.
+    pub boundaries: BTreeMap<ShardId, ShardBoundary>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -712,6 +746,7 @@ mod tests {
             shard_committees: BTreeMap::new(),
             next_shard_committees: BTreeMap::new(),
             consumed_through: BTreeMap::new(),
+            boundaries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }
     }

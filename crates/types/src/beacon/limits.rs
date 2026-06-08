@@ -7,6 +7,35 @@
 //!
 //! These are protocol invariants, not operator-tunable config.
 
+/// Committee-exact cap on a beacon block's `committed_proposals` (one
+/// per committed committee member) and on any per-committee-member map.
+///
+/// A beacon committee holds at most `chain_config.beacon_committee_size`
+/// members, so a committed-proposal list never exceeds this. Genesis
+/// validates `beacon_committee_size <= MAX_BEACON_COMMITTEE`. Tighter
+/// than the generic [`MAX_SIGNERS`](crate::MAX_SIGNERS) wire cap that
+/// other signer collections use.
+pub const MAX_BEACON_COMMITTEE: usize = 128;
+
+/// Hard cap on the number of distinct shards referenced in a single
+/// beacon proposal or block (the `boundary_qcs` /
+/// `shard_contributions` per-shard maps).
+///
+/// A wire/memory bound: at ~250 B per boundary QC this caps a malicious
+/// proposal's per-shard maps at ~1 MB. It is also the hard ceiling on
+/// how far resharding can grow the live-shard set; the real-world
+/// ceiling is lower (`active validators / SHARD_CAPACITY`).
+pub const MAX_SHARDS: usize = 4096;
+
+/// Per-shard cap on the witnesses carried in one
+/// `ShardEpochContribution`.
+///
+/// Must cover a catch-up fold spanning multiple epochs of a shard's
+/// witness accumulator (the beacon lagged a live, producing shard),
+/// not just one epoch, or the completeness check rejects a legitimate
+/// catch-up.
+pub const MAX_WITNESSES_PER_SHARD: usize = 1024;
+
 /// Per-proposer cap on shard witnesses in a single
 /// [`BeaconProposal`](crate::BeaconProposal).
 ///
