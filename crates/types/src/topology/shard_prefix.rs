@@ -1,65 +1,27 @@
-//! Network state root: the single logical global-JMT root reconstituted from
-//! per-shard subtree roots.
+//! Shard prefix paths: the JMT root path a shard's state tree is rooted at.
 //!
 //! Node-major JMT keying ([`crate::state_key`]) makes every shard a contiguous
 //! prefix subtree of one logical global tree, so a shard's `state_root` is the
-//! root of that tree's subtree at the shard's prefix. Combining sibling subtree
-//! roots up the [`ShardTrie`] with the JMT's own internal-node hash rule
-//! reconstitutes the global root — which is what lets a cross-shard state proof
-//! be one continuous Merkle path: key → its shard subtree root → network root.
-//!
-//! The combine *is* the JMT internal hashing (not an opaque `hash(r0 ‖ r1 ‖ …)`),
-//! so the result is provable-into. It is well-defined at an epoch boundary,
-//! where each shard's "final block of the epoch" fixes its subtree root.
+//! root of that tree's subtree at the shard's prefix. Rooting each shard's JMT
+//! at [`shard_prefix_path`] is what makes that identity hold — a shard's
+//! `state_root` is exactly the corresponding subtree node of a monolithic global
+//! tree (proven by the keystone test below). That is what lets a cross-shard
+//! state proof be a Merkle path `key → its shard's subtree root`, verified
+//! against that shard's own attested root, and what makes a resharding split
+//! re-root a child onto the parent's existing subtree node with no state copy.
+//! Roots are tracked per shard and never combined into a single network root.
 
-use std::collections::BTreeMap;
+use hyperscale_jmt::NibblePath;
 
-use hyperscale_jmt::{Blake3Hasher, Hasher, NibblePath};
-
-use crate::{Hash, ShardId, ShardTrie, StateRoot};
-
-/// The network state root for `trie`: the global-JMT root obtained by combining
-/// each shard leaf's `state_root` up the trie with the JMT internal-node hash.
-///
-/// `shard_root` supplies each leaf's subtree root. A leaf with no entry
-/// contributes [`StateRoot::ZERO`] — the JMT empty-subtree sentinel — so callers
-/// consuming the result as a commitment must ensure every active shard has
-/// reported a root for the epoch.
-#[must_use]
-pub fn network_state_root(
-    trie: &ShardTrie,
-    shard_root: &BTreeMap<ShardId, StateRoot>,
-) -> StateRoot {
-    combine(trie, shard_root, ShardId::ROOT)
-}
-
-/// Combine the subtree at `node`: a trie leaf yields its shard root; an internal
-/// node yields the JMT internal hash of its two children's combined roots.
-///
-/// Terminates because a [`ShardTrie`] is a complete partition — every root-to-leaf
-/// bit path reaches a leaf — so the recursion descends at most to the deepest leaf.
-fn combine(
-    trie: &ShardTrie,
-    shard_root: &BTreeMap<ShardId, StateRoot>,
-    node: ShardId,
-) -> StateRoot {
-    if trie.contains(node) {
-        return shard_root.get(&node).copied().unwrap_or(StateRoot::ZERO);
-    }
-    let (left, right) = node.children();
-    let l = combine(trie, shard_root, left);
-    let r = combine(trie, shard_root, right);
-    let hash = Blake3Hasher::hash_internal(&[*l.as_bytes(), *r.as_bytes()]);
-    StateRoot::from_raw(Hash::from_hash_bytes(&hash))
-}
+use crate::ShardId;
 
 /// The JMT root path a shard's state tree is rooted at: the shard's `depth`-bit
 /// prefix as a [`NibblePath`].
 ///
-/// Rooting a shard's tree here makes its `state_root` the global tree's subtree
-/// root at that prefix, so [`network_state_root`] reconstitutes the global root
-/// (and a split re-roots a child onto the parent's existing subtree node — no
-/// state copy). [`ShardId::ROOT`] yields the empty path (whole keyspace).
+/// Rooting a shard's tree here makes its `state_root` the corresponding subtree
+/// node of a monolithic global tree at that prefix (so a split re-roots a child
+/// onto the parent's existing subtree node — no state copy). [`ShardId::ROOT`]
+/// yields the empty path (whole keyspace).
 #[must_use]
 pub fn shard_prefix_path(shard: ShardId) -> NibblePath {
     let depth = shard.depth();
@@ -80,12 +42,42 @@ pub fn shard_prefix_path(shard: ShardId) -> NibblePath {
 
 #[cfg(test)]
 mod tests {
-    use blake3::hash as blake3_hash;
-    use hyperscale_jmt::{MemoryStore, Tree};
+    use std::collections::BTreeMap;
 
-    use super::*;
+    use blake3::hash as blake3_hash;
+    use hyperscale_jmt::{Blake3Hasher, Hasher, MemoryStore, NibblePath, Tree};
+
+    use super::shard_prefix_path;
+    use crate::{Hash, ShardId, ShardTrie, StateRoot};
 
     type Jmt = Tree<Blake3Hasher, 1>;
+
+    /// Combine each shard leaf's prefix-rooted `state_root` up the trie with the
+    /// JMT internal-node hash. Test-only: production tracks each shard's root
+    /// individually and never combines, but the combine is the cleanest way to
+    /// *prove* the per-shard subtree-root identity below (combine == monolithic
+    /// global root ⇒ each shard root is a genuine subtree node).
+    fn network_state_root(
+        trie: &ShardTrie,
+        shard_root: &BTreeMap<ShardId, StateRoot>,
+    ) -> StateRoot {
+        combine(trie, shard_root, ShardId::ROOT)
+    }
+
+    fn combine(
+        trie: &ShardTrie,
+        shard_root: &BTreeMap<ShardId, StateRoot>,
+        node: ShardId,
+    ) -> StateRoot {
+        if trie.contains(node) {
+            return shard_root.get(&node).copied().unwrap_or(StateRoot::ZERO);
+        }
+        let (left, right) = node.children();
+        let l = combine(trie, shard_root, left);
+        let r = combine(trie, shard_root, right);
+        let hash = Blake3Hasher::hash_internal(&[*l.as_bytes(), *r.as_bytes()]);
+        StateRoot::from_raw(Hash::from_hash_bytes(&hash))
+    }
 
     /// A 32-byte key whose top `shard.depth()` bits equal `shard.path()` (so it
     /// routes to `shard` under longest-prefix match), with the remaining bits
@@ -134,7 +126,10 @@ mod tests {
     }
 
     /// The keystone property: combining each shard's independently-built subtree
-    /// root up the trie equals the root of one monolithic JMT over every key.
+    /// root up the trie equals the root of one monolithic JMT over every key —
+    /// i.e. each prefix-rooted shard `state_root` is a genuine subtree node of
+    /// the global tree. The whole sharding substrate (cross-shard proofs,
+    /// snap-sync anchors, zero-copy resharding) rests on this identity.
     fn assert_identity(trie: &ShardTrie, keys_per_shard: u64) {
         let mut all: BTreeMap<[u8; 32], Option<[u8; 32]>> = BTreeMap::new();
         let mut per_shard: BTreeMap<ShardId, BTreeMap<[u8; 32], Option<[u8; 32]>>> =
@@ -176,14 +171,14 @@ mod tests {
     }
 
     #[test]
-    fn combine_equals_monolithic_uniform() {
+    fn prefix_rooted_shards_equal_monolithic_uniform() {
         assert_identity(&ShardTrie::uniform(1), 16);
         assert_identity(&ShardTrie::uniform(2), 12);
         assert_identity(&ShardTrie::uniform(3), 8);
     }
 
     #[test]
-    fn combine_equals_monolithic_non_uniform() {
+    fn prefix_rooted_shards_equal_monolithic_non_uniform() {
         // Surgical splits to a {depth-1, depth-2, depth-2} partition — leaves at
         // mixed depths, reached the way resharding reaches a non-power-of-two trie.
         let mut trie = ShardTrie::single();
@@ -191,49 +186,5 @@ mod tests {
         trie.split(left);
         assert_eq!(trie.len(), 3);
         assert_identity(&trie, 10);
-    }
-
-    #[test]
-    fn single_shard_network_root_is_the_shard_root() {
-        let trie = ShardTrie::single();
-        let r = StateRoot::from_raw(Hash::from_hash_bytes(&[7u8; 32]));
-        let roots = BTreeMap::from([(ShardId::ROOT, r)]);
-        assert_eq!(network_state_root(&trie, &roots), r);
-    }
-
-    #[test]
-    fn determinism_across_anchor_insertion_order() {
-        // The combine reads a BTreeMap, so it is order-independent by
-        // construction; assert the same shard→root mapping built in opposite
-        // insertion orders gives byte-identical roots.
-        let trie = ShardTrie::uniform(2);
-        let leaves: Vec<ShardId> = trie.leaves().collect();
-        let mk = |seed: u8| StateRoot::from_raw(Hash::from_hash_bytes(&[seed; 32]));
-
-        let mut forward = BTreeMap::new();
-        for (i, s) in leaves.iter().enumerate() {
-            forward.insert(*s, mk(u8::try_from(i).expect("few leaves")));
-        }
-        let mut reverse = BTreeMap::new();
-        for (i, s) in leaves.iter().enumerate().rev() {
-            reverse.insert(*s, mk(u8::try_from(i).expect("few leaves")));
-        }
-        assert_eq!(
-            network_state_root(&trie, &forward),
-            network_state_root(&trie, &reverse)
-        );
-    }
-
-    #[test]
-    fn missing_shard_contributes_empty_sentinel() {
-        // A leaf absent from the anchor map combines as StateRoot::ZERO.
-        let trie = ShardTrie::uniform(1);
-        let r0 = StateRoot::from_raw(Hash::from_hash_bytes(&[3u8; 32]));
-        let roots = BTreeMap::from([(ShardId::leaf(1, 0), r0)]);
-        let expected = StateRoot::from_raw(Hash::from_hash_bytes(&Blake3Hasher::hash_internal(&[
-            *r0.as_bytes(),
-            *StateRoot::ZERO.as_bytes(),
-        ])));
-        assert_eq!(network_state_root(&trie, &roots), expected);
     }
 }
