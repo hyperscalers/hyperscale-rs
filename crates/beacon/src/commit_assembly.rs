@@ -219,7 +219,7 @@ impl CommitAssembler {
         let mut committed = Vec::new();
         let mut missing = Vec::new();
         for (i, element) in output.iter().enumerate() {
-            if *element == PcValueElement::ZERO {
+            if *element == PcValueElement::BOTTOM {
                 continue;
             }
             let Some(validator) = members.get(i).copied() else {
@@ -319,7 +319,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let pool = BeaconProposalPool::new(epoch);
         let committee = make_committee(3);
-        let output = PcVector::new(vec![PcValueElement::ZERO; 3]);
+        let output = PcVector::new(vec![PcValueElement::BOTTOM; 3]);
         match CommitAssembler::decode(&pool, &committee, epoch, &output) {
             DecodeOutcome::Complete(proposals) => assert!(proposals.is_empty()),
             DecodeOutcome::Pending { .. } => panic!("all-zero output is complete"),
@@ -331,7 +331,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let committee = make_committee(2);
         let pool = pool_with(epoch, &[(committee[1], 9)]);
-        let output = PcVector::new(vec![PcValueElement::ZERO, element(9, epoch)]);
+        let output = PcVector::new(vec![PcValueElement::BOTTOM, element(9, epoch)]);
         match CommitAssembler::decode(&pool, &committee, epoch, &output) {
             DecodeOutcome::Complete(proposals) => {
                 assert_eq!(proposals.len(), 1);
@@ -346,7 +346,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let committee = make_committee(2);
         let pool = BeaconProposalPool::new(epoch);
-        let output = PcVector::new(vec![element(1, epoch), PcValueElement::ZERO]);
+        let output = PcVector::new(vec![element(1, epoch), PcValueElement::BOTTOM]);
         match CommitAssembler::decode(&pool, &committee, epoch, &output) {
             DecodeOutcome::Pending { missing } => assert_eq!(missing, vec![committee[0]]),
             DecodeOutcome::Complete(_) => panic!("unpooled element must be missing"),
@@ -375,7 +375,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let committee = make_committee(1);
         let pool = BeaconProposalPool::new(epoch);
-        let output = PcVector::new(vec![PcValueElement::ZERO, element(2, epoch)]);
+        let output = PcVector::new(vec![PcValueElement::BOTTOM, element(2, epoch)]);
         match CommitAssembler::decode(&pool, &committee, epoch, &output) {
             DecodeOutcome::Complete(proposals) => assert!(proposals.is_empty()),
             DecodeOutcome::Pending { .. } => panic!("out-of-bounds element must be skipped"),

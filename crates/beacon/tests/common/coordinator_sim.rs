@@ -10,7 +10,7 @@
 //! `step()` drains the network queue first, only falling back to the
 //! loopback queue once peer notifies have closed. Without that
 //! ordering, view-1 PC inputs collapse to per-validator singletons and
-//! PC commits all-`HASH_BOTTOM`s every epoch — the honest path still
+//! PC commits all-bottoms every epoch — the honest path still
 //! terminates but exercises an uninteresting branch.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

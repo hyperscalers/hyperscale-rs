@@ -88,7 +88,7 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
     // vectors instead of per-validator singletons. This test pins the
     // resulting protocol property: every committed beacon block carries
     // every honest replica's proposal. If the sim ever regresses to
-    // "self-first" delivery, view-1 PC collapses to all-`HASH_BOTTOM`s,
+    // "self-first" delivery, view-1 PC collapses to all-bottoms,
     // `committed_proposals` empties, and this test catches it.
     let mut sim = CoordinatorSim::new(4, 0xBE_AC);
     sim.kick_off();

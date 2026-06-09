@@ -272,14 +272,14 @@ fn verify_committed_proposal_binding(
     };
     let certified: Vec<PcValueElement> = cert.committed_value().iter().copied().collect();
     let epoch = block.epoch();
-    let mut canonical = vec![PcValueElement::ZERO; certified.len()];
+    let mut canonical = vec![PcValueElement::BOTTOM; certified.len()];
     for (validator, proposal) in block.block().committed_proposals() {
         let Some(pos) = committee.iter().position(|(id, _)| id == validator) else {
             return false;
         };
         // A second proposal at the same position, or a position past the
         // certified vector, can't be a faithful reconstruction.
-        if pos >= canonical.len() || canonical[pos] != PcValueElement::ZERO {
+        if pos >= canonical.len() || canonical[pos] != PcValueElement::BOTTOM {
             return false;
         }
         canonical[pos] = proposal.pc_element_hash(epoch);
@@ -607,10 +607,10 @@ mod tests {
         let h = good.pc_element_hash(epoch);
         // Committed value: the proposer sits at committee position 1.
         let value = PcVector::new([
-            PcValueElement::ZERO,
+            PcValueElement::BOTTOM,
             h,
-            PcValueElement::ZERO,
-            PcValueElement::ZERO,
+            PcValueElement::BOTTOM,
+            PcValueElement::BOTTOM,
         ]);
 
         let bind = |proposals: Vec<(ValidatorId, BeaconProposal)>| {

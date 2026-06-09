@@ -13,6 +13,7 @@
 
 use std::collections::BTreeSet;
 
+use blake3::Hasher;
 use sbor::prelude::*;
 use thiserror::Error;
 
@@ -44,14 +45,38 @@ pub const PC_VALUE_ELEMENT_BYTES: usize = 32;
 pub struct PcValueElement([u8; PC_VALUE_ELEMENT_BYTES]);
 
 impl PcValueElement {
-    /// All-zero element. Used as the `HASH_BOTTOM` sentinel in
-    /// view-1 PC inputs when a proposal slot is absent.
-    pub const ZERO: Self = Self([0u8; PC_VALUE_ELEMENT_BYTES]);
+    /// All-zero element — the `⊥` (bottom) sentinel marking an absent
+    /// proposal slot in PC input vectors.
+    ///
+    /// Load-bearing contract: no real element may ever equal `BOTTOM`,
+    /// or decoding a committed vector would read that position as
+    /// "absent" and silently drop it. Every digest that produces a
+    /// vector element goes through [`Self::from_digest`], whose
+    /// collision-avoidance rehash keeps real digests off the sentinel.
+    pub const BOTTOM: Self = Self([0u8; PC_VALUE_ELEMENT_BYTES]);
 
     /// Build a `PcValueElement` from a raw 32-byte array.
     #[must_use]
     pub const fn new(bytes: [u8; PC_VALUE_ELEMENT_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    /// Wrap a 32-byte digest as a vector element while keeping
+    /// [`Self::BOTTOM`] out of the digest space: an all-zero digest is
+    /// rehashed under `collision_domain`, preserving collision
+    /// resistance against other inputs while guaranteeing the result
+    /// can't be mistaken for an absent slot.
+    #[must_use]
+    pub fn from_digest(raw: [u8; PC_VALUE_ELEMENT_BYTES], collision_domain: &[u8]) -> Self {
+        if raw != [0u8; PC_VALUE_ELEMENT_BYTES] {
+            return Self(raw);
+        }
+        let mut rehash = Hasher::new();
+        rehash.update(collision_domain);
+        rehash.update(&raw);
+        let mut out = [0u8; PC_VALUE_ELEMENT_BYTES];
+        out.copy_from_slice(rehash.finalize().as_bytes());
+        Self(out)
     }
 
     /// Pack a 64-bit view number into a `PcValueElement`. Used by SPC's

@@ -58,29 +58,16 @@ fn proposal_object_message(po: &SpcProposalObject) -> Vec<u8> {
     buf
 }
 
-/// All-zero sentinel element used in compute-view-input vectors to mark
-/// "no proposal object from this party yet". Cleared from the hashed
-/// digest space by [`hash_proposal_object`]'s collision-avoidance
-/// rehash so a real proposal object can never hash to it.
-const HASH_BOTTOM: PcValueElement = PcValueElement::new([0u8; PC_VALUE_ELEMENT_BYTES]);
-
 /// Blake3-hash a proposal object into a `PcValueElement` suitable for
-/// the inner-PC input vector at the next view. The fallback rehash
-/// avoids accidental collision with [`HASH_BOTTOM`]: if the natural
-/// digest happens to land on all-zeros, a tag-prefixed rehash moves
-/// it elsewhere while preserving full collision resistance against
-/// other inputs.
+/// the inner-PC input vector at the next view.
+/// [`PcValueElement::from_digest`] keeps the result off the
+/// [`PcValueElement::BOTTOM`] "no proposal object" sentinel.
 fn hash_proposal_object(po: &SpcProposalObject) -> PcValueElement {
+    const COLLISION_DOMAIN: &[u8] = b"hyperscale-spc-proposal-bottom-collision-v1";
     let bytes = proposal_object_message(po);
     let mut raw = [0u8; PC_VALUE_ELEMENT_BYTES];
     raw.copy_from_slice(Hasher::new().update(&bytes).finalize().as_bytes());
-    if PcValueElement::new(raw) == HASH_BOTTOM {
-        let mut h2 = Hasher::new();
-        h2.update(b"hyperscale-spc-proposal-bottom-collision-v1");
-        h2.update(&raw);
-        raw.copy_from_slice(h2.finalize().as_bytes());
-    }
-    PcValueElement::new(raw)
+    PcValueElement::from_digest(raw, COLLISION_DOMAIN)
 }
 
 /// `Parent(view, value)` — walk a value vector's first non-bottom
@@ -99,7 +86,7 @@ fn parent_of(
         return None;
     }
     for el in value.iter() {
-        if *el != HASH_BOTTOM
+        if *el != PcValueElement::BOTTOM
             && let Some(po) = proposals.get(el)
         {
             let (parent_view, parent_value) = match &po.cert {
@@ -935,7 +922,9 @@ impl SpcInstance {
                 view_state
                     .proposal_objects
                     .get(&validator)
-                    .map_or(HASH_BOTTOM, |po| hash_proposal_object(po.as_ref()))
+                    .map_or(PcValueElement::BOTTOM, |po| {
+                        hash_proposal_object(po.as_ref())
+                    })
             })
             .collect();
         PcVector::new(elements)
@@ -1101,7 +1090,7 @@ mod tests {
         proposals.insert(h, Verified::<SpcProposalObject>::new_unchecked_for_test(po));
 
         // Search vector: [BOTTOM, h] — second element resolves.
-        let search = PcVector::new([HASH_BOTTOM, h]);
+        let search = PcVector::new([PcValueElement::BOTTOM, h]);
         let (parent_view, resolved_value, resolved_cert) =
             parent_of(SpcView::new(3), &search, &proposals).expect("resolves");
         assert_eq!(parent_view, SpcView::new(2));
@@ -1112,7 +1101,7 @@ mod tests {
     }
 
     /// `hash_proposal_object` is deterministic + never returns
-    /// [`HASH_BOTTOM`] (bottom-collision avoidance gives full
+    /// [`PcValueElement::BOTTOM`] (bottom-collision avoidance gives full
     /// collision resistance against the sentinel).
     #[test]
     fn hash_proposal_object_deterministic_and_avoids_bottom() {
@@ -1127,7 +1116,7 @@ mod tests {
         let h1 = hash_proposal_object(&po);
         let h2 = hash_proposal_object(&po);
         assert_eq!(h1, h2);
-        assert_ne!(h1, HASH_BOTTOM);
+        assert_ne!(h1, PcValueElement::BOTTOM);
     }
 
     /// `TimerExpired` for view ≤ 1 is a no-op — view 1 has no timer

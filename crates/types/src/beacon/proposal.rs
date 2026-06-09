@@ -118,11 +118,9 @@ impl BeaconProposal {
     /// in the epoch's SPC input vector.
     ///
     /// `epoch` is bound into the digest so a proposal can't be replayed
-    /// across epochs as the same PC element. The fallback rehash avoids
-    /// accidental collision with [`HASH_BOTTOM`] (the "no proposal"
-    /// sentinel): if the natural digest happens to land on all-zeros,
-    /// a tag-prefixed rehash moves it elsewhere while preserving
-    /// collision resistance against other inputs.
+    /// across epochs as the same PC element.
+    /// [`PcValueElement::from_digest`] keeps the result off the
+    /// [`PcValueElement::BOTTOM`] "no proposal" sentinel.
     ///
     /// # Panics
     ///
@@ -139,13 +137,7 @@ impl BeaconProposal {
         hasher.update(&encoded);
         let mut raw = [0u8; PC_VALUE_ELEMENT_BYTES];
         raw.copy_from_slice(hasher.finalize().as_bytes());
-        if raw == [0u8; PC_VALUE_ELEMENT_BYTES] {
-            let mut rehash = Hasher::new();
-            rehash.update(COLLISION_DOMAIN);
-            rehash.update(&raw);
-            raw.copy_from_slice(rehash.finalize().as_bytes());
-        }
-        PcValueElement::new(raw)
+        PcValueElement::from_digest(raw, COLLISION_DOMAIN)
     }
 }
 
@@ -350,7 +342,7 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    /// `HASH_BOTTOM` is the all-zero sentinel for "no proposal from
+    /// `PcValueElement::BOTTOM` is the all-zero sentinel for "no proposal from
     /// this validator". `pc_element_hash`'s rehash must guarantee no
     /// real proposal lands on it.
     #[test]

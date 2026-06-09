@@ -22,7 +22,7 @@ use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Ve
 ///
 /// `MessageClass::Consensus` — proposal arrival is round-blocking:
 /// SPC's view-1 input vector commits to each peer's proposal, so a
-/// silent peer drags the input toward `HASH_BOTTOM` and degrades
+/// silent peer drags the input toward `PcValueElement::BOTTOM` and degrades
 /// agreement throughput until they show up or the view rotates.
 ///
 /// Unicast (not gossip) because the audience is exactly the beacon

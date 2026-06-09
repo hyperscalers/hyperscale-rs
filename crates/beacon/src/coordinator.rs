@@ -681,7 +681,7 @@ impl BeaconCoordinator {
 
     /// Build the PC input vector for view 1: one `PcValueElement` per
     /// committee position, the hashed proposal if we've seen it or
-    /// `PcValueElement::ZERO` (`HASH_BOTTOM`) if not.
+    /// [`PcValueElement::BOTTOM`] if not.
     fn compute_view_one_input(&self, epoch: Epoch) -> PcVector {
         let elements: Vec<PcValueElement> = self
             .state
@@ -690,7 +690,7 @@ impl BeaconCoordinator {
             .map(|id| {
                 self.proposal_pool
                     .get(*id)
-                    .map_or(PcValueElement::ZERO, |p| p.pc_element_hash(epoch))
+                    .map_or(PcValueElement::BOTTOM, |p| p.pc_element_hash(epoch))
             })
             .collect();
         PcVector::new(elements)
