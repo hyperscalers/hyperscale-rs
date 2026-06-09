@@ -35,7 +35,7 @@ hyperscale-network-libp2p.workspace = true
 libp2p.workspace = true
 
 # UPnP
-igd-next = { version = "0.17.0", features = ["aio_tokio"] }
+igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 
 # Serialization
 sbor.workspace = true
@@ -88,7 +88,7 @@ tikv-jemallocator = { version = "0.7.0", features = ["background_threads", "unpr
 hyperscale-dispatch-sync.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
-serial_test = "3.4.0"
+serial_test = "3.5.0"
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 tower = "0.5.3"
 
