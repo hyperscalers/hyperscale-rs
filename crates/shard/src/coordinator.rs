@@ -3630,6 +3630,7 @@ impl ShardCoordinator {
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         };
+        let carried_high_qc = timeout.high_qc().clone();
         if !self.timeouts.record(timeout, power) {
             return Vec::new();
         }
@@ -3637,6 +3638,23 @@ impl ShardCoordinator {
         let total = committee.committee_votes(self.local_shard);
         let seen = self.timeouts.power(round);
         let mut actions = Vec::new();
+
+        // A timeout carries its sender's verified tip, so a higher carried
+        // `high_qc` is adopted here, per share — not only at the 2f+1 quorum.
+        // A replica that missed a QC (vote or header lost) otherwise wedges
+        // the pacemaker in a round split: it keeps timing out the old round,
+        // peers ahead drop those below-view timeouts, and neither round ever
+        // reaches quorum. Adoption from the first share re-converges the
+        // view (and can fire the two-chain commit). The carried QC rides
+        // outside the share's signed message and its weighted timestamp is
+        // forgeable, so it passes the same bound and verification as the
+        // quorum-max path; a forged one costs one failed pairing.
+        if carried_high_qc.round() > self.high_qc_round()
+            && !qc_weighted_timestamp_too_far_ahead(&carried_high_qc, self.now)
+            && let Some(verified) = self.verify_qc_sync(topology, &carried_high_qc)
+        {
+            actions.extend(self.try_adopt_verified_qc(&verified));
+        }
 
         // Bracha amplification: f+1 timeouts seen → broadcast our own.
         if VoteCount::has_one_third(seen, total) {
@@ -5377,6 +5395,79 @@ mod tests {
 
         assert!(state.on_verified_timeout(&topology, far_timeout).is_empty());
         assert_eq!(state.timeouts.power(far), VoteCount::ZERO);
+    }
+
+    /// A verified timeout's carried `high_qc` is adopted at share receipt,
+    /// not only at the 2f+1 quorum. A replica that missed a QC (vote or
+    /// header lost) otherwise deadlocks the pacemaker in a round split: it
+    /// keeps timing out the old round, peers ahead drop those below-view
+    /// timeouts, and neither round can reach quorum. One share from an
+    /// ahead peer must lift the replica's `high_qc` and view.
+    #[test]
+    fn verified_timeout_share_adopts_higher_carried_high_qc() {
+        let (mut state, topology, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let net = NetworkDefinition::simulator();
+
+        // A complete pending block at height 1, round 1, extending the
+        // committed tip. Its QC is what this node "missed".
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+
+        // The QC the ahead peers hold: 3-of-4 real vote signatures.
+        let votes: Vec<(usize, Verified<BlockVote>)> = [1usize, 2, 3]
+            .into_iter()
+            .map(|idx| {
+                let vote = Verified::<BlockVote>::sign_local(
+                    &net,
+                    block.hash(),
+                    state.committed_hash,
+                    ShardId::ROOT,
+                    BlockHeight::new(1),
+                    Round::new(1),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                    ProposerTimestamp::from_millis(100_000),
+                );
+                (idx, vote)
+            })
+            .collect();
+        let missed_qc = Verified::<QuorumCertificate>::from_verified_votes(
+            block.hash(),
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            Round::new(1),
+            state.committed_hash,
+            WeightedTimestamp::ZERO,
+            &votes,
+        )
+        .expect("vote aggregation succeeds");
+
+        // An ahead peer times out round 2, carrying that QC.
+        let timeout = Verified::<Timeout>::sign_local(
+            &net,
+            ShardId::ROOT,
+            Round::new(2),
+            (*missed_qc).clone(),
+            ValidatorId::new(1),
+            &keys[1],
+        );
+
+        assert!(state.latest_qc().is_none());
+        let _ = state.on_verified_timeout(&topology, timeout);
+
+        let adopted = state
+            .latest_qc()
+            .expect("a single share's carried high_qc must be adopted");
+        assert_eq!(adopted.round(), Round::new(1));
+        assert_eq!(adopted.height(), BlockHeight::new(1));
+        assert_eq!(
+            state.view(),
+            Round::new(2),
+            "view must sync past the adopted QC",
+        );
+        // The share itself is still tallied for the pacemaker.
+        assert_eq!(state.timeouts.power(Round::new(2)), VoteCount::new(1));
     }
 
     #[test]
