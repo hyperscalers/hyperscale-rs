@@ -8,12 +8,9 @@
 //! headers signed by the *rotated* (post-shuffle) committee.
 //!
 //! A short epoch (2s) is used so the rotation lands within the run window. The
-//! schedule's retention is only a few epochs, so a shard may stall shortly
-//! after the rotation (a shard whose tip falls outside the retained window
-//! can't resolve its own committee) — but by then each shard has already
-//! verified the other's headers under post-shuffle committees, which is the
-//! property under test. In production (5-minute epochs) the retention window is
-//! tens of minutes of wall-clock and no such stall occurs.
+//! run only needs to extend a little past the boundary: once each shard has
+//! verified the other's headers under post-shuffle committees, the property
+//! under test is established.
 
 use std::ops::Range;
 use std::time::Duration;
