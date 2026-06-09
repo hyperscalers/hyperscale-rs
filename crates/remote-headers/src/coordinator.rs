@@ -17,8 +17,8 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardId, TopologySchedule,
-    TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ScheduleLookup, ShardId,
+    TopologySchedule, TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -271,15 +271,28 @@ impl RemoteHeaderCoordinator {
 
         // Resolve the committee that signed this QC — the one seated at the
         // block's parent WT (`committee(h) = at(WT_{h-1})`), the same committee
-        // every shard member used to form the QC. `None` means our beacon
-        // hasn't reached that epoch: buffer for replay once it catches up
-        // rather than verify against a guessed committee.
-        let Some(committee) =
-            topology.at(certified_header.header().parent_qc().weighted_timestamp())
-        else {
-            self.awaiting.push(shard, (sender, certified_header));
-            return vec![];
-        };
+        // every shard member used to form the QC. A not-yet-committed epoch
+        // buffers for replay once the beacon catches up rather than verifying
+        // against a guessed committee. A below-floor epoch drops: it can
+        // never resolve, and buffering it would let a Byzantine sender evict
+        // honest entries from the bounded drop-oldest buffer.
+        let committee =
+            match topology.lookup(certified_header.header().parent_qc().weighted_timestamp()) {
+                ScheduleLookup::Committee(committee) => committee,
+                ScheduleLookup::NotYetCommitted => {
+                    self.awaiting.push(shard, (sender, certified_header));
+                    return vec![];
+                }
+                ScheduleLookup::Evicted => {
+                    warn!(
+                        shard = shard.inner(),
+                        height = height.inner(),
+                        sender = sender.inner(),
+                        "Remote header's committee epoch is below the schedule floor — dropping"
+                    );
+                    return vec![];
+                }
+            };
 
         // Check if we already have a pending entry from this sender.
         let sender_map = self.pending.entry((shard, height)).or_default();
@@ -340,10 +353,12 @@ impl RemoteHeaderCoordinator {
 
                 // The failed candidate is out. Dispatch the next candidate
                 // whose committee resolves; buffer any whose epoch the beacon
-                // hasn't reached yet so a catch-up retries them. If none
-                // resolve, every remaining candidate is buffered or removed and
-                // the key is gone, so the drain re-adds the first one with
-                // `first_for_key` set and re-dispatches it cleanly.
+                // hasn't reached yet so a catch-up retries them, and drop any
+                // keyed below the schedule floor (the epoch can never resolve
+                // again). If none resolve, every remaining candidate is
+                // buffered or removed and the key is gone, so the drain
+                // re-adds the first one with `first_for_key` set and
+                // re-dispatches it cleanly.
                 if let Some(sender_map) = self.pending.get_mut(&key) {
                     sender_map.remove(&sender);
                 }
@@ -356,21 +371,35 @@ impl RemoteHeaderCoordinator {
                         return vec![];
                     };
                     let anchor = next_header.header().parent_qc().weighted_timestamp();
-                    if let Some(committee) = topology.at(anchor) {
-                        return Self::emit_verify_qc(
-                            committee,
-                            shard,
-                            height,
-                            next_sender,
-                            next_header,
-                        );
+                    match topology.lookup(anchor) {
+                        ScheduleLookup::Committee(committee) => {
+                            return Self::emit_verify_qc(
+                                committee,
+                                shard,
+                                height,
+                                next_sender,
+                                next_header,
+                            );
+                        }
+                        ScheduleLookup::NotYetCommitted => {
+                            if let Some(sender_map) = self.pending.get_mut(&key) {
+                                sender_map.remove(&next_sender);
+                            }
+                            self.awaiting.push(shard, (next_sender, next_header));
+                        }
+                        ScheduleLookup::Evicted => {
+                            warn!(
+                                shard = shard.inner(),
+                                height = height.inner(),
+                                sender = next_sender.inner(),
+                                "Pending remote header's committee epoch fell below the \
+                                 schedule floor — dropping"
+                            );
+                            if let Some(sender_map) = self.pending.get_mut(&key) {
+                                sender_map.remove(&next_sender);
+                            }
+                        }
                     }
-                    // Beacon hasn't reached this candidate's epoch — buffer it
-                    // for replay and try the next.
-                    if let Some(sender_map) = self.pending.get_mut(&key) {
-                        sender_map.remove(&next_sender);
-                    }
-                    self.awaiting.push(shard, (next_sender, next_header));
                 }
             }
         };
@@ -882,10 +911,11 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
 
-        // Schedule holds only epoch 5; a header anchored in epoch 0 can't resolve.
-        let behind = TopologySchedule::new(ED, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
+        // Schedule head is epoch 0; a header anchored in epoch 5 is ahead of
+        // this node's beacon and can't resolve yet.
+        let behind = TopologySchedule::new(ED, Epoch::new(0), Arc::new(shard_snapshot(2, &ids, 0)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-        let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
+        let header = remote_header(remote, BlockHeight::new(5), 5 * ED); // parent WT in epoch 5
 
         let actions =
             coord.on_remote_header_received(&behind, Arc::clone(&header), ValidatorId::new(1));
@@ -894,7 +924,7 @@ mod tests {
             "a header whose epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
-        // Beacon catches up: a schedule covering epoch 0 resolves the committee.
+        // Beacon catches up: a schedule covering epoch 5 resolves the committee.
         let caught_up = TopologySchedule::single(Arc::new(shard_snapshot(2, &ids, 0)));
         let drained = coord.on_beacon_block_persisted(&caught_up);
         assert!(
@@ -904,14 +934,41 @@ mod tests {
     }
 
     #[test]
-    fn failed_verification_with_beacon_behind_buffers_all_siblings() {
+    fn remote_header_below_schedule_floor_drops_without_buffering() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+
+        // Schedule retains only epoch 5; a header anchored in epoch 0 sits
+        // below the floor — unresolvable forever, so it must not occupy a
+        // buffer slot a Byzantine sender could use to evict honest entries.
+        let schedule =
+            TopologySchedule::new(ED, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+        let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
+
+        let actions =
+            coord.on_remote_header_received(&schedule, Arc::clone(&header), ValidatorId::new(1));
+        assert!(verify_qc_keys(&actions).is_none(), "nothing to verify");
+
+        // A full-coverage schedule drains nothing — the header was dropped.
+        let caught_up = TopologySchedule::single(Arc::new(shard_snapshot(2, &ids, 0)));
+        let drained = coord.on_beacon_block_persisted(&caught_up);
+        assert!(
+            verify_qc_keys(&drained).is_none(),
+            "a below-floor header must be dropped, not buffered for replay",
+        );
+    }
+
+    #[test]
+    fn failed_verification_with_epoch_evicted_drops_all_siblings() {
         // Three peers gossip the same header at one (shard, height): the first
         // dispatches verification, the other two wait as pending fallbacks. The
         // first candidate's QC verification then fails, and by the time the
-        // result lands the beacon has evicted that epoch, so no sibling can
-        // resolve its committee. Every sibling must move to the awaiting buffer
-        // — none left in `pending` with no verification in flight — so a beacon
-        // catch-up re-dispatches one rather than the whole height wedging.
+        // result lands the schedule's floor has passed that epoch, so no
+        // sibling can ever resolve its committee again. Every sibling must be
+        // dropped — none stranded in `pending` with no verification in flight,
+        // and none buffered for a replay that can't succeed.
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is {1, 3}
@@ -930,7 +987,7 @@ mod tests {
         assert_eq!(coord.memory_stats().pending_headers, 3);
 
         // The first candidate's verification fails, and the schedule no longer
-        // covers epoch 0 (the beacon advanced past it).
+        // covers epoch 0 (every consumer frontier passed it).
         let evicted = TopologySchedule::new(ED, Epoch::new(5), snap());
         let after_fail = coord.on_remote_header_qc_verified(
             &evicted,
@@ -941,20 +998,21 @@ mod tests {
         );
         assert!(
             verify_qc_keys(&after_fail).is_none(),
-            "no sibling can verify while their epoch is outside the schedule",
+            "no sibling can verify once their epoch fell below the floor",
         );
         assert_eq!(
             coord.memory_stats().pending_headers,
             0,
-            "every sibling must move to the awaiting buffer, none stranded in pending",
+            "every sibling must be dropped, none stranded in pending",
         );
 
-        // Beacon catches up: draining re-dispatches a buffered sibling.
+        // A full-coverage schedule drains nothing — the siblings were dropped,
+        // not buffered.
         let caught_up = TopologySchedule::single(snap());
         let drained = coord.on_beacon_block_persisted(&caught_up);
         assert!(
-            verify_qc_keys(&drained).is_some(),
-            "a buffered sibling must re-dispatch verification on beacon catch-up",
+            verify_qc_keys(&drained).is_none(),
+            "dropped siblings must not re-dispatch on beacon catch-up",
         );
     }
 }

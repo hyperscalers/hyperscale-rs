@@ -16,7 +16,7 @@ use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, ReadySignal,
-    ShardId, StoredReceipt, WaveId, WeightedTimestamp,
+    ScheduleLookup, ShardId, StoredReceipt, WaveId, WeightedTimestamp,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -1339,20 +1339,29 @@ impl ShardCoordinator {
     }
 
     /// Validate the header; logs and returns `true` if the caller should
-    /// reject (short-circuit with empty actions). Beacon-behind (`None`
-    /// committee) is treated as a drop here — sync recovers the chain.
+    /// reject (short-circuit with empty actions). An unresolvable committee
+    /// is a drop either way — beacon-behind recovers via sync, while a
+    /// below-floor epoch marks a forged weighted timestamp or ancient
+    /// replay — the split is diagnostic.
     fn reject_invalid_header(&self, topology: &TopologySchedule, header: &BlockHeader) -> bool {
         // Proposer of `h` is drawn from `committee(h) == at(parent_qc weighted
-        // ts)`. Absent it, the beacon hasn't reached this epoch — drop.
-        let Some(proposer_committee) = topology
-            .at(header.parent_qc().weighted_timestamp())
-            .map(AsRef::as_ref)
-        else {
-            warn!(
-                validator = ?self.me,
-                "No committee for header's epoch — beacon behind, dropping header"
-            );
-            return true;
+        // ts)`.
+        let proposer_committee = match topology.lookup(header.parent_qc().weighted_timestamp()) {
+            ScheduleLookup::Committee(committee) => committee.as_ref(),
+            ScheduleLookup::NotYetCommitted => {
+                warn!(
+                    validator = ?self.me,
+                    "No committee for header's epoch yet — beacon behind, dropping header"
+                );
+                return true;
+            }
+            ScheduleLookup::Evicted => {
+                warn!(
+                    validator = ?self.me,
+                    "Header's committee epoch is below the schedule floor — dropping header"
+                );
+                return true;
+            }
         };
         // The parent QC over `h-1` was signed by `committee(h-1)`. Skip the
         // quorum pre-check (`None`) when the parent QC is genesis (no quorum to
@@ -3137,17 +3146,30 @@ impl ShardCoordinator {
         }
 
         // The synced block's QC was signed by its own committee,
-        // `at(parent_qc weighted ts)`. Stall (drop; sync retries) if the
-        // beacon hasn't reached that epoch.
-        let Some(committee) =
-            topology.at(certified.block().header().parent_qc().weighted_timestamp())
-        else {
-            warn!(
-                height = certified.block().height().inner(),
-                "No committee for synced block's epoch — beacon behind, deferring"
-            );
-            return vec![];
-        };
+        // `at(parent_qc weighted ts)`. A not-yet-committed epoch defers
+        // (drop; sync retries once the beacon catches up). An evicted epoch
+        // rejects: the schedule's floor retains every epoch the local chain
+        // can still verify against, so a synced block keyed below it carries
+        // a forged weighted timestamp (it rides outside the signed message)
+        // or sits on a stale fork — no amount of retrying resolves it.
+        let committee =
+            match topology.lookup(certified.block().header().parent_qc().weighted_timestamp()) {
+                ScheduleLookup::Committee(committee) => committee,
+                ScheduleLookup::NotYetCommitted => {
+                    warn!(
+                        height = certified.block().height().inner(),
+                        "No committee for synced block's epoch yet — beacon behind, deferring"
+                    );
+                    return vec![];
+                }
+                ScheduleLookup::Evicted => {
+                    warn!(
+                        height = certified.block().height().inner(),
+                        "Synced block's committee epoch is below the schedule floor — rejecting"
+                    );
+                    return vec![];
+                }
+            };
 
         // Quorum-power gate: `VerifyQcSignature` only checks the BLS
         // aggregation, not whether the signers represent ≥ 2f+1 of voting

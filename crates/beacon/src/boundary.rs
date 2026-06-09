@@ -18,9 +18,10 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHash, BlockHeader, NetworkDefinition, QcContext,
-    QuorumCertificate, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
-    Verify,
+    QuorumCertificate, ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule,
+    ValidatorId, Verified, Verify,
 };
+use tracing::{debug, warn};
 
 use crate::rules;
 use crate::shard_source::ShardSourceTracker;
@@ -176,8 +177,10 @@ fn boundary_header_for(
 /// timestamp — the window the block was produced in — through the
 /// [`TopologySchedule`], which retains historical committees the live
 /// `BeaconState` no longer holds (a tracked crossing can lag the tip by up
-/// to a few epochs). `None` resolution (the epoch fell out of the
-/// retention window) fails closed.
+/// to a few epochs). An unresolvable epoch fails closed either way: a
+/// not-yet-committed one is this node lagging the proposer (abstain and let
+/// it catch up), a below-floor one marks a crossing every consumer frontier
+/// has passed.
 fn boundary_qc_authentic(
     shard: ShardId,
     boundary_header: &BlockHeader,
@@ -188,8 +191,22 @@ fn boundary_qc_authentic(
     if qc.block_hash() != boundary_header.hash() {
         return false;
     }
-    let Some(snapshot) = topology.at(boundary_header.parent_qc().weighted_timestamp()) else {
-        return false;
+    let snapshot = match topology.lookup(boundary_header.parent_qc().weighted_timestamp()) {
+        ScheduleLookup::Committee(snapshot) => snapshot,
+        ScheduleLookup::NotYetCommitted => {
+            debug!(
+                shard = shard.inner(),
+                "Boundary QC's committee epoch not committed yet — abstaining"
+            );
+            return false;
+        }
+        ScheduleLookup::Evicted => {
+            warn!(
+                shard = shard.inner(),
+                "Boundary QC's committee epoch is below the schedule floor — abstaining"
+            );
+            return false;
+        }
     };
     let committee = snapshot.committee_for_shard(shard);
     if committee.is_empty() {

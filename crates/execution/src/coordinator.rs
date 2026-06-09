@@ -45,9 +45,9 @@ use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
-    RoutableTransaction, ShardId, StoredReceipt, TopologySchedule, TopologySnapshot, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WeightedTimestamp, wave_leader, wave_leader_at,
+    RoutableTransaction, ScheduleLookup, ShardId, StoredReceipt, TopologySchedule,
+    TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WAVE_TIMEOUT,
+    WaveCertificate, WaveId, WeightedTimestamp, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
 
@@ -1145,13 +1145,31 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        let Some(committee) = topology.at(cert.vote_anchor_ts()) else {
-            // Beacon hasn't reached this EC's epoch — buffer for replay on
-            // catch-up rather than abandoning and re-fetching. Release the
-            // in-flight slot so the replay re-dispatches.
-            self.pending_ec_verifications.remove(&wire_hash);
-            self.awaiting_certs.push(cert.shard_id(), cert);
-            return vec![];
+        let committee = match topology.lookup(cert.vote_anchor_ts()) {
+            ScheduleLookup::Committee(committee) => committee,
+            ScheduleLookup::NotYetCommitted => {
+                // Beacon hasn't reached this EC's epoch — buffer for replay on
+                // catch-up rather than abandoning and re-fetching. Release the
+                // in-flight slot so the replay re-dispatches.
+                self.pending_ec_verifications.remove(&wire_hash);
+                self.awaiting_certs.push(cert.shard_id(), cert);
+                return vec![];
+            }
+            ScheduleLookup::Evicted => {
+                // Below the schedule floor the EC is past its retention
+                // horizon — provably terminal everywhere, never resolvable
+                // again. Drop instead of buffering, releasing the in-flight
+                // slot and the fetch binding.
+                tracing::warn!(
+                    shard = shard.inner(),
+                    wave = %cert.wave_id(),
+                    "EC's committee epoch is below the schedule floor — dropping"
+                );
+                self.pending_ec_verifications.remove(&wire_hash);
+                return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                    ids: vec![cert.wave_id().clone()],
+                })];
+            }
         };
         let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
             tracing::warn!(
@@ -1802,12 +1820,29 @@ impl ExecutionCoordinator {
         for ec in ecs {
             let shard = ec.shard_id();
             // Each contained EC is verified against the committee seated at its
-            // own anchor on its own shard. `None` (our beacon behind that
-            // epoch) defers the whole wave for replay once the beacon catches
-            // up, rather than abandoning and re-fetching.
-            let Some(committee) = topology.at(ec.vote_anchor_ts()) else {
-                beacon_behind = true;
-                break;
+            // own anchor on its own shard. A not-yet-committed epoch (our
+            // beacon behind) defers the whole wave for replay once the beacon
+            // catches up, rather than abandoning and re-fetching; a below-floor
+            // epoch rejects it — the EC is past its retention horizon and can
+            // never resolve again.
+            let committee = match topology.lookup(ec.vote_anchor_ts()) {
+                ScheduleLookup::Committee(committee) => committee,
+                ScheduleLookup::NotYetCommitted => {
+                    beacon_behind = true;
+                    break;
+                }
+                ScheduleLookup::Evicted => {
+                    tracing::warn!(
+                        wave = %wave.wave_id(),
+                        shard = shard.inner(),
+                        "Rejecting fetched FinalizedWave: contained EC's committee epoch is \
+                         below the schedule floor"
+                    );
+                    self.pending_finalized_wave_verifications.remove(&wave_id);
+                    return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                        ids: vec![wave_id],
+                    })];
+                }
             };
             if !ec_has_shard_quorum_power(committee, ec.as_unverified()) {
                 tracing::warn!(
@@ -3404,16 +3439,17 @@ mod tests {
         const ED: u64 = 1_000;
         let shard = ShardId::ROOT;
 
-        // Schedule holds only epoch 5; an EC anchored in epoch 0 can't resolve.
+        // Schedule head is epoch 0; an EC anchored in epoch 5 is ahead of this
+        // node's beacon and can't resolve yet.
         let behind = TopologySchedule::new(
             ED,
-            Epoch::new(5),
+            Epoch::new(0),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );
         let mut coord = make_test_state();
         let cert = ExecutionCertificate::new(
             WaveId::new(shard, BlockHeight::new(1), BTreeSet::new()),
-            WeightedTimestamp::ZERO, // epoch 0, outside the schedule
+            WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             vec![],
             zero_bls_signature(),
@@ -3445,7 +3481,7 @@ mod tests {
 
         let behind = TopologySchedule::new(
             ED,
-            Epoch::new(5),
+            Epoch::new(0),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );
         let mut coord = make_test_state();
@@ -3457,7 +3493,7 @@ mod tests {
         signers.set(2);
         let ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
-            WeightedTimestamp::ZERO, // epoch 0, outside the schedule
+            WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             vec![],
             zero_bls_signature(),
