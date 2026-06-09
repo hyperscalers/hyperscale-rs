@@ -170,6 +170,14 @@ impl NodeStateMachine {
                     self.execution_coordinator
                         .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
                 );
+                // A proposer whose committee lookup stalled on the missing
+                // epoch has no other retry signal: without this kick the
+                // view-change timer fires first, the height is re-proposed in
+                // a later round, and the round-contiguous commit rule never
+                // sees the consecutive rounds it needs. The post-dispatch
+                // hook turns the latch into one `try_propose` with fresh
+                // transaction selection.
+                self.shard_coordinator.queue_ready_proposal();
                 actions
             }
             ProtocolEvent::BeaconBlockSyncReadyToApply { block } => self
@@ -221,5 +229,46 @@ impl NodeStateMachine {
                 Vec::new()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_types::{Epoch, LocalTimestamp, Round};
+
+    use super::super::test_support::TestNode;
+
+    /// A proposer whose committee lookup stalls on a not-yet-committed epoch
+    /// has no retry signal other than the beacon adopting that epoch, so
+    /// `BeaconBlockPersisted` must latch a proposal retry for the
+    /// post-dispatch hook to turn into `try_propose`. Without it the
+    /// view-change timer fires first, the height moves to a later round, and
+    /// the round-contiguous commit rule never sees consecutive rounds while
+    /// the beacon trails. End-to-end on a leader, the event must surface a
+    /// `BuildProposal` action.
+    #[test]
+    fn beacon_block_persisted_drives_proposal_through_post_dispatch_hook() {
+        // Rounds increase per block, so height 1 is round 1:
+        // proposer_for(r=1) = committee[1 % 4] = ValidatorId::new(1).
+        let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
+        assert!(
+            node.topology().proposer_for(node.shard_id(), Round::new(1)) == node.validator_id(),
+            "local must be the height-1 proposer for this test",
+        );
+
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch: Epoch::GENESIS,
+            },
+        );
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "expected BuildProposal after BeaconBlockPersisted on a leader; got {actions:?}",
+        );
     }
 }
