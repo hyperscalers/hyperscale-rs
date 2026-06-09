@@ -642,7 +642,7 @@ fn consecutive_skips_advance_chain() {
 /// but the other replicas (2 and 3) saw it. SPC's committed
 /// `PcVector` carries a non-`ZERO` element at validator 0's position
 /// because the ⌈2M/3⌉+1 quorum's input vectors agree. Replica 1's
-/// `decode_committed_proposals` returns `Pending`, the coordinator
+/// commit-assembly decode finds the proposal missing, the coordinator
 /// emits `Action::FetchBeaconProposal`, the sim routes the fetch to
 /// a peer who has the proposal pooled, and replica 1 admits it +
 /// finishes assembly + commits the same block hash as everyone else.
