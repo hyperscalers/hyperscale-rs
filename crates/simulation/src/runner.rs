@@ -938,6 +938,13 @@ impl SimulationRunner {
             } => {
                 let fire_time = self.now + duration;
                 let event = timer_event(&id, shard);
+                // Re-arming replaces the pending fire, matching the
+                // production runner (which aborts the old sleep task).
+                // Leaving the old event queued would deliver a stale fire
+                // for every re-arm.
+                if let Some(old) = self.timers.remove(&(node, shard, id.clone())) {
+                    self.event_queue.remove(&old);
+                }
                 let key = self.schedule_event(node, fire_time, event);
                 self.timers.insert((node, shard, id), key);
                 self.stats.timers_set += 1;
