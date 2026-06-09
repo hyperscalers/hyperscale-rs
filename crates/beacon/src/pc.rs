@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc1, PcQc2,
     PcQc3, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView,
-    ValidatorId, Verified,
+    ValidatorId, Verified, byzantine_threshold,
 };
 
 /// What `PcInstance::handle` tells its parent.
@@ -92,13 +92,6 @@ pub struct PcInstance {
     sent_vote2: bool,
     sent_vote3: bool,
     decided: bool,
-}
-
-/// Byzantine fault threshold for a committee of size `n` — classic
-/// BFT `f = (n - 1) / 3`. Committees too small to tolerate any faults
-/// (`n < 4`) return `0`.
-const fn byzantine_threshold(n: usize) -> usize {
-    n.saturating_sub(1) / 3
 }
 
 impl PcInstance {

@@ -59,6 +59,18 @@ pub const BEACON_SIGNER_COUNT: usize = 4;
 /// instance construction also asserts on it as a tripwire.
 pub const MIN_BEACON_COMMITTEE_SIZE: usize = 4;
 
+/// Byzantine fault threshold for a committee of size `n` — classic BFT
+/// `f = (n - 1) / 3`.
+///
+/// Committees too small to tolerate any faults (`n < 4`) return `0`;
+/// callers deriving `n - f` quorums or `f + 1` indirect-cert thresholds
+/// rely on the committee being sized at or above
+/// [`MIN_BEACON_COMMITTEE_SIZE`].
+#[must_use]
+pub const fn byzantine_threshold(n: usize) -> usize {
+    n.saturating_sub(1) / 3
+}
+
 /// Members per shard.
 ///
 /// Sized to accommodate signer target plus a small headroom for in-sync

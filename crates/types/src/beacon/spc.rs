@@ -40,7 +40,8 @@ use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Hash,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle,
     SignerBitfield, SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
-    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, verify_qc3,
+    aggregate_verify_bls_different_messages, byzantine_threshold, pc_context,
+    pc_vote_signing_message, verify_qc3,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -267,12 +268,6 @@ fn pubkey_in_committee(
         .iter()
         .find(|(id, _)| *id == validator)
         .map(|(_, pk)| *pk)
-}
-
-/// Byzantine fault threshold for a committee of size `n` — classic
-/// BFT `f = (n - 1) / 3`. Threshold for indirect certs is `f + 1`.
-const fn byzantine_threshold(n: usize) -> usize {
-    n.saturating_sub(1) / 3
 }
 
 /// Build the canonical "skip target" vector each empty-view skip

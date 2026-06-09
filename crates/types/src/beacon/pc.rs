@@ -23,7 +23,8 @@ use crate::{
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS,
     MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield,
     SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify,
-    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, spc_context,
+    aggregate_verify_bls_different_messages, byzantine_threshold, pc_context,
+    pc_vote_signing_message, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -826,14 +827,6 @@ fn pubkey_in_committee(
         .iter()
         .find(|(id, _)| *id == validator)
         .map(|(_, pk)| *pk)
-}
-
-/// Byzantine fault threshold for a committee of size `n` — classic
-/// BFT `f = (n - 1) / 3`. Committees too small to tolerate any faults
-/// (`n < 4`) return `0`; verifiers that need `n - f` signers rely on
-/// the caller having sized the committee correctly.
-const fn byzantine_threshold(n: usize) -> usize {
-    n.saturating_sub(1) / 3
 }
 
 /// Build the per-prefix signing messages for a round-1 or round-2 vote.

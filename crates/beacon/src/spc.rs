@@ -29,16 +29,10 @@ use hyperscale_types::{
     Bls12381G1PublicKey, Epoch, MAX_VOTE_VECTOR_LEN, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, SpcCert,
     SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, Verified,
+    byzantine_threshold,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance};
-
-/// Byzantine fault threshold for a committee of size `n` — classic
-/// BFT `f = (n - 1) / 3`. Threshold for indirect-cert aggregation is
-/// `f + 1`.
-const fn byzantine_threshold(n: usize) -> usize {
-    n.saturating_sub(1) / 3
-}
 
 /// Cyclic-shift offset for view `view` in an SPC instance with `n`
 /// parties. Views 1 and 2 use the input ranking (offset 0); from view
