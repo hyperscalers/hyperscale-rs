@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingWithdrawal, ShardId, ShardWitness,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
-    verify_vote_equivocation,
+    MAX_WITNESSES_PER_SHARD, MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingWithdrawal,
+    ShardId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord,
+    ValidatorStatus, verify_vote_equivocation,
 };
 
 use crate::state::vrf::jail_validator;
@@ -178,6 +178,22 @@ pub fn contribution_chunk_valid(
         }
     }
     true
+}
+
+/// Witness chunk bounds for one shard's boundary: `prior` is the applied
+/// watermark (`boundaries[shard].witness_leaf_count`) and
+/// `chunk_end = min(prior + MAX_WITNESSES_PER_SHARD, boundary_count)`,
+/// where `boundary_count` is the boundary header's accumulator count. A
+/// boundary whose count regressed below `prior` yields the empty range
+/// `(prior, prior)`. The proposer's chunk sourcing, the received-block
+/// check, and the fold all derive the range here, so they can't drift on
+/// which leaves a contribution carries.
+#[must_use]
+pub fn chunk_bounds(prior: u64, boundary_count: u64) -> (u64, u64) {
+    let chunk_end = prior
+        .saturating_add(MAX_WITNESSES_PER_SHARD as u64)
+        .min(boundary_count.max(prior));
+    (prior, chunk_end)
 }
 
 /// Dispatch a single shard-witness payload to its handler.

@@ -7,15 +7,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, CertifiedBeaconBlock, Epoch,
-    MAX_WITNESSES_PER_SHARD, NetworkDefinition, ShardBoundary, ShardEpochContribution, ShardId,
-    SlotEffects, TransitionCause, ValidatorId, Verifiable,
+    NetworkDefinition, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects,
+    TransitionCause, ValidatorId, Verifiable,
 };
 
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
-use crate::state::witness::{WitnessOutcome, apply_contribution_witnesses, ingest_equivocations};
+use crate::state::witness::{
+    WitnessOutcome, apply_contribution_witnesses, chunk_bounds, ingest_equivocations,
+};
 
 /// Discriminator for [`apply_epoch`] — distinguishes a Normal epoch
 /// from a Skip epoch (empty proposal set, committee resampled with
@@ -219,7 +221,6 @@ fn record_boundaries(
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
 ) -> WitnessOutcome {
     let dur = state.chain_config.epoch_duration_ms;
-    let cap = MAX_WITNESSES_PER_SHARD as u64;
 
     let mut outcome = WitnessOutcome::default();
     let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
@@ -258,7 +259,7 @@ fn record_boundaries(
         if boundary_count < prior {
             continue;
         }
-        let chunk_end = prior.saturating_add(cap).min(boundary_count);
+        let (_, chunk_end) = chunk_bounds(prior, boundary_count);
         if !apply_contribution_witnesses(
             state,
             header,
@@ -303,10 +304,10 @@ mod tests {
     use hyperscale_types::{
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardBoundary, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot, TransitionCause,
-        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
+        LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardBoundary, ShardId, ShardWitness, ShardWitnessPayload,
+        ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
         zero_bls_signature,
     };
 

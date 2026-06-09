@@ -27,14 +27,14 @@ use hyperscale_types::{
     BeaconState, BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION, Epoch,
     GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
-    MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD, MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition,
-    PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError,
-    PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound,
-    QcContext, QuorumCertificate, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
-    ShardEpochContribution, ShardId, ShardWitness, SkipEpochCert, SkipRequest,
-    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verifiable, Verified, Verify,
+    MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition, PcQc3, PcValueElement,
+    PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound, QcContext,
+    QuorumCertificate, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardEpochContribution,
+    ShardId, ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot,
+    ValidatorId, Verifiable, Verified, Verify,
 };
 use tracing::{trace, warn};
 
@@ -43,7 +43,9 @@ use crate::proposal_pool::BeaconProposalPool;
 use crate::shard_source::ShardSourceTracker;
 use crate::skip_tracker::SkipTracker;
 use crate::spc::{MAX_PENDING_EMPTY_VIEW_AHEAD, SpcEffect, SpcEvent, SpcInstance};
-use crate::state::{apply_epoch, apply_input_for, contribution_chunk_valid, epoch_boundary_below};
+use crate::state::{
+    apply_epoch, apply_input_for, chunk_bounds, contribution_chunk_valid, epoch_boundary_below,
+};
 use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
 
 /// Depth of the coordinator's queryable committee-history window.
@@ -1209,21 +1211,16 @@ impl BeaconCoordinator {
     }
 
     /// The witness chunk bounds for `shard` against `boundary_header`:
-    /// `prior` is the applied watermark (`boundaries[shard].witness_leaf_count`),
-    /// `chunk_end = min(prior + MAX_WITNESSES_PER_SHARD, boundary_count)`.
-    /// A boundary whose count regressed below `prior` yields an empty
-    /// range (`chunk_end == prior`).
+    /// reads the applied watermark from `state.boundaries` and the
+    /// boundary's accumulator count from the header, then derives the
+    /// range via [`chunk_bounds`].
     fn witness_chunk_bounds(&self, shard: ShardId, boundary_header: &BlockHeader) -> (u64, u64) {
         let prior = self
             .state
             .boundaries
             .get(&shard)
             .map_or(0, |b| b.witness_leaf_count.inner());
-        let boundary_count = boundary_header.beacon_witness_leaf_count().inner();
-        let chunk_end = prior
-            .saturating_add(MAX_WITNESSES_PER_SHARD as u64)
-            .min(boundary_count.max(prior));
-        (prior, chunk_end)
+        chunk_bounds(prior, boundary_header.beacon_witness_leaf_count().inner())
     }
 
     /// Drain observed equivocations for the next proposal, capped at
