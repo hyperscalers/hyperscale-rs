@@ -1115,10 +1115,15 @@ impl ShardCoordinator {
             "Received block header"
         );
 
+        // Absorbing the parent QC may have started block sync, latching the
+        // coordinator's syncing flag. The runner only learns the sync target
+        // from the returned action, so every drop path below must still
+        // return `sync_actions` — discarding them leaves the flag set with
+        // no fetch ever issued, and the flag blocks any retrigger.
         let sync_actions = self.absorb_parent_qc_from_header(header);
 
         if self.reject_invalid_header(topology, header) {
-            return vec![];
+            return sync_actions;
         }
 
         // View sync runs only after validation, so a header that fails the
@@ -1128,7 +1133,7 @@ impl ShardCoordinator {
 
         if self.pending_blocks.contains_key(block_hash) {
             trace!("Already have pending block {}", block_hash);
-            return vec![];
+            return sync_actions;
         }
 
         // Don't store headers far above the committed tip. A forged
@@ -1148,7 +1153,7 @@ impl ShardCoordinator {
                 committed = self.committed_height.inner(),
                 "Dropping header — height beyond storage lookahead"
             );
-            return vec![];
+            return sync_actions;
         }
 
         // Cap distinct headers per `(height, round)`. The proposer signs one
@@ -1164,7 +1169,7 @@ impl ShardCoordinator {
                 round = round.inner(),
                 "Dropping header — (height, round) at equivocation cap"
             );
-            return vec![];
+            return sync_actions;
         }
 
         // Per-height cap: evict the stored header farthest from verified
@@ -1176,7 +1181,7 @@ impl ShardCoordinator {
                 round = round.inner(),
                 "Dropping header — height at pending cap and no farther entry to evict"
             );
-            return vec![];
+            return sync_actions;
         };
 
         self.pending_blocks.assemble(
@@ -4540,6 +4545,76 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
+    }
+
+    /// A header can both trigger block sync (missing parent) and itself be
+    /// dropped (its committee epoch isn't in the schedule yet — the local
+    /// beacon is behind). The sync trigger latches the coordinator's syncing
+    /// flag, and the runner only learns the target from the returned
+    /// `StartBlockSync` action, so the drop path must still return it.
+    /// Swallowing it leaves the flag set with no fetch ever issued, and the
+    /// flag blocks every retrigger — a permanent sync wedge.
+    #[test]
+    fn dropped_header_still_returns_the_sync_trigger_it_latched() {
+        let (mut state, full) = make_multi_validator_state_at(1);
+
+        // Retain only epoch 0; the header below keys its committee at epoch
+        // 10, which resolves as not-yet-committed and drops the header.
+        let behind = TopologySchedule::new(5_000, Epoch::GENESIS, Arc::clone(full.head()));
+
+        let parent_height = BlockHeight::new(9);
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"missing_parent"));
+        let parent_qc = QuorumCertificate::new(
+            parent_block_hash,
+            ShardId::ROOT,
+            parent_height,
+            BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
+            Round::new(9),
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(50_000),
+        );
+        let header = BlockHeader::new(
+            ShardId::ROOT,
+            BlockHeight::new(10),
+            parent_block_hash,
+            parent_qc,
+            ValidatorId::new(2),
+            ProposerTimestamp::from_millis(50_000),
+            Round::new(10),
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+        );
+
+        let actions = state.on_block_header(
+            &behind,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+
+        assert!(
+            state.is_block_syncing(),
+            "missing parent must latch the syncing flag"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == parent_height
+            )),
+            "the dropped header's sync trigger must reach the runner"
         );
     }
 
