@@ -1667,11 +1667,7 @@ impl BeaconCoordinator {
                         recipients: recipients.to_vec(),
                     });
                 }
-                SpcEffect::BroadcastNewCommit {
-                    view,
-                    value: _,
-                    proof,
-                } => {
+                SpcEffect::BroadcastNewCommit { view, proof } => {
                     let msg = Verified::<SpcNewCommitMsg>::from_verified_proof(view, *proof);
                     actions.push(Action::BroadcastSpcNewCommit {
                         epoch,

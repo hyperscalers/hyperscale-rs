@@ -168,10 +168,13 @@ impl SpcSim {
                         cert: cert.clone(),
                     });
                 }
-                SpcEffect::BroadcastNewCommit { view, value, proof } => {
+                SpcEffect::BroadcastNewCommit { view, proof } => {
+                    // The wire message is built from the proof, so the
+                    // delivered value is `proof.x_pp` — same binding the
+                    // production driver hands the FSM.
                     self.fanout(sender_idx, |_| SpcEvent::NewCommitVerified {
                         view,
-                        value: value.clone(),
+                        value: proof.x_pp().clone(),
                         proof: proof.clone(),
                     });
                 }

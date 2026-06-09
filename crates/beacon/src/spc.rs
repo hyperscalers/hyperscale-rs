@@ -175,15 +175,15 @@ pub enum SpcEffect {
         cert: Box<Verified<SpcCert>>,
     },
     /// Broadcast a `new-commit` to peers — `view`'s inner PC produced
-    /// the (low, proof) pair, anchoring the commit walk. Emitted only
-    /// for `view ≥ 2`; view 1's low is computed but not broadcast,
-    /// since peers learn view-1's QC3 from view-2's direct cert.
+    /// the (low, proof) pair, anchoring the commit walk. The committed
+    /// low rides as `proof.x_pp`; the wire message is built from the
+    /// proof alone. Emitted only for `view ≥ 2`; view 1's low is
+    /// computed but not broadcast, since peers learn view-1's QC3 from
+    /// view-2's direct cert.
     BroadcastNewCommit {
         /// View whose inner PC produced this commit.
         view: SpcView,
-        /// Committed low value.
-        value: PcVector,
-        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
+        /// PC round-3 cert anchoring the committed low as `proof.x_pp`.
         proof: Box<Verified<PcQc3>>,
     },
     /// Pass-through of an inner-PC equivocation, tagged with the SPC
@@ -582,7 +582,6 @@ impl SpcInstance {
         if self.new_commit_broadcast.insert(view) {
             out.push(SpcEffect::BroadcastNewCommit {
                 view,
-                value: low.clone(),
                 proof: Box::new(proof),
             });
             // `commit` walks the parent chain back toward view 1.
@@ -701,7 +700,6 @@ impl SpcInstance {
         if self.new_commit_broadcast.insert(view) {
             out.push(SpcEffect::BroadcastNewCommit {
                 view,
-                value: value.clone(),
                 proof: Box::new(proof),
             });
         }
