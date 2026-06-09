@@ -381,13 +381,23 @@ impl BeaconCoordinator {
 
     /// `TimerId::BeaconSkipTrigger` fired — the next epoch's expected
     /// block hasn't committed within `SKIP_TIMEOUT` of its boundary.
-    /// If the local validator sits on the active pool, sign and
-    /// broadcast a [`SkipRequest`] for the next epoch at the current
-    /// tip; otherwise no-op.
+    /// If the deadline has truly passed and the local validator sits on
+    /// the active pool, sign and broadcast a [`SkipRequest`] for the
+    /// next epoch at the current tip; otherwise no-op.
+    ///
+    /// The deadline is re-validated at fire time because the request is
+    /// built from the *current* tip and epoch: a fire armed against an
+    /// older tip looks fresh once the chain advances, and broadcasting
+    /// it would ask to skip an epoch whose window may not even have
+    /// opened. Re-checking makes any stale or early fire harmless.
     ///
     /// The action handler signs the request (the coordinator has no
     /// key) and emits the loopback into `on_verified_skip_request_received`.
     pub fn on_beacon_skip_timer(&self) -> Vec<Action> {
+        if !self.skip_trigger_due(self.next_epoch_boundary()) {
+            trace!("BeaconSkipTrigger fired before the next epoch's skip deadline");
+            return Vec::new();
+        }
         let local_on_active_pool = self
             .state
             .derive_active_pool()
@@ -2375,6 +2385,37 @@ mod tests {
         assert!(!coord.skip_trigger_due(expected));
         coord.set_now(LocalTimestamp::from_millis(100_000 + timeout_ms));
         assert!(coord.skip_trigger_due(expected));
+    }
+
+    /// The skip-trigger fire re-validates the deadline against the
+    /// *current* next epoch. A fire before that deadline — a re-armed
+    /// timer racing an adoption — must not broadcast: the request it
+    /// would build anchors at the current tip and names the current next
+    /// epoch, so nothing downstream could tell it was stale.
+    #[test]
+    fn skip_timer_fire_before_the_deadline_broadcasts_nothing() {
+        let mut coord = fresh_coord();
+        let boundary = coord.current_state().chain_config.epoch_duration_ms;
+        let timeout_ms: u64 = SKIP_TIMEOUT
+            .as_millis()
+            .try_into()
+            .expect("SKIP_TIMEOUT fits in u64 millis");
+
+        coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms - 1));
+        assert!(
+            coord.on_beacon_skip_timer().is_empty(),
+            "an early fire must not broadcast a skip request",
+        );
+
+        coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
+        let actions = coord.on_beacon_skip_timer();
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::BroadcastSkipRequest { epoch_to_skip, .. }
+                    if epoch_to_skip.inner() == 1)
+            ),
+            "a fire past the deadline must broadcast for the next epoch; got {actions:?}",
+        );
     }
 
     #[test]
