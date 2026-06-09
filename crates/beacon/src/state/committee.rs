@@ -206,7 +206,7 @@ mod tests {
         TransitionCause, ValidatorId, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{
+    use crate::state::test_fixtures::{
         apply_next_epoch, empty_state, single_pool_state, validator_record,
     };
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────

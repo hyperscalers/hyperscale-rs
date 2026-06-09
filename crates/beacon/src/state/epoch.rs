@@ -8,16 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, CertifiedBeaconBlock, Epoch,
     NetworkDefinition, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects,
-    TransitionCause, ValidatorId, Verifiable,
+    TransitionCause, ValidatorId,
 };
 
+use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
-use crate::state::witness::{
-    WitnessOutcome, apply_contribution_witnesses, chunk_bounds, ingest_equivocations,
-};
+use crate::state::witness::{WitnessOutcome, apply_contribution_witnesses, ingest_equivocations};
 
 /// Discriminator for [`apply_epoch`] — distinguishes a Normal epoch
 /// from a Skip epoch (empty proposal set, committee resampled with
@@ -174,22 +173,6 @@ pub fn apply_epoch(
     }
 }
 
-/// The largest epoch-boundary weighted timestamp strictly below `wt`
-/// (`k × epoch_duration_ms` for the greatest `k ≥ 1`), or `None` when no
-/// boundary lies below it. The boundary block's predecessor must sit
-/// at/before this for the block to be the first across the boundary.
-pub const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
-    if epoch_duration_ms == 0 || wt == 0 {
-        return None;
-    }
-    let k = (wt - 1) / epoch_duration_ms;
-    if k == 0 {
-        None
-    } else {
-        Some(k * epoch_duration_ms)
-    }
-}
-
 /// Record each shard's epoch boundary from the committed contributions and
 /// apply each boundary's witness chunk.
 ///
@@ -221,30 +204,28 @@ fn record_boundaries(
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
 ) -> WitnessOutcome {
     let dur = state.chain_config.epoch_duration_ms;
+    // Bind each contribution to its shard's canonical committed QC — the
+    // same selection the receiver's `contributions_well_formed` gate
+    // applied — so the fold and the verifier never diverge on which QC
+    // governs the boundary.
+    let canonical = canonical_boundary_qcs(committed.iter().map(|(_, p)| p));
 
     let mut outcome = WitnessOutcome::default();
     let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
     for (shard, contribution) in shard_contributions {
         let header = &contribution.boundary_header;
         let block_hash = header.hash();
-        // Bind the contribution to a committed boundary QC that names it.
-        let Some(qc) = committed.iter().find_map(|(_, proposal)| {
-            proposal
-                .boundary_qcs()
-                .get(shard)
-                .and_then(|opt| opt.as_ref())
-                .map(Verifiable::as_unverified)
-                .filter(|qc| qc.block_hash() == block_hash)
-        }) else {
+        let Some(qc) = canonical
+            .get(shard)
+            .copied()
+            .filter(|qc| qc.block_hash() == block_hash)
+        else {
             continue;
         };
-        // Require a genuine epoch crossing: the boundary block (weighted
-        // timestamp `qc.wt`) is the first across some epoch boundary, so
-        // its predecessor sits at or before the cut.
-        let Some(cut) = epoch_boundary_below(qc.weighted_timestamp().as_millis(), dur) else {
-            continue;
-        };
-        if header.parent_qc().weighted_timestamp().as_millis() > cut {
+        // Require a genuine epoch crossing: the boundary block is the first
+        // block across some epoch boundary, so its predecessor sits at or
+        // before the cut.
+        if !is_boundary_crossing(header, qc, dur) {
             continue;
         }
         // Chunk math (0-based, count-aligned): `prior` is the applied
@@ -311,8 +292,8 @@ mod tests {
         zero_bls_signature,
     };
 
-    use super::super::test_fixtures::{net, single_pool_state};
     use super::*;
+    use crate::state::test_fixtures::{net, single_pool_state};
 
     // ─── boundary fold ──────────────────────────────────────────────────────
 

@@ -64,8 +64,8 @@ mod tests {
         StakePoolId, ValidatorId, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{empty_state, validator_record};
     use super::*;
+    use crate::state::test_fixtures::{empty_state, validator_record};
 
     // ─── pool_draw ───────────────────────────────────────────────────────
 

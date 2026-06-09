@@ -159,7 +159,7 @@ mod tests {
         JailReason, MIN_STAKE_FLOOR, ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{
+    use crate::state::test_fixtures::{
         apply_next_epoch, malformed_vrf_proposal, single_pool_state, validator_record, vrf_proposal,
     };
     // ─── filter_and_roll_randomness ──────────────────────────────────────

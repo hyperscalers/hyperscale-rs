@@ -12,12 +12,14 @@
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
 
 pub mod action_handlers;
+pub mod boundary;
 pub mod commit_assembly;
 pub mod coordinator;
 pub mod equivocations;
 pub mod genesis;
 pub mod pc;
 pub mod proposal_pool;
+pub mod rules;
 pub mod sampling;
 pub mod shard_source;
 pub mod skip_tracker;

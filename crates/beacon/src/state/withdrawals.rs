@@ -144,7 +144,7 @@ mod tests {
         StakePoolId, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{apply_next_epoch, state_with_pending_withdrawal};
+    use crate::state::test_fixtures::{apply_next_epoch, state_with_pending_withdrawal};
     // ─── complete_pending_withdrawals ────────────────────────────────────
 
     /// A withdrawal still within the unbonding window stays pending —

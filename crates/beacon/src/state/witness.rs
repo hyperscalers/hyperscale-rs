@@ -5,11 +5,12 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason,
-    MAX_WITNESSES_PER_SHARD, MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingWithdrawal,
-    ShardId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord,
-    ValidatorStatus, verify_vote_equivocation,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingWithdrawal, ShardId, ShardWitness,
+    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
+    verify_vote_equivocation,
 };
 
+use crate::rules;
 use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
@@ -139,7 +140,7 @@ pub(super) fn apply_contribution_witnesses(
     chunk_end: u64,
     outcome: &mut WitnessOutcome,
 ) -> bool {
-    if !contribution_chunk_valid(boundary_header, witnesses, prior, chunk_end) {
+    if !rules::contribution_chunk_valid(boundary_header, witnesses, prior, chunk_end) {
         return false;
     }
     for witness in witnesses {
@@ -148,52 +149,6 @@ pub(super) fn apply_contribution_witnesses(
         }
     }
     true
-}
-
-/// Whether `witnesses` are exactly the contiguous, ascending 0-based leaf
-/// range `[prior, chunk_end)`, each merkle-proving into
-/// `boundary_header.beacon_witness_root()`. The shared shape check behind
-/// both the fold's [`apply_contribution_witnesses`] and the coordinator's
-/// received-block `contributions_well_formed`, so producer and verifier
-/// can't drift. Pure — no state, no topology.
-#[must_use]
-pub fn contribution_chunk_valid(
-    boundary_header: &BlockHeader,
-    witnesses: &[ShardWitness],
-    prior: u64,
-    chunk_end: u64,
-) -> bool {
-    let Ok(expected_len) = usize::try_from(chunk_end.saturating_sub(prior)) else {
-        return false;
-    };
-    if witnesses.len() != expected_len {
-        return false;
-    }
-    for (offset, witness) in witnesses.iter().enumerate() {
-        if witness.proof.leaf_index.inner() != prior + offset as u64 {
-            return false;
-        }
-        if !witness.merkle_includes_in(boundary_header) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Witness chunk bounds for one shard's boundary: `prior` is the applied
-/// watermark (`boundaries[shard].witness_leaf_count`) and
-/// `chunk_end = min(prior + MAX_WITNESSES_PER_SHARD, boundary_count)`,
-/// where `boundary_count` is the boundary header's accumulator count. A
-/// boundary whose count regressed below `prior` yields the empty range
-/// `(prior, prior)`. The proposer's chunk sourcing, the received-block
-/// check, and the fold all derive the range here, so they can't drift on
-/// which leaves a contribution carries.
-#[must_use]
-pub fn chunk_bounds(prior: u64, boundary_count: u64) -> (u64, u64) {
-    let chunk_end = prior
-        .saturating_add(MAX_WITNESSES_PER_SHARD as u64)
-        .min(boundary_count.max(prior));
-    (prior, chunk_end)
 }
 
 /// Dispatch a single shard-witness payload to its handler.
@@ -426,12 +381,13 @@ mod tests {
         StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{
+    use super::*;
+    use crate::rules::contribution_chunk_valid;
+    use crate::state::test_fixtures::{
         applied_count, apply_next_epoch, apply_witness_chunk, boundary_chunk, keypair,
         malformed_vrf_proposal, net, pubkey, single_pool_state, validator_record,
         vrf_proposal_with_equivocations,
     };
-    use super::*;
 
     fn deposit(pool: u32, amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {

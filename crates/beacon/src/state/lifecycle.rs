@@ -192,11 +192,11 @@ mod tests {
         ValidatorRecord, ValidatorStatus,
     };
 
-    use super::super::test_fixtures::{
+    use super::distribute_epoch_rewards;
+    use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, pubkey, single_pool_state,
         state_with_pending_withdrawal, validator_record,
     };
-    use super::distribute_epoch_rewards;
     // ─── auto_reactivate ─────────────────────────────────────────────────
 
     /// Build a pool with `n_active` validators (`OnShard`) plus

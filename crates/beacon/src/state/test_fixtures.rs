@@ -1,6 +1,6 @@
 //! Shared test fixtures for state-module tests. Each submodule's
 //! `#[cfg(test)] mod tests` pulls these in via
-//! `use super::super::test_fixtures::*` so common scaffolding
+//! `use crate::test_fixtures::*` so common scaffolding
 //! (keypair derivation, VRF-signed proposals, single-pool state)
 //! lives in one place.
 
