@@ -366,7 +366,7 @@ impl Verified<Provisions> {
 
 #[cfg(test)]
 mod tests {
-    use sbor::{Categorize as _, DecodeError, Encoder as _, NoCustomValueKind, ValueKind};
+    use sbor::{DecodeError, Encoder as _, NoCustomValueKind, ValueKind};
 
     use super::*;
 

@@ -556,7 +556,7 @@ async fn handle_inbound(
     })
     .await;
 
-    result.map_or(Err(BindError::Timeout), |inner| inner)
+    result.unwrap_or(Err(BindError::Timeout))
 }
 
 /// Handle an outbound bind (we are the initiator).
@@ -612,7 +612,7 @@ async fn handle_outbound(
     })
     .await;
 
-    result.map_or(Err(BindError::Timeout), |inner| inner)
+    result.unwrap_or(Err(BindError::Timeout))
 }
 
 #[cfg(test)]

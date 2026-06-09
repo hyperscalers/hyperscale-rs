@@ -507,8 +507,8 @@ impl Verified<BlockHeader> {
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize as _, DecodeError,
-        Encoder as _, NoCustomValueKind, ValueKind, VecEncoder, basic_decode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder as _,
+        NoCustomValueKind, ValueKind, VecEncoder, basic_decode,
     };
 
     use super::*;
