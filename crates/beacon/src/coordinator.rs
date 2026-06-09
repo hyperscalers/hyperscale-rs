@@ -1,9 +1,9 @@
 //! Top-level beacon FSM.
 //!
 //! [`BeaconCoordinator`] is the per-vnode state machine; it owns the
-//! committed [`BeaconState`], the optional current-epoch
-//! [`SpcInstance`], and the wall-clock anchor that drives
-//! epoch-cadence timers.
+//! committed [`BeaconState`], the [`SpcDriver`](crate::spc_driver::SpcDriver)
+//! consensus plane, and the wall-clock anchor that drives epoch-cadence
+//! timers.
 //!
 //! Constructor is pure synchronous data assembly — the runner is
 //! responsible for loading `(latest_block, latest_state)` from
@@ -27,14 +27,13 @@ use hyperscale_types::{
     BeaconState, BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION, Epoch,
     GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
-    MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition, PcQc3, PcValueElement,
-    PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound, QcContext,
-    QuorumCertificate, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardEpochContribution,
-    ShardId, ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot,
-    ValidatorId, Verifiable, Verified, Verify,
+    MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement, PcVector, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    PcVoteEquivocation, PcVoteEquivocationContext, QcContext, QuorumCertificate, RETENTION_HORIZON,
+    SKIP_TIMEOUT, ShardEpochContribution, ShardId, ShardWitness, SkipEpochCert, SkipRequest,
+    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySchedule, TopologySnapshot, ValidatorId, Verifiable, Verified, Verify,
 };
 use tracing::{trace, warn};
 
@@ -43,11 +42,12 @@ use crate::equivocations::EquivocationObservations;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::shard_source::ShardSourceTracker;
 use crate::skip_tracker::SkipTracker;
-use crate::spc::{MAX_PENDING_EMPTY_VIEW_AHEAD, SpcEffect, SpcEvent, SpcInstance};
+use crate::spc::SpcEffect;
+use crate::spc_driver::SpcDriver;
 use crate::state::{
     apply_epoch, apply_input_for, chunk_bounds, contribution_chunk_valid, epoch_boundary_below,
 };
-use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
+use crate::verification::BeaconVerificationPipeline;
 
 /// Depth of the coordinator's queryable committee-history window.
 ///
@@ -78,13 +78,14 @@ pub struct BeaconCoordinator {
     /// checks read `prev_block_hash` without a storage roundtrip.
     latest_block: Arc<Verified<CertifiedBeaconBlock>>,
 
-    /// `None` between bootstrap and the first epoch-boundary
-    /// trigger, and again briefly between an epoch's commit and the
-    /// next instance's bootstrap.
-    spc: Option<SpcInstance>,
+    /// SPC consensus-plane driver: the optional current-epoch instance
+    /// plus the PC-vote and SPC-message verification slot pools. Bare
+    /// between bootstrap and the first epoch-boundary trigger, and again
+    /// briefly between an epoch's commit and the next bootstrap.
+    spc: SpcDriver,
 
-    /// In-flight and verified slot tracking for async crypto checks
-    /// (block cert sigs + skip-request sigs). Dedup-only — the payload
+    /// In-flight slot tracking for the async crypto checks the coordinator
+    /// owns (block cert sigs + skip-request sigs). Dedup-only — the payload
     /// rides through the dispatch/result round-trip in the action and
     /// event themselves, not stashed here.
     verification: BeaconVerificationPipeline,
@@ -228,7 +229,7 @@ impl BeaconCoordinator {
         Self {
             state,
             latest_block,
-            spc: None,
+            spc: SpcDriver::new(me),
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
             skip_tracker: SkipTracker::new(),
@@ -353,61 +354,24 @@ impl BeaconCoordinator {
         }]
     }
 
-    /// A peer's round-1 PC vote arrived. Gate on instance/skip-quorum,
-    /// mark the slot in-flight, and dispatch the BLS check to the
-    /// crypto pool. Admission happens in [`Self::on_pc_vote1_verified`]
-    /// when the result lands.
+    /// A peer's round-1 PC vote arrived. Gate, dedup, and dispatch the
+    /// BLS check via the [`SpcDriver`]. Admission happens in
+    /// [`Self::on_pc_vote1_verified`] when the result lands.
     pub fn on_pc_vote1_received(&mut self, view: SpcView, vote: PcVote1) -> Vec<Action> {
-        let validator = vote.validator();
-        let Some((epoch, committee)) = self.spc_admission_ctx(validator, view, "PcVote") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, validator, PcVoteRound::Vote1);
-        if !self.verification.mark_pc_vote_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifyPcVote1 {
-            epoch,
-            view,
-            vote: Verifiable::from(vote),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_pc_vote1_received(view, vote, skip)
     }
 
     /// A peer's round-2 PC vote arrived.
     pub fn on_pc_vote2_received(&mut self, view: SpcView, vote: Box<PcVote2>) -> Vec<Action> {
-        let validator = vote.validator();
-        let Some((epoch, committee)) = self.spc_admission_ctx(validator, view, "PcVote") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, validator, PcVoteRound::Vote2);
-        if !self.verification.mark_pc_vote_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifyPcVote2 {
-            epoch,
-            view,
-            vote: Box::new(Verifiable::from(*vote)),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_pc_vote2_received(view, vote, skip)
     }
 
     /// A peer's round-3 PC vote arrived.
     pub fn on_pc_vote3_received(&mut self, view: SpcView, vote: Box<PcVote3>) -> Vec<Action> {
-        let validator = vote.validator();
-        let Some((epoch, committee)) = self.spc_admission_ctx(validator, view, "PcVote") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, validator, PcVoteRound::Vote3);
-        if !self.verification.mark_pc_vote_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifyPcVote3 {
-            epoch,
-            view,
-            vote: Box::new(Verifiable::from(*vote)),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_pc_vote3_received(view, vote, skip)
     }
 
     /// A peer's SPC `new-view` arrived. Gate on instance/skip-quorum,
@@ -419,153 +383,42 @@ impl BeaconCoordinator {
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
     ) -> Vec<Action> {
-        let view = proposal.view;
-        let Some((epoch, committee)) = self.spc_admission_ctx(from, view, "NewView") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, from, SpcMsgKind::NewView);
-        if !self.verification.mark_spc_msg_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifySpcNewView {
-            epoch,
-            from,
-            proposal: Box::new(Arc::unwrap_or_clone(proposal)),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_spc_new_view_received(from, proposal, skip)
     }
 
-    /// A peer's SPC `new-commit` arrived. Gate on instance/skip-quorum,
-    /// mark the slot in-flight, and dispatch the embedded QC3's BLS check
-    /// to the crypto pool. Admission happens in
-    /// [`Self::on_spc_new_commit_verified`] when the result lands.
+    /// A peer's SPC `new-commit` arrived.
     pub fn on_spc_new_commit_received(
         &mut self,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
     ) -> Vec<Action> {
-        let view = msg.view;
-        let Some((epoch, committee)) = self.spc_admission_ctx(from, view, "NewCommit") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, from, SpcMsgKind::NewCommit);
-        if !self.verification.mark_spc_msg_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifySpcNewCommit {
-            epoch,
-            from,
-            msg: Box::new(Arc::unwrap_or_clone(msg)),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_spc_new_commit_received(from, msg, skip)
     }
 
-    /// A peer's SPC `empty-view` attestation arrived. Gate on
-    /// instance/skip-quorum, mark the slot in-flight (keyed by the
-    /// embedded signer), and dispatch the BLS check to the crypto pool.
-    /// Admission happens in [`Self::on_spc_empty_view_verified`] when
-    /// the result lands.
+    /// A peer's SPC `empty-view` attestation arrived.
     pub fn on_unverified_spc_empty_view_received(
         &mut self,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        let signer = msg.signer;
-        let view = msg.view;
-        let Some((epoch, committee)) = self.spc_admission_ctx(signer, view, "EmptyView") else {
-            return Vec::new();
-        };
-        let key = (epoch, view, signer, SpcMsgKind::EmptyView);
-        if !self.verification.mark_spc_msg_in_flight(key) {
-            return Vec::new();
-        }
-        vec![Action::VerifySpcEmptyView {
-            epoch,
-            msg: Box::new(Arc::unwrap_or_clone(msg)),
-            committee,
-        }]
+        let skip = self.skip_quorum_at_tip();
+        self.spc.on_unverified_spc_empty_view_received(msg, skip)
     }
 
     /// A locally-signed empty-view attestation arrived via the
-    /// `Action::SignAndBroadcastEmptyView` self-loopback path. The
-    /// signing-key holder produced the BLS sig over a verified high
-    /// triple, so the message is verified by construction — feed it
-    /// directly into the SPC sub-machine without the verify round-trip.
+    /// `Action::SignAndBroadcastEmptyView` self-loopback path — verified
+    /// by construction, so it feeds the FSM directly.
     pub fn on_verified_spc_empty_view_received(
         &mut self,
         msg: Box<Verified<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        let signer = msg.signer;
-        if self
-            .spc_admission_ctx(signer, msg.view, "VerifiedEmptyView")
-            .is_none()
-        {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(msg))
+        let skip = self.skip_quorum_at_tip();
+        let effects = self.spc.on_verified_spc_empty_view_received(msg, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// Common gating for the SPC receive entries: returns the
-    /// `(epoch, committee)` pair if the message is admissible, else logs
-    /// and returns `None`. Four gates, all cheap and applied before the
-    /// BLS dispatch so a flood can't mint verification slots:
-    ///
-    /// 1. The local SPC instance is bootstrapped.
-    /// 2. Skip-quorum hasn't been reached at the local tip.
-    /// 3. `signer` (the claimed vote/message signer, which keys the
-    ///    verification slot) is a current committee member — a
-    ///    non-committee signer can't contribute to consensus.
-    /// 4. `view` is within `[current_view, current_view +
-    ///    MAX_PENDING_EMPTY_VIEW_AHEAD]` — the window the FSM can act on.
-    ///
-    /// Gates 3 and 4 bound the `(signer, view)` slot key to
-    /// `committee_size × window`, so a peer flooding fabricated signers
-    /// or views can't grow the in-flight verification pools without
-    /// bound.
-    fn spc_admission_ctx(
-        &self,
-        signer: ValidatorId,
-        view: SpcView,
-        kind: &'static str,
-    ) -> Option<(Epoch, Vec<(ValidatorId, Bls12381G1PublicKey)>)> {
-        let Some(spc) = self.spc.as_ref() else {
-            trace!(
-                ?signer,
-                kind, "SPC message received but no SPC instance bootstrapped",
-            );
-            return None;
-        };
-        if self.skip_quorum_at_tip() {
-            trace!(
-                ?signer,
-                kind, "SPC message received but skip-quorum reached at local tip — dropping",
-            );
-            return None;
-        }
-        if !spc.committee().iter().any(|(id, _)| *id == signer) {
-            trace!(
-                ?signer,
-                kind, "SPC message from non-committee signer — dropping before dispatch",
-            );
-            return None;
-        }
-        let current = spc.current_view().inner();
-        if view.inner() < current
-            || view.inner() > current.saturating_add(MAX_PENDING_EMPTY_VIEW_AHEAD)
-        {
-            trace!(
-                view = view.inner(),
-                current,
-                kind,
-                "SPC message view outside the actionable window — dropping before dispatch",
-            );
-            return None;
-        }
-        Some((spc.epoch(), spc.committee().to_vec()))
-    }
-
-    /// Result of an [`Action::VerifySpcNewView`] dispatch. The view is
-    /// extracted from the unverified payload at dispatch time and
-    /// carried back here so the slot can be cleared on both arms.
+    /// Result of an [`Action::VerifySpcNewView`] dispatch.
     pub fn on_spc_new_view_verified(
         &mut self,
         epoch: Epoch,
@@ -573,34 +426,11 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     ) -> Vec<Action> {
-        let key = (epoch, view, from, SpcMsgKind::NewView);
-        let proposal = match result {
-            Ok(p) => p,
-            Err(err) => {
-                self.verification.forget_spc_msg(key);
-                warn!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    %err,
-                    "SPC NewView cert verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.verification.forget_spc_msg(key);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        let cert = Verified::<SpcCert>::from_verified_proposal_object(proposal);
-        self.dispatch_spc_event(
-            from,
-            SpcEvent::NewViewVerified {
-                from,
-                view,
-                cert: Box::new(cert),
-            },
-        )
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_spc_new_view_verified(epoch, from, view, result, skip);
+        self.lift_from_spc(effects)
     }
 
     /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
@@ -611,35 +441,11 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     ) -> Vec<Action> {
-        let key = (epoch, view, from, SpcMsgKind::NewCommit);
-        let msg = match result {
-            Ok(m) => m,
-            Err(err) => {
-                self.verification.forget_spc_msg(key);
-                warn!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    %err,
-                    "SPC NewCommit QC3 verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.verification.forget_spc_msg(key);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        let value = msg.value.clone();
-        let proof = Verified::<PcQc3>::from_verified_new_commit(msg);
-        self.dispatch_spc_event(
-            from,
-            SpcEvent::NewCommitVerified {
-                view,
-                value,
-                proof: Box::new(proof),
-            },
-        )
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_spc_new_commit_verified(epoch, from, view, result, skip);
+        self.lift_from_spc(effects)
     }
 
     /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
@@ -650,33 +456,14 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
     ) -> Vec<Action> {
-        let key = (epoch, view, from, SpcMsgKind::EmptyView);
-        let msg = match result {
-            Ok(m) => m,
-            Err(err) => {
-                self.verification.forget_spc_msg(key);
-                warn!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    %err,
-                    "SPC EmptyView verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.verification.forget_spc_msg(key);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(from, SpcEvent::EmptyViewVerified(Box::new(msg)))
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_spc_empty_view_verified(epoch, from, view, result, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// Result of an [`Action::VerifyPcVote1`] dispatch. Clears the
-    /// pipeline slot, routes the verified vote through
-    /// `SpcEvent::PcVoteVerified`, drops on verify failure. Stale
-    /// results (instance gone, epoch advanced, skip-quorum reached) are
-    /// tolerated by the inner `dispatch_spc_event` gating.
+    /// Result of an [`Action::VerifyPcVote1`] dispatch.
     pub fn on_pc_vote1_verified(
         &mut self,
         epoch: Epoch,
@@ -684,31 +471,11 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     ) -> Vec<Action> {
-        let verified = match result {
-            Ok(v) => v,
-            Err(err) => {
-                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1);
-                warn!(
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    ?signer,
-                    ?err,
-                    "PC vote-1 BLS verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVote1Verified {
-                view,
-                vote: verified,
-            },
-        )
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_pc_vote1_verified(epoch, view, signer, result, skip);
+        self.lift_from_spc(effects)
     }
 
     /// Result of an [`Action::VerifyPcVote2`] dispatch.
@@ -719,31 +486,11 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     ) -> Vec<Action> {
-        let verified = match result {
-            Ok(v) => v,
-            Err(err) => {
-                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2);
-                warn!(
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    ?signer,
-                    ?err,
-                    "PC vote-2 BLS verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVote2Verified {
-                view,
-                vote: Box::new(verified),
-            },
-        )
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_pc_vote2_verified(epoch, view, signer, result, skip);
+        self.lift_from_spc(effects)
     }
 
     /// Result of an [`Action::VerifyPcVote3`] dispatch.
@@ -754,112 +501,53 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     ) -> Vec<Action> {
-        let verified = match result {
-            Ok(v) => v,
-            Err(err) => {
-                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3);
-                warn!(
-                    epoch = epoch.inner(),
-                    view = view.inner(),
-                    ?signer,
-                    ?err,
-                    "PC vote-3 BLS verification failed — dropping",
-                );
-                return Vec::new();
-            }
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVote3Verified {
-                view,
-                vote: Box::new(verified),
-            },
-        )
+        let skip = self.skip_quorum_at_tip();
+        let effects = self
+            .spc
+            .on_pc_vote3_verified(epoch, view, signer, result, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// A round-1 PC vote that the coordinator received already
-    /// verified — fed in via the local sign-and-emit handler (or by a
-    /// colocated peer's local-dispatch fast path). Skips the verify
-    /// dispatch and routes straight to the SPC sub-machine.
+    /// A round-1 PC vote the coordinator received already verified — fed
+    /// in via the local sign-and-emit path. Routes straight into the FSM.
     pub fn on_verified_pc_vote1_received(
         &mut self,
         view: SpcView,
         vote: Verified<PcVote1>,
     ) -> Vec<Action> {
-        let signer = vote.validator();
-        let Some((epoch, _)) = self.spc_admission_ctx(signer, view, "PcVote") else {
-            return Vec::new();
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote })
+        let skip = self.skip_quorum_at_tip();
+        let effects = self.spc.on_verified_pc_vote1_received(view, vote, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// A round-2 PC vote that the coordinator received already verified.
+    /// A round-2 PC vote the coordinator received already verified.
     pub fn on_verified_pc_vote2_received(
         &mut self,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
     ) -> Vec<Action> {
-        let signer = vote.validator();
-        let Some((epoch, _)) = self.spc_admission_ctx(signer, view, "PcVote") else {
-            return Vec::new();
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVote2Verified { view, vote })
+        let skip = self.skip_quorum_at_tip();
+        let effects = self.spc.on_verified_pc_vote2_received(view, vote, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// A round-3 PC vote that the coordinator received already verified.
+    /// A round-3 PC vote the coordinator received already verified.
     pub fn on_verified_pc_vote3_received(
         &mut self,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
     ) -> Vec<Action> {
-        let signer = vote.validator();
-        let Some((epoch, _)) = self.spc_admission_ctx(signer, view, "PcVote") else {
-            return Vec::new();
-        };
-        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
-            return Vec::new();
-        }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVote3Verified { view, vote })
+        let skip = self.skip_quorum_at_tip();
+        let effects = self.spc.on_verified_pc_vote3_received(view, vote, skip);
+        self.lift_from_spc(effects)
     }
 
-    /// Shared slot-clear helper used by all three per-round PC vote
-    /// verify-result handlers. The signer is extracted from the
-    /// unverified payload at dispatch time and carried back in the
-    /// result event, so the slot can be cleared on both arms.
-    fn clear_pc_vote_slot(
-        &mut self,
-        epoch: Epoch,
-        view: SpcView,
-        signer: ValidatorId,
-        round: PcVoteRound,
-    ) {
-        self.verification
-            .forget_pc_vote((epoch, view, signer, round));
-    }
-
-    /// `TimerId::BeaconSpcView` fired. Route a synthesized
-    /// `TimerExpired` into SPC against its current view — the FSM's
-    /// stale-view guard no-ops if the view has already advanced.
+    /// `TimerId::BeaconSpcView` fired. Route a synthesized `TimerExpired`
+    /// into the SPC instance against its current view.
     pub fn on_beacon_spc_view_timer(&mut self) -> Vec<Action> {
-        let Some(spc) = self.spc.as_ref() else {
-            trace!("BeaconSpcViewTimer fired but no SPC instance bootstrapped");
-            return Vec::new();
-        };
-        let view = spc.current_view();
-        self.dispatch_spc_event(self.me, SpcEvent::TimerExpired { view })
+        let skip = self.skip_quorum_at_tip();
+        let effects = self.spc.on_beacon_spc_view_timer(skip);
+        self.lift_from_spc(effects)
     }
 
     /// A peer committee member's `BeaconProposal` arrived. Admit it
@@ -942,7 +630,7 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        if from == self.me && self.should_feed_view_one_input(epoch) {
+        if from == self.me && self.spc.should_feed_view_one_input(epoch) {
             return self.feed_view_one_input(epoch);
         }
         Vec::new()
@@ -1081,23 +769,13 @@ impl BeaconCoordinator {
         .is_ok()
     }
 
-    /// Whether the current SPC instance is ready to receive its
-    /// view-1 `Input`: instance exists, drives `epoch`, and hasn't
-    /// been fed already.
-    fn should_feed_view_one_input(&self, epoch: Epoch) -> bool {
-        self.spc
-            .as_ref()
-            .is_some_and(|spc| spc.epoch() == epoch && !spc.view_one_input_fed())
-    }
-
-    /// Build view 1's local input vector from the current pool view
-    /// and drive it into SPC. Lifts the resulting effects.
+    /// Build view 1's local input vector from the current pool view and
+    /// drive it into SPC. Caller gates on
+    /// [`SpcDriver::should_feed_view_one_input`]; lifts the effects.
     fn feed_view_one_input(&mut self, epoch: Epoch) -> Vec<Action> {
         let input = self.compute_view_one_input(epoch);
-        let recipients = self.spc_recipients();
-        let spc = self.spc.as_mut().expect("checked by should_feed");
-        let effects = spc.handle(SpcEvent::Input(input));
-        self.lift_spc_effects(epoch, &recipients, effects)
+        let effects = self.spc.feed_view_one_input(input);
+        self.lift_from_spc(effects)
     }
 
     /// Build the PC input vector for view 1: one `PcValueElement` per
@@ -1135,7 +813,7 @@ impl BeaconCoordinator {
     ///   target. Shard witnesses ride the boundary contributions, not the
     ///   proposal.
     pub fn try_propose(&mut self) -> Vec<Action> {
-        if self.spc.is_none() {
+        if !self.spc.is_bootstrapped() {
             trace!("try_propose: no SPC instance — deferring");
             return Vec::new();
         }
@@ -1218,7 +896,7 @@ impl BeaconCoordinator {
     /// [`Self::try_propose`] so the local `BeaconProposal` enters
     /// the gossip + admission cycle.
     pub fn on_beacon_committee_start_timer(&mut self) -> Vec<Action> {
-        if self.spc.is_some() {
+        if self.spc.is_bootstrapped() {
             trace!("BeaconCommitteeStart fired with SPC already running");
             return Vec::new();
         }
@@ -1230,79 +908,20 @@ impl BeaconCoordinator {
         self.try_propose()
     }
 
-    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch under
-    /// the current `state.committee`. Skips validators absent from
-    /// `state.validators` — a structurally impossible state for an
-    /// on-chain committee, so the skip is defensive rather than
-    /// expected.
+    /// Stand up a fresh SPC instance for the upcoming epoch under the
+    /// current beacon committee, derived from `state`.
     fn bootstrap_spc_for_next_epoch(&mut self) {
         let committee = self.state.derive_beacon_committee();
         self.bootstrap_spc_with_committee(committee);
     }
 
-    /// Stand up the per-epoch [`SpcInstance`] from an explicit committee.
-    ///
-    /// Declines (leaves `self.spc` cleared) when `committee.len() <
-    /// MIN_BEACON_COMMITTEE_SIZE`: a committee that can't tolerate a single
-    /// Byzantine fault must not run PC. Rather than panic in
-    /// [`PcInstance::new`], the coordinator skips the bootstrap and lets
-    /// the skip path carry the epoch — the ready on-shard set has
-    /// collapsed below the BFT floor, an operator-visible degradation
-    /// the chain recovers from once enough validators ready up. The
-    /// assertion in `PcInstance::new` stays as a tripwire for a
-    /// genuinely impossible caller.
+    /// Stand up the per-epoch SPC instance for the next epoch from an
+    /// explicit committee. The BFT-minimum gate (declining the bootstrap
+    /// when the committee can't tolerate a fault, so the skip path carries
+    /// the epoch) lives in [`SpcDriver::bootstrap`].
     fn bootstrap_spc_with_committee(&mut self, committee: Vec<(ValidatorId, Bls12381G1PublicKey)>) {
-        let next_epoch = self.state.current_epoch.next();
-        if committee.len() < MIN_BEACON_COMMITTEE_SIZE {
-            warn!(
-                committee_size = committee.len(),
-                min_committee_size = MIN_BEACON_COMMITTEE_SIZE,
-                epoch = next_epoch.inner(),
-                "Beacon-eligible set below the BFT minimum — declining SPC bootstrap. \
-                 The epoch advances via the skip path; normal blocks resume once the \
-                 ready on-shard set recovers.",
-            );
-            self.spc = None;
-            return;
-        }
-        self.spc = Some(SpcInstance::new(
-            next_epoch,
-            committee,
-            self.me,
-            SPC_VIEW_TIMEOUT,
-        ));
-    }
-
-    /// Drive `event` through the current `SpcInstance` and lift the
-    /// resulting effects. The `from` argument is logged on the
-    /// not-bootstrapped path so dropped messages are attributable.
-    ///
-    /// Skip-quorum gate: if the local node has already observed the
-    /// ⌈2M/3⌉ + 1 active-pool quorum to skip
-    /// `current_epoch.next()` at the local tip, drop the event
-    /// without dispatching. The SPC instance for the abandoned epoch
-    /// can't reach `n - f` once the pool has committed to skipping;
-    /// continued dispatch would just produce wasted work and admit
-    /// equivocation patterns the per-FSM detector doesn't catch.
-    /// Query-based, not state-based — `self.spc` stays `Some` until
-    /// ordinary `adopt_block` teardown clears it.
-    fn dispatch_spc_event(&mut self, from: ValidatorId, event: SpcEvent) -> Vec<Action> {
-        if self.spc.is_none() {
-            trace!(?from, "SPC event received but no SPC instance bootstrapped");
-            return Vec::new();
-        }
-        if self.skip_quorum_at_tip() {
-            trace!(
-                ?from,
-                "SPC event received but skip-quorum reached at local tip — dropping",
-            );
-            return Vec::new();
-        }
-        let recipients = self.spc_recipients();
-        let spc = self.spc.as_mut().expect("checked is_none above");
-        let epoch = spc.epoch();
-        let effects = spc.handle(event);
-        self.lift_spc_effects(epoch, &recipients, effects)
+        self.spc
+            .bootstrap(self.state.current_epoch.next(), committee);
     }
 
     /// Whether the skip tracker has accumulated quorum to abandon
@@ -1833,7 +1452,7 @@ impl BeaconCoordinator {
         apply_epoch(&mut new_state, &self.network, block.epoch(), input);
         self.state = new_state;
         self.latest_block = Arc::clone(&block);
-        self.spc = None;
+        self.spc.clear();
         self.skip_tracker.forget_anchor(prior_tip);
 
         // Refresh the head and record the active snapshot for the just-applied
@@ -2189,6 +1808,20 @@ impl BeaconCoordinator {
             .collect()
     }
 
+    /// Lift effects produced by the [`SpcDriver`] into actions. Captures
+    /// `epoch` + `recipients` before lifting because the `OutputHigh`
+    /// arm's adoption clears the instance. A no-op for empty effects.
+    fn lift_from_spc(&mut self, effects: Vec<SpcEffect>) -> Vec<Action> {
+        if effects.is_empty() {
+            return Vec::new();
+        }
+        let Some(epoch) = self.spc.epoch() else {
+            return Vec::new();
+        };
+        let recipients = self.spc_recipients();
+        self.lift_spc_effects(epoch, &recipients, effects)
+    }
+
     /// Translate the sub-machine's local effect enum into beacon
     /// actions plus internal state mutations (equivocation pool,
     /// commit assembly).
@@ -2323,7 +1956,7 @@ impl BeaconCoordinator {
     /// Test introspection — production code shouldn't gate on this.
     #[must_use]
     pub fn verifications_in_flight(&self) -> usize {
-        self.verification.in_flight_count()
+        self.verification.in_flight_count() + self.spc.in_flight_count()
     }
 }
 
@@ -2366,11 +1999,8 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("current_epoch", &self.state.current_epoch)
             .field("latest_block_hash", &self.latest_block.block_hash())
             .field("me", &self.me)
-            .field("spc_active", &self.spc.is_some())
-            .field(
-                "verifications_in_flight",
-                &self.verification.in_flight_count(),
-            )
+            .field("spc_active", &self.spc.is_bootstrapped())
+            .field("verifications_in_flight", &self.verifications_in_flight())
             .field("witness_chunks", &self.shard_source.total_chunk_len())
             .field("skip_buckets", &self.skip_tracker.bucket_count())
             .field("equivocations", &self.equivocations.len())
@@ -2387,13 +2017,13 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
-        LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, ProposerTimestamp,
-        ProvisionsRoot, Randomness, Round, ShardCommittee, ShardEpochContribution, ShardId,
-        ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView,
-        Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, compute_merkle_root_with_proof,
-        genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
-        zero_bls_signature,
+        LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, PcVector,
+        ProposerTimestamp, ProvisionsRoot, Randomness, Round, ShardCommittee,
+        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
+        build_qc3, compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_vote1,
+        sign_vote2, sign_vote3, spc_context, zero_bls_signature,
     };
 
     use super::*;
@@ -2969,7 +2599,7 @@ mod tests {
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert!(actions.is_empty());
-        assert_eq!(coord.verification.in_flight_count(), 0);
+        assert_eq!(coord.verifications_in_flight(), 0);
     }
 
     /// A PC vote for a view far outside `[current, current +
@@ -2987,7 +2617,7 @@ mod tests {
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(6), vote);
         assert!(actions.is_empty());
-        assert_eq!(coord.verification.in_flight_count(), 0);
+        assert_eq!(coord.verifications_in_flight(), 0);
     }
 
     /// A committee signer's vote within the view window passes the gate
@@ -3005,7 +2635,7 @@ mod tests {
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::VerifyPcVote1 { .. }));
-        assert_eq!(coord.verification.in_flight_count(), 1);
+        assert_eq!(coord.verifications_in_flight(), 1);
     }
 
     #[test]
@@ -3017,11 +2647,10 @@ mod tests {
     #[test]
     fn committee_start_bootstraps_spc_for_on_committee_local() {
         let mut coord = fresh_coord();
-        assert!(coord.spc.is_none());
+        assert!(!coord.spc.is_bootstrapped());
         let actions = coord.on_beacon_committee_start_timer();
-        let spc = coord.spc.as_ref().expect("SPC bootstrapped");
-        assert_eq!(spc.epoch(), Epoch::GENESIS.next());
-        assert_eq!(spc.current_view(), SpcView::new(1));
+        assert_eq!(coord.spc.epoch(), Some(Epoch::GENESIS.next()));
+        assert_eq!(coord.spc.current_view(), Some(SpcView::new(1)));
         assert!(
             actions
                 .iter()
@@ -3042,7 +2671,7 @@ mod tests {
             .map(|i| (ValidatorId::new(i), pubkey(i)))
             .collect();
         coord.bootstrap_spc_with_committee(undersized);
-        assert!(coord.spc.is_none());
+        assert!(!coord.spc.is_bootstrapped());
     }
 
     /// A committee exactly at the BFT minimum bootstraps normally.
@@ -3054,7 +2683,7 @@ mod tests {
             .map(|i| (ValidatorId::new(i), pubkey(i)))
             .collect();
         coord.bootstrap_spc_with_committee(committee);
-        assert!(coord.spc.is_some());
+        assert!(coord.spc.is_bootstrapped());
     }
 
     /// Two skip requests from the same signer at the same anchor/epoch
@@ -3083,12 +2712,12 @@ mod tests {
         let first = coord.on_unverified_skip_request_received(req(0));
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0], Action::VerifySkipRequest { .. }));
-        assert_eq!(coord.verification.in_flight_count(), 1);
+        assert_eq!(coord.verifications_in_flight(), 1);
 
         // Same triple, different signature — deduped before dispatch.
         let second = coord.on_unverified_skip_request_received(req(1));
         assert!(second.is_empty());
-        assert_eq!(coord.verification.in_flight_count(), 1);
+        assert_eq!(coord.verifications_in_flight(), 1);
     }
 
     /// A skip request that fails BLS verification releases its slot, so
@@ -3111,11 +2740,11 @@ mod tests {
             Bls12381G2Signature([0u8; 96]), // garbage sig — fails BLS verify
         )));
         let dispatched = coord.on_unverified_skip_request_received(forged);
-        assert_eq!(coord.verification.in_flight_count(), 1);
+        assert_eq!(coord.verifications_in_flight(), 1);
 
         // Drive the (failing) verification to completion — the slot clears.
         let _ = complete_verifications(&mut coord, dispatched);
-        assert_eq!(coord.verification.in_flight_count(), 0);
+        assert_eq!(coord.verifications_in_flight(), 0);
 
         // A fresh request for the same triple re-dispatches rather than
         // being deduped against a pinned slot.
@@ -3135,16 +2764,16 @@ mod tests {
         let mut coord = new_coord(ValidatorId::new(99));
         let actions = coord.on_beacon_committee_start_timer();
         assert!(actions.is_empty());
-        assert!(coord.spc.is_none());
+        assert!(!coord.spc.is_bootstrapped());
     }
 
     #[test]
     fn committee_start_is_idempotent() {
         let mut coord = fresh_coord();
         coord.on_beacon_committee_start_timer();
-        let spc_view_first = coord.spc.as_ref().unwrap().current_view();
+        let spc_view_first = coord.spc.current_view();
         coord.on_beacon_committee_start_timer();
-        let spc_view_second = coord.spc.as_ref().unwrap().current_view();
+        let spc_view_second = coord.spc.current_view();
         assert_eq!(spc_view_first, spc_view_second);
     }
 
@@ -3280,7 +2909,7 @@ mod tests {
         coord.bootstrap_spc_for_next_epoch();
         let me = coord.me;
         let in_flight = Epoch::GENESIS.next();
-        assert!(!coord.spc.as_ref().unwrap().view_one_input_fed());
+        assert!(!coord.spc.view_one_input_fed());
         let actions = coord.on_beacon_proposal_received(me, in_flight, sample_proposal(0xAB));
         assert!(
             actions
@@ -3288,7 +2917,7 @@ mod tests {
                 .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. })),
             "expected SignAndBroadcastPcVote1 in {actions:?}",
         );
-        assert!(coord.spc.as_ref().unwrap().view_one_input_fed());
+        assert!(coord.spc.view_one_input_fed());
     }
 
     #[test]
@@ -3301,7 +2930,7 @@ mod tests {
             sample_proposal(0xAB),
         );
         assert!(actions.is_empty(), "peer proposal alone doesn't kick PC");
-        assert!(!coord.spc.as_ref().unwrap().view_one_input_fed());
+        assert!(!coord.spc.view_one_input_fed());
     }
 
     /// Drive `signer_positions` of `committee`'s keys through one
@@ -3479,7 +3108,10 @@ mod tests {
         assert_eq!(coord.state.current_epoch, Epoch::new(1));
         assert_eq!(coord.latest_block.block_hash(), block_hash);
         assert!(!coord.verification.is_block_in_flight(block_hash));
-        assert!(coord.spc.is_some(), "next epoch's SPC should bootstrap");
+        assert!(
+            coord.spc.is_bootstrapped(),
+            "next epoch's SPC should bootstrap"
+        );
     }
 
     /// The beacon paces epoch production to wall-clock instead of racing ahead
@@ -3500,7 +3132,7 @@ mod tests {
 
         assert_eq!(coord.state.current_epoch, Epoch::new(1));
         assert!(
-            coord.spc.is_none(),
+            !coord.spc.is_bootstrapped(),
             "caught up to wall-clock: must not bootstrap the next epoch's SPC early",
         );
         assert!(
@@ -3518,7 +3150,7 @@ mod tests {
         coord.set_now(coord.next_epoch_boundary());
         coord.on_beacon_committee_start_timer();
         assert!(
-            coord.spc.is_some(),
+            coord.spc.is_bootstrapped(),
             "the armed BeaconCommitteeStart must bootstrap SPC once its boundary arrives",
         );
     }
@@ -3542,7 +3174,7 @@ mod tests {
         assert_eq!(observer.current_epoch(), Epoch::new(1));
         assert_eq!(observer.latest_block().block_hash(), block_hash);
         // Off-committee, so no SPC bootstrap for the next epoch.
-        assert!(observer.spc.is_none());
+        assert!(!observer.spc.is_bootstrapped());
     }
 
     /// Off-committee observers stay in sync across multiple epochs:
@@ -3569,7 +3201,7 @@ mod tests {
             assert_eq!(observer.current_epoch(), Epoch::new(epoch));
             assert_eq!(observer.latest_block().block_hash(), block_hash);
         }
-        assert!(observer.spc.is_none());
+        assert!(!observer.spc.is_bootstrapped());
     }
 
     /// A committed element whose digest diverges from the locally-pooled
@@ -3816,7 +3448,10 @@ mod tests {
             "request must land in the tracker after verification",
         );
         // n=4 → quorum is ⌈8/3⌉+1 = 4. One sig is below.
-        assert!(coord.spc.is_some(), "SPC still running below quorum");
+        assert!(
+            coord.spc.is_bootstrapped(),
+            "SPC still running below quorum"
+        );
     }
 
     /// Reaching skip-quorum at the local tip builds + adopts the skip
@@ -3925,19 +3560,13 @@ mod tests {
         coord.skip_tracker.observe(last_req);
         assert!(coord.skip_quorum_at_tip());
 
-        // SPC dispatch is now gated — events drop without dispatching
-        // into the FSM (state unchanged, no broadcast actions).
-        let from = ValidatorId::new(0);
-        let actions = coord.dispatch_spc_event(
-            from,
-            SpcEvent::TimerExpired {
-                view: SpcView::new(1),
-            },
-        );
+        // SPC dispatch is now gated — the view timer drops without
+        // dispatching into the FSM (no broadcast actions).
+        let actions = coord.on_beacon_spc_view_timer();
         assert!(actions.is_empty(), "gated dispatch must emit no actions");
         // The SPC instance stays Some — gate is query-based, not
         // state-based.
-        assert!(coord.spc.is_some());
+        assert!(coord.spc.is_bootstrapped());
     }
 
     /// Build a (witness, source-shard verified header) pair where the

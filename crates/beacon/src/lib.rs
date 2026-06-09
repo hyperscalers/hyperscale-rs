@@ -22,5 +22,6 @@ pub mod sampling;
 pub mod shard_source;
 pub mod skip_tracker;
 pub mod spc;
+pub mod spc_driver;
 pub mod state;
 pub mod verification;

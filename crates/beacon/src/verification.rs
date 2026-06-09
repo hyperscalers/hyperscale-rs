@@ -6,16 +6,18 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_types::{BeaconBlockHash, Epoch, PcVoteRound, SpcView, ValidatorId};
+use hyperscale_types::{BeaconBlockHash, Epoch, ValidatorId};
 
 /// In-flight verification slots over an arbitrary key.
 ///
-/// The coordinator marks a slot when it dispatches the verification
-/// action and clears it when the result lands (or the slot is otherwise
-/// no longer needed). A marked slot suppresses redundant redispatch of
-/// the same check.
+/// A slot is marked when the verification action is dispatched and
+/// cleared when the result lands (or the slot is otherwise no longer
+/// needed). A marked slot suppresses redundant redispatch of the same
+/// check. Reused by [`BeaconVerificationPipeline`] (block + skip-request
+/// slots) and by [`SpcDriver`](crate::spc_driver::SpcDriver) (PC-vote +
+/// SPC-message slots).
 #[derive(Debug)]
-struct VerificationSlots<K> {
+pub(crate) struct VerificationSlots<K> {
     in_flight: BTreeSet<K>,
 }
 
@@ -30,43 +32,25 @@ impl<K> Default for VerificationSlots<K> {
 impl<K: Ord> VerificationSlots<K> {
     /// Returns `true` when newly inserted, `false` when a slot for this
     /// key is already in flight.
-    fn mark_in_flight(&mut self, key: K) -> bool {
+    #[must_use]
+    pub(crate) fn mark_in_flight(&mut self, key: K) -> bool {
         self.in_flight.insert(key)
     }
 
-    fn clear(&mut self, key: &K) {
+    pub(crate) fn clear(&mut self, key: &K) {
         self.in_flight.remove(key);
     }
 
-    fn is_in_flight(&self, key: &K) -> bool {
+    #[must_use]
+    pub(crate) fn is_in_flight(&self, key: &K) -> bool {
         self.in_flight.contains(key)
     }
 
-    fn len(&self) -> usize {
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
         self.in_flight.len()
     }
 }
-
-/// Slot key for a pending PC-vote verification.
-///
-/// Per-`(epoch, view, signer, round)` because a Byzantine signer may
-/// dispatch divergent votes at the same round within a view; each gets
-/// its own slot so the post-verify equivocation check sees both.
-pub type PcVoteSlotKey = (Epoch, SpcView, ValidatorId, PcVoteRound);
-
-/// Which SPC message kind a verification slot refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SpcMsgKind {
-    /// `NewView` cert verification.
-    NewView,
-    /// `NewCommit` embedded QC3 verification.
-    NewCommit,
-    /// `EmptyView` sig + embedded QC3 verification.
-    EmptyView,
-}
-
-/// Slot key for a pending SPC message verification.
-pub type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
 
 /// Slot key for a pending skip-request sig verification.
 ///
@@ -80,16 +64,17 @@ pub type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
 /// honest request.
 pub type SkipRequestSlotKey = (BeaconBlockHash, Epoch, ValidatorId);
 
-/// Tracks asynchronous beacon verifications dispatched to the crypto
-/// pool, suppressing redundant redispatch while a check is outstanding.
+/// Tracks the asynchronous block-cert and skip-request verifications the
+/// coordinator dispatches to the crypto pool.
 ///
-/// Four domains, each an independent in-flight slot pool:
+/// Suppresses redundant redispatch while a check is outstanding. The
+/// PC-vote and SPC-message slot pools live on
+/// [`SpcDriver`](crate::spc_driver::SpcDriver).
+///
+/// Two domains, each an independent in-flight slot pool:
 /// - Block-cert verifications, keyed on [`BeaconBlockHash`].
 /// - Skip-request sig verifications, keyed on
 ///   `(anchor, epoch_to_skip, signer)`.
-/// - PC-vote verifications, keyed on `(epoch, view, signer, round)`.
-/// - SPC message verifications, keyed on
-///   `(epoch, view, sender, msg-kind)`.
 ///
 /// Domains never share keys by construction — different `K` types per
 /// slot pool.
@@ -97,8 +82,6 @@ pub type SkipRequestSlotKey = (BeaconBlockHash, Epoch, ValidatorId);
 pub struct BeaconVerificationPipeline {
     blocks: VerificationSlots<BeaconBlockHash>,
     skip_requests: VerificationSlots<SkipRequestSlotKey>,
-    pc_votes: VerificationSlots<PcVoteSlotKey>,
-    spc_msgs: VerificationSlots<SpcMsgSlotKey>,
 }
 
 impl BeaconVerificationPipeline {
@@ -131,27 +114,6 @@ impl BeaconVerificationPipeline {
     pub fn forget_skip_request(&mut self, key: SkipRequestSlotKey) {
         self.skip_requests.clear(&key);
     }
-
-    /// Mark a PC-vote verification in flight. Same semantics as
-    /// [`Self::mark_block_in_flight`].
-    pub fn mark_pc_vote_in_flight(&mut self, key: PcVoteSlotKey) -> bool {
-        self.pc_votes.mark_in_flight(key)
-    }
-
-    /// Clear the PC-vote slot once its result lands.
-    pub fn forget_pc_vote(&mut self, key: PcVoteSlotKey) {
-        self.pc_votes.clear(&key);
-    }
-
-    /// Mark an SPC message verification in flight.
-    pub fn mark_spc_msg_in_flight(&mut self, key: SpcMsgSlotKey) -> bool {
-        self.spc_msgs.mark_in_flight(key)
-    }
-
-    /// Clear the SPC message slot once its result lands.
-    pub fn forget_spc_msg(&mut self, key: SpcMsgSlotKey) {
-        self.spc_msgs.clear(&key);
-    }
 }
 
 // Flat queries; names are the documentation.
@@ -164,7 +126,7 @@ impl BeaconVerificationPipeline {
 
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.blocks.len() + self.skip_requests.len() + self.pc_votes.len() + self.spc_msgs.len()
+        self.blocks.len() + self.skip_requests.len()
     }
 }
 
