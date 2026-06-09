@@ -219,6 +219,7 @@ impl CoordinatorSim {
                     vec![initial_state.clone()],
                     members[i].0,
                     ShardId::ROOT,
+                    WeightedTimestamp::ZERO,
                     network.clone(),
                     config_hash,
                     Arc::new(BeaconProposalPool::new(next_epoch)),

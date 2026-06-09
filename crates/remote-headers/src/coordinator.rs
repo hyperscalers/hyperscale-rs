@@ -862,7 +862,7 @@ mod tests {
             .map(|v| snap_b.public_key(*v).unwrap())
             .collect();
 
-        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
@@ -883,8 +883,7 @@ mod tests {
         let ids = [0u64, 1, 2, 3];
 
         // Schedule holds only epoch 5; a header anchored in epoch 0 can't resolve.
-        let behind =
-            TopologySchedule::new(ED, 1, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
+        let behind = TopologySchedule::new(ED, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
@@ -919,7 +918,7 @@ mod tests {
         let snap = || Arc::new(shard_snapshot(2, &ids, 0));
 
         // Epoch 0 is in the schedule when the headers arrive.
-        let present = TopologySchedule::new(ED, 100, Epoch::new(0), snap());
+        let present = TopologySchedule::new(ED, Epoch::new(0), snap());
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
@@ -932,7 +931,7 @@ mod tests {
 
         // The first candidate's verification fails, and the schedule no longer
         // covers epoch 0 (the beacon advanced past it).
-        let evicted = TopologySchedule::new(ED, 1, Epoch::new(5), snap());
+        let evicted = TopologySchedule::new(ED, Epoch::new(5), snap());
         let after_fail = coord.on_remote_header_qc_verified(
             &evicted,
             remote,

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
-use hyperscale_beacon::coordinator::{BeaconCoordinator, TOPOLOGY_SCHEDULE_RETENTION_EPOCHS};
+use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ProtocolEvent, TimerId};
@@ -499,12 +499,18 @@ impl ProductionRunnerBuilder {
         ));
 
         // Load the topology-history window so each coordinator's schedule
-        // resumes with its full retention of committee snapshots, not just
-        // the latest — cross-shard artifacts back to `RETENTION_HORIZON`
-        // stay verifiable immediately after restart.
+        // resumes with every committee a consumer frontier still reaches:
+        // the recovered shard tip's anchor (the chain resumes verification
+        // there), each shard's last live boundary, and the tx-artifact
+        // horizon. The same floor bounds eviction on every adoption.
+        let boot_floor = retention_floor(
+            &beacon_latest_state,
+            recovered.committee_anchor_ts(),
+            wall_clock_local(),
+        );
         let beacon_history: Vec<BeaconState> = self
             .beacon_storage
-            .recent_states(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS)
+            .states_since(boot_floor)
             .into_iter()
             .map(|state| state.as_ref().clone())
             .collect();
@@ -538,6 +544,7 @@ impl ProductionRunnerBuilder {
                     beacon_history.clone(),
                     cfg.validator_id,
                     cfg.local_shard,
+                    recovered.committee_anchor_ts(),
                     beacon_network.clone(),
                     beacon_config_hash,
                     Arc::clone(&beacon_proposal_pool),

@@ -66,7 +66,7 @@ fn latest_committed_returns_paired_block_and_state() {
 }
 
 #[test]
-fn recent_states_walks_back_oldest_first_capped_at_count() {
+fn states_since_walks_down_to_the_floor_oldest_first() {
     let store = SimBeaconStorage::new();
     for e in 1..=5u64 {
         store.commit_beacon_block(
@@ -75,24 +75,27 @@ fn recent_states_walks_back_oldest_first_capped_at_count() {
         );
     }
 
-    // count larger than the chain → every committed state, oldest first.
-    // Epoch 0 was never committed and is skipped, not truncated.
     let epochs = |states: Vec<Arc<BeaconState>>| {
         states
             .iter()
             .map(|s| s.current_epoch.inner())
             .collect::<Vec<_>>()
     };
-    assert_eq!(epochs(store.recent_states(10)), vec![1, 2, 3, 4, 5]);
-    // count caps the walk to the newest `count` epochs.
-    assert_eq!(epochs(store.recent_states(2)), vec![4, 5]);
-    assert_eq!(epochs(store.recent_states(1)), vec![5]);
+    // A floor below the chain's start stops at the first absent epoch
+    // (epoch 0 was never committed) rather than walking past it.
+    assert_eq!(
+        epochs(store.states_since(Epoch::new(0))),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(epochs(store.states_since(Epoch::new(4))), vec![4, 5]);
+    // A floor above the latest still yields the latest state.
+    assert_eq!(epochs(store.states_since(Epoch::new(9))), vec![5]);
 }
 
 #[test]
-fn recent_states_empty_chain_is_empty() {
+fn states_since_empty_chain_is_empty() {
     let store = SimBeaconStorage::new();
-    assert!(store.recent_states(4).is_empty());
+    assert!(store.states_since(Epoch::new(0)).is_empty());
 }
 
 #[test]

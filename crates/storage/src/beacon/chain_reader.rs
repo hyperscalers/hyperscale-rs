@@ -47,26 +47,30 @@ pub trait BeaconChainReader: Send + Sync {
     /// resume live without walking the chain.
     fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)>;
 
-    /// Up to `count` most-recently-committed states, oldest first — the
-    /// boot-time topology history the runner threads into
-    /// `BeaconCoordinator::new` so the schedule resumes with its full
-    /// retention window of committee snapshots. Walks back from
-    /// [`latest_committed_epoch`](Self::latest_committed_epoch); empty if
-    /// the chain has no genesis yet. Missing epochs in the range are
-    /// skipped rather than truncating the walk.
-    fn recent_states(&self, count: u64) -> Vec<Arc<BeaconState>> {
+    /// Committed states from `floor` through the latest epoch, oldest first
+    /// — the boot-time topology history the runner threads into
+    /// `BeaconCoordinator::new` so the schedule resumes with every committee
+    /// a consumer frontier still reaches (the runner derives `floor` via
+    /// `retention_floor`). Walks down from
+    /// [`latest_committed_epoch`](Self::latest_committed_epoch) and stops at
+    /// `floor` or the first absent epoch (committed epochs are contiguous,
+    /// so absence marks the chain's start). Empty if the chain has no
+    /// genesis yet; always includes the latest state otherwise, even when
+    /// `floor` is above it.
+    fn states_since(&self, floor: Epoch) -> Vec<Arc<BeaconState>> {
         let Some(latest) = self.latest_committed_epoch() else {
             return Vec::new();
         };
-        let oldest = Epoch::new(latest.inner().saturating_sub(count.saturating_sub(1)));
         let mut states = Vec::new();
-        let mut epoch = oldest;
-        while epoch <= latest {
-            if let Some(state) = self.get_state_by_epoch(epoch) {
-                states.push(state);
+        let mut epoch = latest;
+        while let Some(state) = self.get_state_by_epoch(epoch) {
+            states.push(state);
+            if epoch <= floor || epoch == Epoch::GENESIS {
+                break;
             }
-            epoch = epoch.next();
+            epoch = Epoch::new(epoch.inner() - 1);
         }
+        states.reverse();
         states
     }
 }

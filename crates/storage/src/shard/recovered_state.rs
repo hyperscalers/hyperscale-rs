@@ -49,3 +49,20 @@ pub struct RecoveredState {
     /// historical topology. Empty on a fresh start.
     pub beacon_witness_leaf_hashes: Vec<Hash>,
 }
+
+impl RecoveredState {
+    /// Committee anchor of the recovered tip — [`committed_anchor_ts`](Self::committed_anchor_ts)
+    /// when storage recovered it, else the tip QC's own weighted timestamp
+    /// (identical except when the tip is an epoch's first block), else `ZERO`
+    /// on a fresh start. The oldest weighted timestamp the recovered chain
+    /// can still key a topology lookup on.
+    #[must_use]
+    pub fn committee_anchor_ts(&self) -> WeightedTimestamp {
+        self.committed_anchor_ts.unwrap_or_else(|| {
+            self.latest_qc.as_deref().map_or(
+                WeightedTimestamp::ZERO,
+                QuorumCertificate::weighted_timestamp,
+            )
+        })
+    }
+}

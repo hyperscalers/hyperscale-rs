@@ -3302,7 +3302,7 @@ mod tests {
         let (snap_b, keys_b) = committee_snapshot(&[4, 5, 6, 7]);
         assert_ne!(keys_a, keys_b, "committees must have distinct keys");
 
-        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
         let mut coord = make_test_state();
@@ -3344,7 +3344,7 @@ mod tests {
         let (snap_a, _keys_a) = committee_snapshot(&[0, 1, 2, 3]);
         let (snap_b, _keys_b) = committee_snapshot(&[4, 5, 6, 7]);
         let committee_b: Vec<ValidatorId> = snap_b.committee_for_shard(shard).to_vec();
-        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
         // Local node is a committee-B member; commit a single-shard wave anchored
@@ -3407,7 +3407,6 @@ mod tests {
         // Schedule holds only epoch 5; an EC anchored in epoch 0 can't resolve.
         let behind = TopologySchedule::new(
             ED,
-            1,
             Epoch::new(5),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );
@@ -3446,7 +3445,6 @@ mod tests {
 
         let behind = TopologySchedule::new(
             ED,
-            1,
             Epoch::new(5),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );

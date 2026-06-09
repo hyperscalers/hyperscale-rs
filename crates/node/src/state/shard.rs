@@ -401,6 +401,12 @@ impl NodeStateMachine {
         self.outbound_provisions
             .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
 
+        // Beacon coordinator: advance the local chain's committee anchor so
+        // topology schedule eviction tracks this shard's verification
+        // frontier.
+        self.beacon_coordinator
+            .on_local_block_committed(certified.block().header().parent_qc().weighted_timestamp());
+
         actions.extend(self.apply_block_to_execution(certified));
 
         // In-flight counts changed — latch a proposal attempt so the next

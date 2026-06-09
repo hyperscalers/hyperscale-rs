@@ -25,15 +25,15 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
     BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION, Epoch,
-    GenesisConfigHash, JailReason, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
-    MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement, PcVector, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteEquivocation, PcVoteEquivocationContext, RETENTION_HORIZON, SKIP_TIMEOUT, ShardId,
-    ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot, ValidatorId,
-    ValidatorStatus, Verifiable, Verified, Verify,
+    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, Epoch, GenesisConfigHash, JailReason,
+    LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH,
+    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
+    RETENTION_HORIZON, SKIP_TIMEOUT, ShardId, ShardWitness, SkipEpochCert, SkipRequest,
+    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verify,
+    WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -48,19 +48,55 @@ use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
 use crate::{boundary, rules};
 
-/// Depth of the coordinator's queryable committee-history window.
+/// Oldest epoch the topology schedule must retain — the minimum of the
+/// consumer frontiers that still verify QC-bearing artifacts:
 ///
-/// Sized to cover the oldest cross-shard artifact any consumer would
-/// still verify (`RETENTION_HORIZON` worth of epochs) plus headroom for
-/// the lookahead neighbour and the integer-division floor.
+/// - the local shard chain's committee anchor (`local_frontier`, the
+///   committed tip's parent-QC weighted timestamp): live votes/headers and
+///   synced blocks all key their schedule lookups at or after it;
+/// - each shard's last live boundary epoch, minus one window of slack (a
+///   boundary block is signed by the committee at its *parent* QC's weighted
+///   timestamp, which can land one window earlier): the next legitimate
+///   boundary QC or remote header from a stalled shard is signed no earlier;
+/// - the tx-artifact horizon (`now − RETENTION_HORIZON`): provisions and
+///   execution certificates are provably terminal past it.
 ///
-/// **Not consensus-critical**: a node with a smaller value still
-/// produces the same chain, it just can't answer some historical
-/// topology queries. A node-local cache bound, not a protocol parameter.
-/// Exposed so the runner loads exactly this many states from storage at
-/// boot to seed the schedule's restart history.
-pub const TOPOLOGY_SCHEDULE_RETENTION_EPOCHS: u64 =
-    RETENTION_HORIZON.as_secs() / EPOCH_DURATION.as_secs() + 2;
+/// Clamped to `state.current_epoch` so the head entry always survives.
+/// Anything attested below the floor is provably bogus or provably
+/// terminal, so a schedule miss below it is rejectable, never deferrable.
+///
+/// **Not consensus-critical**: the floor bounds a node-local cache; nodes
+/// with different frontiers produce the same chain.
+#[must_use]
+pub fn retention_floor(
+    state: &BeaconState,
+    local_frontier: WeightedTimestamp,
+    now: LocalTimestamp,
+) -> Epoch {
+    let epoch_of = |ms: u64| {
+        ms.checked_div(state.chain_config.epoch_duration_ms)
+            .map_or(Epoch::GENESIS, Epoch::new)
+    };
+    let local_chain = epoch_of(local_frontier.as_millis());
+    let shard_boundaries = state
+        .shard_committees
+        .keys()
+        .map(|shard| {
+            state.boundaries.get(shard).map_or(Epoch::GENESIS, |b| {
+                Epoch::new(b.last_live_epoch.inner().saturating_sub(1))
+            })
+        })
+        .min()
+        .unwrap_or(Epoch::GENESIS);
+    let horizon = epoch_of(
+        now.as_millis()
+            .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
+    );
+    local_chain
+        .min(shard_boundaries)
+        .min(horizon)
+        .min(state.current_epoch)
+}
 
 /// Per-vnode beacon-chain coordinator.
 ///
@@ -130,11 +166,19 @@ pub struct BeaconCoordinator {
     /// committee (refreshed on every `adopt_block` so consumers reading via
     /// `io_loop`'s `ArcSwap` see the post-`apply_epoch` placement immediately
     /// after commit); its `at` resolves any artifact's committee by weighted
-    /// timestamp over the window `[current_epoch −
-    /// TOPOLOGY_SCHEDULE_RETENTION_EPOCHS, current_epoch + 1]`. The `+1`
-    /// lookahead entry is finalized an epoch before its window opens. A
-    /// node-local cache, not consensus-critical.
+    /// timestamp over the window from [`retention_floor`] through
+    /// `current_epoch + 1`. The `+1` lookahead entry is finalized an epoch
+    /// before its window opens. A node-local cache, not consensus-critical.
     topology: TopologySchedule,
+
+    /// Committee anchor of the local shard's committed tip — its parent QC's
+    /// weighted timestamp. The oldest anchor the local chain can still key a
+    /// schedule lookup on; holds [`retention_floor`] open while the shard
+    /// chain verifies blocks older than the beacon head (catch-up after
+    /// downtime, resume after a stall). Seeded at construction from the
+    /// recovered tip; advances on every local commit via
+    /// [`on_local_block_committed`](Self::on_local_block_committed).
+    local_frontier: WeightedTimestamp,
 
     me: ValidatorId,
 
@@ -160,11 +204,15 @@ impl BeaconCoordinator {
     /// recently-committed states (newest last; `history.last()` becomes
     /// the live state). Each state seeds the topology schedule with its
     /// active and lookahead snapshots, so the coordinator boots able to
-    /// verify cross-shard artifacts back across the loaded window. When
-    /// `latest_block` is genesis, debug-asserts its cert's `config_hash`
-    /// matches `expected_config_hash` — catches a runner that loaded a
-    /// chain initialised by a different operator TOML than this process
-    /// is configured for.
+    /// verify cross-shard artifacts back across the loaded window.
+    /// `local_frontier` is the local shard chain's recovered committee
+    /// anchor (`RecoveredState::committee_anchor_ts`); it seeds the
+    /// schedule's eviction floor and advances via
+    /// [`on_local_block_committed`](Self::on_local_block_committed) as the
+    /// chain commits. When `latest_block` is genesis, debug-asserts its cert's
+    /// `config_hash` matches `expected_config_hash` — catches a runner
+    /// that loaded a chain initialised by a different operator TOML than
+    /// this process is configured for.
     ///
     /// # Panics
     ///
@@ -178,6 +226,7 @@ impl BeaconCoordinator {
         history: Vec<BeaconState>,
         me: ValidatorId,
         local_shard: ShardId,
+        local_frontier: WeightedTimestamp,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
         proposal_pool: Arc<BeaconProposalPool>,
@@ -200,12 +249,8 @@ impl BeaconCoordinator {
         // agree on that boundary entry (one's lookahead is the next's active),
         // so the skip drops only a redundant re-derivation.
         let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
-        let mut topology = TopologySchedule::new(
-            epoch_duration_ms,
-            TOPOLOGY_SCHEDULE_RETENTION_EPOCHS,
-            latest_epoch,
-            Arc::clone(&head),
-        );
+        let mut topology =
+            TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
         for state in &history {
             if state.current_epoch != latest_epoch {
                 topology.insert(
@@ -222,9 +267,6 @@ impl BeaconCoordinator {
             }
         }
         let state = history.into_iter().next_back().expect(LATEST_STATE_EXPECT);
-        // Bound the schedule to the retention window in case the caller loaded
-        // more states than we keep; `adopt_block` holds the same bound forward.
-        topology.evict_before(state.current_epoch);
         Self {
             state,
             latest_block,
@@ -238,6 +280,7 @@ impl BeaconCoordinator {
             commit_assembly: CommitAssembler::new(),
             local_shard,
             topology,
+            local_frontier,
             me,
             network,
             now: LocalTimestamp::ZERO,
@@ -256,6 +299,13 @@ impl BeaconCoordinator {
     /// so every handler in the batch reads a consistent `now`.
     pub const fn set_now(&mut self, now: LocalTimestamp) {
         self.now = now;
+    }
+
+    /// Local shard block committed — advance the chain's committee anchor to
+    /// the new tip's parent-QC weighted timestamp, the node-local frontier
+    /// [`retention_floor`] keeps the schedule open for.
+    pub const fn on_local_block_committed(&mut self, anchor_ts: WeightedTimestamp) {
+        self.local_frontier = anchor_ts;
     }
 
     /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
@@ -1299,8 +1349,8 @@ impl BeaconCoordinator {
         });
 
         // Refresh the head and record the active snapshot for the just-applied
-        // epoch plus the lookahead for the next, then drop entries that fell
-        // out of the retention window. The lookahead entry lets a shard
+        // epoch plus the lookahead for the next, then drop entries every
+        // consumer frontier has passed. The lookahead entry lets a shard
         // resolve its committee a full epoch before its window opens.
         let head = Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
         let epoch = self.state.current_epoch;
@@ -1313,7 +1363,8 @@ impl BeaconCoordinator {
                     .derive_next_topology_snapshot(self.network.clone()),
             ),
         );
-        self.topology.evict_before(epoch);
+        self.topology
+            .evict_below(retention_floor(&self.state, self.local_frontier, self.now));
 
         // Evict witnesses the boundary fold has now consumed — those below
         // each shard's advanced applied watermark
@@ -1759,12 +1810,12 @@ mod tests {
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, PcVector,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardCommittee,
-        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
-        build_qc3, compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_vote1,
-        sign_vote2, sign_vote3, spc_context, zero_bls_signature,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardBoundary,
+        ShardCommittee, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload,
+        ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+        TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
+        build_qc1, build_qc2, build_qc3, compute_merkle_root_with_proof, genesis_config_hash,
+        pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context, zero_bls_signature,
     };
 
     use super::*;
@@ -1828,6 +1879,7 @@ mod tests {
             vec![state],
             me,
             ShardId::leaf(1, 0),
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2233,6 +2285,7 @@ mod tests {
             vec![state],
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2253,6 +2306,7 @@ mod tests {
             vec![state],
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
             pool,
@@ -2289,6 +2343,7 @@ mod tests {
             vec![state],
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             GenesisConfigHash::ZERO,
             pool,
@@ -3656,6 +3711,7 @@ mod tests {
             history,
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
             Arc::new(BeaconProposalPool::new(next_epoch)),
@@ -3692,12 +3748,12 @@ mod tests {
         );
     }
 
-    /// A history longer than the retention window is bounded at
-    /// construction — the oldest epochs drop out, the newest stay.
+    /// Construction retains every loaded state — the runner bounds what it
+    /// loads via [`retention_floor`], and `adopt_block` trims forward from
+    /// there as the consumer frontiers advance.
     #[test]
-    fn schedule_evicts_history_beyond_retention() {
-        let newest = TOPOLOGY_SCHEDULE_RETENTION_EPOCHS + 3;
-        let history: Vec<BeaconState> = (0..=newest).map(|e| state_at(e, 4)).collect();
+    fn construction_retains_the_full_loaded_history() {
+        let history: Vec<BeaconState> = (0..=8).map(|e| state_at(e, 4)).collect();
         let coord = coord_from_history(history);
         let ed = coord.current_state().chain_config.epoch_duration_ms;
         let resolves = |window: u64| {
@@ -3706,8 +3762,69 @@ mod tests {
                 .at(WeightedTimestamp::from_millis(window * ed))
                 .is_some()
         };
-        assert!(!resolves(0), "epoch 0 should be evicted past retention");
-        assert!(resolves(newest), "newest epoch retained");
+        assert!(resolves(0), "oldest loaded epoch retained");
+        assert!(resolves(8), "newest epoch retained");
+    }
+
+    fn boundary_live_at(epoch: u64) -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: Epoch::new(epoch),
+            consecutive_misses: 0,
+        }
+    }
+
+    /// Each consumer frontier can become the floor: the lagging one wins.
+    #[test]
+    fn retention_floor_is_the_minimum_consumer_frontier() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = state_at(1000, 4);
+        state.boundaries.insert(shard, boundary_live_at(999));
+        let ed = state.chain_config.epoch_duration_ms;
+        let wt = |epoch: u64| WeightedTimestamp::from_millis(epoch * ed);
+        let local_now = |epoch: u64| LocalTimestamp::from_millis(epoch * ed);
+
+        // A lagging local shard chain holds the floor at its anchor.
+        assert_eq!(
+            retention_floor(&state, wt(5), local_now(1000)),
+            Epoch::new(5)
+        );
+
+        // A stalled shard's boundary holds the floor one window before its
+        // last live epoch.
+        state.boundaries.insert(shard, boundary_live_at(7));
+        assert_eq!(
+            retention_floor(&state, wt(1000), local_now(1000)),
+            Epoch::new(6)
+        );
+
+        // A shard with no boundary record yet pins the floor at genesis.
+        state.boundaries.remove(&shard);
+        assert_eq!(
+            retention_floor(&state, wt(1000), local_now(1000)),
+            Epoch::GENESIS
+        );
+    }
+
+    /// With every chain frontier at the head, the tx-artifact horizon
+    /// (`now − RETENTION_HORIZON`) is the floor.
+    #[test]
+    fn retention_floor_defaults_to_the_artifact_horizon() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = state_at(1000, 4);
+        state.boundaries.insert(shard, boundary_live_at(1000));
+        let ed = state.chain_config.epoch_duration_ms;
+        let now_ms = 1000 * ed;
+        let floor = retention_floor(
+            &state,
+            WeightedTimestamp::from_millis(now_ms),
+            LocalTimestamp::from_millis(now_ms),
+        );
+        let horizon = Epoch::new(now_ms.saturating_sub(RETENTION_HORIZON.as_secs() * 1000) / ed);
+        assert_eq!(floor, horizon);
+        assert!(floor < Epoch::new(1000), "horizon trails the head");
     }
 
     #[test]

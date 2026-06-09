@@ -323,12 +323,7 @@ impl ShardCoordinator {
         // exact again after the next commit. Restoring both `committed_ts` and
         // `committed_anchor_ts` from it keeps a restarted node's BFT clock equal
         // to a non-restarted peer's rather than one to two blocks ahead.
-        let committed_anchor_ts = recovered.committed_anchor_ts.unwrap_or_else(|| {
-            recovered.latest_qc.as_deref().map_or(
-                WeightedTimestamp::ZERO,
-                QuorumCertificate::weighted_timestamp,
-            )
-        });
+        let committed_anchor_ts = recovered.committee_anchor_ts();
         Self {
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
@@ -4294,7 +4289,7 @@ mod tests {
         // A schedule whose only entry is epoch 5 has no committee for the
         // tip's epoch 0, so resolution returns `None` and the gate stalls.
         let snapshot = Arc::clone(full.head());
-        let stalled = TopologySchedule::new(300_000, 8, Epoch::new(5), snapshot);
+        let stalled = TopologySchedule::new(300_000, Epoch::new(5), snapshot);
         assert!(
             !state.is_current_proposer(&stalled),
             "absent committee must stall the proposer gate, not fall back to head",
@@ -4377,7 +4372,7 @@ mod tests {
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut state = ShardCoordinator::new(

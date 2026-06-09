@@ -21,9 +21,10 @@ use crate::{Epoch, TopologySnapshot, WeightedTimestamp};
 ///
 /// `committee_N` governs the weighted-time window `[N·ED, (N+1)·ED)`;
 /// [`at`](Self::at) floors a timestamp to its epoch and returns that
-/// committee. The map spans `[current − retention, current + lookahead]`: past
-/// entries verify artifacts up to the retention horizon old, the lookahead
-/// entry is finalized an epoch before its window opens.
+/// committee. The map spans `[floor, current + lookahead]`: the owner derives
+/// `floor` from the oldest epoch any consumer can still legitimately query
+/// and trims via [`evict_below`](Self::evict_below); the lookahead entry is
+/// finalized an epoch before its window opens.
 ///
 /// A schedule built with [`single`](Self::single) carries one committee for
 /// all time (`epoch_duration_ms == 0` folds every timestamp to genesis) — the
@@ -33,12 +34,23 @@ pub struct TopologySchedule {
     /// Window length in milliseconds; `epoch = floor(wt / epoch_duration_ms)`.
     /// Zero means a single fixed committee (every timestamp maps to genesis).
     epoch_duration_ms: u64,
-    /// Past epochs retained behind the active one before eviction.
-    retention_epochs: u64,
     /// Active committee for routing / gossip ("who is in the committee now?").
     head: Arc<TopologySnapshot>,
     /// Committee snapshots keyed by the epoch each governs.
     by_epoch: BTreeMap<Epoch, Arc<TopologySnapshot>>,
+}
+
+/// Result of resolving a weighted timestamp against the retained window.
+pub enum ScheduleLookup<'a> {
+    /// The epoch's committee is retained.
+    Committee(&'a Arc<TopologySnapshot>),
+    /// The epoch is newer than every retained entry — this node's beacon
+    /// hasn't committed it yet. Transient: buffer or defer and retry.
+    NotYetCommitted,
+    /// The epoch is older than every retained entry. Eviction only drops
+    /// epochs every consumer frontier has passed, so no honest artifact can
+    /// still be attested there — reject rather than defer.
+    Evicted,
 }
 
 impl TopologySchedule {
@@ -46,17 +58,11 @@ impl TopologySchedule {
     /// `head_epoch`. The beacon coordinator inserts the lookahead and any
     /// retained past epochs afterward via [`insert`](Self::insert).
     #[must_use]
-    pub fn new(
-        epoch_duration_ms: u64,
-        retention_epochs: u64,
-        head_epoch: Epoch,
-        head: Arc<TopologySnapshot>,
-    ) -> Self {
+    pub fn new(epoch_duration_ms: u64, head_epoch: Epoch, head: Arc<TopologySnapshot>) -> Self {
         let mut by_epoch = BTreeMap::new();
         by_epoch.insert(head_epoch, Arc::clone(&head));
         Self {
             epoch_duration_ms,
-            retention_epochs,
             head,
             by_epoch,
         }
@@ -73,7 +79,6 @@ impl TopologySchedule {
         by_epoch.insert(Epoch::GENESIS, Arc::clone(&snapshot));
         Self {
             epoch_duration_ms: 0,
-            retention_epochs: u64::MAX,
             head: snapshot,
             by_epoch,
         }
@@ -92,13 +97,32 @@ impl TopologySchedule {
 
     /// Committee that signed an artifact attested at `wt` — exact, for
     /// verification and quorum. `None` when that epoch is outside the retained
-    /// window: past the retention horizon (artifact too old — drop), or beyond
-    /// the lookahead (this node's beacon hasn't committed that epoch yet —
-    /// buffer or stall). Hands out a shared handle: borrow it for verification,
-    /// or clone it to move into an off-thread closure.
+    /// window; callers that handle the two miss reasons differently use
+    /// [`lookup`](Self::lookup). Hands out a shared handle: borrow it for
+    /// verification, or clone it to move into an off-thread closure.
     #[must_use]
     pub fn at(&self, wt: WeightedTimestamp) -> Option<&Arc<TopologySnapshot>> {
-        self.by_epoch.get(&self.epoch_for(wt))
+        match self.lookup(wt) {
+            ScheduleLookup::Committee(snapshot) => Some(snapshot),
+            ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => None,
+        }
+    }
+
+    /// [`at`](Self::at) with the miss reason surfaced: an epoch above every
+    /// retained entry is [`NotYetCommitted`](ScheduleLookup::NotYetCommitted)
+    /// (defer and retry), anything else absent is
+    /// [`Evicted`](ScheduleLookup::Evicted) (reject — no honest artifact is
+    /// attested below the eviction floor).
+    #[must_use]
+    pub fn lookup(&self, wt: WeightedTimestamp) -> ScheduleLookup<'_> {
+        let epoch = self.epoch_for(wt);
+        if let Some(snapshot) = self.by_epoch.get(&epoch) {
+            return ScheduleLookup::Committee(snapshot);
+        }
+        match self.by_epoch.last_key_value() {
+            Some((newest, _)) if epoch > *newest => ScheduleLookup::NotYetCommitted,
+            _ => ScheduleLookup::Evicted,
+        }
     }
 
     /// Active head committee — for the chain's constant
@@ -123,11 +147,11 @@ impl TopologySchedule {
         self.head = snapshot;
     }
 
-    /// Drop entries older than `current_epoch − retention_epochs`, bounding the
-    /// schedule to the retention window.
-    pub fn evict_before(&mut self, current_epoch: Epoch) {
-        let oldest = current_epoch.inner().saturating_sub(self.retention_epochs);
-        self.by_epoch.retain(|epoch, _| epoch.inner() >= oldest);
+    /// Drop entries below `floor`. The owner derives `floor` from the oldest
+    /// epoch any consumer can still legitimately query, so everything below
+    /// is unreachable by honest artifacts.
+    pub fn evict_below(&mut self, floor: Epoch) {
+        self.by_epoch.retain(|epoch, _| *epoch >= floor);
     }
 }
 
@@ -146,7 +170,7 @@ mod tests {
 
     #[test]
     fn epoch_for_floors_to_window() {
-        let sched = TopologySchedule::new(1000, 4, Epoch::new(5), snapshot());
+        let sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
         assert_eq!(
             sched.epoch_for(WeightedTimestamp::from_millis(0)),
             Epoch::new(0)
@@ -184,7 +208,7 @@ mod tests {
     #[test]
     fn at_returns_none_for_epochs_outside_the_window() {
         // The window holds the active epoch 5 and its lookahead 6.
-        let mut sched = TopologySchedule::new(1000, 1, Epoch::new(5), snapshot());
+        let mut sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
         sched.insert(Epoch::new(6), snapshot());
         assert!(sched.at(WeightedTimestamp::from_millis(5500)).is_some());
         assert!(sched.at(WeightedTimestamp::from_millis(6500)).is_some());
@@ -195,14 +219,34 @@ mod tests {
     }
 
     #[test]
-    fn evict_before_drops_past_the_retention_window() {
-        let mut sched = TopologySchedule::new(1000, 1, Epoch::new(4), snapshot());
+    fn lookup_distinguishes_the_two_miss_reasons() {
+        let mut sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        sched.insert(Epoch::new(6), snapshot());
+        assert!(matches!(
+            sched.lookup(WeightedTimestamp::from_millis(5500)),
+            ScheduleLookup::Committee(_)
+        ));
+        assert!(matches!(
+            sched.lookup(WeightedTimestamp::from_millis(7500)),
+            ScheduleLookup::NotYetCommitted
+        ));
+        assert!(matches!(
+            sched.lookup(WeightedTimestamp::from_millis(3500)),
+            ScheduleLookup::Evicted
+        ));
+    }
+
+    #[test]
+    fn evict_below_drops_only_epochs_below_the_floor() {
+        let mut sched = TopologySchedule::new(1000, Epoch::new(4), snapshot());
         sched.insert(Epoch::new(5), snapshot());
         sched.insert(Epoch::new(6), snapshot());
-        // Retain [current-1, ..]; committing epoch 6 evicts 4.
-        sched.evict_before(Epoch::new(6));
+        sched.evict_below(Epoch::new(5));
         assert!(sched.at(WeightedTimestamp::from_millis(4500)).is_none());
         assert!(sched.at(WeightedTimestamp::from_millis(5500)).is_some());
         assert!(sched.at(WeightedTimestamp::from_millis(6500)).is_some());
+        // A floor below every retained entry evicts nothing.
+        sched.evict_below(Epoch::new(0));
+        assert!(sched.at(WeightedTimestamp::from_millis(5500)).is_some());
     }
 }

@@ -26,7 +26,7 @@ use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
     MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
-    Verified, genesis_config_hash,
+    Verified, WeightedTimestamp, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -158,6 +158,7 @@ fn test_beacon_coordinator(
         vec![state],
         me,
         ShardId::ROOT,
+        WeightedTimestamp::ZERO,
         network,
         config_hash,
         pool,

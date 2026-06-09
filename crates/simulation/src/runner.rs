@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use hyperscale_beacon::coordinator::{BeaconCoordinator, TOPOLOGY_SCHEDULE_RETENTION_EPOCHS};
+use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ProtocolEvent, TimerId};
@@ -29,10 +29,11 @@ use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, LocalTimestamp,
+    CertifiedBeaconBlock, CertifiedBlock, Epoch, GenesisPool, GenesisValidator, LocalTimestamp,
     MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
-    bls_keypair_from_seed, genesis_config_hash, shard_prefix_path, uniform_shard_for_node,
+    WeightedTimestamp, bls_keypair_from_seed, genesis_config_hash, shard_prefix_path,
+    uniform_shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -308,11 +309,11 @@ impl SimulationRunner {
                 beacon_latest_state.current_epoch.next(),
             ));
 
-            // Load the topology-history window so each coordinator's
-            // schedule resumes with its full retention of committee
-            // snapshots, not just the latest.
+            // Load the full committed history: sim vnodes start with fresh
+            // shard chains (`RecoveredState::default()` anchors at genesis),
+            // so every committed epoch is still within the chain frontier.
             let beacon_history: Vec<BeaconState> = beacon_storage
-                .recent_states(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS)
+                .states_since(Epoch::GENESIS)
                 .into_iter()
                 .map(|state| state.as_ref().clone())
                 .collect();
@@ -333,6 +334,7 @@ impl SimulationRunner {
                         beacon_history.clone(),
                         validator_id,
                         *shard,
+                        WeightedTimestamp::ZERO,
                         beacon_network.clone(),
                         beacon_config_hash,
                         Arc::clone(&beacon_proposal_pool),
