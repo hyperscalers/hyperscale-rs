@@ -45,6 +45,13 @@ pub fn proposal_boundary_qcs_admissible(
     network: &NetworkDefinition,
 ) -> bool {
     proposal.boundary_qcs().iter().all(|(shard, opt)| {
+        // A boundary QC's verification marker, when present, is only ever
+        // BFT-transitive: the QC rides inside a `Verified<CertifiedBlockHeader>`
+        // whose `parent_qc` is hash-bound to the header but never
+        // signature-checked (`from_qc_attestation`). Admission therefore drops
+        // the marker and re-verifies the QC's `2f+1` against the governing
+        // committee, keeping beacon safety independent of the shard-sync trust
+        // path — never trust the marker to skip this gate.
         opt.as_ref().is_none_or(|qc| {
             boundary_qc_admissible(
                 *shard,
