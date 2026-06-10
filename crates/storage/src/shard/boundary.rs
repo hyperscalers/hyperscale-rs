@@ -10,7 +10,7 @@
 //! identically in simulation and production.
 
 use hyperscale_jmt::{Key, TreeReader};
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, StateRoot};
 
 use super::overlay::SubstateLookup;
 
@@ -27,6 +27,23 @@ pub trait ResolveLeaf {
     /// The raw `(storage key, value)` behind `leaf_key`, or `None` when
     /// the leaf is unknown at this boundary.
     fn resolve_leaf(&self, leaf_key: &Key) -> Option<(Vec<u8>, Vec<u8>)>;
+}
+
+/// One verified snap-sync leaf ready for import: the hashed JMT key and
+/// the raw substate pair it binds.
+///
+/// The leaf key is shipped, not recomputed — it carries the originating
+/// shard's owner-prefixed routing half, which the importer cannot derive
+/// from the raw key alone. The assembler has already proven it into the
+/// attested `state_root` and bound both halves of the pair to it.
+#[derive(Debug, Clone)]
+pub struct ImportLeaf {
+    /// The 32-byte hashed JMT leaf key.
+    pub leaf_key: Key,
+    /// The raw substate storage key.
+    pub storage_key: Vec<u8>,
+    /// The raw substate value.
+    pub value: Vec<u8>,
 }
 
 /// Pin and serve committed state at epoch boundary heights.
@@ -52,4 +69,23 @@ pub trait BoundaryStore {
 
     /// The newest pinned height, if any.
     fn latest_boundary(&self) -> Option<BlockHeight>;
+
+    /// Install a snap-synced boundary state at `height` into this
+    /// (empty) store: raw substates, the JMT rebuilt from the shipped
+    /// leaf keys, and the leaf associations — the state-level image of a
+    /// store that committed through the boundary. Chain metadata is not
+    /// touched; tail block-sync from `height + 1` layers on top.
+    ///
+    /// Returns the resulting state root, which the caller must compare
+    /// against the beacon-attested anchor before trusting the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure. Importing into a non-empty
+    /// store is an error — the import is a bootstrap, not a merge.
+    fn import_boundary_state(
+        &self,
+        height: BlockHeight,
+        leaves: Vec<ImportLeaf>,
+    ) -> Result<StateRoot, String>;
 }

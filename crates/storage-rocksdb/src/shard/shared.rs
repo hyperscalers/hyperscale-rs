@@ -15,7 +15,7 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, ShardChainReader,
+    DbSubstateValue, GenesisCommit, ImportLeaf, JmtSnapshot, PartitionEntry, ShardChainReader,
     ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
@@ -164,6 +164,14 @@ impl BoundaryStore for SharedStorage {
 
     fn latest_boundary(&self) -> Option<BlockHeight> {
         self.0.latest_boundary()
+    }
+
+    fn import_boundary_state(
+        &self,
+        height: BlockHeight,
+        leaves: Vec<ImportLeaf>,
+    ) -> Result<StateRoot, String> {
+        self.0.import_boundary_state(height, leaves)
     }
 }
 

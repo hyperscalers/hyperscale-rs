@@ -6,15 +6,18 @@
 //! that version. Retention mirrors the production checkpoint ring so
 //! eviction behaviour is exercised in simulation too.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
+use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader, ValueHash};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::shard::keys;
+use hyperscale_storage::tree::{Jmt, hash_value};
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, DbPartitionKey, DbSortKey, ResolveLeaf, SubstateLookup,
+    BOUNDARY_RETAIN, BoundaryStore, DbPartitionKey, DbSortKey, ImportLeaf, ResolveLeaf,
+    SubstateLookup,
 };
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, Hash, StateRoot};
 
 use super::core::SimShardStorage;
 use super::snapshot::value_at_version;
@@ -105,6 +108,55 @@ impl BoundaryStore for SimShardStorage {
     fn latest_boundary(&self) -> Option<BlockHeight> {
         read_or_recover(&self.boundary_pins).last().copied()
     }
+
+    fn import_boundary_state(
+        &self,
+        height: BlockHeight,
+        leaves: Vec<ImportLeaf>,
+    ) -> Result<StateRoot, String> {
+        let mut state = write_or_recover(&self.state);
+        if state.current_block_height != BlockHeight::GENESIS
+            || state.current_root_hash != StateRoot::ZERO
+        {
+            return Err("snap-sync import requires an empty store".to_string());
+        }
+
+        // The shipped leaf keys are already owner-prefixed; rebuild the
+        // tree from them directly instead of re-deriving through
+        // `put_at_version`, which would need the owner map.
+        let updates: BTreeMap<Key, Option<ValueHash>> = leaves
+            .iter()
+            .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
+            .collect();
+        let root_path = state.tree_store.root_path();
+        let result = Jmt::apply_updates_at(
+            &state.tree_store,
+            None,
+            height.inner(),
+            &root_path,
+            &updates,
+        )
+        .map_err(|e| format!("snap-sync JMT import: {e}"))?;
+        for (key, node) in result.batch.new_nodes {
+            state.tree_store.insert(key, Arc::new(node));
+        }
+        for leaf in leaves {
+            state
+                .associations
+                .insert(leaf.leaf_key, leaf.storage_key.clone());
+            state.current_state.insert(leaf.storage_key, leaf.value);
+        }
+
+        let root = if result.root_hash == [0u8; 32] {
+            StateRoot::ZERO
+        } else {
+            StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
+        };
+        state.current_block_height = height;
+        state.current_root_hash = root;
+        drop(state);
+        Ok(root)
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +243,63 @@ mod tests {
         commit_one(&storage, 1);
         assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
         assert_eq!(storage.latest_boundary(), None);
+    }
+
+    /// Full serve → import round trip: leaves enumerated and resolved
+    /// from a pinned boundary rebuild an identical store, with the raw
+    /// substates readable.
+    #[test]
+    fn imported_boundary_state_reproduces_the_root() {
+        let storage = SimShardStorage::default();
+        for seed in 1..=6u8 {
+            commit_one(&storage, seed);
+        }
+        let source_root = storage.state_root();
+        storage.pin_boundary(BlockHeight::new(6)).unwrap();
+
+        let boundary = storage.open_boundary(BlockHeight::new(6)).expect("pinned");
+        let root_key = boundary.get_root_key(6).expect("root resolves");
+        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], 1_000).unwrap();
+        let leaves: Vec<ImportLeaf> = chunk
+            .leaves
+            .iter()
+            .map(|(leaf_key, _)| {
+                let (storage_key, value) = boundary.resolve_leaf(leaf_key).expect("resolves");
+                ImportLeaf {
+                    leaf_key: *leaf_key,
+                    storage_key,
+                    value,
+                }
+            })
+            .collect();
+        assert_eq!(leaves.len(), 6);
+
+        let fresh = SimShardStorage::default();
+        let imported_root = fresh
+            .import_boundary_state(BlockHeight::new(6), leaves)
+            .unwrap();
+        assert_eq!(imported_root, source_root);
+        assert_eq!(fresh.state_root(), source_root);
+
+        // Imported raw substates read back at the current tip.
+        let partition_key = DbPartitionKey {
+            node_key: vec![3u8; 50],
+            partition_num: 0,
+        };
+        let fresh_boundary = {
+            fresh.pin_boundary(BlockHeight::new(6)).unwrap();
+            fresh.open_boundary(BlockHeight::new(6)).expect("pinned")
+        };
+        assert_eq!(
+            fresh_boundary.lookup_substate(&partition_key, &DbSortKey(vec![3])),
+            Some(vec![3, 3, 3]),
+        );
+
+        // A second import is rejected — the store is no longer empty.
+        assert!(
+            fresh
+                .import_boundary_state(BlockHeight::new(6), Vec::new())
+                .is_err()
+        );
     }
 }

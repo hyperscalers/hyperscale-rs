@@ -12,24 +12,31 @@
 //! dot-prefixed temporary name and a rename, so a crash mid-create
 //! leaves only a `.tmp-*` directory, swept on the next creation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::{BoundaryStore, DbPartitionKey, DbSortKey, ResolveLeaf, SubstateLookup};
+use hyperscale_jmt::{
+    Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader, ValueHash,
+};
+use hyperscale_storage::tree::{Jmt, hash_value};
+use hyperscale_storage::{
+    BoundaryStore, DbPartitionKey, DbSortKey, ImportLeaf, ResolveLeaf, SubstateLookup,
+};
 use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rocksdb::checkpoint::Checkpoint;
-use rocksdb::{DB, Options};
+use rocksdb::{DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf,
 };
 use super::core::RocksDbShardStorage;
-use super::jmt_stored::StoredNodeKey;
-use super::metadata::read_jmt_metadata;
+use super::jmt_snapshot_store::SnapshotTreeStore;
+use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
+use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
-use crate::typed_cf::{TypedCf, get};
+use crate::typed_cf::{TypedCf, batch_put, get};
 
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
@@ -261,6 +268,73 @@ impl BoundaryStore for RocksDbShardStorage {
     fn latest_boundary(&self) -> Option<BlockHeight> {
         self.checkpoints.latest().map(|(h, _)| h)
     }
+
+    fn import_boundary_state(
+        &self,
+        height: BlockHeight,
+        leaves: Vec<ImportLeaf>,
+    ) -> Result<StateRoot, String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        let (version, root) = self.read_jmt_metadata();
+        if version != 0 || root != StateRoot::ZERO {
+            return Err("snap-sync import requires an empty store".to_string());
+        }
+
+        // The shipped leaf keys are already owner-prefixed; rebuild the
+        // tree from them directly instead of re-deriving through
+        // `put_at_version`, which would need the owner map.
+        let updates: BTreeMap<Key, Option<ValueHash>> = leaves
+            .iter()
+            .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
+            .collect();
+        let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
+        let result = Jmt::apply_updates_at(
+            &snapshot_store,
+            None,
+            height.inner(),
+            &self.root_path,
+            &updates,
+        )
+        .map_err(|e| format!("snap-sync JMT import: {e}"))?;
+
+        let cf = CfHandles::resolve(&self.db);
+        let mut batch = WriteBatch::default();
+        for (node_key, node) in &result.batch.new_nodes {
+            batch_put::<JmtNodesCf>(
+                &mut batch,
+                JmtNodesCf::handle(&cf),
+                &StoredNodeKey::from_jmt(node_key),
+                &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
+            );
+        }
+        let state_cf = StateCf::handle(&cf);
+        let assoc_cf = LeafAssociationsCf::handle(&cf);
+        for leaf in &leaves {
+            // The raw storage key IS the state CF key encoding
+            // (`SubstateKeyCodec` is a raw concatenation).
+            batch.put_cf(state_cf, &leaf.storage_key, &leaf.value);
+            batch_put::<LeafAssociationsCf>(
+                &mut batch,
+                assoc_cf,
+                &Hash::from_hash_bytes(&leaf.leaf_key),
+                &leaf.storage_key,
+            );
+        }
+        let imported_root = if result.root_hash == [0u8; 32] {
+            StateRoot::ZERO
+        } else {
+            StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
+        };
+        write_jmt_metadata(&mut batch, height.inner(), imported_root);
+
+        self.db
+            .write(batch)
+            .map_err(|e| format!("snap-sync import write: {e}"))?;
+        Ok(imported_root)
+    }
 }
 
 /// Directory name for a checkpoint at `height` — zero-padded so
@@ -414,5 +488,49 @@ mod tests {
         commit_one(&storage, 1);
         assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
         assert_eq!(storage.latest_boundary(), None);
+    }
+
+    /// Full serve → import round trip: leaves enumerated and resolved
+    /// from a pinned boundary rebuild an identical store.
+    #[test]
+    fn imported_boundary_state_reproduces_the_root() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        for seed in 1..=6u8 {
+            commit_one(&storage, seed);
+        }
+        let source_root = storage.state_root();
+        storage.pin_boundary(BlockHeight::new(6)).unwrap();
+
+        let boundary = storage.open_boundary(BlockHeight::new(6)).expect("pinned");
+        let root_key = boundary.get_root_key(6).expect("root resolves");
+        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], 1_000).unwrap();
+        let leaves: Vec<ImportLeaf> = chunk
+            .leaves
+            .iter()
+            .map(|(leaf_key, _)| {
+                let (storage_key, value) = boundary.resolve_leaf(leaf_key).expect("resolves");
+                ImportLeaf {
+                    leaf_key: *leaf_key,
+                    storage_key,
+                    value,
+                }
+            })
+            .collect();
+
+        let fresh_dir = TempDir::new().unwrap();
+        let fresh = open_storage(fresh_dir.path());
+        let imported_root = fresh
+            .import_boundary_state(BlockHeight::new(6), leaves)
+            .unwrap();
+        assert_eq!(imported_root, source_root);
+        assert_eq!(fresh.state_root(), source_root);
+
+        // A second import is rejected — the store is no longer empty.
+        assert!(
+            fresh
+                .import_boundary_state(BlockHeight::new(6), Vec::new())
+                .is_err()
+        );
     }
 }
