@@ -9,6 +9,7 @@
 pub(crate) mod blocks;
 pub(crate) mod chain_reader;
 pub(crate) mod chain_writer;
+pub(crate) mod checkpoints;
 pub(crate) mod column_families;
 pub(crate) mod core;
 pub(crate) mod execution_certs;
