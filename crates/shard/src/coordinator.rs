@@ -1574,6 +1574,38 @@ impl ShardCoordinator {
         // This is CRITICAL for shard consensus safety - prevents Byzantine proposers from
         // including fake QCs with invalid signatures.
         if !header.parent_qc().is_genesis() {
+            // The parent QC's weighted timestamp keys this block's committee
+            // but rides outside the QC's signed message, so a Byzantine
+            // proposer can rewrite it on a genuine QC and steer verification
+            // to any retained epoch's committee. Honest aggregation clamps
+            // every vote to the voted block's own anchor (`VoteSet`), so a
+            // genuine QC never regresses below its parent's anchor — enforce
+            // that floor here, the chokepoint every vote path crosses (fresh
+            // headers, deferred children, and the verified-QC cache hit
+            // below). Unresolvable only while the parent itself is unknown —
+            // defer like the committee resolution below does;
+            // `retry_pending_children` re-enters when the parent lands.
+            let Some(parent_anchor) = self.committee_anchor(header.parent_qc().block_hash()) else {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    parent = ?header.parent_qc().block_hash(),
+                    "Parent block not held — deferring anchor check until it arrives"
+                );
+                return vec![];
+            };
+            if header.parent_qc().weighted_timestamp() < parent_anchor {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    height = height.inner(),
+                    qc_weighted_ms = header.parent_qc().weighted_timestamp().as_millis(),
+                    parent_anchor_ms = parent_anchor.as_millis(),
+                    "Parent QC weighted timestamp regresses below the parent's anchor — not voting"
+                );
+                return vec![];
+            }
+
             // Check if we've already verified this exact QC. The cache hit
             // must match byte-for-byte, not just by `block_hash` — see
             // `absorb_parent_qc_from_header` for the same trust gap. A
@@ -3096,11 +3128,12 @@ impl ShardCoordinator {
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
-        // message and can be rewritten by a relay. It is still not
-        // monotonicity-guaranteed (the field is unsigned, with no lower-bound
-        // check at vote time), so clamp to the prior committed value: deadlines
-        // keyed off `committed_ts` (dedup retention, validity windows) must
-        // never run backwards.
+        // message and can be rewritten by a relay. The vote path enforces the
+        // per-block monotonicity floor, but sync-admitted blocks commit on QC
+        // attestation without a local vote, so the field is still not
+        // monotonicity-guaranteed here. Clamp to the prior committed value:
+        // deadlines keyed off `committed_ts` (dedup retention, validity
+        // windows) must never run backwards.
         let weighted_ts = certified
             .block()
             .header()
@@ -4506,6 +4539,88 @@ mod tests {
             successor_committee.committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
             "a parent QC weighted timestamp at N·ED must resolve to committee_N",
+        );
+    }
+
+    #[test]
+    fn vote_path_rejects_anchor_regressing_below_parent() {
+        // The parent QC's weighted timestamp rides outside the QC's signed
+        // message, so a Byzantine proposer can rewrite it on a genuine QC to
+        // steer the block's committee to an older retained epoch. Honest
+        // aggregation floor-clamps every vote to the voted block's own
+        // anchor, so a genuine QC never regresses below the parent's anchor:
+        // a child carrying one must not reach verification or a vote. One
+        // carrying an equal anchor (a fallback's all-at-floor mean) must.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), 5_000);
+        let parent_hash = parent.hash();
+        install_complete_block(&mut state, &parent);
+
+        let child_with_anchor = |weighted_ms: u64, tag: &[u8]| {
+            let mut signers = SignerBitfield::new(4);
+            signers.set(0);
+            signers.set(1);
+            signers.set(2);
+            let parent_qc = QuorumCertificate::new(
+                parent_hash,
+                ShardId::ROOT,
+                BlockHeight::new(5),
+                parent.header().parent_block_hash(),
+                Round::new(5),
+                signers,
+                zero_bls_signature(),
+                WeightedTimestamp::from_millis(weighted_ms),
+            );
+            let header = BlockHeader::new(
+                ShardId::ROOT,
+                BlockHeight::new(6),
+                parent_hash,
+                parent_qc,
+                ValidatorId::new(2),
+                ProposerTimestamp::from_millis(weighted_ms),
+                Round::new(6),
+                false,
+                StateRoot::from_raw(Hash::from_bytes(tag)),
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                InFlightCount::ZERO,
+                BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+            );
+            Block::Live {
+                header,
+                transactions: Arc::new(BoundedVec::new()),
+                certificates: Arc::new(BoundedVec::new()),
+                provisions: Arc::new(BoundedVec::new()),
+            }
+        };
+
+        // Anchor regresses below the parent's (5_000): declined outright.
+        let regressing = child_with_anchor(4_999, b"regressing");
+        let regressing_hash = regressing.hash();
+        install_complete_block(&mut state, &regressing);
+        let actions = state.trigger_qc_verification_or_vote(&topology, regressing_hash);
+        assert!(
+            actions.is_empty(),
+            "regressing anchor must not reach verification: {actions:?}"
+        );
+
+        // Anchor equal to the parent's: proceeds to QC verification.
+        let level = child_with_anchor(5_000, b"level");
+        let level_hash = level.hash();
+        install_complete_block(&mut state, &level);
+        let actions = state.trigger_qc_verification_or_vote(&topology, level_hash);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "level anchor must proceed to parent-QC verification: {actions:?}"
         );
     }
 
