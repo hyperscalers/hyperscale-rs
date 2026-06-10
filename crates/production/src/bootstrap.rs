@@ -1,0 +1,395 @@
+//! Async pump for the sans-io shard bootstrap sequencer.
+//!
+//! [`ShardBootstrap`] owns the sequencing — state assembly, import +
+//! anchor verification, witness history, recovery seeding. This driver
+//! owns what the sequencer can't: dispatching its requests through
+//! [`Network::request`] (verification verdicts feed the peer-health
+//! tracker from inside the response callbacks), writing the import into
+//! the joiner's store, wall-clock pacing between fruitless rounds, and
+//! re-reading the anchor from the live topology when the state assembly
+//! starves (serving peers may have evicted the boundary it targets).
+//! It never gives up on its own; the join stands until the supervisor
+//! tears it down.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_node::SharedTopologySnapshot;
+use hyperscale_node::bootstrap::{BootstrapOutcome, BootstrapRequest, ShardBootstrap};
+use hyperscale_storage::{RecoveredState, ShardStorage};
+use hyperscale_types::{Request, ShardId};
+use tokio::sync::oneshot;
+use tokio::time::sleep;
+use tracing::{debug, info, warn};
+
+/// Pause between rounds that made no progress, so an unreachable or
+/// still-syncing committee isn't hammered.
+const FRUITLESS_ROUND_PAUSE: Duration = Duration::from_secs(1);
+
+/// Fruitless rounds before the anchor is re-read from the live
+/// topology — serving peers may have evicted the targeted boundary, in
+/// which case the assembly restarts against the newer one.
+const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
+
+/// Bootstrap a joining vnode's shard state against the beacon-attested
+/// boundary anchor, returning the [`RecoveredState`] its state machines
+/// boot from. The caller has already established that `storage` is
+/// fresh and an anchor exists.
+///
+/// # Errors
+///
+/// Returns a description of the failure. Errors are terminal for this
+/// join attempt — the import wrote into `storage`, or the store wasn't
+/// fresh to begin with; the operator decides whether to wipe and retry.
+pub async fn bootstrap_shard_state<S, N>(
+    network: &Arc<N>,
+    topology: &SharedTopologySnapshot,
+    storage: &Arc<S>,
+    shard: ShardId,
+) -> Result<RecoveredState, String>
+where
+    S: ShardStorage,
+    N: Network,
+{
+    'anchor: loop {
+        let Some(anchor) = topology.load().boundary(shard) else {
+            return Err(format!("shard {shard:?} has no attested anchor"));
+        };
+        info!(
+            ?shard,
+            height = anchor.height.inner(),
+            "Snap-sync bootstrap starting against attested anchor"
+        );
+        let bootstrap = Arc::new(Mutex::new(ShardBootstrap::new(shard, anchor)));
+        let mut fruitless = 0u32;
+        while !lock(&bootstrap).is_complete() {
+            let import = lock(&bootstrap).take_import();
+            if let Some((height, leaves)) = import {
+                let root = storage
+                    .import_boundary_state(height, leaves)
+                    .map_err(|error| format!("boundary import failed: {error}"))?;
+                lock(&bootstrap).on_imported(root)?;
+                continue;
+            }
+
+            let requests = lock(&bootstrap).next_requests();
+            let accepted = run_round(network, shard, &bootstrap, requests).await;
+            if accepted == 0 {
+                fruitless += 1;
+                if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
+                    fruitless = 0;
+                    // Only the state assembly depends on peers still
+                    // pinning the targeted boundary (and only there is
+                    // a restart sound — nothing has been imported yet);
+                    // the witness history serves from the live chain.
+                    if lock(&bootstrap).is_assembling_state()
+                        && topology
+                            .load()
+                            .boundary(shard)
+                            .is_some_and(|latest| latest != anchor)
+                    {
+                        warn!(
+                            ?shard,
+                            stale = anchor.height.inner(),
+                            "Snap-sync starved; restarting against the advanced anchor"
+                        );
+                        continue 'anchor;
+                    }
+                    warn!(
+                        ?shard,
+                        height = anchor.height.inner(),
+                        "Shard bootstrap making no progress; continuing"
+                    );
+                }
+                sleep(FRUITLESS_ROUND_PAUSE).await;
+            } else {
+                fruitless = 0;
+            }
+        }
+
+        let bootstrap = Arc::try_unwrap(bootstrap)
+            .map_err(|_| ())
+            .expect("all request callbacks resolved before completion")
+            .into_inner()
+            .expect("bootstrap mutex unpoisoned");
+        info!(
+            ?shard,
+            height = bootstrap.anchor().height.inner(),
+            "Snap-sync bootstrap complete; state verified against the anchor"
+        );
+        return Ok(bootstrap.into_recovered_state());
+    }
+}
+
+/// Dispatch one round of requests and await every response callback.
+/// Returns how many responses the sequencer accepted.
+async fn run_round<N: Network>(
+    network: &Arc<N>,
+    shard: ShardId,
+    bootstrap: &Arc<Mutex<ShardBootstrap>>,
+    requests: Vec<BootstrapRequest>,
+) -> usize {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut waiters = Vec::with_capacity(requests.len());
+    for request in requests {
+        let sequencer = Arc::clone(bootstrap);
+        let accepted = Arc::clone(&accepted);
+        let waiter = match request {
+            BootstrapRequest::StateRange(id, request) => {
+                send(network, shard, request, move |result| {
+                    result.map_or_else(
+                        |_| {
+                            lock(&sequencer).on_state_range_failure(id);
+                            // Verdict is ignored on the Err path — the
+                            // network already recorded the failure.
+                            ResponseVerdict::Accept
+                        },
+                        |response| {
+                            judge(
+                                &lock(&sequencer).on_state_range(id, &response),
+                                &accepted,
+                                shard,
+                            )
+                        },
+                    )
+                })
+            }
+            BootstrapRequest::WitnessHistory(request) => {
+                send(network, shard, request, move |result| {
+                    result.map_or_else(
+                        |_| {
+                            lock(&sequencer).on_witness_history_failure();
+                            ResponseVerdict::Accept
+                        },
+                        |response| {
+                            judge(
+                                &lock(&sequencer).on_witness_history(&response),
+                                &accepted,
+                                shard,
+                            )
+                        },
+                    )
+                })
+            }
+        };
+        waiters.push(waiter);
+    }
+    for waiter in waiters {
+        let _ = waiter.await;
+    }
+    accepted.load(Ordering::Relaxed)
+}
+
+/// Issue one request whose verdict `judge_response` decides; the
+/// returned receiver resolves when the callback has run.
+fn send<N: Network, R: Request + Clone + 'static>(
+    network: &Arc<N>,
+    shard: ShardId,
+    request: R,
+    judge_response: impl FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send + 'static,
+) -> oneshot::Receiver<()> {
+    let (done_tx, done_rx) = oneshot::channel();
+    network.request(
+        shard,
+        None,
+        request,
+        None,
+        Box::new(move |result| {
+            let verdict = judge_response(result);
+            let _ = done_tx.send(());
+            verdict
+        }),
+    );
+    done_rx
+}
+
+/// Translate a sequencer outcome into the peer verdict, counting
+/// accepts for the round's progress tracking.
+fn judge(outcome: &BootstrapOutcome, accepted: &AtomicUsize, shard: ShardId) -> ResponseVerdict {
+    match outcome {
+        BootstrapOutcome::Accepted => {
+            accepted.fetch_add(1, Ordering::Relaxed);
+            ResponseVerdict::Accept
+        }
+        BootstrapOutcome::Rejected(reason) => {
+            debug!(?shard, reason, "Bootstrap response rejected");
+            ResponseVerdict::Reject
+        }
+    }
+}
+
+fn lock(bootstrap: &Mutex<ShardBootstrap>) -> std::sync::MutexGuard<'_, ShardBootstrap> {
+    bootstrap.lock().expect("bootstrap mutex unpoisoned")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use arc_swap::ArcSwap;
+    use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
+    use hyperscale_node::{serve_state_range_request, serve_witness_history_request};
+    use hyperscale_storage::test_helpers::{
+        commit_block_with_updates, commit_block_with_witnesses, make_database_update,
+    };
+    use hyperscale_storage::{BoundaryStore, PendingChain, SubstateStore};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
+    use hyperscale_types::{
+        BlockHeight, GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor,
+        TopologySnapshot, ValidatorId, ValidatorSet,
+    };
+    use sbor::{basic_decode, basic_encode};
+
+    use super::*;
+
+    const ENTRIES: u8 = 12;
+    const ANCHOR_HEIGHT: u64 = ENTRIES as u64 + 1;
+
+    /// A committed replica: `ENTRIES` substate blocks, then a boundary
+    /// block whose header carries the (empty) witness commitment, pinned
+    /// for serving.
+    fn replica() -> (Arc<SimShardStorage>, ShardAnchor) {
+        let storage = SimShardStorage::default();
+        for seed in 1..=ENTRIES {
+            let updates =
+                make_database_update(vec![seed; 50], 0, vec![seed], vec![seed, seed, seed]);
+            commit_block_with_updates(&storage, BlockHeight::new(u64::from(seed)), &updates);
+        }
+        let block_hash =
+            commit_block_with_witnesses(&storage, BlockHeight::new(ANCHOR_HEIGHT), &[]);
+        storage
+            .pin_boundary(BlockHeight::new(ANCHOR_HEIGHT))
+            .unwrap();
+        let anchor = ShardAnchor {
+            state_root: storage.state_root(),
+            block_hash,
+            height: BlockHeight::new(ANCHOR_HEIGHT),
+        };
+        (Arc::new(storage), anchor)
+    }
+
+    /// Serves bootstrap requests from `honest`, except the first
+    /// `flaky_failures` requests which fail at the transport level.
+    /// Requests are matched by `message_type_id` and round-tripped
+    /// through SBOR to erase the generic.
+    struct StubNetwork {
+        honest: Arc<SimShardStorage>,
+        pending_chain: PendingChain<SimShardStorage>,
+        flaky_failures: AtomicUsize,
+    }
+
+    impl StubNetwork {
+        fn new(storage: Arc<SimShardStorage>, flaky_failures: usize) -> Self {
+            Self {
+                honest: Arc::clone(&storage),
+                pending_chain: PendingChain::new(storage),
+                flaky_failures: AtomicUsize::new(flaky_failures),
+            }
+        }
+    }
+
+    impl Network for StubNetwork {
+        fn request<R: Request + Clone + 'static>(
+            &self,
+            _shard: ShardId,
+            _preferred_peer: Option<ValidatorId>,
+            request: R,
+            _class_override: Option<MessageClass>,
+            on_response: Box<
+                dyn FnOnce(Result<<R as Request>::Response, RequestError>) -> ResponseVerdict
+                    + Send,
+            >,
+        ) {
+            if self
+                .flaky_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                on_response(Err(RequestError::Timeout));
+                return;
+            }
+            let encoded = basic_encode(&request).expect("request encodes");
+            let response = match R::message_type_id() {
+                "state_range.request" => {
+                    let req: GetStateRangeRequest = basic_decode(&encoded).expect("decode");
+                    basic_encode(&serve_state_range_request(&self.honest, &req)).expect("encode")
+                }
+                "witness_history.request" => {
+                    let req: GetWitnessHistoryRequest = basic_decode(&encoded).expect("decode");
+                    basic_encode(&serve_witness_history_request(&self.pending_chain, &req))
+                        .expect("encode")
+                }
+                other => panic!("unexpected bootstrap request type {other}"),
+            };
+            on_response(Ok(basic_decode(&response).expect("response decodes")));
+        }
+
+        fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _shard: ShardId, _message: &M) {
+            unimplemented!("bootstrap never gossips")
+        }
+        fn broadcast_global<M: GossipMessage + 'static>(&self, _message: &M) {
+            unimplemented!("bootstrap never gossips")
+        }
+        fn register_gossip_handler<M: GossipMessage + 'static>(
+            &self,
+            _handler: impl GossipHandler<M>,
+        ) {
+            unimplemented!("bootstrap registers no handlers")
+        }
+        fn register_request_handler<R: Request + Send + 'static>(
+            &self,
+            _shard: ShardId,
+            _handler: impl RequestHandler<R>,
+        ) {
+            unimplemented!("bootstrap registers no handlers")
+        }
+        fn notify<M: NetworkMessage + 'static>(&self, _recipients: &[ValidatorId], _message: &M) {
+            unimplemented!("bootstrap never notifies")
+        }
+        fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+            &self,
+            _handler: impl NotificationHandler<M>,
+        ) {
+            unimplemented!("bootstrap registers no handlers")
+        }
+        fn subscribe_shard(&self, _shard: ShardId) {}
+        fn unsubscribe_shard(&self, _shard: ShardId) {}
+    }
+
+    fn shared_topology(anchor: ShardAnchor, shard: ShardId) -> SharedTopologySnapshot {
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            HashMap::from([(shard, Vec::new())]),
+            HashMap::new(),
+            HashMap::from([(shard, anchor)]),
+        );
+        Arc::new(ArcSwap::from_pointee(snapshot))
+    }
+
+    /// The pump end to end over the sequencer: request dispatch with
+    /// verdicts, the import write, and the seeded recovery — healing
+    /// transport failures on the way.
+    #[tokio::test]
+    async fn pump_drives_the_sequencer_to_a_seeded_recovery() {
+        let (serving, anchor) = replica();
+        let shard = ShardId::ROOT;
+        let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 3));
+        let topology = shared_topology(anchor, shard);
+        let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+
+        let recovered = bootstrap_shard_state(&network, &topology, &fresh, shard)
+            .await
+            .expect("bootstrap succeeds");
+
+        assert_eq!(recovered.committed_height, anchor.height);
+        assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        assert!(recovered.beacon_witness_leaf_hashes.is_empty());
+        // The imported store reproduces the attested root.
+        assert_eq!(fresh.state_root(), anchor.state_root);
+    }
+}

@@ -64,6 +64,7 @@
 //! let shared_dispatch = Arc::new(dispatch);
 //! ```
 
+mod bootstrap;
 pub mod rpc;
 mod runner;
 mod status;

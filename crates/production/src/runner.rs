@@ -29,7 +29,7 @@ use hex::encode as hex_encode;
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
-use hyperscale_core::{ProtocolEvent, TimerId};
+use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
@@ -328,6 +328,12 @@ impl ProductionRunnerBuilder {
         install();
 
         let vnode_configs = self.vnodes;
+        // Per-vnode signing keys, retained so a placement delta can be
+        // translated into a `ShardCommand::Join` for the moved vnode.
+        let vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>> = vnode_configs
+            .iter()
+            .map(|v| (v.validator_id, Arc::clone(&v.signing_key)))
+            .collect();
         let shared_topology = self.topology;
         let shard_config = self.shard_config;
         let storages = self.storages;
@@ -648,6 +654,7 @@ impl ProductionRunnerBuilder {
 
         let storages = Arc::new(std::sync::Mutex::new(storages));
         let (reconfigure_tx, reconfigure_rx) = mpsc::channel(16);
+        let (participation_tx, participation_rx) = mpsc::unbounded_channel();
         let supervisor = ShardSupervisor::new(
             Arc::clone(host.process()),
             shard_config,
@@ -661,6 +668,7 @@ impl ProductionRunnerBuilder {
             self.mempool_snapshot.clone(),
             Arc::clone(&storages),
             self.storage_factory,
+            participation_tx,
         );
 
         Ok(ProductionRunner {
@@ -670,6 +678,8 @@ impl ProductionRunnerBuilder {
             supervisor: Some(supervisor),
             reconfigure_tx,
             reconfigure_rx: Some(reconfigure_rx),
+            participation_rx: Some(participation_rx),
+            vnode_keys,
             network: adapter,
             topology_snapshot: topology,
             storages,
@@ -722,6 +732,13 @@ pub struct ProductionRunner {
     reconfigure_tx: mpsc::Sender<ShardCommand>,
     /// Receiver drained by `run()`'s select loop.
     reconfigure_rx: Option<mpsc::Receiver<ShardCommand>>,
+    /// Placement deltas emitted by the hosted vnodes' beacon
+    /// coordinators, forwarded off the shard threads. `run()`'s select
+    /// loop translates each into [`ShardCommand`]s for the supervisor.
+    participation_rx: Option<mpsc::UnboundedReceiver<ParticipationChange>>,
+    /// Per-validator signing keys for every vnode this runner was built
+    /// with, keyed for the placement-delta translation.
+    vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
@@ -1035,6 +1052,13 @@ impl ProductionRunner {
             .reconfigure_rx
             .take()
             .expect("reconfigure_rx already taken");
+        let mut participation_rx = self
+            .participation_rx
+            .take()
+            .expect("participation_rx already taken");
+        let mut bootstrap_done_rx = supervisor
+            .take_bootstrap_done_rx()
+            .expect("bootstrap_done_rx already taken");
 
         loop {
             tokio::select! {
@@ -1046,6 +1070,16 @@ impl ProductionRunner {
                 command = reconfigure_rx.recv() => {
                     if let Some(command) = command {
                         supervisor.handle(command);
+                    }
+                }
+                change = participation_rx.recv() => {
+                    if let Some(change) = change {
+                        self.apply_participation_change(&mut supervisor, &change);
+                    }
+                }
+                done = bootstrap_done_rx.recv() => {
+                    if let Some(done) = done {
+                        supervisor.finish_join(done);
                     }
                 }
                 _ = metrics_tick.tick() => {
@@ -1074,6 +1108,42 @@ impl ProductionRunner {
     #[must_use]
     pub fn reconfigure_handle(&self) -> mpsc::Sender<ShardCommand> {
         self.reconfigure_tx.clone()
+    }
+
+    /// Translate a beacon-detected placement delta into supervisor
+    /// commands for the moved vnode. A join starts the shard's
+    /// bootstrap immediately — the delta arrives a full epoch before
+    /// the window opens, and the vnode votes only once ready.
+    fn apply_participation_change(
+        &self,
+        supervisor: &mut ShardSupervisor,
+        change: &ParticipationChange,
+    ) {
+        info!(
+            validator = change.validator.inner(),
+            join = ?change.join,
+            leave = ?change.leave,
+            effective_epoch = change.effective_epoch.inner(),
+            "Beacon placement change detected"
+        );
+        let Some(shard) = change.join else {
+            return;
+        };
+        let Some(signing_key) = self.vnode_keys.get(&change.validator) else {
+            warn!(
+                validator = change.validator.inner(),
+                "Placement change for a validator without a local signing key; ignored"
+            );
+            return;
+        };
+        supervisor.handle(ShardCommand::Join {
+            shard,
+            vnodes: vec![VnodeConfig {
+                validator_id: change.validator,
+                local_shard: shard,
+                signing_key: Arc::clone(signing_key),
+            }],
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1337,6 +1407,10 @@ pub struct ShardLoopConfig {
     pub(crate) shutdown_rx: Receiver<()>,
     pub(crate) tokio_handle: TokioHandle,
     pub(crate) initial_timer_ops: Vec<TimerOp>,
+    /// Placement deltas emitted by this shard's vnodes, forwarded to
+    /// the runner's reconfiguration loop. `None` in tests that drive a
+    /// loop without a runner.
+    pub(crate) participation_tx: Option<mpsc::UnboundedSender<ParticipationChange>>,
     /// Shared RPC `vnodes` list. Each shard's thread writes its own
     /// vnodes' entries via `retain != self.shard_coordinator` + push on the metrics
     /// tick; concurrent shards racing on the same `ArcSwap` lose at most
@@ -1418,6 +1492,12 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
             let output = shard_loop.run_step(input);
             for op in output.timer_ops {
                 timer_mgr.process_op(op);
+            }
+            if let Some(tx) = &config.participation_tx {
+                for change in output.reconfigurations {
+                    // Send failure means the runner is shutting down.
+                    let _ = tx.send(change);
+                }
             }
         }
 

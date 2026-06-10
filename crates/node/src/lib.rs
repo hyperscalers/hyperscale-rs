@@ -30,20 +30,21 @@
 //! [`ProcessIo`]: crate::process_io::ProcessIo
 
 mod batch_accumulator;
+pub mod bootstrap;
 mod config;
 pub mod event;
 pub mod host;
 pub mod process_io;
 mod shard_io;
 pub mod shard_loop;
-pub mod snap_sync;
 mod state;
 mod vnode;
-pub mod witness_history;
 
 pub use config::NodeConfig;
 pub use host::NodeHost;
 pub use shard_io::ShardIo;
+pub use shard_io::fetch::state_range_serve::serve_state_range_request;
+pub use shard_io::fetch::witness_history_serve::serve_witness_history_request;
 pub use shard_io::sync::block::BlockSyncStateKind;
 pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;

@@ -146,6 +146,21 @@ where
         &self.beacon_proposal_pool
     }
 
+    /// Shared network handle. Runner-level drivers (e.g. the shard
+    /// supervisor's snap-sync bootstrap) issue requests through it.
+    #[must_use]
+    pub const fn network(&self) -> &Arc<N> {
+        &self.network
+    }
+
+    /// Shared lock-free topology snapshot handle, refreshed on every
+    /// `Action::TopologyChanged`. Long-running consumers hold the
+    /// handle and re-load to observe beacon commits.
+    #[must_use]
+    pub const fn topology(&self) -> &SharedTopologySnapshot {
+        &self.topology_snapshot
+    }
+
     /// Sender for `shard`'s event channel (an owned clone — crossbeam
     /// senders are cheap `Arc` handles).
     ///

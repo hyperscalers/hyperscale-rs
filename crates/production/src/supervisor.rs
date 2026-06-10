@@ -15,12 +15,13 @@
 //! vnodes on one shard share storage and a thread, and a departing one
 //! must not tear the other down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Sender, unbounded};
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
+use hyperscale_core::ParticipationChange;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
@@ -31,11 +32,14 @@ use hyperscale_node::shard_loop::ShardEvent;
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
+use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
-use hyperscale_types::{BeaconState, GenesisConfigHash, NetworkDefinition, ShardId};
+use hyperscale_types::{BeaconState, BlockHeight, GenesisConfigHash, NetworkDefinition, ShardId};
 use tokio::runtime::Handle as TokioHandle;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::bootstrap::bootstrap_shard_state;
 use crate::rpc::{MempoolSnapshot, NodeStatusState};
 use crate::runner::{
     ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop, wall_clock_local,
@@ -74,6 +78,16 @@ pub enum ShardCommand {
     },
 }
 
+/// A finished snap-sync bootstrap, ready for the supervisor to seat:
+/// the imported storage verified against the attested anchor, plus the
+/// recovered state the shard's state machines boot from.
+pub struct CompletedBootstrap {
+    shard: ShardId,
+    vnodes: Vec<VnodeConfig>,
+    storage: Arc<RocksDbShardStorage>,
+    recovered: RecoveredState,
+}
+
 /// One hosted shard's runtime: its pinned thread plus the handles the
 /// supervisor needs to stop it.
 struct ShardThread {
@@ -104,7 +118,18 @@ pub struct ShardSupervisor {
     /// Per-shard `RocksDB` handles, shared with the runner's GC tick.
     storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
     storage_factory: Option<StorageFactory>,
+    /// Cloned into every spawned shard loop's config so placement
+    /// deltas reach the runner's reconfiguration loop.
+    participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     shards: HashMap<ShardId, ShardThread>,
+    /// Shards whose join is parked on an in-flight snap-sync bootstrap.
+    /// Guards against a second `Join` racing a double import.
+    bootstrapping: HashSet<ShardId>,
+    /// Completed bootstraps land here; the runner's select loop drains
+    /// the paired receiver and calls [`Self::finish_join`].
+    bootstrap_done_tx: mpsc::UnboundedSender<CompletedBootstrap>,
+    /// Receiver side, taken by the runner's `run()` loop.
+    bootstrap_done_rx: Option<mpsc::UnboundedReceiver<CompletedBootstrap>>,
 }
 
 impl ShardSupervisor {
@@ -122,7 +147,9 @@ impl ShardSupervisor {
         mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
         storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
         storage_factory: Option<StorageFactory>,
+        participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     ) -> Self {
+        let (bootstrap_done_tx, bootstrap_done_rx) = mpsc::unbounded_channel();
         Self {
             process,
             node_config: NodeConfig::default(),
@@ -137,8 +164,21 @@ impl ShardSupervisor {
             mempool_snapshot,
             storages,
             storage_factory,
+            participation_tx,
             shards: HashMap::new(),
+            bootstrapping: HashSet::new(),
+            bootstrap_done_tx,
+            bootstrap_done_rx: Some(bootstrap_done_rx),
         }
+    }
+
+    /// Take the bootstrap-completion receiver. The runner's `run()`
+    /// loop drains it and hands each completion to
+    /// [`Self::finish_join`].
+    pub(crate) const fn take_bootstrap_done_rx(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<CompletedBootstrap>> {
+        self.bootstrap_done_rx.take()
     }
 
     /// Spawn a startup shard's pinned thread and record it. Used by the
@@ -176,11 +216,22 @@ impl ShardSupervisor {
         }
     }
 
-    /// Bring up `shard`: open storage, build vnode state machines from
-    /// the host's beacon chain, wire the process maps, spawn the thread.
+    /// Bring up `shard`: open storage, bootstrap its state when the
+    /// store is fresh and the beacon attests an anchor, build vnode
+    /// state machines from the host's beacon chain, wire the process
+    /// maps, spawn the thread.
+    ///
+    /// Three paths by what the store and the beacon offer:
+    /// - **retained storage** (committed height > 0) — seat directly;
+    ///   normal block sync covers the tail;
+    /// - **fresh store, attested anchor** — snap-sync bootstrap off
+    ///   this loop (a tokio task), seated via [`Self::finish_join`]
+    ///   when the import verifies against the anchor;
+    /// - **fresh store, no anchor** — seat directly and replay from
+    ///   genesis through block sync.
     fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
-        if self.shards.contains_key(&shard) {
-            warn!(shard = ?shard, "Join rejected: shard already hosted");
+        if self.shards.contains_key(&shard) || self.bootstrapping.contains(&shard) {
+            warn!(shard = ?shard, "Join rejected: shard already hosted or bootstrapping");
             return;
         }
         if vnodes.is_empty() || vnodes.iter().any(|v| v.local_shard != shard) {
@@ -199,7 +250,59 @@ impl ShardSupervisor {
             }
         };
 
-        let inits = self.build_vnode_inits(shard, vnodes, &storage);
+        let recovered = storage.load_recovered_state();
+        let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
+        let anchor = self.process.topology().load().boundary(shard);
+        if fresh_store && anchor.is_some() {
+            self.bootstrapping.insert(shard);
+            let process = Arc::clone(&self.process);
+            let done_tx = self.bootstrap_done_tx.clone();
+            let vnodes = vnodes.to_vec();
+            self.tokio_handle.spawn(async move {
+                match bootstrap_shard_state(process.network(), process.topology(), &storage, shard)
+                    .await
+                {
+                    Ok(recovered) => {
+                        // Send failure means the runner is shutting
+                        // down; the join dies with it.
+                        let _ = done_tx.send(CompletedBootstrap {
+                            shard,
+                            vnodes,
+                            storage,
+                            recovered,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(shard = ?shard, error, "Shard bootstrap failed; join abandoned");
+                    }
+                }
+            });
+            return;
+        }
+        self.seat_shard(shard, vnodes, storage, &recovered);
+    }
+
+    /// Seat a bootstrap-completed shard. Runs on the runner's loop via
+    /// the completion channel — never on the bootstrap task.
+    pub(crate) fn finish_join(&mut self, done: CompletedBootstrap) {
+        self.bootstrapping.remove(&done.shard);
+        if self.shards.contains_key(&done.shard) {
+            warn!(shard = ?done.shard, "Bootstrap completed for an already-hosted shard; dropped");
+            return;
+        }
+        self.seat_shard(done.shard, &done.vnodes, done.storage, &done.recovered);
+    }
+
+    /// Wire a shard's vnodes into the process maps and spawn its pinned
+    /// thread, booting the state machines from `recovered`.
+    fn seat_shard(
+        &mut self,
+        shard: ShardId,
+        vnodes: &[VnodeConfig],
+        storage: Arc<RocksDbShardStorage>,
+        recovered: &RecoveredState,
+    ) {
+        let inits = self.build_vnode_inits(shard, vnodes, recovered);
         let vnode_count = inits.len();
 
         let (timer_tx, timer_rx) = unbounded();
@@ -296,6 +399,7 @@ impl ShardSupervisor {
             shutdown_rx: channels.shutdown_rx,
             tokio_handle: self.tokio_handle.clone(),
             initial_timer_ops,
+            participation_tx: Some(self.participation_tx.clone()),
             rpc_status: self.rpc_status.clone(),
             sync_status: self.sync_status.clone(),
             mempool_snapshot: self.mempool_snapshot.clone(),
@@ -304,15 +408,16 @@ impl ShardSupervisor {
 
     /// Build one `VnodeInit` per joining vnode: a fresh beacon
     /// coordinator resumed from the host's committed beacon chain, and
-    /// a `NodeStateMachine` recovered from the (typically empty) shard
-    /// storage. Fresh per-shard stores are shared across the group.
+    /// a `NodeStateMachine` booted from `recovered` — loaded from
+    /// retained storage, synthesized from a snap-synced anchor, or
+    /// default for a genesis replay. Fresh per-shard stores are shared
+    /// across the group.
     fn build_vnode_inits(
         &self,
         shard: ShardId,
         vnodes: &[VnodeConfig],
-        storage: &Arc<RocksDbShardStorage>,
+        recovered: &RecoveredState,
     ) -> Vec<VnodeInit> {
-        let recovered = storage.load_recovered_state();
         let beacon_storage = self.process.beacon_storage();
         let (latest_block, latest_state) = beacon_storage
             .latest_committed()
