@@ -67,7 +67,9 @@
 pub mod rpc;
 mod runner;
 mod status;
+mod supervisor;
 mod telemetry;
 pub use runner::{ProductionRunner, RunnerError, VnodeConfig};
 pub use status::SyncStatus;
+pub use supervisor::{ShardCommand, StorageFactory};
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

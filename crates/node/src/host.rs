@@ -26,7 +26,7 @@ use quick_cache::sync::Cache as QuickCache;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::process_io::ProcessIo;
+use crate::process_io::{ProcessIo, register_shard_request_handlers};
 use crate::shard_io::ShardIo;
 use crate::shard_io::block_commit::BlockCommitCoordinator;
 use crate::shard_io::caches::SharedCaches;
@@ -235,37 +235,12 @@ where
             .state
             .shard_id();
         assert!(
-            vnodes.iter().all(|v| v.state.shard_id() == shard),
-            "add_shard vnodes must all target one shard"
-        );
-        assert!(
             !self.shards.contains_key(&shard),
             "shard {shard:?} already hosted"
         );
-
-        self.process.insert_shard_sender(shard, sender.clone());
-        let (io, handles) = build_shard_io(shard, &vnodes, storage, &self.config);
-        self.process.dispatch_handles.insert_shard(shard, handles);
-        self.process.network.subscribe_shard(shard);
-
-        let b = &self.config.batch;
-        let shard_loop = ShardLoop {
-            shard,
-            event_tx: sender,
-            process: Arc::clone(&self.process),
-            io,
-            vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
-            now: self.now,
-            pending_timer_ops: Vec::new(),
-            emitted_statuses: Vec::new(),
-            actions_generated: 0,
-            outbound_gossip_batches: std::collections::BTreeMap::new(),
-            tx_gossip_max: b.tx_gossip_max,
-            tx_gossip_window: b.tx_gossip_window,
-        };
+        let mut shard_loop = attach_shard(&self.process, &self.config, vnodes, storage, sender);
+        shard_loop.set_time(self.now);
         self.shards.insert(shard, shard_loop);
-        self.refresh_execution_cache_shards();
-        self.register_request_handlers_for(shard);
     }
 
     /// Stop hosting `shard`: exclude it from the network's hosted set,
@@ -277,20 +252,8 @@ where
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {
         let shard_loop = self.shards.remove(&shard)?;
-        self.process.network.unsubscribe_shard(shard);
-        self.process.remove_shard_sender(shard);
-        self.process.dispatch_handles.remove_shard(shard);
-        self.refresh_execution_cache_shards();
+        detach_shard(&self.process, shard);
         Some(shard_loop)
-    }
-
-    /// Re-derive the execution cache's hosted set from the live shard
-    /// map after an add or remove.
-    fn refresh_execution_cache_shards(&self) {
-        self.process
-            .dispatch_handles
-            .execution_cache
-            .set_hosted_shards(self.shards.keys().copied().collect());
     }
 
     /// Consume the host and yield its constituent parts: the shared
@@ -528,6 +491,90 @@ where
             sl.flush_all_batches();
         }
     }
+}
+
+/// Wire a runtime-joined shard into the process-scoped maps and build
+/// its `ShardLoop`.
+///
+/// Installs the event sender, builds the `ShardIo` + dispatch handles,
+/// grows the execution cache and network hosted sets, and registers
+/// the shard's request handlers. Returns the loop for the caller to
+/// drive — `NodeHost::add_shard` seats it in the host's map (the sim
+/// step path); the production supervisor moves it onto a pinned
+/// thread.
+///
+/// # Panics
+///
+/// Panics if `vnodes` is empty or targets mixed shards.
+pub fn attach_shard<S, N, D>(
+    process: &Arc<ProcessIo<S, N, D>>,
+    config: &NodeConfig,
+    vnodes: Vec<VnodeInit>,
+    storage: S,
+    sender: Sender<ShardEvent>,
+) -> ShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    let shard = vnodes
+        .first()
+        .expect("attach_shard requires at least one vnode")
+        .state
+        .shard_id();
+    assert!(
+        vnodes.iter().all(|v| v.state.shard_id() == shard),
+        "attach_shard vnodes must all target one shard"
+    );
+
+    process.insert_shard_sender(shard, sender.clone());
+    let (io, handles) = build_shard_io(shard, &vnodes, storage, config);
+    process.dispatch_handles.insert_shard(shard, handles);
+    process
+        .dispatch_handles
+        .execution_cache
+        .add_hosted_shard(shard);
+    process.network.subscribe_shard(shard);
+
+    let b = &config.batch;
+    let shard_loop = ShardLoop {
+        shard,
+        event_tx: sender,
+        process: Arc::clone(process),
+        io,
+        vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
+        now: LocalTimestamp::ZERO,
+        pending_timer_ops: Vec::new(),
+        emitted_statuses: Vec::new(),
+        actions_generated: 0,
+        outbound_gossip_batches: std::collections::BTreeMap::new(),
+        tx_gossip_max: b.tx_gossip_max,
+        tx_gossip_window: b.tx_gossip_window,
+    };
+    register_shard_request_handlers(process, &shard_loop.io, shard);
+    shard_loop
+}
+
+/// Reverse of [`attach_shard`]: unwire a shard from the process maps.
+///
+/// Call once the shard's loop has stopped stepping (the sim path drops
+/// the loop; the production supervisor joins the thread first).
+/// Inbound traffic for the shard is rejected from the moment the maps
+/// swap.
+pub fn detach_shard<S, N, D>(process: &Arc<ProcessIo<S, N, D>>, shard: ShardId)
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    process.network.unsubscribe_shard(shard);
+    process.remove_shard_sender(shard);
+    process.dispatch_handles.remove_shard(shard);
+    process
+        .dispatch_handles
+        .execution_cache
+        .remove_hosted_shard(shard);
 }
 
 /// Build one shard's `ShardIo` plus its dispatch-handle entry from the

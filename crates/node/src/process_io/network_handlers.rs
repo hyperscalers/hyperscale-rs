@@ -30,6 +30,8 @@ use tracing::warn;
 
 use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
+use crate::process_io::ProcessIo;
+use crate::shard_io::ShardIo;
 use crate::shard_io::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
@@ -46,334 +48,8 @@ where
     pub(crate) fn register_request_handler(&self) {
         let shards: Vec<ShardId> = self.hosted_shards().collect();
         for shard in shards {
-            self.register_request_handlers_for(shard);
+            register_shard_request_handlers(&self.process, self.shard_io(shard), shard);
         }
-    }
-
-    /// Register one shard's per-type request handlers with the network.
-    ///
-    /// Each handler is a closure that captures that shard's state and
-    /// delegates to the serving function in the corresponding protocol
-    /// module. Called once per shard — at init for startup shards and
-    /// again when a shard is added at runtime (after its `ShardLoop` is
-    /// seated, so the closures capture live `ShardIo` handles).
-    #[allow(clippy::too_many_lines)] // single registration table; one closure per request type
-    pub(crate) fn register_request_handlers_for(&self, shard: ShardId) {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        use hyperscale_types::network::request::{
-            GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
-            GetTransactionsRequest,
-        };
-
-        use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
-        use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
-        use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
-        use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
-        use crate::shard_io::fetch::provision_serve::serve_provision_request;
-        use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
-        use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
-        use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
-        use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
-        use crate::shard_io::sync::block_serve::serve_block_request;
-        use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
-
-        type ProvisionResponse = GetProvisionResponse;
-        type ProvisionWaiter = Arc<(
-            std::sync::Mutex<Option<ProvisionResponse>>,
-            std::sync::Condvar,
-        )>;
-
-        struct InFlightSlot {
-            waiter: ProvisionWaiter,
-            waiters: usize,
-        }
-
-        struct ProvisionsRequestDedup {
-            cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
-            in_flight: HashMap<(u64, u64), InFlightSlot>,
-        }
-
-        // Single-flight guard: clears the `in_flight` slot and wakes waiters
-        // when the producer's stack unwinds — including on panic, where the
-        // explicit cleanup below would be skipped. Waiters treat a still-`None`
-        // slot after wake as a failure response.
-        struct InFlightGuard {
-            dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>>,
-            waiter: ProvisionWaiter,
-            cache_key: (u64, u64),
-        }
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                if let Ok(mut g) = self.dedup.lock() {
-                    g.in_flight.remove(&self.cache_key);
-                }
-                self.waiter.1.notify_all();
-            }
-        }
-
-        // Cap how long a waiter blocks on a producer. Request handlers run on
-        // tokio blocking-pool threads; without a bound, a stalled producer can
-        // pin every waiter thread and eventually starve the pool. The guard
-        // above already wakes waiters on producer panic — this bound covers
-        // the rest (deadlock, deep stalls, runaway work).
-        const PRODUCER_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-        // Cap concurrent waiters on a single producer. Honest fan-out from
-        // a remote committee can stack dozens of waiters on one (height,
-        // shard) key; this cap covers that case while bounding the
-        // blocking-pool footprint when a producer stalls. Waiters past
-        // the cap return `None` immediately and let the caller retry —
-        // by then the producer has typically published a result that the
-        // cache fast path will serve.
-        const MAX_WAITERS_PER_KEY: usize = 64;
-
-        // Each handler closure captures this shard's `PendingChain` and
-        // per-protocol caches. No raw `&S` flows into a serve function:
-        // every chain read goes through `PendingChain` so the
-        // shard-committed / JMT-persisted window is reachable from one
-        // place.
-        // ── block.request → sync protocol ────────────────────────────
-
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
-        self.process
-            .network
-            .register_request_handler::<GetBlockRequest>(shard, move |req| {
-                serve_block_request(&pending_chain, &provision_store, &req)
-            });
-
-        // ── transaction.request → fetch protocol ─────────────────────
-
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        let tx_store = Arc::clone(&self.shard_io(shard).caches.tx_store);
-        self.process
-            .network
-            .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
-                serve_transaction_request(&pending_chain, &tx_store, &req)
-            });
-
-        // ── state_range.request → snap-sync boundary serving ─────────
-
-        let storage = Arc::clone(&self.shard_io(shard).storage);
-        self.process
-            .network
-            .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
-                serve_state_range_request(&storage, &req)
-            });
-
-        // ── provision.request → serve from local store ───────────────
-        //
-        // Dedup + cache: the proof for (block_height, target_shard) is
-        // deterministic, and many validators request the same provisions.
-        // Without dedup each request regenerates the merkle proof (~30ms),
-        // and under load 40+ redundant generations per height cause CPU
-        // thrashing.
-
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        let topology = self.process.topology_snapshot.clone();
-        let outbound_cache = Arc::clone(&self.shard_io(shard).caches.provision_store);
-
-        let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
-            Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
-                cache: std::collections::BTreeMap::new(),
-                in_flight: HashMap::new(),
-            }));
-
-        self.process
-            .network
-            .register_request_handler::<GetProvisionsRequest>(
-                shard,
-                move |req: GetProvisionsRequest| {
-                    let cache_key = (req.block_height.inner(), req.target_shard.inner());
-
-                    // Outbound fast path: if we still hold the exact batch we
-                    // generated for this (source_block_height, target_shard),
-                    // rebuild the response from memory — no RocksDB regeneration,
-                    // no merkle-proof recomputation.
-                    if let Some(provisions) =
-                        outbound_cache.get_outbound(req.block_height, req.target_shard)
-                    {
-                        record_fetch_response_sent(
-                            "provision",
-                            provisions.transactions().len().max(1),
-                        );
-                        return GetProvisionResponse {
-                            provisions: Some(provisions),
-                        };
-                    }
-
-                    // Fast path: check cache or join an existing in-flight
-                    // computation. Reservation happens under `dedup` lock so
-                    // the per-key waiter cap is checked atomically with the
-                    // count increment.
-                    let waiter_to_join = {
-                        let mut guard = dedup.lock().unwrap();
-                        if let Some(cached) = guard.cache.get(&cache_key) {
-                            if let Some(p) = &cached.provisions {
-                                record_fetch_response_sent(
-                                    "provision",
-                                    p.transactions().len().max(1),
-                                );
-                            }
-                            return cached.clone();
-                        }
-                        if let Some(slot) = guard.in_flight.get_mut(&cache_key) {
-                            if slot.waiters >= MAX_WAITERS_PER_KEY {
-                                // Cap reached — return a soft failure so the
-                                // caller can retry once the producer publishes;
-                                // the cache fast path will then serve.
-                                return GetProvisionResponse { provisions: None };
-                            }
-                            slot.waiters += 1;
-                            Some(Arc::clone(&slot.waiter))
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(waiter) = waiter_to_join {
-                        let (lock, cvar) = &*waiter;
-                        let wait_result = cvar.wait_timeout_while(
-                            lock.lock().unwrap(),
-                            PRODUCER_WAIT_BUDGET,
-                            |r| r.is_none(),
-                        );
-                        // Decrement the per-key waiter count regardless of how
-                        // we left the wait (timeout, success, or producer drop).
-                        // The producer's `InFlightGuard` may have already
-                        // removed the slot, and a fresh producer may have
-                        // inserted a new one under the same key — `ptr_eq`
-                        // ensures we only decrement against the slot we
-                        // actually joined.
-                        if let Ok(mut g) = dedup.lock()
-                            && let Some(slot) = g.in_flight.get_mut(&cache_key)
-                            && Arc::ptr_eq(&slot.waiter, &waiter)
-                        {
-                            slot.waiters = slot.waiters.saturating_sub(1);
-                        }
-                        let (result, wait_outcome) = wait_result.unwrap();
-                        if wait_outcome.timed_out() {
-                            return GetProvisionResponse { provisions: None };
-                        }
-                        return result
-                            .clone()
-                            .unwrap_or(GetProvisionResponse { provisions: None });
-                    }
-
-                    // We're the producer — register the in-flight slot and let
-                    // the guard handle cleanup + waiter wake-up on every exit
-                    // path, including panic.
-                    let waiter: ProvisionWaiter = Arc::new((
-                        std::sync::Mutex::new(None::<GetProvisionResponse>),
-                        std::sync::Condvar::new(),
-                    ));
-                    dedup.lock().unwrap().in_flight.insert(
-                        cache_key,
-                        InFlightSlot {
-                            waiter: Arc::clone(&waiter),
-                            waiters: 0,
-                        },
-                    );
-
-                    let _guard = InFlightGuard {
-                        dedup: Arc::clone(&dedup),
-                        waiter: Arc::clone(&waiter),
-                        cache_key,
-                    };
-
-                    let response = serve_provision_request(
-                        &pending_chain,
-                        shard,
-                        topology.load().shard_trie(),
-                        &req,
-                    );
-
-                    if response.provisions.is_some() {
-                        let mut g = dedup.lock().unwrap();
-                        g.cache.insert(cache_key, response.clone());
-                        // Evict oldest entry (keep last 256)
-                        if g.cache.len() > 256 {
-                            g.cache.pop_first();
-                        }
-                    }
-
-                    // Publish the result before the guard's notify_all fires.
-                    *waiter.0.lock().unwrap() = Some(response.clone());
-
-                    response
-                },
-            );
-
-        // ── local_provision.request → provision cache lookup ─────────
-
-        let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
-        let verified_headers = Arc::clone(&self.shard_io(shard).caches.verified_headers);
-        self.process
-            .network
-            .register_request_handler::<GetLocalProvisionsRequest>(shard, move |req| {
-                serve_local_provisions_request(&provision_store, &verified_headers, &req)
-            });
-
-        // ── finalized_wave.request → cache lookup + pending_chain fallback ─
-
-        let fw_cache = Arc::clone(&self.shard_io(shard).caches.finalized_wave);
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        self.process
-            .network
-            .register_request_handler::<GetFinalizedWavesRequest>(shard, move |req| {
-                serve_finalized_waves_request(&pending_chain, &fw_cache, &req)
-            });
-
-        // ── execution_cert.request → cert store lookup ────────────────
-
-        let exec_cert_store = Arc::clone(&self.shard_io(shard).caches.exec_cert_store);
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        self.process
-            .network
-            .register_request_handler::<GetExecutionCertsRequest>(shard, move |req| {
-                serve_execution_certs_request(&pending_chain, &exec_cert_store, &req)
-            });
-
-        // ── remote_header.request → range header sync ───────────────────
-
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        self.process
-            .network
-            .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
-                serve_remote_headers_request(&pending_chain, shard, &req)
-            });
-
-        // ── beacon.shard_witnesses.request → witness proof serve ────────
-        //
-        // Beacon validators outside this shard's committee pull
-        // accumulator leaves + inclusion proofs anchored at a
-        // specific committed block. Pure CPU + storage read; no
-        // dedup until traffic profiling shows it's worth it.
-
-        let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
-        self.process
-            .network
-            .register_request_handler::<GetShardWitnessesRequest>(shard, move |req| {
-                serve_shard_witnesses_request(&pending_chain, &req)
-            });
-
-        // ── beacon.proposal.request → host-shared pool lookup ──────
-        let beacon_proposal_pool = Arc::clone(&self.process.beacon_proposal_pool);
-        self.process
-            .network
-            .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
-                serve_beacon_proposal_request(&beacon_proposal_pool, &req)
-            });
-
-        // ── beacon.block.request → committed beacon block by epoch ──
-        let beacon_storage = Arc::clone(&self.process.beacon_storage);
-        self.process
-            .network
-            .register_request_handler::<GetBeaconBlockRequest>(shard, move |req| {
-                serve_beacon_block_request(beacon_storage.as_ref(), &req)
-            });
     }
 
     /// Register gossip handlers for broadcast message types (transactions
@@ -1000,4 +676,331 @@ where
                 },
             );
     }
+}
+
+/// Register one shard's per-type request handlers with the network.
+///
+/// Each handler is a closure that captures that shard's state and
+/// delegates to the serving function in the corresponding protocol
+/// module. Called once per shard — at init for startup shards and
+/// again when a shard is added at runtime (after its `ShardLoop` is
+/// seated, so the closures capture live `ShardIo` handles).
+#[allow(clippy::too_many_lines)] // single registration table; one closure per request type
+pub fn register_shard_request_handlers<S, N, D>(
+    process: &Arc<ProcessIo<S, N, D>>,
+    io: &ShardIo<S>,
+    shard: ShardId,
+) where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use hyperscale_types::network::request::{
+        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+        GetTransactionsRequest,
+    };
+
+    use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
+    use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
+    use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
+    use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
+    use crate::shard_io::fetch::provision_serve::serve_provision_request;
+    use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
+    use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
+    use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
+    use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
+    use crate::shard_io::sync::block_serve::serve_block_request;
+    use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
+
+    type ProvisionResponse = GetProvisionResponse;
+    type ProvisionWaiter = Arc<(
+        std::sync::Mutex<Option<ProvisionResponse>>,
+        std::sync::Condvar,
+    )>;
+
+    struct InFlightSlot {
+        waiter: ProvisionWaiter,
+        waiters: usize,
+    }
+
+    struct ProvisionsRequestDedup {
+        cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
+        in_flight: HashMap<(u64, u64), InFlightSlot>,
+    }
+
+    // Single-flight guard: clears the `in_flight` slot and wakes waiters
+    // when the producer's stack unwinds — including on panic, where the
+    // explicit cleanup below would be skipped. Waiters treat a still-`None`
+    // slot after wake as a failure response.
+    struct InFlightGuard {
+        dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>>,
+        waiter: ProvisionWaiter,
+        cache_key: (u64, u64),
+    }
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            if let Ok(mut g) = self.dedup.lock() {
+                g.in_flight.remove(&self.cache_key);
+            }
+            self.waiter.1.notify_all();
+        }
+    }
+
+    // Cap how long a waiter blocks on a producer. Request handlers run on
+    // tokio blocking-pool threads; without a bound, a stalled producer can
+    // pin every waiter thread and eventually starve the pool. The guard
+    // above already wakes waiters on producer panic — this bound covers
+    // the rest (deadlock, deep stalls, runaway work).
+    const PRODUCER_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Cap concurrent waiters on a single producer. Honest fan-out from
+    // a remote committee can stack dozens of waiters on one (height,
+    // shard) key; this cap covers that case while bounding the
+    // blocking-pool footprint when a producer stalls. Waiters past
+    // the cap return `None` immediately and let the caller retry —
+    // by then the producer has typically published a result that the
+    // cache fast path will serve.
+    const MAX_WAITERS_PER_KEY: usize = 64;
+
+    // Each handler closure captures this shard's `PendingChain` and
+    // per-protocol caches. No raw `&S` flows into a serve function:
+    // every chain read goes through `PendingChain` so the
+    // shard-committed / JMT-persisted window is reachable from one
+    // place.
+    // ── block.request → sync protocol ────────────────────────────
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    let provision_store = Arc::clone(&io.caches.provision_store);
+    process
+        .network
+        .register_request_handler::<GetBlockRequest>(shard, move |req| {
+            serve_block_request(&pending_chain, &provision_store, &req)
+        });
+
+    // ── transaction.request → fetch protocol ─────────────────────
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    let tx_store = Arc::clone(&io.caches.tx_store);
+    process
+        .network
+        .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
+            serve_transaction_request(&pending_chain, &tx_store, &req)
+        });
+
+    // ── state_range.request → snap-sync boundary serving ─────────
+
+    let storage = Arc::clone(&io.storage);
+    process
+        .network
+        .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
+            serve_state_range_request(&storage, &req)
+        });
+
+    // ── provision.request → serve from local store ───────────────
+    //
+    // Dedup + cache: the proof for (block_height, target_shard) is
+    // deterministic, and many validators request the same provisions.
+    // Without dedup each request regenerates the merkle proof (~30ms),
+    // and under load 40+ redundant generations per height cause CPU
+    // thrashing.
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    let topology = process.topology_snapshot.clone();
+    let outbound_cache = Arc::clone(&io.caches.provision_store);
+
+    let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
+        Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
+            cache: std::collections::BTreeMap::new(),
+            in_flight: HashMap::new(),
+        }));
+
+    process
+        .network
+        .register_request_handler::<GetProvisionsRequest>(
+            shard,
+            move |req: GetProvisionsRequest| {
+                let cache_key = (req.block_height.inner(), req.target_shard.inner());
+
+                // Outbound fast path: if we still hold the exact batch we
+                // generated for this (source_block_height, target_shard),
+                // rebuild the response from memory — no RocksDB regeneration,
+                // no merkle-proof recomputation.
+                if let Some(provisions) =
+                    outbound_cache.get_outbound(req.block_height, req.target_shard)
+                {
+                    record_fetch_response_sent("provision", provisions.transactions().len().max(1));
+                    return GetProvisionResponse {
+                        provisions: Some(provisions),
+                    };
+                }
+
+                // Fast path: check cache or join an existing in-flight
+                // computation. Reservation happens under `dedup` lock so
+                // the per-key waiter cap is checked atomically with the
+                // count increment.
+                let waiter_to_join = {
+                    let mut guard = dedup.lock().unwrap();
+                    if let Some(cached) = guard.cache.get(&cache_key) {
+                        if let Some(p) = &cached.provisions {
+                            record_fetch_response_sent("provision", p.transactions().len().max(1));
+                        }
+                        return cached.clone();
+                    }
+                    if let Some(slot) = guard.in_flight.get_mut(&cache_key) {
+                        if slot.waiters >= MAX_WAITERS_PER_KEY {
+                            // Cap reached — return a soft failure so the
+                            // caller can retry once the producer publishes;
+                            // the cache fast path will then serve.
+                            return GetProvisionResponse { provisions: None };
+                        }
+                        slot.waiters += 1;
+                        Some(Arc::clone(&slot.waiter))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(waiter) = waiter_to_join {
+                    let (lock, cvar) = &*waiter;
+                    let wait_result =
+                        cvar.wait_timeout_while(lock.lock().unwrap(), PRODUCER_WAIT_BUDGET, |r| {
+                            r.is_none()
+                        });
+                    // Decrement the per-key waiter count regardless of how
+                    // we left the wait (timeout, success, or producer drop).
+                    // The producer's `InFlightGuard` may have already
+                    // removed the slot, and a fresh producer may have
+                    // inserted a new one under the same key — `ptr_eq`
+                    // ensures we only decrement against the slot we
+                    // actually joined.
+                    if let Ok(mut g) = dedup.lock()
+                        && let Some(slot) = g.in_flight.get_mut(&cache_key)
+                        && Arc::ptr_eq(&slot.waiter, &waiter)
+                    {
+                        slot.waiters = slot.waiters.saturating_sub(1);
+                    }
+                    let (result, wait_outcome) = wait_result.unwrap();
+                    if wait_outcome.timed_out() {
+                        return GetProvisionResponse { provisions: None };
+                    }
+                    return result
+                        .clone()
+                        .unwrap_or(GetProvisionResponse { provisions: None });
+                }
+
+                // We're the producer — register the in-flight slot and let
+                // the guard handle cleanup + waiter wake-up on every exit
+                // path, including panic.
+                let waiter: ProvisionWaiter = Arc::new((
+                    std::sync::Mutex::new(None::<GetProvisionResponse>),
+                    std::sync::Condvar::new(),
+                ));
+                dedup.lock().unwrap().in_flight.insert(
+                    cache_key,
+                    InFlightSlot {
+                        waiter: Arc::clone(&waiter),
+                        waiters: 0,
+                    },
+                );
+
+                let _guard = InFlightGuard {
+                    dedup: Arc::clone(&dedup),
+                    waiter: Arc::clone(&waiter),
+                    cache_key,
+                };
+
+                let response = serve_provision_request(
+                    &pending_chain,
+                    shard,
+                    topology.load().shard_trie(),
+                    &req,
+                );
+
+                if response.provisions.is_some() {
+                    let mut g = dedup.lock().unwrap();
+                    g.cache.insert(cache_key, response.clone());
+                    // Evict oldest entry (keep last 256)
+                    if g.cache.len() > 256 {
+                        g.cache.pop_first();
+                    }
+                }
+
+                // Publish the result before the guard's notify_all fires.
+                *waiter.0.lock().unwrap() = Some(response.clone());
+
+                response
+            },
+        );
+
+    // ── local_provision.request → provision cache lookup ─────────
+
+    let provision_store = Arc::clone(&io.caches.provision_store);
+    let verified_headers = Arc::clone(&io.caches.verified_headers);
+    process
+        .network
+        .register_request_handler::<GetLocalProvisionsRequest>(shard, move |req| {
+            serve_local_provisions_request(&provision_store, &verified_headers, &req)
+        });
+
+    // ── finalized_wave.request → cache lookup + pending_chain fallback ─
+
+    let fw_cache = Arc::clone(&io.caches.finalized_wave);
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetFinalizedWavesRequest>(shard, move |req| {
+            serve_finalized_waves_request(&pending_chain, &fw_cache, &req)
+        });
+
+    // ── execution_cert.request → cert store lookup ────────────────
+
+    let exec_cert_store = Arc::clone(&io.caches.exec_cert_store);
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetExecutionCertsRequest>(shard, move |req| {
+            serve_execution_certs_request(&pending_chain, &exec_cert_store, &req)
+        });
+
+    // ── remote_header.request → range header sync ───────────────────
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
+            serve_remote_headers_request(&pending_chain, shard, &req)
+        });
+
+    // ── beacon.shard_witnesses.request → witness proof serve ────────
+    //
+    // Beacon validators outside this shard's committee pull
+    // accumulator leaves + inclusion proofs anchored at a
+    // specific committed block. Pure CPU + storage read; no
+    // dedup until traffic profiling shows it's worth it.
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetShardWitnessesRequest>(shard, move |req| {
+            serve_shard_witnesses_request(&pending_chain, &req)
+        });
+
+    // ── beacon.proposal.request → host-shared pool lookup ──────
+    let beacon_proposal_pool = Arc::clone(&process.beacon_proposal_pool);
+    process
+        .network
+        .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
+            serve_beacon_proposal_request(&beacon_proposal_pool, &req)
+        });
+
+    // ── beacon.block.request → committed beacon block by epoch ──
+    let beacon_storage = Arc::clone(&process.beacon_storage);
+    process
+        .network
+        .register_request_handler::<GetBeaconBlockRequest>(shard, move |req| {
+            serve_beacon_block_request(beacon_storage.as_ref(), &req)
+        });
 }

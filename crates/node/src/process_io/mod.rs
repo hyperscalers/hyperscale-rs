@@ -22,6 +22,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{RoutableTransaction, ShardId};
+pub(crate) use network_handlers::register_shard_request_handlers;
 
 use crate::event::{ShardEvent, ShardScopedInput};
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
@@ -131,6 +132,18 @@ where
             beacon_commit: BeaconCommitCoordinator::new(),
             beacon_proposal_pool,
         }
+    }
+
+    /// Process-level beacon chain storage handle.
+    #[must_use]
+    pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
+        &self.beacon_storage
+    }
+
+    /// Host-shared per-epoch beacon proposal pool.
+    #[must_use]
+    pub const fn beacon_proposal_pool(&self) -> &Arc<BeaconProposalPool> {
+        &self.beacon_proposal_pool
     }
 
     /// Sender for `shard`'s event channel (an owned clone — crossbeam

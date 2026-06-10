@@ -60,7 +60,7 @@ use quick_cache::sync::Cache as QuickCache;
 use radix_common::types::ComponentAddress;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
@@ -70,6 +70,7 @@ use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
 use crate::status::{ShardSyncState, SyncStatus};
+use crate::supervisor::{ShardCommand, ShardSupervisor, StorageFactory};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -132,6 +133,7 @@ impl Drop for ShutdownHandle {
 /// (V > 1 with every entry mapped to the same `local_shard`) collapses onto
 /// one `NodeHost`, one libp2p peer, and one `ShardIo`, with per-vnode signing
 /// keys and per-vnode `NodeStateMachine`s.
+#[derive(Clone)]
 pub struct VnodeConfig {
     /// This vnode's validator identity.
     pub validator_id: ValidatorId,
@@ -178,6 +180,9 @@ pub struct ProductionRunnerBuilder {
     network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
     channel_capacity: usize,
+    /// Opens a runtime-joined shard's `RocksDB` storage. Without one,
+    /// `ShardCommand::Join` is rejected.
+    storage_factory: Option<StorageFactory>,
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
@@ -229,7 +234,16 @@ impl ProductionRunnerBuilder {
             network_definition: None,
             mempool_config: MempoolConfig::default(),
             provision_config: ProvisionConfig::default(),
+            storage_factory: None,
         }
+    }
+
+    /// Set the storage factory that opens a runtime-joined shard's
+    /// `RocksDB` storage. Without one, `ShardCommand::Join` is rejected.
+    #[must_use]
+    pub fn storage_factory(mut self, factory: StorageFactory) -> Self {
+        self.storage_factory = Some(factory);
+        self
     }
 
     /// Set the Radix network definition for transaction validation.
@@ -371,23 +385,23 @@ impl ProductionRunnerBuilder {
         // Build one (timer / callback / shutdown) channel triple per
         // hosted shard up front so the per-shard event senders inside
         // `ProcessIo` can point at each shard's own callback channel.
-        // `ShardChannels` carries the receivers; the runner keeps a clone
-        // of each shutdown sender for fanout at termination.
+        // `ShardChannels` carries both ends; the supervisor keeps the
+        // shutdown/callback senders alive for the shard's lifetime.
         let mut shard_channels: HashMap<ShardId, ShardChannels> = HashMap::new();
         let mut shard_callback_txs: HashMap<ShardId, Sender<ShardEvent>> = HashMap::new();
-        let mut shard_shutdown_txs: HashMap<ShardId, Sender<()>> = HashMap::new();
         for shard in &local_shards {
             let (timer_tx, timer_rx) = unbounded();
             let (callback_tx, callback_rx) = unbounded();
             let (shutdown_tx, shutdown_rx) = unbounded();
-            shard_callback_txs.insert(*shard, callback_tx);
-            shard_shutdown_txs.insert(*shard, shutdown_tx);
+            shard_callback_txs.insert(*shard, callback_tx.clone());
             shard_channels.insert(
                 *shard,
                 ShardChannels {
                     timer_tx,
                     timer_rx,
+                    callback_tx,
                     callback_rx,
+                    shutdown_tx,
                     shutdown_rx,
                 },
             );
@@ -625,11 +639,37 @@ impl ProductionRunnerBuilder {
         // half the txs.
         let tx_status_caches = host.tx_status_caches();
 
+        // Per-shard vnode counts seed the supervisor's membership
+        // refcounts for the startup shards.
+        let shard_vnode_counts: HashMap<ShardId, usize> = host
+            .hosted_shards()
+            .map(|shard| (shard, host.vnodes_len(shard)))
+            .collect();
+
+        let storages = Arc::new(std::sync::Mutex::new(storages));
+        let (reconfigure_tx, reconfigure_rx) = mpsc::channel(16);
+        let supervisor = ShardSupervisor::new(
+            Arc::clone(host.process()),
+            shard_config,
+            self.mempool_config,
+            self.provision_config,
+            beacon_network,
+            beacon_config_hash,
+            TokioHandle::current(),
+            self.rpc_status.clone(),
+            self.sync_status.clone(),
+            self.mempool_snapshot.clone(),
+            Arc::clone(&storages),
+            self.storage_factory,
+        );
+
         Ok(ProductionRunner {
             host: Some(host),
             shard_channels: Some(shard_channels),
-            shard_callback_txs,
-            shard_shutdown_txs,
+            shard_vnode_counts,
+            supervisor: Some(supervisor),
+            reconfigure_tx,
+            reconfigure_rx: Some(reconfigure_rx),
             network: adapter,
             topology_snapshot: topology,
             storages,
@@ -669,26 +709,28 @@ pub struct ProductionRunner {
     /// construction and consumed when `run()` spawns the shard threads.
     shard_channels: Option<HashMap<ShardId, ShardChannels>>,
 
-    /// Per-shard callback senders, kept alive on the runner so the
-    /// channels survive until shutdown. The same `Sender` clones live
-    /// inside [`ProcessIo::shard_event_senders`] for off-thread callers.
-    #[allow(dead_code)]
-    shard_callback_txs: HashMap<ShardId, Sender<ShardEvent>>,
+    /// Per-shard local vnode counts at startup, seeding the
+    /// supervisor's membership refcounts.
+    shard_vnode_counts: HashMap<ShardId, usize>,
 
-    /// Per-shard shutdown signals. `shutdown()` fans these to every
-    /// shard thread in parallel.
-    shard_shutdown_txs: HashMap<ShardId, Sender<()>>,
+    /// Owns the pinned shard threads from `run()` onward and executes
+    /// runtime membership commands.
+    supervisor: Option<ShardSupervisor>,
+
+    /// Command channel into the supervisor; cloned out via
+    /// [`Self::reconfigure_handle`].
+    reconfigure_tx: mpsc::Sender<ShardCommand>,
+    /// Receiver drained by `run()`'s select loop.
+    reconfigure_rx: Option<mpsc::Receiver<ShardCommand>>,
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
     /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
-    /// One `RocksDB` storage per hosted shard. The runner keeps these
-    /// alive across `run()` startup and clones them into the pinned
-    /// loop's [`PinnedLoopConfig::storages`] for per-shard JMT GC and
-    /// storage-memory metrics.
-    #[allow(dead_code)]
-    storages: HashMap<ShardId, Arc<RocksDbShardStorage>>,
+    /// Per-shard `RocksDB` handles for the JMT GC tick and storage
+    /// metrics, shared with the supervisor, which inserts and removes
+    /// entries as shards join and leave.
+    storages: Arc<std::sync::Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for.
@@ -971,34 +1013,28 @@ impl ProductionRunner {
             timer_ops_by_shard.entry(shard).or_default().push(op);
         }
 
-        // ── 3. Spawn one pinned thread per hosted shard.
-        let tokio_handle = TokioHandle::current();
-        let mut shard_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(shards.len());
+        // ── 3. Spawn one pinned thread per hosted shard, recorded in the
+        // supervisor so runtime membership commands can stop them.
+        let mut supervisor = self.supervisor.take().expect("supervisor already taken");
         for (shard, shard_loop) in shards {
             let channels = shard_channels
                 .remove(&shard)
                 .expect("channels allocated for every hosted shard");
             let initial_timer_ops = timer_ops_by_shard.remove(&shard).unwrap_or_default();
-            let cfg = ShardLoopConfig {
-                timer_tx: channels.timer_tx,
-                timer_rx: channels.timer_rx,
-                callback_rx: channels.callback_rx,
-                shutdown_rx: channels.shutdown_rx,
-                tokio_handle: tokio_handle.clone(),
-                initial_timer_ops,
-                rpc_status: self.rpc_status.clone(),
-                sync_status: self.sync_status.clone(),
-                mempool_snapshot: self.mempool_snapshot.clone(),
-            };
-            shard_threads.push(spawn_shard_loop(shard_loop, cfg));
+            let vnode_count = self.shard_vnode_counts.get(&shard).copied().unwrap_or(1);
+            supervisor.spawn_recorded(shard_loop, channels, initial_timer_ops, vnode_count);
         }
 
-        // ── 4. Metrics + maintenance + shutdown loop.
+        // ── 4. Metrics + maintenance + reconfiguration + shutdown loop.
         let mut metrics_tick = interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_gc = Instant::now();
         let gc_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown_rx = self.shutdown_rx.take().expect("shutdown_rx already taken");
+        let mut reconfigure_rx = self
+            .reconfigure_rx
+            .take()
+            .expect("reconfigure_rx already taken");
 
         loop {
             tokio::select! {
@@ -1006,6 +1042,11 @@ impl ProductionRunner {
                 _ = &mut shutdown_rx => {
                     info!("Shutdown signal received");
                     break;
+                }
+                command = reconfigure_rx.recv() => {
+                    if let Some(command) = command {
+                        supervisor.handle(command);
+                    }
                 }
                 _ = metrics_tick.tick() => {
                     self.collect_metrics();
@@ -1021,19 +1062,18 @@ impl ProductionRunner {
 
         // ── 5. Fan shutdown to every shard thread in parallel.
         info!("Sending shutdown to shard threads");
-        for (shard, tx) in &self.shard_shutdown_txs {
-            if tx.send(()).is_err() {
-                debug!(shard = ?shard, "Shard already exited");
-            }
-        }
-        for handle in shard_threads {
-            if let Err(e) = handle.join() {
-                warn!("Shard thread panicked: {:?}", e);
-            }
-        }
+        supervisor.shutdown_all();
 
         info!("Production runner stopped");
         Ok(())
+    }
+
+    /// Command channel into the shard supervisor. Send
+    /// [`ShardCommand`]s to add or drop shard participation at runtime;
+    /// they execute on the runner's tokio loop, off the shard threads.
+    #[must_use]
+    pub fn reconfigure_handle(&self) -> mpsc::Sender<ShardCommand> {
+        self.reconfigure_tx.clone()
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1083,6 +1123,8 @@ impl ProductionRunner {
         in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
         let storages: Vec<(ShardId, Arc<RocksDbShardStorage>)> = self
             .storages
+            .lock()
+            .expect("storages lock")
             .iter()
             .map(|(s, st)| (*s, Arc::clone(st)))
             .collect();
@@ -1171,16 +1213,18 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 type ProdHost = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
-type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
+pub type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Per-shard receivers driving a single shard's pinned thread. Built
 /// during construction and consumed when [`ProductionRunner::run`]
 /// hands the bundle to [`run_shard_loop`].
-struct ShardChannels {
-    timer_tx: Sender<ShardEvent>,
-    timer_rx: Receiver<ShardEvent>,
-    callback_rx: Receiver<ShardEvent>,
-    shutdown_rx: Receiver<()>,
+pub struct ShardChannels {
+    pub(crate) timer_tx: Sender<ShardEvent>,
+    pub(crate) timer_rx: Receiver<ShardEvent>,
+    pub(crate) callback_tx: Sender<ShardEvent>,
+    pub(crate) callback_rx: Receiver<ShardEvent>,
+    pub(crate) shutdown_tx: Sender<()>,
+    pub(crate) shutdown_rx: Receiver<()>,
 }
 
 /// Manages tokio-based timers for one shard's pinned event loop.
@@ -1274,7 +1318,7 @@ fn shard_for_address(address: &ComponentAddress, shard_trie: &ShardTrie) -> Shar
 /// Same epoch as `WeightedTimestamp` so the proposer-skew comparison works
 /// without unit conversion. NTP back-steps are absorbed by saturating
 /// arithmetic on `LocalTimestamp`.
-fn wall_clock_local() -> LocalTimestamp {
+pub fn wall_clock_local() -> LocalTimestamp {
     let ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1286,25 +1330,25 @@ fn wall_clock_local() -> LocalTimestamp {
 }
 
 /// Per-shard pinned-thread configuration.
-struct ShardLoopConfig {
-    timer_tx: Sender<ShardEvent>,
-    timer_rx: Receiver<ShardEvent>,
-    callback_rx: Receiver<ShardEvent>,
-    shutdown_rx: Receiver<()>,
-    tokio_handle: TokioHandle,
-    initial_timer_ops: Vec<TimerOp>,
+pub struct ShardLoopConfig {
+    pub(crate) timer_tx: Sender<ShardEvent>,
+    pub(crate) timer_rx: Receiver<ShardEvent>,
+    pub(crate) callback_rx: Receiver<ShardEvent>,
+    pub(crate) shutdown_rx: Receiver<()>,
+    pub(crate) tokio_handle: TokioHandle,
+    pub(crate) initial_timer_ops: Vec<TimerOp>,
     /// Shared RPC `vnodes` list. Each shard's thread writes its own
     /// vnodes' entries via `retain != self.shard_coordinator` + push on the metrics
     /// tick; concurrent shards racing on the same `ArcSwap` lose at most
     /// one second of staleness on their slot.
-    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    pub(crate) rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     /// Shared sync status. Each shard's thread inserts its slot
     /// (keyed by shard id) on the metrics tick.
-    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    pub(crate) sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
     /// Shared mempool snapshot. Each shard's thread inserts its slot
     /// from the first hosted vnode (same-shard vnodes share the
     /// mempool, so any one gives the canonical view).
-    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    pub(crate) mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
 }
 
 /// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
@@ -1493,7 +1537,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
 /// CFS keeps long-lived CPU-bound threads cache-warm without explicit
 /// pinning, and the per-shard model already isolates each shard's
 /// scheduling from the others.
-fn spawn_shard_loop(
+pub fn spawn_shard_loop(
     shard_loop: ProdShardLoop,
     config: ShardLoopConfig,
 ) -> std::thread::JoinHandle<()> {

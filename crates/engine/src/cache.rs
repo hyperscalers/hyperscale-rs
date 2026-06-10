@@ -151,6 +151,21 @@ impl ProcessExecutionCache {
         self.hosted_shards.store(Arc::new(hosted));
     }
 
+    /// Add one shard to the hosted set.
+    pub fn add_hosted_shard(&self, shard: ShardId) {
+        let mut set = (**self.hosted_shards.load()).clone();
+        set.insert(shard);
+        self.hosted_shards.store(Arc::new(set));
+    }
+
+    /// Remove one shard from the hosted set. Entries still claiming the
+    /// shard fall to the retention sweep.
+    pub fn remove_hosted_shard(&self, shard: ShardId) {
+        let mut set = (**self.hosted_shards.load()).clone();
+        set.remove(&shard);
+        self.hosted_shards.store(Arc::new(set));
+    }
+
     /// Non-blocking slot acquisition keyed by `tx_hash`.
     ///
     /// Returns a [`SlotStatus`] the caller can react to: cache hit,
