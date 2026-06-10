@@ -18,5 +18,6 @@ pub mod beacon;
 pub mod shard;
 
 pub use beacon::core::SimBeaconStorage;
+pub use shard::boundary::SimBoundary;
 pub use shard::core::SimShardStorage;
 pub use shard::snapshot::SimSnapshot;

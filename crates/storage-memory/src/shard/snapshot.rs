@@ -104,6 +104,33 @@ impl SimSnapshot {
     }
 }
 
+/// Value of `storage_key` at `version`: the prior value of the smallest
+/// state-history write after `version` (value-just-before that write,
+/// which equals value-at-version since no writes happened between), or
+/// the current value when no later write exists.
+pub fn value_at_version(
+    current_state: &BTreeMap<Vec<u8>, Vec<u8>>,
+    state_history: &BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,
+    storage_key: &[u8],
+    version: u64,
+    current_version: u64,
+) -> Option<Vec<u8>> {
+    let current = current_state.get(storage_key).cloned();
+
+    if version >= current_version {
+        return current;
+    }
+
+    let lower = (storage_key.to_vec(), version + 1);
+    let next = state_history
+        .range((Bound::Included(lower), Bound::Unbounded))
+        .next();
+    match next {
+        Some(((k, _v_prime), prior)) if k.as_slice() == storage_key => prior.clone(),
+        _ => current,
+    }
+}
+
 impl SubstateDatabase for SimSnapshot {
     fn get_raw_substate_by_db_key(
         &self,
@@ -111,25 +138,13 @@ impl SubstateDatabase for SimSnapshot {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let storage_key = keys::to_storage_key(partition_key, sort_key);
-        let current = self.current_state.get(&storage_key).cloned();
-
-        if self.version >= self.current_version {
-            return current;
-        }
-
-        // Historical: smallest state-history entry for K with
-        // v' > version. Its prior value is the state at `version`
-        // (value-just-before v', which equals value-at-version since no
-        // writes happened between).
-        let lower = (storage_key.clone(), self.version + 1);
-        let next = self
-            .state_history
-            .range((Bound::Included(lower), Bound::Unbounded))
-            .next();
-        match next {
-            Some(((k, _v_prime), prior)) if k == &storage_key => prior.clone(),
-            _ => current,
-        }
+        value_at_version(
+            &self.current_state,
+            &self.state_history,
+            &storage_key,
+            self.version,
+            self.current_version,
+        )
     }
 
     fn list_raw_values_from_db_key(

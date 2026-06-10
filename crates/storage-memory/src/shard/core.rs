@@ -8,7 +8,7 @@
 //! `state_history` to find the smallest write after V; its prior value
 //! is the state at V.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
@@ -54,6 +54,12 @@ pub struct SimShardStorage {
     /// a smaller value in tests that want to exercise retention
     /// behaviour.
     pub(crate) jmt_history_length: u64,
+
+    /// Boundary heights pinned for snap-sync serving. The in-memory
+    /// store retains every JMT version, so a pin is pure bookkeeping —
+    /// kept under the production ring's retention so eviction behaviour
+    /// is observable in simulation too.
+    pub(crate) boundary_pins: RwLock<BTreeSet<BlockHeight>>,
 }
 
 impl Default for SimShardStorage {
@@ -77,6 +83,7 @@ impl SimShardStorage {
             state: Arc::new(RwLock::new(shared)),
             consensus: RwLock::new(ConsensusState::new()),
             jmt_history_length: u64::MAX,
+            boundary_pins: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -88,6 +95,7 @@ impl SimShardStorage {
             state: Arc::new(RwLock::new(SharedState::new())),
             consensus: RwLock::new(ConsensusState::new()),
             jmt_history_length,
+            boundary_pins: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -99,6 +107,7 @@ impl SimShardStorage {
     pub fn clear(&mut self) {
         *write_or_recover(&self.state) = SharedState::new();
         *write_or_recover(&self.consensus) = ConsensusState::new();
+        write_or_recover(&self.boundary_pins).clear();
     }
 
     /// Number of live substate entries (current tip). Historical

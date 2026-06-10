@@ -85,6 +85,11 @@ pub struct RocksDbShardStorage {
     /// the global tree's subtree at that prefix. Empty for a single-shard /
     /// whole-keyspace store. Set once at open from the shard's `ShardId`.
     pub(crate) root_path: NibblePath,
+
+    /// Checkpoint ring for snap-sync boundary pins. `None` until
+    /// [`Self::enable_checkpoints`] wires a ring directory — pinning a
+    /// boundary without one is an error, serving stays disabled.
+    pub(crate) checkpoints: Option<super::checkpoints::CheckpointRing>,
 }
 
 impl RocksDbShardStorage {
@@ -227,7 +232,20 @@ impl RocksDbShardStorage {
             commit_lock: Mutex::new(()),
             jmt_history_length: config.jmt_history_length,
             root_path,
+            checkpoints: None,
         })
+    }
+
+    /// Wire a checkpoint ring at `dir` so boundary pins
+    /// ([`hyperscale_storage::BoundaryStore::pin_boundary`]) create
+    /// `RocksDB` checkpoints there, retaining the newest `retain`.
+    /// Call before wrapping the storage in an `Arc`.
+    pub fn enable_checkpoints(&mut self, dir: std::path::PathBuf, retain: usize) {
+        self.checkpoints = Some(super::checkpoints::CheckpointRing::from_db(
+            Arc::clone(&self.db),
+            dir,
+            retain,
+        ));
     }
 
     /// Get the configured JMT history retention length (in block heights).

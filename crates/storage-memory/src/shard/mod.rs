@@ -5,6 +5,7 @@
 //! Sibling [`crate::beacon`](crate::beacon) hosts the parallel
 //! beacon-chain in-memory backend.
 
+pub(crate) mod boundary;
 pub(crate) mod chain_reader;
 pub(crate) mod chain_writer;
 pub(crate) mod core;

@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
-    BaseReadCache, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
-    GenesisCommit, JmtSnapshot, PartitionEntry, ShardChainReader, ShardChainWriter,
-    SubstateDatabase, SubstateStore, VersionedStore,
+    BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, ShardChainReader,
+    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
@@ -148,6 +148,22 @@ impl TreeReader for SharedStorage {
 
     fn root_path(&self) -> NibblePath {
         self.0.root_path()
+    }
+}
+
+impl BoundaryStore for SharedStorage {
+    type Boundary = super::checkpoints::CheckpointStore;
+
+    fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        self.0.pin_boundary(height)
+    }
+
+    fn open_boundary(&self, height: BlockHeight) -> Option<Self::Boundary> {
+        self.0.open_boundary(height)
+    }
+
+    fn latest_boundary(&self) -> Option<BlockHeight> {
+        self.0.latest_boundary()
     }
 }
 

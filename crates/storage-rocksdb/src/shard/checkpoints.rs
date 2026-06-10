@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::{DbPartitionKey, DbSortKey};
+use hyperscale_storage::{BoundaryStore, DbPartitionKey, DbSortKey, SubstateLookup};
 use hyperscale_types::{BlockHeight, StateRoot};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{DB, Options};
@@ -53,12 +53,12 @@ impl CheckpointRing {
     /// checkpoint as soon as it is created.
     #[must_use]
     pub fn new(storage: &RocksDbShardStorage, dir: PathBuf, retain: usize) -> Self {
+        Self::from_db(Arc::clone(&storage.db), dir, retain)
+    }
+
+    pub(crate) fn from_db(db: Arc<DB>, dir: PathBuf, retain: usize) -> Self {
         assert!(retain > 0, "checkpoint ring must retain at least one entry");
-        Self {
-            db: Arc::clone(&storage.db),
-            dir,
-            retain,
-        }
+        Self { db, dir, retain }
     }
 
     /// Create a checkpoint of the database's current state, labelled with
@@ -213,6 +213,38 @@ impl TreeReader for CheckpointStore {
     }
 }
 
+impl SubstateLookup for CheckpointStore {
+    fn lookup_substate(
+        &self,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+    ) -> Option<Vec<u8>> {
+        self.get_substate(partition_key, sort_key)
+    }
+}
+
+impl BoundaryStore for RocksDbShardStorage {
+    type Boundary = CheckpointStore;
+
+    fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        let ring = self
+            .checkpoints
+            .as_ref()
+            .ok_or_else(|| "checkpoint ring not configured".to_string())?;
+        ring.create(height).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn open_boundary(&self, height: BlockHeight) -> Option<CheckpointStore> {
+        let ring = self.checkpoints.as_ref()?;
+        let (_, path) = ring.entries().into_iter().find(|(h, _)| *h == height)?;
+        CheckpointStore::open(&path, self.root_path.clone()).ok()
+    }
+
+    fn latest_boundary(&self) -> Option<BlockHeight> {
+        self.checkpoints.as_ref()?.latest().map(|(h, _)| h)
+    }
+}
+
 /// Directory name for a checkpoint at `height` — zero-padded so
 /// lexicographic order matches numeric order.
 fn entry_name(height: BlockHeight) -> String {
@@ -356,5 +388,33 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let err = CheckpointStore::open(&temp.path().join("nope"), NibblePath::empty());
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn boundary_store_pins_and_serves_through_the_trait() {
+        let temp = TempDir::new().unwrap();
+        let mut storage = open_storage(temp.path());
+        storage.enable_checkpoints(temp.path().join("checkpoints"), 3);
+        commit_one(&storage, 1);
+        let pinned_root = storage.state_root();
+
+        storage.pin_boundary(BlockHeight::new(1)).unwrap();
+        commit_one(&storage, 2);
+
+        assert_eq!(storage.latest_boundary(), Some(BlockHeight::new(1)));
+        assert!(storage.open_boundary(BlockHeight::new(9)).is_none());
+        let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
+        let (version, root) = boundary.read_jmt_metadata();
+        assert_eq!(version, 1);
+        assert_eq!(root, pinned_root);
+    }
+
+    #[test]
+    fn pin_without_ring_errors() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        commit_one(&storage, 1);
+        assert!(storage.pin_boundary(BlockHeight::new(1)).is_err());
+        assert_eq!(storage.latest_boundary(), None);
     }
 }

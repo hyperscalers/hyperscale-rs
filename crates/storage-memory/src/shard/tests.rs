@@ -90,9 +90,6 @@ impl SimShardStorage {
         for (key, node) in &collected.nodes {
             s.tree_store.insert(key.clone(), Arc::clone(node));
         }
-        for stale_key in &collected.stale_node_keys {
-            s.tree_store.remove(stale_key);
-        }
 
         s.current_block_height = BlockHeight::new(new_version);
         s.current_root_hash = new_root;

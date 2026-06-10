@@ -7,6 +7,7 @@
 //! ([`crate::tree`](crate::tree), [`crate::lock_recover`](crate::lock_recover))
 //! live at crate root.
 
+pub mod boundary;
 pub mod chain_reader;
 pub mod chain_writer;
 pub mod genesis;
