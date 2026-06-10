@@ -904,9 +904,9 @@ impl ShardCoordinator {
         )
     }
 
-    /// Pre-build gate: we must be the proposer for this round and not already
-    /// building (or parked on the verification pipeline for) the same
-    /// height/round.
+    /// Pre-build gate: we must be the proposer for this round, must not have
+    /// voted at it yet, and must not already be building (or parked on the
+    /// verification pipeline for) the same height/round.
     fn can_propose(
         &self,
         topology: &TopologySchedule,
@@ -920,6 +920,23 @@ impl ShardCoordinator {
             return false;
         };
         if committee.proposer_for(self.local_shard, round) != self.me {
+            return false;
+        }
+
+        // Safe-vote rule, proposer side: `on_proposal_built` self-votes the
+        // block, so building again at a round we already voted in would sign
+        // a second vote at one round — and `proposal_parent()` is unchanged
+        // until a QC forms, so that second block would be a sibling of the
+        // first. A QC or timeout always advances the view past
+        // `last_voted_round`, so the legitimate next proposal passes.
+        if round <= self.last_voted_round {
+            trace!(
+                validator = ?self.me,
+                height = next_height.inner(),
+                round = round.inner(),
+                last_voted_round = self.last_voted_round.inner(),
+                "Already voted at this round, skipping proposal"
+            );
             return false;
         }
 
@@ -6171,6 +6188,52 @@ mod tests {
         };
         assert_eq!(*timestamp, ProposerTimestamp::from_local(current_time));
         assert_ne!(timestamp.as_millis(), old_timestamp);
+    }
+
+    #[test]
+    fn second_propose_after_self_vote_is_suppressed() {
+        // Once a proposal's build completes and the proposer self-votes it,
+        // a retry at the still-current view (routinely queued by
+        // TransactionsAdmitted / ProvisionsAdmitted) must not build a sibling
+        // block — that would sign two votes at one round.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.latest_qc = Some(make_test_qc(
+            BlockHash::from_raw(Hash::from_bytes(b"block_3")),
+            BlockHeight::new(3),
+        ));
+        // Height 4 proposes at round 4 (rounds increase per block).
+        state.view_change.view = Round::new(4);
+
+        let height = BlockHeight::new(4);
+        let round = Round::new(4);
+        let actions = state.try_propose(&topology, &[], vec![], vec![]);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "first proposal should build"
+        );
+
+        // The runner completes the build: the tracker slot clears and the
+        // proposer self-votes, consuming the round.
+        assert!(matches!(
+            state.proposal.take_matching(height, round),
+            TakeResult::Matched
+        ));
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"own_block_4"));
+        let vote = state.create_vote(&topology, block_hash, height, round);
+        assert!(
+            vote.iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
+        assert_eq!(state.last_voted_round(), round);
+
+        // The retry at the same view must be a no-op, not a sibling build.
+        let retry = state.try_propose(&topology, &[], vec![], vec![]);
+        assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
     #[test]
