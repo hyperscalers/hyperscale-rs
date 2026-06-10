@@ -16,9 +16,9 @@ use hyperscale_types::{
     ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
     InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector,
     PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardId,
-    SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
-    zero_bls_signature,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root, compute_merkle_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -474,6 +474,57 @@ pub fn commit_block_with_updates(
 
 const fn empty_witness() -> BeaconWitnessCommit {
     BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO)
+}
+
+/// Commit a block at `height` whose header commits the beacon-witness
+/// accumulator state after appending `leaves`.
+///
+/// The header carries the leaves' merkle root and cumulative count, and
+/// the leaves fold into the same atomic write. Returns the committed
+/// block hash.
+pub fn commit_block_with_witnesses(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    height: BlockHeight,
+    leaves: &[ShardWitnessPayload],
+) -> BlockHash {
+    let leaf_hashes: Vec<Hash> = leaves.iter().map(ShardWitnessPayload::leaf_hash).collect();
+    let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes));
+    let count = BeaconWitnessLeafCount::new(leaves.len() as u64);
+    let mut parent_bytes = [0u8; 32];
+    parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
+    let block = Block::Live {
+        header: BlockHeader::new(
+            ShardId::ROOT,
+            height,
+            BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
+            QuorumCertificate::genesis(ShardId::ROOT),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(height.inner() * 1000),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            root,
+            count,
+        ),
+        transactions: Arc::new(BoundedVec::new()),
+        certificates: Arc::new(BoundedVec::new()),
+        provisions: Arc::new(BoundedVec::new()),
+    };
+    let block_hash = block.hash();
+    let witness = BeaconWitnessCommit {
+        starting_leaf_index: BeaconWitnessLeafCount::ZERO,
+        leaves: leaves.to_vec(),
+        leaf_count_at_block_end: count,
+    };
+    storage.commit_block(&make_test_certified(block), &witness);
+    block_hash
 }
 
 /// Shared EC roundtrip test: commit a block carrying an EC, then read it

@@ -12,6 +12,7 @@ mod provision;
 mod remote_header;
 mod state_range;
 mod transaction;
+mod witness_history;
 
 pub use block::GetBlockResponse;
 pub use execution_cert::GetExecutionCertsResponse;
@@ -24,3 +25,6 @@ pub use state_range::{
     MAX_STATE_RANGE_VALUE_LEN, StateRangeChunk, StateRangeLeaf,
 };
 pub use transaction::GetTransactionsResponse;
+pub use witness_history::{
+    GetWitnessHistoryResponse, MAX_HASHES_PER_WITNESS_HISTORY, WitnessHistoryChunk,
+};

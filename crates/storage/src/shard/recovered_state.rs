@@ -2,7 +2,8 @@
 //! state machine after a crash or restart.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Hash, QuorumCertificate, StateRoot, Verified, WeightedTimestamp,
+    BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardAnchor, StateRoot, Verified,
+    WeightedTimestamp,
 };
 
 /// State recovered from storage on startup.
@@ -51,6 +52,33 @@ pub struct RecoveredState {
 }
 
 impl RecoveredState {
+    /// The recovered state of a snap-synced bootstrap: the store was
+    /// imported at the beacon-attested boundary `anchor`, so the
+    /// committed tip is the boundary block itself.
+    ///
+    /// `boundary_header` is the anchor block's header, hash-verified
+    /// against `anchor.block_hash` by the fetch path; its `parent_qc`
+    /// weighted timestamp is the tip's committee anchor, and
+    /// `witness_leaf_hashes` is its verified accumulator history.
+    /// `latest_qc` stays `None` — the store holds no QC for the
+    /// boundary block, and the first tail-synced block's QC adopts
+    /// through the normal round-monotonic path.
+    #[must_use]
+    pub fn from_snap_synced_boundary(
+        anchor: &ShardAnchor,
+        boundary_header: &BlockHeader,
+        witness_leaf_hashes: Vec<Hash>,
+    ) -> Self {
+        Self {
+            committed_height: anchor.height,
+            committed_hash: Some(anchor.block_hash),
+            latest_qc: None,
+            committed_anchor_ts: Some(boundary_header.parent_qc().weighted_timestamp()),
+            jmt_root: Some(anchor.state_root),
+            beacon_witness_leaf_hashes: witness_leaf_hashes,
+        }
+    }
+
     /// Committee anchor of the recovered tip — [`committed_anchor_ts`](Self::committed_anchor_ts)
     /// when storage recovered it, else the tip QC's own weighted timestamp
     /// (identical except when the tip is an epoch's first block), else `ZERO`

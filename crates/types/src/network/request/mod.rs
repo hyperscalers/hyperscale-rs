@@ -13,6 +13,7 @@ mod remote_header;
 mod state_range;
 mod sync;
 mod transaction;
+mod witness_history;
 
 pub use block::GetBlockRequest;
 pub use execution_cert::GetExecutionCertsRequest;
@@ -23,3 +24,4 @@ pub use remote_header::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST}
 pub use state_range::GetStateRangeRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;
+pub use witness_history::GetWitnessHistoryRequest;

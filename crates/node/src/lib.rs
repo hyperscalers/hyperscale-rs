@@ -39,6 +39,7 @@ pub mod shard_loop;
 pub mod snap_sync;
 mod state;
 mod vnode;
+pub mod witness_history;
 
 pub use config::NodeConfig;
 pub use host::NodeHost;

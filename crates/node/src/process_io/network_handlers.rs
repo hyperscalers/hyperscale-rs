@@ -700,7 +700,7 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_types::network::request::{
         GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
-        GetTransactionsRequest,
+        GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
     use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
@@ -711,6 +711,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
     use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
     use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
+    use crate::shard_io::fetch::witness_history_serve::serve_witness_history_request;
     use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
     use crate::shard_io::sync::block_serve::serve_block_request;
     use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
@@ -797,6 +798,15 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
             serve_state_range_request(&storage, &req)
+        });
+
+    // ── witness_history.request → snap-sync accumulator seeding ──
+
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetWitnessHistoryRequest>(shard, move |req| {
+            serve_witness_history_request(&pending_chain, &req)
         });
 
     // ── provision.request → serve from local store ───────────────
