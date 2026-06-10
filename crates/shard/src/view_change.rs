@@ -22,6 +22,8 @@ use hyperscale_types::{
     VIEW_CHANGE_TIMEOUT_MAX,
 };
 
+use crate::coordinator::SPECULATIVE_VERIFY_GAP;
+
 /// How far past the verified `high_qc` round a single validator's unverified
 /// header or vote may nudge the local view. Anchored to verified progress so a
 /// Byzantine peer can't ratchet the view across repeated observations. Held
@@ -32,6 +34,10 @@ use hyperscale_types::{
 /// advances come from the timeout pacemaker; a node further behind catches up
 /// via verified QC adoption and block-sync.
 const VIEW_SYNC_GAP: u64 = 256;
+
+// The dragged-to round must stay votable under the speculative-verification
+// floor — see both constants' docs.
+const _: () = assert!(VIEW_SYNC_GAP <= SPECULATIVE_VERIFY_GAP);
 
 pub struct ViewChangeController {
     /// Current round.

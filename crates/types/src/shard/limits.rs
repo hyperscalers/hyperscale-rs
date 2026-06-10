@@ -52,6 +52,9 @@ pub const MAX_TX_IN_FLIGHT: usize = MAX_TXS_PER_BLOCK * 3;
 /// Hard cap on `header.round() - header.parent_qc().round()` — how many
 /// skipped consensus rounds a single block may span.
 ///
+/// Via the shard pacemaker's ceiling (`high_qc.round + MAX_ROUND_GAP`), it
+/// also caps how far the view can ever run past certified progress.
+///
 /// Every validator re-derives one `MissedProposal` beacon-witness leaf per
 /// skipped round when verifying and committing a block (see
 /// [`missed_proposals_since_prev_commit`](crate::missed_proposals_since_prev_commit)),
@@ -61,8 +64,12 @@ pub const MAX_TX_IN_FLIGHT: usize = MAX_TXS_PER_BLOCK * 3;
 /// without this cap, one self-named header at `round ≈ u64::MAX` forces
 /// every honest validator to materialize a `Vec` of that length.
 ///
-/// Each gap unit corresponds to a genuine view-change timeout, so honest
-/// liveness keeps the gap within a handful even under sustained leader
-/// failure. The cap sits far above any value reachable by real consensus
-/// while bounding the derivation to a few tens of megabytes.
+/// The value is the shard's stall runway. Round gaps accrue only through
+/// 2f+1 timeout quorums (Byzantine nodes alone can't advance the pacemaker),
+/// each costing one view-change timeout — 30s at the backoff cap — so the
+/// cap is reached after roughly `100_000` × 30s ≈ 35 days of continuous
+/// certification stall, at which point the view parks at the ceiling and the
+/// shard needs operator recovery. The wire cap and the pacemaker ceiling
+/// must be the same constant: the view must never enter a round where no
+/// proposal extending an adoptable QC would be wire-valid.
 pub const MAX_ROUND_GAP: u64 = 100_000;

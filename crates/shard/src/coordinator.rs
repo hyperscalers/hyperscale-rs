@@ -117,15 +117,29 @@ use crate::verification::{
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
 
-/// Largest `round - parent_qc.round` gap for which a header is verified
+/// Floor on the `round - parent_qc.round` gap for which a header is verified
 /// speculatively. The beacon-witness verification derives one leaf per skipped
-/// round, so this bounds that work per header. It sits far above any legitimate
-/// view-change run (which is bounded by the committee size — an honest leader
-/// commits within one rotation) and far below `MAX_ROUND_GAP`, the ceiling at
-/// which headers are still *accepted*. Blocks with a larger gap are admitted
-/// but not verified here; if one is genuinely committed, this node is behind
-/// and recovers it through block-sync.
-const SPECULATIVE_VERIFY_GAP: u64 = 1024;
+/// round, so this bounds that work per header during normal operation, when
+/// the local view sits within a handful of rounds of `locked_round`. The
+/// effective bound is `max(SPECULATIVE_VERIFY_GAP, view - locked_round)` (see
+/// `try_vote_on_block`): any safe-votable block has `round == view` and
+/// `parent_qc.round >= locked_round`, so the second term keeps every round the
+/// pacemaker can actually reach votable — after a long certification stall the
+/// recovery block's gap equals the rounds the local pacemaker itself burned
+/// through verified 2f+1 quorums, and refusing to verify it would wedge the
+/// shard permanently (every timed-out round is vote-burned, so the votable
+/// window must slide with the view). Both terms of the bound advance only via
+/// verified progress, so a Byzantine proposer cannot inflate them; per-header
+/// work beyond the floor is work the protocol mandates at commit anyway (one
+/// `MissedProposal` leaf per burned round). Blocks past the bound are admitted
+/// but not verified; if one is genuinely committed, this node is behind and
+/// recovers it through block-sync.
+///
+/// Must stay at or above `VIEW_SYNC_GAP`: an unverified header claim may drag
+/// the view that far past `high_qc`, and the dragged-to round must remain
+/// votable under the floor or a header flood could park the shard at a round
+/// where every candidate is gap-skipped.
+pub const SPECULATIVE_VERIFY_GAP: u64 = 1024;
 
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
 /// proposer signs exactly one block per round, so anything beyond a small
@@ -1728,18 +1742,28 @@ impl ShardCoordinator {
         // verification derives one leaf per skipped round, so its cost is
         // `round - parent_qc.round` — and a Byzantine proposer can drive that
         // gap to `MAX_ROUND_GAP` (a genesis `parent_qc` makes the gap the whole
-        // round number) and flood the verification pool with such headers. A
-        // gap beyond `SPECULATIVE_VERIFY_GAP` is far past any legitimate
-        // view-change run, so skip verification (and the vote it gates). If an
-        // honest quorum ever commits such a block this node is behind and
-        // recovers it through block-sync, which admits it via QC attestation
-        // rather than re-deriving the witness locally.
-        if round.inner().saturating_sub(parent_qc_round.inner()) > SPECULATIVE_VERIFY_GAP {
+        // round number) and flood the verification pool with such headers. The
+        // floor covers any legitimate view-change run in normal operation; the
+        // `view - locked_round` term keeps every pacemaker-reachable round
+        // votable, so a recovery block after a long certification stall (its
+        // gap equals the rounds this node's own pacemaker burned) is still
+        // verified rather than wedging the shard. See `SPECULATIVE_VERIFY_GAP`
+        // for the full argument. Blocks past the bound are left for
+        // block-sync, which admits via QC attestation rather than re-deriving
+        // the witness locally.
+        let justified_gap = SPECULATIVE_VERIFY_GAP.max(
+            self.view_change
+                .view
+                .inner()
+                .saturating_sub(self.locked_round.inner()),
+        );
+        if round.inner().saturating_sub(parent_qc_round.inner()) > justified_gap {
             trace!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
                 round = round.inner(),
                 parent_qc_round = parent_qc_round.inner(),
+                justified_gap,
                 "Round gap beyond speculative bound — deferring to block-sync"
             );
             return vec![];
@@ -3762,7 +3786,16 @@ impl ShardCoordinator {
         round: Round,
     ) -> Vec<Action> {
         let mut actions = self.adopt_timeout_quorum_high_qc(topology, round);
-        if self.view_change.advance_to(round.next()) {
+        // One round past the pacemaker ceiling nothing is wire-valid (a
+        // proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
+        // QC) and no timeout tallies, so the view must never enter it. The
+        // quorum-max `high_qc` adoption above may have just raised the
+        // ceiling; at the clamp the view parks until a higher carried
+        // `high_qc` slides it.
+        if self
+            .view_change
+            .advance_to(round.next().min(self.max_pacemaker_round()))
+        {
             // Reset the timeout baseline so the new leader gets a full window.
             self.view_change.record_leader_activity(self.now);
             self.timeouts.prune_below(self.view_change.view);
@@ -4869,6 +4902,76 @@ mod tests {
             far_actions.is_empty(),
             "a round gap beyond the bound must skip verification: {far_actions:?}",
         );
+    }
+
+    #[test]
+    fn stall_witnessed_gap_remains_votable() {
+        // After a long certification stall the recovery block's round gap
+        // equals the rounds the local pacemaker burned — far beyond the
+        // static floor. The bound slides with `view - locked_round`, so the
+        // block is still verified; without that the shard would wedge
+        // permanently once the view drifted past the floor (every timed-out
+        // round is vote-burned, so no older round can recover it).
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_tip"));
+        state.committed_hash = committed_hash;
+
+        // The pacemaker witnessed a drift far past the floor.
+        let stalled_view = SPECULATIVE_VERIFY_GAP * 3;
+        state.view_change.view = Round::new(stalled_view);
+
+        // Recovery block at the current view, extending the stuck QC: its
+        // gap exceeds the floor but not the witnessed drift.
+        let recovery = empty_block_at_round(committed_hash, stalled_view);
+        let recovery_hash = recovery.hash();
+        let recovery_round = recovery.header().round();
+        install_complete_block(&mut state, &recovery);
+        let actions = state.try_vote_on_block(
+            &topology,
+            recovery_hash,
+            BlockHeight::new(1),
+            recovery_round,
+        );
+        assert!(
+            !actions.is_empty(),
+            "a gap the local pacemaker witnessed must still verify",
+        );
+
+        // Beyond even the witnessed drift: skipped.
+        let beyond = empty_block_at_round(committed_hash, stalled_view + 10);
+        let beyond_hash = beyond.hash();
+        let beyond_round = beyond.header().round();
+        install_complete_block(&mut state, &beyond);
+        let actions =
+            state.try_vote_on_block(&topology, beyond_hash, BlockHeight::new(1), beyond_round);
+        assert!(
+            actions.is_empty(),
+            "a gap beyond the witnessed drift must skip verification: {actions:?}",
+        );
+    }
+
+    #[test]
+    fn timeout_quorum_advance_clamps_at_pacemaker_ceiling() {
+        // One round past `high_qc + MAX_ROUND_GAP` nothing is wire-valid and
+        // no timeout tallies, so a quorum at the ceiling must park the view
+        // there rather than advance into the dead round.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let ceiling = state.max_pacemaker_round();
+        state.view_change.view = ceiling;
+        let _ = state.advance_on_timeout_quorum(&topology, ceiling);
+        assert_eq!(
+            state.view_change.view, ceiling,
+            "the view must never pass the pacemaker ceiling"
+        );
+
+        // A quorum below the ceiling still advances normally.
+        let below = Round::new(ceiling.inner() - 10);
+        state.view_change.view = below;
+        let _ = state.advance_on_timeout_quorum(&topology, below);
+        assert_eq!(state.view_change.view, below.next());
     }
 
     #[test]
