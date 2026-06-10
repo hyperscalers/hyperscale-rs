@@ -36,11 +36,11 @@ use crate::beacon::cert::BeaconCert;
 use crate::beacon::certified::CertifiedBeaconBlock;
 use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
-use crate::topology::snapshot::TopologySnapshot;
+use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, Bls12381G1PublicKey, Epoch, Randomness, ShardId, Stake,
-    StakePoolId, StateRoot, ValidatorId,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, Randomness,
+    ShardId, Stake, StakePoolId, StateRoot, ValidatorId,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -212,6 +212,9 @@ pub struct ShardBoundary {
     pub state_root: StateRoot,
     /// Hash of that boundary block — the checkpoint identifier.
     pub block_hash: BlockHash,
+    /// Height of that boundary block — where a snap-synced joiner's tail
+    /// block-sync starts.
+    pub height: BlockHeight,
     /// Beacon-witness accumulator high-water mark at the boundary.
     pub witness_leaf_count: BeaconWitnessLeafCount,
     /// Epoch in which this boundary was last refreshed by an observed
@@ -571,7 +574,33 @@ impl BeaconState {
             .map(|(sid, sc)| (*sid, sc.members.clone()))
             .collect();
 
-        TopologySnapshot::from_explicit_committees(network, &validator_set, shard_committees)
+        // Project each shard's snap-sync anchor across the CQRS firewall.
+        // Genesis seeds zeroed placeholder boundaries until a shard's first
+        // observed crossing; those aren't attested anchors, so they don't
+        // project — `boundary(shard)` returns `None` and a joiner replays
+        // from genesis instead of snap-syncing.
+        let boundaries: HashMap<ShardId, ShardAnchor> = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.block_hash != BlockHash::ZERO)
+            .map(|(sid, b)| {
+                (
+                    *sid,
+                    ShardAnchor {
+                        state_root: b.state_root,
+                        block_hash: b.block_hash,
+                        height: b.height,
+                    },
+                )
+            })
+            .collect();
+
+        TopologySnapshot::from_explicit_committees(
+            network,
+            &validator_set,
+            shard_committees,
+            boundaries,
+        )
     }
 
     /// Active-duty validator pool: every validator `OnShard { ready: true }`

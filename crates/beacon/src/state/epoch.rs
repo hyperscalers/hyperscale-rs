@@ -256,6 +256,7 @@ fn record_boundaries(
             ShardBoundary {
                 state_root: header.state_root(),
                 block_hash,
+                height: header.height(),
                 witness_leaf_count: BeaconWitnessLeafCount::new(chunk_end),
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
@@ -451,9 +452,67 @@ mod tests {
 
         let recorded = state.boundaries.get(&shard).expect("boundary recorded");
         assert_eq!(recorded.state_root, anchor);
+        assert_eq!(recorded.height, BlockHeight::new(5));
         assert_eq!(recorded.witness_leaf_count, BeaconWitnessLeafCount::new(7));
         assert_eq!(recorded.last_live_epoch, Epoch::new(1));
         assert_eq!(recorded.consecutive_misses, 0);
+    }
+
+    /// The topology snapshot projects a recorded boundary as a
+    /// `ShardAnchor`, but a zeroed genesis placeholder reads as `None` —
+    /// no attested anchor to snap-sync against.
+    #[test]
+    fn snapshot_projects_recorded_anchor_not_placeholder() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::GENESIS,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::GENESIS,
+                consecutive_misses: 0,
+            },
+        );
+        assert_eq!(
+            state.derive_topology_snapshot(net()).boundary(shard),
+            None,
+            "placeholder boundary must not project",
+        );
+
+        let anchor_root = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
+        let b = boundary_block(shard, 5, 900, anchor_root, 0);
+        let block_hash = b.hash();
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: BoundedVec::new(),
+            },
+        ))
+        .collect();
+        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+
+        let projected = state.derive_topology_snapshot(net()).boundary(shard);
+        let anchor = projected.expect("recorded boundary projects");
+        assert_eq!(anchor.state_root, anchor_root);
+        assert_eq!(anchor.block_hash, block_hash);
+        assert_eq!(anchor.height, BlockHeight::new(5));
+        // Re-derivation is deterministic.
+        assert_eq!(
+            state.derive_topology_snapshot(net()).boundary(shard),
+            projected
+        );
     }
 
     /// A contribution whose predecessor sits past the cut (1200 > 1000) is
@@ -468,6 +527,7 @@ mod tests {
             ShardBoundary {
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
+                height: BlockHeight::GENESIS,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,

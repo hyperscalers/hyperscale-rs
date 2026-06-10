@@ -11,14 +11,30 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    Bls12381G1PublicKey, NetworkDefinition, NodeId, Round, RoutableTransaction, ShardId, ShardTrie,
-    ValidatorId, ValidatorSet, VoteCount,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId, Round,
+    RoutableTransaction, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
 };
 
 /// Per-shard committee membership.
 #[derive(Debug, Clone)]
 struct ShardCommittee {
     active_validators: Vec<ValidatorId>,
+}
+
+/// A shard's beacon-attested committed boundary — the snap-sync anchor.
+///
+/// Projected from the beacon fold's per-shard boundary record. A joiner
+/// bootstraps the shard's committed state against `state_root` and
+/// block-syncs the tail from `height`; `block_hash` identifies the
+/// boundary block a serving peer checkpoints at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardAnchor {
+    /// Subtree root at the shard's most recent committed boundary block.
+    pub state_root: StateRoot,
+    /// Hash of that boundary block.
+    pub block_hash: BlockHash,
+    /// Height of that boundary block — where tail block-sync starts.
+    pub height: BlockHeight,
 }
 
 /// Hash a `NodeId` to a u64 using blake3 (first 8 bytes, little-endian).
@@ -71,6 +87,7 @@ pub struct TopologySnapshot {
     network: NetworkDefinition,
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
+    boundaries: HashMap<ShardId, ShardAnchor>,
     validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -105,6 +122,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
+            boundaries: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -139,6 +157,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
+            boundaries: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -182,6 +201,7 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
+            boundaries: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -194,6 +214,8 @@ impl TopologySnapshot {
     /// `num_shards`-way partition), the live shards are precisely those keys.
     /// Used to mirror a `BeaconState`'s committees, whose keys define the
     /// active partition — uniform today, non-uniform under resharding.
+    /// `boundaries` carries each shard's attested boundary anchor; shards
+    /// with no attested boundary yet are simply absent.
     ///
     /// # Panics
     ///
@@ -204,6 +226,7 @@ impl TopologySnapshot {
         network: NetworkDefinition,
         global_validator_set: &ValidatorSet,
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
+        boundaries: HashMap<ShardId, ShardAnchor>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
         let shard_trie = ShardTrie::from_leaves(shard_committees.keys().copied());
@@ -229,6 +252,7 @@ impl TopologySnapshot {
             network,
             shard_trie,
             shard_committees: committees,
+            boundaries,
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -300,6 +324,17 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn global_validator_set(&self) -> &Arc<ValidatorSet> {
         &self.global_validator_set
+    }
+
+    /// The shard's beacon-attested boundary anchor.
+    ///
+    /// `None` means the shard has no attested anchor — either the shard is
+    /// unknown or it has not yet had a committed boundary crossing — so a
+    /// bootstrapping joiner falls back to genesis replay instead of
+    /// snap-sync.
+    #[must_use]
+    pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
+        self.boundaries.get(&shard).copied()
     }
 
     // ── Derived committee queries ────────────────────────────────────────
@@ -452,7 +487,7 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ValidatorInfo, generate_bls_keypair};
+    use crate::{Hash, ValidatorInfo, generate_bls_keypair};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
@@ -579,6 +614,35 @@ mod tests {
             &vs,
             committees,
         );
+    }
+
+    /// `boundary()` exposes a projected anchor; shards without one read
+    /// `None`.
+    #[test]
+    fn test_boundary_anchor_exposed() {
+        let validators: Vec<_> = (0..2).map(make_test_validator).collect();
+        let vs = ValidatorSet::new(validators);
+        let mut committees = HashMap::new();
+        committees.insert(ShardId::leaf(1, 0), vec![ValidatorId::new(0)]);
+        committees.insert(ShardId::leaf(1, 1), vec![ValidatorId::new(1)]);
+
+        let anchor = ShardAnchor {
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
+            height: BlockHeight::new(42),
+        };
+        let mut boundaries = HashMap::new();
+        boundaries.insert(ShardId::leaf(1, 0), anchor);
+
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            committees,
+            boundaries,
+        );
+
+        assert_eq!(snapshot.boundary(ShardId::leaf(1, 0)), Some(anchor));
+        assert_eq!(snapshot.boundary(ShardId::leaf(1, 1)), None);
     }
 
     /// A committee's vote count is its member count — one vote each.

@@ -3906,6 +3906,7 @@ mod tests {
         ShardBoundary {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: Epoch::new(epoch),
             consecutive_misses: 0,
