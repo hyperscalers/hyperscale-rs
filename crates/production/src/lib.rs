@@ -65,6 +65,7 @@
 //! ```
 
 mod bootstrap;
+mod drain;
 pub mod rpc;
 mod runner;
 mod status;

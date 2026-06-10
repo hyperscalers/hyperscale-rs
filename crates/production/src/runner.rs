@@ -60,10 +60,11 @@ use radix_common::types::ComponentAddress;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
+use crate::drain::{DRAIN_GRACE, DRAIN_POLL_INTERVAL, drain_after_window_close};
 use crate::rpc::state::VnodeMempoolSnapshot;
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, SharedTxStatusCaches, TxSubmissionSender, VnodeMempoolStats,
@@ -1115,7 +1116,10 @@ impl ProductionRunner {
     /// Translate a beacon-detected placement delta into supervisor
     /// commands for the moved vnode. A join starts the shard's
     /// bootstrap immediately — the delta arrives a full epoch before
-    /// the window opens, and the vnode votes only once ready.
+    /// the window opens, and the vnode votes only once ready. A leave
+    /// drains gracefully: the shard keeps serving until the validator's
+    /// window observably closes plus the DA retention grace, so its
+    /// replacement can snap-sync from it during the overlap.
     fn apply_participation_change(
         &self,
         supervisor: &mut ShardSupervisor,
@@ -1128,6 +1132,36 @@ impl ProductionRunner {
             effective_epoch = change.effective_epoch.inner(),
             "Beacon placement change detected"
         );
+        if let Some(shard) = change.leave {
+            let topology = self.topology_snapshot.clone();
+            let reconfigure = self.reconfigure_tx.clone();
+            let validator = change.validator;
+            spawn(async move {
+                if drain_after_window_close(
+                    &topology,
+                    validator,
+                    shard,
+                    DRAIN_GRACE,
+                    DRAIN_POLL_INTERVAL,
+                )
+                .await
+                {
+                    info!(
+                        ?shard,
+                        validator = validator.inner(),
+                        "Drain complete; leaving shard"
+                    );
+                    // Send failure means the runner is shutting down.
+                    let _ = reconfigure.send(ShardCommand::Leave { shard }).await;
+                } else {
+                    info!(
+                        ?shard,
+                        validator = validator.inner(),
+                        "Drain cancelled; validator re-entered the committee"
+                    );
+                }
+            });
+        }
         let Some(shard) = change.join else {
             return;
         };
