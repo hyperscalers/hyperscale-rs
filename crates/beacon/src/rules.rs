@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, BeaconState, BlockHeader, MAX_WITNESSES_PER_SHARD,
-    QuorumCertificate, ShardId, ShardWitness, Verifiable,
+    QuorumCertificate, ShardId, ShardWitness, Verifiable, is_epoch_crossing,
 };
 
 /// Witness chunk bounds for one shard's boundary: `prior` is the applied
@@ -121,11 +121,11 @@ pub(crate) fn is_boundary_crossing(
     qc: &QuorumCertificate,
     epoch_duration_ms: u64,
 ) -> bool {
-    let Some(cut) = epoch_boundary_below(qc.weighted_timestamp().as_millis(), epoch_duration_ms)
-    else {
-        return false;
-    };
-    boundary_header.parent_qc().weighted_timestamp().as_millis() <= cut
+    is_epoch_crossing(
+        boundary_header.parent_qc().weighted_timestamp(),
+        qc.weighted_timestamp(),
+        epoch_duration_ms,
+    )
 }
 
 /// Whether `block`'s shard contributions are the faithful canonical
@@ -159,19 +159,4 @@ pub(crate) fn contributions_well_formed(state: &BeaconState, block: &BeaconBlock
             contribution_chunk_valid(header, &contribution.witnesses, prior, chunk_end)
         })
     })
-}
-
-/// The largest epoch-boundary weighted timestamp strictly below `wt`
-/// (`k × epoch_duration_ms` for the greatest `k ≥ 1`), or `None` when no
-/// boundary lies below it.
-const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
-    if epoch_duration_ms == 0 || wt == 0 {
-        return None;
-    }
-    let k = (wt - 1) / epoch_duration_ms;
-    if k == 0 {
-        None
-    } else {
-        Some(k * epoch_duration_ms)
-    }
 }

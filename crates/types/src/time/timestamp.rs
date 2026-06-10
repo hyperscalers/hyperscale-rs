@@ -95,6 +95,41 @@ impl Display for WeightedTimestamp {
     }
 }
 
+/// The largest epoch-boundary weighted timestamp strictly below `wt`
+/// (`k × epoch_duration_ms` for the greatest `k ≥ 1`), or `None` when no
+/// boundary lies below it.
+#[must_use]
+pub const fn epoch_boundary_below(wt: u64, epoch_duration_ms: u64) -> Option<u64> {
+    if epoch_duration_ms == 0 || wt == 0 {
+        return None;
+    }
+    let k = (wt - 1) / epoch_duration_ms;
+    if k == 0 {
+        None
+    } else {
+        Some(k * epoch_duration_ms)
+    }
+}
+
+/// Whether a block is its shard's epoch-boundary crossing.
+///
+/// The first block across some `k × epoch_duration_ms` cut: the block's
+/// certifying QC (`qc_wt`) sits past a boundary that the block's parent
+/// QC (`parent_qc_wt`) sits at or before. Pure over the chain's epoch
+/// duration, so the beacon fold and the shard-side checkpoint trigger
+/// apply the identical test.
+#[must_use]
+pub const fn is_epoch_crossing(
+    parent_qc_wt: WeightedTimestamp,
+    qc_wt: WeightedTimestamp,
+    epoch_duration_ms: u64,
+) -> bool {
+    match epoch_boundary_below(qc_wt.as_millis(), epoch_duration_ms) {
+        Some(cut) => parent_qc_wt.as_millis() <= cut,
+        None => false,
+    }
+}
+
 /// Unauthenticated, single-validator wall-clock timestamp in milliseconds.
 ///
 /// Carried on two types:
