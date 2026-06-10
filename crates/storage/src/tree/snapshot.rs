@@ -2,21 +2,26 @@
 
 use std::sync::Arc;
 
-use hyperscale_jmt::{Node, NodeKey};
+use hyperscale_jmt::{Key, Node, NodeKey};
 use hyperscale_types::{BlockHeight, StateRoot};
 
 use super::CollectedWrites;
 
-/// Associates a JMT leaf node with the substate value it represents.
+/// Associates a JMT leaf (hashed key) with the raw substate storage key
+/// it represents.
 ///
-/// Enables historical state queries by linking the JMT structure
-/// (which is versioned) to actual substate values.
+/// `jmt_leaf_key` is one-way, so this is the only route from a leaf
+/// enumerated out of the tree back to the raw `(storage key, value)`
+/// pair a snap-syncing joiner imports. Backends persist the mapping
+/// alongside the tree: it is deterministic and immutable per key, so
+/// retaining entries for deleted leaves is always safe.
 #[derive(Debug, Clone)]
 pub struct LeafSubstateKeyAssociation {
-    /// The JMT leaf node key.
-    pub tree_node_key: NodeKey,
-    /// The substate value associated with this leaf.
-    pub substate_value: Vec<u8>,
+    /// The 32-byte hashed JMT leaf key.
+    pub leaf_key: Key,
+    /// The raw substate storage key, or `None` when this write deleted
+    /// the leaf.
+    pub storage_key: Option<Vec<u8>>,
 }
 
 /// A snapshot of JMT nodes computed during speculative execution.
@@ -61,7 +66,7 @@ impl JmtSnapshot {
             new_height,
             nodes: collected.nodes,
             stale_node_keys: collected.stale_node_keys,
-            leaf_substate_associations: Vec::new(),
+            leaf_substate_associations: collected.leaf_associations,
         }
     }
 }

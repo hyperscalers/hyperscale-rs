@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use hyperscale_jmt::NodeKey;
+use hyperscale_jmt::Key;
 use hyperscale_storage::shard::keys;
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
@@ -34,8 +34,11 @@ pub struct SharedState {
     pub tree_store: SimTreeStore,
     pub current_block_height: BlockHeight,
     pub current_root_hash: StateRoot,
-    /// Leaf-key → substate-value associations for historical queries.
-    pub associations: HashMap<NodeKey, Vec<u8>>,
+    /// Hashed-leaf-key → raw-storage-key associations for snap-sync
+    /// range serving. Entries for deleted leaves are retained — the
+    /// mapping is deterministic and immutable per key, and pinned
+    /// boundaries serve versions where the leaf may still be live.
+    pub associations: HashMap<Key, Vec<u8>>,
     /// Current value per `storage_key`. Absent key = no value. This is
     /// the authoritative source of truth for reads at the current tip.
     pub current_state: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -79,7 +82,9 @@ impl SharedState {
         // pruning after `jmt_history_length` blocks (default 256). In
         // simulation, we retain all nodes (tests are short-lived).
         for a in snapshot.leaf_substate_associations {
-            self.associations.insert(a.tree_node_key, a.substate_value);
+            if let Some(storage_key) = a.storage_key {
+                self.associations.insert(a.leaf_key, storage_key);
+            }
         }
 
         self.current_block_height = snapshot.new_height;

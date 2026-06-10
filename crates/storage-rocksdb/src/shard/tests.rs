@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
@@ -38,10 +39,11 @@ fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCer
         SignerBitfield::empty(),
     ))
 }
+use hyperscale_storage::tree::hash_storage_key;
 use sbor::prelude::IndexMap;
 use tempfile::TempDir;
 
-use super::column_families::STATE_HISTORY_CF;
+use super::column_families::{LeafAssociationsCf, STATE_HISTORY_CF};
 use super::core::RocksDbShardStorage;
 use crate::config::RocksDbConfig;
 
@@ -71,6 +73,54 @@ fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<Quor
         CertifiedBlock::new_unchecked(block.clone(), <Verified<_>>::clone(qc)),
     ));
     storage.commit_block(&certified, &no_witness());
+}
+
+/// Build a `DatabaseUpdates` containing a single `Delete` operation.
+fn make_database_delete(node_key: Vec<u8>, partition: u8, sort_key: Vec<u8>) -> DatabaseUpdates {
+    let mut updates = DatabaseUpdates::default();
+    updates.node_updates.insert(
+        node_key,
+        NodeDatabaseUpdates {
+            partition_updates: std::iter::once((
+                partition,
+                PartitionDatabaseUpdates::Delta {
+                    substate_updates: std::iter::once((
+                        DbSortKey(sort_key),
+                        DatabaseUpdate::Delete,
+                    ))
+                    .collect(),
+                },
+            ))
+            .collect(),
+        },
+    );
+    updates
+}
+
+/// The leaf-association CF mirrors the live substate key set: a set
+/// writes the hashed-key → raw-key mapping, a delete drops it.
+#[test]
+fn leaf_associations_track_live_substates() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+
+    let node_key = vec![3u8; 50];
+    let updates = make_database_update(node_key.clone(), 0, vec![7], vec![1, 2, 3]);
+    storage.commit(&updates).unwrap();
+
+    let mut raw_key = node_key.clone();
+    raw_key.push(0);
+    raw_key.push(7);
+    let hashed = Hash::from_hash_bytes(&hash_storage_key(&raw_key, &HashMap::new()));
+    assert_eq!(
+        storage.cf_get::<LeafAssociationsCf>(&hashed),
+        Some(raw_key.clone()),
+    );
+
+    storage
+        .commit(&make_database_delete(node_key, 0, vec![7]))
+        .unwrap();
+    assert_eq!(storage.cf_get::<LeafAssociationsCf>(&hashed), None);
 }
 
 #[test]

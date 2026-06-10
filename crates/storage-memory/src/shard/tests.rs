@@ -6,7 +6,7 @@ use hyperscale_storage::test_helpers::{
     db_node_key, make_database_update, make_mapped_database_update, make_test_block,
     make_test_certified, make_test_qc,
 };
-use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
+use hyperscale_storage::tree::{hash_storage_key, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter,
@@ -89,6 +89,11 @@ impl SimShardStorage {
 
         for (key, node) in &collected.nodes {
             s.tree_store.insert(key.clone(), Arc::clone(node));
+        }
+        for a in collected.leaf_associations {
+            if let Some(storage_key) = a.storage_key {
+                s.associations.insert(a.leaf_key, storage_key);
+            }
         }
 
         s.current_block_height = BlockHeight::new(new_version);
@@ -183,6 +188,45 @@ fn commit_empty(
     qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
     commit_with(storage, &DatabaseUpdates::default(), block, qc)
+}
+
+/// Associations map hashed leaf keys to raw storage keys, and entries
+/// outlive substate deletion — the mapping is deterministic per key, and
+/// pinned boundary versions may still serve the leaf.
+#[test]
+fn leaf_associations_map_hashed_to_raw_keys() {
+    let storage = SimShardStorage::default();
+    let node_key = vec![3u8; 50];
+    storage.commit_shared(&make_database_update(node_key.clone(), 0, vec![7], vec![1]));
+
+    let mut raw_key = node_key.clone();
+    raw_key.push(0);
+    raw_key.push(7);
+    let hashed = hash_storage_key(&raw_key, &HashMap::new());
+    assert_eq!(
+        storage.state.read().unwrap().associations.get(&hashed),
+        Some(&raw_key),
+    );
+
+    let mut delete = DatabaseUpdates::default();
+    delete.node_updates.insert(
+        node_key,
+        NodeDatabaseUpdates {
+            partition_updates: std::iter::once((
+                0u8,
+                PartitionDatabaseUpdates::Delta {
+                    substate_updates: std::iter::once((DbSortKey(vec![7]), DatabaseUpdate::Delete))
+                        .collect(),
+                },
+            ))
+            .collect(),
+        },
+    );
+    storage.commit_shared(&delete);
+    assert_eq!(
+        storage.state.read().unwrap().associations.get(&hashed),
+        Some(&raw_key),
+    );
 }
 
 #[test]

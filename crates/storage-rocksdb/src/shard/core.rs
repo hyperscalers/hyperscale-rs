@@ -25,7 +25,7 @@ use hyperscale_storage::{
     GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
     SubstateStore, tree,
 };
-use hyperscale_types::{Block, BlockHeight, NodeId, QuorumCertificate, StateRoot, Verified};
+use hyperscale_types::{Block, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
     SliceTransform, WriteBatch,
@@ -35,8 +35,8 @@ use tracing::field::Empty;
 use tracing::{Level, Span, instrument};
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, CfHandles, HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, STATE_HISTORY_CF,
-    StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
+    ALL_COLUMN_FAMILIES, CfHandles, HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, LeafAssociationsCf,
+    STATE_HISTORY_CF, StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
 };
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode};
@@ -369,6 +369,19 @@ impl RocksDbShardStorage {
                 &new_version,
                 &stale_parts,
             );
+        }
+
+        // Leaf associations — keep the hashed-key → raw-key mapping in
+        // lockstep with the live leaf set.
+        let leaf_assoc_cf = LeafAssociationsCf::handle(&cf);
+        for assoc in &snapshot.leaf_substate_associations {
+            let key = Hash::from_hash_bytes(&assoc.leaf_key);
+            match &assoc.storage_key {
+                Some(storage_key) => {
+                    batch_put::<LeafAssociationsCf>(batch, leaf_assoc_cf, &key, storage_key);
+                }
+                None => batch_delete::<LeafAssociationsCf>(batch, leaf_assoc_cf, &key),
+            }
         }
 
         // JMT metadata — single key, atomic read.

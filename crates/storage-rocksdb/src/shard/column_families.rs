@@ -93,6 +93,19 @@ pub const EXECUTION_CERTS_CF: &str = "execution_certs";
 /// follows the retention horizon configured at the runtime layer.
 pub const BEACON_WITNESSES_CF: &str = "beacon_witnesses";
 
+/// Column family mapping hashed JMT leaf keys back to raw substate
+/// storage keys.
+///
+/// Key: the 32-byte hashed leaf key (`jmt_leaf_key` output). Value: the
+/// raw storage key (`db_node_key ++ partition_num ++ sort_key`). The
+/// mapping is deterministic and immutable per key; entries are deleted
+/// when their substate is deleted, so the CF mirrors `STATE_CF`'s live
+/// key set. Snap-sync range serving resolves enumerated leaves through
+/// it — keyed in hashed order, a range walk reads it sequentially.
+/// Hard-link checkpoints pin it alongside the tree, making a checkpoint
+/// self-contained for serving.
+pub const LEAF_ASSOCIATIONS_CF: &str = "leaf_associations";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
@@ -115,6 +128,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     EXECUTION_METADATA_CF,
     EXECUTION_CERTS_CF,
     BEACON_WITNESSES_CF,
+    LEAF_ASSOCIATIONS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -138,6 +152,7 @@ pub struct CfHandles<'a> {
     execution_metadata: &'a ColumnFamily,
     execution_certs: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
+    leaf_associations: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -163,6 +178,7 @@ impl<'a> CfHandles<'a> {
             execution_metadata: resolve(EXECUTION_METADATA_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
+            leaf_associations: resolve(LEAF_ASSOCIATIONS_CF),
         }
     }
 }
@@ -235,6 +251,20 @@ impl TypedCf for StaleJmtNodesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.stale_jmt_nodes
+    }
+}
+
+/// Hashed-leaf-key → raw-storage-key mapping; see [`LEAF_ASSOCIATIONS_CF`].
+pub struct LeafAssociationsCf;
+impl TypedCf for LeafAssociationsCf {
+    const NAME: &'static str = LEAF_ASSOCIATIONS_CF;
+    type Key = Hash; // 32-byte hashed JMT leaf key
+    type Value = Vec<u8>; // raw substate storage key
+    type KeyCodec = HashCodec;
+    type ValueCodec = RawCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.leaf_associations
     }
 }
 
