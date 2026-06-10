@@ -52,7 +52,8 @@ where
         use std::sync::Arc;
 
         use hyperscale_types::network::request::{
-            GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
+            GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+            GetTransactionsRequest,
         };
 
         use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
@@ -61,6 +62,7 @@ where
         use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
         use crate::shard_io::fetch::provision_serve::serve_provision_request;
         use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
+        use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
         use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
         use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
         use crate::shard_io::sync::block_serve::serve_block_request;
@@ -140,6 +142,15 @@ where
                 .network
                 .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
                     serve_transaction_request(&pending_chain, &tx_store, &req)
+                });
+
+            // ── state_range.request → snap-sync boundary serving ─────────
+
+            let storage = Arc::clone(&self.shard_io(shard).storage);
+            self.process
+                .network
+                .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
+                    serve_state_range_request(&storage, &req)
                 });
 
             // ── provision.request → serve from local store ───────────────

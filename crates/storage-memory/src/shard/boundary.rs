@@ -8,11 +8,11 @@
 
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
+use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::shard::keys;
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, DbPartitionKey, DbSortKey, SubstateLookup,
+    BOUNDARY_RETAIN, BoundaryStore, DbPartitionKey, DbSortKey, ResolveLeaf, SubstateLookup,
 };
 use hyperscale_types::BlockHeight;
 
@@ -61,6 +61,22 @@ impl SubstateLookup for SimBoundary {
             self.version,
             state.current_block_height.inner(),
         )
+    }
+}
+
+impl ResolveLeaf for SimBoundary {
+    fn resolve_leaf(&self, leaf_key: &Key) -> Option<(Vec<u8>, Vec<u8>)> {
+        let state = read_or_recover(&self.state);
+        let storage_key = state.associations.get(leaf_key)?.clone();
+        let value = value_at_version(
+            &state.current_state,
+            &state.state_history,
+            &storage_key,
+            self.version,
+            state.current_block_height.inner(),
+        )?;
+        drop(state);
+        Some((storage_key, value))
     }
 }
 

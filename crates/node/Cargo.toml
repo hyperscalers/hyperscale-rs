@@ -12,6 +12,7 @@ hyperscale-metrics.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
+hyperscale-jmt.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-network.workspace = true
 hyperscale-provisions.workspace = true

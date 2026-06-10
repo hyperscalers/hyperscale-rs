@@ -30,6 +30,7 @@ pub mod host;
 pub mod local_provision_serve;
 pub mod provision_serve;
 pub mod shard_witness_serve;
+pub mod state_range_serve;
 pub mod transaction_serve;
 
 pub use host::FetchHost;

@@ -275,6 +275,11 @@ impl SimShardStorage {
         // roots must be retained for provision proof generation at past
         // block heights. RocksDB GC handles pruning in production. See
         // also `apply_jmt_snapshot`.
+        for a in collected.leaf_associations {
+            if let Some(storage_key) = a.storage_key {
+                s.associations.insert(a.leaf_key, storage_key);
+            }
+        }
 
         s.current_block_height = block_height;
         s.current_root_hash = new_root;

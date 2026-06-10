@@ -408,6 +408,69 @@ fn commit_empty_blocks_up_to(
     }
 }
 
+/// Commit `updates` at `height` through the production block-commit path.
+///
+/// The updates ride a single-receipt finalized wave inside a test block,
+/// so substates, state history, the JMT, and leaf associations all land
+/// exactly as a live commit writes them. Returns the resulting state
+/// root.
+pub fn commit_block_with_updates(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    height: BlockHeight,
+    updates: &DatabaseUpdates,
+) -> StateRoot {
+    let receipt = StoredReceipt {
+        tx_hash: TxHash::ZERO,
+        consensus: Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            database_updates: updates.clone(),
+            owned_nodes: BoundedVec::new(),
+            application_events: vec![],
+            beacon_witness_events: Vec::new(),
+        }),
+        metadata: None,
+    };
+    let certificate = Arc::new(WaveCertificate::new(
+        WaveId::new(ShardId::ROOT, height, BTreeSet::new()),
+        vec![],
+    ));
+    let finalized = Arc::new(FinalizedWave::new(certificate, vec![receipt]).into());
+
+    let block = match make_test_block(height) {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+        } => {
+            let mut certificates = (*certificates).clone();
+            certificates.push(finalized);
+            Block::Live {
+                header,
+                transactions,
+                certificates: Arc::new(certificates),
+                provisions,
+            }
+        }
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+        } => {
+            let mut certificates = (*certificates).clone();
+            certificates.push(finalized);
+            Block::Sealed {
+                header,
+                transactions,
+                certificates: Arc::new(certificates),
+                provision_hashes,
+            }
+        }
+    };
+    storage.commit_block(&make_test_certified(block), &empty_witness())
+}
+
 const fn empty_witness() -> BeaconWitnessCommit {
     BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO)
 }

@@ -15,14 +15,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::{BoundaryStore, DbPartitionKey, DbSortKey, SubstateLookup};
-use hyperscale_types::{BlockHeight, StateRoot};
+use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_storage::{BoundaryStore, DbPartitionKey, DbSortKey, ResolveLeaf, SubstateLookup};
+use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{DB, Options};
 use tracing::warn;
 
-use super::column_families::{ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, StateCf};
+use super::column_families::{
+    ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf,
+};
 use super::core::RocksDbShardStorage;
 use super::jmt_stored::StoredNodeKey;
 use super::metadata::read_jmt_metadata;
@@ -216,6 +218,24 @@ impl SubstateLookup for CheckpointStore {
         sort_key: &DbSortKey,
     ) -> Option<Vec<u8>> {
         self.get_substate(partition_key, sort_key)
+    }
+}
+
+impl ResolveLeaf for CheckpointStore {
+    fn resolve_leaf(&self, leaf_key: &Key) -> Option<(Vec<u8>, Vec<u8>)> {
+        let cf = CfHandles::resolve(&self.db);
+        let hashed = Hash::from_hash_bytes(leaf_key);
+        let storage_key =
+            get::<LeafAssociationsCf>(&self.db, LeafAssociationsCf::handle(&cf), &hashed)?;
+        // The association's stored bytes ARE the state CF key encoding
+        // (`SubstateKeyCodec` is a raw concatenation), so the value read
+        // skips the typed decode/encode round-trip.
+        let value = self
+            .db
+            .get_cf(StateCf::handle(&cf), &storage_key)
+            .ok()
+            .flatten()?;
+        Some((storage_key, value))
     }
 }
 
