@@ -56,7 +56,14 @@ pub use tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 /// proposal building, provision handlers), bound on the specific traits
 /// directly so the signature reflects what the function actually touches.
 pub trait ShardStorage:
-    ShardChainWriter + SubstateStore + VersionedStore + ShardChainReader + TreeReader + Send + Sync
+    ShardChainWriter
+    + SubstateStore
+    + VersionedStore
+    + ShardChainReader
+    + TreeReader
+    + BoundaryStore
+    + Send
+    + Sync
 {
 }
 
@@ -66,6 +73,7 @@ impl<S> ShardStorage for S where
         + VersionedStore
         + ShardChainReader
         + TreeReader
+        + BoundaryStore
         + Send
         + Sync
 {

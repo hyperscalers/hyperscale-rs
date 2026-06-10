@@ -27,6 +27,7 @@ use hyperscale_storage::{ChainEntry, PendingChain, ShardChainWriter, ShardStorag
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
     LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable, Verified,
+    WeightedTimestamp, is_epoch_crossing,
 };
 use tracing::debug;
 
@@ -311,10 +312,39 @@ pub enum AccumulateDecision {
     },
 }
 
+/// A committed block's identity as the candidate epoch-boundary its
+/// committing child adjudicates: `(hash, height, parent_qc wt)`.
+pub type BoundaryMemo = (BlockHash, BlockHeight, WeightedTimestamp);
+
+/// Pins shard state at epoch-boundary blocks for snap-sync serving.
+///
+/// Detection runs on the crossing block's committing *child*: the beacon
+/// reads a boundary's weighted timestamp from the child's `parent_qc`
+/// (the canonical, hash-pinned anchor), so the server pins exactly the
+/// block the beacon attests. A locally aggregated QC over the boundary
+/// block itself can carry a different weighted timestamp and flip the
+/// crossing verdict.
+struct BoundaryTrigger {
+    /// The chain's epoch window length — must match the beacon fold's.
+    epoch_duration_ms: u64,
+    /// Backend pin (`BoundaryStore::pin_boundary`). Invoked on the I/O
+    /// pool between the boundary block's write and its child's, when
+    /// storage state is exactly the boundary block's.
+    pin: Arc<dyn Fn(BlockHeight) + Send + Sync>,
+    /// The last flushed block — the candidate boundary the next flushed
+    /// block's `parent_qc` adjudicates. `None` until the first flush
+    /// (or unseeded restart); a broken hash linkage (sync-path gap)
+    /// skips the pin and re-anchors here.
+    last: Option<BoundaryMemo>,
+}
+
 pub struct BlockCommitCoordinator {
     /// Shard this coordinator persists for. Stamped onto emitted
     /// `BlockPersisted` events.
     shard: ShardId,
+
+    /// Epoch-boundary pin trigger; `None` leaves boundary pinning off.
+    boundary: Option<BoundaryTrigger>,
 
     /// Prepared commit cache shared with delegated dispatch closures.
     /// Stores `(block_height, prepared_commit)` keyed by block hash so
@@ -362,6 +392,7 @@ impl BlockCommitCoordinator {
     pub fn new(shard: ShardId, initial_persisted_height: BlockHeight) -> Self {
         Self {
             shard,
+            boundary: None,
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending: Vec::new(),
             persisted_height: initial_persisted_height,
@@ -369,6 +400,24 @@ impl BlockCommitCoordinator {
             qc_only_queue: VecDeque::new(),
             qc_only_in_flight: false,
         }
+    }
+
+    /// Install the epoch-boundary pin trigger.
+    ///
+    /// `seed` is the committed tip's [`BoundaryMemo`] so the first
+    /// post-restart commit can adjudicate its parent; `None` skips at
+    /// most the one boundary that lands exactly at the restart gap.
+    pub fn set_boundary_trigger(
+        &mut self,
+        epoch_duration_ms: u64,
+        pin: Arc<dyn Fn(BlockHeight) + Send + Sync>,
+        seed: Option<BoundaryMemo>,
+    ) {
+        self.boundary = Some(BoundaryTrigger {
+            epoch_duration_ms,
+            pin,
+            last: seed,
+        });
     }
 
     /// Try to claim the single-in-flight QC-only JMT-prep slot for `pending`.
@@ -658,6 +707,31 @@ impl BlockCommitCoordinator {
         let already_notified: Vec<bool> =
             ready_commits.iter().map(|c| c.committed_notified).collect();
 
+        // Adjudicate epoch-boundary crossings: each block's `parent_qc`
+        // carries the canonical weighted timestamp for its parent, so a
+        // commit decides whether the PREVIOUS block was its shard's
+        // crossing. The pin runs before this block's storage write, while
+        // state is exactly the boundary block's.
+        let mut pin_before: Vec<Option<BlockHeight>> = vec![None; ready_commits.len()];
+        let pin_hook = self.boundary.as_ref().map(|t| Arc::clone(&t.pin));
+        if let Some(trigger) = self.boundary.as_mut() {
+            for (i, commit) in ready_commits.iter().enumerate() {
+                let block = commit.certified.block();
+                let parent_qc = block.header().parent_qc();
+                if let Some((last_hash, last_height, last_parent_wt)) = trigger.last
+                    && parent_qc.block_hash() == last_hash
+                    && is_epoch_crossing(
+                        last_parent_wt,
+                        parent_qc.weighted_timestamp(),
+                        trigger.epoch_duration_ms,
+                    )
+                {
+                    pin_before[i] = Some(last_height);
+                }
+                trigger.last = Some((block.hash(), block.height(), parent_qc.weighted_timestamp()));
+            }
+        }
+
         let commits = ready_commits;
         let event_tx = event_tx.clone();
         let in_flight = Arc::clone(&self.commit_in_flight);
@@ -680,6 +754,11 @@ impl BlockCommitCoordinator {
             // batch in one sync.
             let total = prepared_map.len();
             for (i, prepared) in prepared_map.into_iter().enumerate() {
+                // Pin the parent's epoch-boundary state before this
+                // block's write lands on top of it.
+                if let (Some(boundary_height), Some(pin)) = (pin_before[i], pin_hook.as_ref()) {
+                    pin(boundary_height);
+                }
                 let commit = commit_slots[i].as_ref().unwrap();
                 let hint = if i + 1 == total {
                     SyncHint::FlushNow
@@ -734,7 +813,7 @@ mod tests {
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_test_helpers::{TestCommittee, make_live_block};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHeight, QuorumCertificate, ShardId, ValidatorId,
+        BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, ShardId, ValidatorId,
     };
 
     use super::*;
@@ -1337,5 +1416,212 @@ mod tests {
         assert_eq!(committed_heights(&sink), vec![1]);
         assert_eq!(committed_tags(&sink), vec![tag]);
         assert!(!coord.has_prepared(&hash));
+    }
+
+    // ── Boundary trigger ─────────────────────────────────────────────────
+
+    use hyperscale_types::{
+        BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, TransactionRoot,
+    };
+
+    /// Tag the pin hook pushes into the sink, distinguishing pins from
+    /// block commits (which use their height as the tag).
+    const PIN_TAG: u64 = u64::MAX;
+
+    /// Epoch window used by the trigger tests.
+    const EPOCH_MS: u64 = 1_000;
+
+    fn pin_hook(sink: CommitSink) -> Arc<dyn Fn(BlockHeight) + Send + Sync> {
+        Arc::new(move |height| sink.lock().unwrap().push((height, PIN_TAG)))
+    }
+
+    fn linked_qc(block_hash: BlockHash, wt_ms: u64) -> QuorumCertificate {
+        let g = QuorumCertificate::genesis(ShardId::ROOT);
+        QuorumCertificate::new(
+            block_hash,
+            g.shard_id(),
+            g.height(),
+            g.parent_block_hash(),
+            g.round(),
+            g.signers().clone(),
+            g.aggregated_signature(),
+            WeightedTimestamp::from_millis(wt_ms),
+        )
+    }
+
+    /// Build a commit whose header links to `parent_hash` via a
+    /// `parent_qc` carrying `parent_qc_wt_ms` — the canonical timestamp
+    /// the trigger adjudicates the parent with.
+    fn make_linked_commit(
+        height: u64,
+        parent_hash: BlockHash,
+        parent_qc_wt_ms: u64,
+        sink: CommitSink,
+    ) -> (PendingCommit, PreparedCommit, BlockHash) {
+        let header = BlockHeader::new(
+            ShardId::ROOT,
+            BlockHeight::new(height),
+            parent_hash,
+            linked_qc(parent_hash, parent_qc_wt_ms),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_000 + height),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+        );
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(vec![].into()),
+            certificates: Arc::new(vec![].into()),
+            provisions: Arc::new(BoundedVec::new()),
+        };
+        let hash = block.hash();
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(linked_qc(hash, 0));
+        // SAFETY: synthetic test fixture; trigger tests don't exercise
+        // the `Verified<CertifiedBlock>` predicate.
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(block, qc),
+        ));
+        let pending = PendingCommit {
+            certified,
+            source: CommitSource::Sync,
+            committed_notified: false,
+            witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        };
+        let prepared = make_mock_prepared(sink, height);
+        (pending, prepared, hash)
+    }
+
+    fn enqueue_linked(
+        coord: &mut BlockCommitCoordinator,
+        height: u64,
+        parent_hash: BlockHash,
+        parent_qc_wt_ms: u64,
+        sink: CommitSink,
+    ) -> BlockHash {
+        let (commit, prepared, hash) =
+            make_linked_commit(height, parent_hash, parent_qc_wt_ms, sink);
+        let _ = coord.accumulate(commit, now());
+        coord.insert_prepared(hash, BlockHeight::new(height), prepared);
+        hash
+    }
+
+    /// The crossing block's child carries the canonical QC; the pin for
+    /// the crossing lands between the crossing's write and the child's.
+    #[test]
+    fn boundary_pin_fires_between_crossing_and_child() {
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        // b1 certified at wt 500, b2 at wt 900 (same epoch window), b3's
+        // parent_qc at wt 1100 — past the 1000ms cut b2's parent sat
+        // before, making b2 the crossing.
+        let b1 = enqueue_linked(&mut coord, 1, BlockHash::ZERO, 500, Arc::clone(&sink));
+        let b2 = enqueue_linked(&mut coord, 2, b1, 900, Arc::clone(&sink));
+        let _b3 = enqueue_linked(&mut coord, 3, b2, 1_100, Arc::clone(&sink));
+
+        coord.flush(&tx, &dispatch);
+
+        let recorded: Vec<(u64, u64)> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, t)| (h.inner(), *t))
+            .collect();
+        assert_eq!(recorded, vec![(1, 1), (2, 2), (2, PIN_TAG), (3, 3)]);
+    }
+
+    /// The memo survives across flushes: the crossing and its child can
+    /// land in different batches.
+    #[test]
+    fn boundary_pin_fires_across_separate_flushes() {
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let b1 = enqueue_linked(&mut coord, 1, BlockHash::ZERO, 500, Arc::clone(&sink));
+        let b2 = enqueue_linked(&mut coord, 2, b1, 900, Arc::clone(&sink));
+        coord.flush(&tx, &dispatch);
+        coord.mark_persisted(BlockHeight::new(2));
+
+        let _b3 = enqueue_linked(&mut coord, 3, b2, 1_100, Arc::clone(&sink));
+        coord.flush(&tx, &dispatch);
+
+        let pins: Vec<u64> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t)| *t == PIN_TAG)
+            .map(|(h, _)| h.inner())
+            .collect();
+        assert_eq!(pins, vec![2]);
+    }
+
+    /// A broken parent linkage (sync-path gap) skips the pin instead of
+    /// adjudicating against the wrong parent.
+    #[test]
+    fn boundary_pin_skipped_on_broken_parent_linkage() {
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let b1 = enqueue_linked(&mut coord, 1, BlockHash::ZERO, 500, Arc::clone(&sink));
+        let _b2 = enqueue_linked(&mut coord, 2, b1, 900, Arc::clone(&sink));
+        // b3's parent_qc points at a hash the memo doesn't hold.
+        let _b3 = enqueue_linked(&mut coord, 3, BlockHash::ZERO, 1_100, Arc::clone(&sink));
+
+        coord.flush(&tx, &dispatch);
+
+        assert!(sink.lock().unwrap().iter().all(|(_, t)| *t != PIN_TAG));
+    }
+
+    /// A seeded memo lets the first post-restart commit adjudicate the
+    /// committed tip it builds on.
+    #[test]
+    fn boundary_pin_fires_from_seeded_memo() {
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::new(2));
+        let sink = empty_sink();
+        let tip_hash = BlockHash::from_raw(Hash::from_bytes(b"tip"));
+        coord.set_boundary_trigger(
+            EPOCH_MS,
+            pin_hook(Arc::clone(&sink)),
+            Some((
+                tip_hash,
+                BlockHeight::new(2),
+                WeightedTimestamp::from_millis(900),
+            )),
+        );
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let _b3 = enqueue_linked(&mut coord, 3, tip_hash, 1_100, Arc::clone(&sink));
+        coord.flush(&tx, &dispatch);
+
+        let pins: Vec<u64> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t)| *t == PIN_TAG)
+            .map(|(h, _)| h.inner())
+            .collect();
+        assert_eq!(pins, vec![2]);
     }
 }

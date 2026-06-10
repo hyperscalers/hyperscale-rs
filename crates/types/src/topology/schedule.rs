@@ -68,6 +68,15 @@ impl TopologySchedule {
         }
     }
 
+    /// The chain's epoch window length in milliseconds — the constant the
+    /// schedule's epoch resolution divides by, sourced from the folded
+    /// `BeaconState`'s chain config. Zero for [`Self::single`], where no
+    /// epoch boundaries exist.
+    #[must_use]
+    pub const fn epoch_duration_ms(&self) -> u64 {
+        self.epoch_duration_ms
+    }
+
     /// A schedule of one committee for all time: every weighted timestamp
     /// resolves to `snapshot`, and it is also the head. Used by tests and by
     /// within-epoch callers that hold a single committee.

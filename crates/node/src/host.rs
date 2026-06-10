@@ -152,7 +152,48 @@ where
                 .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
             let storage = Arc::new(storage);
             let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
-            let block_commit = BlockCommitCoordinator::new(*shard, initial_persisted_height);
+            let mut block_commit = BlockCommitCoordinator::new(*shard, initial_persisted_height);
+            {
+                // Seed the boundary memo from the committed tip so the
+                // first post-restart commit can adjudicate its parent.
+                let seed =
+                    storage
+                        .get_certified_header(initial_persisted_height)
+                        .map(|certified| {
+                            let header = certified.header();
+                            (
+                                header.hash(),
+                                header.height(),
+                                header.parent_qc().weighted_timestamp(),
+                            )
+                        });
+                // The chain's epoch duration, read from the projected
+                // schedule (sourced from the folded `BeaconState`'s chain
+                // config) — never from node-local configuration, which
+                // could silently diverge from the chain the beacon fold
+                // actually runs.
+                let epoch_duration_ms = rep
+                    .state
+                    .beacon_coordinator()
+                    .topology_schedule()
+                    .epoch_duration_ms();
+                let pin_storage = Arc::clone(&storage);
+                let pin_shard = *shard;
+                block_commit.set_boundary_trigger(
+                    epoch_duration_ms,
+                    Arc::new(move |height| {
+                        if let Err(error) = pin_storage.pin_boundary(height) {
+                            tracing::warn!(
+                                shard = ?pin_shard,
+                                %height,
+                                error,
+                                "epoch boundary pin failed; this node won't serve this boundary"
+                            );
+                        }
+                    }),
+                    seed,
+                );
+            }
             per_shard_dispatch.insert(
                 *shard,
                 ShardDispatchHandles {

@@ -31,10 +31,11 @@ use crate::typed_cf::{TypedCf, get};
 
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
-/// Holds the newest [`Self::retain`] checkpoints; creating a new one
-/// evicts the oldest beyond that. Entries are discovered by scanning the
-/// ring directory, so the ring picks up where it left off after a
-/// restart.
+/// Owned by [`RocksDbShardStorage`] and driven through
+/// [`BoundaryStore`]. Holds the newest [`Self::retain`] checkpoints;
+/// creating a new one evicts the oldest beyond that. Entries are
+/// discovered by scanning the ring directory, so the ring picks up
+/// where it left off after a restart.
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,
@@ -42,7 +43,7 @@ pub struct CheckpointRing {
 }
 
 impl CheckpointRing {
-    /// Create a ring over `storage`'s database, rooted at `dir`.
+    /// Create a ring over `db`, rooted at `dir`.
     ///
     /// `dir` is created lazily on first checkpoint. `retain` is the ring
     /// size — how many checkpoints survive eviction.
@@ -51,11 +52,6 @@ impl CheckpointRing {
     ///
     /// Panics if `retain` is zero — a zero-size ring would evict every
     /// checkpoint as soon as it is created.
-    #[must_use]
-    pub fn new(storage: &RocksDbShardStorage, dir: PathBuf, retain: usize) -> Self {
-        Self::from_db(Arc::clone(&storage.db), dir, retain)
-    }
-
     pub(crate) fn from_db(db: Arc<DB>, dir: PathBuf, retain: usize) -> Self {
         assert!(retain > 0, "checkpoint ring must retain at least one entry");
         Self { db, dir, retain }
@@ -227,21 +223,23 @@ impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
-        let ring = self
-            .checkpoints
-            .as_ref()
-            .ok_or_else(|| "checkpoint ring not configured".to_string())?;
-        ring.create(height).map(|_| ()).map_err(|e| e.to_string())
+        self.checkpoints
+            .create(height)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     fn open_boundary(&self, height: BlockHeight) -> Option<CheckpointStore> {
-        let ring = self.checkpoints.as_ref()?;
-        let (_, path) = ring.entries().into_iter().find(|(h, _)| *h == height)?;
+        let (_, path) = self
+            .checkpoints
+            .entries()
+            .into_iter()
+            .find(|(h, _)| *h == height)?;
         CheckpointStore::open(&path, self.root_path.clone()).ok()
     }
 
     fn latest_boundary(&self) -> Option<BlockHeight> {
-        self.checkpoints.as_ref()?.latest().map(|(h, _)| h)
+        self.checkpoints.latest().map(|(h, _)| h)
     }
 }
 
@@ -259,8 +257,8 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Tree};
-    use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::make_database_update;
+    use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
     use tempfile::TempDir;
 
     use super::*;
@@ -268,7 +266,7 @@ mod tests {
     type Jmt = Tree<Blake3Hasher, 1>;
 
     fn open_storage(dir: &Path) -> RocksDbShardStorage {
-        RocksDbShardStorage::open(dir.join("db"), NibblePath::empty()).unwrap()
+        RocksDbShardStorage::open(dir, NibblePath::empty()).unwrap()
     }
 
     fn commit_one(storage: &RocksDbShardStorage, seed: u8) {
@@ -277,17 +275,16 @@ mod tests {
     }
 
     #[test]
-    fn create_open_and_serve_verified_range() {
+    fn pin_open_and_serve_verified_range() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         commit_one(&storage, 1);
         commit_one(&storage, 2);
         let expected_root = storage.state_root();
 
-        let ring = CheckpointRing::new(&storage, temp.path().join("checkpoints"), 3);
-        let path = ring.create(BlockHeight::new(2)).unwrap();
+        storage.pin_boundary(BlockHeight::new(2)).unwrap();
 
-        let store = CheckpointStore::open(&path, NibblePath::empty()).unwrap();
+        let store = storage.open_boundary(BlockHeight::new(2)).expect("pinned");
         let (version, root) = store.read_jmt_metadata();
         assert_eq!(version, 2);
         assert_eq!(root, expected_root);
@@ -319,13 +316,12 @@ mod tests {
         commit_one(&storage, 1);
         let pinned_root = storage.state_root();
 
-        let ring = CheckpointRing::new(&storage, temp.path().join("checkpoints"), 3);
-        let path = ring.create(BlockHeight::new(1)).unwrap();
+        storage.pin_boundary(BlockHeight::new(1)).unwrap();
 
         commit_one(&storage, 2);
         assert_ne!(storage.state_root(), pinned_root);
 
-        let store = CheckpointStore::open(&path, NibblePath::empty()).unwrap();
+        let store = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let (version, root) = store.read_jmt_metadata();
         assert_eq!(version, 1);
         assert_eq!(root, pinned_root);
@@ -335,15 +331,14 @@ mod tests {
     fn retention_evicts_oldest() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        let ring = CheckpointRing::new(&storage, temp.path().join("checkpoints"), 3);
 
-        for height in 1..=4u64 {
+        // One past the ring size: the oldest pin is evicted.
+        for height in 1..=(BOUNDARY_RETAIN as u64 + 1) {
             commit_one(&storage, u8::try_from(height).unwrap());
-            ring.create(BlockHeight::new(height)).unwrap();
+            storage.pin_boundary(BlockHeight::new(height)).unwrap();
         }
 
-        let heights: Vec<u64> = ring.entries().iter().map(|(h, _)| h.inner()).collect();
-        assert_eq!(heights, vec![2, 3, 4]);
+        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
         assert!(
             !temp
                 .path()
@@ -351,36 +346,38 @@ mod tests {
                 .join(entry_name(BlockHeight::new(1)))
                 .exists()
         );
-        assert_eq!(ring.latest().unwrap().0, BlockHeight::new(4));
+        assert!(storage.open_boundary(BlockHeight::new(2)).is_some());
+        assert_eq!(
+            storage.latest_boundary(),
+            Some(BlockHeight::new(BOUNDARY_RETAIN as u64 + 1)),
+        );
     }
 
     #[test]
-    fn create_is_idempotent_per_height() {
+    fn pin_is_idempotent_per_height() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         commit_one(&storage, 1);
 
-        let ring = CheckpointRing::new(&storage, temp.path().join("checkpoints"), 3);
-        let first = ring.create(BlockHeight::new(1)).unwrap();
-        let second = ring.create(BlockHeight::new(1)).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(ring.entries().len(), 1);
+        storage.pin_boundary(BlockHeight::new(1)).unwrap();
+        storage.pin_boundary(BlockHeight::new(1)).unwrap();
+        assert_eq!(storage.checkpoints.entries().len(), 1);
+        assert_eq!(storage.latest_boundary(), Some(BlockHeight::new(1)));
     }
 
     #[test]
-    fn ring_survives_restart_via_directory_scan() {
+    fn ring_survives_reopen_via_directory_scan() {
         let temp = TempDir::new().unwrap();
-        let storage = open_storage(temp.path());
-        commit_one(&storage, 1);
+        {
+            let storage = open_storage(temp.path());
+            commit_one(&storage, 1);
+            storage.pin_boundary(BlockHeight::new(1)).unwrap();
+        }
 
-        let dir = temp.path().join("checkpoints");
-        CheckpointRing::new(&storage, dir.clone(), 3)
-            .create(BlockHeight::new(1))
-            .unwrap();
-
-        // A fresh ring over the same directory sees the existing entry.
-        let revived = CheckpointRing::new(&storage, dir, 3);
-        assert_eq!(revived.latest().unwrap().0, BlockHeight::new(1));
+        // A fresh storage over the same directory sees the existing pin.
+        let revived = open_storage(temp.path());
+        assert_eq!(revived.latest_boundary(), Some(BlockHeight::new(1)));
+        assert!(revived.open_boundary(BlockHeight::new(1)).is_some());
     }
 
     #[test]
@@ -391,30 +388,11 @@ mod tests {
     }
 
     #[test]
-    fn boundary_store_pins_and_serves_through_the_trait() {
-        let temp = TempDir::new().unwrap();
-        let mut storage = open_storage(temp.path());
-        storage.enable_checkpoints(temp.path().join("checkpoints"), 3);
-        commit_one(&storage, 1);
-        let pinned_root = storage.state_root();
-
-        storage.pin_boundary(BlockHeight::new(1)).unwrap();
-        commit_one(&storage, 2);
-
-        assert_eq!(storage.latest_boundary(), Some(BlockHeight::new(1)));
-        assert!(storage.open_boundary(BlockHeight::new(9)).is_none());
-        let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
-        let (version, root) = boundary.read_jmt_metadata();
-        assert_eq!(version, 1);
-        assert_eq!(root, pinned_root);
-    }
-
-    #[test]
-    fn pin_without_ring_errors() {
+    fn unpinned_height_is_not_served() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         commit_one(&storage, 1);
-        assert!(storage.pin_boundary(BlockHeight::new(1)).is_err());
+        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
         assert_eq!(storage.latest_boundary(), None);
     }
 }

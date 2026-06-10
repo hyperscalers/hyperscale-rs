@@ -1166,18 +1166,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
     for shard in &hosted_shards {
         let shard_id = ShardId::leaf(shard_depth, *shard);
-        let db_path = config
-            .node
-            .data_dir
-            .join(format!("shard-{shard}"))
-            .join("db");
+        // The shard's storage directory: the database lives at `db/`
+        // inside it, the snap-sync checkpoint ring at `checkpoints/`.
+        let shard_dir = config.node.data_dir.join(format!("shard-{shard}"));
         let storage = RocksDbShardStorage::open_with_config(
-            &db_path,
+            &shard_dir,
             &rocksdb_config,
             shard_prefix_path(shard_id),
         )
-        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-        info!(shard = shard, path = %db_path.display(), "Storage opened");
+        .with_context(|| format!("Failed to open database at {}", shard_dir.display()))?;
+        info!(shard = shard, path = %shard_dir.display(), "Storage opened");
         storages.insert(shard_id, Arc::new(storage));
     }
 

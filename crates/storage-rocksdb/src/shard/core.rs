@@ -21,9 +21,9 @@ use std::time::Instant;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
-    GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
-    SubstateStore, tree,
+    BOUNDARY_RETAIN, BaseReadCache, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry,
+    SubstateDatabase, SubstateStore, tree,
 };
 use hyperscale_types::{Block, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified};
 use rocksdb::{
@@ -86,16 +86,15 @@ pub struct RocksDbShardStorage {
     /// whole-keyspace store. Set once at open from the shard's `ShardId`.
     pub(crate) root_path: NibblePath,
 
-    /// Checkpoint ring for snap-sync boundary pins. `None` until
-    /// [`Self::enable_checkpoints`] wires a ring directory — pinning a
-    /// boundary without one is an error, serving stays disabled.
-    pub(crate) checkpoints: Option<super::checkpoints::CheckpointRing>,
+    /// Checkpoint ring for snap-sync boundary pins, rooted at the
+    /// `checkpoints` directory beside the database.
+    pub(crate) checkpoints: super::checkpoints::CheckpointRing,
 }
 
 impl RocksDbShardStorage {
-    /// Open or create a `RocksDB` database at the given path.
+    /// Open or create a shard store rooted at the given directory.
     ///
-    /// Creates default column families: default, blocks, transactions, state, certificates.
+    /// See [`Self::open_with_config`] for the directory layout.
     ///
     /// # Errors
     ///
@@ -105,6 +104,11 @@ impl RocksDbShardStorage {
     }
 
     /// Open with custom configuration.
+    ///
+    /// `path` is the shard's storage directory: the database lives at
+    /// `path/db`, and the snap-sync checkpoint ring at `path/checkpoints`
+    /// (`RocksDB` checkpoints hard-link the database's SSTs, so the ring
+    /// sits beside — never inside — the `RocksDB`-owned directory).
     ///
     /// `root_path` is the prefix of the shard this store serves (via
     /// [`hyperscale_types::shard_prefix_path`]), so its JMT roots there and its
@@ -119,6 +123,7 @@ impl RocksDbShardStorage {
         config: &RocksDbConfig,
         root_path: NibblePath,
     ) -> Result<Self, StorageError> {
+        let dir = path.as_ref();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -220,32 +225,27 @@ impl RocksDbShardStorage {
             })
             .collect();
 
-        let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
+        let db = DB::open_cf_descriptors(&opts, dir.join("db"), cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         // Validate all expected column families exist at startup.
         // This fails fast instead of panicking on first access at runtime.
         CfHandles::resolve(&db);
 
+        let db = Arc::new(db);
+        let checkpoints = super::checkpoints::CheckpointRing::from_db(
+            Arc::clone(&db),
+            dir.join("checkpoints"),
+            BOUNDARY_RETAIN,
+        );
+
         Ok(Self {
-            db: Arc::new(db),
+            db,
             commit_lock: Mutex::new(()),
             jmt_history_length: config.jmt_history_length,
             root_path,
-            checkpoints: None,
+            checkpoints,
         })
-    }
-
-    /// Wire a checkpoint ring at `dir` so boundary pins
-    /// ([`hyperscale_storage::BoundaryStore::pin_boundary`]) create
-    /// `RocksDB` checkpoints there, retaining the newest `retain`.
-    /// Call before wrapping the storage in an `Arc`.
-    pub fn enable_checkpoints(&mut self, dir: std::path::PathBuf, retain: usize) {
-        self.checkpoints = Some(super::checkpoints::CheckpointRing::from_db(
-            Arc::clone(&self.db),
-            dir,
-            retain,
-        ));
     }
 
     /// Get the configured JMT history retention length (in block heights).
