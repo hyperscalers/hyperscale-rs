@@ -3379,8 +3379,21 @@ impl ShardCoordinator {
     /// (`submit_synced_block_for_verification` re-buffers on a
     /// `NotYetCommitted` lookup). The beacon adopting the epoch is that
     /// path's only retry signal.
+    ///
+    /// Also re-evaluates Ready emission: a vnode that finished its
+    /// bootstrap sync before its committee window opened got `None`
+    /// from the sync-complete gate (it wasn't yet in the head
+    /// committee), and a beacon commit is the only signal that the
+    /// window may now be active. Skipped mid-sync — completion re-fires
+    /// the emission anyway. Re-emission is bounded to one signal per
+    /// beacon commit and self-silences once the fold flips the
+    /// validator into the consensus subset.
     pub fn on_beacon_block_persisted(&mut self, topology: &TopologySchedule) -> Vec<Action> {
-        self.try_drain_buffered_synced_blocks(topology)
+        let mut actions = self.try_drain_buffered_synced_blocks(topology);
+        if !self.is_block_syncing() {
+            actions.extend(self.maybe_emit_ready_signal(topology));
+        }
+        actions
     }
 
     /// Admit a QC-verified synced block into the chain state and drive the
@@ -6605,6 +6618,34 @@ mod tests {
         assert!(actions.is_empty());
     }
 
+    /// A 4-member committee where validator 0 (the local node) is a
+    /// full member but outside the consensus subset — placed, not yet
+    /// ready.
+    fn not_ready_member_topology() -> TopologySchedule {
+        use std::collections::HashMap;
+
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: generate_bls_keypair().public_key(),
+            })
+            .collect();
+        let vs = ValidatorSet::new(validators);
+        let members: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let mut committees = HashMap::new();
+        committees.insert(ShardId::ROOT, members.clone());
+        let mut consensus = HashMap::new();
+        consensus.insert(ShardId::ROOT, members[1..].to_vec());
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            committees,
+            consensus,
+            HashMap::new(),
+        );
+        TopologySchedule::single(Arc::new(snapshot))
+    }
+
     /// A committee member outside the consensus subset — placed but not
     /// yet ready — emits exactly one `SignAndBroadcastReadySignal` when
     /// sync reaches the tip, windowed from the next committable height
@@ -6659,6 +6700,46 @@ mod tests {
         assert_eq!(**end, **start + (MAX_READY_WINDOW_BLOCKS - 1));
         assert_eq!(recipients.len(), 3);
         assert!(!recipients.contains(&state.me));
+    }
+
+    /// A vnode that finished bootstrap sync before its committee window
+    /// opened missed the sync-complete emission (the head committee
+    /// didn't include it yet). The beacon commit that activates the
+    /// window must re-fire the signal — without this the flag only
+    /// flips via the ready timeout.
+    #[test]
+    fn beacon_commit_re_fires_ready_signal_for_synced_not_ready_member() {
+        let (mut state, _) = make_test_state();
+        let topology = not_ready_member_topology();
+
+        let actions = state.on_beacon_block_persisted(&topology);
+        let signals = actions
+            .iter()
+            .filter(|a| matches!(a, Action::SignAndBroadcastReadySignal { .. }))
+            .count();
+        assert_eq!(
+            signals, 1,
+            "expected exactly one re-fired ready signal, got {actions:?}"
+        );
+
+        // Mid-sync the re-kick stays quiet: the height window would be
+        // stale, and sync completion re-fires the emission itself.
+        state.set_block_syncing(true);
+        let actions = state.on_beacon_block_persisted(&topology);
+        assert!(
+            actions.is_empty(),
+            "no ready signal while block sync is in flight, got {actions:?}"
+        );
+    }
+
+    /// An already-ready member (in the consensus subset) stays silent on
+    /// beacon commits — the re-kick is only for the placed-but-not-ready
+    /// window.
+    #[test]
+    fn beacon_commit_emits_no_ready_signal_for_consensus_member() {
+        let (mut state, topology) = make_test_state();
+        let actions = state.on_beacon_block_persisted(&topology);
+        assert!(actions.is_empty(), "expected no actions, got {actions:?}");
     }
 
     #[test]
