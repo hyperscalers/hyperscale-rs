@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::StreamExt;
 use hyperscale_metrics::record_gossipsub_publish_failure;
@@ -60,7 +61,7 @@ pub(super) async fn run(
     mut bulk_rx: mpsc::Receiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
-    local_shards: std::collections::HashSet<ShardId>,
+    local_shards: Arc<ArcSwap<std::collections::HashSet<ShardId>>>,
     version_interop_mode: VersionInteroperabilityMode,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
@@ -372,10 +373,12 @@ pub(super) async fn run(
                     }
                 }
 
-                // Delegate gossipsub messages to the event handler
+                // Delegate gossipsub messages to the event handler. The
+                // hosted set is loaded per event so shards added or
+                // dropped at runtime are filtered correctly.
                 super::gossipsub::handle_gossipsub_event(
                     event,
-                    &local_shards,
+                    &local_shards.load(),
                     &registry,
                     &validation_tx,
                 );
@@ -399,6 +402,12 @@ fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
                 warn!("Failed to subscribe to topic: {}", e);
             } else {
                 info!("Subscribed to gossipsub topic: {}", topic);
+            }
+        }
+        SwarmCommand::Unsubscribe { topic } => {
+            let topic = IdentTopic::new(topic);
+            if swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                info!("Unsubscribed from gossipsub topic: {}", topic);
             }
         }
         SwarmCommand::Broadcast { topic, data, .. } => {

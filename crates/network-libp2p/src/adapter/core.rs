@@ -47,8 +47,10 @@ pub struct Libp2pAdapter {
     local_validator_ids: Vec<ValidatorId>,
 
     /// Shards hosted by this peer. Drives per-shard request stream
-    /// protocol registration and per-shard gossipsub topic subscription.
-    local_shards: HashSet<ShardId>,
+    /// protocol registration, per-shard gossipsub topic subscription,
+    /// and the event loop's inbound shard-local filter — which loads it
+    /// per message, so runtime add/drop takes effect immediately.
+    local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
 
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
@@ -249,7 +251,7 @@ impl Libp2pAdapter {
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_ids,
-            local_shards,
+            local_shards: Arc::new(ArcSwap::from_pointee(local_shards)),
             priority_channels,
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
@@ -261,7 +263,7 @@ impl Libp2pAdapter {
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
         let event_loop_validator_peers = validator_peers;
-        let event_loop_local_shards = adapter.local_shards.clone();
+        let event_loop_local_shards = Arc::clone(&adapter.local_shards);
         let bind_trigger_tx = bind_handle.bind_tx.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         spawn(async move {
@@ -399,11 +401,39 @@ impl Libp2pAdapter {
         &self.local_validator_ids
     }
 
-    /// Shards hosted by this libp2p peer. Drives per-shard request stream
-    /// protocol registration and per-shard gossipsub subscriptions.
+    /// Shards hosted by this libp2p peer (a loaded snapshot). Drives
+    /// per-shard request stream protocol registration and per-shard
+    /// gossipsub subscriptions.
     #[must_use]
-    pub const fn local_shards(&self) -> &HashSet<ShardId> {
-        &self.local_shards
+    pub fn local_shards(&self) -> Arc<HashSet<ShardId>> {
+        self.local_shards.load_full()
+    }
+
+    /// Add `shard` to the hosted set — the event loop's inbound
+    /// shard-local filter admits its topics from the next message.
+    pub fn add_local_shard(&self, shard: ShardId) {
+        let mut set = (**self.local_shards.load()).clone();
+        set.insert(shard);
+        self.local_shards.store(Arc::new(set));
+    }
+
+    /// Remove `shard` from the hosted set — the inbound filter rejects
+    /// its shard-local topics from the next message.
+    pub fn remove_local_shard(&self, shard: ShardId) {
+        let mut set = (**self.local_shards.load()).clone();
+        set.remove(&shard);
+        self.local_shards.store(Arc::new(set));
+    }
+
+    /// Unsubscribe from a gossipsub topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
+    pub fn unsubscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
+        self.priority_channels
+            .send(SwarmCommand::Unsubscribe { topic })
+            .map_err(|_| NetworkError::NetworkShutdown)
     }
 
     /// Get the cached connected peer count (non-blocking).

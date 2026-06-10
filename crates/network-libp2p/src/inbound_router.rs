@@ -17,6 +17,7 @@ use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::ShardId;
 use libp2p::{PeerId, Stream};
+use libp2p_stream::Control;
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -88,14 +89,96 @@ impl PeerRateState {
 
 /// Handle for the inbound router tasks.
 ///
-/// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from being
-/// aborted when the `JoinHandle`s are dropped. One request handle per
-/// hosted shard plus the singleton notify handle.
+/// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from
+/// being aborted when the `JoinHandle`s are dropped. One request accept
+/// loop per hosted shard — keyed so a single shard's loop can be
+/// started or stopped when shard participation changes — plus the
+/// singleton notify handle.
 pub struct InboundRouterHandle {
-    #[allow(dead_code)]
-    request_handles: Vec<JoinHandle<()>>,
+    router: Arc<InboundRouter>,
+    control: Control,
+    request_handles: DashMap<ShardId, JoinHandle<()>>,
     #[allow(dead_code)]
     notify_handle: JoinHandle<()>,
+}
+
+impl InboundRouterHandle {
+    /// Start the request accept loop for `shard`, registering its wire
+    /// protocol on the stream control. Replaces (and aborts) any prior
+    /// loop for the same shard.
+    pub fn start_shard_loop(&self, shard: ShardId) {
+        let handle = spawn_request_loop(Arc::clone(&self.router), self.control.clone(), shard);
+        if let Some(prior) = self.request_handles.insert(shard, handle) {
+            prior.abort();
+        }
+    }
+
+    /// Stop the request accept loop for `shard`. Aborting the task
+    /// drops its `IncomingStreams`, which de-registers the shard's wire
+    /// protocol — peers opening it afterwards get protocol-not-supported
+    /// until a re-join starts the loop again.
+    pub fn stop_shard_loop(&self, shard: ShardId) {
+        if let Some((_, handle)) = self.request_handles.remove(&shard) {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawn one shard's request accept loop: register the shard's wire
+/// protocol (`/hyperscale/request/shard-N/1.0.0`) on the stream control
+/// and dispatch each admitted stream through the shared router. The
+/// task runs until aborted; aborting drops the `IncomingStreams`, which
+/// de-registers the protocol.
+fn spawn_request_loop(
+    router: Arc<InboundRouter>,
+    mut control: Control,
+    shard: ShardId,
+) -> JoinHandle<()> {
+    spawn(async move {
+        let protocol = request_protocol(shard);
+        let mut incoming = match control.accept(protocol.clone()) {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                error!(
+                    error = ?e,
+                    shard = shard.inner(),
+                    "Failed to register request protocol"
+                );
+                return;
+            }
+        };
+
+        info!(shard = shard.inner(), "InboundRouter: request loop started");
+
+        while let Some((peer_id, stream)) = incoming.next().await {
+            if let Some(permit) = router.try_admit(&peer_id) {
+                let router_clone = router.clone();
+                spawn(async move {
+                    let _permit = permit;
+                    let result = router_clone
+                        .handle_request_stream(peer_id, shard, stream)
+                        .await;
+                    router_clone.decrement_peer_count(&peer_id);
+                    match result {
+                        Ok(()) => router_clone.record_success(&peer_id),
+                        Err(ref e) => {
+                            if !e.is_client_abandonment() {
+                                router_clone.record_failure(&peer_id);
+                            }
+                            debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
+                        }
+                    }
+                });
+            } else {
+                drop(stream);
+            }
+        }
+
+        info!(
+            shard = shard.inner(),
+            "InboundRouter: request loop shutting down"
+        );
+    })
 }
 
 /// Routes inbound requests to per-type handlers via the handler registry.
@@ -135,61 +218,21 @@ impl InboundRouter {
         // the router's admission/dispatch logic; what the protocol
         // identifier carries is purely routing — the body is unchanged
         // and the per-type handler in the registry answers either way.
-        let request_handles: Vec<JoinHandle<()>> = adapter
+        let request_handles: DashMap<ShardId, JoinHandle<()>> = adapter
             .local_shards()
             .iter()
             .copied()
             .map(|shard| {
-                let router = router.clone();
-                let mut control = adapter.stream_control();
-                spawn(async move {
-                    let protocol = request_protocol(shard);
-                    let mut incoming = match control.accept(protocol.clone()) {
-                        Ok(incoming) => incoming,
-                        Err(e) => {
-                            error!(
-                                error = ?e,
-                                shard = shard.inner(),
-                                "Failed to register request protocol"
-                            );
-                            return;
-                        }
-                    };
-
-                    info!(shard = shard.inner(), "InboundRouter: request loop started");
-
-                    while let Some((peer_id, stream)) = incoming.next().await {
-                        if let Some(permit) = router.try_admit(&peer_id) {
-                            let router_clone = router.clone();
-                            spawn(async move {
-                                let _permit = permit;
-                                let result = router_clone
-                                    .handle_request_stream(peer_id, shard, stream)
-                                    .await;
-                                router_clone.decrement_peer_count(&peer_id);
-                                match result {
-                                    Ok(()) => router_clone.record_success(&peer_id),
-                                    Err(ref e) => {
-                                        if !e.is_client_abandonment() {
-                                            router_clone.record_failure(&peer_id);
-                                        }
-                                        debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
-                                    }
-                                }
-                            });
-                        } else {
-                            drop(stream);
-                        }
-                    }
-
-                    info!(shard = shard.inner(), "InboundRouter: request loop shutting down");
-                })
+                (
+                    shard,
+                    spawn_request_loop(Arc::clone(&router), adapter.stream_control(), shard),
+                )
             })
             .collect();
 
         // ── Notification accept loop (NOTIFY_PROTOCOL) ──
         let notify_handle = {
-            let router = router;
+            let router = Arc::clone(&router);
             let mut control = adapter.stream_control();
             spawn(async move {
                 let mut incoming = match control.accept(NOTIFY_PROTOCOL) {
@@ -231,6 +274,8 @@ impl InboundRouter {
         };
 
         InboundRouterHandle {
+            router,
+            control: adapter.stream_control(),
             request_handles,
             notify_handle,
         }
@@ -529,7 +574,29 @@ impl std::fmt::Display for StreamError {
 
 #[cfg(test)]
 mod tests {
+    use libp2p_stream::Behaviour as StreamBehaviour;
+
     use super::*;
+
+    /// Dropping a shard's `IncomingStreams` de-registers its wire
+    /// protocol, so a later re-join can `accept` it again. The
+    /// stop/start shard-loop cycle leans on exactly this.
+    #[test]
+    fn accept_after_drop_reregisters_protocol() {
+        let behaviour = StreamBehaviour::new();
+        let mut control = behaviour.new_control();
+        let protocol = request_protocol(ShardId::leaf(1, 0));
+
+        let first = control.accept(protocol.clone()).expect("first accept");
+        assert!(
+            control.accept(protocol.clone()).is_err(),
+            "double accept of a live protocol must be rejected"
+        );
+        drop(first);
+        let _ = control
+            .accept(protocol)
+            .expect("re-accept after drop re-registers the protocol");
+    }
 
     fn make_router(global_cap: usize) -> Arc<InboundRouter> {
         Arc::new(InboundRouter {

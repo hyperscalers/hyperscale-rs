@@ -37,6 +37,9 @@ pub(super) enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
     Subscribe { topic: String },
 
+    /// Unsubscribe from a gossipsub topic.
+    Unsubscribe { topic: String },
+
     /// Broadcast a message to a topic with the given class.
     ///
     /// Class determines processing order in the event loop. More-urgent
@@ -150,6 +153,7 @@ impl ClassCommandChannels {
             SwarmCommand::Broadcast { class, .. } => *class,
             // Control commands always get Consensus class.
             SwarmCommand::Subscribe { .. }
+            | SwarmCommand::Unsubscribe { .. }
             | SwarmCommand::Dial { .. }
             | SwarmCommand::GetListenAddresses { .. }
             | SwarmCommand::GetConnectedPeers { .. } => MessageClass::Consensus,

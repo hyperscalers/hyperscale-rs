@@ -4,8 +4,8 @@
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use hyperscale_metrics::record_request_retry;
@@ -65,9 +65,12 @@ pub struct Libp2pNetwork {
     tokio_handle: Handle,
     /// Shared handler registry for per-type gossip and request dispatch.
     registry: Arc<HandlerRegistry>,
-    /// Shards hosted by this host. Drives per-shard gossipsub
-    /// subscriptions on `register_gossip_handler`.
-    local_shards: HashSet<ShardId>,
+    /// Shard-scoped gossip type ids seen by `register_gossip_handler`,
+    /// recorded so `subscribe_shard` can replay every per-shard topic
+    /// for a shard that joins after registration. Registration happens
+    /// at init and reconfiguration is single-threaded, so a plain mutex
+    /// suffices.
+    shard_gossip_types: Mutex<Vec<&'static str>>,
     /// Topology snapshot used to resolve shard → committee for outbound
     /// requests. Updated lock-free via [`Self::update_topology`].
     topology: Arc<ArcSwap<TopologySnapshot>>,
@@ -77,9 +80,11 @@ pub struct Libp2pNetwork {
     peer_unreachable_count: Arc<AtomicUsize>,
     /// Persistent per-peer notification stream pool.
     notify_pool: NotifyStreamPool,
-    /// Inbound router handle — spawned eagerly at construction.
-    /// Kept alive to prevent the background task from being aborted.
-    _inbound_router: InboundRouterHandle,
+    /// Inbound router handle — spawned eagerly at construction. Kept
+    /// alive to prevent the background tasks from being aborted; also
+    /// the seam for starting/stopping a shard's request accept loop on
+    /// reconfiguration.
+    inbound_router: InboundRouterHandle,
 }
 
 impl Libp2pNetwork {
@@ -101,21 +106,16 @@ impl Libp2pNetwork {
 
         let notify_pool = NotifyStreamPool::new(adapter.clone(), tokio_handle.clone());
 
-        // Mirror the adapter's hosted-shard set so `register_gossip_handler`
-        // can subscribe to one topic per hosted shard without consulting
-        // the topology snapshot.
-        let local_shards = adapter.local_shards().clone();
-
         Self {
             adapter,
             request_manager,
             tokio_handle,
             registry,
-            local_shards,
+            shard_gossip_types: Mutex::new(Vec::new()),
             topology,
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
-            _inbound_router: inbound_router,
+            inbound_router,
         }
     }
 
@@ -200,13 +200,21 @@ impl Network for Libp2pNetwork {
 
         // Auto-subscribe to the corresponding gossipsub topic(s). Shard-
         // scoped handlers register one topic per hosted shard so a
-        // multi-shard host receives gossip for every shard it serves.
+        // multi-shard host receives gossip for every shard it serves;
+        // the type id is recorded so a shard joining later replays the
+        // same subscriptions via `subscribe_shard`.
         let topics: Vec<Topic> = match M::SCOPE {
-            TopicScope::Shard => self
-                .local_shards
-                .iter()
-                .map(|shard| Topic::shard(M::message_type_id(), *shard))
-                .collect(),
+            TopicScope::Shard => {
+                self.shard_gossip_types
+                    .lock()
+                    .expect("shard_gossip_types lock")
+                    .push(M::message_type_id());
+                self.adapter
+                    .local_shards()
+                    .iter()
+                    .map(|shard| Topic::shard(M::message_type_id(), *shard))
+                    .collect()
+            }
             TopicScope::Global => vec![Topic::global(M::message_type_id())],
         };
         for topic in topics {
@@ -224,9 +232,40 @@ impl Network for Libp2pNetwork {
 
     fn subscribe_shard(&self, shard: ShardId) {
         self.registry.add_hosted_shard(shard);
+        self.adapter.add_local_shard(shard);
+        // Replay every registered shard-scoped gossip type onto the new
+        // shard's topics, then bring up its request accept loop.
+        let types: Vec<&'static str> = self
+            .shard_gossip_types
+            .lock()
+            .expect("shard_gossip_types lock")
+            .clone();
+        for type_id in types {
+            let topic = Topic::shard(type_id, shard);
+            if let Err(e) = self.adapter.subscribe_topic(topic.to_string()) {
+                warn!(topic = %topic, error = ?e, "Failed to subscribe to topic");
+            } else {
+                info!(topic = %topic, "Subscribed to topic");
+            }
+        }
+        let _guard = self.tokio_handle.enter();
+        self.inbound_router.start_shard_loop(shard);
     }
 
     fn unsubscribe_shard(&self, shard: ShardId) {
+        self.inbound_router.stop_shard_loop(shard);
+        let types: Vec<&'static str> = self
+            .shard_gossip_types
+            .lock()
+            .expect("shard_gossip_types lock")
+            .clone();
+        for type_id in types {
+            let topic = Topic::shard(type_id, shard);
+            if let Err(e) = self.adapter.unsubscribe_topic(topic.to_string()) {
+                warn!(topic = %topic, error = ?e, "Failed to unsubscribe from topic");
+            }
+        }
+        self.adapter.remove_local_shard(shard);
         self.registry.remove_hosted_shard(shard);
         self.registry.unregister_requests_for_shard(shard);
     }
@@ -304,7 +343,8 @@ impl Network for Libp2pNetwork {
         // because handlers may take locks or block on condvars (the
         // provision-dedup handler is the canonical example).
         let registry = self
-            .local_shards
+            .adapter
+            .local_shards()
             .contains(&shard)
             .then(|| Arc::clone(&self.registry));
         let topology = Arc::clone(&self.topology);
