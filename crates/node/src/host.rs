@@ -197,6 +197,7 @@ where
                     now: LocalTimestamp::ZERO,
                     pending_timer_ops: Vec::new(),
                     emitted_statuses: Vec::new(),
+                    pending_reconfigurations: Vec::new(),
                     actions_generated: 0,
                     outbound_gossip_batches: std::collections::BTreeMap::new(),
                     tx_gossip_max,
@@ -413,6 +414,7 @@ where
         for sl in self.shards.values_mut() {
             sl.pending_timer_ops.clear();
             sl.emitted_statuses.clear();
+            sl.pending_reconfigurations.clear();
             sl.actions_generated = 0;
         }
 
@@ -450,11 +452,14 @@ where
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             timer_ops: Vec::new(),
+            reconfigurations: Vec::new(),
         };
         for sl in self.shards.values_mut() {
             out.emitted_statuses.append(&mut sl.emitted_statuses);
             out.actions_generated += std::mem::replace(&mut sl.actions_generated, 0);
             out.timer_ops.append(&mut sl.pending_timer_ops);
+            out.reconfigurations
+                .append(&mut sl.pending_reconfigurations);
         }
         out
     }
@@ -547,6 +552,7 @@ where
         now: LocalTimestamp::ZERO,
         pending_timer_ops: Vec::new(),
         emitted_statuses: Vec::new(),
+        pending_reconfigurations: Vec::new(),
         actions_generated: 0,
         outbound_gossip_batches: std::collections::BTreeMap::new(),
         tx_gossip_max: b.tx_gossip_max,

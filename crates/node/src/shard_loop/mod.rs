@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
@@ -203,6 +203,11 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
+    /// Placement deltas emitted via [`Action::ReconfigureParticipation`]
+    /// during this step. The runner reconfigures physical shard
+    /// membership from these — they are requests to the process layer,
+    /// not state-machine state.
+    pub reconfigurations: Vec<ParticipationChange>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -255,6 +260,9 @@ where
     /// Per-step scratch: `(tx_hash, status)` pairs emitted via
     /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`].
     pub emitted_statuses: Vec<(TxHash, TransactionStatus)>,
+    /// Per-step scratch: placement deltas emitted via
+    /// `Action::ReconfigureParticipation`. Drained into [`StepOutput`].
+    pub pending_reconfigurations: Vec<ParticipationChange>,
     /// Per-step scratch: count of actions this shard's vnodes produced
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
@@ -500,12 +508,14 @@ where
     pub fn run_step(&mut self, input: ShardScopedInput) -> StepOutput {
         self.pending_timer_ops.clear();
         self.emitted_statuses.clear();
+        self.pending_reconfigurations.clear();
         self.actions_generated = 0;
         self.step(input);
         StepOutput {
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
+            reconfigurations: std::mem::take(&mut self.pending_reconfigurations),
         }
     }
 

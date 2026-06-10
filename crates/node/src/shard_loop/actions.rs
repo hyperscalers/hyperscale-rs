@@ -209,6 +209,9 @@ where
             Action::TopologyChanged { topology_snapshot } => {
                 self.handle_topology_changed(&topology_snapshot);
             }
+            Action::ReconfigureParticipation(change) => {
+                self.pending_reconfigurations.push(change);
+            }
         }
     }
 

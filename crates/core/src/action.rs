@@ -40,6 +40,32 @@ pub struct CrossShardExecutionRequest {
     pub ownership: HashMap<NodeId, NodeId>,
 }
 
+/// A beacon-driven change to one vnode's physical shard participation,
+/// detected on the lookahead committees one epoch before it takes
+/// effect.
+///
+/// Carried by [`Action::ReconfigureParticipation`] out of the state
+/// machine to whoever owns physical shard membership — the production
+/// shard supervisor, or the simulation harness via `StepOutput`. The
+/// consumer starts bootstrapping `joins` immediately (snap-sync + tail
+/// sync need the lookahead epoch) and schedules `leaves` for the
+/// window close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipationChange {
+    /// The vnode whose placement changed.
+    pub validator: ValidatorId,
+    /// Shard the validator is placed on at `effective_epoch` but not in
+    /// the active window. A validator sits on at most one shard
+    /// (`ValidatorStatus::OnShard` is singular), so a placement change
+    /// is at most one join plus one leave; at least one side is `Some`.
+    pub join: Option<ShardId>,
+    /// Shard the validator is on in the active window but not at
+    /// `effective_epoch`.
+    pub leave: Option<ShardId>,
+    /// Epoch whose window activates the new placement.
+    pub effective_epoch: Epoch,
+}
+
 /// A single cross-shard transaction's provisioning needs.
 ///
 /// Collected per-block and emitted via [`Action::FetchAndBroadcastProvisions`].
@@ -787,6 +813,15 @@ pub enum Action {
         /// New topology snapshot to propagate.
         topology_snapshot: Arc<TopologySnapshot>,
     },
+
+    /// The lookahead committees move this vnode's validator onto or off
+    /// a shard at the next window — surface the delta to the runner so
+    /// it can reconfigure physical participation (open storage and
+    /// bootstrap a joined shard, schedule a left shard's drain).
+    ///
+    /// Not delegated: the payload travels out of the shard thread to
+    /// the process-level owner of shard membership.
+    ReconfigureParticipation(ParticipationChange),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback ProtocolEvent)

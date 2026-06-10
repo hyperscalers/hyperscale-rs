@@ -17,11 +17,11 @@
 //! matches `expected_config_hash` — a tripwire against booting a
 //! validator off a chain initialised by a different operator TOML.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest, TimerId};
+use hyperscale_core::{Action, FetchAbandon, FetchRequest, ParticipationChange, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
     BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
@@ -29,11 +29,11 @@ use hyperscale_types::{
     LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH,
     NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
-    RETENTION_HORIZON, SKIP_TIMEOUT, ShardId, ShardWitness, SkipEpochCert, SkipRequest,
-    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    RETENTION_HORIZON, SKIP_TIMEOUT, ShardCommittee, ShardId, ShardWitness, SkipEpochCert,
+    SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -1450,6 +1450,19 @@ impl BeaconCoordinator {
             },
         ];
 
+        // A lookahead placement delta for the local validator means the
+        // host must reconfigure physical participation before the next
+        // window opens: bootstrap of a joined shard needs the lookahead
+        // epoch (snap-sync + tail sync), and a left shard's drain is
+        // scheduled from the window close. The delta exists at exactly
+        // one commit — the next `apply_epoch` promotes the lookahead
+        // into the active window and the two views agree again. Emitted
+        // after `TopologyChanged` so the consumer reads a snapshot (and
+        // snap-sync anchor) that already reflects this commit.
+        if let Some(change) = self.participation_delta() {
+            actions.push(Action::ReconfigureParticipation(change));
+        }
+
         let abandoned_proposals = self.commit_assembly.prune_stale(self.state.current_epoch);
         if !abandoned_proposals.is_empty() {
             actions.push(Action::AbandonFetch(FetchAbandon::BeaconProposal {
@@ -1486,6 +1499,37 @@ impl BeaconCoordinator {
         }
 
         actions
+    }
+
+    /// The local validator's placement delta between the active window
+    /// (`shard_committees`) and the lookahead (`next_shard_committees`),
+    /// or `None` when the two agree. The lookahead is final for its
+    /// window — membership changes fold one epoch ahead — so a delta
+    /// here is the earliest, and only, detection point. A validator
+    /// sits on at most one shard per window (`ValidatorStatus::OnShard`
+    /// is singular and `members ⇔ status` is a fold invariant), so each
+    /// view yields at most one placement.
+    fn participation_delta(&self) -> Option<ParticipationChange> {
+        fn placement(
+            committees: &BTreeMap<ShardId, ShardCommittee>,
+            me: ValidatorId,
+        ) -> Option<ShardId> {
+            committees
+                .iter()
+                .find(|(_, committee)| committee.members.contains(&me))
+                .map(|(shard, _)| *shard)
+        }
+        let current = placement(&self.state.shard_committees, self.me);
+        let next = placement(&self.state.next_shard_committees, self.me);
+        if current == next {
+            return None;
+        }
+        Some(ParticipationChange {
+            validator: self.me,
+            join: next,
+            leave: current,
+            effective_epoch: self.state.current_epoch.next(),
+        })
     }
 
     /// SPC has decided this epoch. When every committed-vector
@@ -4024,5 +4068,69 @@ mod tests {
         // pre-commit one (both Arcs wrap freshly-derived snapshots).
         let post_snap = Arc::clone(coord.current_topology_snapshot());
         assert!(!Arc::ptr_eq(&pre_snap, &post_snap));
+    }
+
+    // ─── participation delta detection ───────────────────────────────────
+
+    /// Genesis seeds identical active and lookahead committees, so a
+    /// fresh coordinator detects no placement delta.
+    #[test]
+    fn participation_delta_none_when_views_agree() {
+        let coord = fresh_coord();
+        assert_eq!(coord.participation_delta(), None);
+    }
+
+    /// A lookahead that moves the local validator from shard 0 to
+    /// shard 1 yields exactly that join/leave pair, effective at the
+    /// next epoch's window.
+    #[test]
+    fn participation_delta_detects_relocation() {
+        let mut coord = fresh_coord();
+        let from = ShardId::leaf(1, 0);
+        let to = ShardId::leaf(1, 1);
+        let me = coord.me;
+
+        let mut moved = coord.state.next_shard_committees[&from].clone();
+        moved.members.retain(|&v| v != me);
+        coord.state.next_shard_committees.insert(from, moved);
+        coord
+            .state
+            .next_shard_committees
+            .insert(to, ShardCommittee { members: vec![me] });
+
+        let change = coord
+            .participation_delta()
+            .expect("relocation produces a delta");
+        assert_eq!(change.validator, me);
+        assert_eq!(change.join, Some(to));
+        assert_eq!(change.leave, Some(from));
+        assert_eq!(change.effective_epoch, coord.state.current_epoch.next());
+
+        // Promotion makes the views agree again — the delta is gone, so
+        // the action fires at exactly one commit.
+        coord.state.shard_committees = coord.state.next_shard_committees.clone();
+        assert_eq!(coord.participation_delta(), None);
+    }
+
+    /// Another validator's move is invisible to this coordinator — the
+    /// delta is strictly about the local validator's placement.
+    #[test]
+    fn participation_delta_ignores_other_validators() {
+        let mut coord = fresh_coord();
+        let from = ShardId::leaf(1, 0);
+        let to = ShardId::leaf(1, 1);
+        let other = ValidatorId::new(3);
+
+        let mut moved = coord.state.next_shard_committees[&from].clone();
+        moved.members.retain(|&v| v != other);
+        coord.state.next_shard_committees.insert(from, moved);
+        coord.state.next_shard_committees.insert(
+            to,
+            ShardCommittee {
+                members: vec![other],
+            },
+        );
+
+        assert_eq!(coord.participation_delta(), None);
     }
 }
