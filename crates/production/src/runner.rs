@@ -66,7 +66,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
 use crate::drain::{DRAIN_GRACE, DRAIN_POLL_INTERVAL, drain_after_window_close};
-use crate::rpc::state::VnodeMempoolSnapshot;
+use crate::rpc::state::{RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
@@ -185,9 +185,7 @@ pub struct ProductionRunnerBuilder {
     channel_capacity: usize,
     /// Opens a runtime-joined shard's `RocksDB` storage.
     storage_factory: StorageFactory,
-    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
-    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    publishers: RpcPublishers,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
     /// Radix network definition for transaction validation.
@@ -230,9 +228,7 @@ impl ProductionRunnerBuilder {
             network_config,
             dispatch: None,
             channel_capacity: 10_000,
-            rpc_status: None,
-            mempool_snapshot: None,
-            sync_status: None,
+            publishers: RpcPublishers::default(),
             genesis_config: None,
             network_definition: None,
             mempool_config: MempoolConfig::default(),
@@ -279,21 +275,21 @@ impl ProductionRunnerBuilder {
     /// Wire in the shared `NodeStatusState` so the runner publishes RPC status snapshots.
     #[must_use]
     pub fn rpc_status(mut self, status: Arc<ArcSwap<NodeStatusState>>) -> Self {
-        self.rpc_status = Some(status);
+        self.publishers.node_status = Some(status);
         self
     }
 
     /// Wire in the shared mempool snapshot so the runner publishes mempool stats.
     #[must_use]
     pub fn mempool_snapshot(mut self, snapshot: Arc<ArcSwap<MempoolSnapshot>>) -> Self {
-        self.mempool_snapshot = Some(snapshot);
+        self.publishers.mempool = Some(snapshot);
         self
     }
 
     /// Wire in the shared sync status so the runner publishes sync progress.
     #[must_use]
     pub fn sync_status(mut self, status: Arc<ArcSwap<SyncStatus>>) -> Self {
-        self.sync_status = Some(status);
+        self.publishers.sync_status = Some(status);
         self
     }
 
@@ -578,9 +574,7 @@ impl ProductionRunnerBuilder {
             beacon_network,
             beacon_config_hash,
             TokioHandle::current(),
-            self.rpc_status.clone(),
-            self.sync_status.clone(),
-            self.mempool_snapshot.clone(),
+            self.publishers.clone(),
             Arc::clone(&storages),
             self.storage_factory,
             participation_tx,
@@ -599,8 +593,7 @@ impl ProductionRunnerBuilder {
             topology_snapshot: topology,
             storages,
             dispatch,
-            rpc_status: self.rpc_status,
-            sync_status: self.sync_status,
+            publishers: self.publishers,
             genesis_config: self.genesis_config,
             local_shards,
             tx_status,
@@ -667,10 +660,9 @@ pub struct ProductionRunner {
     /// Every shard this runner hosts vnodes for at startup.
     local_shards: HashSet<ShardId>,
 
-    /// Shared RPC `NodeStatusState` updated by the metrics tick.
-    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    /// Shared sync status updated by the metrics tick.
-    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    /// Shared RPC publishers; the metrics tick stamps peer counts into
+    /// the status slots.
+    publishers: RpcPublishers,
 
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
@@ -959,9 +951,9 @@ impl ProductionRunner {
             .participation_rx
             .take()
             .expect("participation_rx already taken");
-        let mut bootstrap_done_rx = supervisor
-            .take_bootstrap_done_rx()
-            .expect("bootstrap_done_rx already taken");
+        let mut supervisor_events_rx = supervisor
+            .take_events_rx()
+            .expect("supervisor events_rx already taken");
 
         loop {
             tokio::select! {
@@ -980,9 +972,9 @@ impl ProductionRunner {
                         self.apply_participation_change(&mut supervisor, &change);
                     }
                 }
-                done = bootstrap_done_rx.recv() => {
-                    if let Some(done) = done {
-                        supervisor.finish_join(done);
+                event = supervisor_events_rx.recv() => {
+                    if let Some(event) = event {
+                        supervisor.on_event(event);
                     }
                 }
                 _ = metrics_tick.tick() => {
@@ -1102,7 +1094,7 @@ impl ProductionRunner {
         set_libp2p_peers(peer_count);
 
         // ── Update RPC status with peer count ────────────────────────────
-        if let Some(ref rpc_status) = self.rpc_status {
+        if let Some(ref rpc_status) = self.publishers.node_status {
             let current = rpc_status.load();
             if current.connected_peers != peer_count {
                 let mut updated = (**current).clone();
@@ -1112,7 +1104,7 @@ impl ProductionRunner {
         }
 
         // ── Update sync_peers on the sync status (only runner has Libp2pNetwork) ──
-        if let Some(ref sync_status) = self.sync_status {
+        if let Some(ref sync_status) = self.publishers.sync_status {
             let current = sync_status.load();
             if current.sync_peers != peer_count {
                 let mut updated = (**current).clone();
@@ -1348,18 +1340,12 @@ pub struct ShardLoopConfig {
     /// the runner's reconfiguration loop. `None` in tests that drive a
     /// loop without a runner.
     pub(crate) participation_tx: Option<mpsc::UnboundedSender<ParticipationChange>>,
-    /// Shared RPC `vnodes` list. Each shard's thread writes its own
-    /// vnodes' entries via `retain != self.shard_coordinator` + push on the metrics
-    /// tick; concurrent shards racing on the same `ArcSwap` lose at most
-    /// one second of staleness on their slot.
-    pub(crate) rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    /// Shared sync status. Each shard's thread inserts its slot
-    /// (keyed by shard id) on the metrics tick.
-    pub(crate) sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-    /// Shared mempool snapshot. Each shard's thread inserts its slot
-    /// from the first hosted vnode (same-shard vnodes share the
-    /// mempool, so any one gives the canonical view).
-    pub(crate) mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    /// Shared RPC publishers. Each shard's thread writes its own slots
+    /// on the metrics tick (per-vnode status entries, its sync-status
+    /// key, and its vnodes' mempool snapshots); concurrent shards
+    /// racing on the same `ArcSwap` lose at most one second of
+    /// staleness on their slot.
+    pub(crate) publishers: RpcPublishers,
 }
 
 /// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
@@ -1462,7 +1448,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     let shard_key = shard_loop.shard.inner();
 
     // ── /status: per-vnode entries ─────────────────────────────────
-    if let Some(ref rpc_status) = config.rpc_status {
+    if let Some(ref rpc_status) = config.publishers.node_status {
         let current = rpc_status.load();
         let mut updated = (**current).clone();
         updated.vnodes.retain(|v| v.shard != shard_key);
@@ -1493,7 +1479,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     }
 
     // ── /sync: per-shard block-sync state ──────────────────────────
-    if let Some(ref sync_status) = config.sync_status {
+    if let Some(ref sync_status) = config.publishers.sync_status {
         let block_sync = shard_loop.io.syncs.block.block_sync_status();
         let current = sync_status.load();
         let mut updated = (**current).clone();
@@ -1516,7 +1502,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     // converge by determinism but their instantaneous counts can
     // differ, so the backpressure check iterates every entry rather
     // than picking a per-shard representative.
-    if let Some(ref mempool_snapshot) = config.mempool_snapshot {
+    if let Some(ref mempool_snapshot) = config.publishers.mempool {
         #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
         let remote_congestion_threshold = InFlightCount::new((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
         let current = mempool_snapshot.load();

@@ -12,6 +12,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::status::SyncStatus;
 
+/// Shared RPC state publishers — whole-value `ArcSwap`s the runner and
+/// shard threads store into and the HTTP handlers load lock-free. A
+/// `None` slot means no RPC server is attached (tests, tooling).
+#[derive(Clone, Default)]
+pub struct RpcPublishers {
+    /// `/status` per-vnode readouts.
+    pub node_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    /// `/sync` per-shard block-sync state.
+    pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    /// Per-vnode mempool snapshots feeding RPC submission backpressure.
+    pub mempool: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+}
+
 /// Submit a locally-issued transaction to the runner.
 ///
 /// Returns `true` if the runner accepted the tx; `false` only when the

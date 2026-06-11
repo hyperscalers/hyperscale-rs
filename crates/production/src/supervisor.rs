@@ -15,10 +15,9 @@
 //! vnodes on one shard share storage and a thread, and a departing one
 //! must not tear the other down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
 use crossbeam::channel::{Sender, unbounded};
 use hyperscale_core::ParticipationChange;
 use hyperscale_dispatch_pooled::PooledDispatch;
@@ -37,11 +36,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::bootstrap::bootstrap_shard_state;
-use crate::rpc::{MempoolSnapshot, NodeStatusState};
+use crate::rpc::RpcPublishers;
 use crate::runner::{
     ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop, wall_clock_local,
 };
-use crate::status::SyncStatus;
 
 /// The process-scoped resource bundle as the production runner types it.
 type ProdProcessIo = ProcessIo<SharedStorage, Libp2pNetwork, PooledDispatch>;
@@ -85,6 +83,32 @@ pub struct CompletedBootstrap {
     recovered: RecoveredState,
 }
 
+/// A background-work completion fed back into the supervisor by the
+/// runner's select loop. All blocking membership work (storage opens,
+/// thread joins) and async snap-sync bootstraps land here, so every
+/// membership state transition runs on the runner's loop.
+pub enum SupervisorEvent {
+    /// A join's blocking storage open finished.
+    Opened {
+        /// Shard the join targets.
+        shard: ShardId,
+        /// The join's vnodes, threaded through the open.
+        vnodes: Vec<VnodeConfig>,
+        /// The opened storage and its recovered state, or the open
+        /// failure.
+        outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
+    },
+    /// A snap-sync bootstrap settled (`Err` carries the failed shard).
+    Bootstrapped(Result<CompletedBootstrap, ShardId>),
+    /// A departing shard's thread joined; the unwire can finish.
+    TornDown {
+        /// Shard whose thread exited.
+        shard: ShardId,
+        /// The departed vnodes' validator ids, for the RPC scrub.
+        validator_ids: Vec<u64>,
+    },
+}
+
 /// One hosted shard's runtime: its pinned thread plus the handles the
 /// supervisor needs to stop it.
 struct ShardThread {
@@ -109,9 +133,7 @@ pub struct ShardSupervisor {
     beacon_network: NetworkDefinition,
     beacon_config_hash: GenesisConfigHash,
     tokio_handle: TokioHandle,
-    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    publishers: RpcPublishers,
     /// Per-shard `RocksDB` handles, shared with the runner's GC tick.
     storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
     storage_factory: StorageFactory,
@@ -119,17 +141,24 @@ pub struct ShardSupervisor {
     /// deltas reach the runner's reconfiguration loop.
     participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     shards: HashMap<ShardId, ShardThread>,
-    /// Shards whose join is parked on an in-flight snap-sync bootstrap,
-    /// mapped to the count of vnodes still pending. Guards against a
-    /// second `Join` racing a double import; a `Leave` during bootstrap
-    /// decrements, abandoning the join at zero.
+    /// Shards whose join is parked on background work — the off-loop
+    /// storage open or an in-flight snap-sync bootstrap — mapped to the
+    /// count of vnodes still pending. Guards against a second `Join`
+    /// racing a double import; a `Leave` meanwhile decrements,
+    /// abandoning the join at zero.
     bootstrapping: HashMap<ShardId, usize>,
-    /// Bootstrap outcomes land here (`Err` carries the failed shard);
-    /// the runner's select loop drains the paired receiver and calls
-    /// [`Self::finish_join`].
-    bootstrap_done_tx: mpsc::UnboundedSender<Result<CompletedBootstrap, ShardId>>,
+    /// Shards whose teardown is parked on the off-loop thread join.
+    /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
+    draining: HashSet<ShardId>,
+    /// Joins that arrived while their shard was draining, replayed by
+    /// the [`SupervisorEvent::TornDown`] handler. Dropping them instead
+    /// would lose the placement delta until restart.
+    pending_joins: HashMap<ShardId, Vec<VnodeConfig>>,
+    /// Background-work completions land here; the runner's select loop
+    /// drains the paired receiver into [`Self::on_event`].
+    events_tx: mpsc::UnboundedSender<SupervisorEvent>,
     /// Receiver side, taken by the runner's `run()` loop.
-    bootstrap_done_rx: Option<mpsc::UnboundedReceiver<Result<CompletedBootstrap, ShardId>>>,
+    events_rx: Option<mpsc::UnboundedReceiver<SupervisorEvent>>,
 }
 
 impl ShardSupervisor {
@@ -142,14 +171,12 @@ impl ShardSupervisor {
         beacon_network: NetworkDefinition,
         beacon_config_hash: GenesisConfigHash,
         tokio_handle: TokioHandle,
-        rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-        sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-        mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+        publishers: RpcPublishers,
         storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
         storage_factory: StorageFactory,
         participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     ) -> Self {
-        let (bootstrap_done_tx, bootstrap_done_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             process,
             node_config: NodeConfig::default(),
@@ -159,26 +186,41 @@ impl ShardSupervisor {
             beacon_network,
             beacon_config_hash,
             tokio_handle,
-            rpc_status,
-            sync_status,
-            mempool_snapshot,
+            publishers,
             storages,
             storage_factory,
             participation_tx,
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
-            bootstrap_done_tx,
-            bootstrap_done_rx: Some(bootstrap_done_rx),
+            draining: HashSet::new(),
+            pending_joins: HashMap::new(),
+            events_tx,
+            events_rx: Some(events_rx),
         }
     }
 
-    /// Take the bootstrap-completion receiver. The runner's `run()`
-    /// loop drains it and hands each completion to
-    /// [`Self::finish_join`].
-    pub(crate) const fn take_bootstrap_done_rx(
+    /// Take the background-event receiver. The runner's `run()` loop
+    /// drains it into [`Self::on_event`].
+    pub(crate) const fn take_events_rx(
         &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<Result<CompletedBootstrap, ShardId>>> {
-        self.bootstrap_done_rx.take()
+    ) -> Option<mpsc::UnboundedReceiver<SupervisorEvent>> {
+        self.events_rx.take()
+    }
+
+    /// Settle one background-work completion.
+    pub(crate) fn on_event(&mut self, event: SupervisorEvent) {
+        match event {
+            SupervisorEvent::Opened {
+                shard,
+                vnodes,
+                outcome,
+            } => self.on_opened(shard, vnodes, outcome),
+            SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
+            SupervisorEvent::TornDown {
+                shard,
+                validator_ids,
+            } => self.on_torn_down(shard, &validator_ids),
+        }
     }
 
     /// Spawn a startup shard's pinned thread and record it. Used by the
@@ -220,19 +262,11 @@ impl ShardSupervisor {
         }
     }
 
-    /// Bring up `shard`: open storage, bootstrap its state when the
-    /// store is fresh and the beacon attests an anchor, build vnode
-    /// state machines from the host's beacon chain, wire the process
-    /// maps, spawn the thread.
-    ///
-    /// Three paths by what the store and the beacon offer:
-    /// - **retained storage** (committed height > 0) — seat directly;
-    ///   normal block sync covers the tail;
-    /// - **fresh store, attested anchor** — snap-sync bootstrap off
-    ///   this loop (a tokio task), seated via [`Self::finish_join`]
-    ///   when the import verifies against the anchor;
-    /// - **fresh store, no anchor** — seat directly and replay from
-    ///   genesis through block sync.
+    /// Bring up `shard`: open its storage off this loop, then continue
+    /// in [`Self::on_opened`] — seat directly for a retained store or a
+    /// genesis replay, or snap-sync against the beacon-attested anchor
+    /// first. A join for a shard still tearing down queues and replays
+    /// once the teardown finishes.
     fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
         if self.shards.contains_key(&shard) || self.bootstrapping.contains_key(&shard) {
             warn!(shard = ?shard, "Join rejected: shard already hosted or bootstrapping");
@@ -242,45 +276,101 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Join rejected: vnodes must be non-empty and target the shard");
             return;
         }
-        let storage = match (self.storage_factory)(shard) {
-            Ok(storage) => storage,
+        if self.draining.contains(&shard) {
+            info!(shard = ?shard, "Join queued behind the shard's in-flight teardown");
+            if self.pending_joins.insert(shard, vnodes.to_vec()).is_some() {
+                warn!(shard = ?shard, "Replaced an earlier queued join for the shard");
+            }
+            return;
+        }
+
+        // The RocksDB open (and a previously-used store's recovery
+        // read) can stall on disk; run it off the loop and continue in
+        // `on_opened`. The `bootstrapping` entry blocks double joins
+        // and lets a `Leave` during the open release memberships.
+        self.bootstrapping.insert(shard, vnodes.len());
+        let factory = Arc::clone(&self.storage_factory);
+        let events = self.events_tx.clone();
+        let vnodes = vnodes.to_vec();
+        self.tokio_handle.spawn_blocking(move || {
+            let outcome = factory(shard).map(|storage| {
+                let recovered = storage.load_recovered_state();
+                (storage, recovered)
+            });
+            // Send failure means the runner is shutting down; the join
+            // dies with it.
+            let _ = events.send(SupervisorEvent::Opened {
+                shard,
+                vnodes,
+                outcome,
+            });
+        });
+    }
+
+    /// Continue a join whose storage open finished.
+    ///
+    /// Three paths by what the store and the beacon offer:
+    /// - **retained storage** (committed height > 0) — seat directly;
+    ///   normal block sync covers the tail;
+    /// - **fresh store, attested anchor** — snap-sync bootstrap off
+    ///   this loop (a tokio task), seated via [`Self::finish_join`]
+    ///   when the import verifies against the anchor;
+    /// - **fresh store, no anchor** — seat directly and replay from
+    ///   genesis through block sync.
+    fn on_opened(
+        &mut self,
+        shard: ShardId,
+        mut vnodes: Vec<VnodeConfig>,
+        outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
+    ) {
+        let Some(pending) = self.bootstrapping.get(&shard).copied() else {
+            info!(shard = ?shard, "Storage opened for an abandoned join; dropped");
+            return;
+        };
+        let (storage, recovered) = match outcome {
+            Ok(opened) => opened,
             Err(error) => {
+                self.bootstrapping.remove(&shard);
                 warn!(shard = ?shard, error, "Join rejected: storage open failed");
                 return;
             }
         };
+        // Leaves during the open released memberships from the tail.
+        vnodes.truncate(pending);
 
-        let recovered = storage.load_recovered_state();
         let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
         let anchor = self.process.topology().load().boundary(shard);
         if fresh_store && anchor.is_some() {
-            self.bootstrapping.insert(shard, vnodes.len());
             let process = Arc::clone(&self.process);
-            let done_tx = self.bootstrap_done_tx.clone();
-            let vnodes = vnodes.to_vec();
+            let events = self.events_tx.clone();
             self.tokio_handle.spawn(async move {
-                match bootstrap_shard_state(process.network(), process.topology(), &storage, shard)
-                    .await
+                let done = match bootstrap_shard_state(
+                    process.network(),
+                    process.topology(),
+                    &storage,
+                    shard,
+                )
+                .await
                 {
-                    Ok(recovered) => {
-                        // Send failure means the runner is shutting
-                        // down; the join dies with it.
-                        let _ = done_tx.send(Ok(CompletedBootstrap {
-                            shard,
-                            vnodes,
-                            storage,
-                            recovered,
-                        }));
-                    }
+                    Ok(recovered) => Ok(CompletedBootstrap {
+                        shard,
+                        vnodes,
+                        storage,
+                        recovered,
+                    }),
                     Err(error) => {
                         warn!(shard = ?shard, error, "Shard bootstrap failed; join abandoned");
-                        let _ = done_tx.send(Err(shard));
+                        Err(shard)
                     }
-                }
+                };
+                // Send failure means the runner is shutting down; the
+                // join dies with it.
+                let _ = events.send(SupervisorEvent::Bootstrapped(done));
             });
             return;
         }
-        self.seat_shard(shard, vnodes, storage, &recovered);
+        self.bootstrapping.remove(&shard);
+        self.seat_shard(shard, &vnodes, storage, &recovered);
     }
 
     /// Settle a finished bootstrap: seat the shard on success, clear
@@ -288,7 +378,7 @@ impl ShardSupervisor {
     /// can retry the join), drop the outcome when every pending vnode
     /// left during the bootstrap. Runs on the runner's loop via the
     /// completion channel — never on the bootstrap task.
-    pub(crate) fn finish_join(&mut self, done: Result<CompletedBootstrap, ShardId>) {
+    fn finish_join(&mut self, done: Result<CompletedBootstrap, ShardId>) {
         let shard = match &done {
             Ok(done) => done.shard,
             Err(shard) => *shard,
@@ -402,13 +492,35 @@ impl ShardSupervisor {
             .remove(&shard)
             .expect("entry fetched above still present");
         let _ = entry.shutdown_tx.send(());
-        if entry.join.join().is_err() {
-            warn!(shard = ?shard, "Shard thread panicked before teardown");
-        }
+        // The thread join waits out an in-flight shard step; run it off
+        // the loop and finish the unwire in `on_torn_down`.
+        self.draining.insert(shard);
+        let events = self.events_tx.clone();
+        self.tokio_handle.spawn_blocking(move || {
+            if entry.join.join().is_err() {
+                warn!(shard = ?shard, "Shard thread panicked before teardown");
+            }
+            // Send failure means the runner is shutting down; the
+            // teardown finishes with it.
+            let _ = events.send(SupervisorEvent::TornDown {
+                shard,
+                validator_ids: entry.validator_ids,
+            });
+        });
+    }
+
+    /// Finish a teardown whose thread joined: unwire the process maps,
+    /// drop the storage handle, scrub the RPC slots, and replay any
+    /// join that queued behind the drain.
+    fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
         detach_shard(&self.process, shard);
         self.storages.lock().expect("storages lock").remove(&shard);
-        self.scrub_rpc_state(shard, &entry.validator_ids);
+        self.scrub_rpc_state(shard, validator_ids);
+        self.draining.remove(&shard);
         info!(shard = ?shard, "Shard left and torn down");
+        if let Some(vnodes) = self.pending_joins.remove(&shard) {
+            self.join(shard, &vnodes);
+        }
     }
 
     /// Remove a departed shard's slots from the shared RPC state maps.
@@ -419,17 +531,17 @@ impl ShardSupervisor {
     /// overlap) republishes its mempool slot on that shard's next tick.
     fn scrub_rpc_state(&self, shard: ShardId, validator_ids: &[u64]) {
         let shard_key = shard.inner();
-        if let Some(ref rpc_status) = self.rpc_status {
+        if let Some(ref rpc_status) = self.publishers.node_status {
             let mut updated = (**rpc_status.load()).clone();
             updated.vnodes.retain(|v| v.shard != shard_key);
             rpc_status.store(Arc::new(updated));
         }
-        if let Some(ref sync_status) = self.sync_status {
+        if let Some(ref sync_status) = self.publishers.sync_status {
             let mut updated = (**sync_status.load()).clone();
             updated.shards.remove(&shard_key);
             sync_status.store(Arc::new(updated));
         }
-        if let Some(ref mempool_snapshot) = self.mempool_snapshot {
+        if let Some(ref mempool_snapshot) = self.publishers.mempool {
             let mut updated = (**mempool_snapshot.load()).clone();
             for id in validator_ids {
                 updated.vnodes.remove(id);
@@ -466,9 +578,7 @@ impl ShardSupervisor {
             tokio_handle: self.tokio_handle.clone(),
             initial_timer_ops,
             participation_tx: Some(self.participation_tx.clone()),
-            rpc_status: self.rpc_status.clone(),
-            sync_status: self.sync_status.clone(),
-            mempool_snapshot: self.mempool_snapshot.clone(),
+            publishers: self.publishers.clone(),
         }
     }
 
