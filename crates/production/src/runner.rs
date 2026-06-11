@@ -19,7 +19,7 @@
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -450,12 +450,11 @@ impl ProductionRunnerBuilder {
                 .take(beacon_committee_size)
                 .map(|v| v.id)
                 .collect();
-            let initial_shard_committees: std::collections::BTreeMap<ShardId, Vec<ValidatorId>> =
-                shared_topology
-                    .shard_trie()
-                    .leaves()
-                    .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
-                    .collect();
+            let initial_shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = shared_topology
+                .shard_trie()
+                .leaves()
+                .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
+                .collect();
             let config = BeaconGenesisConfig {
                 chain_config,
                 initial_validators,
@@ -622,7 +621,7 @@ impl ProductionRunnerBuilder {
         // shard's own pinned-thread callback channel — callbacks,
         // network handlers, and RPC fanout for that shard land on its
         // thread directly.
-        let shard_event_senders: HashMap<ShardId, Sender<ShardEvent>> = shard_callback_txs
+        let shard_event_senders: BTreeMap<ShardId, Sender<ShardEvent>> = shard_callback_txs
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();
@@ -1280,7 +1279,9 @@ struct NetworkStack {
 }
 
 fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerError> {
-    let registry = Arc::new(HandlerRegistry::new(args.local_shards.clone()));
+    let registry = Arc::new(HandlerRegistry::new(
+        args.local_shards.iter().copied().collect(),
+    ));
 
     let adapter = Libp2pAdapter::new(
         args.network_config,

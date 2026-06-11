@@ -32,7 +32,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -366,7 +366,7 @@ impl SimulatedNetwork {
         let registries = (0..num_hosts)
             .map(|host_index| {
                 let host_index = u32::try_from(host_index).expect("host_index fits u32");
-                let hosted: HashSet<ShardId> = match config.hosting_mode {
+                let hosted: BTreeSet<ShardId> = match config.hosting_mode {
                     HostingMode::SameShardBundled => {
                         let hosts_per_shard = config.validators_per_shard / config.vnodes_per_host;
                         std::iter::once(ShardId::leaf(

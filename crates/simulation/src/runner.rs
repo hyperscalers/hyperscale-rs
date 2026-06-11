@@ -402,7 +402,7 @@ impl SimulationRunner {
             // Single receiver per host: every hosted shard's sender is a
             // clone of the same `event_tx`, and the harness drains all
             // shards through `event_rx` deterministically.
-            let shard_event_senders: HashMap<ShardId, Sender<ShardEvent>> =
+            let shard_event_senders: BTreeMap<ShardId, Sender<ShardEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
                 vnode_inits,

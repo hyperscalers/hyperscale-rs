@@ -11,7 +11,7 @@
 mod beacon_commit;
 mod network_handlers;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -32,7 +32,7 @@ use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 /// Handler closures and RPC fan-out `.load()` for an atomic snapshot on
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
-pub(crate) type SharedShardSenders = Arc<ArcSwap<HashMap<ShardId, Sender<ShardEvent>>>>;
+pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<ShardEvent>>>>;
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -114,7 +114,7 @@ where
     pub(crate) fn new(
         network: Arc<N>,
         dispatch: D,
-        shard_event_senders: HashMap<ShardId, Sender<ShardEvent>>,
+        shard_event_senders: BTreeMap<ShardId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         tx_validator: Arc<TransactionValidation>,

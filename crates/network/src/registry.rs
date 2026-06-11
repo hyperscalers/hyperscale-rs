@@ -18,7 +18,7 @@
 //! only from the single thread driving shard reconfiguration.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -96,7 +96,7 @@ const DEDUP_CACHE_CAPACITY: usize = 1024;
 
 struct TypedGossipDispatcher<M, H> {
     handler: Arc<H>,
-    hosted_shards: Arc<ArcSwap<HashSet<ShardId>>>,
+    hosted_shards: Arc<ArcSwap<BTreeSet<ShardId>>>,
     /// Content-key dedup cache (see [`GossipMessage::dedup_key`]). Idle
     /// for types whose `dedup_key` returns `None`.
     dedup: QuickCache<u64, ()>,
@@ -239,7 +239,7 @@ pub struct HandlerRegistry {
     /// fan-out inside [`TypedGossipDispatcher`], which loads it per
     /// message; swapped via [`Self::set_hosted_shards`] when shard
     /// participation changes.
-    hosted_shards: Arc<ArcSwap<HashSet<ShardId>>>,
+    hosted_shards: Arc<ArcSwap<BTreeSet<ShardId>>>,
     gossip: ArcSwap<HashMap<&'static str, Arc<RawGossipHandler>>>,
     request: ArcSwap<HashMap<(&'static str, ShardId), Arc<RawRequestHandler>>>,
     notification: ArcSwap<HashMap<&'static str, Arc<RawNotificationHandler>>>,
@@ -258,7 +258,7 @@ pub struct HandlerRegistry {
 impl HandlerRegistry {
     /// Create a registry serving the given hosted shards.
     #[must_use]
-    pub fn new(hosted_shards: HashSet<ShardId>) -> Self {
+    pub fn new(hosted_shards: BTreeSet<ShardId>) -> Self {
         Self {
             hosted_shards: Arc::new(ArcSwap::from_pointee(hosted_shards)),
             gossip: ArcSwap::from_pointee(HashMap::new()),
@@ -272,14 +272,14 @@ impl HandlerRegistry {
 
     /// Shards hosted by the registry's owner (a loaded snapshot).
     #[must_use]
-    pub fn hosted_shards(&self) -> Arc<HashSet<ShardId>> {
+    pub fn hosted_shards(&self) -> Arc<BTreeSet<ShardId>> {
         self.hosted_shards.load_full()
     }
 
     /// Replace the hosted-shard set. Every gossip dispatcher observes
     /// the new set on its next message; in-flight dispatches finish
     /// against the snapshot they loaded.
-    pub fn set_hosted_shards(&self, hosted: HashSet<ShardId>) {
+    pub fn set_hosted_shards(&self, hosted: BTreeSet<ShardId>) {
         self.hosted_shards.store(Arc::new(hosted));
     }
 
@@ -608,7 +608,7 @@ impl HandlerRegistry {
 
 impl Default for HandlerRegistry {
     fn default() -> Self {
-        Self::new(HashSet::new())
+        Self::new(BTreeSet::new())
     }
 }
 
@@ -855,7 +855,7 @@ mod tests {
             const SCOPE: TopicScope = TopicScope::Shard;
         }
 
-        let hosted: HashSet<ShardId> = std::iter::once(ShardId::leaf(1, 0)).collect();
+        let hosted: BTreeSet<ShardId> = std::iter::once(ShardId::leaf(1, 0)).collect();
         let registry = HandlerRegistry::new(hosted);
 
         let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));

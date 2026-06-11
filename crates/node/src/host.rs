@@ -10,7 +10,7 @@
 //! Production and simulation runners both build a `NodeHost` via
 //! [`Self::new`] and drive it through [`Self::step`] / [`Self::set_time`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -44,7 +44,7 @@ use crate::vnode::{Vnode, VnodeInit};
 /// plus the per-shard drivers, keyed by hosted shard id.
 pub type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
-    HashMap<ShardId, ShardLoop<S, N, D>>,
+    BTreeMap<ShardId, ShardLoop<S, N, D>>,
 );
 
 /// Top-level node composition: process-scoped resources plus one
@@ -62,7 +62,9 @@ where
     /// One [`ShardLoop`] per hosted shard. State machines are driven
     /// exclusively through these — all `ProtocolEvent` ingestion and
     /// `Action` emission happen via per-shard `step()` dispatch.
-    pub(crate) shards: HashMap<ShardId, ShardLoop<S, N, D>>,
+    /// Ordered so that whole-host sweeps (step, drains, batch flushes)
+    /// visit shards deterministically regardless of join order.
+    pub(crate) shards: BTreeMap<ShardId, ShardLoop<S, N, D>>,
 
     /// Process-scoped shared resources: network adapter, dispatch pool,
     /// tx validator, topology snapshot, dispatch handles, event sender.
@@ -114,7 +116,7 @@ where
         executor: RadixExecutor,
         network: N,
         dispatch: D,
-        shard_event_senders: HashMap<ShardId, Sender<ShardEvent>>,
+        shard_event_senders: BTreeMap<ShardId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
@@ -186,7 +188,7 @@ where
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
         let tx_gossip_max = b.tx_gossip_max;
         let tx_gossip_window = b.tx_gossip_window;
-        let shards: HashMap<ShardId, ShardLoop<S, N, D>> = shard_builds
+        let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
                 let shard_loop = ShardLoop {
@@ -200,7 +202,7 @@ where
                     emitted_statuses: Vec::new(),
                     pending_reconfigurations: Vec::new(),
                     actions_generated: 0,
-                    outbound_gossip_batches: std::collections::BTreeMap::new(),
+                    outbound_gossip_batches: BTreeMap::new(),
                     tx_gossip_max,
                     tx_gossip_window,
                 };
@@ -555,7 +557,7 @@ where
         emitted_statuses: Vec::new(),
         pending_reconfigurations: Vec::new(),
         actions_generated: 0,
-        outbound_gossip_batches: std::collections::BTreeMap::new(),
+        outbound_gossip_batches: BTreeMap::new(),
         tx_gossip_max: b.tx_gossip_max,
         tx_gossip_window: b.tx_gossip_window,
     };
