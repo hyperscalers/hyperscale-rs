@@ -26,7 +26,11 @@ pub struct BeaconWitnessRootContext<'a> {
     /// (`topology.witness_base(shard)`) — a proposer cannot shift the
     /// window it commits over.
     pub claimed_base: BeaconWitnessLeafCount,
-    /// Accumulator leaves at the parent block's tip — the prefix the
+    /// Absolute leaf index of `parent_witness_leaves[0]` — the
+    /// committed accumulator's retained-window start. The recomputed
+    /// leaf count is `parent_leaves_start + |window + new leaves|`.
+    pub parent_leaves_start: BeaconWitnessLeafCount,
+    /// Accumulator leaves at the parent block's tip — the window the
     /// new payloads append onto.
     pub parent_witness_leaves: Vec<Hash>,
     /// Round of the parent block — anchors the missed-proposal walk.
@@ -195,7 +199,8 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
             leaves.push(payload.leaf_hash());
         }
         let computed_root = Self::from_raw(compute_merkle_root(&leaves));
-        let computed_count = BeaconWitnessLeafCount::new(leaves.len() as u64);
+        let computed_count =
+            BeaconWitnessLeafCount::new(ctx.parent_leaves_start.inner() + leaves.len() as u64);
         if computed_root != expected_root || computed_count != ctx.expected_leaf_count {
             tracing::warn!(
                 ?expected_root,
@@ -254,6 +259,7 @@ mod tests {
         BeaconWitnessRootContext {
             expected_leaf_count: BeaconWitnessLeafCount::new(expected_leaf_count),
             claimed_base: BeaconWitnessLeafCount::new(claimed_base),
+            parent_leaves_start: BeaconWitnessLeafCount::ZERO,
             parent_witness_leaves,
             parent_round: Round::INITIAL,
             shard,

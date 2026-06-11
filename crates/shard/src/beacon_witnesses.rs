@@ -22,47 +22,63 @@ use crate::pending::PendingBlocks;
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
-/// Holds the full leaf-hash history so [`Self::root`] and
+/// Holds the retained leaf-hash window so [`Self::root`] and
 /// [`Self::preview_append`] can recompute roots without re-reading the
 /// source payloads, and so the coordinator can hand the leaves to the
-/// verification pipeline for prospective-root checks. Pruning is the
-/// runtime layer's job — the accumulator only knows about leaves it
-/// currently retains.
+/// verification pipeline for prospective-root checks. `leaves[i]` is
+/// the accumulator's absolute leaf `start_index + i`; the merkle root
+/// commits the retained window only.
 #[derive(Debug, Clone, Default)]
 pub struct BeaconWitnessAccumulator {
+    /// Absolute index of `leaves[0]`.
+    start_index: BeaconWitnessLeafCount,
     leaves: Vec<Hash>,
 }
 
 impl BeaconWitnessAccumulator {
-    /// Construct an empty accumulator.
+    /// Construct an empty accumulator starting at leaf zero.
     #[must_use]
     pub const fn new() -> Self {
-        Self { leaves: Vec::new() }
+        Self {
+            start_index: BeaconWitnessLeafCount::ZERO,
+            leaves: Vec::new(),
+        }
     }
 
-    /// Construct from a pre-existing leaf list — typically the result
+    /// Construct from a retained leaf window: `leaves[0]` is the
+    /// accumulator's absolute leaf `start_index`. Typically the result
     /// of replaying retained leaves out of the `beacon_witnesses`
     /// column family at startup.
     #[must_use]
-    pub const fn from_leaves(leaves: Vec<Hash>) -> Self {
-        Self { leaves }
+    pub const fn from_leaves(start_index: BeaconWitnessLeafCount, leaves: Vec<Hash>) -> Self {
+        Self {
+            start_index,
+            leaves,
+        }
     }
 
-    /// Total leaves the accumulator has seen.
+    /// Absolute index of the first retained leaf.
+    #[must_use]
+    pub const fn start_index(&self) -> BeaconWitnessLeafCount {
+        self.start_index
+    }
+
+    /// Total leaves the accumulator has seen — the retained window plus
+    /// everything before its start.
     #[must_use]
     pub const fn leaf_count(&self) -> BeaconWitnessLeafCount {
-        BeaconWitnessLeafCount::new(self.leaves.len() as u64)
+        BeaconWitnessLeafCount::new(self.start_index.inner() + self.leaves.len() as u64)
     }
 
-    /// Borrow the full leaf-hash list. Used by the verifier path to
-    /// hand a snapshot to the off-thread CPU check without exposing the
-    /// internal `Vec` for mutation.
+    /// Borrow the retained leaf-hash window. Used by the verifier path
+    /// to hand a snapshot to the off-thread CPU check without exposing
+    /// the internal `Vec` for mutation.
     #[must_use]
     pub fn leaves(&self) -> &[Hash] {
         &self.leaves
     }
 
-    /// Current root.
+    /// Root over the retained window.
     #[must_use]
     pub fn root(&self) -> BeaconWitnessRoot {
         BeaconWitnessRoot::from_raw(compute_merkle_root(&self.leaves))
@@ -89,7 +105,7 @@ impl BeaconWitnessAccumulator {
             hashes.push(payload.leaf_hash());
         }
         let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&hashes));
-        let count = BeaconWitnessLeafCount::new(hashes.len() as u64);
+        let count = BeaconWitnessLeafCount::new(self.start_index.inner() + hashes.len() as u64);
         (root, count)
     }
 
@@ -106,13 +122,17 @@ impl BeaconWitnessAccumulator {
 /// Snapshot of the beacon-witness accumulator's leaf hashes at the
 /// state the supplied parent block would leave behind.
 ///
+/// Returned as `(start_index, leaves)` — `leaves[0]` sits at the
+/// absolute leaf index `start_index` (the committed accumulator's own
+/// start).
+///
 /// Walks from `parent_block_hash` back through the pending chain to
 /// the committed tip, re-deriving each ancestor's witness-leaf delta
 /// from its receipts + manifest's `ready_signals` + missed-round scan,
-/// then prepends the committed accumulator's leaves. The derivation is
-/// byte-identical to what the proposer ran, so the returned vector is
-/// exactly the input the verifier must apply the block's own new
-/// leaves to.
+/// then prepends the committed accumulator's retained window. The
+/// derivation is byte-identical to what the proposer ran, so the
+/// returned window is exactly the input the verifier must apply the
+/// block's own new leaves to.
 ///
 /// Returns `Err(blocking_hash)` when the walk hits an ancestor that
 /// is either absent from `pending_blocks` or present but not yet
@@ -131,10 +151,11 @@ pub fn prospective_parent_witness_leaves(
     pending_blocks: &PendingBlocks,
     local_shard: ShardId,
     topology: &TopologySnapshot,
-) -> Result<Vec<Hash>, BlockHash> {
+) -> Result<(BeaconWitnessLeafCount, Vec<Hash>), BlockHash> {
+    let start_index = accumulator.start_index();
     let committed_leaves = accumulator.leaves();
     if parent_block_hash == committed_hash {
-        return Ok(committed_leaves.to_vec());
+        return Ok((start_index, committed_leaves.to_vec()));
     }
     let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
     let mut current = parent_block_hash;
@@ -175,7 +196,7 @@ pub fn prospective_parent_witness_leaves(
     for delta in chain_deltas.iter().rev() {
         leaves.extend_from_slice(delta);
     }
-    Ok(leaves)
+    Ok((start_index, leaves))
 }
 
 #[cfg(test)]
@@ -247,6 +268,26 @@ mod tests {
 
         assert_eq!(acc.root(), snapshot_root);
         assert_eq!(acc.leaf_count(), snapshot_count);
+    }
+
+    /// A windowed accumulator counts the leaves before its retained
+    /// start: `leaf_count = start_index + |window|`, through both the
+    /// committed count and the preview, while the root commits the
+    /// retained window only.
+    #[test]
+    fn windowed_accumulator_counts_from_start_index() {
+        let window = vec![deposit(1).leaf_hash(), deposit(2).leaf_hash()];
+        let acc = BeaconWitnessAccumulator::from_leaves(BeaconWitnessLeafCount::new(5), window);
+
+        assert_eq!(acc.start_index(), BeaconWitnessLeafCount::new(5));
+        assert_eq!(acc.leaf_count(), BeaconWitnessLeafCount::new(7));
+        assert_eq!(
+            acc.root(),
+            BeaconWitnessRoot::from_raw(compute_merkle_root(acc.leaves())),
+        );
+
+        let (_, preview_count) = acc.preview_append(&[deposit(3)]);
+        assert_eq!(preview_count, BeaconWitnessLeafCount::new(8));
     }
 
     /// The all-zero `Hash::ZERO` is used as padding by the merkle

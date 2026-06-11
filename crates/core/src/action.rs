@@ -516,9 +516,12 @@ pub enum Action {
         /// The block header's claimed witness window base, checked
         /// against the schedule-resolved value for the block's window.
         claimed_base: BeaconWitnessLeafCount,
-        /// Accumulator leaves at the parent block — the base the proposer
-        /// appended onto. Captured by the coordinator from its committed
-        /// accumulator plus any in-chain pending-block deltas.
+        /// Absolute leaf index of `parent_witness_leaves[0]` — the
+        /// committed accumulator's retained-window start.
+        parent_leaves_start: BeaconWitnessLeafCount,
+        /// Accumulator leaves at the parent block — the window the
+        /// proposer appended onto. Captured by the coordinator from its
+        /// committed accumulator plus any in-chain pending-block deltas.
         parent_witness_leaves: Vec<Hash>,
         /// Parent round; used with `round` to walk
         /// `(parent_round + 1 .. round)` for the `MissedProposal` channel.

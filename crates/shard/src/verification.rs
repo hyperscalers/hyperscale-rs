@@ -1182,7 +1182,7 @@ impl VerificationPipeline {
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
         let header = block.header();
-        let parent_witness_leaves = match prospective_parent_witness_leaves(
+        let (parent_leaves_start, parent_witness_leaves) = match prospective_parent_witness_leaves(
             accumulator,
             committed_hash,
             header.parent_block_hash(),
@@ -1190,7 +1190,7 @@ impl VerificationPipeline {
             local_shard,
             topology,
         ) {
-            Ok(leaves) => leaves,
+            Ok(window) => window,
             Err(blocking_hash) => {
                 debug!(
                     ?block_hash,
@@ -1223,6 +1223,7 @@ impl VerificationPipeline {
             expected_root: header.beacon_witness_root(),
             expected_leaf_count: header.beacon_witness_leaf_count(),
             claimed_base: header.beacon_witness_base(),
+            parent_leaves_start,
             parent_witness_leaves,
             parent_round: header.parent_qc().round(),
             height: header.height(),

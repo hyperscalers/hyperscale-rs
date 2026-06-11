@@ -514,6 +514,7 @@ where
             expected_root,
             expected_leaf_count,
             claimed_base,
+            parent_leaves_start,
             parent_witness_leaves,
             parent_round,
             height,
@@ -530,6 +531,7 @@ where
             let bw_ctx = BeaconWitnessRootContext {
                 expected_leaf_count,
                 claimed_base,
+                parent_leaves_start,
                 parent_witness_leaves,
                 parent_round,
                 shard: ctx.shard,

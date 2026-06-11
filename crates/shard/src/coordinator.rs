@@ -78,14 +78,14 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader,
-    BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
-    CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
-    MAX_ROUND_GAP, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round,
-    RoutableTransaction, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
-    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
+    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot,
+    LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
+    QuorumCertificate, Round, RoutableTransaction, StateRoot, StateRootVerifyError, Timeout,
+    TopologySchedule, TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId,
+    Verifiable, Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -363,6 +363,7 @@ impl ShardCoordinator {
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
+                BeaconWitnessLeafCount::ZERO,
                 recovered.beacon_witness_leaf_hashes,
             ),
             config,
@@ -1097,7 +1098,7 @@ impl ShardCoordinator {
         // `prospective_parent_witness_leaves`, so previewing against the
         // committed accumulator alone would omit those leaves and produce a
         // root no validator accepts.
-        let parent_leaves = prospective_parent_witness_leaves(
+        let (parent_start, parent_leaves) = prospective_parent_witness_leaves(
             &self.beacon_witness_accumulator,
             self.committed_hash,
             parent_block_hash,
@@ -1111,10 +1112,14 @@ impl ShardCoordinator {
                 ?blocking,
                 "Beacon-witness ancestor walk blocked at proposal; previewing against committed prefix"
             );
-            self.beacon_witness_accumulator.leaves().to_vec()
+            (
+                self.beacon_witness_accumulator.start_index(),
+                self.beacon_witness_accumulator.leaves().to_vec(),
+            )
         });
         let (beacon_witness_root, beacon_witness_leaf_count) =
-            BeaconWitnessAccumulator::from_leaves(parent_leaves).preview_append(&new_leaves);
+            BeaconWitnessAccumulator::from_leaves(parent_start, parent_leaves)
+                .preview_append(&new_leaves);
         // The window base resolves from the same schedule entry as the
         // committee — verifiers check the header's claim against it.
         let beacon_witness_base = committee.witness_base(self.local_shard);
