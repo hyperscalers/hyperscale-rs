@@ -21,6 +21,27 @@ pub const NODE_ID_LEN: usize = 30;
 /// Length of a full `db_node_key`: hash prefix followed by the `NodeId`.
 pub const DB_NODE_KEY_LEN: usize = DB_NODE_KEY_HASH_PREFIX_LEN + NODE_ID_LEN;
 
+/// Decode cap on a raw substate storage key.
+///
+/// Applied by every wire object carrying one (provisioned
+/// `SubstateEntry`s and snap-sync `StateRangeLeaf`s alike) — one limit,
+/// so anything that can be committed can also be provisioned and
+/// served.
+///
+/// Real keys are `db_node_key` (50 bytes) + partition (1) + `sort_key`
+/// (≤ a few hundred bytes for any realistic substate). 4 KiB is well
+/// above any legitimate Radix substate key and rejects obviously
+/// oversized arrivals before allocation.
+pub const MAX_STATE_ENTRY_KEY_LEN: usize = 4 * 1024;
+
+/// Decode cap on a raw substate value, shared by the same wire objects
+/// as [`MAX_STATE_ENTRY_KEY_LEN`].
+///
+/// Radix substates have an engine-side ceiling well below this; the cap
+/// exists to bound the SBOR `Vec<u8>` pre-allocation a peer can force on
+/// a single `value` field.
+pub const MAX_STATE_ENTRY_VALUE_LEN: usize = 1024 * 1024;
+
 /// Hash a flat storage key (`db_node_key || partition_num || sort_key`) to its
 /// 32-byte JMT leaf key.
 ///

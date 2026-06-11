@@ -105,7 +105,6 @@ pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{
     MAX_MERKLE_PROOF_LEN, MAX_OWNED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX,
-    MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN,
 };
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
@@ -155,6 +154,7 @@ pub use signing::{
     spc_relay_signing_message, state_provisions_message, timeout_message, validator_bind_message,
     vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
+pub use state_key::{MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN};
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::timeouts::{

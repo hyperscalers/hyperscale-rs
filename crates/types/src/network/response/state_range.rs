@@ -2,7 +2,10 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BoundedBytes, BoundedVec, Hash, MerkleInclusionProof, MessageClass, NetworkMessage};
+use crate::{
+    BoundedBytes, BoundedVec, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN,
+    MerkleInclusionProof, MessageClass, NetworkMessage,
+};
 
 /// Cap on the leaves a single state range chunk can carry.
 ///
@@ -10,14 +13,6 @@ use crate::{BoundedBytes, BoundedVec, Hash, MerkleInclusionProof, MessageClass, 
 /// a joiner paginates with `more` + cursor continuation, so the cap
 /// sizes chunks, not the total transfer.
 pub const MAX_LEAVES_PER_STATE_RANGE: usize = 1_024;
-
-/// Decode cap on a single raw substate storage key
-/// (`db_node_key ++ partition ++ sort_key` — ~51 bytes plus the sort
-/// key in practice).
-pub const MAX_STATE_RANGE_KEY_LEN: usize = 1_024;
-
-/// Decode cap on a single raw substate value.
-pub const MAX_STATE_RANGE_VALUE_LEN: usize = 2 * 1024 * 1024;
 
 /// One leaf of a state range: the JMT leaf key plus the raw substate
 /// pair it represents.
@@ -32,10 +27,12 @@ pub const MAX_STATE_RANGE_VALUE_LEN: usize = 2 * 1024 * 1024;
 pub struct StateRangeLeaf {
     /// The 32-byte hashed JMT leaf key.
     pub leaf_key: Hash,
-    /// The raw substate storage key.
-    pub storage_key: BoundedBytes<MAX_STATE_RANGE_KEY_LEN>,
-    /// The raw substate value.
-    pub value: BoundedBytes<MAX_STATE_RANGE_VALUE_LEN>,
+    /// The raw substate storage key, bounded by the same decode cap as
+    /// a provisioned `SubstateEntry` — any committed key must be
+    /// servable here, so the two limits must not diverge.
+    pub storage_key: BoundedBytes<MAX_STATE_ENTRY_KEY_LEN>,
+    /// The raw substate value, bounded like a provisioned entry's.
+    pub value: BoundedBytes<MAX_STATE_ENTRY_VALUE_LEN>,
 }
 
 /// A served chunk of a shard's state at a pinned boundary: leaves in
