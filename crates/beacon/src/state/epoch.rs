@@ -14,6 +14,7 @@ use hyperscale_types::{
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
+use crate::state::reshape::execute_ready_splits;
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
@@ -163,6 +164,12 @@ pub fn apply_epoch(
     let rewards_credited = distribute_epoch_rewards(state);
     let timeout_readied = auto_ready_timeout(state);
     run_shuffle_step(state);
+    // After the shuffle so the parent-half assignment reads
+    // post-rotation membership and the children first shuffle one
+    // epoch after they form; before the resample so freshly placed
+    // ready members enter this epoch's beacon-eligible set like any
+    // witness-readied validator.
+    execute_ready_splits(state);
     let beacon_committee_transition =
         resample_beacon_committee(state, &BTreeSet::new(), transition_cause);
 
