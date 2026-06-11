@@ -247,6 +247,7 @@ pub fn make_live_block(
         InFlightCount::ZERO,
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        BeaconWitnessLeafCount::ZERO,
     );
     let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
         .into_iter()
@@ -314,6 +315,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
+            beacon_witness_base,
         ) = header.into_parts();
         let pqc = parent_qc.as_unverified();
         let stamped = QuorumCertificate::new(
@@ -345,6 +347,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
+            beacon_witness_base,
         )
     };
     match block {

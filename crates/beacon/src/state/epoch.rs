@@ -348,6 +348,7 @@ mod tests {
             InFlightCount::ZERO,
             root,
             BeaconWitnessLeafCount::new(leaf_count),
+            BeaconWitnessLeafCount::ZERO,
         )
     }
 

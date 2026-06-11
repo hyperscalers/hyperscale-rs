@@ -524,6 +524,7 @@ mod tests {
                 header.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             );
         }
         let certified_header =

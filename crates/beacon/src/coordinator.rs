@@ -2074,6 +2074,7 @@ mod tests {
             InFlightCount::ZERO,
             root,
             BeaconWitnessLeafCount::new(leaf_count),
+            BeaconWitnessLeafCount::ZERO,
         );
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
@@ -2200,6 +2201,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("bw-{height}").as_bytes())),
             BeaconWitnessLeafCount::new(leaf_count),
+            BeaconWitnessLeafCount::ZERO,
         );
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
@@ -3804,6 +3806,7 @@ mod tests {
             InFlightCount::ZERO,
             beacon_root,
             BeaconWitnessLeafCount::new(total_leaves),
+            BeaconWitnessLeafCount::ZERO,
         );
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(

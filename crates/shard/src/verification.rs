@@ -1222,6 +1222,7 @@ impl VerificationPipeline {
             block_hash,
             expected_root: header.beacon_witness_root(),
             expected_leaf_count: header.beacon_witness_leaf_count(),
+            claimed_base: header.beacon_witness_base(),
             parent_witness_leaves,
             parent_round: header.parent_qc().round(),
             height: header.height(),
@@ -1768,6 +1769,7 @@ mod tests {
             InFlightCount::new(in_flight),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         )
     }
 
@@ -1795,6 +1797,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::new(in_flight),
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         )
     }
@@ -2218,6 +2221,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
         let block = Block::Live {

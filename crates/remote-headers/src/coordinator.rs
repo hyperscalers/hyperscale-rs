@@ -757,6 +757,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         );
         // Deliberately set wrong block_hash
         let qc = QuorumCertificate::new(
@@ -849,6 +850,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
         let qc = QuorumCertificate::new(

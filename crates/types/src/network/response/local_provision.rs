@@ -153,6 +153,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         );
         let header_hash = header.hash();
         let qc = QuorumCertificate::new(

@@ -21,6 +21,11 @@ pub struct BeaconWitnessRootContext<'a> {
     /// Header's claimed leaf count after appending this block's new
     /// witness payloads. Verification checks the computed count matches.
     pub expected_leaf_count: BeaconWitnessLeafCount,
+    /// Header's claimed beacon-witness window base. Verification checks
+    /// it equals the schedule-resolved base for the block's window
+    /// (`topology.witness_base(shard)`) — a proposer cannot shift the
+    /// window it commits over.
+    pub claimed_base: BeaconWitnessLeafCount,
     /// Accumulator leaves at the parent block's tip — the prefix the
     /// new payloads append onto.
     pub parent_witness_leaves: Vec<Hash>,
@@ -60,6 +65,15 @@ pub enum BeaconWitnessRootVerifyError {
         expected_count: u64,
         /// Count computed from the recomputed leaves.
         computed_count: u64,
+    },
+    /// The header's claimed window base differs from the
+    /// schedule-resolved base for the block's window.
+    #[error("claimed beacon-witness base {claimed} ≠ schedule-resolved base {expected}")]
+    WindowBaseMismatch {
+        /// Header's claimed window base.
+        claimed: u64,
+        /// Base resolved from the block's schedule entry.
+        expected: u64,
     },
 }
 
@@ -153,6 +167,19 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
 
     fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let expected_root = *self;
+        let resolved_base = ctx.topology.witness_base(ctx.shard);
+        if ctx.claimed_base != resolved_base {
+            tracing::warn!(
+                claimed = ctx.claimed_base.inner(),
+                expected = resolved_base.inner(),
+                height = ctx.height.inner(),
+                "Beacon-witness window base verification FAILED"
+            );
+            return Err(BeaconWitnessRootVerifyError::WindowBaseMismatch {
+                claimed: ctx.claimed_base.inner(),
+                expected: resolved_base.inner(),
+            });
+        }
         let missed = missed_proposals_since_prev_commit(
             ctx.shard,
             ctx.height,
@@ -187,5 +214,88 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
             });
         }
         Ok(Verified::new_unchecked(expected_root))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{
+        NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet, generate_bls_keypair,
+    };
+
+    /// A snapshot whose `witness_base(shard)` answers `base` for one
+    /// validator's single-shard committee.
+    fn snapshot_with_base(shard: ShardId, base: u64) -> TopologySnapshot {
+        let validators = vec![ValidatorInfo {
+            validator_id: ValidatorId::new(0),
+            public_key: generate_bls_keypair().public_key(),
+        }];
+        let vs = ValidatorSet::new(validators);
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            HashMap::from([(shard, vec![ValidatorId::new(0)])]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
+        )
+    }
+
+    fn context_with(
+        topology: &TopologySnapshot,
+        shard: ShardId,
+        claimed_base: u64,
+        parent_witness_leaves: Vec<Hash>,
+        expected_leaf_count: u64,
+    ) -> BeaconWitnessRootContext<'_> {
+        BeaconWitnessRootContext {
+            expected_leaf_count: BeaconWitnessLeafCount::new(expected_leaf_count),
+            claimed_base: BeaconWitnessLeafCount::new(claimed_base),
+            parent_witness_leaves,
+            parent_round: Round::INITIAL,
+            shard,
+            height: BlockHeight::new(5),
+            // parent_round.next() — no missed-proposal walk, so the
+            // empty committee in the snapshot is never consulted.
+            round: Round::INITIAL.next(),
+            receipts: &[],
+            ready_signals: &[],
+            topology,
+        }
+    }
+
+    /// A header whose claimed window base differs from the
+    /// schedule-resolved value fails before any root recomputation — a
+    /// proposer cannot shift the window it commits over.
+    #[test]
+    fn window_base_mismatch_is_rejected() {
+        let shard = ShardId::ROOT;
+        let topology = snapshot_with_base(shard, 2);
+        let ctx = context_with(&topology, shard, 7, Vec::new(), 0);
+
+        let result = BeaconWitnessRoot::ZERO.verify(&ctx);
+        assert_eq!(
+            result.unwrap_err(),
+            BeaconWitnessRootVerifyError::WindowBaseMismatch {
+                claimed: 7,
+                expected: 2,
+            }
+        );
+    }
+
+    /// A claim matching the schedule-resolved base passes the window
+    /// check and proceeds to the root comparison.
+    #[test]
+    fn matching_base_passes_window_check() {
+        let shard = ShardId::ROOT;
+        let topology = snapshot_with_base(shard, 2);
+        let leaves = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
+        let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
+        let ctx = context_with(&topology, shard, 2, leaves, 2);
+
+        assert!(expected_root.verify(&ctx).is_ok());
     }
 }

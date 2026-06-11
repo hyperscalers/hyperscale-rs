@@ -982,6 +982,7 @@ impl ShardCoordinatorSim {
                 ready_signals,
                 beacon_witness_root,
                 beacon_witness_leaf_count,
+                beacon_witness_base,
             } => {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
@@ -1007,6 +1008,7 @@ impl ShardCoordinatorSim {
                     ready_signals,
                     beacon_witness_root,
                     beacon_witness_leaf_count,
+                    beacon_witness_base,
                     &pending_snapshots,
                 );
                 let block_hash = result.block_hash;
@@ -1152,6 +1154,7 @@ impl ShardCoordinatorSim {
                 block_hash,
                 expected_root,
                 expected_leaf_count,
+                claimed_base,
                 parent_witness_leaves,
                 parent_round,
                 height,
@@ -1166,6 +1169,7 @@ impl ShardCoordinatorSim {
                     .collect();
                 let bw_ctx = BeaconWitnessRootContext {
                     expected_leaf_count,
+                    claimed_base,
                     parent_witness_leaves,
                     parent_round,
                     shard: self.shard,
@@ -1362,5 +1366,6 @@ fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         h.in_flight(),
         h.beacon_witness_root(),
         h.beacon_witness_leaf_count(),
+        h.beacon_witness_base(),
     )
 }

@@ -1115,6 +1115,9 @@ impl ShardCoordinator {
         });
         let (beacon_witness_root, beacon_witness_leaf_count) =
             BeaconWitnessAccumulator::from_leaves(parent_leaves).preview_append(&new_leaves);
+        // The window base resolves from the same schedule entry as the
+        // committee — verifiers check the header's claim against it.
+        let beacon_witness_base = committee.witness_base(self.local_shard);
 
         let plan = assemble_build_action(
             self.me,
@@ -1127,6 +1130,7 @@ impl ShardCoordinator {
             ready_signals,
             beacon_witness_root,
             beacon_witness_leaf_count,
+            beacon_witness_base,
         );
 
         info!(
@@ -4575,6 +4579,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         );
         Block::Live {
             header,
@@ -4685,6 +4690,7 @@ mod tests {
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             );
             Block::Live {
                 header,
@@ -4739,6 +4745,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         )
     }
@@ -4809,6 +4816,7 @@ mod tests {
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             )
         };
 
@@ -4873,6 +4881,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         );
 
         let actions = state.on_block_header(
@@ -4918,6 +4927,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
         Block::Live {
@@ -5066,6 +5076,7 @@ mod tests {
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             );
             let _ = state.on_block_header(
                 &topology,
@@ -5116,6 +5127,7 @@ mod tests {
                 std::collections::BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -5192,6 +5204,7 @@ mod tests {
                 std::collections::BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -5280,6 +5293,7 @@ mod tests {
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             )
         };
 
@@ -5350,6 +5364,7 @@ mod tests {
                 __h.provision_tx_roots().clone().into_inner(),
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -5434,6 +5449,7 @@ mod tests {
                 __h.provision_tx_roots().clone().into_inner(),
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -5541,6 +5557,7 @@ mod tests {
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             )
         };
         let block_hash = header.hash();
@@ -5591,6 +5608,7 @@ mod tests {
                 __h.provision_tx_roots().clone().into_inner(),
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -6001,6 +6019,7 @@ mod tests {
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             )
         };
 
@@ -6270,6 +6289,7 @@ mod tests {
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             )
         };
         let actions1 = state.on_block_header(
@@ -6314,6 +6334,7 @@ mod tests {
                 __h.provision_tx_roots().clone().into_inner(),
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -6411,6 +6432,7 @@ mod tests {
                 __h.provision_tx_roots().clone().into_inner(),
                 __h.in_flight(),
                 BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             )
         };
@@ -7002,6 +7024,7 @@ mod tests {
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                 )
             },
             transactions: Arc::new(BoundedVec::new()),
@@ -7071,6 +7094,7 @@ mod tests {
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                 )
             },
             transactions: Arc::new(BoundedVec::new()),
@@ -7115,6 +7139,7 @@ mod tests {
                     __h.provision_tx_roots().clone().into_inner(),
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                 )
             },
@@ -7310,6 +7335,7 @@ mod tests {
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                 )
             },
             transactions: Arc::new(vec![tx1.clone()].into()),
@@ -7343,6 +7369,7 @@ mod tests {
                     __h.provision_tx_roots().clone().into_inner(),
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                 )
             },
@@ -7390,6 +7417,7 @@ mod tests {
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                 )
             },
             transactions: Arc::new(vec![tx1.clone()].into()),
@@ -7421,6 +7449,7 @@ mod tests {
                     __h.provision_tx_roots().clone().into_inner(),
                     __h.in_flight(),
                     BeaconWitnessRoot::ZERO,
+                    BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                 )
             },

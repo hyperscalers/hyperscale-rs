@@ -182,6 +182,7 @@ mod tests {
             InFlightCount::new(u32::from(height)),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         )
     }
 

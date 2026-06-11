@@ -824,6 +824,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         )
     }
 
@@ -846,6 +847,7 @@ mod tests {
             BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         )
     }

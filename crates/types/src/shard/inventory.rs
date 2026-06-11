@@ -460,6 +460,7 @@ mod tests {
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
             ),
             transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))].into()),
             certificates: Arc::new(BoundedVec::new()),

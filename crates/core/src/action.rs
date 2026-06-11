@@ -513,6 +513,9 @@ pub enum Action {
         expected_root: BeaconWitnessRoot,
         /// Expected accumulator leaf count from the block header.
         expected_leaf_count: BeaconWitnessLeafCount,
+        /// The block header's claimed witness window base, checked
+        /// against the schedule-resolved value for the block's window.
+        claimed_base: BeaconWitnessLeafCount,
         /// Accumulator leaves at the parent block — the base the proposer
         /// appended onto. Captured by the coordinator from its committed
         /// accumulator plus any in-chain pending-block deltas.
@@ -661,6 +664,10 @@ pub enum Action {
         /// Pre-derived total accumulator leaf count after this block's
         /// witnesses are appended.
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
+        /// The witness window base of the block's window, resolved by the
+        /// coordinator from the same schedule entry as the block's
+        /// committee. Stamped verbatim into the header.
+        beacon_witness_base: BeaconWitnessLeafCount,
     },
 
     /// Execute every transaction in a single-shard wave.

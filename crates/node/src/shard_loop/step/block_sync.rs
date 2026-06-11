@@ -468,6 +468,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         )
     }
 
@@ -496,6 +497,7 @@ mod tests {
             h.provision_tx_roots().clone().into_inner(),
             h.in_flight(),
             BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         )
     }

@@ -48,6 +48,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         InFlightCount::ZERO,
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        BeaconWitnessLeafCount::ZERO,
     );
     let block = Block::Live {
         header,
@@ -102,6 +103,7 @@ fn make_remote_header_targeting(
         std::collections::BTreeMap::new(),
         InFlightCount::ZERO,
         BeaconWitnessRoot::ZERO,
+        BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
     );
     let header_hash = header.hash();

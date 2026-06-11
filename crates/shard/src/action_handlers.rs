@@ -208,6 +208,7 @@ pub fn build_proposal<S: ShardChainWriter>(
     ready_signals: Vec<ReadySignal>,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
+    beacon_witness_base: BeaconWitnessLeafCount,
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult {
     let (state_root, jmt_snapshot, prepared) = storage.prepare_block_commit(
@@ -272,6 +273,7 @@ pub fn build_proposal<S: ShardChainWriter>(
         in_flight,
         beacon_witness_root,
         beacon_witness_leaf_count,
+        beacon_witness_base,
     );
 
     let block = Block::Live {
@@ -511,6 +513,7 @@ where
             block_hash,
             expected_root,
             expected_leaf_count,
+            claimed_base,
             parent_witness_leaves,
             parent_round,
             height,
@@ -526,6 +529,7 @@ where
                 .collect();
             let bw_ctx = BeaconWitnessRootContext {
                 expected_leaf_count,
+                claimed_base,
                 parent_witness_leaves,
                 parent_round,
                 shard: ctx.shard,
@@ -649,6 +653,7 @@ where
             ready_signals,
             beacon_witness_root,
             beacon_witness_leaf_count,
+            beacon_witness_base,
         } => {
             let view = ctx
                 .pending_chain
@@ -675,6 +680,7 @@ where
                 ready_signals,
                 beacon_witness_root,
                 beacon_witness_leaf_count,
+                beacon_witness_base,
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;

@@ -44,6 +44,15 @@ pub struct BlockHeader {
     in_flight: InFlightCount,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
+    /// The beacon-witness window base of the window this block belongs
+    /// to — the folded watermark frozen at promotion, resolved from the
+    /// same schedule entry as the block's committee
+    /// (`epoch_for(parent_qc.wt)`). Verification rejects a header whose
+    /// claim differs from the schedule-resolved value, so every
+    /// downstream consumer (fold proofs, witness serving, snap-sync
+    /// joiners) reads the base off the header instead of reconstructing
+    /// historical beacon state.
+    beacon_witness_base: BeaconWitnessLeafCount,
 }
 
 impl BlockHeader {
@@ -53,7 +62,7 @@ impl BlockHeader {
     ///
     /// Panics if `waves.len() > MAX_TXS_PER_BLOCK` or
     /// `provision_tx_roots.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 18 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the 19 stored fields
     #[must_use]
     pub fn new(
         shard_id: ShardId,
@@ -74,6 +83,7 @@ impl BlockHeader {
         in_flight: InFlightCount,
         beacon_witness_root: BeaconWitnessRoot,
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
+        beacon_witness_base: BeaconWitnessLeafCount,
     ) -> Self {
         Self {
             shard_id,
@@ -94,6 +104,7 @@ impl BlockHeader {
             in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
+            beacon_witness_base,
         }
     }
 
@@ -123,6 +134,7 @@ impl BlockHeader {
             in_flight: InFlightCount::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
         }
     }
 
@@ -317,8 +329,19 @@ impl BlockHeader {
         self.beacon_witness_leaf_count
     }
 
+    /// The beacon-witness window base of the window this block belongs
+    /// to — the folded watermark frozen at promotion. Verification
+    /// rejects a claim that differs from the schedule-resolved value,
+    /// so a holder of a verified header reads the window straight off
+    /// it: the accumulator commitment spans leaves
+    /// `[beacon_witness_base, beacon_witness_leaf_count)`.
+    #[must_use]
+    pub const fn beacon_witness_base(&self) -> BeaconWitnessLeafCount {
+        self.beacon_witness_base
+    }
+
     /// Decompose into the raw fields, in struct-declaration order.
-    #[allow(clippy::type_complexity)] // mirrors the 18 stored fields
+    #[allow(clippy::type_complexity)] // mirrors the 19 stored fields
     #[must_use]
     pub fn into_parts(
         self,
@@ -341,6 +364,7 @@ impl BlockHeader {
         InFlightCount,
         BeaconWitnessRoot,
         BeaconWitnessLeafCount,
+        BeaconWitnessLeafCount,
     ) {
         (
             self.shard_id,
@@ -361,6 +385,7 @@ impl BlockHeader {
             self.in_flight,
             self.beacon_witness_root,
             self.beacon_witness_leaf_count,
+            self.beacon_witness_base,
         )
     }
 
@@ -528,8 +553,8 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BlockHeader has 18 fields.
-            enc.write_size(18).unwrap();
+            // BlockHeader has 19 fields.
+            enc.write_size(19).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();
@@ -568,7 +593,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(18).unwrap();
+            enc.write_size(19).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();

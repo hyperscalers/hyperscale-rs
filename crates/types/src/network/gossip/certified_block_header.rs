@@ -121,6 +121,7 @@ mod tests {
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
         );
         let qc = QuorumCertificate::genesis(ShardId::leaf(1, 0));
 

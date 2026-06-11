@@ -313,6 +313,7 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         InFlightCount::ZERO,
         root,
         BeaconWitnessLeafCount::new(leaf_count),
+        BeaconWitnessLeafCount::ZERO,
     )
 }
 

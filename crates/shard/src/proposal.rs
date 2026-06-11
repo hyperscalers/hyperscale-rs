@@ -297,11 +297,11 @@ pub struct BuildActionPlan {
 /// and the supplied inputs, writes nothing. The caller applies the returned
 /// mutations (leader activity, tracker.start, dispatch-or-defer).
 ///
-/// `ready_signals`, `beacon_witness_root`, and `beacon_witness_leaf_count`
-/// are pre-derived by the coordinator (which owns the
-/// `BeaconWitnessAccumulator` and `ReadySignalPool`) and threaded through
-/// the action so `build_proposal` doesn't need to know about the
-/// accumulator type.
+/// `ready_signals` and the `beacon_witness_*` trio are pre-derived by
+/// the coordinator (which owns the `BeaconWitnessAccumulator`, the
+/// `ReadySignalPool`, and the window-resolved schedule entry) and
+/// threaded through the action so `build_proposal` doesn't need to know
+/// about the accumulator type.
 #[allow(clippy::too_many_arguments)] // assemble fans a coordinator-side bundle into the action
 pub fn assemble_build_action(
     me: ValidatorId,
@@ -314,6 +314,7 @@ pub fn assemble_build_action(
     ready_signals: Vec<ReadySignal>,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
+    beacon_witness_base: BeaconWitnessLeafCount,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -390,6 +391,7 @@ pub fn assemble_build_action(
         ready_signals,
         beacon_witness_root,
         beacon_witness_leaf_count,
+        beacon_witness_base,
     };
 
     BuildActionPlan {
