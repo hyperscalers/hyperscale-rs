@@ -26,7 +26,7 @@ use hyperscale_types::{
     GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
     StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WaveCertificate, WaveId,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate, WaveId,
     WeightedTimestamp, bls_keypair_from_seed,
 };
 
@@ -284,7 +284,10 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
         )
     };
-    CertifiedBlock::new_unchecked(block, qc)
+    // SAFETY: synthetic test fixture. Wrapped `Verified` because every
+    // commit path stores a verified QC — consumers of committed blocks
+    // (e.g. `certified_header()`) rely on that invariant.
+    CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(qc))
 }
 
 /// Re-stamp a block's `parent_qc` weighted timestamp, keeping the QC

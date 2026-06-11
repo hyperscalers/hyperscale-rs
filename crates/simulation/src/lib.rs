@@ -32,3 +32,4 @@ mod event_queue;
 mod runner;
 
 pub use runner::SimulationRunner;
+pub use runner::relocation::JoinKind;

@@ -12,7 +12,7 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
-use hyperscale_core::{ProtocolEvent, TimerId};
+use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
@@ -29,10 +29,10 @@ use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, CertifiedBlock, Epoch, GenesisPool, GenesisValidator, LocalTimestamp,
-    MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
-    WeightedTimestamp, bls_keypair_from_seed, genesis_config_hash, shard_prefix_path,
+    CertifiedBeaconBlock, CertifiedBlock, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
+    LocalTimestamp, MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
+    Verified, WeightedTimestamp, bls_keypair_from_seed, genesis_config_hash, shard_prefix_path,
     uniform_shard_for_node,
 };
 use radix_common::math::Decimal;
@@ -43,6 +43,8 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
+
+pub mod relocation;
 
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
@@ -72,6 +74,28 @@ pub struct SimulationRunner {
 
     /// Per-node event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<ShardEvent>>,
+
+    /// Per-node event senders, retained so a shard added at runtime
+    /// (vnode relocation) can be wired onto the host's existing channel.
+    event_txs: Vec<Sender<ShardEvent>>,
+
+    /// Signing keys for every registered validator, retained so a
+    /// relocated vnode's state machine can be rebuilt on its new shard.
+    signing_keys: Vec<Arc<Bls12381G1PrivateKey>>,
+
+    /// Beacon genesis config hash, retained for runtime-built
+    /// `BeaconCoordinator`s.
+    beacon_config_hash: GenesisConfigHash,
+
+    /// Beacon network definition, retained for runtime-built
+    /// `BeaconCoordinator`s.
+    beacon_network: NetworkDefinition,
+
+    /// Placement deltas the hosted vnodes emitted via
+    /// `Action::ReconfigureParticipation`, in deterministic event
+    /// order. Drained by the harness via
+    /// [`Self::take_reconfigurations`].
+    pending_reconfigurations: Vec<(NodeIndex, ParticipationChange)>,
 
     /// Global event queue, ordered deterministically.
     event_queue: BTreeMap<EventKey, ShardEvent>,
@@ -266,6 +290,7 @@ impl SimulationRunner {
         let num_hosts = host_layout.len();
         let mut hosts = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
+        let mut host_event_txs = Vec::with_capacity(num_hosts);
 
         for (host_index, host_vnodes) in host_layout.iter().enumerate() {
             // Group this host's vnodes by shard. For cross-shard
@@ -397,6 +422,7 @@ impl SimulationRunner {
 
             hosts.push(host);
             event_rxs.push(event_rx);
+            host_event_txs.push(event_tx);
         }
 
         info!(
@@ -407,9 +433,23 @@ impl SimulationRunner {
             "Created simulation runner"
         );
 
+        let signing_keys: Vec<Arc<Bls12381G1PrivateKey>> = keys
+            .iter()
+            .map(|key| {
+                Arc::new(
+                    Bls12381G1PrivateKey::from_bytes(&key.to_bytes()).expect("valid key bytes"),
+                )
+            })
+            .collect();
+
         Self {
             hosts,
             event_rxs,
+            event_txs: host_event_txs,
+            signing_keys,
+            beacon_config_hash,
+            beacon_network,
+            pending_reconfigurations: Vec::new(),
             event_queue: BTreeMap::new(),
             sequence: 0,
             now: Duration::ZERO,
@@ -916,11 +956,14 @@ impl SimulationRunner {
         }
     }
 
-    /// Process `StepOutput`: stats and timer ops.
+    /// Process `StepOutput`: stats, timer ops, and placement deltas.
     fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
         self.stats.actions_generated += u64::try_from(output.actions_generated).unwrap_or(u64::MAX);
         for op in output.timer_ops {
             self.process_timer_op(node, op);
+        }
+        for change in output.reconfigurations {
+            self.pending_reconfigurations.push((node, change));
         }
     }
 

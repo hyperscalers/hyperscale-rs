@@ -16,9 +16,11 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, PartitionEntry,
-    SubstateDatabase, SubstateStore,
+    RecoveredState, SubstateDatabase, SubstateStore,
 };
-use hyperscale_types::{BlockHeight, NodeId, StateRoot};
+use hyperscale_types::{
+    BlockHeight, Hash, NodeId, QuorumCertificate, ShardWitnessPayload, StateRoot, Verified,
+};
 
 use super::state::{ConsensusState, SharedState, apply_updates};
 
@@ -41,12 +43,19 @@ use super::state::{ConsensusState, SharedState, apply_updates};
 ///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
 ///   Separate because consensus metadata is independent of substate/JMT state.
+///
+/// Every field is behind a shared handle, so a [`Clone`] is another
+/// handle onto the *same* store — the in-memory analogue of
+/// production's `SharedStorage` wrapper over one `RocksDB` instance. A
+/// shard's storage can therefore be retained across a runtime
+/// leave/rejoin cycle.
+#[derive(Clone)]
 pub struct SimShardStorage {
     /// Substate data + JMT state (single `RwLock`).
     pub(crate) state: Arc<RwLock<SharedState>>,
 
     /// Consensus metadata (single `RwLock`).
-    pub(crate) consensus: RwLock<ConsensusState>,
+    pub(crate) consensus: Arc<RwLock<ConsensusState>>,
 
     /// Retention window for historical substate reads. `snapshot_at(V)`
     /// panics if `V < current_version - jmt_history_length` (saturating).
@@ -59,7 +68,7 @@ pub struct SimShardStorage {
     /// store retains every JMT version, so a pin is pure bookkeeping —
     /// kept under the production ring's retention so eviction behaviour
     /// is observable in simulation too.
-    pub(crate) boundary_pins: RwLock<BTreeSet<BlockHeight>>,
+    pub(crate) boundary_pins: Arc<RwLock<BTreeSet<BlockHeight>>>,
 }
 
 impl Default for SimShardStorage {
@@ -81,9 +90,9 @@ impl SimShardStorage {
         shared.tree_store.set_root_path(root_path);
         Self {
             state: Arc::new(RwLock::new(shared)),
-            consensus: RwLock::new(ConsensusState::new()),
+            consensus: Arc::new(RwLock::new(ConsensusState::new())),
             jmt_history_length: u64::MAX,
-            boundary_pins: RwLock::new(BTreeSet::new()),
+            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -93,9 +102,9 @@ impl SimShardStorage {
     pub fn with_jmt_history_length(jmt_history_length: u64) -> Self {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
-            consensus: RwLock::new(ConsensusState::new()),
+            consensus: Arc::new(RwLock::new(ConsensusState::new())),
             jmt_history_length,
-            boundary_pins: RwLock::new(BTreeSet::new()),
+            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -108,6 +117,44 @@ impl SimShardStorage {
         *write_or_recover(&self.state) = SharedState::new();
         *write_or_recover(&self.consensus) = ConsensusState::new();
         write_or_recover(&self.boundary_pins).clear();
+    }
+
+    /// Load recovered state for restarting a state machine on this
+    /// store — the in-memory analogue of
+    /// `RocksDbShardStorage::load_recovered_state`. Returns
+    /// `RecoveredState::default()` for a fresh store.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn load_recovered_state(&self) -> RecoveredState {
+        let c = read_or_recover(&self.consensus);
+        let committed_height = c.committed_height;
+        let committed_hash = c.committed_hash;
+        let latest_qc = c
+            .committed_qc
+            .clone()
+            .map(Verified::<QuorumCertificate>::from_persisted);
+        let committed_anchor_ts = c
+            .blocks
+            .get(&committed_height)
+            .map(|block| block.block().header().parent_qc().weighted_timestamp());
+        let beacon_witness_leaf_hashes: Vec<Hash> = c
+            .beacon_witnesses
+            .values()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        drop(c);
+
+        RecoveredState {
+            committed_height,
+            committed_hash,
+            latest_qc,
+            committed_anchor_ts,
+            jmt_root: Some(self.state_root()),
+            beacon_witness_leaf_hashes,
+        }
     }
 
     /// Number of live substate entries (current tip). Historical
