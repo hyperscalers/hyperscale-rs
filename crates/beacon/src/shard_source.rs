@@ -113,9 +113,10 @@ impl ShardSourceTracker {
     }
 
     /// Insert a verified source-shard header. Called by the coordinator
-    /// from `on_verified_remote_header` for every active shard (on- or
-    /// off-committee).
-    pub fn on_verified_remote_header(
+    /// from `on_verified_source_header` for every active shard (on- or
+    /// off-committee) — remote shards via the remote-header path, the
+    /// local shard from its own commit stream.
+    pub fn on_verified_source_header(
         &mut self,
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
     ) {
@@ -522,7 +523,7 @@ mod tests {
 
     /// Record a verified header and detect any crossing it completes.
     fn note(t: &mut ShardSourceTracker, h: &Arc<Verified<CertifiedBlockHeader>>, dur: u64) {
-        t.on_verified_remote_header(Arc::clone(h));
+        t.on_verified_source_header(Arc::clone(h));
         t.observe_crossing(h.header().shard_id(), h.header().height(), dur);
     }
 
@@ -703,7 +704,7 @@ mod tests {
         note(&mut t, &c, 1_000);
         // Push the boundary block out of the sliding header window.
         for height in 4..=(MAX_RETAINED_HEADERS_PER_SHARD as u64 + 4) {
-            t.on_verified_remote_header(linked_header(shard(0), height, BlockHash::ZERO, 1_600, 0));
+            t.on_verified_source_header(linked_header(shard(0), height, BlockHash::ZERO, 1_600, 0));
         }
         t.prune_stale_headers();
         assert!(t.header(shard(0), BlockHeight::new(2)).is_none());
@@ -726,7 +727,7 @@ mod tests {
     fn prune_stale_headers_bounds_the_window() {
         let mut t = ShardSourceTracker::new();
         for height in 1..=(MAX_RETAINED_HEADERS_PER_SHARD as u64 + 3) {
-            t.on_verified_remote_header(linked_header(shard(0), height, BlockHash::ZERO, 0, 0));
+            t.on_verified_source_header(linked_header(shard(0), height, BlockHash::ZERO, 0, 0));
         }
         t.prune_stale_headers();
         // Oldest heights dropped; the window holds the most recent set.
@@ -743,7 +744,7 @@ mod tests {
     #[test]
     fn evicted_from_committee_clears_chunks_keeps_headers() {
         let mut t = ShardSourceTracker::new();
-        t.on_verified_remote_header(linked_header(shard(0), 1, BlockHash::ZERO, 0, 0));
+        t.on_verified_source_header(linked_header(shard(0), 1, BlockHash::ZERO, 0, 0));
         t.admit_witness(witness(shard(0), anchor(1), 0));
         t.register_pending_fetch(shard(0), BlockHeight::new(5), anchor(1), LeafIndex::new(1));
         let abandoned = t.evicted_from_committee();

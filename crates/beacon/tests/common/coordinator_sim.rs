@@ -428,9 +428,9 @@ impl CoordinatorSim {
             witnesses.len() as u64,
         );
         for idx in 0..self.coordinators.len() {
-            let a_b = self.coordinators[idx].on_verified_remote_header(b);
+            let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
-            let a_c = self.coordinators[idx].on_verified_remote_header(&c);
+            let a_c = self.coordinators[idx].on_verified_source_header(&c);
             self.absorb(idx, a_c);
             let a_w = self.coordinators[idx].on_shard_witnesses_received(shard, witnesses.to_vec());
             self.absorb(idx, a_w);

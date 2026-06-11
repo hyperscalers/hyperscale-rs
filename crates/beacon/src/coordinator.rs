@@ -1274,8 +1274,14 @@ impl BeaconCoordinator {
         Vec::new()
     }
 
-    /// Record a verified source-shard header and note any epoch-boundary
-    /// crossing it makes visible. Off-committee vnodes retain the header
+    /// Record a verified source-shard header — a remote shard's via the
+    /// remote-header path, or the local shard's from its own commit
+    /// stream — and note any epoch-boundary crossing it makes visible.
+    /// Local-shard intake is what makes the shard's own boundary QCs
+    /// verifiable at proposal admission (and reportable by local
+    /// proposers): `boundary_qc_admissible` resolves headers from this
+    /// view, and a validator is never on the remote path for its own
+    /// shard. Off-committee vnodes retain the header
     /// (their inbound `BeaconBlock` verifier needs it to check witness
     /// merkle paths) and emit nothing. On-committee vnodes additionally
     /// fetch the witness chunk of the shard's latest observed crossing via
@@ -1284,12 +1290,12 @@ impl BeaconCoordinator {
     /// the boundary block, bounded to [`MAX_WITNESSES_PER_FETCH`] leaves
     /// per call so a large producer/consumer gap can't make one header do
     /// unbounded work.
-    pub fn on_verified_remote_header(
+    pub fn on_verified_source_header(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
         self.shard_source
-            .on_verified_remote_header(Arc::clone(certified_header));
+            .on_verified_source_header(Arc::clone(certified_header));
         self.shard_source.observe_crossing(
             certified_header.header().shard_id(),
             certified_header.header().height(),
@@ -2217,7 +2223,7 @@ mod tests {
 
         // Header synced but the witness chunk isn't in hand — still defer
         // (the coupling rule: a boundary is only reportable with its chunk).
-        coord.on_verified_remote_header(&b);
+        coord.on_verified_source_header(&b);
         assert!(
             boundary::build_shard_contributions(&coord.state, &coord.shard_source, &committed)
                 .is_none()
@@ -3734,7 +3740,7 @@ mod tests {
     /// block, not the full applied/boundary gap. The remainder is picked
     /// up on later observations as the watermark advances.
     #[test]
-    fn on_verified_remote_header_caps_leaf_fetch_window() {
+    fn on_verified_source_header_caps_leaf_fetch_window() {
         use hyperscale_types::{MAX_WITNESSES_PER_FETCH, ShardId};
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
@@ -3745,8 +3751,8 @@ mod tests {
         let total_leaves = u64::try_from(MAX_WITNESSES_PER_FETCH + 50).unwrap();
         let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, total_leaves);
         let c = linked_block_header(shard, 6, b.block_hash(), 300_001, total_leaves);
-        coord.on_verified_remote_header(&b);
-        let actions = coord.on_verified_remote_header(&c);
+        coord.on_verified_source_header(&b);
+        let actions = coord.on_verified_source_header(&c);
 
         let leaf_indices = actions
             .iter()
@@ -3774,7 +3780,7 @@ mod tests {
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .shard_source
-            .on_verified_remote_header(Arc::clone(&header));
+            .on_verified_source_header(Arc::clone(&header));
 
         let actions = coord.on_shard_witnesses_received(shard, vec![Arc::clone(&witness)]);
         assert!(actions.is_empty());
@@ -3790,7 +3796,7 @@ mod tests {
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .shard_source
-            .on_verified_remote_header(Arc::clone(&header));
+            .on_verified_source_header(Arc::clone(&header));
 
         // Witness is for `shard` but envelope claims `other`.
         let actions = coord.on_shard_witnesses_received(other, vec![witness]);
@@ -3804,7 +3810,7 @@ mod tests {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
         // Build a witness pointing at a block hash that no header
-        // record exists for (we never call on_verified_remote_header).
+        // record exists for (we never call on_verified_source_header).
         let (witness, _header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
 
         let actions = coord.on_shard_witnesses_received(shard, vec![witness]);
@@ -3820,7 +3826,7 @@ mod tests {
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
         coord
             .shard_source
-            .on_verified_remote_header(Arc::clone(&header));
+            .on_verified_source_header(Arc::clone(&header));
 
         // Tamper with the witness's leaf_index so the path no longer
         // reconstructs the committed root.
@@ -3844,7 +3850,7 @@ mod tests {
         let (witness, header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
         observer
             .shard_source
-            .on_verified_remote_header(Arc::clone(&header));
+            .on_verified_source_header(Arc::clone(&header));
 
         let actions = observer.on_shard_witnesses_received(shard, vec![witness]);
         assert!(actions.is_empty());

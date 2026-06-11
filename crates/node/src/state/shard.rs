@@ -173,7 +173,7 @@ impl NodeStateMachine {
                     .on_verified_remote_header(&certified_header);
                 actions.extend(
                     self.beacon_coordinator
-                        .on_verified_remote_header(&certified_header),
+                        .on_verified_source_header(&certified_header),
                 );
                 actions
             }
@@ -365,7 +365,7 @@ impl NodeStateMachine {
     }
 
     /// Block committed — notify all subsystems in commit order.
-    fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
+    fn on_block_committed(&mut self, certified: &Verified<CertifiedBlock>) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_hash = certified.block().hash();
 
@@ -408,6 +408,19 @@ impl NodeStateMachine {
         // frontier.
         self.beacon_coordinator
             .on_local_block_committed(certified.block().header().parent_qc().weighted_timestamp());
+
+        // The commit stream is the beacon's source view of the *local*
+        // shard — remote shards' headers arrive via the remote-header
+        // path, but a validator is never on that path for its own
+        // shard. Feeding each committed certified header here is what
+        // makes the local shard's epoch crossings observable, its
+        // boundary QCs verifiable at proposal admission, and its
+        // witness chunks fetchable for local proposers.
+        let certified_header = Arc::new(certified.certified_header());
+        actions.extend(
+            self.beacon_coordinator
+                .on_verified_source_header(&certified_header),
+        );
 
         actions.extend(self.apply_block_to_execution(certified));
 
