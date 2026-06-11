@@ -349,6 +349,7 @@ mod tests {
             HashMap::from([(shard, Vec::new())]),
             HashMap::new(),
             HashMap::from([(shard, anchor)]),
+            HashMap::new(),
         );
         Arc::new(ArcSwap::from_pointee(snapshot))
     }

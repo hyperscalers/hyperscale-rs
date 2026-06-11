@@ -11,8 +11,9 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId, Round,
-    RoutableTransaction, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId,
+    Round, RoutableTransaction, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet,
+    VoteCount,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -97,6 +98,10 @@ pub struct TopologySnapshot {
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
     boundaries: HashMap<ShardId, ShardAnchor>,
+    /// Per-shard beacon-witness window base for the window this snapshot
+    /// governs — `BeaconState.witness_window_bases` projected across the
+    /// CQRS firewall. Absent shards read as `ZERO` (nothing consumed).
+    witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
     validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -133,6 +138,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             boundaries: HashMap::new(),
+            witness_bases: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -169,6 +175,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             boundaries: HashMap::new(),
+            witness_bases: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -214,6 +221,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
             boundaries: HashMap::new(),
+            witness_bases: HashMap::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -231,6 +239,8 @@ impl TopologySnapshot {
     /// vote-bitfield indexing); a shard absent from it has an empty consensus
     /// committee. `boundaries` carries each shard's attested boundary anchor;
     /// shards with no attested boundary yet are simply absent.
+    /// `witness_bases` carries each shard's beacon-witness window base;
+    /// shards absent from it read as `ZERO`.
     ///
     /// # Panics
     ///
@@ -244,6 +254,7 @@ impl TopologySnapshot {
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
         mut consensus_members: HashMap<ShardId, Vec<ValidatorId>>,
         boundaries: HashMap<ShardId, ShardAnchor>,
+        witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
         let shard_trie = ShardTrie::from_leaves(shard_committees.keys().copied());
@@ -278,6 +289,7 @@ impl TopologySnapshot {
             shard_trie,
             shard_committees: committees,
             boundaries,
+            witness_bases,
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -380,6 +392,17 @@ impl TopologySnapshot {
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.boundaries.get(&shard).copied()
+    }
+
+    /// The shard's beacon-witness window base for the window this
+    /// snapshot governs — the folded watermark frozen at promotion.
+    /// `ZERO` for shards the projection doesn't know (nothing consumed).
+    #[must_use]
+    pub fn witness_base(&self, shard: ShardId) -> BeaconWitnessLeafCount {
+        self.witness_bases
+            .get(&shard)
+            .copied()
+            .unwrap_or(BeaconWitnessLeafCount::ZERO)
     }
 
     // ── Derived committee queries ────────────────────────────────────────
@@ -677,16 +700,29 @@ mod tests {
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);
 
+        let mut witness_bases = HashMap::new();
+        witness_bases.insert(ShardId::leaf(1, 0), BeaconWitnessLeafCount::new(7));
+
         let snapshot = TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &vs,
             committees.clone(),
             committees,
             boundaries,
+            witness_bases,
         );
 
         assert_eq!(snapshot.boundary(ShardId::leaf(1, 0)), Some(anchor));
         assert_eq!(snapshot.boundary(ShardId::leaf(1, 1)), None);
+        assert_eq!(
+            snapshot.witness_base(ShardId::leaf(1, 0)),
+            BeaconWitnessLeafCount::new(7)
+        );
+        // Absent shards read as ZERO — nothing consumed.
+        assert_eq!(
+            snapshot.witness_base(ShardId::leaf(1, 1)),
+            BeaconWitnessLeafCount::ZERO
+        );
     }
 
     /// The committee view splits: full membership answers networking
@@ -711,6 +747,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
         );
 
@@ -756,6 +793,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
         );
     }

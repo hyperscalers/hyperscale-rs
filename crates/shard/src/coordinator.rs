@@ -6642,6 +6642,7 @@ mod tests {
             committees,
             consensus,
             HashMap::new(),
+            HashMap::new(),
         );
         TopologySchedule::single(Arc::new(snapshot))
     }
@@ -6674,6 +6675,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
         );
         let topology = TopologySchedule::single(Arc::new(snapshot));

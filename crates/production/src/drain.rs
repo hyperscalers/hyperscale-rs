@@ -89,6 +89,7 @@ mod tests {
             HashMap::from([(SHARD, members)]),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         )
     }
 

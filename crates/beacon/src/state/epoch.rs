@@ -112,6 +112,11 @@ pub fn apply_epoch(
     // consensus set one epoch out rather than mid-window.
     state.shard_consensus_members = state.ready_consensus_members(&state.next_shard_committees);
     state.shard_committees = state.next_shard_committees.clone();
+    // Freeze each shard's beacon-witness window base under the same
+    // discipline: the applied watermark as it stands before this epoch's
+    // fold advances it, matching what the prior state's lookahead
+    // derivation read live from the same boundaries.
+    state.witness_window_bases = state.live_witness_bases();
 
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface
@@ -473,6 +478,81 @@ mod tests {
         assert_eq!(recorded.witness_leaf_count, BeaconWitnessLeafCount::new(7));
         assert_eq!(recorded.last_live_epoch, Epoch::new(1));
         assert_eq!(recorded.consecutive_misses, 0);
+    }
+
+    /// The witness window base frozen at promotion is byte-identical to
+    /// what the prior state's lookahead derivation read live from
+    /// `boundaries`: the stamp happens before the epoch's fold advances
+    /// the watermark, and nothing mutates `boundaries` between the end
+    /// of one `apply_epoch` and the start of the next.
+    #[test]
+    fn witness_window_base_freeze_matches_prior_lookahead() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::GENESIS,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::GENESIS,
+                consecutive_misses: 0,
+            },
+        );
+        state.witness_window_bases = state.live_witness_bases();
+
+        // Epoch 1 folds a boundary whose chunk applies 7 witness leaves.
+        let root = StateRoot::from_raw(Hash::from_bytes(b"epoch1"));
+        let (header, witnesses) = boundary_block_with_witnesses(shard, 5, 900, root, 7);
+        let qc = qc_over(&header, 1_500);
+        let proposal = BeaconProposal::new(
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: header,
+                witnesses: witnesses.into(),
+            },
+        ))
+        .collect();
+        apply_epoch(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            ApplyEpochInput::Normal {
+                committed: &committed,
+                shard_contributions: &contributions,
+            },
+        );
+
+        // The stamp ran before the fold: window 1's base is the genesis
+        // watermark, not the count the fold just applied.
+        assert_eq!(
+            state.witness_window_bases.get(&shard),
+            Some(&BeaconWitnessLeafCount::ZERO)
+        );
+        // What the lookahead derivation for window 2 reads live now.
+        let lookahead = state.live_witness_bases();
+        assert_eq!(lookahead.get(&shard), Some(&BeaconWitnessLeafCount::new(7)));
+
+        // Window 2's promotion freezes exactly what the lookahead read.
+        apply_epoch(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
+        );
+        assert_eq!(state.witness_window_bases, lookahead);
     }
 
     /// The topology snapshot projects a recorded boundary as a

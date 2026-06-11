@@ -116,6 +116,7 @@ fn initial_state() -> BeaconState {
         shard_committees: shard_committees.clone(),
         next_shard_committees: shard_committees,
         shard_consensus_members: BTreeMap::new(),
+        witness_window_bases: BTreeMap::new(),
         boundaries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };

@@ -293,6 +293,20 @@ pub struct BeaconState {
     /// active one — a Ready or Jail witness folding this epoch takes
     /// consensus effect one window out, exactly like membership changes.
     pub shard_consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
+    /// Per-shard beacon-witness window base for the window this state
+    /// governs, frozen at promotion: each shard's applied witness
+    /// watermark (`boundaries[shard].witness_leaf_count`) as it stood
+    /// when the lookahead committee was promoted — before this epoch's
+    /// fold advances it.
+    ///
+    /// Freezing here keeps the base byte-identical to what the prior
+    /// state's lookahead derivation read live from the same boundaries
+    /// (nothing mutates `boundaries` between the end of one
+    /// `apply_epoch` and the start of the next), so a window's base is
+    /// the same whether a node resolves it from the lookahead schedule
+    /// entry or the re-derived active one — the
+    /// [`Self::shard_consensus_members`] discipline.
+    pub witness_window_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
     /// Per-shard boundary record: the snap-sync anchor (`state_root` /
     /// `block_hash`), the applied witness high-water mark, and the
     /// liveness history. Seeded for every genesis shard so it is never
@@ -562,6 +576,7 @@ impl BeaconState {
         self.derive_topology_from(
             &self.shard_committees,
             self.shard_consensus_members.clone(),
+            self.witness_window_bases.clone(),
             network,
         )
     }
@@ -578,6 +593,7 @@ impl BeaconState {
         self.derive_topology_from(
             &self.next_shard_committees,
             self.ready_consensus_members(&self.next_shard_committees),
+            self.live_witness_bases(),
             network,
         )
     }
@@ -612,10 +628,23 @@ impl BeaconState {
             .collect()
     }
 
+    /// Each shard's applied witness watermark as `boundaries` stand right
+    /// now — the value the next promotion freezes into
+    /// [`Self::witness_window_bases`], and what the lookahead snapshot
+    /// projects for the window it describes.
+    #[must_use]
+    pub fn live_witness_bases(&self) -> BTreeMap<ShardId, BeaconWitnessLeafCount> {
+        self.boundaries
+            .iter()
+            .map(|(shard, boundary)| (*shard, boundary.witness_leaf_count))
+            .collect()
+    }
+
     fn derive_topology_from(
         &self,
         committees: &BTreeMap<ShardId, ShardCommittee>,
         consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
+        witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
         network: NetworkDefinition,
     ) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = self
@@ -656,12 +685,16 @@ impl BeaconState {
             })
             .collect();
 
+        let witness_bases: HashMap<ShardId, BeaconWitnessLeafCount> =
+            witness_bases.into_iter().collect();
+
         TopologySnapshot::from_explicit_committees(
             network,
             &validator_set,
             shard_committees,
             consensus_members,
             boundaries,
+            witness_bases,
         )
     }
 
@@ -834,6 +867,7 @@ mod tests {
             shard_committees: BTreeMap::new(),
             next_shard_committees: BTreeMap::new(),
             shard_consensus_members: BTreeMap::new(),
+            witness_window_bases: BTreeMap::new(),
             boundaries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }
@@ -1071,6 +1105,46 @@ mod tests {
         assert_eq!(
             snapshot.consensus_committee_for_shard(shard),
             [ValidatorId::new(0)]
+        );
+    }
+
+    // ─── witness window bases ─────────────────────────────────────────
+
+    /// The head snapshot projects the promotion-frozen window bases; the
+    /// lookahead snapshot projects the live watermarks the next promotion
+    /// will freeze. A fold advancing `boundaries` mid-window must not
+    /// retroactively move the active window's base.
+    #[test]
+    fn head_projects_frozen_bases_lookahead_projects_live() {
+        let mut state = single_pool_state(4);
+        let shard = ShardId::ROOT;
+        state.witness_window_bases = state.live_witness_bases();
+        let frozen = state.witness_window_bases.get(&shard).copied();
+
+        // The fold advances the live watermark mid-window.
+        state
+            .boundaries
+            .entry(shard)
+            .or_insert(ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::GENESIS,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::GENESIS,
+                consecutive_misses: 0,
+            })
+            .witness_leaf_count = BeaconWitnessLeafCount::new(7);
+
+        let head = state.derive_topology_snapshot(NetworkDefinition::simulator());
+        assert_eq!(
+            head.witness_base(shard),
+            frozen.unwrap_or(BeaconWitnessLeafCount::ZERO)
+        );
+
+        let lookahead = state.derive_next_topology_snapshot(NetworkDefinition::simulator());
+        assert_eq!(
+            lookahead.witness_base(shard),
+            BeaconWitnessLeafCount::new(7)
         );
     }
 
