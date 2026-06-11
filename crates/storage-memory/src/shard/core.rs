@@ -161,6 +161,7 @@ impl SimShardStorage {
     ///
     /// Panics if the internal `RwLock` is poisoned, or if the JMT has
     /// already been initialized.
+    #[must_use]
     #[allow(clippy::implicit_hasher)] // call sites pass std `HashMap`s
     pub fn finalize_genesis_jmt(
         &self,
@@ -191,6 +192,14 @@ impl SimShardStorage {
         }
         for stale_key in &collected.stale_node_keys {
             s.tree_store.remove(stale_key);
+        }
+        // Genesis leaves must be resolvable for snap-sync serving like
+        // any other commit's — every path that writes JMT leaves applies
+        // its collected associations.
+        for a in collected.leaf_associations {
+            if let Some(storage_key) = a.storage_key {
+                s.associations.insert(a.leaf_key, storage_key);
+            }
         }
 
         s.current_block_height = BlockHeight::GENESIS;
