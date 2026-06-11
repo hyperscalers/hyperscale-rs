@@ -48,4 +48,4 @@ pub use shard_io::fetch::witness_history_serve::serve_witness_history_request;
 pub use shard_io::sync::block::BlockSyncStateKind;
 pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
-pub use vnode::{Vnode, VnodeInit};
+pub use vnode::{SeatVnodeGroup, Vnode, VnodeInit, seat_vnode_group};

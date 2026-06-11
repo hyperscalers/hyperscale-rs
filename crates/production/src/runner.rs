@@ -26,15 +26,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
-use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
-use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
-use hyperscale_mempool::{MempoolConfig, TxStore};
+use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
@@ -43,13 +41,15 @@ use hyperscale_network_libp2p::{
     RequestStreamPool, generate_random_keypair,
 };
 use hyperscale_node::shard_loop::{ShardEvent, ShardLoop, TimerOp, timer_event};
-use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
-use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
+use hyperscale_node::{
+    NodeConfig, NodeHost, SeatVnodeGroup, SharedTopologySnapshot, VnodeInit, seat_vnode_group,
+};
+use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, Block, BlockHeight, Bls12381G1PrivateKey,
+    BeaconChainConfig, BeaconGenesisConfig, Block, BlockHeight, Bls12381G1PrivateKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, InFlightCount,
     LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness, RoutableTransaction,
     ShardId, ShardTrie, Stake, StakePoolId, TopologySnapshot, ValidatorId, Verified,
@@ -471,115 +471,41 @@ impl ProductionRunnerBuilder {
             self.beacon_storage
                 .commit_beacon_block(&beacon_genesis_block, &beacon_genesis_state);
         }
-        let (beacon_latest_block, beacon_latest_state) = self
-            .beacon_storage
-            .latest_committed()
-            .expect("beacon chain is non-empty after the genesis commit above");
-
-        // One `ProvisionStore` + `TxStore` + `ExecCertStore` +
-        // `FinalizedWaveStore` per hosted shard, shared across every same-
-        // shard vnode and into the `NodeHost`'s `SharedCaches`. Determinism
-        // guarantees same-shard vnodes admit identical sets, but co-owning
-        // the stores makes the canonical view explicit and gives the
-        // request/sync handlers one place to read. Per-shard scoping
-        // matters for `ProvisionStore`: under cross-shard packing the
-        // co-hosted source-shard's `OutboundProvisionTracker` evicts on
-        // every acknowledged EC, and a host-wide store lets that eviction
-        // delete entries the inbound coordinator on the target shard
-        // still needs to verify proposals against.
-        let provision_stores: HashMap<ShardId, Arc<ProvisionStore>> = local_shards
-            .iter()
-            .map(|s| (*s, Arc::new(ProvisionStore::new())))
-            .collect();
-        let tx_stores: HashMap<ShardId, Arc<TxStore>> = local_shards
-            .iter()
-            .map(|s| (*s, Arc::new(TxStore::new())))
-            .collect();
-        let exec_cert_stores: HashMap<ShardId, Arc<ExecCertStore>> = local_shards
-            .iter()
-            .map(|s| (*s, Arc::new(ExecCertStore::new())))
-            .collect();
-        let finalized_wave_stores: HashMap<ShardId, Arc<FinalizedWaveStore>> = local_shards
-            .iter()
-            .map(|s| (*s, Arc::new(FinalizedWaveStore::new())))
-            .collect();
-
         // One `Arc<BeaconProposalPool>` per host (beacon is process-
         // wide consensus), shared across every co-hosted vnode's
         // coordinator and the inbound `GetBeaconProposalRequest`
         // handler.
         let beacon_proposal_pool = Arc::new(BeaconProposalPool::new(
-            beacon_latest_state.current_epoch.next(),
+            self.beacon_storage
+                .latest_committed_epoch()
+                .expect("beacon chain is non-empty after the genesis commit above")
+                .next(),
         ));
 
-        // Load the topology-history window so each coordinator's schedule
-        // resumes with every committee a consumer frontier still reaches:
-        // the recovered shard tip's anchor (the chain resumes verification
-        // there), each shard's last live boundary, and the tx-artifact
-        // horizon. The same floor bounds eviction on every adoption.
-        let boot_floor = retention_floor(
-            &beacon_latest_state,
-            recovered.committee_anchor_ts(),
-            wall_clock_local(),
-        );
-        let beacon_history: Vec<BeaconState> = self
-            .beacon_storage
-            .states_since(boot_floor)
+        let mut vnodes_by_shard: BTreeMap<ShardId, Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>> =
+            BTreeMap::new();
+        for cfg in vnode_configs {
+            vnodes_by_shard
+                .entry(cfg.local_shard)
+                .or_default()
+                .push((cfg.validator_id, cfg.signing_key));
+        }
+        let vnode_inits: Vec<VnodeInit> = vnodes_by_shard
             .into_iter()
-            .map(|state| state.as_ref().clone())
-            .collect();
-
-        let vnode_inits: Vec<VnodeInit> = vnode_configs
-            .into_iter()
-            .map(|cfg| {
-                let shard = cfg.local_shard;
-                let provision_store = Arc::clone(
-                    provision_stores
-                        .get(&shard)
-                        .expect("hosted shard derived from vnodes"),
-                );
-                let tx_store = Arc::clone(
-                    tx_stores
-                        .get(&shard)
-                        .expect("hosted shard derived from vnodes"),
-                );
-                let exec_cert_store = Arc::clone(
-                    exec_cert_stores
-                        .get(&shard)
-                        .expect("hosted shard derived from vnodes"),
-                );
-                let finalized_wave_store = Arc::clone(
-                    finalized_wave_stores
-                        .get(&shard)
-                        .expect("hosted shard derived from vnodes"),
-                );
-                let beacon_coordinator = BeaconCoordinator::new(
-                    Arc::clone(&beacon_latest_block),
-                    beacon_history.clone(),
-                    cfg.validator_id,
-                    cfg.local_shard,
-                    recovered.committee_anchor_ts(),
-                    beacon_network.clone(),
+            .flat_map(|(shard, vnodes)| {
+                seat_vnode_group(SeatVnodeGroup {
+                    beacon_storage: self.beacon_storage.as_ref(),
+                    proposal_pool: Arc::clone(&beacon_proposal_pool),
+                    beacon_network: beacon_network.clone(),
                     beacon_config_hash,
-                    Arc::clone(&beacon_proposal_pool),
-                );
-                let state = NodeStateMachine::new(
-                    cfg.validator_id,
-                    cfg.local_shard,
-                    &shard_config,
-                    recovered.clone(),
-                    beacon_coordinator,
-                    self.mempool_config.clone(),
-                    self.provision_config,
-                    provision_store,
-                    tx_store,
-                    exec_cert_store,
-                    finalized_wave_store,
-                );
-                VnodeInit {
-                    state,
-                    signing_key: cfg.signing_key,
-                }
+                    now: wall_clock_local(),
+                    shard,
+                    recovered: &recovered,
+                    shard_config: &shard_config,
+                    mempool_config: self.mempool_config.clone(),
+                    provision_config: self.provision_config,
+                    vnodes,
+                })
             })
             .collect();
 

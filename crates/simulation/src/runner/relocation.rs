@@ -14,9 +14,10 @@
 //! Nothing here runs unless a test calls it, so simulations that never
 //! relocate are byte-identical to before.
 
-use hyperscale_beacon::coordinator::retention_floor;
 use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap};
-use hyperscale_node::{serve_state_range_request, serve_witness_history_request};
+use hyperscale_node::{
+    SeatVnodeGroup, seat_vnode_group, serve_state_range_request, serve_witness_history_request,
+};
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::ShardAnchor;
 
@@ -86,7 +87,7 @@ impl SimulationRunner {
             )
         };
 
-        let init = self.runtime_vnode_init(node, validator, shard, recovered);
+        let init = self.runtime_vnode_init(node, validator, shard, &recovered);
         self.hosts[node as usize].add_shard(
             vec![init],
             storage,
@@ -183,58 +184,35 @@ impl SimulationRunner {
         bootstrap.into_recovered_state()
     }
 
-    /// Build a runtime joiner's `VnodeInit`: a beacon coordinator
-    /// resumed from the host's committed beacon chain plus a state
-    /// machine booted from `recovered` — the same construction the
-    /// production supervisor runs at seat time.
+    /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —
+    /// the same construction the production supervisor runs at seat
+    /// time.
     fn runtime_vnode_init(
         &self,
         node: NodeIndex,
         validator: ValidatorId,
         shard: ShardId,
-        recovered: RecoveredState,
+        recovered: &RecoveredState,
     ) -> VnodeInit {
         let host = &self.hosts[node as usize];
-        let beacon_storage = host.beacon_storage();
-        let (latest_block, latest_state) = beacon_storage
-            .latest_committed()
-            .expect("beacon chain is non-empty after genesis");
         let now = LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(0));
-        let boot_floor = retention_floor(&latest_state, recovered.committee_anchor_ts(), now);
-        let beacon_history: Vec<BeaconState> = beacon_storage
-            .states_since(boot_floor)
-            .into_iter()
-            .map(|state| state.as_ref().clone())
-            .collect();
-
-        let beacon_coordinator = BeaconCoordinator::new(
-            Arc::clone(&latest_block),
-            beacon_history,
-            validator,
-            shard,
-            recovered.committee_anchor_ts(),
-            self.beacon_network.clone(),
-            self.beacon_config_hash,
-            Arc::clone(host.process().beacon_proposal_pool()),
+        let signing_key = Arc::clone(
+            &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
         );
-        let state = NodeStateMachine::new(
-            validator,
+        seat_vnode_group(SeatVnodeGroup {
+            beacon_storage: host.beacon_storage().as_ref(),
+            proposal_pool: Arc::clone(host.process().beacon_proposal_pool()),
+            beacon_network: self.beacon_network.clone(),
+            beacon_config_hash: self.beacon_config_hash,
+            now,
             shard,
-            &ShardConsensusConfig::default(),
             recovered,
-            beacon_coordinator,
-            MempoolConfig::default(),
-            ProvisionConfig::default(),
-            Arc::new(ProvisionStore::new()),
-            Arc::new(TxStore::new()),
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizedWaveStore::new()),
-        );
-        VnodeInit {
-            state,
-            signing_key: Arc::clone(
-                &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
-            ),
-        }
+            shard_config: &ShardConsensusConfig::default(),
+            mempool_config: MempoolConfig::default(),
+            provision_config: ProvisionConfig::default(),
+            vnodes: vec![(validator, signing_key)],
+        })
+        .pop()
+        .expect("one vnode in, one init out")
     }
 }
