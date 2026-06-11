@@ -144,7 +144,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&boundary, &root_key, &start, 1_000).unwrap();
+        let chunk = Jmt::collect_range(&boundary, &root_key, &start, &end, 1_000).unwrap();
         assert!(!chunk.leaves.is_empty());
         let proof = Jmt::prove_range(&boundary, &root_key, &start, &end, &chunk).unwrap();
         Jmt::verify_range(
@@ -172,7 +172,7 @@ mod tests {
 
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let root_key = boundary.get_root_key(1).expect("pinned root resolves");
-        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], 10).unwrap();
+        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], &[0xFF; 32], 10).unwrap();
         let (leaf, _) = chunk.leaves.first().expect("one substate committed");
         let (_, value) = boundary.resolve_leaf(leaf).expect("leaf resolves");
         assert_eq!(value, vec![1]);
@@ -211,7 +211,8 @@ mod tests {
 
         let boundary = storage.open_boundary(BlockHeight::new(6)).expect("pinned");
         let root_key = boundary.get_root_key(6).expect("root resolves");
-        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], 1_000).unwrap();
+        let chunk =
+            Jmt::collect_range(&boundary, &root_key, &[0u8; 32], &[0xFF; 32], 1_000).unwrap();
         let leaves: Vec<ImportLeaf> = chunk
             .leaves
             .iter()

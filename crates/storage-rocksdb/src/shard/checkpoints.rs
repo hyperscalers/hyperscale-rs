@@ -325,7 +325,7 @@ mod tests {
         let root_key = store.get_root_key(version).expect("root resolves");
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&store, &root_key, &start, 1_000).unwrap();
+        let chunk = Jmt::collect_range(&store, &root_key, &start, &end, 1_000).unwrap();
         assert!(!chunk.leaves.is_empty());
         assert!(!chunk.more);
         let proof = Jmt::prove_range(&store, &root_key, &start, &end, &chunk).unwrap();
@@ -440,7 +440,8 @@ mod tests {
 
         let boundary = storage.open_boundary(BlockHeight::new(6)).expect("pinned");
         let root_key = boundary.get_root_key(6).expect("root resolves");
-        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], 1_000).unwrap();
+        let chunk =
+            Jmt::collect_range(&boundary, &root_key, &[0u8; 32], &[0xFF; 32], 1_000).unwrap();
         let leaves: Vec<ImportLeaf> = chunk
             .leaves
             .iter()

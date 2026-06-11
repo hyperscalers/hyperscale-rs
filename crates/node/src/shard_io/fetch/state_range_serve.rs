@@ -50,17 +50,9 @@ pub fn serve_state_range_request<S: ShardStorage>(
     }
     let limit = (req.limit as usize).clamp(1, MAX_LEAVES_PER_STATE_RANGE);
 
-    let Ok(mut range) = Jmt::collect_range(&boundary, &root_key, &start, limit) else {
+    let Ok(mut range) = Jmt::collect_range(&boundary, &root_key, &start, &end, limit) else {
         return unavailable;
     };
-
-    // Clip to the requested end. Anything dropped lies past the range,
-    // so the chunk is exhaustive for `[start, end]` regardless of what
-    // the enumeration saw next.
-    if range.leaves.last().is_some_and(|(key, _)| *key > end) {
-        range.leaves.retain(|(key, _)| *key <= end);
-        range.more = false;
-    }
 
     // Resolve raw pairs under the byte budget; stopping early shortens
     // the chunk and signals continuation.

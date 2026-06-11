@@ -26,6 +26,22 @@ pub type Key = [u8; 32];
 /// the value itself lives in application storage alongside.
 pub type ValueHash = Hash;
 
+/// Extract `count` bits (right-aligned, `count <= 8`) from `key`
+/// starting at bit offset `depth_bits` from the MSB.
+pub(crate) fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
+    debug_assert!(count <= 8);
+    debug_assert!(depth_bits as usize + count as usize <= 256);
+
+    let byte = (depth_bits / 8) as usize;
+    let off = (depth_bits % 8) as usize;
+    let hi = u16::from(key[byte]);
+    let lo = u16::from(*key.get(byte + 1).unwrap_or(&0));
+    let combined = (hi << 8) | lo;
+    let shift = 16 - off - count as usize;
+    let mask = (1u16 << count) - 1;
+    u8::try_from((combined >> shift) & mask).unwrap_or(u8::MAX)
+}
+
 /// Maximum tree depth in bits. A 32-byte key has 256 bits; for any
 /// supported arity (1, 2, or 4 bits per level) the depth is bounded by
 /// `256 / ARITY_BITS`.

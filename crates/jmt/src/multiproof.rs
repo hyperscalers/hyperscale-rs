@@ -68,7 +68,7 @@
 //! decoded proof against a root or key set. Use [`Tree::verify`] for that.
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
-use crate::node::{Key, MAX_DEPTH_BITS, Node, NodeKey, ValueHash};
+use crate::node::{Key, MAX_DEPTH_BITS, Node, NodeKey, ValueHash, bits_at};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -276,30 +276,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
             };
         }
 
-        // Every claim must terminate on a reachable depth: within the
-        // 256-bit key space and on the per-level `ARITY_BITS` grid the
-        // walk steps through. A claim off the grid never matches the
-        // recursion depth, so the bucket split keeps descending and
-        // `bits_at` indexes a key byte past its end. Bounding the whole
-        // claim set here keeps `verify_rec` and `siblings_needed` from
-        // ever descending past the tree height on a peer-supplied proof.
-        for claim in &proof.claims {
-            if claim.depth_bits > MAX_DEPTH_BITS || claim.depth_bits % u16::from(ARITY_BITS) != 0 {
-                return Err(ProofError::Malformed("claim depth off the arity grid"));
-            }
-            // A claim terminating above the proof's root never matches the
-            // recursion depth, so the bucket split would descend past the
-            // key space and index out of bounds.
-            if claim.depth_bits < proof.root_depth_bits {
-                return Err(ProofError::Malformed("claim depth above the proof root"));
-            }
-        }
-
-        if proof.root_depth_bits > MAX_DEPTH_BITS
-            || !proof.root_depth_bits.is_multiple_of(u16::from(ARITY_BITS))
-        {
-            return Err(ProofError::Malformed("root depth off the arity grid"));
-        }
+        check_claim_grid::<ARITY_BITS>(&proof.claims, proof.root_depth_bits)?;
 
         // Reconstruct root by walking the claim topology, starting at the depth
         // the tree is rooted at (zero for a whole-keyspace tree).
@@ -322,20 +299,64 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
 // Internal helpers
 // ============================================================
 
-/// Extract `count` bits from `key` starting at bit offset `depth_bits`
-/// from the MSB.
-pub(crate) fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
-    debug_assert!(count <= 8);
-    debug_assert!(depth_bits as usize + count as usize <= 256);
+/// Bound every claim onto the arity grid the reconstruction walks, at
+/// or below the proof root, and the root itself onto the grid.
+///
+/// A claim off the grid never matches the recursion depth, so the
+/// bucket split would keep descending and `bits_at` would index a key
+/// byte past its end; bounding the whole claim set up front keeps the
+/// walk (and `siblings_needed`) from ever descending past the tree
+/// height on a peer-supplied proof.
+pub(crate) fn check_claim_grid<const ARITY_BITS: u8>(
+    claims: &[ProofClaim],
+    root_depth_bits: u16,
+) -> Result<(), ProofError> {
+    for claim in claims {
+        if claim.depth_bits > MAX_DEPTH_BITS
+            || !claim.depth_bits.is_multiple_of(u16::from(ARITY_BITS))
+        {
+            return Err(ProofError::Malformed("claim depth off the arity grid"));
+        }
+        // A claim terminating above the proof's root never matches the
+        // recursion depth either.
+        if claim.depth_bits < root_depth_bits {
+            return Err(ProofError::Malformed("claim depth above the proof root"));
+        }
+    }
+    if root_depth_bits > MAX_DEPTH_BITS || !root_depth_bits.is_multiple_of(u16::from(ARITY_BITS)) {
+        return Err(ProofError::Malformed("root depth off the arity grid"));
+    }
+    Ok(())
+}
 
-    let byte = (depth_bits / 8) as usize;
-    let off = (depth_bits % 8) as usize;
-    let hi = u16::from(key[byte]);
-    let lo = u16::from(*key.get(byte + 1).unwrap_or(&0));
-    let combined = (hi << 8) | lo;
-    let shift = 16 - off - count as usize;
-    let mask = (1u16 << count) - 1;
-    u8::try_from((combined >> shift) & mask).unwrap_or(u8::MAX)
+/// Resolve a co-terminal claim group: when every claim pinpoints
+/// `depth` they all describe one terminal node — several claims may
+/// share it (a leaf claim plus boundary anchors terminating at the
+/// same divergent leaf or empty slot) and must agree on what it is.
+/// `Ok(None)` means no claim terminates here and the walk descends;
+/// mixed depths at one subtree are malformed.
+pub(crate) fn terminal_group<H: Hasher>(
+    claims: &[ProofClaim],
+    depth: u16,
+) -> Result<Option<Hash>, ProofError> {
+    debug_assert!(!claims.is_empty());
+    let all_terminal = claims.iter().all(|c| c.depth_bits == depth);
+    let any_terminal = claims.iter().any(|c| c.depth_bits == depth);
+    if any_terminal && !all_terminal {
+        return Err(ProofError::Malformed(
+            "mixed termination depths at same subtree",
+        ));
+    }
+    if !all_terminal {
+        return Ok(None);
+    }
+    let hash = termination_hash::<H>(&claims[0]);
+    if claims[1..].iter().any(|c| termination_hash::<H>(c) != hash) {
+        return Err(ProofError::Malformed(
+            "inconsistent claims at one terminal node",
+        ));
+    }
+    Ok(Some(hash))
 }
 
 pub(crate) fn termination_hash<H: Hasher>(claim: &ProofClaim) -> Hash {
@@ -466,20 +487,8 @@ where
 {
     debug_assert!(!claims.is_empty());
 
-    // Terminal: all claims pinpoint the current depth.
-    let all_terminal = claims.iter().all(|c| c.depth_bits == depth);
-    let any_terminal = claims.iter().any(|c| c.depth_bits == depth);
-    if any_terminal && !all_terminal {
-        return Err(ProofError::Malformed(
-            "mixed termination depths at same subtree",
-        ));
-    }
-    if all_terminal {
-        // All claims must agree on the termination content. We derive
-        // the hash from the first claim; consistency checking across
-        // claims is left to the application layer (expected_claims
-        // matching in verify()).
-        return Ok((termination_hash::<H>(&claims[0]), 0));
+    if let Some(hash) = terminal_group::<H>(claims, depth)? {
+        return Ok((hash, 0));
     }
 
     // Non-terminal: split claims by bucket at this depth.
@@ -885,6 +894,41 @@ mod tests {
 
     fn v(b: u8) -> ValueHash {
         [b; 32]
+    }
+
+    /// Co-terminal claims must agree on the terminal node's content.
+    /// The reconstruction hashes one claim of the group; without the
+    /// consistency check a prover could attach a co-terminal claim
+    /// with arbitrary content to an otherwise valid proof.
+    #[test]
+    fn inconsistent_co_terminal_claims_rejected() {
+        let entries: Vec<(Key, ValueHash)> = (0u8..4).map(|i| (k(i), v(i))).collect();
+        let (store, root, root_hash) = build_store(&entries);
+
+        // X routes to leaf k(0) and diverges there: co-terminal with it.
+        let mut x = k(0);
+        x[31] = 1;
+        let mut proof = Jmt::prove(&store, &root, &[k(0), x]).unwrap();
+        assert_eq!(proof.claims.len(), 2);
+        assert_eq!(proof.claims[0].key, k(0));
+        assert_eq!(proof.claims[0].depth_bits, proof.claims[1].depth_bits);
+
+        // Tamper the mismatch claim's stored leaf content.
+        if let ClaimTermination::LeafMismatch {
+            stored_value_hash, ..
+        } = &mut proof.claims[1].termination
+        {
+            *stored_value_hash = [0xEE; 32];
+        } else {
+            panic!("second claim should be a LeafMismatch");
+        }
+
+        let err = Jmt::verify(&proof, root_hash, &[(k(0), Some(v(0)))]).unwrap_err();
+        assert!(matches!(err, ProofError::Malformed(_)));
+
+        // The untampered group still verifies.
+        let clean = Jmt::prove(&store, &root, &[k(0), x]).unwrap();
+        Jmt::verify(&clean, root_hash, &[(k(0), Some(v(0)))]).unwrap();
     }
 
     fn build_store(entries: &[(Key, ValueHash)]) -> (MemoryStore, NodeKey, Hash) {

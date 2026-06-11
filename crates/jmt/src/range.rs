@@ -5,8 +5,8 @@
 //! shard's attested subtree root. Three primitives:
 //!
 //! - [`Tree::collect_range`] — enumerate up to `limit` leaves with
-//!   `key >= start`, in ascending key order, at a pinned version
-//!   (server side).
+//!   keys in `[start, end]`, in ascending key order, at a pinned
+//!   version (server side).
 //! - [`Tree::prove_range`] — build a [`MultiProof`] covering a collected
 //!   chunk (server side).
 //! - [`Tree::verify_range`] — check a chunk against an expected root:
@@ -46,9 +46,9 @@
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 use crate::multiproof::{
-    ClaimTermination, MultiProof, ProofClaim, ProofError, bits_at, termination_hash,
+    ClaimTermination, MultiProof, ProofClaim, ProofError, check_claim_grid, terminal_group,
 };
-use crate::node::{Key, MAX_DEPTH_BITS, NibblePath, Node, NodeKey, ValueHash};
+use crate::node::{Key, NibblePath, Node, NodeKey, ValueHash, bits_at};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -65,11 +65,14 @@ pub struct RangeChunk {
 }
 
 impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
-    /// Enumerate up to `limit` leaves with `key >= start`, in ascending
-    /// key order, from the tree rooted at `root_key`.
+    /// Enumerate up to `limit` leaves with keys in `[start, end]`
+    /// (inclusive), in ascending key order, from the tree rooted at
+    /// `root_key`.
     ///
     /// `root_key` pins both the version and the rooting prefix, so the
-    /// enumeration is a consistent point-in-time read.
+    /// enumeration is a consistent point-in-time read. Subtrees outside
+    /// the span are skipped, so the walk's cost tracks the span's leaf
+    /// population, not the tree's.
     ///
     /// # Errors
     ///
@@ -77,11 +80,12 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     /// in `store` (never committed or pruned — never conflated with an
     /// empty range), [`ProofError::MissingNode`] if a referenced child has
     /// been pruned underneath the walk, or [`ProofError::Malformed`] for a
-    /// zero `limit`.
+    /// zero `limit` or an inverted range.
     pub fn collect_range<S>(
         store: &S,
         root_key: &NodeKey,
         start: &Key,
+        end: &Key,
         limit: usize,
     ) -> Result<RangeChunk, ProofError>
     where
@@ -90,13 +94,16 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         if limit == 0 {
             return Err(ProofError::Malformed("zero range limit"));
         }
+        if start > end {
+            return Err(ProofError::Malformed("inverted range"));
+        }
         if store.get_node(root_key).is_none() {
             return Err(ProofError::RootMissing);
         }
         // Collect one extra leaf: its presence is the `more` signal.
         let mut leaves = Vec::new();
         let mut current = root_key.clone();
-        collect_rec::<S, ARITY_BITS>(store, &mut current, start, limit + 1, &mut leaves)?;
+        collect_rec::<S, ARITY_BITS>(store, &mut current, (start, end), limit + 1, &mut leaves)?;
         let more = leaves.len() > limit;
         if more {
             leaves.truncate(limit);
@@ -164,9 +171,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         if proof.root_depth_bits != root_depth {
             return Err(ProofError::Malformed("proof rooted at unexpected depth"));
         }
-        if root_depth > MAX_DEPTH_BITS || !root_depth.is_multiple_of(u16::from(ARITY_BITS)) {
-            return Err(ProofError::Malformed("root depth off the arity grid"));
-        }
+        check_claim_grid::<ARITY_BITS>(&proof.claims, root_depth)?;
         if start > requested_end {
             return Err(ProofError::Malformed("inverted range"));
         }
@@ -211,18 +216,6 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         }
 
         check_claims_match_chunk(&proof.claims, chunk, start, &span_end)?;
-
-        // Same structural bounds as `Tree::verify`.
-        for claim in &proof.claims {
-            if claim.depth_bits > MAX_DEPTH_BITS
-                || !claim.depth_bits.is_multiple_of(u16::from(ARITY_BITS))
-            {
-                return Err(ProofError::Malformed("claim depth off the arity grid"));
-            }
-            if claim.depth_bits < root_depth {
-                return Err(ProofError::Malformed("claim depth above the proof root"));
-            }
-        }
 
         // Reconstruct the root, rejecting any non-empty sibling inside
         // the span.
@@ -293,11 +286,12 @@ fn check_claims_match_chunk(
     Ok(())
 }
 
-/// Depth-first in-order leaf collection, capped at `cap` entries.
+/// Depth-first in-order leaf collection over `span` (inclusive),
+/// capped at `cap` entries.
 fn collect_rec<S, const ARITY_BITS: u8>(
     store: &S,
     node_key: &mut NodeKey,
-    start: &Key,
+    span: (&Key, &Key),
     cap: usize,
     out: &mut Vec<(Key, ValueHash)>,
 ) -> Result<(), ProofError>
@@ -316,7 +310,7 @@ where
 
     match &*node {
         Node::Leaf(leaf) => {
-            if leaf.key >= *start {
+            if leaf.key >= *span.0 && leaf.key <= *span.1 {
                 out.push((leaf.key, leaf.value_hash));
             }
         }
@@ -329,14 +323,15 @@ where
                     continue;
                 };
                 let bucket_u8 = u8::try_from(bucket).unwrap_or(u8::MAX);
-                // Skip subtrees entirely left of `start`.
-                if subtree_high(&node_key.path, bucket_u8, ARITY_BITS) < *start {
+                // Skip subtrees entirely outside the span.
+                let (low, high) = subspan(&node_key.path, ARITY_BITS, u64::from(bucket_u8));
+                if high < *span.0 || low > *span.1 {
                     continue;
                 }
                 let saved_version = node_key.version;
                 node_key.version = child.version;
                 node_key.path.push_bits(bucket_u8, ARITY_BITS);
-                let result = collect_rec::<S, ARITY_BITS>(store, node_key, start, cap, out);
+                let result = collect_rec::<S, ARITY_BITS>(store, node_key, span, cap, out);
                 node_key.path.truncate(depth);
                 node_key.version = saved_version;
                 result?;
@@ -364,23 +359,7 @@ where
 {
     debug_assert!(!claims.is_empty());
 
-    let all_terminal = claims.iter().all(|c| c.depth_bits == depth);
-    let any_terminal = claims.iter().any(|c| c.depth_bits == depth);
-    if any_terminal && !all_terminal {
-        return Err(ProofError::Malformed(
-            "mixed termination depths at same subtree",
-        ));
-    }
-    if all_terminal {
-        // Several claims may share a terminal node (a leaf claim plus
-        // boundary anchors terminating at the same divergent leaf or
-        // empty slot); they must agree on what that node is.
-        let hash = termination_hash::<H>(&claims[0]);
-        if claims[1..].iter().any(|c| termination_hash::<H>(c) != hash) {
-            return Err(ProofError::Malformed(
-                "inconsistent claims at one terminal node",
-            ));
-        }
+    if let Some(hash) = terminal_group::<H>(claims, depth)? {
         return Ok((hash, 0));
     }
 
@@ -436,15 +415,6 @@ where
         return Err(ProofError::Malformed("claims not covered by bucket split"));
     }
     Ok((H::hash_internal(&children), consumed))
-}
-
-/// Largest key inside the subtree at `path` extended by `bucket`.
-fn subtree_high(path: &NibblePath, bucket: u8, arity_bits: u8) -> Key {
-    let mut key = [0u8; 32];
-    key[..path.as_bytes().len()].copy_from_slice(path.as_bytes());
-    set_bits(&mut key, path.len(), arity_bits, bucket);
-    fill_ones_from(&mut key, path.len() + u16::from(arity_bits));
-    key
 }
 
 /// The key immediately after `key`, or `None` at the key-space maximum.
@@ -610,7 +580,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 50);
         assert!(!chunk.more);
 
@@ -645,7 +615,7 @@ mod tests {
         let mut collected: Vec<(Key, ValueHash)> = Vec::new();
         let mut cursor = span_low;
         loop {
-            let chunk = Jmt::collect_range(&store, &root_key, &cursor, 5).unwrap();
+            let chunk = Jmt::collect_range(&store, &root_key, &cursor, &span_high, 5).unwrap();
             let proof = Jmt::prove_range(&store, &root_key, &cursor, &span_high, &chunk).unwrap();
             Jmt::verify_range(&proof, root_hash, &prefix, &cursor, &span_high, &chunk).unwrap();
             collected.extend_from_slice(&chunk.leaves);
@@ -676,7 +646,7 @@ mod tests {
 
         let cursor = next_key(&k(13)).unwrap();
         let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&store, &root, &cursor, 100).unwrap();
+        let chunk = Jmt::collect_range(&store, &root, &cursor, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 18);
         let proof = Jmt::prove_range(&store, &root, &cursor, &end, &chunk).unwrap();
         Jmt::verify_range(
@@ -697,7 +667,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let mut chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.remove(5);
         // The server proves exactly what it returned — the omitted leaf's
         // subtree becomes a sibling inside the span.
@@ -721,7 +691,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let mut chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.pop();
         assert!(!chunk.more);
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
@@ -744,7 +714,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let mut chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.pop();
         chunk.more = true;
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
@@ -766,7 +736,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let mut chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
         chunk.leaves[3].1 = v(99);
         let err = Jmt::verify_range(
@@ -788,7 +758,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let mut chunk = Jmt::collect_range(&store, &root, &start, 100).unwrap();
+        let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         // Insert a leaf the tree does not hold (odd key inside the range).
         chunk.leaves.insert(3, (k(5), v(55)));
         chunk.leaves.sort_unstable_by_key(|(key, _)| *key);
@@ -908,7 +878,7 @@ mod tests {
         let (store, root_key, root_hash, _prefix, _entries) = build_prefix_store(8);
         let (span_low, span_high) = prefix_span();
 
-        let chunk = Jmt::collect_range(&store, &root_key, &span_low, 100).unwrap();
+        let chunk = Jmt::collect_range(&store, &root_key, &span_low, &span_high, 100).unwrap();
         let proof = Jmt::prove_range(&store, &root_key, &span_low, &span_high, &chunk).unwrap();
         // The proof is rooted at the 4-bit prefix; claiming the empty
         // root path must be rejected before any reconstruction.
@@ -953,7 +923,7 @@ mod tests {
 
         let start = k(2);
         let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], 100).unwrap();
+        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 100).unwrap();
         // First leaf (key 0) precedes the verified range start.
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
         let err = Jmt::verify_range(
@@ -973,23 +943,66 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i * 3), v(i))).collect();
         let (store, root, _root_hash) = build_store(&entries);
 
-        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], 4).unwrap();
+        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 4).unwrap();
         assert_eq!(chunk.leaves.len(), 4);
         assert!(chunk.more);
         let keys: Vec<Key> = chunk.leaves.iter().map(|(key, _)| *key).collect();
         assert_eq!(keys, vec![k(0), k(3), k(6), k(9)]);
 
-        let resumed = Jmt::collect_range(&store, &root, &next_key(&k(9)).unwrap(), 100).unwrap();
+        let resumed =
+            Jmt::collect_range(&store, &root, &next_key(&k(9)).unwrap(), &[0xFFu8; 32], 100)
+                .unwrap();
         assert_eq!(resumed.leaves.len(), 6);
         assert!(!resumed.more);
         assert_eq!(resumed.leaves.first().unwrap().0, k(12));
     }
 
     #[test]
+    fn collect_range_honors_the_end_bound() {
+        let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
+        let (store, root, _root_hash) = build_store(&entries);
+
+        // End mid-tree: enumeration stops at the bound, exhaustively.
+        let chunk = Jmt::collect_range(&store, &root, &k(2), &k(6), 100).unwrap();
+        let keys: Vec<Key> = chunk.leaves.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, vec![k(2), k(3), k(4), k(5), k(6)]);
+        assert!(!chunk.more, "no in-range leaves remain");
+
+        // End exactly on a leaf key: the leaf is included.
+        let chunk = Jmt::collect_range(&store, &root, &k(0), &k(0), 100).unwrap();
+        assert_eq!(chunk.leaves.len(), 1);
+        assert!(!chunk.more);
+
+        // `more` reflects in-range leaves only, even when the next
+        // tree leaf past the limit probe lies outside the span.
+        let chunk = Jmt::collect_range(&store, &root, &k(2), &k(6), 3).unwrap();
+        assert_eq!(chunk.leaves.len(), 3);
+        assert!(chunk.more, "in-range leaves remain past the limit");
+        let chunk = Jmt::collect_range(&store, &root, &k(2), &k(6), 5).unwrap();
+        assert_eq!(chunk.leaves.len(), 5);
+        assert!(!chunk.more, "the span is exhausted at exactly the limit");
+    }
+
+    #[test]
+    fn collect_range_empty_span_collects_nothing() {
+        // A span between two adjacent leaves holds nothing; the walk
+        // must not spill into leaves past `end`.
+        let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i * 10), v(i))).collect();
+        let (store, root, _root_hash) = build_store(&entries);
+
+        let chunk = Jmt::collect_range(&store, &root, &k(1), &k(9), 100).unwrap();
+        assert!(chunk.leaves.is_empty());
+        assert!(!chunk.more);
+
+        let err = Jmt::collect_range(&store, &root, &k(9), &k(1), 100).unwrap_err();
+        assert!(matches!(err, ProofError::Malformed(_)));
+    }
+
+    #[test]
     fn collect_range_missing_root_errors() {
         let store = MemoryStore::new();
         let root = NodeKey::root(1);
-        let err = Jmt::collect_range(&store, &root, &[0u8; 32], 10).unwrap_err();
+        let err = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 10).unwrap_err();
         assert!(matches!(err, ProofError::RootMissing));
     }
 
@@ -1006,7 +1019,7 @@ mod tests {
 
         let start = [0u8; 32];
         let end = [0xFFu8; 32];
-        let chunk = Jmt4::collect_range(&store, &root, &start, 100).unwrap();
+        let chunk = Jmt4::collect_range(&store, &root, &start, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 16);
         let proof = Jmt4::prove_range(&store, &root, &start, &end, &chunk).unwrap();
         Jmt4::verify_range(
