@@ -132,6 +132,16 @@ pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 /// permanent regardless of this value.
 pub const JAIL_COOLDOWN_EPOCHS: u64 = 16;
 
+/// How many quiet epochs cancel a pending shard reshape.
+///
+/// Reshape triggers re-derive once per witness window while the load
+/// condition holds, so an admitted reshape whose condition lapsed (a
+/// split target that drained, a merge child that regrew) stops
+/// re-asserting and its record drops once `current_epoch −
+/// last_asserted` reaches this bound. The same bound expires a lone
+/// merge half whose sibling never asserts.
+pub const RESHAPE_TRIGGER_TTL_EPOCHS: u64 = 2;
+
 /// How long a stake-pool withdrawal request remains pending before its
 /// amount is released and any resulting auto-deactivations apply.
 ///

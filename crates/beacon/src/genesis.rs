@@ -150,6 +150,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         shard_consensus_members: BTreeMap::new(),
         witness_window_bases: BTreeMap::new(),
         boundaries,
+        pending_reshapes: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };
     // Genesis placements are `ready: true` by construction, so the frozen

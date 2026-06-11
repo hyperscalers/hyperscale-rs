@@ -16,7 +16,9 @@ use crate::state::committee::{diff_shard_committees, resample_beacon_committee, 
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
-use crate::state::witness::{WitnessOutcome, apply_contribution_witnesses, ingest_equivocations};
+use crate::state::witness::{
+    WitnessOutcome, apply_contribution_witnesses, ingest_equivocations, prune_stale_reshapes,
+};
 
 /// Discriminator for [`apply_epoch`] — distinguishes a Normal epoch
 /// from a Skip epoch (empty proposal set, committee resampled with
@@ -146,6 +148,11 @@ pub fn apply_epoch(
     } else {
         WitnessOutcome::default()
     };
+
+    // Sweep pending reshapes whose triggers went quiet — after the
+    // epoch's witnesses applied, so an assertion folded this epoch is
+    // never swept.
+    prune_stale_reshapes(state);
 
     let vrf = filter_and_roll_randomness(state, network, epoch, committed);
     // Equivocation evidence rides committed proposals; shard-witness lifts

@@ -226,6 +226,32 @@ pub struct ShardBoundary {
     pub consecutive_misses: u32,
 }
 
+/// An admitted, not-yet-executed shard reshape, keyed in
+/// [`BeaconState::pending_reshapes`] by its target: the splitting shard
+/// itself, or the parent a merge reforms under.
+///
+/// Liveness is assertion-driven: a shard's trigger re-derives once per
+/// witness window while its load condition holds, each fold refreshing
+/// the recorded epoch. A record whose every required assertion goes
+/// quiet for [`RESHAPE_TRIGGER_TTL_EPOCHS`](crate::RESHAPE_TRIGGER_TTL_EPOCHS)
+/// epochs cancels — a drained split target or regrown merge child
+/// self-cancels by falling silent.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub enum PendingReshape {
+    /// The target shard splits into its two children.
+    Split {
+        /// Epoch the shard's trigger last folded.
+        last_asserted: Epoch,
+    },
+    /// The target parent's two children merge back under it. The merge
+    /// is paired — eligible for scheduling — once both children hold a
+    /// live half.
+    Merge {
+        /// Per-child epoch of the most recent folded assertion.
+        halves: BTreeMap<ShardId, Epoch>,
+    },
+}
+
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
 ///
 /// Cross-validator agreement on every field at every epoch follows from
@@ -315,6 +341,11 @@ pub struct BeaconState {
     /// which also advances `witness_leaf_count` as it applies each
     /// boundary contribution's witness chunk.
     pub boundaries: BTreeMap<ShardId, ShardBoundary>,
+    /// Admitted shard reshapes awaiting execution, keyed by target
+    /// (the splitting shard / the merge parent). Written by the witness
+    /// fold's trigger admission; pruned by the per-epoch staleness
+    /// sweep when assertions go quiet.
+    pub pending_reshapes: BTreeMap<ShardId, PendingReshape>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -518,6 +549,23 @@ impl BeaconState {
             .filter(|(_, r)| matches!(r.status, ValidatorStatus::Pooled))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Whether `shard` is already involved in a pending reshape — as a
+    /// split target, or as a child of a pending merge. Reshapes never
+    /// overlap: trigger admission rejects a target this returns `true`
+    /// for.
+    #[must_use]
+    pub fn reshape_involves(&self, shard: ShardId) -> bool {
+        self.pending_reshapes
+            .iter()
+            .any(|(target, reshape)| match reshape {
+                PendingReshape::Split { .. } => *target == shard,
+                PendingReshape::Merge { .. } => {
+                    let (left, right) = target.children();
+                    shard == left || shard == right
+                }
+            })
     }
 
     /// Validators eligible to serve on the beacon committee: status is
@@ -869,6 +917,7 @@ mod tests {
             shard_consensus_members: BTreeMap::new(),
             witness_window_bases: BTreeMap::new(),
             boundaries: BTreeMap::new(),
+            pending_reshapes: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }
     }

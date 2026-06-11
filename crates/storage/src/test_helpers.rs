@@ -270,6 +270,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
         shard_consensus_members: BTreeMap::new(),
         witness_window_bases: BTreeMap::new(),
         boundaries: BTreeMap::new(),
+        pending_reshapes: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     })
 }

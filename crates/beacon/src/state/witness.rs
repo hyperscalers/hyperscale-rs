@@ -1,13 +1,13 @@
 //! Witness ingestion: dedup, watermark gating, per-payload dispatch,
 //! and equivocation re-verification.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingWithdrawal, ShardId, ShardWitness,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
-    verify_vote_equivocation,
+    BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
+    RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitness, ShardWitnessPayload, Stake, StakePool,
+    ValidatorId, ValidatorRecord, ValidatorStatus, verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -368,12 +368,119 @@ pub(super) fn apply_shard_payload(
             );
             Some(ShardEvent::Jailed(*proposer_id))
         }
-        ShardWitnessPayload::ScheduleSplit { .. } | ShardWitnessPayload::ScheduleMerge { .. } => {
-            // Reshape triggers are inert to the fold: the beacon does
-            // not admit reshape scheduling.
+        ShardWitnessPayload::ScheduleSplit { shard } => {
+            // Source pinning: only the shard itself asserts its split.
+            if source_shard != *shard {
+                return None;
+            }
+            // Re-assertion of an in-flight split refreshes the
+            // staleness clock and nothing else.
+            if let Some(PendingReshape::Split { last_asserted }) =
+                state.pending_reshapes.get_mut(shard)
+            {
+                *last_asserted = state.current_epoch;
+                return None;
+            }
+            // The target must be an active trie leaf, free of any
+            // overlapping reshape.
+            if !state.shard_committees.contains_key(shard) || state.reshape_involves(*shard) {
+                return None;
+            }
+            // The shard ceiling counts splits already admitted but not
+            // yet executed — each adds one net shard.
+            let pending_splits = state
+                .pending_reshapes
+                .values()
+                .filter(|r| matches!(r, PendingReshape::Split { .. }))
+                .count();
+            if state.shard_committees.len() + pending_splits + 1 > MAX_SHARDS {
+                return None;
+            }
+            // Pool gate: the grow phase draws a full committee's worth
+            // of observers; refuse what the pool can't staff. Rejection
+            // isn't an error — the shard re-asserts next window and
+            // admission resumes when the pool allows.
+            if state.pooled_validators().len() < state.chain_config.shard_size as usize {
+                return None;
+            }
+            tracing::info!(?shard, "Shard split admitted; reshape pending");
+            state.pending_reshapes.insert(
+                *shard,
+                PendingReshape::Split {
+                    last_asserted: state.current_epoch,
+                },
+            );
+            None
+        }
+        ShardWitnessPayload::ScheduleMerge { parent } => {
+            // Source pinning: only a child asserts the merge under its
+            // parent.
+            if source_shard.parent() != Some(*parent) {
+                return None;
+            }
+            // Both children must be active trie leaves.
+            let (left, right) = parent.children();
+            if !state.shard_committees.contains_key(&left)
+                || !state.shard_committees.contains_key(&right)
+            {
+                return None;
+            }
+            // Record or refresh this child's half. The merge pairs —
+            // becomes schedulable — once both children hold a live
+            // half; a lone half expires via the staleness sweep.
+            if let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get_mut(parent) {
+                halves.insert(source_shard, state.current_epoch);
+                return None;
+            }
+            // Neither child may be involved in another reshape (the
+            // same-parent merge was handled by the refresh above).
+            if state.reshape_involves(left) || state.reshape_involves(right) {
+                return None;
+            }
+            tracing::info!(
+                ?parent,
+                child = ?source_shard,
+                "Shard merge half asserted; awaiting the sibling"
+            );
+            state.pending_reshapes.insert(
+                *parent,
+                PendingReshape::Merge {
+                    halves: BTreeMap::from([(source_shard, state.current_epoch)]),
+                },
+            );
             None
         }
     }
+}
+
+/// Cancel pending reshapes whose triggers went quiet.
+///
+/// Triggers re-derive once per witness window while the load condition
+/// holds, so every live assertion refreshes each epoch. A split whose
+/// target stopped asserting (it drained below the threshold), or a
+/// merge half whose child stopped (it regrew), drops once the silence
+/// reaches [`RESHAPE_TRIGGER_TTL_EPOCHS`]; a merge record with no live
+/// halves left drops entirely. Runs after the epoch's witnesses apply,
+/// so an assertion folded this epoch is never swept.
+pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
+    let current = state.current_epoch.inner();
+    state.pending_reshapes.retain(|target, reshape| {
+        let keep = match reshape {
+            PendingReshape::Split { last_asserted } => {
+                current.saturating_sub(last_asserted.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
+            }
+            PendingReshape::Merge { halves } => {
+                halves.retain(|_, last| {
+                    current.saturating_sub(last.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
+                });
+                !halves.is_empty()
+            }
+        };
+        if !keep {
+            tracing::info!(?target, "Pending reshape cancelled — trigger went quiet");
+        }
+        keep
+    });
 }
 
 #[cfg(test)]
@@ -381,9 +488,9 @@ mod tests {
 
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
-        BlockHeight, EMISSIONS_PER_EPOCH, Epoch, JAIL_COOLDOWN_EPOCHS, JailReason, MIN_STAKE_FLOOR,
-        MISSED_PROPOSAL_JAIL_THRESHOLD, Round, ShardCommittee, ShardId, ShardWitnessPayload, Stake,
-        StakePool, StakePoolId, ValidatorId, ValidatorStatus,
+        BlockHeight, EMISSIONS_PER_EPOCH, Epoch, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
+        MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Round, ShardCommittee,
+        ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
     use super::*;
@@ -1424,5 +1531,200 @@ mod tests {
                 reason: JailReason::Equivocation,
             },
         );
+    }
+
+    // ─── reshape trigger admission ───────────────────────────────────────
+
+    /// A state with the given shards as active trie leaves and `pooled`
+    /// validators free in the global pool, with a small committee
+    /// target so the pool gate is exercisable.
+    fn reshape_state(active: &[ShardId], pooled: u64) -> BeaconState {
+        let mut state = single_pool_state(0);
+        state.current_epoch = Epoch::new(5);
+        state.chain_config.shard_size = 4;
+        for shard in active {
+            state
+                .shard_committees
+                .insert(*shard, ShardCommittee::default());
+        }
+        for i in 0..pooled {
+            let id = 1000 + i;
+            state.validators.insert(
+                ValidatorId::new(id),
+                validator_record(id, 0, ValidatorStatus::Pooled),
+            );
+        }
+        state
+    }
+
+    fn split_payload(shard: ShardId) -> ShardWitnessPayload {
+        ShardWitnessPayload::ScheduleSplit { shard }
+    }
+
+    /// Admission records the pending split when the target is an active
+    /// leaf and the pool can staff a full observer cohort.
+    #[test]
+    fn split_admission_records_pending_when_pool_can_staff() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 4);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert_eq!(
+            state.pending_reshapes.get(&p),
+            Some(&PendingReshape::Split {
+                last_asserted: Epoch::new(5),
+            }),
+        );
+    }
+
+    /// The pool gate refuses what it can't staff; admission resumes
+    /// once the pool refills (re-assertion is automatic shard-side).
+    #[test]
+    fn split_rejected_until_pool_can_staff() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 3);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert!(state.pending_reshapes.is_empty());
+
+        state.validators.insert(
+            ValidatorId::new(2000),
+            validator_record(2000, 0, ValidatorStatus::Pooled),
+        );
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert!(state.pending_reshapes.contains_key(&p));
+    }
+
+    /// Only the shard itself may assert its split, and only a child may
+    /// assert the merge under its parent.
+    #[test]
+    fn reshape_triggers_are_source_pinned() {
+        let p = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let mut state = reshape_state(&[p, sibling], 4);
+
+        apply_shard_payload(&mut state, sibling, &split_payload(p));
+        assert!(state.pending_reshapes.is_empty());
+
+        // A merge under ROOT asserted by a non-child source.
+        let stranger = ShardId::leaf(2, 0b11);
+        apply_shard_payload(
+            &mut state,
+            stranger,
+            &ShardWitnessPayload::ScheduleMerge {
+                parent: ShardId::ROOT,
+            },
+        );
+        assert!(state.pending_reshapes.is_empty());
+    }
+
+    /// A split target that isn't an active trie leaf is dropped.
+    #[test]
+    fn split_rejected_on_inactive_target() {
+        let p = ShardId::leaf(1, 0);
+        let elsewhere = ShardId::leaf(1, 1);
+        let mut state = reshape_state(&[elsewhere], 4);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert!(state.pending_reshapes.is_empty());
+    }
+
+    /// Re-assertion refreshes the staleness clock; silence for
+    /// `RESHAPE_TRIGGER_TTL_EPOCHS` cancels the pending reshape.
+    #[test]
+    fn split_reassertion_refreshes_and_silence_cancels() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 4);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+
+        state.current_epoch = Epoch::new(6);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert_eq!(
+            state.pending_reshapes.get(&p),
+            Some(&PendingReshape::Split {
+                last_asserted: Epoch::new(6),
+            }),
+        );
+
+        // One quiet epoch survives the sweep; the second cancels.
+        state.current_epoch = Epoch::new(7);
+        prune_stale_reshapes(&mut state);
+        assert!(state.pending_reshapes.contains_key(&p));
+        state.current_epoch = Epoch::new(8);
+        prune_stale_reshapes(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+    }
+
+    /// Merge halves pair across the two children; a lone half expires
+    /// after the TTL.
+    #[test]
+    fn merge_halves_pair_and_a_lone_half_expires() {
+        let (left, right) = ShardId::ROOT.children();
+        let mut state = reshape_state(&[left, right], 0);
+        let payload = ShardWitnessPayload::ScheduleMerge {
+            parent: ShardId::ROOT,
+        };
+
+        apply_shard_payload(&mut state, left, &payload);
+        let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get(&ShardId::ROOT)
+        else {
+            panic!("merge half not recorded");
+        };
+        assert_eq!(halves.len(), 1);
+
+        apply_shard_payload(&mut state, right, &payload);
+        let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get(&ShardId::ROOT)
+        else {
+            panic!("merge record dropped");
+        };
+        assert_eq!(halves.len(), 2);
+
+        // A fresh lone half goes quiet and expires.
+        let mut lone = reshape_state(&[left, right], 0);
+        apply_shard_payload(&mut lone, left, &payload);
+        lone.current_epoch = Epoch::new(7);
+        prune_stale_reshapes(&mut lone);
+        assert!(lone.pending_reshapes.is_empty());
+    }
+
+    /// A merge requires both children active; a child already pending a
+    /// split blocks the merge (no overlapping reshapes), and vice versa.
+    #[test]
+    fn overlapping_reshapes_are_rejected() {
+        let (left, right) = ShardId::ROOT.children();
+        let merge = ShardWitnessPayload::ScheduleMerge {
+            parent: ShardId::ROOT,
+        };
+
+        // Only one child active: merge dropped.
+        let mut state = reshape_state(&[left], 0);
+        apply_shard_payload(&mut state, left, &merge);
+        assert!(state.pending_reshapes.is_empty());
+
+        // Pending split on a child blocks the merge.
+        let mut state = reshape_state(&[left, right], 4);
+        apply_shard_payload(&mut state, left, &split_payload(left));
+        apply_shard_payload(&mut state, right, &merge);
+        assert!(matches!(
+            state.pending_reshapes.get(&left),
+            Some(PendingReshape::Split { .. }),
+        ));
+        assert!(!state.pending_reshapes.contains_key(&ShardId::ROOT));
+
+        // Pending merge blocks a child's split.
+        let mut state = reshape_state(&[left, right], 4);
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &split_payload(right));
+        assert!(!state.pending_reshapes.contains_key(&right));
+    }
+
+    /// Splits stop at the shard ceiling, counting splits already
+    /// admitted but not yet executed.
+    #[test]
+    fn split_rejected_at_max_shards() {
+        let depth = 12u32; // 2^12 == MAX_SHARDS
+        let shards: Vec<ShardId> = (0..MAX_SHARDS as u64)
+            .map(|path| ShardId::leaf(depth, path))
+            .collect();
+        let mut state = reshape_state(&shards, 8);
+        apply_shard_payload(&mut state, shards[0], &split_payload(shards[0]));
+        assert!(state.pending_reshapes.is_empty());
     }
 }

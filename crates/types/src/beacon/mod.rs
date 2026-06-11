@@ -54,8 +54,9 @@ pub use certified::{
 pub use constants::{
     BEACON_SIGNER_COUNT, EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR, JAIL_COOLDOWN_EPOCHS,
     MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, POOL_BUFFER_TARGET,
-    READY_TIMEOUT_EPOCHS, SHARD_CAPACITY, SHUFFLE_INTERVAL_EPOCHS, SPC_INPUT_DWELL,
-    SPC_VIEW_TIMEOUT, TOKENS_PER_YEAR_TARGET, UNBONDING_WINDOW_EPOCHS, byzantine_threshold,
+    READY_TIMEOUT_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, SHARD_CAPACITY, SHUFFLE_INTERVAL_EPOCHS,
+    SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, TOKENS_PER_YEAR_TARGET, UNBONDING_WINDOW_EPOCHS,
+    byzantine_threshold,
 };
 pub use genesis::{
     BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
@@ -92,8 +93,8 @@ pub use spc::{
     verify_empty_view_msg, verify_proposal_object,
 };
 pub use state::{
-    BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardBoundary, ShardCommittee,
-    SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+    BeaconState, CommitteeTransition, JailReason, PendingReshape, PendingWithdrawal, ShardBoundary,
+    ShardCommittee, SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };
 pub use witness::{
     BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitness, ShardWitnessPayload,
