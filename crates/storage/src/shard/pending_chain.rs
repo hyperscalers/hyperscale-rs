@@ -956,6 +956,10 @@ mod tests {
                 .push(height);
             StubSnapshot
         }
+
+        fn substate_count_at(&self, _height: BlockHeight) -> Option<u64> {
+            None
+        }
     }
 
     impl TreeReader for StubStore {
@@ -1071,6 +1075,7 @@ mod tests {
             nodes: vec![],
             stale_node_keys: vec![],
             leaf_associations: vec![],
+            leaf_delta: 0,
         })
     }
 

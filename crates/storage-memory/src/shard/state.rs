@@ -47,6 +47,11 @@ pub struct SharedState {
     /// before the write at that version. Consumed by historical reads
     /// and the retention GC.
     pub state_history: BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,
+    /// Committed substate (JMT leaf) count per version, written in
+    /// lockstep with each applied snapshot. Consensus-critical:
+    /// shard-witness derivation reads it, so it must be identical on
+    /// every replica.
+    pub substate_counts: BTreeMap<u64, u64>,
 }
 
 impl SharedState {
@@ -62,6 +67,7 @@ impl SharedState {
             current_state: BTreeMap::new(),
             state_history: BTreeMap::new(),
             associations: HashMap::new(),
+            substate_counts: BTreeMap::new(),
         }
     }
 
@@ -86,6 +92,20 @@ impl SharedState {
                 self.associations.insert(a.leaf_key, storage_key);
             }
         }
+
+        // Substate count: the count behind the currently applied version
+        // (equal across any interleaved empty commits) plus this
+        // snapshot's leaf delta.
+        let prior = self
+            .substate_counts
+            .get(&self.current_block_height.inner())
+            .copied()
+            .unwrap_or(0);
+        let count = prior
+            .checked_add_signed(snapshot.leaf_delta)
+            .expect("substate count must not go negative");
+        self.substate_counts
+            .insert(snapshot.new_height.inner(), count);
 
         self.current_block_height = snapshot.new_height;
         self.current_root_hash = snapshot.result_root;

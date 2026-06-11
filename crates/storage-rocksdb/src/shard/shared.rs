@@ -135,6 +135,10 @@ impl VersionedStore for SharedStorage {
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         self.0.snapshot_at(height)
     }
+
+    fn substate_count_at(&self, height: BlockHeight) -> Option<u64> {
+        self.0.substate_count_at(height)
+    }
 }
 
 impl TreeReader for SharedStorage {

@@ -9,7 +9,9 @@
 
 use rocksdb::WriteBatch;
 
-use super::column_families::{JmtNodesCf, StaleJmtNodesCf, StaleStateHistoryCf, StateHistoryCf};
+use super::column_families::{
+    JmtNodesCf, StaleJmtNodesCf, StaleStateHistoryCf, StateHistoryCf, SubstateCountsCf,
+};
 use super::core::RocksDbShardStorage;
 use super::jmt_stored::StaleTreePart;
 use crate::typed_cf::{self, TypedCf};
@@ -47,6 +49,7 @@ impl RocksDbShardStorage {
         let cf = self.cf();
         let stale_cf = StaleJmtNodesCf::handle(&cf);
         let jmt_cf = JmtNodesCf::handle(&cf);
+        let counts_cf = SubstateCountsCf::handle(&cf);
 
         let mut processed_count = 0;
         let mut deleted_nodes = 0;
@@ -68,6 +71,15 @@ impl RocksDbShardStorage {
 
             typed_cf::batch_delete::<StaleJmtNodesCf>(&mut batch, stale_cf, &version);
             processed_count += 1;
+        }
+
+        // Per-version substate counts share the historical-tree cutoff:
+        // a count below the retention floor anchors nothing.
+        for (version, _) in typed_cf::iter_all::<SubstateCountsCf>(&self.db, counts_cf) {
+            if version >= cutoff_version {
+                break;
+            }
+            typed_cf::batch_delete::<SubstateCountsCf>(&mut batch, counts_cf, &version);
         }
 
         if !batch.is_empty()

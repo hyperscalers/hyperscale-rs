@@ -458,6 +458,10 @@ pub struct TreeUpdateBatch {
     pub stale_nodes: Vec<StaleNodeIndex>,
     /// New `(version, root_key)` mapping, if the tree changed.
     pub root_key: Option<(u64, NodeKey)>,
+    /// Net leaf-count change: inserts of new keys minus deletes of
+    /// existing keys. Value updates and deletes of absent keys
+    /// contribute zero.
+    pub leaf_delta: i64,
 }
 
 #[cfg(test)]

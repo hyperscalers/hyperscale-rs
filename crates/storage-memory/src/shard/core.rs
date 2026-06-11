@@ -260,6 +260,11 @@ impl SimShardStorage {
             }
         }
 
+        let genesis_count =
+            u64::try_from(collected.leaf_delta).expect("genesis leaf delta must be non-negative");
+        s.substate_counts
+            .insert(BlockHeight::GENESIS.inner(), genesis_count);
+
         s.current_block_height = BlockHeight::GENESIS;
         s.current_root_hash = root;
 

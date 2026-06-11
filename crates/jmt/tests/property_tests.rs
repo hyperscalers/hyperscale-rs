@@ -431,3 +431,58 @@ proptest! {
         Jmt::verify(&decoded, root_hash, &expected).unwrap();
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// `leaf_delta` tracks the tree's true key count: the fresh build
+    /// reports the initial cardinality, and a second batch mixing
+    /// value updates, deletes of existing keys, fresh inserts and
+    /// deletes of absent keys reports exactly the model's size change.
+    #[test]
+    fn leaf_delta_tracks_model(
+        entries in non_empty_entries(),
+        existing_ops in prop::collection::vec(
+            (any::<prop::sample::Index>(), prop::option::of(value_strategy())),
+            0..16,
+        ),
+        fresh_ops in prop::collection::btree_map(
+            key_strategy(),
+            prop::option::of(value_strategy()),
+            0..16,
+        ),
+    ) {
+        let mut store = MemoryStore::new();
+        let v1: BTreeMap<Key, Option<ValueHash>> =
+            entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
+        prop_assert_eq!(r1.batch.leaf_delta, i64::try_from(entries.len()).unwrap());
+        store.apply(&r1);
+
+        // Random keys are fresh w.r.t. `entries` with overwhelming
+        // probability; existing-key ops overlay them so collisions
+        // resolve identically in the batch and the model.
+        let keys: Vec<Key> = entries.keys().copied().collect();
+        let mut batch: BTreeMap<Key, Option<ValueHash>> = fresh_ops;
+        for (idx, op) in &existing_ops {
+            batch.insert(*idx.get(&keys), *op);
+        }
+
+        let mut model = entries.clone();
+        for (k, op) in &batch {
+            match op {
+                Some(v) => {
+                    model.insert(*k, *v);
+                }
+                None => {
+                    model.remove(k);
+                }
+            }
+        }
+        let expected =
+            i64::try_from(model.len()).unwrap() - i64::try_from(entries.len()).unwrap();
+
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &batch).unwrap();
+        prop_assert_eq!(r2.batch.leaf_delta, expected);
+    }
+}

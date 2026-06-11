@@ -124,6 +124,44 @@ fn leaf_associations_track_live_substates() {
     assert_eq!(storage.cf_get::<LeafAssociationsCf>(&hashed), None);
 }
 
+/// The per-version substate count tracks inserts, value updates and
+/// deletes; historical entries stay readable and survive a reopen.
+#[test]
+fn substate_count_tracks_commits_and_survives_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+
+    let key_a = vec![3u8; 50];
+    let key_b = vec![4u8; 50];
+
+    // v1: two inserts.
+    let v1 = merge_database_updates(&[
+        make_database_update(key_a.clone(), 0, vec![7], vec![1]),
+        make_database_update(key_b, 0, vec![8], vec![2]),
+    ]);
+    storage.commit(&v1).unwrap();
+    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
+
+    // v2: value update only — count unchanged.
+    storage
+        .commit(&make_database_update(key_a.clone(), 0, vec![7], vec![9]))
+        .unwrap();
+    assert_eq!(storage.substate_count_at(BlockHeight::new(2)), Some(2));
+
+    // v3: delete one — count drops; the historical entry is untouched.
+    storage
+        .commit(&make_database_delete(key_a, 0, vec![7]))
+        .unwrap();
+    assert_eq!(storage.substate_count_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
+
+    drop(storage);
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(reopened.substate_count_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(reopened.substate_count_at(BlockHeight::new(2)), Some(2));
+    assert_eq!(reopened.substate_count_at(BlockHeight::new(4)), None);
+}
+
 #[test]
 fn test_basic_substate_operations() {
     let temp_dir = TempDir::new().unwrap();
@@ -1155,6 +1193,36 @@ fn test_state_history_create_delete_create() {
             "state-history read at V={v}: want={want:?}, got={got:?}"
         );
     }
+}
+
+/// JMT GC prunes per-version substate counts below the retention
+/// cutoff and retains everything at or above it.
+#[test]
+fn substate_counts_pruned_by_jmt_gc() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = RocksDbConfig {
+        jmt_history_length: 2,
+        ..Default::default()
+    };
+    let storage =
+        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
+            .unwrap();
+
+    for h in 1..=10u64 {
+        let updates = make_database_update(
+            vec![u8::try_from(h).unwrap_or(u8::MAX); 50],
+            0,
+            vec![1],
+            vec![1],
+        );
+        storage.commit(&updates).unwrap();
+    }
+    storage.run_jmt_gc();
+
+    // current=10, cutoff=8: below-cutoff entries pruned, the rest intact.
+    assert_eq!(storage.substate_count_at(BlockHeight::new(7)), None);
+    assert_eq!(storage.substate_count_at(BlockHeight::new(8)), Some(8));
+    assert_eq!(storage.substate_count_at(BlockHeight::new(10)), Some(10));
 }
 
 /// `snapshot_at(V)` must panic when V is below the retention floor.

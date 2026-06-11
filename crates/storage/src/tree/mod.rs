@@ -213,6 +213,7 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
         nodes,
         stale_node_keys: Vec::new(),
         leaf_associations: Vec::new(),
+        leaf_delta: 0,
     }
 }
 
@@ -381,6 +382,7 @@ pub fn put_at_version<S: TreeReader + Sync>(
         collected.stale_node_keys.push(stale.node_key.clone());
     }
     collected.leaf_associations = leaf_associations;
+    collected.leaf_delta = result.batch.leaf_delta;
 
     (root_hash, collected)
 }

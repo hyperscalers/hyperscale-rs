@@ -93,6 +93,17 @@ pub const EXECUTION_CERTS_CF: &str = "execution_certs";
 /// follows the retention horizon configured at the runtime layer.
 pub const BEACON_WITNESSES_CF: &str = "beacon_witnesses";
 
+/// Column family for the committed substate (JMT leaf) count per version.
+///
+/// Key: `version_BE_8B`; value: SBOR-encoded `u64` — the tree's total
+/// leaf count after the commit at that version. Written in the same
+/// batch as the commit (crash-consistent with the tree), one entry per
+/// committed version. Consensus-critical: shard-witness derivation
+/// reads the count behind a block's parent state, so it must be
+/// identical on every replica. GC prunes entries below the same
+/// `jmt_history_length` cutoff as historical tree data.
+pub const SUBSTATE_COUNTS_CF: &str = "substate_counts";
+
 /// Column family mapping hashed JMT leaf keys back to raw substate
 /// storage keys.
 ///
@@ -129,6 +140,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     EXECUTION_CERTS_CF,
     BEACON_WITNESSES_CF,
     LEAF_ASSOCIATIONS_CF,
+    SUBSTATE_COUNTS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -153,6 +165,7 @@ pub struct CfHandles<'a> {
     execution_certs: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     leaf_associations: &'a ColumnFamily,
+    substate_counts: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -179,6 +192,7 @@ impl<'a> CfHandles<'a> {
             execution_certs: resolve(EXECUTION_CERTS_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             leaf_associations: resolve(LEAF_ASSOCIATIONS_CF),
+            substate_counts: resolve(SUBSTATE_COUNTS_CF),
         }
     }
 }
@@ -251,6 +265,20 @@ impl TypedCf for StaleJmtNodesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.stale_jmt_nodes
+    }
+}
+
+/// Committed substate count per version; see [`SUBSTATE_COUNTS_CF`].
+pub struct SubstateCountsCf;
+impl TypedCf for SubstateCountsCf {
+    const NAME: &'static str = SUBSTATE_COUNTS_CF;
+    type Key = u64; // version
+    type Value = u64; // total leaf count after this version's commit
+    type KeyCodec = BeU64Codec;
+    type ValueCodec = SborCodec<u64>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.substate_counts
     }
 }
 

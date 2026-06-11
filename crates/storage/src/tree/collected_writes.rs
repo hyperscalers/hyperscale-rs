@@ -19,4 +19,6 @@ pub struct CollectedWrites {
     /// Hashed-leaf-key → raw-storage-key associations for the writes in
     /// this computation (`None` storage key = leaf deleted).
     pub leaf_associations: Vec<LeafSubstateKeyAssociation>,
+    /// Net change to the tree's leaf (substate) count.
+    pub leaf_delta: i64,
 }

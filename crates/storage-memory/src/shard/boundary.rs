@@ -106,6 +106,12 @@ impl BoundaryStore for SimShardStorage {
             state.current_state.insert(leaf.storage_key, leaf.value);
         }
 
+        // Seed the substate count: a fresh-tree import's leaf delta IS
+        // the imported leaf population.
+        let count = u64::try_from(result.batch.leaf_delta)
+            .map_err(|_| "snap-sync import produced a negative leaf count".to_string())?;
+        state.substate_counts.insert(height.inner(), count);
+
         state.current_block_height = height;
         state.current_root_hash = root;
         drop(state);

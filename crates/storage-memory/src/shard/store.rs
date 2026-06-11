@@ -88,6 +88,13 @@ impl VersionedStore for SimShardStorage {
             current_version,
         }
     }
+
+    fn substate_count_at(&self, height: BlockHeight) -> Option<u64> {
+        read_or_recover(&self.state)
+            .substate_counts
+            .get(&height.inner())
+            .copied()
+    }
 }
 
 impl TreeReader for SimShardStorage {

@@ -285,6 +285,18 @@ impl SimShardStorage {
             }
         }
 
+        // Substate count: prior count behind the current version plus
+        // this commit's leaf delta — same rule as `apply_jmt_snapshot`.
+        let prior = s
+            .substate_counts
+            .get(&s.current_block_height.inner())
+            .copied()
+            .unwrap_or(0);
+        let count = prior
+            .checked_add_signed(collected.leaf_delta)
+            .expect("substate count must not go negative");
+        s.substate_counts.insert(block_height.inner(), count);
+
         s.current_block_height = block_height;
         s.current_root_hash = new_root;
 
