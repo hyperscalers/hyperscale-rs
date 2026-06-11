@@ -759,7 +759,7 @@ mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BoundedVec,
-        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
+        CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
         ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
         Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash, ValidatorId,
         Verifiable, WaveId, WeightedTimestamp, compute_merkle_root, zero_bls_signature,
@@ -1371,7 +1371,7 @@ mod tests {
             shard,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(2, 0), WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1000 + height.inner()),
             Round::INITIAL,
@@ -1415,7 +1415,7 @@ mod tests {
     /// block's `parent_qc` weighted timestamp, so fixtures anchor their time
     /// there while keeping the QC genesis-shaped (so `is_genesis()` holds).
     fn genesis_qc_at(shard: ShardId, weighted_ts_ms: u64) -> QuorumCertificate {
-        let g = QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO);
+        let g = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
         QuorumCertificate::new(
             g.block_hash(),
             g.shard_id(),
@@ -1459,7 +1459,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
         };
         let qc = {
-            let __qc = QuorumCertificate::genesis(ShardId::leaf(2, 0), WeightedTimestamp::ZERO);
+            let __qc = QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT);
             QuorumCertificate::new(
                 block.hash(),
                 __qc.shard_id(),

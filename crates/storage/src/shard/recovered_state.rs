@@ -2,8 +2,8 @@
 //! state machine after a crash or restart.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate,
-    ShardAnchor, StateRoot, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
+    QuorumCertificate, ShardAnchor, StateRoot, Verified, WeightedTimestamp,
 };
 
 /// State recovered from storage on startup.
@@ -63,13 +63,13 @@ pub struct RecoveredState {
     /// Zero on a fresh start.
     pub substate_count: u64,
 
-    /// The chain's start-time anchor — the weighted timestamp carried by
-    /// its genesis QC (see `QuorumCertificate::genesis`). `ZERO` for
-    /// chains born at network genesis; a child chain created by a shard
-    /// split anchors at the parent's final committed canonical weighted
-    /// timestamp. The coordinator reconstructs genesis-fallback QCs from
-    /// this value, so it must byte-match the chain's real genesis QC.
-    pub genesis_anchor_wt: WeightedTimestamp,
+    /// The chain's origin — genesis height plus start-time anchor (see
+    /// `ChainOrigin`). `ChainOrigin::ROOT` for chains born at network
+    /// genesis; a child chain created by a shard split continues the
+    /// parent's height line and clock. The coordinator reconstructs
+    /// genesis-fallback QCs from this value, so it must byte-match the
+    /// chain's real genesis QC.
+    pub chain_origin: ChainOrigin,
 }
 
 impl RecoveredState {
@@ -101,7 +101,7 @@ impl RecoveredState {
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
             substate_count,
-            genesis_anchor_wt: WeightedTimestamp::ZERO,
+            chain_origin: ChainOrigin::ROOT,
         }
     }
 

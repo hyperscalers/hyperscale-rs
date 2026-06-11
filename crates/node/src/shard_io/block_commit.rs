@@ -828,7 +828,8 @@ mod tests {
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_test_helpers::{TestCommittee, make_live_block};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, ShardId, ValidatorId,
+        BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
+        ValidatorId,
     };
 
     use super::*;
@@ -884,8 +885,7 @@ mod tests {
         );
         let block_hash = block.hash();
         let qc = {
-            let __qc =
-                QuorumCertificate::genesis(block.header().shard_id(), WeightedTimestamp::ZERO);
+            let __qc = QuorumCertificate::genesis(block.header().shard_id(), ChainOrigin::ROOT);
             QuorumCertificate::new(
                 block_hash,
                 __qc.shard_id(),
@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     fn linked_qc(block_hash: BlockHash, wt_ms: u64) -> QuorumCertificate {
-        let g = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
+        let g = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
         QuorumCertificate::new(
             block_hash,
             g.shard_id(),

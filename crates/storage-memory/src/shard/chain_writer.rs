@@ -243,10 +243,12 @@ impl SimShardStorage {
         let block_height = block.height();
         let mut s = write_or_recover(&self.state);
 
+        // A genesis commit re-records the height the install already wrote
+        // (the chain's genesis height — 0 only for chains born at network
+        // genesis); every other block advances the version by exactly one.
         assert!(
             block_height == s.current_block_height + 1
-                || (block_height == BlockHeight::GENESIS
-                    && s.current_block_height == BlockHeight::GENESIS),
+                || (block.is_genesis() && block_height == s.current_block_height),
             "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
             s.current_block_height
         );

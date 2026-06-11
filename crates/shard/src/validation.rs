@@ -415,7 +415,7 @@ mod tests {
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BoundedVec,
-        CertificateRoot, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
+        CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
         ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
         StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -449,7 +449,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
             Round::new(0),
@@ -503,7 +503,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

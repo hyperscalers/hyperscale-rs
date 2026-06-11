@@ -13,8 +13,8 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate, ShardId,
-    StateRoot, TxHash, Verified, WaveId, WeightedTimestamp,
+    BlockHash, BlockHeader, BlockHeight, ChainOrigin, InFlightCount, ProvisionHash,
+    QuorumCertificate, ShardId, StateRoot, TxHash, Verified, WaveId,
 };
 use tracing::warn;
 
@@ -22,7 +22,7 @@ use crate::pending::{PendingBlock, PendingBlocks};
 
 pub struct ChainView<'a> {
     local_shard: ShardId,
-    genesis_anchor_wt: WeightedTimestamp,
+    chain_origin: ChainOrigin,
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
@@ -33,7 +33,7 @@ pub struct ChainView<'a> {
 impl<'a> ChainView<'a> {
     pub const fn new(
         local_shard: ShardId,
-        genesis_anchor_wt: WeightedTimestamp,
+        chain_origin: ChainOrigin,
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
@@ -42,7 +42,7 @@ impl<'a> ChainView<'a> {
     ) -> Self {
         Self {
             local_shard,
-            genesis_anchor_wt,
+            chain_origin,
             committed_height,
             committed_hash,
             committed_state_root,
@@ -100,10 +100,7 @@ impl<'a> ChainView<'a> {
             || {
                 (
                     self.committed_hash,
-                    Verified::<QuorumCertificate>::genesis(
-                        self.local_shard,
-                        self.genesis_anchor_wt,
-                    ),
+                    Verified::<QuorumCertificate>::genesis(self.local_shard, self.chain_origin),
                 )
             },
             |qc| (qc.block_hash(), qc.clone()),
@@ -173,7 +170,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1000),
             Round::INITIAL,
@@ -213,7 +210,7 @@ mod tests {
     ) -> R {
         let view = ChainView {
             local_shard: ShardId::ROOT,
-            genesis_anchor_wt: WeightedTimestamp::ZERO,
+            chain_origin: ChainOrigin::ROOT,
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,

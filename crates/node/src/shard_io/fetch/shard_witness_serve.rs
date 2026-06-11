@@ -141,10 +141,10 @@ mod tests {
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, Hash, InFlightCount,
-        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
+        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
+        InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
+        StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
         verify_merkle_inclusion, zero_bls_signature,
     };
 
@@ -168,7 +168,7 @@ mod tests {
             SHARD,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(SHARD, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_000 * height.inner()),
             Round::INITIAL,

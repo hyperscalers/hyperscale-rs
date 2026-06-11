@@ -66,8 +66,8 @@ impl CommitPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        ValidatorId, WeightedTimestamp, zero_bls_signature,
+        Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId, SignerBitfield,
+        StateRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -77,7 +77,7 @@ mod tests {
             ShardId::ROOT,
             ValidatorId::new(tag),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -140,8 +140,8 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use hyperscale_types::{
-        Block, BlockHash, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        ValidatorId, WeightedTimestamp, zero_bls_signature,
+        Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId, SignerBitfield,
+        StateRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
     use proptest::prelude::*;
 
@@ -152,7 +152,7 @@ mod properties {
             ShardId::ROOT,
             ValidatorId::new(tag),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let qc = QuorumCertificate::new(
             block.hash(),

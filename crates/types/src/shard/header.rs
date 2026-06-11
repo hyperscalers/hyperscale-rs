@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec,
-    CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
-    MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId,
-    WeightedTimestamp,
+    CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot,
+    MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot,
+    ProvisionsRoot, QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, ValidatorId,
+    Verifiable, Verified, Verify, WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -109,27 +109,28 @@ impl BlockHeader {
         }
     }
 
-    /// Create a genesis block header (height 0) with the given proposer and
-    /// JMT state. `anchor_wt` is the chain's start-time anchor (see
-    /// [`QuorumCertificate::genesis`]): `ZERO` for chains born at network
-    /// genesis, the parent's final committed canonical weighted timestamp
-    /// for a child chain created by a shard split.
+    /// Create a genesis block header with the given proposer and JMT
+    /// state. The [`ChainOrigin`] supplies the genesis height and the
+    /// chain's start-time anchor (see [`QuorumCertificate::genesis`]):
+    /// [`ChainOrigin::ROOT`] for chains born at network genesis; a child
+    /// chain created by a shard split continues the parent's height line
+    /// and clock.
     #[must_use]
     pub fn genesis(
         shard_id: ShardId,
         proposer: ValidatorId,
         state_root: StateRoot,
-        anchor_wt: WeightedTimestamp,
+        origin: ChainOrigin,
     ) -> Self {
         Self {
             shard_id,
-            height: BlockHeight::new(0),
+            height: origin.genesis_height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             // Genesis QC carries no signature and is valid by definition;
             // `Verified::<QuorumCertificate>::genesis` is the only path to a
             // verified genesis value (the predicate's signer check would
             // reject the zero-signers genesis bitfield).
-            parent_qc: Verified::<QuorumCertificate>::genesis(shard_id, anchor_wt).into(),
+            parent_qc: Verified::<QuorumCertificate>::genesis(shard_id, origin).into(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -157,7 +158,9 @@ impl BlockHeader {
         self.shard_id
     }
 
-    /// Block height in the chain (genesis = 0).
+    /// Block height in the chain. The genesis height is a per-chain
+    /// property: 0 for chains born at network genesis, parent terminal
+    /// height + 1 for a split child.
     #[must_use]
     pub const fn height(&self) -> BlockHeight {
         self.height
@@ -424,9 +427,18 @@ impl BlockHeader {
     }
 
     /// Check if this is the genesis block header.
+    ///
+    /// Structural, not height-based: the genesis header is the only
+    /// header whose parent QC is a genesis QC at the header's own height.
+    /// Every later block sits above its parent QC — the first real block
+    /// carries the chain's genesis QC one height below itself. A chain's
+    /// genesis height is a per-chain property (a split child's genesis
+    /// continues the parent's height line), so `height == 0` cannot
+    /// identify genesis.
     #[must_use]
     pub fn is_genesis(&self) -> bool {
-        self.height == BlockHeight::GENESIS
+        let parent_qc = self.parent_qc();
+        parent_qc.is_genesis() && self.height == parent_qc.height()
     }
 
     /// Get the expected proposer for this height (round-robin).
@@ -553,7 +565,7 @@ mod tests {
             ShardId::ROOT,
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         )
     }
 
@@ -670,7 +682,7 @@ mod tests {
         let mut header = sample_header();
         header.parent_qc = header.parent_qc.as_unverified().clone().into();
         let verified_qc =
-            Verified::<QuorumCertificate>::genesis(header.shard_id(), WeightedTimestamp::ZERO);
+            Verified::<QuorumCertificate>::genesis(header.shard_id(), ChainOrigin::ROOT);
         let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
             .expect("matching parent_qc accepted");
         assert!(verified.parent_qc_verified().is_genesis());
@@ -682,8 +694,7 @@ mod tests {
     fn with_verified_parent_qc_rejects_mismatched_witness() {
         let header = sample_header();
         let other_shard = ShardId::from_heap_index(header.shard_id().inner() + 1);
-        let mismatched =
-            Verified::<QuorumCertificate>::genesis(other_shard, WeightedTimestamp::ZERO);
+        let mismatched = Verified::<QuorumCertificate>::genesis(other_shard, ChainOrigin::ROOT);
         let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
             .expect_err("mismatched parent_qc rejected");
         assert_eq!(err, BlockHeaderParentQcMismatch);

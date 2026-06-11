@@ -8,9 +8,9 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition,
-    Round, ShardId, SignerBitfield, Verified, Verify, VoteCount, WeightedTimestamp,
-    block_vote_message, verify_bls12381_v1, zero_bls_signature,
+    BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, ChainOrigin,
+    NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify, VoteCount,
+    WeightedTimestamp, block_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -54,7 +54,7 @@ impl QuorumCertificate {
         }
     }
 
-    /// Create a genesis QC (for block 0) for the given shard.
+    /// Create the genesis QC of a chain with the given [`ChainOrigin`].
     ///
     /// The shard is tagged on the QC so any committee lookup keyed off
     /// `qc.shard_id` resolves the same shard the QC anchors. A
@@ -62,25 +62,25 @@ impl QuorumCertificate {
     /// committee lookups to shard 0 for any genesis-anchored header.
     /// The genesis QC has a zero block hash and zero signature.
     ///
-    /// `anchor_wt` is the chain's start-time anchor, carried as the QC's
-    /// weighted timestamp: the BFT clock reads its floor from
-    /// `parent_qc.weighted_timestamp`, so a chain's first blocks anchor
-    /// their validity windows and committee lookups here. Chains born at
-    /// network genesis pass `ZERO`; a child chain created by a shard
-    /// split passes the parent's final committed canonical weighted
-    /// timestamp, keeping the child's clock continuous with the parent
-    /// it inherits instead of resetting mid-network-life.
+    /// The origin supplies the genesis block's height and the chain's
+    /// start-time anchor, carried as the QC's weighted timestamp: the BFT
+    /// clock reads its floor from `parent_qc.weighted_timestamp`, so a
+    /// chain's first blocks anchor their validity windows and committee
+    /// lookups here. Chains born at network genesis pass
+    /// [`ChainOrigin::ROOT`]; a child chain created by a shard split
+    /// continues the parent's height line and clock instead of resetting
+    /// them mid-network-life.
     #[must_use]
-    pub const fn genesis(shard_id: ShardId, anchor_wt: WeightedTimestamp) -> Self {
+    pub const fn genesis(shard_id: ShardId, origin: ChainOrigin) -> Self {
         Self {
             block_hash: BlockHash::ZERO,
             shard_id,
-            height: BlockHeight::new(0),
+            height: origin.genesis_height,
             parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp: anchor_wt,
+            weighted_timestamp: origin.anchor_wt,
         }
     }
 
@@ -176,9 +176,19 @@ impl QuorumCertificate {
     }
 
     /// Check if this is a genesis QC.
+    ///
+    /// Structural and deliberately height-blind: a genesis QC certifies
+    /// no block (zero hash) and carries no votes (empty signers), while a
+    /// real QC always certifies a real block hash with 2f+1 signers. A
+    /// chain's genesis height is a per-chain property — a split child's
+    /// genesis continues the parent's height line — so height cannot
+    /// identify genesis. Sites that bypass signature verification for
+    /// genesis QCs reconstruct the canonical genesis from the chain's
+    /// [`ChainOrigin`] and byte-compare, so a genesis-shape QC claiming
+    /// the wrong height or anchor never verifies.
     #[must_use]
     pub fn is_genesis(&self) -> bool {
-        self.height == BlockHeight::GENESIS && self.block_hash == BlockHash::ZERO
+        self.block_hash == BlockHash::ZERO && self.signers.is_empty()
     }
 
     /// Get the number of signers.
@@ -189,8 +199,9 @@ impl QuorumCertificate {
 
     /// Two-chain commit rule: Check if this QC enables committing the parent block.
     ///
-    /// A QC for block at height N allows committing the block at height N-1.
-    /// Genesis QC (height 0) doesn't enable any commit.
+    /// A QC for block at height N allows committing the block at height
+    /// N-1. A genesis QC enables no commit, and neither does a QC at the
+    /// absolute height floor (no block sits below height 0 on any chain).
     #[must_use]
     pub fn has_committable_block(&self) -> bool {
         self.height != BlockHeight::GENESIS && !self.is_genesis()
@@ -271,8 +282,8 @@ impl Verified<QuorumCertificate> {
     /// zero signers, so this constructor is the only path to the genesis
     /// verified value.
     #[must_use]
-    pub const fn genesis(shard_id: ShardId, anchor_wt: WeightedTimestamp) -> Self {
-        Self::new_unchecked(QuorumCertificate::genesis(shard_id, anchor_wt))
+    pub const fn genesis(shard_id: ShardId, origin: ChainOrigin) -> Self {
+        Self::new_unchecked(QuorumCertificate::genesis(shard_id, origin))
     }
 
     /// Re-wrap a [`QuorumCertificate`] read out of persistent storage
@@ -440,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let qc = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
+        let qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
         assert!(qc.is_genesis());
         assert_eq!(qc.height(), BlockHeight::new(0));
         assert_eq!(qc.block_hash(), BlockHash::ZERO);

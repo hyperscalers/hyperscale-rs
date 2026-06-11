@@ -29,11 +29,11 @@ use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, CertifiedBlock, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
-    LocalTimestamp, MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake, StakePoolId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
-    Verified, WeightedTimestamp, bls_keypair_from_seed, genesis_config_hash, shard_prefix_path,
-    uniform_shard_for_node,
+    CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, Epoch, GenesisConfigHash, GenesisPool,
+    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake,
+    StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verified, WeightedTimestamp, bls_keypair_from_seed, genesis_config_hash,
+    shard_prefix_path, uniform_shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -764,7 +764,7 @@ impl SimulationRunner {
                 shard_id * self.network.config().validators_per_shard,
             ));
             let genesis_block =
-                Block::genesis(shard, proposer, genesis_jmt_root, WeightedTimestamp::ZERO);
+                Block::genesis(shard, proposer, genesis_jmt_root, ChainOrigin::ROOT);
 
             for host_index in &hosts_for_shard {
                 let i = *host_index as usize;
@@ -781,7 +781,7 @@ impl SimulationRunner {
                     shard,
                     proposer,
                     genesis_jmt_root,
-                    WeightedTimestamp::ZERO,
+                    ChainOrigin::ROOT,
                 ));
                 let genesis_commit_event = ShardEvent::protocol(
                     shard,

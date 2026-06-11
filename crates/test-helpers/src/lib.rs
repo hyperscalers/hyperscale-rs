@@ -22,12 +22,12 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
-    CertifiedBlock, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-    GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
-    StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, bls_keypair_from_seed,
+    CertifiedBlock, ChainOrigin, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+    GlobalReceiptHash, GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId,
+    SignerBitfield, StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash,
+    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate,
+    WaveId, WeightedTimestamp, bls_keypair_from_seed,
 };
 
 /// A test committee of validators with deterministic BLS keypairs.
@@ -232,7 +232,7 @@ pub fn make_live_block(
         shard_id,
         height,
         BlockHash::ZERO,
-        QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+        QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
         proposer,
         ProposerTimestamp::from_millis(timestamp_ms),
         Round::INITIAL,
@@ -273,7 +273,7 @@ pub fn make_live_block(
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let block = stamp_parent_qc_weighted_timestamp(block, weighted_timestamp_ms);
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
+        let __qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_id(),

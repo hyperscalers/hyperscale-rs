@@ -714,11 +714,11 @@ impl RemoteHeaderCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot, Epoch,
-        Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
-        zero_bls_signature,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
+        ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
+        StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
+        bls_keypair_from_seed, zero_bls_signature,
     };
 
     use super::*;
@@ -742,7 +742,7 @@ mod tests {
             ShardId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(2, 0), WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

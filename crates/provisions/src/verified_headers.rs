@@ -77,9 +77,9 @@ impl VerifiedHeaderBuffer {
 mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
-        InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        Round, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        zero_bls_signature,
+        ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
+        WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -89,7 +89,7 @@ mod tests {
             shard,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

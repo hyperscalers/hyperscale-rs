@@ -437,11 +437,12 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-        Bls12381G2Signature, BoundedVec, CertificateRoot, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-        WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+        Bls12381G2Signature, BoundedVec, CertificateRoot, ChainOrigin, ConsensusReceipt,
+        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+        GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
+        TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -453,7 +454,7 @@ mod tests {
             ShardId::ROOT,
             HEIGHT,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_000),
             Round::INITIAL,

@@ -209,7 +209,12 @@ impl Display for ShardId {
 pub struct BlockHeight(u64);
 
 impl BlockHeight {
-    /// Genesis block height.
+    /// The absolute height floor — the genesis height of chains born at
+    /// network genesis. Not every chain starts here: a child chain
+    /// created by a shard split inherits its genesis height from its
+    /// `ChainOrigin` (parent terminal height + 1), so "is genesis" checks
+    /// must use the structural predicates on headers and QCs, never a
+    /// comparison against this constant.
     pub const GENESIS: Self = Self(0);
 
     /// Construct a block height from a raw `u64`.

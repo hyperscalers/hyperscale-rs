@@ -794,8 +794,8 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot,
-        Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardId,
-        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -806,7 +806,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(tag)),
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

@@ -51,10 +51,10 @@ use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, Block, BlockHeight, Bls12381G1PrivateKey,
-    CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, InFlightCount,
-    LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness, RoutableTransaction,
-    ShardId, ShardTrie, Stake, StakePoolId, TopologySnapshot, ValidatorId, Verified,
-    WeightedTimestamp, genesis_config_hash,
+    CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, GenesisPool, GenesisValidator,
+    InFlightCount, LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness,
+    RoutableTransaction, ShardId, ShardTrie, Stake, StakePoolId, TopologySnapshot, ValidatorId,
+    Verified, genesis_config_hash,
 };
 use libp2p::identity::Keypair;
 use radix_common::types::ComponentAddress;
@@ -825,12 +825,8 @@ impl ProductionRunner {
                 .copied()
                 .unwrap_or(ValidatorId::new(0));
 
-            let genesis_block = Block::genesis(
-                shard,
-                first_validator,
-                genesis_jmt_root,
-                WeightedTimestamp::ZERO,
-            );
+            let genesis_block =
+                Block::genesis(shard, first_validator, genesis_jmt_root, ChainOrigin::ROOT);
 
             let genesis_hash = genesis_block.hash();
             info!(
@@ -852,7 +848,7 @@ impl ProductionRunner {
                 shard,
                 first_validator,
                 genesis_block.header().state_root(),
-                WeightedTimestamp::ZERO,
+                ChainOrigin::ROOT,
             ));
             let genesis_commit_output = host.step(ShardEvent::protocol(
                 shard,

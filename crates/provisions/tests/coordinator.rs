@@ -11,9 +11,9 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemo
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, Hash, InFlightCount,
-    LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash, ProvisionsRoot,
-    QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot,
+    BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
+    InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
+    ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot,
     TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp, zero_bls_signature,
 };
 
@@ -33,7 +33,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         ShardId::leaf(1, 0),
         height,
         BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-        QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
+        QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
         ValidatorId::new(0),
         ProposerTimestamp::ZERO,
         Round::INITIAL,
@@ -57,7 +57,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         provisions: Arc::new(BoundedVec::new()),
     };
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
+        let __qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_id(),
@@ -89,7 +89,7 @@ fn make_remote_header_targeting(
         source_shard,
         height,
         BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
+        QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
         ValidatorId::new(0),
         ProposerTimestamp::from_millis(1000 + height.inner()),
         Round::INITIAL,

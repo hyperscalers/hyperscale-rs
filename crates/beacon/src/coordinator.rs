@@ -1975,7 +1975,7 @@ mod tests {
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-        Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, Epoch,
+        Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
         ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
@@ -3825,7 +3825,7 @@ mod tests {
         let (root, siblings, _) = compute_merkle_root_with_proof(&leaves, leaf_idx_usize);
         let beacon_root = BeaconWitnessRoot::from_raw(root);
 
-        let parent_qc = QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO);
+        let parent_qc = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
         let parent_block_hash = BlockHash::ZERO;
         let header = BlockHeader::new(
             shard,

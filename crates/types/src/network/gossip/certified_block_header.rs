@@ -98,15 +98,15 @@ mod tests {
     fn test_sbor_roundtrip() {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
-            Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId, StateRoot,
-            TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+            ChainOrigin, Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+            StateRoot, TransactionRoot, ValidatorId, zero_bls_signature,
         };
 
         let header = BlockHeader::new(
             ShardId::leaf(1, 1),
             BlockHeight::new(42),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -123,7 +123,7 @@ mod tests {
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
-        let qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
+        let qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
 
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),

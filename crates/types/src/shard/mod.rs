@@ -19,6 +19,7 @@
 mod block;
 pub mod certified;
 pub mod certified_header;
+pub mod chain_origin;
 pub mod header;
 pub mod inventory;
 pub mod limits;
@@ -44,11 +45,11 @@ mod tests {
     use crate::test_utils::test_validity_range;
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-        Bls12381G2Signature, BoundedVec, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
-        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-        WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
+        Bls12381G2Signature, BoundedVec, CertificateRoot, ChainOrigin, ExecutionCertificate,
+        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
+        Verified, WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
         routable_from_notarized_v1, sign_and_notarize,
     };
 
@@ -58,7 +59,7 @@ mod tests {
             ShardId::leaf(1, 0),
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -87,7 +88,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
 
         assert!(genesis.is_genesis());
@@ -96,7 +97,7 @@ mod tests {
         assert_eq!(genesis.header().transaction_root(), TransactionRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc(),
-            &QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO)
+            &QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT)
         );
     }
 
@@ -210,7 +211,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         assert_eq!(genesis.header().certificate_root(), CertificateRoot::ZERO);
     }
@@ -228,7 +229,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         )
         .into_sealed()
         .into_live(Arc::new(BoundedVec::new()));
@@ -255,7 +256,7 @@ mod tests {
                 header.beacon_witness_base(),
             );
         }
-        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
+        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
         let bytes = basic_encode(&CertifiedBlockWire {
             block: bad_block,
             qc: genesis_qc,

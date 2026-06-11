@@ -418,9 +418,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot, Hash,
-        InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId, generate_bls_keypair,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
+        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
+        generate_bls_keypair,
     };
 
     use super::*;
@@ -434,7 +435,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

@@ -53,8 +53,8 @@ mod tests {
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CertifiedBlockHeader, LocalTimestamp, QuorumCertificate, ShardId, ValidatorId, Verified,
-        WaveId, WeightedTimestamp,
+        CertifiedBlockHeader, ChainOrigin, LocalTimestamp, QuorumCertificate, ShardId, ValidatorId,
+        Verified, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -110,7 +110,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardId::leaf(1, 1), WeightedTimestamp::ZERO),
+                QuorumCertificate::genesis(ShardId::leaf(1, 1), ChainOrigin::ROOT),
             )));
         let _ = node.handle(
             LocalTimestamp::ZERO,

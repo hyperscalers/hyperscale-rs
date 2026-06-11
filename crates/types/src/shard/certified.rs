@@ -10,8 +10,8 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    Block, BlockHash, BlockHeight, CertifiedBlockHeader, QuorumCertificate, ShardId, StateRoot,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Block, BlockHash, BlockHeight, CertifiedBlockHeader, ChainOrigin, QuorumCertificate, ShardId,
+    StateRoot, ValidatorId, Verifiable, Verified,
 };
 
 /// A block alongside the QC that certifies it.
@@ -20,7 +20,7 @@ use crate::{
 /// [`Self::new_checked`] for in-process construction and the wire decoder
 /// below for peer-supplied bytes. Without the decode-side check a Byzantine
 /// peer can ship a synced block paired with a forged "genesis QC"
-/// (`qc.block_hash == ZERO`, `qc.height == 0`) for an arbitrary block height,
+/// (`qc.block_hash == ZERO`, empty signers) for an arbitrary block height,
 /// bypassing every gate keyed on `qc.is_genesis()` (e.g. the synced-block
 /// quorum-power gate in `shard::coordinator`).
 ///
@@ -218,11 +218,11 @@ impl Verified<CertifiedBlock> {
         shard_id: ShardId,
         proposer: ValidatorId,
         state_root: StateRoot,
-        anchor_wt: WeightedTimestamp,
+        origin: ChainOrigin,
     ) -> Self {
-        let block = Block::genesis(shard_id, proposer, state_root, anchor_wt);
+        let block = Block::genesis(shard_id, proposer, state_root, origin);
         let block_hash = block.hash();
-        let base = QuorumCertificate::genesis(shard_id, anchor_wt);
+        let base = QuorumCertificate::genesis(shard_id, origin);
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             base.shard_id(),
@@ -427,7 +427,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -458,7 +458,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let block_hash = block.hash();
         let qc = QuorumCertificate::new(
@@ -489,7 +489,7 @@ mod tests {
             ShardId::leaf(1, 1),
             ValidatorId::new(1),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let other_qc_raw = QuorumCertificate::new(
             other_block.hash(),
@@ -517,10 +517,10 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
         );
         let block_hash = block.hash();
-        let raw_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
+        let raw_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             raw_qc.shard_id(),

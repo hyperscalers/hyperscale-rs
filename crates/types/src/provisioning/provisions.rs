@@ -489,7 +489,8 @@ mod tests {
         use super::*;
         use crate::state_key::{jmt_leaf_key, jmt_value_hash};
         use crate::{
-            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardId, StateRoot, ValidatorId,
+            BlockHeader, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId, StateRoot,
+            ValidatorId,
         };
 
         type Jmt = Tree<Blake3Hasher, 1>;
@@ -526,15 +527,11 @@ mod tests {
 
         fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
             let shard = ShardId::leaf(1, 0);
-            let header = BlockHeader::genesis(
-                shard,
-                ValidatorId::new(0),
-                state_root,
-                WeightedTimestamp::ZERO,
-            );
+            let header =
+                BlockHeader::genesis(shard, ValidatorId::new(0), state_root, ChainOrigin::ROOT);
             Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
                 header,
-                Verified::<QuorumCertificate>::genesis(shard, WeightedTimestamp::ZERO),
+                Verified::<QuorumCertificate>::genesis(shard, ChainOrigin::ROOT),
             ))
         }
 

@@ -19,8 +19,8 @@ use hyperscale_storage::{
     RecoveredState, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified,
-    WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, NodeId, QuorumCertificate, StateRoot,
+    Verified,
 };
 
 use super::state::{ConsensusState, SharedState, apply_updates};
@@ -171,7 +171,7 @@ impl SimShardStorage {
                 .get(&committed_height.inner())
                 .copied()
                 .unwrap_or(0),
-            genesis_anchor_wt: WeightedTimestamp::ZERO,
+            chain_origin: ChainOrigin::ROOT,
         }
     }
 

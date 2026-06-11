@@ -484,9 +484,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CertifiedBlock, CertifiedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
-        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardId,
-        TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WeightedTimestamp,
+        CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp,
+        MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
+        Round, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -540,7 +540,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardId::leaf(1, 1), WeightedTimestamp::ZERO),
+                QuorumCertificate::genesis(ShardId::leaf(1, 1), ChainOrigin::ROOT),
             )));
 
         let pre_exec = node

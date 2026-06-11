@@ -271,8 +271,12 @@ impl RocksDbShardStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
+        // A genesis commit re-records the height the install already wrote
+        // (the chain's genesis height — 0 only for chains born at network
+        // genesis); every other block advances the version by exactly one.
         assert!(
-            block_height == base_version + 1 || (block_height == 0 && base_version == 0),
+            block_height == base_version + 1
+                || (block.is_genesis() && block_height == base_version),
             "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({base_version})"
         );
 

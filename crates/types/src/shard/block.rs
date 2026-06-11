@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
-    FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, RoutableTransaction, ShardId, StateRoot, TransactionRoot, TxHash,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RoutableTransaction, ShardId, StateRoot, TransactionRoot,
+    TxHash, ValidatorId, Verifiable, Verified,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -161,8 +161,8 @@ impl Eq for Block {}
 
 impl Block {
     /// Create an empty genesis block with the given proposer and JMT state.
-    /// `anchor_wt` is the chain's start-time anchor (see
-    /// [`QuorumCertificate::genesis`](crate::QuorumCertificate::genesis)).
+    /// The [`ChainOrigin`] supplies the genesis height and start-time anchor
+    /// (see [`QuorumCertificate::genesis`](crate::QuorumCertificate::genesis)).
     ///
     /// Genesis is born `Live` with no provisions — the temporality machinery
     /// activates only once there are cross-shard waves in flight.
@@ -171,10 +171,10 @@ impl Block {
         shard_id: ShardId,
         proposer: ValidatorId,
         state_root: StateRoot,
-        anchor_wt: WeightedTimestamp,
+        origin: ChainOrigin,
     ) -> Self {
         Self::Live {
-            header: BlockHeader::genesis(shard_id, proposer, state_root, anchor_wt),
+            header: BlockHeader::genesis(shard_id, proposer, state_root, origin),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),

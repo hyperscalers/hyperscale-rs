@@ -113,10 +113,10 @@ mod tests {
     fn entry_with_bundled_header_roundtrips() {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-            CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LocalReceiptRoot,
-            MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionsRoot,
-            QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-            ValidatorId, WeightedTimestamp, zero_bls_signature,
+            CertificateRoot, CertifiedBlockHeader, ChainOrigin, Hash, InFlightCount,
+            LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
+            ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
+            TransactionRoot, TxHash, ValidatorId, WeightedTimestamp, zero_bls_signature,
         };
 
         let source_shard = ShardId::leaf(1, 1);
@@ -138,7 +138,7 @@ mod tests {
             source_shard,
             source_height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(source_shard, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(source_shard, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

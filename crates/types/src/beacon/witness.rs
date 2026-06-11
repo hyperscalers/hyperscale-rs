@@ -459,9 +459,9 @@ mod tests {
     #[test]
     fn proof_positions_rebase_against_the_header_window() {
         use crate::{
-            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, CertificateRoot, InFlightCount,
-            LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-            StateRoot, TransactionRoot, WeightedTimestamp, compute_merkle_root_with_proof,
+            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, CertificateRoot, ChainOrigin,
+            InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+            Round, StateRoot, TransactionRoot, compute_merkle_root_with_proof,
         };
 
         let base = 5u64;
@@ -480,7 +480,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(9),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::ZERO,
             Round::INITIAL,

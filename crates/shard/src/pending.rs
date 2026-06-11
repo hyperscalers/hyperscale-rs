@@ -807,9 +807,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, BoundedVec, CertificateRoot,
-        Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verified,
-        WaveCertificate, WaveId, WeightedTimestamp,
+        WaveCertificate, WaveId,
     };
 
     use super::*;
@@ -819,7 +819,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -843,7 +843,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             round,
