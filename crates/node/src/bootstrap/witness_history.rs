@@ -62,15 +62,24 @@ impl WitnessHistorySync {
 
     /// The next page request, or `None` while one is in flight or the
     /// assembly is complete.
+    ///
+    /// `start_index` is absolute: the window base (learned from the
+    /// first page's header) plus the hashes assembled so far. The
+    /// opening request starts at zero — the server clamps it up to the
+    /// base the joiner doesn't yet know.
     pub fn next_request(&mut self) -> Option<GetWitnessHistoryRequest> {
         if self.state != SyncState::Idle {
             return None;
         }
         self.state = SyncState::InFlight;
+        let base = self
+            .header
+            .as_ref()
+            .map_or(0, |h| h.beacon_witness_base().inner());
         Some(GetWitnessHistoryRequest {
             height: self.anchor.height,
             block_hash: self.anchor.block_hash,
-            start_index: self.hashes.len() as u64,
+            start_index: base + self.hashes.len() as u64,
             limit: self.limit,
         })
     }
@@ -96,35 +105,41 @@ impl WitnessHistorySync {
         if chunk.header.hash() != self.anchor.block_hash {
             return self.reject("served header does not hash to the anchor");
         }
-        let count = chunk.header.beacon_witness_leaf_count().inner();
+        // The header's commitment spans its window `[base, count)`; the
+        // assembly is the window's hashes only.
+        let window_len = chunk
+            .header
+            .beacon_witness_leaf_count()
+            .inner()
+            .saturating_sub(chunk.header.beacon_witness_base().inner());
         let assembled = self.hashes.len() as u64 + chunk.leaf_hashes.len() as u64;
-        if assembled > count {
-            return self.reject("served hashes exceed the header's leaf count");
+        if assembled > window_len {
+            return self.reject("served hashes exceed the header's window");
         }
         if chunk.more {
             if chunk.leaf_hashes.is_empty() {
                 return self.reject("empty page with continuation");
             }
-            if assembled == count {
-                return self.reject("continuation past the header's leaf count");
+            if assembled == window_len {
+                return self.reject("continuation past the header's window");
             }
-        } else if assembled < count {
-            return self.reject("final page leaves the history short");
+        } else if assembled < window_len {
+            return self.reject("final page leaves the window short");
         }
 
+        self.header = Some(chunk.header.clone());
         self.hashes.extend(chunk.leaf_hashes.iter().copied());
         if chunk.more {
             return BootstrapOutcome::Accepted;
         }
 
-        // Final binding: the assembled vector must merkle to the
+        // Final binding: the assembled window must merkle to the
         // anchor-bound header's commitment. Count equality holds by the
         // arithmetic above.
         let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&self.hashes));
         if root != chunk.header.beacon_witness_root() {
-            return self.reject("assembled history does not merkle to the header's root");
+            return self.reject("assembled window does not merkle to the header's root");
         }
-        self.header = Some(chunk.header.clone());
         self.state = SyncState::Complete;
         BootstrapOutcome::Accepted
     }
@@ -243,6 +258,48 @@ mod tests {
         assert!(hashes.is_empty());
     }
 
+    /// An anchor whose header commits a window starting past leaf zero:
+    /// the opening zero request clamps up to the base at the server, the
+    /// assembly verifies against the windowed root, and the seeded
+    /// recovery starts the accumulator at the base.
+    #[test]
+    fn windowed_anchor_assembles_the_window_only() {
+        use hyperscale_storage::test_helpers::commit_block_with_witness_window;
+        use hyperscale_types::BeaconWitnessLeafCount;
+
+        let storage = SimShardStorage::default();
+        let window: Vec<_> = (10u64..15).map(stake_deposit).collect();
+        let block_hash = commit_block_with_witness_window(
+            &storage,
+            BlockHeight::new(HEIGHT),
+            3,
+            &window,
+            &window,
+            None,
+        );
+        let anchor = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash,
+            height: BlockHeight::new(HEIGHT),
+        };
+        let peer = PendingChain::new(Arc::new(storage));
+
+        let mut sync = WitnessHistorySync::new(anchor, 2);
+        drive(&mut sync, &peer);
+        assert!(sync.is_complete());
+
+        let (header, hashes) = sync.take_parts();
+        assert_eq!(header.beacon_witness_base(), BeaconWitnessLeafCount::new(3));
+        let expected: Vec<Hash> = window.iter().map(ShardWitnessPayload::leaf_hash).collect();
+        assert_eq!(hashes, expected);
+
+        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, hashes);
+        assert_eq!(
+            recovered.beacon_witness_start,
+            BeaconWitnessLeafCount::new(3)
+        );
+    }
+
     #[test]
     fn header_not_matching_the_anchor_is_rejected() {
         let leaves: Vec<_> = (1u64..=3).map(stake_deposit).collect();
@@ -282,7 +339,7 @@ mod tests {
         response.history.as_mut().unwrap().leaf_hashes.0[1] = Hash::from_bytes(b"tampered");
         assert!(matches!(
             sync.on_response(&response),
-            BootstrapOutcome::Rejected("assembled history does not merkle to the header's root"),
+            BootstrapOutcome::Rejected("assembled window does not merkle to the header's root"),
         ));
 
         // The rejection reset the assembly; an honest retry completes.
@@ -302,7 +359,7 @@ mod tests {
         chunk.leaf_hashes.0.pop();
         assert!(matches!(
             sync.on_response(&response),
-            BootstrapOutcome::Rejected("final page leaves the history short"),
+            BootstrapOutcome::Rejected("final page leaves the window short"),
         ));
     }
 

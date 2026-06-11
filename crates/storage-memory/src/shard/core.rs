@@ -19,7 +19,7 @@ use hyperscale_storage::{
     RecoveredState, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BlockHeight, Hash, NodeId, QuorumCertificate, ShardWitnessPayload, StateRoot, Verified,
+    BeaconWitnessLeafCount, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified,
 };
 
 use super::state::{ConsensusState, SharedState, apply_updates};
@@ -141,10 +141,19 @@ impl SimShardStorage {
             .blocks
             .get(&committed_height)
             .map(|block| block.block().header().parent_qc().weighted_timestamp());
+        // The accumulator window starts at the tip's witness base;
+        // retained entries below it are the persistence layer's
+        // hysteresis stock — serving data, not accumulator state.
+        let beacon_witness_start = c
+            .blocks
+            .get(&committed_height)
+            .map_or(BeaconWitnessLeafCount::ZERO, |block| {
+                block.block().header().beacon_witness_base()
+            });
         let beacon_witness_leaf_hashes: Vec<Hash> = c
             .beacon_witnesses
-            .values()
-            .map(ShardWitnessPayload::leaf_hash)
+            .range(beacon_witness_start.inner()..)
+            .map(|(_, payload)| payload.leaf_hash())
             .collect();
         drop(c);
 
@@ -154,6 +163,7 @@ impl SimShardStorage {
             latest_qc,
             committed_anchor_ts,
             jmt_root: Some(self.state_root()),
+            beacon_witness_start,
             beacon_witness_leaf_hashes,
         }
     }

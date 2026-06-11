@@ -2,8 +2,8 @@
 //! state machine after a crash or restart.
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardAnchor, StateRoot, Verified,
-    WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate,
+    ShardAnchor, StateRoot, Verified, WeightedTimestamp,
 };
 
 /// State recovered from storage on startup.
@@ -41,10 +41,18 @@ pub struct RecoveredState {
     /// If not provided (None), defaults to `StateRoot::ZERO` for fresh start.
     pub jmt_root: Option<StateRoot>,
 
-    /// Beacon-witness accumulator leaf hashes for the recovery shard, in
-    /// monotonic leaf-index order. Storage backends derive these from
-    /// the `beacon_witnesses` CF by hashing each retained payload, so
-    /// the shard coordinator can rebuild
+    /// Absolute leaf index of `beacon_witness_leaf_hashes[0]` — the
+    /// committed tip's witness window base. Stored payloads below it
+    /// (the persistence layer's one-window hysteresis stock) are
+    /// serving data, not accumulator state, and are excluded from the
+    /// recovered window. `ZERO` on a fresh start.
+    pub beacon_witness_start: BeaconWitnessLeafCount,
+
+    /// Beacon-witness accumulator leaf hashes for the recovery shard
+    /// from `beacon_witness_start`, in monotonic leaf-index order.
+    /// Storage backends derive these from the `beacon_witnesses` CF by
+    /// hashing each retained payload at or above the tip's window base,
+    /// so the shard coordinator can rebuild
     /// [`BeaconWitnessAccumulator`](../../crates/shard/src/beacon_witnesses.rs)
     /// to the on-disk count without re-deriving from receipts +
     /// historical topology. Empty on a fresh start.
@@ -59,10 +67,11 @@ impl RecoveredState {
     /// `boundary_header` is the anchor block's header, hash-verified
     /// against `anchor.block_hash` by the fetch path; its `parent_qc`
     /// weighted timestamp is the tip's committee anchor, and
-    /// `witness_leaf_hashes` is its verified accumulator history.
-    /// `latest_qc` stays `None` — the store holds no QC for the
-    /// boundary block, and the first tail-synced block's QC adopts
-    /// through the normal round-monotonic path.
+    /// `witness_leaf_hashes` is its verified accumulator window —
+    /// starting at the header's `beacon_witness_base`. `latest_qc`
+    /// stays `None` — the store holds no QC for the boundary block,
+    /// and the first tail-synced block's QC adopts through the normal
+    /// round-monotonic path.
     #[must_use]
     pub fn from_snap_synced_boundary(
         anchor: &ShardAnchor,
@@ -75,6 +84,7 @@ impl RecoveredState {
             latest_qc: None,
             committed_anchor_ts: Some(boundary_header.parent_qc().weighted_timestamp()),
             jmt_root: Some(anchor.state_root),
+            beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
         }
     }

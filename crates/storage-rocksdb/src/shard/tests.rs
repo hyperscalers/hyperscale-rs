@@ -1371,3 +1371,67 @@ fn test_genesis_skips_history_entries() {
         Some(vec![0xAA])
     );
 }
+
+/// Witness retention follows the commit-carried floor (a `WriteBatch`
+/// range delete) with one window of hysteresis, and recovery rebuilds
+/// the accumulator window from the tip header's base — entries below it
+/// are serving stock only.
+#[test]
+fn witness_window_retention_and_recovery() {
+    use hyperscale_storage::test_helpers::{commit_block_with_witness_window, stake_deposit};
+    use hyperscale_types::ShardWitnessPayload;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let deposits: Vec<_> = (0u64..6).map(stake_deposit).collect();
+
+    // Window [0, 4): all four leaves appended, nothing pruned.
+    commit_block_with_witness_window(
+        &storage,
+        BlockHeight::new(1),
+        0,
+        &deposits[0..4],
+        &deposits[0..4],
+        None,
+    );
+    // Window [2, 6): the tail appends, persisted floor untouched.
+    commit_block_with_witness_window(
+        &storage,
+        BlockHeight::new(2),
+        2,
+        &deposits[2..6],
+        &deposits[4..6],
+        None,
+    );
+    // Window [4, 6): the base advance carries the previous window's
+    // base as the persisted floor — leaves below 2 drop, [2, 4) stays
+    // as hysteresis stock.
+    commit_block_with_witness_window(
+        &storage,
+        BlockHeight::new(3),
+        4,
+        &deposits[4..6],
+        &[],
+        Some(BeaconWitnessLeafCount::new(2)),
+    );
+
+    // A read spanning the dropped range comes back short; the retained
+    // hysteresis range answers in full.
+    assert_eq!(storage.get_beacon_witness_payload_range(0, 6).len(), 4);
+    assert_eq!(
+        storage.get_beacon_witness_payload_range(2, 6),
+        deposits[2..6].to_vec(),
+    );
+
+    // Recovery starts the accumulator window at the tip's base.
+    let recovered = storage.load_recovered_state();
+    assert_eq!(
+        recovered.beacon_witness_start,
+        BeaconWitnessLeafCount::new(4)
+    );
+    let expected: Vec<_> = deposits[4..6]
+        .iter()
+        .map(ShardWitnessPayload::leaf_hash)
+        .collect();
+    assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
+}

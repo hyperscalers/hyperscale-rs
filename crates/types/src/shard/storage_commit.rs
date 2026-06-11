@@ -68,6 +68,13 @@ pub struct BeaconWitnessCommit {
     /// fetch responder can map `block_hash → (first_leaf, last_leaf)`
     /// without re-walking history.
     pub leaf_count_at_block_end: BeaconWitnessLeafCount,
+    /// Persisted-payload retention floor carried when this block's
+    /// window base advances: delete stored leaves below the *previous*
+    /// window's base, in the same atomic write. One window of
+    /// hysteresis keeps the previous window's trees provable for the
+    /// beacon fold still consuming them. `None` leaves retention
+    /// untouched.
+    pub prune_persisted_below: Option<BeaconWitnessLeafCount>,
 }
 
 impl BeaconWitnessCommit {
@@ -80,6 +87,7 @@ impl BeaconWitnessCommit {
             starting_leaf_index,
             leaves: Vec::new(),
             leaf_count_at_block_end: starting_leaf_index,
+            prune_persisted_below: None,
         }
     }
 }

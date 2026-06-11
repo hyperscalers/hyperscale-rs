@@ -526,6 +526,71 @@ pub fn commit_block_with_witnesses(
         starting_leaf_index: BeaconWitnessLeafCount::ZERO,
         leaves: leaves.to_vec(),
         leaf_count_at_block_end: count,
+        prune_persisted_below: None,
+    };
+    storage.commit_block(&make_test_certified(block), &witness);
+    block_hash
+}
+
+/// Commit a block at `height` whose header commits the witness window
+/// `[base, base + window.len())`.
+///
+/// The header carries the root over `window`, the cumulative count, and
+/// `base` as its window base. The commit appends `appended` (the
+/// window's tail at `base + window.len() - appended.len()`) and carries
+/// `prune_persisted_below` so backend retention behaviour is
+/// observable. Returns the committed block hash.
+///
+/// # Panics
+///
+/// Panics if `appended` is longer than `window` — the appended tail
+/// must lie inside the committed window.
+pub fn commit_block_with_witness_window(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    height: BlockHeight,
+    base: u64,
+    window: &[ShardWitnessPayload],
+    appended: &[ShardWitnessPayload],
+    prune_persisted_below: Option<BeaconWitnessLeafCount>,
+) -> BlockHash {
+    assert!(appended.len() <= window.len());
+    let leaf_hashes: Vec<Hash> = window.iter().map(ShardWitnessPayload::leaf_hash).collect();
+    let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes));
+    let count = BeaconWitnessLeafCount::new(base + window.len() as u64);
+    let mut parent_bytes = [0u8; 32];
+    parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
+    let block = Block::Live {
+        header: BlockHeader::new(
+            ShardId::ROOT,
+            height,
+            BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
+            QuorumCertificate::genesis(ShardId::ROOT),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(height.inner() * 1000),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            root,
+            count,
+            BeaconWitnessLeafCount::new(base),
+        ),
+        transactions: Arc::new(BoundedVec::new()),
+        certificates: Arc::new(BoundedVec::new()),
+        provisions: Arc::new(BoundedVec::new()),
+    };
+    let block_hash = block.hash();
+    let witness = BeaconWitnessCommit {
+        starting_leaf_index: BeaconWitnessLeafCount::new(count.inner() - appended.len() as u64),
+        leaves: appended.to_vec(),
+        leaf_count_at_block_end: count,
+        prune_persisted_below,
     };
     storage.commit_block(&make_test_certified(block), &witness);
     block_hash

@@ -80,17 +80,24 @@ fn build_witnesses<S: ShardStorage>(
         return Vec::new();
     }
 
+    // The anchor header's root commits its witness window only; paths
+    // build over the window's hashes at window-relative positions.
+    let base = header.beacon_witness_base();
     let leaf_count_at_block_end = header.beacon_witness_leaf_count();
-    if leaf_count_at_block_end.inner() == 0 {
+    let window_len = leaf_count_at_block_end.inner().saturating_sub(base.inner());
+    if window_len == 0 {
         return Vec::new();
     }
 
-    let payloads = pending_chain.get_beacon_witness_payloads(leaf_count_at_block_end);
-    if payloads.is_empty() {
+    let payloads = pending_chain
+        .get_beacon_witness_payload_range(base.inner(), leaf_count_at_block_end.inner());
+    if (payloads.len() as u64) < window_len {
         debug!(
             block_height = req.block_height.inner(),
+            base = base.inner(),
             expected = leaf_count_at_block_end.inner(),
-            "Shard-witness request: leaves pruned past retention horizon"
+            retained = payloads.len(),
+            "Shard-witness request: window leaves pruned past retention horizon"
         );
         return Vec::new();
     }
@@ -102,10 +109,10 @@ fn build_witnesses<S: ShardStorage>(
     let mut witnesses: Vec<Arc<ShardWitness>> = Vec::with_capacity(req.leaf_indices.len());
     for leaf_index in req.leaf_indices.iter() {
         let raw_index = leaf_index.inner();
-        if raw_index >= leaf_count_at_block_end.inner() {
+        if raw_index < base.inner() || raw_index >= leaf_count_at_block_end.inner() {
             continue;
         }
-        let Ok(position) = usize::try_from(raw_index) else {
+        let Ok(position) = usize::try_from(raw_index - base.inner()) else {
             continue;
         };
         let Some(payload) = payloads.get(position).cloned() else {
@@ -219,6 +226,7 @@ mod tests {
             starting_leaf_index,
             leaves: leaves.to_vec(),
             leaf_count_at_block_end,
+            prune_persisted_below: None,
         };
         // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
@@ -281,6 +289,45 @@ mod tests {
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
         assert!(resp.witnesses.is_empty());
+    }
+
+    /// An anchor whose root commits a window starting past leaf zero:
+    /// served proofs verify at window-relative positions through the
+    /// header-rebasing predicate, and below-window indices are dropped.
+    #[test]
+    fn fetch_serves_windowed_proofs_and_drops_below_window_indices() {
+        use hyperscale_storage::test_helpers::commit_block_with_witness_window;
+
+        let storage = Arc::new(SimShardStorage::default());
+        let window: Vec<_> = (1u64..=3).map(deposit).collect();
+        let block_hash = commit_block_with_witness_window(
+            storage.as_ref(),
+            BlockHeight::new(1),
+            4,
+            &window,
+            &window,
+            None,
+        );
+        let pending_chain = PendingChain::new(storage);
+        let header = pending_chain
+            .certified_header(BlockHeight::new(1))
+            .expect("committed anchor resolves")
+            .header()
+            .clone();
+
+        // Global leaves 4..7 are in the window; 2 sits below it.
+        let req = GetShardWitnessesRequest::new(
+            SHARD,
+            BlockHeight::new(1),
+            block_hash,
+            vec![LeafIndex::new(2), LeafIndex::new(4), LeafIndex::new(6)],
+        );
+        let resp = serve_shard_witnesses_request(&pending_chain, &req);
+        assert_eq!(resp.witnesses.len(), 2);
+        for witness in resp.witnesses.iter() {
+            assert!(witness.proof.leaf_index.inner() >= 4);
+            assert!(witness.merkle_includes_in(&header));
+        }
     }
 
     #[test]

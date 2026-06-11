@@ -163,9 +163,10 @@ impl Verified<BeaconWitnessRoot> {
 
 /// Construction asserts: re-deriving the block's new witness payloads
 /// from the receipts + missed-round walk + `ready_signals`, appending to
-/// `parent_witness_leaves`, and merkle-ing the result produces a root
-/// that equals the header's claimed [`BeaconWitnessRoot`] **and** a
-/// leaf count that equals the header's claimed count.
+/// `parent_witness_leaves` trimmed to the block's window base, and
+/// merkle-ing the result produces a root that equals the header's
+/// claimed [`BeaconWitnessRoot`] **and** a leaf count that equals the
+/// header's claimed count.
 impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
     type Error = BeaconWitnessRootVerifyError;
 
@@ -193,14 +194,28 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
         );
         let new_leaves = derive_leaves(ctx.receipts, &missed, ctx.ready_signals);
 
-        let mut leaves = ctx.parent_witness_leaves.clone();
+        // The root commits the block's window only: drop parent leaves
+        // below the validated base. The base never undercuts the parent
+        // window's start (it is bounded by a committed ancestor's count,
+        // and pruning follows commits), so the trim is in range for
+        // honest local state; a defensive empty window fails the root
+        // comparison loudly rather than verifying a misaligned prefix.
+        let trim = usize::try_from(
+            ctx.claimed_base
+                .inner()
+                .saturating_sub(ctx.parent_leaves_start.inner()),
+        )
+        .unwrap_or(usize::MAX);
+        let window = ctx.parent_witness_leaves.get(trim..).unwrap_or(&[]);
+
+        let mut leaves = window.to_vec();
         leaves.reserve(new_leaves.len());
         for payload in &new_leaves {
             leaves.push(payload.leaf_hash());
         }
         let computed_root = Self::from_raw(compute_merkle_root(&leaves));
         let computed_count =
-            BeaconWitnessLeafCount::new(ctx.parent_leaves_start.inner() + leaves.len() as u64);
+            BeaconWitnessLeafCount::new(ctx.claimed_base.inner() + leaves.len() as u64);
         if computed_root != expected_root || computed_count != ctx.expected_leaf_count {
             tracing::warn!(
                 ?expected_root,
@@ -300,8 +315,47 @@ mod tests {
         let topology = snapshot_with_base(shard, 2);
         let leaves = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
-        let ctx = context_with(&topology, shard, 2, leaves, 2);
+        let mut ctx = context_with(&topology, shard, 2, leaves, 4);
+        ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
 
         assert!(expected_root.verify(&ctx).is_ok());
+    }
+
+    /// A block whose base advanced past the parent window's start trims
+    /// the stale prefix before the root recomputation: the root commits
+    /// `[base, count)` and the count stays globally cumulative.
+    #[test]
+    fn parent_window_trims_to_the_block_base() {
+        let shard = ShardId::ROOT;
+        let topology = snapshot_with_base(shard, 2);
+        let parent_leaves = vec![
+            Hash::from_bytes(b"abs-1"),
+            Hash::from_bytes(b"abs-2"),
+            Hash::from_bytes(b"abs-3"),
+        ];
+        // Window after the trim: absolute leaves 2 and 3.
+        let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&parent_leaves[1..]));
+
+        let mut ctx = context_with(&topology, shard, 2, parent_leaves, 4);
+        ctx.parent_leaves_start = BeaconWitnessLeafCount::new(1);
+
+        assert!(expected_root.verify(&ctx).is_ok());
+
+        // The untrimmed full-prefix root no longer verifies.
+        let mut stale = context_with(
+            &topology,
+            shard,
+            2,
+            vec![
+                Hash::from_bytes(b"abs-1"),
+                Hash::from_bytes(b"abs-2"),
+                Hash::from_bytes(b"abs-3"),
+            ],
+            4,
+        );
+        stale.parent_leaves_start = BeaconWitnessLeafCount::new(1);
+        let full_root =
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&stale.parent_witness_leaves));
+        assert!(full_root.verify(&stale).is_err());
     }
 }

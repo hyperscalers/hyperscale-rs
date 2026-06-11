@@ -229,11 +229,12 @@ pub struct ShardWitnessProof {
     /// the accumulator root this proof verifies against.
     pub committed_block_hash: BlockHash,
     /// Position of the witness in the shard's monotonic
-    /// beacon-witness accumulator. Combined with `siblings`, recovers
-    /// the path from leaf to root.
+    /// beacon-witness accumulator — the global leaf identity. The
+    /// merkle path verifies at the window-relative position
+    /// `leaf_index - header.beacon_witness_base()`.
     pub leaf_index: LeafIndex,
     /// Sibling hashes along the path from leaf to root, leaf-side
-    /// first. Length equals the accumulator's depth at
+    /// first. Length equals the witness window's depth at
     /// `committed_block_hash`.
     pub siblings: BoundedVec<Hash, MAX_WITNESS_PROOF_DEPTH>,
 }
@@ -258,9 +259,11 @@ impl ShardWitness {
     /// is already authenticated by its canonical-QC binding
     /// (`hash(boundary_header) == qc.block_hash`), so no
     /// `Verified<CertifiedBlockHeader>` is in hand. The shard and
-    /// anchor-block-hash must match the header, the leaf index must fit the
-    /// merkle helper's `u32` width, and the path from `payload.leaf_hash()`
-    /// must reach `header.beacon_witness_root()`.
+    /// anchor-block-hash must match the header, the leaf index must sit
+    /// inside the header's witness window and fit the merkle helper's
+    /// `u32` width once rebased, and the path from `payload.leaf_hash()`
+    /// must reach `header.beacon_witness_root()` at the window-relative
+    /// position `leaf_index - beacon_witness_base`.
     #[must_use]
     pub fn merkle_includes_in(&self, header: &BlockHeader) -> bool {
         if self.proof.shard_id != header.shard_id() {
@@ -269,14 +272,18 @@ impl ShardWitness {
         if self.proof.committed_block_hash != header.hash() {
             return false;
         }
-        let Ok(leaf_index_u32) = u32::try_from(self.proof.leaf_index.inner()) else {
+        let base = header.beacon_witness_base().inner();
+        if self.proof.leaf_index.inner() < base {
+            return false;
+        }
+        let Ok(position) = u32::try_from(self.proof.leaf_index.inner() - base) else {
             return false;
         };
         verify_merkle_inclusion(
             *header.beacon_witness_root().as_raw(),
             self.payload.leaf_hash(),
             &self.proof.siblings,
-            leaf_index_u32,
+            position,
         )
     }
 }
@@ -290,7 +297,12 @@ pub enum ShardWitnessVerifyError {
     /// `proof.committed_block_hash != ctx.block_hash()`.
     #[error("witness committed_block_hash does not match header block hash")]
     BlockHashMismatch,
-    /// `proof.leaf_index` exceeds the merkle helper's `u32` index width.
+    /// `proof.leaf_index` sits below the header's witness window base —
+    /// the windowed root commits nothing at that position.
+    #[error("leaf_index below the header's witness window")]
+    LeafBelowWindow,
+    /// The window-relative position exceeds the merkle helper's `u32`
+    /// index width.
     #[error("leaf_index exceeds u32")]
     LeafIndexOverflow,
     /// Merkle inclusion check against `header.beacon_witness_root()` failed.
@@ -317,13 +329,17 @@ impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
         if self.proof.committed_block_hash != ctx.block_hash() {
             return Err(ShardWitnessVerifyError::BlockHashMismatch);
         }
-        let leaf_index_u32 = u32::try_from(self.proof.leaf_index.inner())
+        let base = header.beacon_witness_base().inner();
+        if self.proof.leaf_index.inner() < base {
+            return Err(ShardWitnessVerifyError::LeafBelowWindow);
+        }
+        let position = u32::try_from(self.proof.leaf_index.inner() - base)
             .map_err(|_| ShardWitnessVerifyError::LeafIndexOverflow)?;
         if !verify_merkle_inclusion(
             *header.beacon_witness_root().as_raw(),
             self.payload.leaf_hash(),
             &self.proof.siblings,
-            leaf_index_u32,
+            position,
         ) {
             return Err(ShardWitnessVerifyError::BadInclusion);
         }
@@ -395,6 +411,75 @@ mod tests {
         let bytes = basic_encode(&w).unwrap();
         let decoded: ShardWitness = basic_decode(&bytes).unwrap();
         assert_eq!(w, decoded);
+    }
+
+    /// A header whose root commits the window `[base, count)`: a proof
+    /// built at the window-relative position verifies under its global
+    /// `leaf_index`, and an index below the base is rejected outright.
+    #[test]
+    fn proof_positions_rebase_against_the_header_window() {
+        use crate::{
+            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, CertificateRoot, InFlightCount,
+            LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+            StateRoot, TransactionRoot, compute_merkle_root_with_proof,
+        };
+
+        let base = 5u64;
+        let payloads: Vec<ShardWitnessPayload> = (0..3)
+            .map(|i| ShardWitnessPayload::Ready {
+                id: ValidatorId::new(i),
+            })
+            .collect();
+        let window: Vec<Hash> = payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        let (root, _, _) = compute_merkle_root_with_proof(&window, 0);
+
+        let header = BlockHeader::new(
+            ShardId::ROOT,
+            BlockHeight::new(9),
+            BlockHash::ZERO,
+            QuorumCertificate::genesis(ShardId::ROOT),
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::from_raw(root),
+            BeaconWitnessLeafCount::new(base + window.len() as u64),
+            BeaconWitnessLeafCount::new(base),
+        );
+
+        // Global leaf 6 sits at window position 1.
+        let (_, siblings, _) = compute_merkle_root_with_proof(&window, 1);
+        let witness = ShardWitness {
+            payload: payloads[1].clone(),
+            proof: ShardWitnessProof {
+                shard_id: ShardId::ROOT,
+                committed_block_hash: header.hash(),
+                leaf_index: LeafIndex::new(base + 1),
+                siblings: siblings.into(),
+            },
+        };
+        assert!(witness.merkle_includes_in(&header));
+
+        // The same path under an un-rebased (global) position fails.
+        let mut global_position = witness.clone();
+        global_position.proof.leaf_index = LeafIndex::new(1);
+        assert!(!global_position.merkle_includes_in(&header));
+
+        // An index below the window can't prove into the windowed root.
+        let mut below_window = witness;
+        below_window.proof.leaf_index = LeafIndex::new(base - 1);
+        assert!(!below_window.merkle_includes_in(&header));
     }
 
     #[test]

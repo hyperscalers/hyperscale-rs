@@ -42,7 +42,11 @@ pub fn serve_witness_history_request<S: ShardStorage>(
     }
 
     let count = header.beacon_witness_leaf_count().inner();
-    let start = req.start_index;
+    // The header's commitment spans its window only; requests below the
+    // base clamp up to it (a joiner opens at index 0 before it has the
+    // header in hand).
+    let base = header.beacon_witness_base().inner();
+    let start = req.start_index.max(base);
     if start > count {
         return unavailable;
     }

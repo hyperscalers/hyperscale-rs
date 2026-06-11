@@ -78,14 +78,14 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot,
-    LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, Round, RoutableTransaction, StateRoot, StateRootVerifyError, Timeout,
-    TopologySchedule, TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId,
-    Verifiable, Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
+    BeaconWitnessCommit, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
+    CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
+    MAX_ROUND_GAP, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round,
+    RoutableTransaction, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
+    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -363,7 +363,7 @@ impl ShardCoordinator {
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
-                BeaconWitnessLeafCount::ZERO,
+                recovered.beacon_witness_start,
                 recovered.beacon_witness_leaf_hashes,
             ),
             config,
@@ -1098,7 +1098,7 @@ impl ShardCoordinator {
         // `prospective_parent_witness_leaves`, so previewing against the
         // committed accumulator alone would omit those leaves and produce a
         // root no validator accepts.
-        let (parent_start, parent_leaves) = prospective_parent_witness_leaves(
+        let (parent_start, mut parent_leaves) = prospective_parent_witness_leaves(
             &self.beacon_witness_accumulator,
             self.committed_hash,
             parent_block_hash,
@@ -1117,12 +1117,24 @@ impl ShardCoordinator {
                 self.beacon_witness_accumulator.leaves().to_vec(),
             )
         });
-        let (beacon_witness_root, beacon_witness_leaf_count) =
-            BeaconWitnessAccumulator::from_leaves(parent_start, parent_leaves)
-                .preview_append(&new_leaves);
         // The window base resolves from the same schedule entry as the
         // committee — verifiers check the header's claim against it.
+        // The root commits the window only, so parent leaves below the
+        // base trim off before the preview; the base never undercuts the
+        // parent window's start (it is bounded by a committed ancestor's
+        // count, and pruning follows commits).
         let beacon_witness_base = committee.witness_base(self.local_shard);
+        let trim = usize::try_from(
+            beacon_witness_base
+                .inner()
+                .saturating_sub(parent_start.inner()),
+        )
+        .unwrap_or(usize::MAX)
+        .min(parent_leaves.len());
+        parent_leaves.drain(..trim);
+        let (beacon_witness_root, beacon_witness_leaf_count) =
+            BeaconWitnessAccumulator::from_leaves(beacon_witness_base, parent_leaves)
+                .preview_append(&new_leaves);
 
         let plan = assemble_build_action(
             self.me,
@@ -3110,10 +3122,21 @@ impl ShardCoordinator {
         let starting_leaf_index = self.beacon_witness_accumulator.leaf_count();
         self.beacon_witness_accumulator.commit_append(&new_leaves);
         let leaf_count_at_block_end = self.beacon_witness_accumulator.leaf_count();
+        // A committed block whose (QC-attested) window base advanced past
+        // the accumulator's start moves both retention floors: the
+        // in-memory window prunes to the new base, while the persisted
+        // payloads keep one window of hysteresis — they prune only to the
+        // *previous* window's base, so the previous window's trees stay
+        // provable for the beacon fold still consuming them.
+        let prior_start = self.beacon_witness_accumulator.start_index();
+        let block_base = block.header().beacon_witness_base();
+        let prune_persisted_below = (block_base > prior_start).then_some(prior_start);
+        self.beacon_witness_accumulator.prune_to(block_base);
         let witness = BeaconWitnessCommit {
             starting_leaf_index,
             leaves: new_leaves,
             leaf_count_at_block_end,
+            prune_persisted_below,
         };
         self.ready_signal_pool.evict_expired(height);
 

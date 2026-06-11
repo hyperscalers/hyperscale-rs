@@ -203,11 +203,7 @@ fn build_prepared_commit(
                 qc,
                 witness.leaf_count_at_block_end,
             );
-            storage.append_beacon_witnesses_to_batch(
-                &mut write_batch,
-                witness.starting_leaf_index,
-                &witness.leaves,
-            );
+            storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
             append_block_certs_to_batch(&storage, &mut write_batch, block);
 
             let applied = storage.try_apply_prepared_commit(
@@ -290,11 +286,7 @@ impl RocksDbShardStorage {
         );
 
         self.append_block_to_batch(&mut batch, block, qc, witness.leaf_count_at_block_end);
-        self.append_beacon_witnesses_to_batch(
-            &mut batch,
-            witness.starting_leaf_index,
-            &witness.leaves,
-        );
+        self.append_beacon_witnesses_to_batch(&mut batch, witness);
 
         append_block_certs_to_batch(self, &mut batch, block);
 

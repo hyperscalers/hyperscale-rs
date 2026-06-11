@@ -117,6 +117,21 @@ impl BeaconWitnessAccumulator {
             self.leaves.push(payload.leaf_hash());
         }
     }
+
+    /// Drop retained leaves below `base` and advance the window start
+    /// to it. A `base` at or below the current start is a no-op — the
+    /// window only moves forward.
+    pub fn prune_to(&mut self, base: BeaconWitnessLeafCount) {
+        let drop = base.inner().saturating_sub(self.start_index.inner());
+        if drop == 0 {
+            return;
+        }
+        let drop = usize::try_from(drop)
+            .unwrap_or(self.leaves.len())
+            .min(self.leaves.len());
+        self.leaves.drain(..drop);
+        self.start_index = base;
+    }
 }
 
 /// Snapshot of the beacon-witness accumulator's leaf hashes at the
@@ -268,6 +283,34 @@ mod tests {
 
         assert_eq!(acc.root(), snapshot_root);
         assert_eq!(acc.leaf_count(), snapshot_count);
+    }
+
+    /// `prune_to` drops leaves below the new base and advances the
+    /// start; a base at or below the current start is a no-op, so the
+    /// window only moves forward.
+    #[test]
+    fn prune_to_advances_the_window() {
+        let mut acc = BeaconWitnessAccumulator::new();
+        let payloads: Vec<_> = (1..=4).map(deposit).collect();
+        acc.commit_append(&payloads);
+
+        acc.prune_to(BeaconWitnessLeafCount::new(2));
+        assert_eq!(acc.start_index(), BeaconWitnessLeafCount::new(2));
+        assert_eq!(acc.leaf_count(), BeaconWitnessLeafCount::new(4));
+        assert_eq!(
+            acc.leaves(),
+            &[deposit(3).leaf_hash(), deposit(4).leaf_hash()],
+        );
+        assert_eq!(
+            acc.root(),
+            BeaconWitnessRoot::from_raw(compute_merkle_root(acc.leaves())),
+        );
+
+        // Backwards or repeated prunes leave the window untouched.
+        acc.prune_to(BeaconWitnessLeafCount::new(1));
+        assert_eq!(acc.start_index(), BeaconWitnessLeafCount::new(2));
+        acc.prune_to(BeaconWitnessLeafCount::new(2));
+        assert_eq!(acc.leaf_count(), BeaconWitnessLeafCount::new(4));
     }
 
     /// A windowed accumulator counts the leaves before its retained

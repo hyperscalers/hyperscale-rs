@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash,
-    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, TxHash, Verifiable,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
+    FinalizedWave, Hash, ProvisionHash, QuorumCertificate, RoutableTransaction, TxHash, Verifiable,
     Verified, WaveCertificate, WaveId,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
@@ -157,27 +157,34 @@ impl RocksDbShardStorage {
         }
     }
 
-    /// Append per-block beacon-witness leaves into an existing
-    /// `WriteBatch`. Each leaf at position `i` lands at key
+    /// Fold a block's beacon-witness commit into an existing
+    /// `WriteBatch`: each appended leaf at position `i` lands at key
     /// `starting_leaf_index + i` in
-    /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf).
+    /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf),
+    /// and a carried retention floor range-deletes the leaves below it.
     ///
-    /// No-op when `leaves` is empty. Called from `commit_prepared_blocks`
-    /// and `commit_block` so the witness writes commit in the same
-    /// atomic batch as the block + JMT.
+    /// Called from `commit_prepared_blocks` and `commit_block` so the
+    /// witness writes commit in the same atomic batch as the block + JMT.
     pub(crate) fn append_beacon_witnesses_to_batch(
         &self,
         batch: &mut WriteBatch,
-        starting_leaf_index: BeaconWitnessLeafCount,
-        leaves: &[ShardWitnessPayload],
+        witness: &BeaconWitnessCommit,
     ) {
-        if leaves.is_empty() {
-            return;
-        }
         let cf = self.cf();
         let beacon_witnesses_cf = BeaconWitnessesCf::handle(&cf);
-        let start = starting_leaf_index.inner();
-        for (offset, payload) in leaves.iter().enumerate() {
+        if let Some(floor) = witness.prune_persisted_below
+            && floor.inner() > 0
+        {
+            // BE-encoded u64 keys are byte-ordered, so the range delete
+            // drops exactly the leaves below the floor.
+            batch.delete_range_cf(
+                beacon_witnesses_cf,
+                0u64.to_be_bytes(),
+                floor.inner().to_be_bytes(),
+            );
+        }
+        let start = witness.starting_leaf_index.inner();
+        for (offset, payload) in witness.leaves.iter().enumerate() {
             let leaf_index = start + offset as u64;
             batch_put::<BeaconWitnessesCf>(batch, beacon_witnesses_cf, &leaf_index, payload);
         }

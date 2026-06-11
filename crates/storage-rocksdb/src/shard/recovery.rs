@@ -3,12 +3,13 @@
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
 use hyperscale_types::{
-    BlockHash, BlockHeight, BlockMetadata, Hash, ShardWitnessPayload, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, Hash, ShardWitnessPayload,
+    WeightedTimestamp,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf};
 use super::core::RocksDbShardStorage;
-use crate::typed_cf::{TypedCf, get, iter_all};
+use crate::typed_cf::{TypedCf, get, iter_from};
 
 impl RocksDbShardStorage {
     /// Load recovered state from storage for crash recovery.
@@ -42,7 +43,8 @@ impl RocksDbShardStorage {
             );
         }
 
-        let beacon_witness_leaf_hashes = self.load_beacon_witness_leaf_hashes();
+        let beacon_witness_start = self.committed_witness_base(committed_height);
+        let beacon_witness_leaf_hashes = self.load_beacon_witness_leaf_hashes(beacon_witness_start);
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_operation("load_recovered_state", elapsed);
@@ -53,6 +55,7 @@ impl RocksDbShardStorage {
             has_latest_qc = latest_qc.is_some(),
             jmt_block_height = jmt_block_height.inner(),
             jmt_root = ?jmt_root,
+            beacon_witness_start = beacon_witness_start.inner(),
             beacon_witness_leaf_count = beacon_witness_leaf_hashes.len(),
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
@@ -64,6 +67,7 @@ impl RocksDbShardStorage {
             latest_qc,
             committed_anchor_ts: self.committed_anchor_ts(committed_height),
             jmt_root: jmt_root_opt,
+            beacon_witness_start,
             beacon_witness_leaf_hashes,
         }
     }
@@ -81,17 +85,30 @@ impl RocksDbShardStorage {
         Some(metadata.header().parent_qc().weighted_timestamp())
     }
 
-    /// Read all retained beacon-witness leaves from the
-    /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf)
+    /// The committed tip's witness window base, read from its stored
+    /// header. `ZERO` when no block is stored at `committed_height`
+    /// (fresh start / genesis tip).
+    fn committed_witness_base(&self, committed_height: BlockHeight) -> BeaconWitnessLeafCount {
+        let cf = self.cf();
+        let blocks_cf = BlocksCf::handle(&cf);
+        get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())
+            .map_or(BeaconWitnessLeafCount::ZERO, |metadata: BlockMetadata| {
+                metadata.header().beacon_witness_base()
+            })
+    }
+
+    /// Read the retained beacon-witness leaves at or above `start` from
+    /// the [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf)
     /// in key order and hash each payload through
     /// [`ShardWitnessPayload::leaf_hash`]. The result feeds
     /// [`BeaconWitnessAccumulator::from_leaves`](../../crates/shard/src/beacon_witnesses.rs)
-    /// at coordinator startup. Storage is scoped per-shard, so the
-    /// full-scan order is the accumulator's monotonic leaf order.
-    fn load_beacon_witness_leaf_hashes(&self) -> Vec<Hash> {
+    /// at coordinator startup. Entries below `start` are the
+    /// persistence layer's hysteresis stock — serving data, not
+    /// accumulator state.
+    fn load_beacon_witness_leaf_hashes(&self, start: BeaconWitnessLeafCount) -> Vec<Hash> {
         let cf = self.cf();
         let beacon_witnesses_cf = BeaconWitnessesCf::handle(&cf);
-        iter_all::<BeaconWitnessesCf>(&self.db, beacon_witnesses_cf)
+        iter_from::<BeaconWitnessesCf>(&self.db, beacon_witnesses_cf, &start.inner())
             .map(|(_leaf_index, payload): (_, ShardWitnessPayload)| payload.leaf_hash())
             .collect()
     }

@@ -211,14 +211,18 @@ fn build_prepared_commit(
 }
 
 impl SimShardStorage {
-    /// Append `witness.leaves` into the in-memory beacon-witness map.
-    /// Lives next to the commit paths so both prepared-commit and
-    /// from-scratch commits share one entry point.
+    /// Fold a block's beacon-witness commit into the in-memory map:
+    /// append `witness.leaves` and drop entries below a carried
+    /// retention floor. Lives next to the commit paths so both
+    /// prepared-commit and from-scratch commits share one entry point.
     fn append_beacon_witnesses(&self, witness: &BeaconWitnessCommit) {
-        if witness.leaves.is_empty() {
+        if witness.leaves.is_empty() && witness.prune_persisted_below.is_none() {
             return;
         }
         let mut c = write_or_recover(&self.consensus);
+        if let Some(floor) = witness.prune_persisted_below {
+            c.beacon_witnesses = c.beacon_witnesses.split_off(&floor.inner());
+        }
         let start = witness.starting_leaf_index.inner();
         for (offset, payload) in witness.leaves.iter().enumerate() {
             c.beacon_witnesses
