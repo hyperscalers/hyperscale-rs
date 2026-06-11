@@ -21,7 +21,7 @@ use libp2p_stream::Control;
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, spawn_blocking};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, request_protocol};
@@ -38,6 +38,15 @@ const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// keep-alive handles liveness detection; this just prevents resource
 /// leaks if a sender silently disappears.
 const PERSISTENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Interval between request-protocol registration attempts when the
+/// slot is still held by a predecessor loop's `IncomingStreams`.
+const ACCEPT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Registration attempts before giving up. Generous: the predecessor
+/// frees the slot as soon as the runtime processes its abort, so
+/// exhaustion means something is wedged, not slow.
+const ACCEPT_RETRY_LIMIT: usize = 100;
 
 /// Maximum number of inbound streams handled concurrently across all peers.
 const MAX_INBOUND_CONCURRENT: usize = 128;
@@ -105,12 +114,14 @@ pub struct InboundRouterHandle {
 impl InboundRouterHandle {
     /// Start the request accept loop for `shard`, registering its wire
     /// protocol on the stream control. Replaces (and aborts) any prior
-    /// loop for the same shard.
+    /// loop for the same shard; the prior is aborted first so the new
+    /// loop's registration usually lands on its first attempt.
     pub fn start_shard_loop(&self, shard: ShardId) {
-        let handle = spawn_request_loop(Arc::clone(&self.router), self.control.clone(), shard);
-        if let Some(prior) = self.request_handles.insert(shard, handle) {
+        if let Some((_, prior)) = self.request_handles.remove(&shard) {
             prior.abort();
         }
+        let handle = spawn_request_loop(Arc::clone(&self.router), self.control.clone(), shard);
+        self.request_handles.insert(shard, handle);
     }
 
     /// Stop the request accept loop for `shard`. Aborting the task
@@ -136,16 +147,36 @@ fn spawn_request_loop(
 ) -> JoinHandle<()> {
     spawn(async move {
         let protocol = request_protocol(shard);
-        let mut incoming = match control.accept(protocol.clone()) {
-            Ok(incoming) => incoming,
-            Err(e) => {
-                error!(
-                    error = ?e,
-                    shard = shard.inner(),
-                    "Failed to register request protocol"
-                );
-                return;
+        // Registration collides while a predecessor loop's
+        // `IncomingStreams` is still alive: aborting that loop frees the
+        // slot only when the runtime processes the abort, so a
+        // stop/start shard cycle (or in-place restart) can race it.
+        // Retry until the slot frees — giving up here would leave the
+        // shard silently unable to serve requests.
+        let mut incoming = None;
+        for attempt in 0..ACCEPT_RETRY_LIMIT {
+            match control.accept(protocol.clone()) {
+                Ok(streams) => {
+                    incoming = Some(streams);
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        error = ?e,
+                        shard = shard.inner(),
+                        attempt,
+                        "Request protocol still registered; retrying"
+                    );
+                    sleep(ACCEPT_RETRY_INTERVAL).await;
+                }
             }
+        }
+        let Some(mut incoming) = incoming else {
+            error!(
+                shard = shard.inner(),
+                "Failed to register request protocol; request serving for this shard is down"
+            );
+            return;
         };
 
         info!(shard = shard.inner(), "InboundRouter: request loop started");
@@ -596,6 +627,46 @@ mod tests {
         let _ = control
             .accept(protocol)
             .expect("re-accept after drop re-registers the protocol");
+    }
+
+    /// A request loop spawned while the protocol slot is still held —
+    /// the stop/start race, where the predecessor's abort hasn't been
+    /// processed yet — must keep retrying and claim the slot once the
+    /// holder drops, instead of dying and leaving the shard unservable.
+    #[tokio::test]
+    async fn request_loop_retries_registration_until_the_slot_frees() {
+        let behaviour = StreamBehaviour::new();
+        let mut control = behaviour.new_control();
+        let shard = ShardId::leaf(1, 0);
+        let protocol = request_protocol(shard);
+        let holder = control.accept(protocol.clone()).expect("hold the slot");
+
+        let router = make_router(8);
+        let _loop_handle = spawn_request_loop(router, behaviour.new_control(), shard);
+
+        // Let the loop hit the collision and park in its retry cycle,
+        // then free the slot.
+        sleep(ACCEPT_RETRY_INTERVAL * 2).await;
+        drop(holder);
+
+        // Once the retrying loop claims the slot, a probe accept
+        // collides with *its* registration. A successful probe means we
+        // raced ahead of the loop — hand the slot back and let it win.
+        let mut loop_owns_the_slot = false;
+        for _ in 0..ACCEPT_RETRY_LIMIT {
+            match control.accept(protocol.clone()) {
+                Err(_) => {
+                    loop_owns_the_slot = true;
+                    break;
+                }
+                Ok(probe) => drop(probe),
+            }
+            sleep(ACCEPT_RETRY_INTERVAL).await;
+        }
+        assert!(
+            loop_owns_the_slot,
+            "the retrying loop must claim the protocol after the holder drops"
+        );
     }
 
     fn make_router(global_cap: usize) -> Arc<InboundRouter> {
