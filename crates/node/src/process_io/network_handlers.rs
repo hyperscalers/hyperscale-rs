@@ -66,6 +66,7 @@ where
         // ── transaction.gossip → ShardScopedInput::TransactionGossipReceived ─
 
         let senders = self.process.shard_event_senders.clone();
+        let canonical_txs = Arc::clone(&self.process.canonical_txs);
         self.process
             .network
             .register_gossip_handler::<TransactionGossip>(
@@ -79,6 +80,10 @@ where
                         return GossipVerdict::Reject;
                     };
                     for transaction in gossip.transactions.into_inner() {
+                        // A cross-shard tx arrives once per hosted shard
+                        // topic, each a fresh decode; canonicalizing here
+                        // lets the shards share one validation verdict.
+                        let transaction = canonical_txs.canonicalize(&transaction);
                         push_shard_input(
                             tx,
                             shard,

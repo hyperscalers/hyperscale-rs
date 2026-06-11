@@ -9,6 +9,7 @@
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
 mod beacon_commit;
+mod canonical_txs;
 mod network_handlers;
 mod tx_status;
 
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 pub(crate) use beacon_commit::BeaconCommitCoordinator;
+pub(crate) use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch::Dispatch;
@@ -107,6 +109,13 @@ where
     /// thread writes through its monotonic merge; RPC threads read
     /// lock-free.
     pub(crate) tx_status: Arc<TxStatusCache>,
+
+    /// Canonical `RoutableTransaction` instance per tx hash, so
+    /// co-hosted shards validating the same transaction share one
+    /// `OnceLock` verdict instead of each running the full
+    /// signature/SBOR validation. `Arc` so the gossip handler closure
+    /// can hold it without capturing the whole `ProcessIo`.
+    pub(crate) canonical_txs: Arc<CanonicalTxs>,
 }
 
 impl<S, N, D> ProcessIo<S, N, D>
@@ -139,6 +148,7 @@ where
             beacon_commit: BeaconCommitCoordinator::new(),
             beacon_proposal_pool,
             tx_status: Arc::new(TxStatusCache::new()),
+            canonical_txs: Arc::new(CanonicalTxs::new()),
         }
     }
 
@@ -268,6 +278,10 @@ where
     /// concurrently because `compute_submit_fanout` only reads the
     /// lock-free topology snapshot and the immutable sender map.
     pub fn submit_transaction(&self, tx: &Arc<RoutableTransaction>) -> bool {
+        // Seed the canonical-instance cache so gossip echoes of this tx
+        // arriving on other hosted shards' topics share its validation
+        // verdict.
+        let tx = &self.canonical_txs.canonicalize(tx);
         let fanout = self.compute_submit_fanout(tx);
         let mut ok = true;
         match fanout {

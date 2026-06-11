@@ -172,6 +172,14 @@ where
             return;
         }
 
+        // Each shard's fetch responses decode fresh instances;
+        // canonicalizing lets co-hosted shards share one validation
+        // verdict.
+        let batch: Vec<Arc<RoutableTransaction>> = batch
+            .into_iter()
+            .map(|tx| self.process.canonical_txs.canonicalize(&tx))
+            .collect();
+
         let delivered_ids: Vec<TxHash> = batch.iter().map(|tx| tx.hash()).collect();
         self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids: delivered_ids });
 
@@ -335,6 +343,10 @@ where
     ///
     /// [`ProcessIo::compute_submit_fanout`]: crate::process_io::ProcessIo::compute_submit_fanout
     pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
+        // Seed the canonical-instance cache so gossip echoes of this tx
+        // arriving on other hosted shards' topics share its validation
+        // verdict.
+        let tx = &self.process.canonical_txs.canonicalize(tx);
         match self.process.compute_submit_fanout(tx) {
             SubmitFanout::Admit {
                 source,
