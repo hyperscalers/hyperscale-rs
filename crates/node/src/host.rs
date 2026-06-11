@@ -27,7 +27,7 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::process_io::{ProcessIo, register_shard_request_handlers};
 use crate::shard_io::ShardIo;
-use crate::shard_io::block_commit::BlockCommitCoordinator;
+use crate::shard_io::block_commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard_io::caches::SharedCaches;
 use crate::shard_io::fetch::FetchHost;
 use crate::shard_io::phase_times::TxPhaseTimesCache;
@@ -599,11 +599,11 @@ fn build_shard_io<S: ShardStorage>(
             .get_certified_header(initial_persisted_height)
             .map(|certified| {
                 let header = certified.header();
-                (
-                    header.hash(),
-                    header.height(),
-                    header.parent_qc().weighted_timestamp(),
-                )
+                BoundaryMemo {
+                    hash: header.hash(),
+                    height: header.height(),
+                    parent_qc_wt: header.parent_qc().weighted_timestamp(),
+                }
             });
         // The chain's epoch duration, read from the projected
         // schedule (sourced from the folded `BeaconState`'s chain

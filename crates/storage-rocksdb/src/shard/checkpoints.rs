@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::import_leaf_updates;
-use hyperscale_storage::{BoundaryStore, ImportLeaf, ResolveLeaf};
+use hyperscale_storage::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf};
 use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{DB, Options, WriteBatch};
@@ -36,29 +36,20 @@ use crate::typed_cf::{TypedCf, batch_put, get};
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
 /// Owned by [`RocksDbShardStorage`] and driven through
-/// [`BoundaryStore`]. Holds the newest [`Self::retain`] checkpoints;
+/// [`BoundaryStore`]. Holds the newest [`BOUNDARY_RETAIN`] checkpoints;
 /// creating a new one evicts the oldest beyond that. Entries are
 /// discovered by scanning the ring directory, so the ring picks up
 /// where it left off after a restart.
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,
-    retain: usize,
 }
 
 impl CheckpointRing {
-    /// Create a ring over `db`, rooted at `dir`.
-    ///
-    /// `dir` is created lazily on first checkpoint. `retain` is the ring
-    /// size — how many checkpoints survive eviction.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `retain` is zero — a zero-size ring would evict every
-    /// checkpoint as soon as it is created.
-    pub(crate) fn from_db(db: Arc<DB>, dir: PathBuf, retain: usize) -> Self {
-        assert!(retain > 0, "checkpoint ring must retain at least one entry");
-        Self { db, dir, retain }
+    /// Create a ring over `db`, rooted at `dir`. The directory is
+    /// created lazily on first checkpoint.
+    pub(crate) const fn from_db(db: Arc<DB>, dir: PathBuf) -> Self {
+        Self { db, dir }
     }
 
     /// Create a checkpoint of the database's current state, labelled with
@@ -74,10 +65,16 @@ impl CheckpointRing {
     /// Returns [`StorageError`] if checkpoint creation or the filesystem
     /// rename fails. Eviction failures are logged, not returned — a
     /// stale extra checkpoint costs disk, not correctness.
-    pub fn create(&self, height: BlockHeight) -> Result<PathBuf, StorageError> {
-        let final_path = self.dir.join(entry_name(height));
+    /// The deterministic on-disk path for `height`'s checkpoint —
+    /// present only while the height is pinned.
+    pub(crate) fn entry_path(&self, height: BlockHeight) -> PathBuf {
+        self.dir.join(entry_name(height))
+    }
+
+    pub fn create(&self, height: BlockHeight) -> Result<(), StorageError> {
+        let final_path = self.entry_path(height);
         if final_path.exists() {
-            return Ok(final_path);
+            return Ok(());
         }
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint dir: {e}")))?;
@@ -94,7 +91,7 @@ impl CheckpointRing {
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint rename: {e}")))?;
 
         self.evict();
-        Ok(final_path)
+        Ok(())
     }
 
     /// All checkpoints in the ring, ascending by height.
@@ -118,7 +115,7 @@ impl CheckpointRing {
     /// Remove the oldest entries beyond the ring size.
     fn evict(&self) {
         let entries = self.entries();
-        let excess = entries.len().saturating_sub(self.retain);
+        let excess = entries.len().saturating_sub(BOUNDARY_RETAIN);
         for (height, path) in entries.into_iter().take(excess) {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(%height, path = %path.display(), error = %e, "checkpoint eviction failed");
@@ -217,19 +214,14 @@ impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
-        self.checkpoints
-            .create(height)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.checkpoints.create(height).map_err(|e| e.to_string())
     }
 
     fn open_boundary(&self, height: BlockHeight) -> Option<CheckpointStore> {
-        let (_, path) = self
-            .checkpoints
-            .entries()
-            .into_iter()
-            .find(|(h, _)| *h == height)?;
-        CheckpointStore::open(&path, self.root_path.clone()).ok()
+        let path = self.checkpoints.entry_path(height);
+        path.exists()
+            .then(|| CheckpointStore::open(&path, self.root_path.clone()).ok())
+            .flatten()
     }
 
     fn import_boundary_state(

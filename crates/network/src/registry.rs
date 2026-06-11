@@ -280,16 +280,20 @@ impl HandlerRegistry {
     /// observes the new set on its next message; in-flight dispatches
     /// finish against the snapshot they loaded.
     pub fn add_hosted_shard(&self, shard: ShardId) {
-        let mut set = (**self.hosted_shards.load()).clone();
-        set.insert(shard);
-        self.hosted_shards.store(Arc::new(set));
+        self.hosted_shards.rcu(|set| {
+            let mut set = (**set).clone();
+            set.insert(shard);
+            set
+        });
     }
 
     /// Remove one shard from the hosted set.
     pub fn remove_hosted_shard(&self, shard: ShardId) {
-        let mut set = (**self.hosted_shards.load()).clone();
-        set.remove(&shard);
-        self.hosted_shards.store(Arc::new(set));
+        self.hosted_shards.rcu(|set| {
+            let mut set = (**set).clone();
+            set.remove(&shard);
+            set
+        });
     }
 
     /// Remove every request handler registered for `shard` — both the

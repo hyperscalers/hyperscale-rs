@@ -19,7 +19,7 @@
 //! [`record_metrics`] picks a representative shard + vnode via
 //! [`MetricsSnapshot::primary`] and emits its values.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
@@ -76,18 +76,19 @@ pub struct VnodeMetrics {
 /// representative shard + vnode (see [`Self::primary`]).
 pub struct MetricsSnapshot {
     /// Per-hosted-shard infrastructure metrics.
-    pub shards: HashMap<ShardId, ShardMetrics>,
+    pub shards: BTreeMap<ShardId, ShardMetrics>,
     /// Per-hosted-vnode consensus metrics.
-    pub vnodes: HashMap<ValidatorId, VnodeMetrics>,
+    pub vnodes: BTreeMap<ValidatorId, VnodeMetrics>,
     /// Flat memory readouts, assembled from primary shard + primary vnode.
     pub memory: MemoryMetrics,
 }
 
 impl MetricsSnapshot {
     /// Pick a representative `(ShardMetrics, VnodeMetrics)` pair for
-    /// the memory readouts and any flat gauge that's still process-wide.
-    /// Returns `None` if there's nothing hosted (shouldn't happen for a
-    /// running `NodeHost`).
+    /// the memory readouts and any flat gauge that's still process-wide
+    /// — the lowest hosted shard id and validator id. Returns `None` if
+    /// there's nothing hosted (shouldn't happen for a running
+    /// `NodeHost`).
     #[must_use]
     pub fn primary(&self) -> Option<(&ShardMetrics, &VnodeMetrics)> {
         let shard = self.shards.values().next()?;
@@ -232,8 +233,8 @@ where
     #[must_use]
     #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let mut shards = HashMap::new();
-        let mut vnodes = HashMap::new();
+        let mut shards = BTreeMap::new();
+        let mut vnodes = BTreeMap::new();
 
         for shard in self.hosted_shards() {
             let fetches = self.shard_io(shard).fetches.metrics();

@@ -500,6 +500,17 @@ impl SimulationRunner {
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Number of hosts in the simulation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host count exceeds `NodeIndex` (test harnesses are
+    /// far smaller).
+    #[must_use]
+    pub fn num_hosts(&self) -> NodeIndex {
+        NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex")
+    }
+
     /// Get a reference to a node's storage. Returns the storage for the
     /// host's first hosted shard.
     #[must_use]

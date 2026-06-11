@@ -148,17 +148,21 @@ impl ProcessExecutionCache {
     /// claims from the set as it stands at acquire time; existing
     /// entries keep the claims they were inserted with.
     pub fn add_hosted_shard(&self, shard: ShardId) {
-        let mut set = (**self.hosted_shards.load()).clone();
-        set.insert(shard);
-        self.hosted_shards.store(Arc::new(set));
+        self.hosted_shards.rcu(|set| {
+            let mut set = (**set).clone();
+            set.insert(shard);
+            set
+        });
     }
 
     /// Remove one shard from the hosted set. Entries still claiming the
     /// shard fall to the retention sweep.
     pub fn remove_hosted_shard(&self, shard: ShardId) {
-        let mut set = (**self.hosted_shards.load()).clone();
-        set.remove(&shard);
-        self.hosted_shards.store(Arc::new(set));
+        self.hosted_shards.rcu(|set| {
+            let mut set = (**set).clone();
+            set.remove(&shard);
+            set
+        });
     }
 
     /// Non-blocking slot acquisition keyed by `tx_hash`.

@@ -21,9 +21,9 @@ use std::time::Instant;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BaseReadCache, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry,
-    SubstateDatabase, SubstateStore, tree,
+    BaseReadCache, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
+    GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
+    SubstateStore, tree,
 };
 use hyperscale_types::{Block, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified};
 use rocksdb::{
@@ -233,11 +233,8 @@ impl RocksDbShardStorage {
         CfHandles::resolve(&db);
 
         let db = Arc::new(db);
-        let checkpoints = super::checkpoints::CheckpointRing::from_db(
-            Arc::clone(&db),
-            dir.join("checkpoints"),
-            BOUNDARY_RETAIN,
-        );
+        let checkpoints =
+            super::checkpoints::CheckpointRing::from_db(Arc::clone(&db), dir.join("checkpoints"));
 
         Ok(Self {
             db,

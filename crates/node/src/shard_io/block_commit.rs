@@ -313,8 +313,18 @@ pub enum AccumulateDecision {
 }
 
 /// A committed block's identity as the candidate epoch-boundary its
-/// committing child adjudicates: `(hash, height, parent_qc wt)`.
-pub type BoundaryMemo = (BlockHash, BlockHeight, WeightedTimestamp);
+/// committing child adjudicates.
+#[derive(Clone, Copy)]
+pub struct BoundaryMemo {
+    /// The candidate's block hash; the child's `parent_qc` must point
+    /// here or the linkage is broken and the pin re-anchors.
+    pub hash: BlockHash,
+    /// Height pinned when the candidate proves to be the crossing.
+    pub height: BlockHeight,
+    /// The candidate's `parent_qc` weighted timestamp — the low side of
+    /// the crossing interval its child adjudicates.
+    pub parent_qc_wt: WeightedTimestamp,
+}
 
 /// Pins shard state at epoch-boundary blocks for snap-sync serving.
 ///
@@ -718,17 +728,21 @@ impl BlockCommitCoordinator {
             for (i, commit) in ready_commits.iter().enumerate() {
                 let block = commit.certified.block();
                 let parent_qc = block.header().parent_qc();
-                if let Some((last_hash, last_height, last_parent_wt)) = trigger.last
-                    && parent_qc.block_hash() == last_hash
+                if let Some(last) = trigger.last
+                    && parent_qc.block_hash() == last.hash
                     && is_epoch_crossing(
-                        last_parent_wt,
+                        last.parent_qc_wt,
                         parent_qc.weighted_timestamp(),
                         trigger.epoch_duration_ms,
                     )
                 {
-                    pin_before[i] = Some(last_height);
+                    pin_before[i] = Some(last.height);
                 }
-                trigger.last = Some((block.hash(), block.height(), parent_qc.weighted_timestamp()));
+                trigger.last = Some(BoundaryMemo {
+                    hash: block.hash(),
+                    height: block.height(),
+                    parent_qc_wt: parent_qc.weighted_timestamp(),
+                });
             }
         }
 
@@ -1604,11 +1618,11 @@ mod tests {
         coord.set_boundary_trigger(
             EPOCH_MS,
             pin_hook(Arc::clone(&sink)),
-            Some((
-                tip_hash,
-                BlockHeight::new(2),
-                WeightedTimestamp::from_millis(900),
-            )),
+            Some(BoundaryMemo {
+                hash: tip_hash,
+                height: BlockHeight::new(2),
+                parent_qc_wt: WeightedTimestamp::from_millis(900),
+            }),
         );
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();

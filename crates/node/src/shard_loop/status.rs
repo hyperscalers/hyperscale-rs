@@ -9,7 +9,7 @@
 //! in their own maps, so callers that care about a specific shard or
 //! validator don't have to thread a "primary" choice through the API.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
@@ -64,9 +64,9 @@ pub struct VnodeStatus {
 #[derive(Debug, Clone)]
 pub struct NodeStatusSnapshot {
     /// Per-hosted-shard readouts.
-    pub shards: HashMap<ShardId, ShardStatus>,
+    pub shards: BTreeMap<ShardId, ShardStatus>,
     /// Per-hosted-vnode readouts.
-    pub vnodes: HashMap<ValidatorId, VnodeStatus>,
+    pub vnodes: BTreeMap<ValidatorId, VnodeStatus>,
 }
 
 impl NodeStatusSnapshot {
@@ -74,12 +74,10 @@ impl NodeStatusSnapshot {
     /// flat-shape RPC clients. Returns `None` if the host has no shards
     /// or no vnodes (shouldn't happen for a running `NodeHost`).
     ///
-    /// Selection is "first hosted shard, first vnode in that shard" —
-    /// stable across calls because the underlying maps are populated in
-    /// the order vnodes were registered.
+    /// Selection is the lowest hosted shard id and validator id —
+    /// deterministic regardless of registration order.
     #[must_use]
     pub fn primary(&self) -> Option<(&ShardStatus, &VnodeStatus)> {
-        // HashMap iteration is unordered; for V=1 there's only one entry.
         let shard = self.shards.values().next()?;
         let vnode = self.vnodes.values().next()?;
         Some((shard, vnode))
@@ -100,8 +98,8 @@ where
         #[allow(clippy::cast_possible_truncation)]
         let remote_congestion_threshold = InFlightCount::new((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
 
-        let mut shards = HashMap::new();
-        let mut vnodes = HashMap::new();
+        let mut shards = BTreeMap::new();
+        let mut vnodes = BTreeMap::new();
 
         for shard in self.hosted_shards() {
             shards.insert(

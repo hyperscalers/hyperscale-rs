@@ -28,7 +28,7 @@ use hyperscale_types::{
 use tracing_test::traced_test;
 
 mod common;
-use common::{PER_SHARD, TEST_EPOCH_MS, rotation_config};
+use common::{TEST_EPOCH_MS, rotation_config};
 
 /// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
 /// move: one shard's rotation victim is drawn straight into the other
@@ -86,8 +86,7 @@ fn mover_status(
 /// A host (other than `except`) whose first vnode sits in `shard`,
 /// for reading the shard's chain from a settled member.
 fn member_host(runner: &SimulationRunner, shard: ShardId, except: NodeIndex) -> NodeIndex {
-    let hosts = 2 * PER_SHARD;
-    (0..hosts)
+    (0..runner.num_hosts())
         .find(|&h| h != except && runner.vnode_state_in(h, shard).is_some())
         .expect("every shard has settled member hosts")
 }
