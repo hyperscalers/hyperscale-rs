@@ -200,6 +200,27 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         "the joiner must follow the new shard's chain past its snap-sync anchor"
     );
 
+    // ── Windowed witness commitment: the cycle ran under a moved base ─
+    // The ready flip above IS a folded Ready leaf, so the destination
+    // shard's witness window base has advanced past zero by now — the
+    // mover's proposals and votes above verified windowed roots with a
+    // nonzero base, and its snap-sync witness fetch assembled a window,
+    // not the full history (a full-history transfer cannot verify
+    // against a windowed root).
+    let (_, beacon_state) = runner
+        .beacon_storage(node)
+        .expect("mover host has beacon storage")
+        .latest_committed()
+        .expect("beacon chain is committed");
+    assert!(
+        beacon_state
+            .witness_window_bases
+            .get(&to)
+            .is_some_and(|base| base.inner() > 0),
+        "the destination shard's witness window base must have advanced \
+         past zero once the mover's Ready leaf folded"
+    );
+
     // ── Drain: the origin shard tears down and stays live without us ─
     assert!(
         !matches!(
