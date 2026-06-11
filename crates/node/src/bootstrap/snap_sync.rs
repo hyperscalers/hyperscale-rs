@@ -26,12 +26,16 @@
 //! 3. each proof claim's value hash is recomputed from the shipped raw
 //!    value.
 
-use hyperscale_jmt::{Blake3Hasher, Key, MultiProof, NibblePath, RangeChunk, Tree, subspan};
+use hyperscale_jmt::{
+    Blake3Hasher, Key, MultiProof, NibblePath, RangeChunk, Tree, next_key, subspan,
+};
 use hyperscale_storage::ImportLeaf;
 use hyperscale_types::network::request::GetStateRangeRequest;
 use hyperscale_types::network::response::{GetStateRangeResponse, StateRangeChunk};
 use hyperscale_types::state_key::{jmt_value_hash, leaf_key_binds_storage_key};
 use hyperscale_types::{Hash, ShardAnchor};
+
+use super::BootstrapOutcome;
 
 type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -53,17 +57,6 @@ enum SubRangeState {
     InFlight,
     /// Exhausted through `end`.
     Done,
-}
-
-/// Outcome of feeding one response into [`SnapSync::on_response`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum ChunkOutcome {
-    /// Chunk verified and absorbed; the sub-range continues (or just
-    /// finished — check [`SnapSync::is_complete`]).
-    Accepted,
-    /// Chunk rejected; the sub-range is re-armed for retry. The driver
-    /// should penalize the peer and rotate.
-    Rejected(&'static str),
 }
 
 /// Snap-sync assembly state for one shard bootstrap.
@@ -150,15 +143,15 @@ impl SnapSync {
         &mut self,
         sub_range: usize,
         response: &GetStateRangeResponse,
-    ) -> ChunkOutcome {
+    ) -> BootstrapOutcome {
         let sub = &mut self.sub_ranges[sub_range];
         if sub.state != SubRangeState::InFlight {
-            return ChunkOutcome::Rejected("unsolicited response");
+            return BootstrapOutcome::Rejected("unsolicited response");
         }
         sub.state = SubRangeState::Idle;
 
         let Some(chunk) = &response.chunk else {
-            return ChunkOutcome::Rejected("boundary unavailable at peer");
+            return BootstrapOutcome::Rejected("boundary unavailable at peer");
         };
         let verified = match verify_chunk(
             self.anchor.state_root.as_raw().as_bytes(),
@@ -168,27 +161,27 @@ impl SnapSync {
             chunk,
         ) {
             Ok(verified) => verified,
-            Err(reason) => return ChunkOutcome::Rejected(reason),
+            Err(reason) => return BootstrapOutcome::Rejected(reason),
         };
 
         if chunk.more {
             // Complete through the last leaf; resume just past it. The
-            // verifier rejected `more` without leaves, so `last` exists,
-            // and a leaf at the absolute key-space maximum cannot have a
-            // successor — the span is exhausted.
+            // verifier rejected `more` without leaves, so `last` exists.
+            // A successor past the sub-range end (or none at all — the
+            // absolute key-space maximum) means the span is exhausted.
             let last = verified
                 .last()
                 .expect("verified truncated chunk carries leaves")
                 .leaf_key;
             match next_key(&last) {
-                Some(next) => sub.cursor = next,
-                None => sub.state = SubRangeState::Done,
+                Some(next) if next <= sub.end => sub.cursor = next,
+                _ => sub.state = SubRangeState::Done,
             }
         } else {
             sub.state = SubRangeState::Done;
         }
         self.leaves.extend(verified);
-        ChunkOutcome::Accepted
+        BootstrapOutcome::Accepted
     }
 
     /// Whether every sub-range is exhausted.
@@ -199,7 +192,7 @@ impl SnapSync {
             .all(|sub| sub.state == SubRangeState::Done)
     }
 
-    /// The verified leaves, ready for
+    /// Take the verified leaves, ready for
     /// `BoundaryStore::import_boundary_state`.
     ///
     /// # Panics
@@ -207,12 +200,12 @@ impl SnapSync {
     /// Panics unless [`Self::is_complete`] — a partial import would
     /// produce a root that can never match the anchor.
     #[must_use]
-    pub fn into_leaves(self) -> Vec<ImportLeaf> {
+    pub fn take_leaves(&mut self) -> Vec<ImportLeaf> {
         assert!(
             self.is_complete(),
             "snap-sync leaves taken before assembly completed",
         );
-        self.leaves
+        std::mem::take(&mut self.leaves)
     }
 }
 
@@ -252,20 +245,6 @@ fn verify_chunk(
             value: leaf.value.to_vec(),
         })
         .collect())
-}
-
-/// The key immediately after `key`, or `None` at the key-space maximum.
-fn next_key(key: &Key) -> Option<Key> {
-    let mut out = *key;
-    for byte in out.iter_mut().rev() {
-        if *byte == u8::MAX {
-            *byte = 0;
-        } else {
-            *byte += 1;
-            return Some(out);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -310,7 +289,7 @@ mod tests {
     fn drive(
         sync: &mut SnapSync,
         pick: impl Fn(usize, usize) -> Arc<SimShardStorage>,
-    ) -> Vec<ChunkOutcome> {
+    ) -> Vec<BootstrapOutcome> {
         let mut outcomes = Vec::new();
         let mut attempts = vec![0usize; sync.sub_ranges.len()];
         for _ in 0..1_000 {
@@ -346,10 +325,10 @@ mod tests {
                 Arc::clone(&peer_b)
             }
         });
-        assert!(outcomes.iter().all(|o| *o == ChunkOutcome::Accepted));
+        assert!(outcomes.iter().all(|o| *o == BootstrapOutcome::Accepted));
         assert!(sync.is_complete());
 
-        let leaves = sync.into_leaves();
+        let leaves = sync.take_leaves();
         assert_eq!(leaves.len(), usize::from(ENTRIES));
 
         let fresh = SimShardStorage::default();
@@ -392,13 +371,13 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .any(|o| matches!(o, ChunkOutcome::Rejected(_)))
+                .any(|o| matches!(o, BootstrapOutcome::Rejected(_)))
         );
         assert!(sync.is_complete());
 
         let fresh = SimShardStorage::default();
         let imported_root = fresh
-            .import_boundary_state(BlockHeight::new(HEIGHT), sync.into_leaves())
+            .import_boundary_state(BlockHeight::new(HEIGHT), sync.take_leaves())
             .unwrap();
         assert_eq!(imported_root, anchor.state_root);
     }
@@ -416,7 +395,7 @@ mod tests {
 
         assert!(matches!(
             sync.on_response(id, &response),
-            ChunkOutcome::Rejected(_)
+            BootstrapOutcome::Rejected(_)
         ));
         assert!(!sync.is_complete());
     }
@@ -437,7 +416,7 @@ mod tests {
 
         assert!(matches!(
             sync.on_response(id, &response),
-            ChunkOutcome::Rejected(_)
+            BootstrapOutcome::Rejected(_)
         ));
     }
 
@@ -452,12 +431,12 @@ mod tests {
         let unavailable = GetStateRangeResponse { chunk: None };
         assert!(matches!(
             sync.on_response(id, &unavailable),
-            ChunkOutcome::Rejected(_)
+            BootstrapOutcome::Rejected(_)
         ));
 
         // The retry against the live peer completes the assembly.
         let outcomes = drive(&mut sync, |_, _| Arc::clone(&peer));
-        assert!(outcomes.iter().all(|o| *o == ChunkOutcome::Accepted));
+        assert!(outcomes.iter().all(|o| *o == BootstrapOutcome::Accepted));
         assert!(sync.is_complete());
     }
 }

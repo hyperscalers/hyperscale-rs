@@ -38,6 +38,6 @@ pub use node::{
     Child, ChildKind, InternalNode, Key, LeafNode, NibblePath, Node, NodeKey, PathDecodeError,
     StaleNodeIndex, TreeUpdateBatch, ValueHash,
 };
-pub use range::{RangeChunk, subspan};
+pub use range::{RangeChunk, next_key, subspan};
 pub use storage::{MemoryStore, TreeReader, TreeWriter};
 pub use tree::{Tree, UpdateError, UpdateResult};

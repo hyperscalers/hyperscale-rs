@@ -109,7 +109,7 @@ pub fn serve_state_range_request<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{MultiProof, NibblePath, RangeChunk};
+    use hyperscale_jmt::{MultiProof, NibblePath, RangeChunk, next_key};
     use hyperscale_storage::test_helpers::{commit_block_with_updates, make_database_update};
     use hyperscale_storage::tree::hash_value;
     use hyperscale_storage::{BoundaryStore, SubstateStore};
@@ -196,15 +196,8 @@ mod tests {
         assert!(first.more);
 
         // Resume immediately after the last served leaf.
-        let mut cursor = *first.leaves.last().unwrap().leaf_key.as_bytes();
-        for byte in cursor.iter_mut().rev() {
-            if *byte == u8::MAX {
-                *byte = 0;
-            } else {
-                *byte += 1;
-                break;
-            }
-        }
+        let cursor = next_key(first.leaves.last().unwrap().leaf_key.as_bytes())
+            .expect("not at the key-space maximum");
         let mut resume = full_range_request(8);
         resume.start = Hash::from_hash_bytes(&cursor);
         let second = serve_state_range_request(&storage, &resume)

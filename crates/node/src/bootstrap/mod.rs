@@ -32,8 +32,8 @@ use hyperscale_types::{
     BlockHeader, BlockHeight, Hash, ShardAnchor, ShardId, StateRoot, shard_prefix_path,
 };
 
-use self::snap_sync::{ChunkOutcome, SnapSync};
-use self::witness_history::{HistoryOutcome, WitnessHistorySync};
+use self::snap_sync::SnapSync;
+use self::witness_history::WitnessHistorySync;
 
 /// State sub-range fan-out: `2^4 = 16` concurrent range fetches.
 const SPLIT_BITS: u8 = 4;
@@ -56,16 +56,15 @@ pub enum BootstrapRequest {
     WitnessHistory(GetWitnessHistoryRequest),
 }
 
-/// Outcome of feeding one response into the sequencer. Mirrors the
-/// inner assemblers' outcomes so the driver's verdict handling is
-/// uniform across phases.
+/// Outcome of feeding one response into the sequencer or one of its
+/// inner assemblers.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BootstrapOutcome {
     /// Response verified and absorbed.
     Accepted,
-    /// Response rejected; the driver should penalize the peer. The
-    /// affected work is re-emitted by the next
-    /// [`ShardBootstrap::next_requests`].
+    /// Response rejected; the driver should penalize the peer and
+    /// rotate. The affected work is re-armed and re-emitted by the
+    /// next [`ShardBootstrap::next_requests`].
     Rejected(&'static str),
 }
 
@@ -140,15 +139,9 @@ impl ShardBootstrap {
         let Phase::State(snap) = &mut self.phase else {
             return BootstrapOutcome::Rejected("state response outside the state phase");
         };
-        let outcome = match snap.on_response(sub_range, response) {
-            ChunkOutcome::Accepted => BootstrapOutcome::Accepted,
-            ChunkOutcome::Rejected(reason) => BootstrapOutcome::Rejected(reason),
-        };
+        let outcome = snap.on_response(sub_range, response);
         if snap.is_complete() {
-            let Phase::State(snap) = std::mem::replace(&mut self.phase, Phase::Importing) else {
-                unreachable!("phase matched State above");
-            };
-            self.phase = Phase::ImportReady(snap.into_leaves());
+            self.phase = Phase::ImportReady(snap.take_leaves());
         }
         outcome
     }
@@ -165,13 +158,11 @@ impl ShardBootstrap {
     /// `Some` exactly once; the driver answers with the imported root
     /// via [`Self::on_imported`].
     pub fn take_import(&mut self) -> Option<(BlockHeight, Vec<ImportLeaf>)> {
-        if !matches!(self.phase, Phase::ImportReady(_)) {
+        let Phase::ImportReady(leaves) = &mut self.phase else {
             return None;
-        }
-        let Phase::ImportReady(leaves) = std::mem::replace(&mut self.phase, Phase::Importing)
-        else {
-            unreachable!("phase matched ImportReady above");
         };
+        let leaves = std::mem::take(leaves);
+        self.phase = Phase::Importing;
         Some((self.anchor.height, leaves))
     }
 
@@ -210,16 +201,9 @@ impl ShardBootstrap {
         let Phase::Witness(witness) = &mut self.phase else {
             return BootstrapOutcome::Rejected("witness response outside the witness phase");
         };
-        let outcome = match witness.on_response(response) {
-            HistoryOutcome::Accepted => BootstrapOutcome::Accepted,
-            HistoryOutcome::Rejected(reason) => BootstrapOutcome::Rejected(reason),
-        };
+        let outcome = witness.on_response(response);
         if witness.is_complete() {
-            let Phase::Witness(witness) = std::mem::replace(&mut self.phase, Phase::Importing)
-            else {
-                unreachable!("phase matched Witness above");
-            };
-            let (header, hashes) = witness.into_parts();
+            let (header, hashes) = witness.take_parts();
             self.phase = Phase::Complete(Box::new(header), hashes);
         }
         outcome
@@ -383,7 +367,8 @@ mod tests {
     fn import_root_mismatch_is_an_error() {
         let (serving, anchor) = replica(&[]);
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
-        loop {
+        let mut imported = false;
+        for _ in 0..1_000 {
             for request in bootstrap.next_requests() {
                 if let BootstrapRequest::StateRange(id, request) = request {
                     let response = serve_state_range_request(&serving, &request);
@@ -391,9 +376,11 @@ mod tests {
                 }
             }
             if bootstrap.take_import().is_some() {
+                imported = true;
                 break;
             }
         }
+        assert!(imported, "state assembly never reached the import");
         assert!(
             bootstrap
                 .on_imported(StateRoot::from_raw(Hash::from_bytes(

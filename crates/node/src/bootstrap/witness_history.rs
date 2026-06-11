@@ -25,16 +25,7 @@ use hyperscale_types::network::request::GetWitnessHistoryRequest;
 use hyperscale_types::network::response::GetWitnessHistoryResponse;
 use hyperscale_types::{BeaconWitnessRoot, BlockHeader, Hash, ShardAnchor, compute_merkle_root};
 
-/// Outcome of feeding one response into [`WitnessHistorySync::on_response`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum HistoryOutcome {
-    /// Page absorbed; the assembly continues (or just finished — check
-    /// [`WitnessHistorySync::is_complete`]).
-    Accepted,
-    /// Page rejected and the assembly reset to scratch. The driver
-    /// should penalize the peer and rotate.
-    Rejected(&'static str),
-}
+use super::BootstrapOutcome;
 
 #[derive(Debug, PartialEq, Eq)]
 enum SyncState {
@@ -93,9 +84,9 @@ impl WitnessHistorySync {
     }
 
     /// Verify and absorb one response.
-    pub fn on_response(&mut self, response: &GetWitnessHistoryResponse) -> HistoryOutcome {
+    pub fn on_response(&mut self, response: &GetWitnessHistoryResponse) -> BootstrapOutcome {
         if self.state != SyncState::InFlight {
-            return HistoryOutcome::Rejected("unsolicited response");
+            return BootstrapOutcome::Rejected("unsolicited response");
         }
         self.state = SyncState::Idle;
 
@@ -123,7 +114,7 @@ impl WitnessHistorySync {
 
         self.hashes.extend(chunk.leaf_hashes.iter().copied());
         if chunk.more {
-            return HistoryOutcome::Accepted;
+            return BootstrapOutcome::Accepted;
         }
 
         // Final binding: the assembled vector must merkle to the
@@ -135,7 +126,7 @@ impl WitnessHistorySync {
         }
         self.header = Some(chunk.header.clone());
         self.state = SyncState::Complete;
-        HistoryOutcome::Accepted
+        BootstrapOutcome::Accepted
     }
 
     /// Whether the history is fully assembled and verified.
@@ -144,32 +135,34 @@ impl WitnessHistorySync {
         self.state == SyncState::Complete
     }
 
-    /// The verified boundary header and leaf-hash history, ready to
-    /// seed a `RecoveredState`.
+    /// Take the verified boundary header and leaf-hash history, ready
+    /// to seed a `RecoveredState`.
     ///
     /// # Panics
     ///
     /// Panics unless [`Self::is_complete`] — a partial history would
     /// seed an accumulator whose roots can never match.
     #[must_use]
-    pub fn into_parts(self) -> (BlockHeader, Vec<Hash>) {
+    pub fn take_parts(&mut self) -> (BlockHeader, Vec<Hash>) {
         assert!(
             self.is_complete(),
             "witness history taken before assembly completed",
         );
         (
-            self.header.expect("complete assembly stored its header"),
-            self.hashes,
+            self.header
+                .take()
+                .expect("complete assembly stored its header"),
+            std::mem::take(&mut self.hashes),
         )
     }
 
     /// Drop everything assembled so far and re-arm. Pages carry no
     /// individual proof, so any failure poisons the whole assembly.
-    fn reject(&mut self, reason: &'static str) -> HistoryOutcome {
+    fn reject(&mut self, reason: &'static str) -> BootstrapOutcome {
         self.hashes.clear();
         self.header = None;
         self.state = SyncState::Idle;
-        HistoryOutcome::Rejected(reason)
+        BootstrapOutcome::Rejected(reason)
     }
 }
 
@@ -217,7 +210,7 @@ mod tests {
                 break;
             };
             let response = serve_witness_history_request(peer, &request);
-            assert_eq!(sync.on_response(&response), HistoryOutcome::Accepted);
+            assert_eq!(sync.on_response(&response), BootstrapOutcome::Accepted);
         }
     }
 
@@ -231,7 +224,7 @@ mod tests {
         assert!(sync.is_complete());
         assert!(sync.next_request().is_none());
 
-        let (header, hashes) = sync.into_parts();
+        let (header, hashes) = sync.take_parts();
         assert_eq!(header.hash(), anchor.block_hash);
         let expected: Vec<Hash> = leaves.iter().map(ShardWitnessPayload::leaf_hash).collect();
         assert_eq!(hashes, expected);
@@ -255,7 +248,7 @@ mod tests {
         let mut sync = WitnessHistorySync::new(anchor, 16);
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
-        let (_, hashes) = sync.into_parts();
+        let (_, hashes) = sync.take_parts();
         assert!(hashes.is_empty());
     }
 
@@ -282,7 +275,7 @@ mod tests {
         let response = serve_witness_history_request(&peer, &honest_request);
         assert!(matches!(
             sync.on_response(&response),
-            HistoryOutcome::Rejected("served header does not hash to the anchor"),
+            BootstrapOutcome::Rejected("served header does not hash to the anchor"),
         ));
         assert!(!sync.is_complete());
     }
@@ -298,7 +291,7 @@ mod tests {
         response.history.as_mut().unwrap().leaf_hashes.0[1] = Hash::from_bytes(b"tampered");
         assert!(matches!(
             sync.on_response(&response),
-            HistoryOutcome::Rejected("assembled history does not merkle to the header's root"),
+            BootstrapOutcome::Rejected("assembled history does not merkle to the header's root"),
         ));
 
         // The rejection reset the assembly; an honest retry completes.
@@ -318,7 +311,7 @@ mod tests {
         chunk.leaf_hashes.0.pop();
         assert!(matches!(
             sync.on_response(&response),
-            HistoryOutcome::Rejected("final page leaves the history short"),
+            BootstrapOutcome::Rejected("final page leaves the history short"),
         ));
     }
 
@@ -335,7 +328,7 @@ mod tests {
         chunk.more = true;
         assert!(matches!(
             sync.on_response(&response),
-            HistoryOutcome::Rejected("empty page with continuation"),
+            BootstrapOutcome::Rejected("empty page with continuation"),
         ));
     }
 
@@ -348,7 +341,7 @@ mod tests {
         let _ = sync.next_request().expect("idle assembly emits");
         assert!(matches!(
             sync.on_response(&GetWitnessHistoryResponse { history: None }),
-            HistoryOutcome::Rejected("history unavailable at peer"),
+            BootstrapOutcome::Rejected("history unavailable at peer"),
         ));
 
         drive(&mut sync, &peer);
@@ -363,14 +356,14 @@ mod tests {
         let mut sync = WitnessHistorySync::new(anchor, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let response = serve_witness_history_request(&peer, &request);
-        assert_eq!(sync.on_response(&response), HistoryOutcome::Accepted);
+        assert_eq!(sync.on_response(&response), BootstrapOutcome::Accepted);
         assert!(sync.is_complete());
 
         // A duplicate delivery after completion must not disturb the
         // assembled state.
         assert!(matches!(
             sync.on_response(&response),
-            HistoryOutcome::Rejected("unsolicited response"),
+            BootstrapOutcome::Rejected("unsolicited response"),
         ));
         assert!(sync.is_complete());
     }

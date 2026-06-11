@@ -447,6 +447,21 @@ fn subtree_high(path: &NibblePath, bucket: u8, arity_bits: u8) -> Key {
     key
 }
 
+/// The key immediately after `key`, or `None` at the key-space maximum.
+#[must_use]
+pub fn next_key(key: &Key) -> Option<Key> {
+    let mut out = *key;
+    for byte in out.iter_mut().rev() {
+        if *byte == u8::MAX {
+            *byte = 0;
+        } else {
+            *byte += 1;
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// The `index`-th of `2^split_bits` equal key sub-spans of the subtree
 /// at `path`, as an inclusive `(low, high)` pair.
 ///
@@ -535,19 +550,6 @@ mod tests {
 
     fn v(b: u8) -> ValueHash {
         [b; 32]
-    }
-
-    fn next_key(key: &Key) -> Key {
-        let mut out = *key;
-        for b in out.iter_mut().rev() {
-            if *b == u8::MAX {
-                *b = 0;
-            } else {
-                *b += 1;
-                break;
-            }
-        }
-        out
     }
 
     fn build_store(entries: &[(Key, ValueHash)]) -> (MemoryStore, NodeKey, Hash) {
@@ -650,7 +652,7 @@ mod tests {
             if !chunk.more {
                 break;
             }
-            cursor = next_key(&chunk.leaves.last().unwrap().0);
+            cursor = next_key(&chunk.leaves.last().unwrap().0).unwrap();
         }
         assert_eq!(collected, entries);
 
@@ -672,7 +674,7 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..32).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let cursor = next_key(&k(13));
+        let cursor = next_key(&k(13)).unwrap();
         let end = [0xFFu8; 32];
         let chunk = Jmt::collect_range(&store, &root, &cursor, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 18);
@@ -835,7 +837,7 @@ mod tests {
         let entries = vec![(k(0x00), v(1)), (k(0x2F), v(2))];
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = next_key(&k(0x00));
+        let start = next_key(&k(0x00)).unwrap();
         let end = k(0x20);
         let chunk = RangeChunk {
             leaves: Vec::new(),
@@ -977,7 +979,7 @@ mod tests {
         let keys: Vec<Key> = chunk.leaves.iter().map(|(key, _)| *key).collect();
         assert_eq!(keys, vec![k(0), k(3), k(6), k(9)]);
 
-        let resumed = Jmt::collect_range(&store, &root, &next_key(&k(9)), 100).unwrap();
+        let resumed = Jmt::collect_range(&store, &root, &next_key(&k(9)).unwrap(), 100).unwrap();
         assert_eq!(resumed.leaves.len(), 6);
         assert!(!resumed.more);
         assert_eq!(resumed.leaves.first().unwrap().0, k(12));
