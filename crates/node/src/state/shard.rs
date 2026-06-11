@@ -486,7 +486,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
         CertifiedBlock, CertifiedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
         ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardId,
-        TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
+        TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WeightedTimestamp,
     };
 
     use super::super::test_support::TestNode;
@@ -540,7 +540,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardId::leaf(1, 1)),
+                QuorumCertificate::genesis(ShardId::leaf(1, 1), WeightedTimestamp::ZERO),
             )));
 
         let pre_exec = node

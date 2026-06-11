@@ -16,7 +16,7 @@ use crate::{
     FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     QuorumCertificate, RoutableTransaction, ShardId, StateRoot, TransactionRoot, TxHash,
-    ValidatorId, Verifiable, Verified,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -161,13 +161,20 @@ impl Eq for Block {}
 
 impl Block {
     /// Create an empty genesis block with the given proposer and JMT state.
+    /// `anchor_wt` is the chain's start-time anchor (see
+    /// [`QuorumCertificate::genesis`](crate::QuorumCertificate::genesis)).
     ///
     /// Genesis is born `Live` with no provisions — the temporality machinery
     /// activates only once there are cross-shard waves in flight.
     #[must_use]
-    pub fn genesis(shard_id: ShardId, proposer: ValidatorId, state_root: StateRoot) -> Self {
+    pub fn genesis(
+        shard_id: ShardId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+        anchor_wt: WeightedTimestamp,
+    ) -> Self {
         Self::Live {
-            header: BlockHeader::genesis(shard_id, proposer, state_root),
+            header: BlockHeader::genesis(shard_id, proposer, state_root, anchor_wt),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),

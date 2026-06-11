@@ -322,6 +322,13 @@ pub struct ShardCoordinator {
 
     /// This validator's home shard.
     local_shard: ShardId,
+
+    /// The chain's start-time anchor — the weighted timestamp its genesis
+    /// QC carries. `ZERO` for chains born at network genesis; a child
+    /// chain created by a shard split anchors at the parent's final
+    /// committed canonical weighted timestamp. Genesis-fallback QCs
+    /// reconstructed here must byte-match the chain's real genesis QC.
+    genesis_anchor_wt: WeightedTimestamp,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -387,7 +394,10 @@ impl ShardCoordinator {
             locked_round: high_qc_round,
             last_voted_round: high_qc_round,
             commits: CommitPipeline::new(),
-            verification: VerificationPipeline::new(recovered.committed_height),
+            verification: VerificationPipeline::new(
+                recovered.committed_height,
+                recovered.genesis_anchor_wt,
+            ),
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             dedup_index: CommitDedupIndex::new(),
@@ -400,6 +410,7 @@ impl ShardCoordinator {
             now: LocalTimestamp::ZERO,
             me,
             local_shard,
+            genesis_anchor_wt: recovered.genesis_anchor_wt,
         }
     }
 
@@ -417,6 +428,7 @@ impl ShardCoordinator {
     const fn chain_view(&self) -> ChainView<'_> {
         ChainView::new(
             self.local_shard,
+            self.genesis_anchor_wt,
             self.committed_height,
             self.committed_hash,
             self.committed_state_root,
@@ -1959,6 +1971,7 @@ impl ShardCoordinator {
             // verification but can't contribute in-flight accounting.
             let chain = ChainView::new(
                 self.local_shard,
+                self.genesis_anchor_wt,
                 self.committed_height,
                 self.committed_hash,
                 self.committed_state_root,
@@ -3497,7 +3510,7 @@ impl ShardCoordinator {
             );
             let shard = certified.qc().shard_id();
             let (block, _) = certified.into_parts();
-            let verified_qc = Verified::<QuorumCertificate>::genesis(shard);
+            let verified_qc = Verified::<QuorumCertificate>::genesis(shard, self.genesis_anchor_wt);
             return self.apply_synced_block(block, verified_qc);
         }
 
@@ -3834,7 +3847,7 @@ impl ShardCoordinator {
         self.latest_qc
             .as_deref()
             .cloned()
-            .unwrap_or_else(|| QuorumCertificate::genesis(self.local_shard))
+            .unwrap_or_else(|| QuorumCertificate::genesis(self.local_shard, self.genesis_anchor_wt))
     }
 
     /// Round of our `high_qc` (genesis round if we hold none). The anchor for
@@ -4361,6 +4374,7 @@ impl ShardCoordinator {
     ) -> Vec<ReadyStateRootVerification> {
         let chain = ChainView::new(
             local_shard,
+            self.genesis_anchor_wt,
             self.committed_height,
             self.committed_hash,
             self.committed_state_root,
@@ -4944,7 +4958,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
             round,
@@ -5126,7 +5140,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(1),
             committed_hash,
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(round % 4),
             ProposerTimestamp::from_millis(100_000),
             Round::new(round),
@@ -5274,7 +5288,7 @@ mod tests {
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 committed_hash,
-                QuorumCertificate::genesis(ShardId::ROOT),
+                QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
                 ValidatorId::new(1),
                 ProposerTimestamp::from_millis(100_000),
                 Round::new(1),
@@ -5326,7 +5340,7 @@ mod tests {
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 committed_hash,
-                QuorumCertificate::genesis(ShardId::ROOT),
+                QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
                 ValidatorId::new(round % 4),
                 ProposerTimestamp::from_millis(100_000),
                 Round::new(round),
@@ -5907,7 +5921,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard),
+                QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO),
                 ValidatorId::new(voter),
                 &generate_bls_keypair(),
             )
@@ -5947,7 +5961,7 @@ mod tests {
             &net,
             shard,
             far,
-            QuorumCertificate::genesis(shard),
+            QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO),
             ValidatorId::new(1),
             &generate_bls_keypair(),
         );
@@ -6044,7 +6058,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard),
+                QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO),
                 ValidatorId::new(voter),
                 &generate_bls_keypair(),
             )
@@ -6088,7 +6102,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard),
+                QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO),
                 ValidatorId::new(2),
                 &generate_bls_keypair(),
             ),

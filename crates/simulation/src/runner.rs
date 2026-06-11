@@ -763,7 +763,8 @@ impl SimulationRunner {
             let proposer = ValidatorId::new(u64::from(
                 shard_id * self.network.config().validators_per_shard,
             ));
-            let genesis_block = Block::genesis(shard, proposer, genesis_jmt_root);
+            let genesis_block =
+                Block::genesis(shard, proposer, genesis_jmt_root, WeightedTimestamp::ZERO);
 
             for host_index in &hosts_for_shard {
                 let i = *host_index as usize;
@@ -780,6 +781,7 @@ impl SimulationRunner {
                     shard,
                     proposer,
                     genesis_jmt_root,
+                    WeightedTimestamp::ZERO,
                 ));
                 let genesis_commit_event = ShardEvent::protocol(
                     shard,

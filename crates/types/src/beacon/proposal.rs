@@ -249,13 +249,17 @@ impl Verified<BeaconProposal> {
 mod tests {
     use super::*;
     use crate::{
-        PcValueElement, PcVector, PcVoteRound, ShardId, SpcView, ValidatorId, zero_bls_signature,
+        PcValueElement, PcVector, PcVoteRound, ShardId, SpcView, ValidatorId, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     fn sample_boundary_qcs() -> BTreeMap<ShardId, Option<QuorumCertificate>> {
         std::iter::once((
             ShardId::ROOT,
-            Some(QuorumCertificate::genesis(ShardId::ROOT)),
+            Some(QuorumCertificate::genesis(
+                ShardId::ROOT,
+                WeightedTimestamp::ZERO,
+            )),
         ))
         .collect()
     }

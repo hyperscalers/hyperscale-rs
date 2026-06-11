@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     Block, BlockHash, BlockHeight, CertifiedBlockHeader, QuorumCertificate, ShardId, StateRoot,
-    ValidatorId, Verifiable, Verified,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// A block alongside the QC that certifies it.
@@ -214,10 +214,15 @@ impl Verified<CertifiedBlock> {
     /// Panics if the assemble linkage fails — structurally impossible
     /// for genesis pairs.
     #[must_use]
-    pub fn genesis(shard_id: ShardId, proposer: ValidatorId, state_root: StateRoot) -> Self {
-        let block = Block::genesis(shard_id, proposer, state_root);
+    pub fn genesis(
+        shard_id: ShardId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+        anchor_wt: WeightedTimestamp,
+    ) -> Self {
+        let block = Block::genesis(shard_id, proposer, state_root, anchor_wt);
         let block_hash = block.hash();
-        let base = QuorumCertificate::genesis(shard_id);
+        let base = QuorumCertificate::genesis(shard_id, anchor_wt);
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             base.shard_id(),
@@ -418,7 +423,12 @@ mod tests {
     /// from raw `QuorumCertificate` to `Verifiable<QuorumCertificate>`.
     #[test]
     fn wire_bypass_identical_across_verified_states() {
-        let block = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let qc = QuorumCertificate::new(
             block.hash(),
             ShardId::leaf(1, 0),
@@ -444,7 +454,12 @@ mod tests {
     /// with the same `LinkageError` shape as `assemble`.
     #[test]
     fn from_qc_attestation_accepts_matching_pair_and_rejects_mismatch() {
-        let block = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let block_hash = block.hash();
         let qc = QuorumCertificate::new(
             block_hash,
@@ -470,7 +485,12 @@ mod tests {
         // (its embedded QC matches its block), but `from_qc_attestation`
         // replaces the embedded QC with the supplied one, so it must
         // re-check the linkage against the new QC.
-        let other_block = Block::genesis(ShardId::leaf(1, 1), ValidatorId::new(1), StateRoot::ZERO);
+        let other_block = Block::genesis(
+            ShardId::leaf(1, 1),
+            ValidatorId::new(1),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let other_qc_raw = QuorumCertificate::new(
             other_block.hash(),
             ShardId::leaf(1, 1),
@@ -493,9 +513,14 @@ mod tests {
     /// verified — byte-equal to whatever the header carries.
     #[test]
     fn parent_qc_attested_returns_header_parent_qc() {
-        let block = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let block_hash = block.hash();
-        let raw_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0));
+        let raw_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             raw_qc.shard_id(),

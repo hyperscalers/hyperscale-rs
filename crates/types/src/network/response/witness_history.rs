@@ -66,7 +66,7 @@ mod tests {
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
         InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        Round, ShardId, StateRoot, TransactionRoot, ValidatorId,
+        Round, ShardId, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
@@ -74,7 +74,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(7),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

@@ -20,6 +20,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified,
+    WeightedTimestamp,
 };
 
 use super::state::{ConsensusState, SharedState, apply_updates};
@@ -170,6 +171,7 @@ impl SimShardStorage {
                 .get(&committed_height.inner())
                 .copied()
                 .unwrap_or(0),
+            genesis_anchor_wt: WeightedTimestamp::ZERO,
         }
     }
 

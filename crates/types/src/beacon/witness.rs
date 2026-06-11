@@ -461,7 +461,7 @@ mod tests {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, CertificateRoot, InFlightCount,
             LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-            StateRoot, TransactionRoot, compute_merkle_root_with_proof,
+            StateRoot, TransactionRoot, WeightedTimestamp, compute_merkle_root_with_proof,
         };
 
         let base = 5u64;
@@ -480,7 +480,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(9),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::ZERO,
             Round::INITIAL,

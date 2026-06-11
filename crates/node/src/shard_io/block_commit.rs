@@ -884,7 +884,8 @@ mod tests {
         );
         let block_hash = block.hash();
         let qc = {
-            let __qc = QuorumCertificate::genesis(block.header().shard_id());
+            let __qc =
+                QuorumCertificate::genesis(block.header().shard_id(), WeightedTimestamp::ZERO);
             QuorumCertificate::new(
                 block_hash,
                 __qc.shard_id(),
@@ -1452,7 +1453,7 @@ mod tests {
     }
 
     fn linked_qc(block_hash: BlockHash, wt_ms: u64) -> QuorumCertificate {
-        let g = QuorumCertificate::genesis(ShardId::ROOT);
+        let g = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
         QuorumCertificate::new(
             block_hash,
             g.shard_id(),

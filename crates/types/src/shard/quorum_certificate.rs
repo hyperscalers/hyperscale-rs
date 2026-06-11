@@ -61,8 +61,17 @@ impl QuorumCertificate {
     /// fixed-`ShardId::ROOT` default would silently route shard-N
     /// committee lookups to shard 0 for any genesis-anchored header.
     /// The genesis QC has a zero block hash and zero signature.
+    ///
+    /// `anchor_wt` is the chain's start-time anchor, carried as the QC's
+    /// weighted timestamp: the BFT clock reads its floor from
+    /// `parent_qc.weighted_timestamp`, so a chain's first blocks anchor
+    /// their validity windows and committee lookups here. Chains born at
+    /// network genesis pass `ZERO`; a child chain created by a shard
+    /// split passes the parent's final committed canonical weighted
+    /// timestamp, keeping the child's clock continuous with the parent
+    /// it inherits instead of resetting mid-network-life.
     #[must_use]
-    pub const fn genesis(shard_id: ShardId) -> Self {
+    pub const fn genesis(shard_id: ShardId, anchor_wt: WeightedTimestamp) -> Self {
         Self {
             block_hash: BlockHash::ZERO,
             shard_id,
@@ -71,7 +80,7 @@ impl QuorumCertificate {
             round: Round::INITIAL,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp: WeightedTimestamp::ZERO,
+            weighted_timestamp: anchor_wt,
         }
     }
 
@@ -262,8 +271,8 @@ impl Verified<QuorumCertificate> {
     /// zero signers, so this constructor is the only path to the genesis
     /// verified value.
     #[must_use]
-    pub const fn genesis(shard_id: ShardId) -> Self {
-        Self::new_unchecked(QuorumCertificate::genesis(shard_id))
+    pub const fn genesis(shard_id: ShardId, anchor_wt: WeightedTimestamp) -> Self {
+        Self::new_unchecked(QuorumCertificate::genesis(shard_id, anchor_wt))
     }
 
     /// Re-wrap a [`QuorumCertificate`] read out of persistent storage
@@ -431,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let qc = QuorumCertificate::genesis(ShardId::ROOT);
+        let qc = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
         assert!(qc.is_genesis());
         assert_eq!(qc.height(), BlockHeight::new(0));
         assert_eq!(qc.block_hash(), BlockHash::ZERO);

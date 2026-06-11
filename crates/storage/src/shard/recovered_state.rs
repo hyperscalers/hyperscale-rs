@@ -62,6 +62,14 @@ pub struct RecoveredState {
     /// coordinator's count frontier for reshape-trigger derivation.
     /// Zero on a fresh start.
     pub substate_count: u64,
+
+    /// The chain's start-time anchor — the weighted timestamp carried by
+    /// its genesis QC (see `QuorumCertificate::genesis`). `ZERO` for
+    /// chains born at network genesis; a child chain created by a shard
+    /// split anchors at the parent's final committed canonical weighted
+    /// timestamp. The coordinator reconstructs genesis-fallback QCs from
+    /// this value, so it must byte-match the chain's real genesis QC.
+    pub genesis_anchor_wt: WeightedTimestamp,
 }
 
 impl RecoveredState {
@@ -93,6 +101,7 @@ impl RecoveredState {
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
             substate_count,
+            genesis_anchor_wt: WeightedTimestamp::ZERO,
         }
     }
 

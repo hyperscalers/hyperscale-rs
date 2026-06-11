@@ -806,7 +806,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(tag)),
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

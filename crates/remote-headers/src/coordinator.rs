@@ -742,7 +742,7 @@ mod tests {
             ShardId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(2, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(2, 0), WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

@@ -3825,7 +3825,7 @@ mod tests {
         let (root, siblings, _) = compute_merkle_root_with_proof(&leaves, leaf_idx_usize);
         let beacon_root = BeaconWitnessRoot::from_raw(root);
 
-        let parent_qc = QuorumCertificate::genesis(shard);
+        let parent_qc = QuorumCertificate::genesis(shard, WeightedTimestamp::ZERO);
         let parent_block_hash = BlockHash::ZERO;
         let header = BlockHeader::new(
             shard,

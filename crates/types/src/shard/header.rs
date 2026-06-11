@@ -14,6 +14,7 @@ use crate::{
     CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
     MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
     Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId,
+    WeightedTimestamp,
 };
 
 /// Block header containing consensus metadata.
@@ -108,9 +109,18 @@ impl BlockHeader {
         }
     }
 
-    /// Create a genesis block header (height 0) with the given proposer and JMT state.
+    /// Create a genesis block header (height 0) with the given proposer and
+    /// JMT state. `anchor_wt` is the chain's start-time anchor (see
+    /// [`QuorumCertificate::genesis`]): `ZERO` for chains born at network
+    /// genesis, the parent's final committed canonical weighted timestamp
+    /// for a child chain created by a shard split.
     #[must_use]
-    pub fn genesis(shard_id: ShardId, proposer: ValidatorId, state_root: StateRoot) -> Self {
+    pub fn genesis(
+        shard_id: ShardId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+        anchor_wt: WeightedTimestamp,
+    ) -> Self {
         Self {
             shard_id,
             height: BlockHeight::new(0),
@@ -119,7 +129,7 @@ impl BlockHeader {
             // `Verified::<QuorumCertificate>::genesis` is the only path to a
             // verified genesis value (the predicate's signer check would
             // reject the zero-signers genesis bitfield).
-            parent_qc: Verified::<QuorumCertificate>::genesis(shard_id).into(),
+            parent_qc: Verified::<QuorumCertificate>::genesis(shard_id, anchor_wt).into(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -539,7 +549,12 @@ mod tests {
     use super::*;
 
     fn sample_header() -> BlockHeader {
-        BlockHeader::genesis(ShardId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
+        BlockHeader::genesis(
+            ShardId::ROOT,
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        )
     }
 
     /// Hand-roll a `BlockHeader` whose `waves` length prefix exceeds the cap.
@@ -654,7 +669,8 @@ mod tests {
     fn with_verified_parent_qc_upgrades_matching_header() {
         let mut header = sample_header();
         header.parent_qc = header.parent_qc.as_unverified().clone().into();
-        let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_id());
+        let verified_qc =
+            Verified::<QuorumCertificate>::genesis(header.shard_id(), WeightedTimestamp::ZERO);
         let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
             .expect("matching parent_qc accepted");
         assert!(verified.parent_qc_verified().is_genesis());
@@ -666,7 +682,8 @@ mod tests {
     fn with_verified_parent_qc_rejects_mismatched_witness() {
         let header = sample_header();
         let other_shard = ShardId::from_heap_index(header.shard_id().inner() + 1);
-        let mismatched = Verified::<QuorumCertificate>::genesis(other_shard);
+        let mismatched =
+            Verified::<QuorumCertificate>::genesis(other_shard, WeightedTimestamp::ZERO);
         let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
             .expect_err("mismatched parent_qc rejected");
         assert_eq!(err, BlockHeaderParentQcMismatch);

@@ -526,10 +526,15 @@ mod tests {
 
         fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
             let shard = ShardId::leaf(1, 0);
-            let header = BlockHeader::genesis(shard, ValidatorId::new(0), state_root);
+            let header = BlockHeader::genesis(
+                shard,
+                ValidatorId::new(0),
+                state_root,
+                WeightedTimestamp::ZERO,
+            );
             Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
                 header,
-                Verified::<QuorumCertificate>::genesis(shard),
+                Verified::<QuorumCertificate>::genesis(shard, WeightedTimestamp::ZERO),
             ))
         }
 

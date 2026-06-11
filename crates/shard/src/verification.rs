@@ -17,6 +17,7 @@ use hyperscale_types::{
     CertifiedBlock, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, ShardId, StateRoot,
     TopologySnapshot, TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -310,11 +311,18 @@ pub struct VerificationPipeline {
     /// straight into `Action::CommitBlock` and `BlockCommitted` without
     /// being reconstructed.
     verified_certified_blocks: HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
+
+    /// The chain's start-time anchor (the genesis QC's weighted
+    /// timestamp). Assembly reconstructs the canonical genesis QC from
+    /// this value when a header claims a genesis `parent_qc`; the
+    /// byte-equality check in `with_verified_parent_qc` then rejects any
+    /// claimed genesis QC whose anchor differs from the chain's.
+    genesis_anchor_wt: WeightedTimestamp,
 }
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(persisted_height: BlockHeight) -> Self {
+    pub fn new(persisted_height: BlockHeight, genesis_anchor_wt: WeightedTimestamp) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
@@ -329,6 +337,7 @@ impl VerificationPipeline {
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
             verified_certified_blocks: HashMap::new(),
+            genesis_anchor_wt,
         }
     }
 
@@ -650,7 +659,7 @@ impl VerificationPipeline {
 
         let parent_qc_raw = block.header().parent_qc();
         let parent_qc_verified = if parent_qc_raw.is_genesis() {
-            Verified::<QuorumCertificate>::genesis(parent_qc_raw.shard_id())
+            Verified::<QuorumCertificate>::genesis(parent_qc_raw.shard_id(), self.genesis_anchor_wt)
         } else {
             let Some(cached) = self.verified_qcs.get(&parent_qc_raw.block_hash()).cloned() else {
                 warn!(
@@ -1870,7 +1879,7 @@ mod tests {
             ShardId::ROOT,
             height,
             parent_block_hash,
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -1940,6 +1949,7 @@ mod tests {
     ) -> ChainView<'a> {
         ChainView::new(
             ShardId::ROOT,
+            WeightedTimestamp::ZERO,
             committed_height,
             committed_hash,
             StateRoot::ZERO,
@@ -1956,7 +1966,7 @@ mod tests {
 
     #[test]
     fn classify_vote_in_flight_skips_vote_when_locked() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let pending = PendingBlocks::new();
@@ -1970,7 +1980,7 @@ mod tests {
     fn classify_vote_in_flight_skips_vote_when_parent_pruned() {
         // Non-genesis parent QC that isn't in the chain view: parent is
         // effectively pruned, so we skip voting but still keep verifying.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let parent = bh(b"parent");
         let parent_qc = QuorumCertificate::new(
             parent,
@@ -1999,7 +2009,7 @@ mod tests {
 
     #[test]
     fn classify_vote_in_flight_proceeds_when_genesis_parent_and_counts_match() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let pending = PendingBlocks::new();
@@ -2013,7 +2023,7 @@ mod tests {
     fn classify_vote_in_flight_aborts_on_in_flight_mismatch() {
         // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
         // with 0 transactions: proposed doesn't match expected → Abort.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
         let pending = PendingBlocks::new();
@@ -2027,7 +2037,7 @@ mod tests {
 
     #[test]
     fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
@@ -2039,7 +2049,7 @@ mod tests {
     fn drain_ready_state_root_verifications_enriches_from_chain_view() {
         // Parent is at GENESIS height ≤ last_persisted_height, so initiate
         // queues this entry directly into ready_state_root_verifications.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let parent_block_hash = bh(b"parent");
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
@@ -2082,7 +2092,7 @@ mod tests {
         // A sibling verification can call `remove_pending_block` between
         // queue-up and drain. Drain must skip the orphaned entry rather than
         // dispatch with empty `finalized_waves` against the wrong inputs.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let parent_block_hash = bh(b"parent");
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
@@ -2110,7 +2120,7 @@ mod tests {
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let topology = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -2149,7 +2159,7 @@ mod tests {
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let topology = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -2194,7 +2204,7 @@ mod tests {
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let topology = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -2229,7 +2239,12 @@ mod tests {
     // ─── PendingAssembly multi-slot completion ──────────────────────────
 
     fn assembly_block() -> Block {
-        Block::genesis(ShardId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
+        Block::genesis(
+            ShardId::ROOT,
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        )
     }
 
     fn assembly_qc_for(block: &Block) -> QuorumCertificate {
@@ -2252,7 +2267,7 @@ mod tests {
     /// QC completes the assembly.
     #[test]
     fn record_assembly_waits_for_every_outstanding_slot() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = assembly_block();
         let block_hash = block.hash();
         let header = block.header().clone();
@@ -2296,7 +2311,7 @@ mod tests {
     /// that already fired.
     #[test]
     fn track_pending_assembly_prefills_already_verified_slots() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = assembly_block();
         let block_hash = block.hash();
         let verified_qc =
@@ -2327,12 +2342,12 @@ mod tests {
     /// proposer's say-so. A genuinely-empty sibling root is still prefilled.
     #[test]
     fn track_pending_assembly_rejects_nonzero_root_on_empty_content() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let forged_header = BlockHeader::new(
             ShardId::ROOT,
             BlockHeight::new(1),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -2372,7 +2387,7 @@ mod tests {
     /// is a no-op returning `None`.
     #[test]
     fn record_qc_assembly_returns_none_for_unknown_block() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         let block = assembly_block();
         let verified_qc =
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
@@ -2383,7 +2398,7 @@ mod tests {
     /// `record_root_assembly` against an unknown block is a no-op too.
     #[test]
     fn record_root_assembly_returns_none_for_unknown_block() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, WeightedTimestamp::ZERO);
         assert!(
             vp.record_state_root_result(
                 bh(b"no-such-block"),

@@ -58,7 +58,7 @@ mod tests {
             ShardId::leaf(1, 0),
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(1, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -83,7 +83,12 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
+        let genesis = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight::new(0));
@@ -91,7 +96,7 @@ mod tests {
         assert_eq!(genesis.header().transaction_root(), TransactionRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc(),
-            &QuorumCertificate::genesis(ShardId::leaf(1, 0))
+            &QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO)
         );
     }
 
@@ -201,7 +206,12 @@ mod tests {
 
     #[test]
     fn test_genesis_certificate_root_is_zero() {
-        let genesis = Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO);
+        let genesis = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         assert_eq!(genesis.header().certificate_root(), CertificateRoot::ZERO);
     }
 
@@ -214,10 +224,14 @@ mod tests {
         // Forge a non-genesis block paired with a genesis QC. Without the
         // pairing check at decode this slips past the synced-block apply
         // path's `qc.is_genesis()` quorum-power bypass.
-        let mut bad_block =
-            Block::genesis(ShardId::leaf(1, 0), ValidatorId::new(0), StateRoot::ZERO)
-                .into_sealed()
-                .into_live(Arc::new(BoundedVec::new()));
+        let mut bad_block = Block::genesis(
+            ShardId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        )
+        .into_sealed()
+        .into_live(Arc::new(BoundedVec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
             *header = BlockHeader::new(
                 header.shard_id(),
@@ -241,7 +255,7 @@ mod tests {
                 header.beacon_witness_base(),
             );
         }
-        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0));
+        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO);
         let bytes = basic_encode(&CertifiedBlockWire {
             block: bad_block,
             qc: genesis_qc,

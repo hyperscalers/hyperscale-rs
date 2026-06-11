@@ -168,7 +168,7 @@ mod tests {
             SHARD,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(SHARD),
+            QuorumCertificate::genesis(SHARD, WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_000 * height.inner()),
             Round::INITIAL,

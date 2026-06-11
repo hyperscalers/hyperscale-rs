@@ -73,7 +73,12 @@ mod tests {
     use super::*;
 
     fn make_certified(height: u64, tag: u64) -> Arc<Verified<CertifiedBlock>> {
-        let block = Block::genesis(ShardId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardId::ROOT,
+            ValidatorId::new(tag),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let qc = QuorumCertificate::new(
             block.hash(),
             ShardId::ROOT,
@@ -143,7 +148,12 @@ mod properties {
     use super::*;
 
     fn make_certified(height: u64, tag: u64) -> Arc<Verified<CertifiedBlock>> {
-        let block = Block::genesis(ShardId::ROOT, ValidatorId::new(tag), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardId::ROOT,
+            ValidatorId::new(tag),
+            StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         let qc = QuorumCertificate::new(
             block.hash(),
             ShardId::ROOT,

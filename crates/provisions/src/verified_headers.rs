@@ -89,7 +89,7 @@ mod tests {
             shard,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(1, 0)),
+            QuorumCertificate::genesis(ShardId::leaf(1, 0), WeightedTimestamp::ZERO),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

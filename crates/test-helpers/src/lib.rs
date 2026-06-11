@@ -208,9 +208,9 @@ impl TestCommittee {
 /// Build a minimal `Block::Live` fixture for driving state machines.
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
-/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardId::ROOT)`, `round`
-/// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
-/// pass only the bits that vary between tests.
+/// are `Hash::ZERO`, `parent_qc` is the ZERO-anchored root-shard genesis QC,
+/// `round` is `Round::INITIAL`, and there are no wave roots or provisions.
+/// Callers pass only the bits that vary between tests.
 ///
 /// Transactions are wrapped as `Verifiable::Unverified` — adequate for the
 /// `on_block_committed` path (`WaveState` lifts via
@@ -232,7 +232,7 @@ pub fn make_live_block(
         shard_id,
         height,
         BlockHash::ZERO,
-        QuorumCertificate::genesis(ShardId::ROOT),
+        QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO),
         proposer,
         ProposerTimestamp::from_millis(timestamp_ms),
         Round::INITIAL,
@@ -273,7 +273,7 @@ pub fn make_live_block(
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let block = stamp_parent_qc_weighted_timestamp(block, weighted_timestamp_ms);
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardId::ROOT);
+        let __qc = QuorumCertificate::genesis(ShardId::ROOT, WeightedTimestamp::ZERO);
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_id(),

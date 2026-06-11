@@ -72,6 +72,7 @@ impl RocksDbShardStorage {
             substate_count: self
                 .substate_count_at_version(committed_height.inner())
                 .unwrap_or(0),
+            genesis_anchor_wt: WeightedTimestamp::ZERO,
         }
     }
 
