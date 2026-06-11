@@ -20,7 +20,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
-use hyperscale_types::{LocalTimestamp, ShardId, TransactionStatus, TxHash};
+use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 
 use crate::NodeStateMachine;
@@ -33,6 +33,7 @@ use crate::shard_io::caches::SharedCaches;
 use crate::shard_io::fetch::FetchHost;
 use crate::shard_io::phase_times::TxPhaseTimesCache;
 use crate::shard_io::sync::SyncHost;
+use crate::shard_io::sync::block::BlockSyncInput;
 use crate::shard_loop::{
     DispatchHandles, ProcessScopedInput, ShardDispatchHandles, ShardEvent, ShardLoop,
     SharedTopologySnapshot, StepOutput,
@@ -649,7 +650,7 @@ fn build_shard_io<S: ShardStorage>(
         prepared_commits: block_commit.prepared_commits_handle(),
     };
     let b = &config.batch;
-    let io = ShardIo {
+    let mut io = ShardIo {
         storage,
         pending_chain,
         block_commit,
@@ -666,5 +667,20 @@ fn build_shard_io<S: ShardStorage>(
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
     };
+    // Seed the block-sync watermark at the recovered tip so the first
+    // sync after a restart — or a runtime join's tail sync after a
+    // snap-sync import — fetches from `committed + 1` instead of
+    // re-pulling the whole chain from genesis for the coordinator to
+    // filter as already committed.
+    if initial_persisted_height > BlockHeight::GENESIS {
+        let outputs = io.syncs.block.handle(BlockSyncInput::Admitted {
+            scope: (),
+            height: initial_persisted_height,
+        });
+        debug_assert!(
+            outputs.is_empty(),
+            "seeding an idle sync FSM must not emit work"
+        );
+    }
     (io, handles)
 }
