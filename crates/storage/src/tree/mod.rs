@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 pub use collected_writes::CollectedWrites;
 use hyperscale_jmt::{
-    Blake3Hasher, Key, NibblePath, Node as JmtNode, NodeKey, Tree, TreeReader, ValueHash,
+    Blake3Hasher, Key, NibblePath, Node as JmtNode, NodeKey, Tree, TreeReader, UpdateResult,
+    ValueHash,
 };
 use hyperscale_types::state_key::{db_node_key_to_node_id, jmt_leaf_key, jmt_value_hash};
 use hyperscale_types::{BlockHeight, Hash, NodeId, StateRoot};
@@ -33,6 +34,8 @@ use radix_substate_store_interface::interface::{
 };
 use rayon::prelude::*;
 pub use snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
+
+use crate::ImportLeaf;
 
 /// Layered tree reader that overlays pending JMT snapshots on a base store.
 ///
@@ -100,6 +103,44 @@ pub type Jmt = Tree<Blake3Hasher, 1>;
 pub fn hash_storage_key(storage_key: &[u8], owner_map: &HashMap<NodeId, NodeId>) -> Key {
     let owner = db_node_key_to_node_id(storage_key).and_then(|n| owner_map.get(&n).copied());
     jmt_leaf_key(storage_key, owner)
+}
+
+/// A JMT root hash as a [`StateRoot`], mapping the empty-tree sentinel
+/// (all zeroes) to `StateRoot::ZERO`.
+#[must_use]
+pub fn state_root_from_jmt(root_hash: [u8; 32]) -> StateRoot {
+    if root_hash == [0u8; 32] {
+        StateRoot::ZERO
+    } else {
+        StateRoot::from_raw(Hash::from_hash_bytes(&root_hash))
+    }
+}
+
+/// Rebuild a JMT at `height` from snap-synced import leaves.
+///
+/// The shipped leaf keys are already owner-prefixed, so the tree is
+/// rebuilt from them directly instead of re-deriving through
+/// [`put_at_version`], which would need the owner map. The caller
+/// persists the result's node batch plus whatever raw-pair and
+/// leaf-association records its backend keeps, and stores the returned
+/// root as the imported state root.
+///
+/// # Errors
+///
+/// Returns a description when the JMT update fails.
+pub fn import_leaf_updates<S: TreeReader>(
+    store: &S,
+    root_path: &NibblePath,
+    height: BlockHeight,
+    leaves: &[ImportLeaf],
+) -> Result<(StateRoot, UpdateResult), String> {
+    let updates: BTreeMap<Key, Option<ValueHash>> = leaves
+        .iter()
+        .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
+        .collect();
+    let result = Jmt::apply_updates_at(store, None, height.inner(), root_path, &updates)
+        .map_err(|e| format!("snap-sync JMT import: {e}"))?;
+    Ok((state_root_from_jmt(result.root_hash), result))
 }
 
 /// Hash a raw value to a 32-byte value hash stored in leaves.
@@ -328,11 +369,7 @@ pub fn put_at_version<S: TreeReader + Sync>(
     )
     .expect("JMT apply_updates failed");
 
-    let root_hash = if result.root_hash == [0u8; 32] {
-        StateRoot::ZERO
-    } else {
-        StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
-    };
+    let root_hash = state_root_from_jmt(result.root_hash);
 
     let mut collected = CollectedWrites::default();
     for (node_key, node) in &result.batch.new_nodes {

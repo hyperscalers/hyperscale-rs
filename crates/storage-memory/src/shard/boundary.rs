@@ -6,14 +6,13 @@
 //! that version. Retention mirrors the production checkpoint ring so
 //! eviction behaviour is exercised in simulation too.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader, ValueHash};
+use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
-use hyperscale_storage::tree::{Jmt, hash_value};
+use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf};
-use hyperscale_types::{BlockHeight, Hash, StateRoot};
+use hyperscale_types::{BlockHeight, StateRoot};
 
 use super::core::SimShardStorage;
 use super::snapshot::value_at_version;
@@ -95,22 +94,8 @@ impl BoundaryStore for SimShardStorage {
             return Err("snap-sync import requires an empty store".to_string());
         }
 
-        // The shipped leaf keys are already owner-prefixed; rebuild the
-        // tree from them directly instead of re-deriving through
-        // `put_at_version`, which would need the owner map.
-        let updates: BTreeMap<Key, Option<ValueHash>> = leaves
-            .iter()
-            .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
-            .collect();
         let root_path = state.tree_store.root_path();
-        let result = Jmt::apply_updates_at(
-            &state.tree_store,
-            None,
-            height.inner(),
-            &root_path,
-            &updates,
-        )
-        .map_err(|e| format!("snap-sync JMT import: {e}"))?;
+        let (root, result) = import_leaf_updates(&state.tree_store, &root_path, height, &leaves)?;
         for (key, node) in result.batch.new_nodes {
             state.tree_store.insert(key, Arc::new(node));
         }
@@ -121,11 +106,6 @@ impl BoundaryStore for SimShardStorage {
             state.current_state.insert(leaf.storage_key, leaf.value);
         }
 
-        let root = if result.root_hash == [0u8; 32] {
-            StateRoot::ZERO
-        } else {
-            StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
-        };
         state.current_block_height = height;
         state.current_root_hash = root;
         drop(state);

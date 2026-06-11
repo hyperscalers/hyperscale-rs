@@ -12,14 +12,11 @@
 //! dot-prefixed temporary name and a rename, so a crash mid-create
 //! leaves only a `.tmp-*` directory, swept on the next creation.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyperscale_jmt::{
-    Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader, ValueHash,
-};
-use hyperscale_storage::tree::{Jmt, hash_value};
+use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{BoundaryStore, ImportLeaf, ResolveLeaf};
 use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rocksdb::checkpoint::Checkpoint;
@@ -249,22 +246,9 @@ impl BoundaryStore for RocksDbShardStorage {
             return Err("snap-sync import requires an empty store".to_string());
         }
 
-        // The shipped leaf keys are already owner-prefixed; rebuild the
-        // tree from them directly instead of re-deriving through
-        // `put_at_version`, which would need the owner map.
-        let updates: BTreeMap<Key, Option<ValueHash>> = leaves
-            .iter()
-            .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
-            .collect();
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
-        let result = Jmt::apply_updates_at(
-            &snapshot_store,
-            None,
-            height.inner(),
-            &self.root_path,
-            &updates,
-        )
-        .map_err(|e| format!("snap-sync JMT import: {e}"))?;
+        let (imported_root, result) =
+            import_leaf_updates(&snapshot_store, &self.root_path, height, &leaves)?;
 
         let cf = CfHandles::resolve(&self.db);
         let mut batch = WriteBatch::default();
@@ -289,11 +273,6 @@ impl BoundaryStore for RocksDbShardStorage {
                 &leaf.storage_key,
             );
         }
-        let imported_root = if result.root_hash == [0u8; 32] {
-            StateRoot::ZERO
-        } else {
-            StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
-        };
         write_jmt_metadata(&mut batch, height.inner(), imported_root);
 
         self.db
