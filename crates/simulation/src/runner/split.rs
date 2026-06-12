@@ -74,11 +74,21 @@ impl SimulationRunner {
         )
         .expect("terminal pair derives the beacon-anchored genesis");
 
-        let storage = observer_store
-            .unwrap_or_else(|| parent_storage.clone_for_split_child(shard_prefix_path(child)));
-        let adopted = storage
-            .adopt_split_child(origin)
-            .expect("child subtree adoption");
+        let (storage, adopted) = observer_store.map_or_else(
+            || {
+                let storage = parent_storage.clone_for_split_child(shard_prefix_path(child));
+                let adopted = storage
+                    .adopt_split_child(origin)
+                    .expect("child subtree adoption");
+                (storage, adopted)
+            },
+            |storage| {
+                let adopted = storage
+                    .adopt_followed_child(origin)
+                    .expect("followed child store adoption");
+                (storage, adopted)
+            },
+        );
         assert_eq!(
             adopted, anchor.state_root,
             "adopted subtree root must match the beacon anchor",

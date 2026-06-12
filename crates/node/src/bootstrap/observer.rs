@@ -220,7 +220,7 @@ impl ObserverBootstrap {
 }
 
 /// Outcome of feeding one block-sync response to [`ObserverTail`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailOutcome {
     /// The block chains and is queued for application via
     /// [`ObserverTail::take_apply`].

@@ -45,7 +45,7 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::bootstrap::{bootstrap_observer_state, bootstrap_shard_state};
+use crate::bootstrap::{bootstrap_observer_state, bootstrap_shard_state, follow_observer_store};
 use crate::rpc::RpcPublishers;
 use crate::runner::{
     ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop, wall_clock_local,
@@ -129,9 +129,6 @@ pub struct CompletedBootstrap {
     recovered: RecoveredState,
 }
 
-/// A finished observer duty: the child-rooted store on disk holds the
-/// child's span as of `root`, and the ready signal is broadcast. The
-/// store handle is dropped — the boundary handoff reopens it from disk.
 /// A settled split-child adoption: the child store on disk is pointed
 /// at its adopted subtree with the deterministic genesis derived and
 /// verified against the beacon's child anchor; seating installs the
@@ -144,10 +141,25 @@ pub struct CompletedAdoption {
     recovered: RecoveredState,
 }
 
+/// A completed observer sync: the child-rooted store holds the child's
+/// span as of `root`, and the ready signal is broadcast. The duty task
+/// holds the store open and keeps following the splitting shard's chain
+/// toward the boundary handoff.
 pub struct CompletedObservation {
     child: ShardId,
     root: StateRoot,
     substate_count: u64,
+}
+
+/// An observer duty's boundary handoff, prepared: the followed store is
+/// adopted at the child's genesis with the deterministic genesis
+/// derived and verified against the beacon's child anchor. Seating
+/// waits only for the placement delta's vnodes.
+pub struct PreparedObserverFlip {
+    child: ShardId,
+    storage: Arc<RocksDbShardStorage>,
+    genesis: Block,
+    recovered: RecoveredState,
 }
 
 /// A background-work completion fed back into the supervisor by the
@@ -172,6 +184,9 @@ pub enum SupervisorEvent {
     /// A split child's store adoption settled (`Err` carries the failed
     /// child).
     SplitAdopted(Result<Box<CompletedAdoption>, ShardId>),
+    /// An observer duty's boundary handoff settled (`Err` carries the
+    /// failed child).
+    ObserverPrepared(Result<Box<PreparedObserverFlip>, ShardId>),
     /// A departing shard's thread joined; the unwire can finish.
     TornDown {
         /// Shard whose thread exited.
@@ -188,13 +203,16 @@ struct ObserverDuty {
     via: ShardId,
     /// The local vnode holding the seat.
     validator: ValidatorId,
-    /// The duty task while the sync is in flight; aborted by
-    /// `Unobserve`. `None` once complete.
+    /// The duty task — the sync, then the stay-current follow of the
+    /// splitting shard's chain, then the boundary handoff's adoption.
+    /// Aborted by `Unobserve`; `None` once the handoff is prepared.
     task: Option<JoinHandle<()>>,
-    /// The imported child subtree root, once complete. The synced
-    /// store itself lives on disk, closed until the boundary handoff
-    /// reopens it.
+    /// The imported child subtree root, once the sync completes (the
+    /// follow keeps the store current with the parent from there).
     synced: Option<StateRoot>,
+    /// The prepared boundary handoff, once the follow reaches the
+    /// parent's crossing — waiting for the placement delta to seat it.
+    prepared: Option<Box<PreparedObserverFlip>>,
 }
 
 /// One hosted shard's runtime: its pinned thread plus the handles the
@@ -238,6 +256,10 @@ pub struct ShardSupervisor {
     bootstrapping: HashMap<ShardId, usize>,
     /// Observer duties, in flight or complete, keyed by pending child.
     observers: HashMap<ShardId, ObserverDuty>,
+    /// Split joins that arrived while their observer duty's boundary
+    /// handoff was still preparing, seated by the
+    /// [`SupervisorEvent::ObserverPrepared`] handler.
+    pending_observer_joins: HashMap<ShardId, Vec<VnodeConfig>>,
     /// Shards whose teardown is parked on the off-loop thread join.
     /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
     draining: HashSet<ShardId>,
@@ -286,6 +308,7 @@ impl ShardSupervisor {
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
             observers: HashMap::new(),
+            pending_observer_joins: HashMap::new(),
             draining: HashSet::new(),
             pending_joins: HashMap::new(),
             events_tx,
@@ -312,6 +335,7 @@ impl ShardSupervisor {
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
             SupervisorEvent::Observed(done) => self.finish_observation(done),
             SupervisorEvent::SplitAdopted(done) => self.finish_adoption(done),
+            SupervisorEvent::ObserverPrepared(done) => self.finish_observer_preparation(done),
             SupervisorEvent::TornDown {
                 shard,
                 validator_ids,
@@ -443,13 +467,13 @@ impl ShardSupervisor {
             return;
         }
         self.bootstrapping.insert(child, vnodes.len());
-        let process = Arc::clone(&self.process);
-        let events = self.events_tx.clone();
-        let factory = Arc::clone(&self.storage_factory);
-        let storage_dir = Arc::clone(&self.storage_dir);
         let vnodes = vnodes.to_vec();
         match adoption {
             SplitAdoption::ParentHalf { parent } => {
+                let process = Arc::clone(&self.process);
+                let events = self.events_tx.clone();
+                let factory = Arc::clone(&self.storage_factory);
+                let storage_dir = Arc::clone(&self.storage_dir);
                 let parent_storage = self
                     .storages
                     .lock()
@@ -486,53 +510,131 @@ impl ShardSupervisor {
                 });
             }
             SplitAdoption::Observer { .. } => {
-                self.tokio_handle.spawn(async move {
-                    let _anchor = wait_for_child_anchor(&process, child).await;
-                    let dir = storage_dir(child);
-                    let done = spawn_blocking(move || {
-                        // The observer synced the child's span at an
-                        // earlier parent anchor; without following the
-                        // parent to its crossing the store is stale, and
-                        // a fresh snap-sync against the child anchor is
-                        // the correct (if slower) path. Wipe and re-open.
-                        if dir.exists() {
-                            std::fs::remove_dir_all(&dir)
-                                .map_err(|e| format!("stale observer store wipe: {e}"))?;
+                if let Some(duty) = self.observers.get_mut(&child) {
+                    if let Some(prepared) = duty.prepared.take() {
+                        self.observers.remove(&child);
+                        self.bootstrapping.remove(&child);
+                        if self.shards.contains_key(&child) {
+                            warn!(shard = ?child, "Observer flip for an already-hosted shard; dropped");
+                            return;
                         }
-                        factory(child)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("observer reopen task panicked: {e}")));
-                    let done = match done {
-                        Ok(storage) => {
-                            match bootstrap_shard_state(
-                                process.network(),
-                                process.topology(),
-                                &storage,
-                                child,
-                            )
-                            .await
-                            {
-                                Ok(recovered) => Ok(CompletedBootstrap {
-                                    shard: child,
-                                    vnodes,
-                                    storage,
-                                    recovered,
-                                }),
-                                Err(error) => {
-                                    warn!(shard = ?child, error, "Observer flip bootstrap failed; join abandoned");
-                                    Err(child)
-                                }
-                            }
-                        }
+                        self.seat_shard_with_genesis(
+                            child,
+                            &vnodes,
+                            prepared.storage,
+                            &prepared.recovered,
+                            Some(&prepared.genesis),
+                        );
+                    } else {
+                        // The duty is still following the parent to its
+                        // crossing; the join parks and
+                        // `finish_observer_preparation` seats it.
+                        info!(shard = ?child, "Split join parked on the observer duty's boundary handoff");
+                        self.pending_observer_joins.insert(child, vnodes);
+                    }
+                    return;
+                }
+                // No duty survives for the child — it failed or was
+                // abandoned — so the flip falls back to a fresh
+                // snap-sync against the now-projected child anchor.
+                self.spawn_observer_fallback(child, vnodes);
+            }
+        }
+    }
+
+    /// The observer flip's fallback: no followed store exists, so the
+    /// stale directory is wiped and the join snap-syncs fresh against
+    /// the child anchor — correct, slower.
+    fn spawn_observer_fallback(&self, child: ShardId, vnodes: Vec<VnodeConfig>) {
+        let process = Arc::clone(&self.process);
+        let events = self.events_tx.clone();
+        let factory = Arc::clone(&self.storage_factory);
+        let dir = (self.storage_dir)(child);
+        self.tokio_handle.spawn(async move {
+            let _anchor = wait_for_child_anchor(&process, child).await;
+            let done = spawn_blocking(move || {
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| format!("stale observer store wipe: {e}"))?;
+                }
+                factory(child)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("observer reopen task panicked: {e}")));
+            let done = match done {
+                Ok(storage) => {
+                    match bootstrap_shard_state(process.network(), process.topology(), &storage, child)
+                        .await
+                    {
+                        Ok(recovered) => Ok(CompletedBootstrap {
+                            shard: child,
+                            vnodes,
+                            storage,
+                            recovered,
+                        }),
                         Err(error) => {
-                            warn!(shard = ?child, error, "Observer flip reopen failed; join abandoned");
+                            warn!(shard = ?child, error, "Observer flip bootstrap failed; join abandoned");
                             Err(child)
                         }
+                    }
+                }
+                Err(error) => {
+                    warn!(shard = ?child, error, "Observer flip reopen failed; join abandoned");
+                    Err(child)
+                }
+            };
+            // Send failure means the runner is shutting down.
+            let _ = events.send(SupervisorEvent::Bootstrapped(done));
+        });
+    }
+
+    /// Settle an observer duty's boundary handoff: seat a parked join
+    /// with the prepared store, stash the preparation for a join still
+    /// to come, or — on failure — fall back to a fresh snap-sync for a
+    /// parked join.
+    fn finish_observer_preparation(&mut self, done: Result<Box<PreparedObserverFlip>, ShardId>) {
+        match done {
+            Ok(prepared) => {
+                let child = prepared.child;
+                if !self.observers.contains_key(&child) {
+                    info!(shard = ?child, "Observer handoff prepared for an abandoned duty; dropped");
+                    return;
+                }
+                if let Some(vnodes) = self.pending_observer_joins.remove(&child) {
+                    self.observers.remove(&child);
+                    let Some(pending) = self.bootstrapping.remove(&child) else {
+                        info!(shard = ?child, "Observer handoff prepared for an abandoned join; dropped");
+                        return;
                     };
-                    // Send failure means the runner is shutting down.
-                    let _ = events.send(SupervisorEvent::Bootstrapped(done));
-                });
+                    if self.shards.contains_key(&child) {
+                        warn!(shard = ?child, "Observer handoff prepared for an already-hosted shard; dropped");
+                        return;
+                    }
+                    self.seat_shard_with_genesis(
+                        child,
+                        &vnodes[..pending.min(vnodes.len())],
+                        prepared.storage,
+                        &prepared.recovered,
+                        Some(&prepared.genesis),
+                    );
+                } else {
+                    let duty = self
+                        .observers
+                        .get_mut(&child)
+                        .expect("duty presence checked above");
+                    duty.task = None;
+                    duty.prepared = Some(prepared);
+                }
+            }
+            Err(child) => {
+                // The follow or adoption failed closed; the handoff
+                // falls back to a fresh snap-sync. A parked join runs it
+                // now; otherwise the join takes the fallback path when
+                // it arrives (the duty entry is gone).
+                self.observers.remove(&child);
+                if let Some(vnodes) = self.pending_observer_joins.remove(&child) {
+                    self.spawn_observer_fallback(child, vnodes);
+                }
             }
         }
     }
@@ -662,9 +764,12 @@ impl ShardSupervisor {
         );
     }
 
-    /// Begin an observer duty: open the child-rooted store and run the
-    /// sync + ready-signal pipeline off this loop. The duty completes
-    /// in [`Self::finish_observation`].
+    /// Begin an observer duty: open a fresh child-rooted store and run
+    /// the duty pipeline off this loop — the child-span sync and ready
+    /// signal ([`Self::finish_observation`]), then the stay-current
+    /// follow of the splitting shard's chain to its crossing and the
+    /// boundary handoff's adoption
+    /// ([`Self::finish_observer_preparation`]).
     fn observe(
         &mut self,
         via: ShardId,
@@ -676,70 +781,89 @@ impl ShardSupervisor {
             warn!(?child, "Observe rejected: duty already running");
             return;
         }
+        if self.shards.contains_key(&child) {
+            warn!(?child, "Observe rejected: child already hosted");
+            return;
+        }
         let factory = Arc::clone(&self.storage_factory);
+        let dir = (self.storage_dir)(child);
         let process = Arc::clone(&self.process);
         let events = self.events_tx.clone();
         let beacon_network = self.beacon_network.clone();
         let signing_key = Arc::clone(signing_key);
         let task = self.tokio_handle.spawn(async move {
-            let opened = spawn_blocking(move || factory(child)).await;
-            let done = match opened {
-                Ok(Ok(storage)) => {
-                    match bootstrap_observer_state(
-                        process.network(),
-                        process.topology(),
-                        &storage,
-                        via,
-                        child,
-                    )
-                    .await
-                    {
-                        Ok((anchor, root, substate_count)) => {
-                            // Sync complete: tell the splitting shard's
-                            // committee, where the signal classifies as
-                            // a ReshapeReady witness leaf and folds
-                            // into the split's readiness gate.
-                            let signal = observer_ready_signal(
-                                &beacon_network,
-                                validator,
-                                &signing_key,
-                                anchor,
-                            );
-                            let recipients: Vec<ValidatorId> = process
-                                .topology()
-                                .load()
-                                .committee_for_shard(via)
-                                .iter()
-                                .copied()
-                                .filter(|&v| v != validator)
-                                .collect();
-                            process
-                                .network()
-                                .notify(&recipients, &ReadySignalNotification::new(signal));
-                            Ok(CompletedObservation {
-                                child,
-                                root,
-                                substate_count,
-                            })
-                        }
-                        Err(error) => {
-                            warn!(?via, ?child, error, "Observer duty failed");
-                            Err(child)
-                        }
-                    }
+            // A leftover directory — an abandoned earlier duty or a
+            // failed flip — holds state synced against a stale anchor;
+            // a fresh duty starts from a fresh store.
+            let opened = spawn_blocking(move || {
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| format!("stale observer store wipe: {e}"))?;
                 }
+                factory(child)
+            })
+            .await;
+            let storage = match opened {
+                Ok(Ok(storage)) => storage,
                 Ok(Err(error)) => {
                     warn!(?child, error, "Observer duty rejected: storage open failed");
-                    Err(child)
+                    let _ = events.send(SupervisorEvent::Observed(Err(child)));
+                    return;
                 }
                 Err(error) => {
                     warn!(?child, %error, "Observer duty's storage open panicked");
-                    Err(child)
+                    let _ = events.send(SupervisorEvent::Observed(Err(child)));
+                    return;
                 }
             };
+            let (anchor, root, substate_count) = match bootstrap_observer_state(
+                process.network(),
+                process.topology(),
+                &storage,
+                via,
+                child,
+            )
+            .await
+            {
+                Ok(synced) => synced,
+                Err(error) => {
+                    warn!(?via, ?child, error, "Observer duty failed");
+                    let _ = events.send(SupervisorEvent::Observed(Err(child)));
+                    return;
+                }
+            };
+            // Sync complete: tell the splitting shard's committee, where
+            // the signal classifies as a ReshapeReady witness leaf and
+            // folds into the split's readiness gate.
+            let signal = observer_ready_signal(&beacon_network, validator, &signing_key, anchor);
+            let recipients: Vec<ValidatorId> = process
+                .topology()
+                .load()
+                .committee_for_shard(via)
+                .iter()
+                .copied()
+                .filter(|&v| v != validator)
+                .collect();
+            process
+                .network()
+                .notify(&recipients, &ReadySignalNotification::new(signal));
             // Send failure means the runner is shutting down; the duty
             // dies with it.
-            let _ = events.send(SupervisorEvent::Observed(done));
+            let _ = events.send(SupervisorEvent::Observed(Ok(CompletedObservation {
+                child,
+                root,
+                substate_count,
+            })));
+
+            // Stay current: follow the parent's chain to its crossing,
+            // then adopt the followed store for the boundary handoff.
+            let done = prepare_observer_flip(&process, storage, via, child, anchor, root)
+                .await
+                .map_err(|error| {
+                    warn!(?via, ?child, error, "Observer boundary handoff failed");
+                    child
+                });
+            let _ = events.send(SupervisorEvent::ObserverPrepared(done));
         });
         self.observers.insert(
             child,
@@ -748,6 +872,7 @@ impl ShardSupervisor {
                 validator,
                 task: Some(task),
                 synced: None,
+                prepared: None,
             },
         );
     }
@@ -772,7 +897,8 @@ impl ShardSupervisor {
                     substates = observation.substate_count,
                     "Observer duty complete; ready signal broadcast"
                 );
-                duty.task = None;
+                // The duty task continues into the stay-current follow;
+                // its handle stays for `Unobserve` to abort.
                 duty.synced = Some(observation.root);
             }
             Err(child) => {
@@ -1030,6 +1156,57 @@ impl ShardSupervisor {
 /// the child's genesis record. The flip cannot act sooner: the anchor
 /// carries the adopted root and the deterministic genesis hash the
 /// adoption verifies against.
+/// The boundary handoff's preparation, run at the tail of the observer
+/// duty task: follow the splitting parent to its crossing, then adopt
+/// the followed store at the derived genesis and verify it against the
+/// beacon-anchored root.
+async fn prepare_observer_flip(
+    process: &ProdProcessIo,
+    storage: Arc<RocksDbShardStorage>,
+    via: ShardId,
+    child: ShardId,
+    anchor: ShardAnchor,
+    root: StateRoot,
+) -> Result<Box<PreparedObserverFlip>, String> {
+    let (genesis, origin, _) = follow_observer_store(
+        process.network(),
+        process.topology(),
+        &storage,
+        via,
+        child,
+        anchor,
+        root,
+    )
+    .await?;
+    spawn_blocking(move || {
+        let adopted = storage
+            .adopt_followed_child(origin)
+            .map_err(|e| format!("followed adoption: {e}"))?;
+        if adopted != genesis.header().state_root() {
+            return Err(format!(
+                "followed root {adopted:?} does not match the child anchor {:?}",
+                genesis.header().state_root(),
+            ));
+        }
+        let substate_count = storage
+            .substate_count_at_version(origin.genesis_height.inner())
+            .unwrap_or(0);
+        let recovered = RecoveredState {
+            substate_count,
+            chain_origin: origin,
+            ..RecoveredState::default()
+        };
+        Ok(Box::new(PreparedObserverFlip {
+            child,
+            storage,
+            genesis,
+            recovered,
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("observer adoption task panicked: {e}")))
+}
+
 async fn wait_for_child_anchor(process: &ProdProcessIo, child: ShardId) -> ShardAnchor {
     loop {
         if let Some(anchor) = process.topology().load().boundary(child) {

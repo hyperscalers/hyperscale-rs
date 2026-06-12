@@ -82,7 +82,10 @@ impl RocksDbShardStorage {
     /// recovery. The genesis block itself then commits through the
     /// normal chain-writer path, whose genesis arm expects exactly this
     /// metadata. Idempotent: a re-run over an already-adopted store
-    /// returns the recorded adoption untouched.
+    /// returns the recorded adoption untouched. An observer's followed
+    /// store adopts through [`Self::adopt_followed_child`] instead —
+    /// the shapes are caller-distinguished, since a checkpoint can be
+    /// structurally ambiguous with a followed store.
     ///
     /// Returns the adopted child `state_root` — `ZERO` for an empty
     /// side. The caller asserts it against the beacon-verified
@@ -190,6 +193,100 @@ impl RocksDbShardStorage {
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(format!("split adoption write: {e}")))?;
         Ok(child_root)
+    }
+
+    /// Re-point an observer's followed store at its adopted subtree —
+    /// the child root the store itself holds at its tip version.
+    ///
+    /// The store imported the child span at the splitting parent's
+    /// anchor and followed the parent's child-half writes to its
+    /// crossing, so its tree *is* the adopted subtree: the tip's root
+    /// node is copied to the genesis version, the substate count seeded
+    /// by walking it, and the chain origin recorded for recovery. The
+    /// tip version is sparse on the parent's heights (foreign-half
+    /// blocks never advanced it), so no checkpoint vintage applies —
+    /// the trust is the caller's equality check against the
+    /// beacon-seeded child anchor. Idempotent like
+    /// [`Self::adopt_split_child`].
+    ///
+    /// Returns the adopted child `state_root` — `ZERO` for a store
+    /// whose span held nothing (an empty half).
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the store's tip sits at or past the genesis
+    /// height (a followed store only ever advances on child-half writes,
+    /// which the parent's coast cannot produce), when its metadata names
+    /// a root its tree doesn't hold, or when the store's root path is
+    /// the trie root.
+    pub fn adopt_followed_child(&self, origin: ChainOrigin) -> Result<StateRoot, StorageError> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::DatabaseError("commit lock poisoned".into()))?;
+
+        let (tip_version, current_root) = read_jmt_metadata(&*self.db);
+        let genesis_version = origin.genesis_height.inner();
+        // A re-run over an already-adopted store (crash between adoption
+        // and the genesis commit) returns the recorded adoption.
+        if tip_version == genesis_version && read_chain_origin(&*self.db) == origin {
+            return Ok(current_root);
+        }
+        if tip_version >= genesis_version {
+            return Err(StorageError::DatabaseError(format!(
+                "followed adoption vintage mismatch: store at version {tip_version}, \
+                 genesis height {genesis_version}"
+            )));
+        }
+        let child_path = self.root_path.clone();
+        if child_path.is_empty() {
+            return Err(StorageError::DatabaseError(
+                "split adoption requires a non-root child prefix".into(),
+            ));
+        }
+
+        let cf = CfHandles::resolve(&self.db);
+        let mut batch = WriteBatch::default();
+        if current_root == StateRoot::ZERO {
+            // An empty half: the sync imported nothing and no follow
+            // ever advanced the tip — the child starts from an empty
+            // tree at its genesis height.
+            batch_put::<SubstateCountsCf>(
+                &mut batch,
+                SubstateCountsCf::handle(&cf),
+                &genesis_version,
+                &0,
+            );
+        } else {
+            let own_root_key = JmtNodeKey::new(tip_version, child_path.clone());
+            let own_root = self
+                .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&own_root_key))
+                .ok_or_else(|| {
+                    StorageError::DatabaseError(
+                        "followed store holds no root node at its tip version".into(),
+                    )
+                })?;
+            let genesis_root_key = JmtNodeKey::new(genesis_version, child_path);
+            batch_put::<JmtNodesCf>(
+                &mut batch,
+                JmtNodesCf::handle(&cf),
+                &StoredNodeKey::from_jmt(&genesis_root_key),
+                &own_root,
+            );
+            let count = self.count_subtree_leaves(&genesis_root_key, &own_root)?;
+            batch_put::<SubstateCountsCf>(
+                &mut batch,
+                SubstateCountsCf::handle(&cf),
+                &genesis_version,
+                &count,
+            );
+        }
+        write_jmt_metadata(&mut batch, genesis_version, current_root);
+        write_chain_origin(&mut batch, origin);
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::DatabaseError(format!("followed adoption write: {e}")))?;
+        Ok(current_root)
     }
 
     /// Count the live leaves under the adopted child root by walking the
@@ -450,5 +547,22 @@ mod tests {
         let (left_version, _) = left.read_jmt_metadata();
         let (right_version, _) = right.read_jmt_metadata();
         assert!(left_version < 8 || right_version < 8);
+
+        // The followed-store adoption: each store re-points at its own
+        // root from its sparse tip version, with no checkpoint vintage
+        // to satisfy.
+        let origin = ChainOrigin {
+            genesis_height: BlockHeight::new(9),
+            anchor_wt: WeightedTimestamp::from_millis(42_000),
+        };
+        for (store, followed_root) in [(&left, left_root), (&right, right_root)] {
+            let adopted = store.adopt_followed_child(origin).unwrap();
+            assert_eq!(adopted, followed_root);
+            assert_eq!(store.read_jmt_metadata(), (9, followed_root));
+            assert!(store.substate_count_at_version(9).is_some());
+            assert_eq!(read_chain_origin(&*store.db), origin);
+            // Idempotent: a re-run lands on the same values.
+            assert_eq!(store.adopt_followed_child(origin).unwrap(), adopted);
+        }
     }
 }

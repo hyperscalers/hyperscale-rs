@@ -17,10 +17,14 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::bootstrap::observer::ObserverBootstrap;
+use hyperscale_node::bootstrap::observer::{ObserverBootstrap, ObserverTail, TailOutcome};
+use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::bootstrap::{BootstrapOutcome, BootstrapRequest, ShardBootstrap};
 use hyperscale_storage::{RecoveredState, ShardStorage};
-use hyperscale_types::{Request, ShardAnchor, ShardId, StateRoot};
+use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::{
+    Block, BlockHeader, BlockHeight, ChainOrigin, Request, ShardAnchor, ShardId, StateRoot,
+};
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -218,6 +222,154 @@ where
             "Observer bootstrap complete; child span imported"
         );
         return Ok((anchor, root, bootstrap.imported_substate_count()));
+    }
+}
+
+/// Pace between follow rounds that found no new block — the parent
+/// chain commits on its own cadence, and the boundary handoff waits on
+/// beacon folds.
+const FOLLOW_PAUSE: Duration = Duration::from_millis(200);
+
+/// Keep an observer's synced child store current with the splitting
+/// parent's chain until the beacon seeds the child's own anchor, then
+/// catch up through the parent's terminal block and derive the
+/// deterministic genesis from the terminal pair.
+///
+/// Requests target `via` while the parent lives; once the child anchor
+/// projects they target `child` instead — the parent committee
+/// dissolves at the boundary, while the child committee's parent-half
+/// members serve the parent's blocks from their hard-linked
+/// checkpoints. Never gives up on its own; the duty stands until the
+/// supervisor tears it down.
+///
+/// Returns the derived genesis block, the chain origin, and the
+/// followed root (the caller adopts the store and verifies the root
+/// against the child anchor).
+///
+/// # Errors
+///
+/// Returns a description when a follow application contradicts a
+/// followed header's `split_child_roots` or the store write fails —
+/// the duty fails closed and the flip falls back to a fresh snap-sync.
+pub async fn follow_observer_store<S, N>(
+    network: &Arc<N>,
+    topology: &SharedTopologySnapshot,
+    storage: &Arc<S>,
+    via: ShardId,
+    child: ShardId,
+    anchor: ShardAnchor,
+    imported_root: StateRoot,
+) -> Result<(Block, ChainOrigin, StateRoot), String>
+where
+    S: ShardStorage,
+    N: Network,
+{
+    let tail = Arc::new(Mutex::new(ObserverTail::new(anchor, child, imported_root)));
+    loop {
+        let pending = lock(&tail).take_apply();
+        if let Some((height, receipts)) = pending {
+            let root = storage
+                .follow_block_writes(height, &receipts)
+                .map_err(|e| format!("follow application failed: {e}"))?;
+            lock(&tail).on_applied(root)?;
+            continue;
+        }
+        let child_anchor = topology.load().boundary(child);
+        if let Some(child_anchor) = child_anchor
+            && lock(&tail).next_height() >= child_anchor.height
+        {
+            // Caught up through the parent's terminal block. The tail
+            // retains no headers, so the terminal pair is fetched by
+            // height — self-verifying: the coast header must certify
+            // the terminal one and the derived genesis must reproduce
+            // the beacon-anchored hash.
+            let terminal_height = child_anchor
+                .height
+                .prev()
+                .ok_or("child anchor at the absolute height floor")?;
+            let terminal = fetch_followed_header(network, child, terminal_height).await;
+            let coast = fetch_followed_header(network, child, child_anchor.height).await;
+            let (genesis, origin) =
+                split_genesis_from_terminal(child, &terminal, &coast, &child_anchor)?;
+            let root = lock(&tail).root();
+            info!(
+                ?via,
+                ?child,
+                height = child_anchor.height.inner(),
+                "Observer follow reached the parent's crossing"
+            );
+            return Ok((genesis, origin, root));
+        }
+
+        let target = if child_anchor.is_some() { child } else { via };
+        let request = lock(&tail)
+            .next_request()
+            .expect("a tail with no pending application always wants a fetch");
+        let outcome = Arc::new(Mutex::new(TailOutcome::NotYetAvailable));
+        let sequencer = Arc::clone(&tail);
+        let slot = Arc::clone(&outcome);
+        let waiter = send(network, target, request, move |result| {
+            result.map_or_else(
+                |_| {
+                    lock(&sequencer).on_failure();
+                    ResponseVerdict::Accept
+                },
+                |response| {
+                    let outcome = lock(&sequencer).on_response(&response);
+                    *lock(&slot) = outcome;
+                    match outcome {
+                        TailOutcome::Accepted | TailOutcome::NotYetAvailable => {
+                            ResponseVerdict::Accept
+                        }
+                        TailOutcome::Rejected(_) => ResponseVerdict::Reject,
+                    }
+                },
+            )
+        });
+        let _ = waiter.await;
+        let outcome = *lock(&outcome);
+        match outcome {
+            TailOutcome::Accepted => {}
+            TailOutcome::NotYetAvailable => sleep(FOLLOW_PAUSE).await,
+            TailOutcome::Rejected(reason) => {
+                debug!(?via, ?child, reason, "Follow response rejected");
+                sleep(FOLLOW_PAUSE).await;
+            }
+        }
+    }
+}
+
+/// Fetch one committed header of the followed chain by height from
+/// `shard`'s committee, retrying until a peer serves it. Headers ride
+/// inline on every block response; the caller's derivation
+/// self-verifies the pair, so no body rehydration is needed.
+async fn fetch_followed_header<N: Network>(
+    network: &Arc<N>,
+    shard: ShardId,
+    height: BlockHeight,
+) -> BlockHeader {
+    loop {
+        let slot: Arc<Mutex<Option<BlockHeader>>> = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&slot);
+        let waiter = send(
+            network,
+            shard,
+            GetBlockRequest::new(height, height),
+            move |result| {
+                if let Ok(response) = result
+                    && let Some(elided) = &response.certified
+                {
+                    *lock(&out) = Some(elided.header().clone());
+                }
+                ResponseVerdict::Accept
+            },
+        );
+        let _ = waiter.await;
+        let fetched = lock(&slot).take();
+        if let Some(header) = fetched {
+            return header;
+        }
+        sleep(FOLLOW_PAUSE).await;
     }
 }
 
