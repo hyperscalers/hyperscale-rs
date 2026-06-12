@@ -199,7 +199,7 @@ impl SimulationRunner {
     /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —
     /// the same construction the production supervisor runs at seat
     /// time.
-    fn runtime_vnode_init(
+    pub(super) fn runtime_vnode_init(
         &self,
         node: NodeIndex,
         validator: ValidatorId,

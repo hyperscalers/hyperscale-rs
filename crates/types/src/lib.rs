@@ -169,7 +169,7 @@ pub use time::timestamp::{
     LocalTimestamp, ProposerTimestamp, WeightedTimestamp, is_epoch_crossing,
 };
 pub use topology::awaiting::AwaitingTopologyBuffer;
-pub use topology::schedule::{ScheduleLookup, TopologySchedule};
+pub use topology::schedule::{ScheduleLookup, SplitAtBoundary, TopologySchedule};
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{
     ShardAnchor, TopologySnapshot, node_id_hash_u64, uniform_shard_for_node,

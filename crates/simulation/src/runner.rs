@@ -46,6 +46,7 @@ use crate::event_queue::EventKey;
 
 pub mod observer;
 pub mod relocation;
+mod split;
 
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
@@ -519,6 +520,16 @@ impl SimulationRunner {
         let host = self.hosts.get(node as usize)?;
         let shard = host.hosted_shards().next()?;
         Some(&host.shard_io(shard).storage)
+    }
+
+    /// Get a reference to a node's storage for a specific hosted shard,
+    /// or `None` when the host doesn't carry it.
+    #[must_use]
+    pub fn hosts_shard(&self, node: NodeIndex, shard: ShardId) -> Option<&SimShardStorage> {
+        let host = self.hosts.get(node as usize)?;
+        host.hosted_shards()
+            .any(|s| s == shard)
+            .then(|| &*host.shard_io(shard).storage)
     }
 
     /// Process-shared beacon storage for a host. One handle per host,

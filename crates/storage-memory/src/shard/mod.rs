@@ -10,6 +10,7 @@ pub(crate) mod chain_reader;
 pub(crate) mod chain_writer;
 pub(crate) mod core;
 pub(crate) mod snapshot;
+pub(crate) mod split;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod tree_store;

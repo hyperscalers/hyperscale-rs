@@ -17,7 +17,7 @@ use hyperscale_types::{
     BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_TXS_PER_BLOCK, ProposerTimestamp,
     ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId,
-    StoredReceipt, WaveId, WeightedTimestamp, derive_reshape_trigger,
+    SplitAtBoundary, StoredReceipt, WaveId, WeightedTimestamp, derive_reshape_trigger,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -466,11 +466,15 @@ impl ShardCoordinator {
 
     /// Weighted timestamp selecting the committee for the height in progress /
     /// our next proposal: we extend `high_qc`, so the committee is
-    /// `at(high_qc.weighted_timestamp())`. Genesis (no QC) → `ZERO` (epoch 0).
+    /// `at(high_qc.weighted_timestamp())`. With no QC yet the chain sits at
+    /// its genesis, whose QC carries the chain origin's anchor — `ZERO` for
+    /// root chains, the parent's terminal canonical timestamp for a split
+    /// child (a `ZERO` fallback would resolve a child's first proposal
+    /// against epoch 0).
     fn tip_anchor_ts(&self) -> WeightedTimestamp {
         self.latest_qc
             .as_ref()
-            .map_or(WeightedTimestamp::ZERO, |qc| qc.weighted_timestamp())
+            .map_or(self.chain_origin.anchor_wt, |qc| qc.weighted_timestamp())
     }
 
     /// Committee that signed/produced `block_hash`. `None` to stall: the block
@@ -516,6 +520,24 @@ impl ShardCoordinator {
     /// next boundary and stragglers reach this tip via block sync.
     fn chain_terminated(&self, topology: &TopologySchedule) -> bool {
         self.past_terminal_window(topology, self.committed_anchor_ts)
+    }
+
+    /// Whether a header keyed at `wt` carries `split_child_roots` — the
+    /// split-pending shard's final-epoch delivery, identical on the
+    /// build side (carry) and the vote side (required). `None` when the
+    /// window's verdict is locally unresolvable yet
+    /// ([`SplitAtBoundary::Unresolved`]); callers defer and retry once
+    /// the local beacon catches up.
+    fn split_child_roots_bit(
+        &self,
+        topology: &TopologySchedule,
+        wt: WeightedTimestamp,
+    ) -> Option<bool> {
+        match topology.split_at_next_boundary(self.local_shard, wt) {
+            SplitAtBoundary::Children(..) => Some(true),
+            SplitAtBoundary::No => Some(false),
+            SplitAtBoundary::Unresolved => None,
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1294,6 +1316,23 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
+        // The final-epoch headers of a splitting shard carry the root
+        // node's child hashes; the window predicate keys on the same
+        // schedule entry as the committee. Whether this window is the
+        // final one is unknowable until the local beacon commits the
+        // fold that decides it — stall the build (before the witness
+        // preview drains the ready-signal pool) rather than guess a
+        // header replicas would reject.
+        let Some(carry_split_child_roots) =
+            self.split_child_roots_bit(topology, parent_qc.weighted_timestamp())
+        else {
+            trace!(
+                validator = ?self.me,
+                height = height.inner(),
+                "Split-at-boundary unresolved at proposal; deferring until the beacon catches up"
+            );
+            return vec![];
+        };
         let receipts: Vec<StoredReceipt> = match &kind {
             ProposalKind::Normal {
                 finalized_waves, ..
@@ -1318,13 +1357,6 @@ impl ShardCoordinator {
             &receipts,
             &missed,
         );
-
-        // The final-epoch headers of a splitting shard carry the root
-        // node's child hashes; the window predicate keys on the same
-        // schedule entry as the committee.
-        let carry_split_child_roots = topology
-            .split_at_next_boundary(self.local_shard, parent_qc.weighted_timestamp())
-            .is_some();
 
         let plan = assemble_build_action(
             self.me,
@@ -2077,12 +2109,21 @@ impl ShardCoordinator {
                 InFlightCheck::Abort => return vec![],
             };
 
-            let split_child_roots_required = topology
-                .split_at_next_boundary(
-                    self.local_shard,
-                    block.header().parent_qc().weighted_timestamp(),
-                )
-                .is_some();
+            // Whether this window requires the header's split-child-root
+            // pair is decided by the fold that starts it — locally
+            // unresolvable until that beacon commit lands. Defer the vote
+            // like a missing committee (the block stays pending) rather
+            // than judge the header against a guess.
+            let Some(split_child_roots_required) = self
+                .split_child_roots_bit(topology, block.header().parent_qc().weighted_timestamp())
+            else {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    "Split-at-boundary unresolved at vote; deferring until the beacon catches up"
+                );
+                return vec![];
+            };
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
                 self.local_shard,
@@ -4741,6 +4782,7 @@ impl ShardCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
 
     use hyperscale_core::Action;
     use hyperscale_types::{
@@ -7017,6 +7059,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         );
         TopologySchedule::single(Arc::new(snapshot))
     }
@@ -7052,6 +7095,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         );
         let topology = TopologySchedule::single(Arc::new(snapshot));
 

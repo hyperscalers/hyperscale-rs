@@ -61,7 +61,7 @@ pub async fn drain_after_window_close(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
     use arc_swap::ArcSwap;
@@ -91,6 +91,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         )
     }
 

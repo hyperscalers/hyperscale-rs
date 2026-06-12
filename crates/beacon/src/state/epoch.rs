@@ -121,6 +121,12 @@ pub fn apply_epoch(
     // fold advances it, matching what the prior state's lookahead
     // derivation read live from the same boundaries.
     state.witness_window_bases = state.live_witness_bases();
+    // Freeze the pending-split set the same way — before this fold's
+    // admissions, cancellations, and executions mutate it — so a
+    // window's split-at-boundary projection is byte-identical whether
+    // resolved from the lookahead schedule entry or the re-derived
+    // active one.
+    state.split_pending_window = state.live_split_pending();
 
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface

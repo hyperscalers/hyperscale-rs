@@ -13,17 +13,19 @@
 //! on its assigned child, and each child stands at full committee
 //! strength a full epoch before its window opens.
 
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_storage::SubstateStore;
+use hyperscale_storage::{ShardChainReader, SubstateStore};
+use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, PendingReshape, ReshapeThresholds, ShardId, StateRoot,
-    ValidatorId, ValidatorStatus,
+    BeaconChainConfig, BeaconState, BlockHash, PendingReshape, ReshapeThresholds, ShardId,
+    SplitChildRoots, StateRoot, ValidatorId, ValidatorStatus,
 };
 use tracing_test::traced_test;
 
@@ -44,6 +46,13 @@ const ADMISSION_BUDGET_EPOCHS: u64 = 8;
 /// well inside `RESHAPE_READY_TTL_EPOCHS`, so the reshape executes
 /// rather than abandons.
 const GATE_BUDGET_EPOCHS: u64 = 8;
+
+/// Epochs allowed for the parent's final window, its coast to the
+/// crossing, and the fold that consumes the terminal contribution.
+const SEED_BUDGET_EPOCHS: u64 = 6;
+
+/// Epochs allowed for the flipped children to commit past genesis.
+const CHILD_RUN_BUDGET_EPOCHS: u64 = 4;
 
 /// The single-shard, paced-epoch network with the split trigger armed
 /// from genesis (`split_substates: 0` — every committed count
@@ -113,6 +122,7 @@ const fn epochs(n: u64) -> Duration {
 
 #[traced_test]
 #[test]
+#[allow(clippy::too_many_lines)] // one grow-split lifecycle asserted end to end
 fn observers_grow_a_split_through_its_readiness_gate() {
     let mut runner = SimulationRunner::new(&grow_config(), 11);
     runner.initialize_genesis();
@@ -149,6 +159,7 @@ fn observers_grow_a_split_through_its_readiness_gate() {
 
     // ── Observer duty: sync each child span, signal ready ──
     let mut synced: Vec<(ValidatorId, ShardId, StateRoot)> = Vec::new();
+    let mut synced_stores: Vec<(ValidatorId, SimShardStorage)> = Vec::new();
     for (validator, child) in &cohort {
         let (store, root) = runner.observe_child(*validator, ShardId::ROOT, *child);
         assert_eq!(
@@ -157,6 +168,7 @@ fn observers_grow_a_split_through_its_readiness_gate() {
             "the child-rooted store must hold exactly the imported subtree",
         );
         synced.push((*validator, *child, root));
+        synced_stores.push((*validator, store));
     }
     // Same child, same anchor: the two observers of each half must have
     // assembled byte-identical subtrees.
@@ -209,12 +221,158 @@ fn observers_grow_a_split_through_its_readiness_gate() {
     }
     // The parent membership partitioned across the children: every
     // original member sits on exactly one child.
+    let mut parent_halves: Vec<(ValidatorId, ShardId)> = Vec::new();
     for member in 0..u64::from(PER_SHARD) {
-        let status = state.validators[&ValidatorId::new(member)].status;
-        assert!(
-            matches!(status, ValidatorStatus::OnShard { shard, .. }
-                if shard.parent() == Some(ShardId::ROOT)),
-            "parent member {member} must land on a child; got {status:?}",
+        let id = ValidatorId::new(member);
+        let status = state.validators[&id].status;
+        match status {
+            ValidatorStatus::OnShard { shard, .. } if shard.parent() == Some(ShardId::ROOT) => {
+                parent_halves.push((id, shard));
+            }
+            other => panic!("parent member {member} must land on a child; got {other:?}"),
+        }
+    }
+    let parent_terminal_root = runner
+        .node_storage(0)
+        .expect("host 0 carries the parent")
+        .state_root();
+
+    // ── Through the boundary: the parent coasts to its crossing and
+    // the fold seeds both children from its terminal contribution ──
+    let seed_deadline = runner.now() + epochs(SEED_BUDGET_EPOCHS);
+    let seeded = run_until(&mut runner, seed_deadline, |r| {
+        beacon_state(r).is_some_and(|s| {
+            [left, right].iter().all(|c| {
+                s.boundaries
+                    .get(c)
+                    .is_some_and(|b| b.block_hash != BlockHash::ZERO)
+            })
+        })
+    });
+    if !seeded {
+        let s = beacon_state(&runner).expect("state");
+        let storage = runner.node_storage(0).expect("host 0 carries the parent");
+        let committed = storage.committed_height();
+        let mut tail = String::new();
+        let mut height = committed;
+        for _ in 0..6 {
+            if let Some(block) = storage.get_block(height) {
+                let header = block.block().header();
+                let _ = write!(
+                    tail,
+                    "\n  h={height:?} child_roots={:?} parent_qc_wt={:?} root={:?}",
+                    header.split_child_roots(),
+                    header.parent_qc().weighted_timestamp(),
+                    header.state_root(),
+                );
+            }
+            let Some(prev) = height.prev() else { break };
+            height = prev;
+        }
+        panic!(
+            "seeding timed out; boundaries: {:?}; parent committed: {committed:?}; \
+             parent root: {:?}; epoch {:?}; parent tail:{tail}",
+            s.boundaries,
+            storage.state_root(),
+            s.current_epoch,
         );
+    }
+    let state = beacon_state(&runner).expect("post-seed state");
+    assert!(
+        !state.boundaries.contains_key(&ShardId::ROOT),
+        "the parent's terminal record must drop once consumed and drained",
+    );
+    // Subtree-root continuity, the keystone: the seeded anchors are
+    // exactly the parent terminal root's two children.
+    let pair = SplitChildRoots {
+        left: state.boundaries[&left].state_root,
+        right: state.boundaries[&right].state_root,
+    };
+    assert!(
+        pair.composes_to(parent_terminal_root),
+        "the children's anchors must compose to the parent's terminal root",
+    );
+
+    // ── The flip: parent halves clone-and-adopt on their own hosts;
+    // each observer's synced store reopens on a host whose own vnode
+    // flipped to the sibling (a pool extra runs no host in sim, so the
+    // harness seats it cross-shard — production observers run their
+    // own hosts through the supervisor) ──
+    for (validator, child) in &parent_halves {
+        let node = u32::try_from(validator.inner()).expect("host per parent member");
+        runner.flip_split_child(node, *validator, ShardId::ROOT, *child, None);
+    }
+    let mut sibling_hosts: Vec<u32> = Vec::new();
+    for (validator, child, _) in &synced {
+        let (node, _) = parent_halves
+            .iter()
+            .map(|(v, c)| (u32::try_from(v.inner()).expect("host index"), *c))
+            .find(|(node, host_child)| host_child != child && !sibling_hosts.contains(node))
+            .expect("a free host whose own vnode flipped to the sibling");
+        sibling_hosts.push(node);
+        let store = synced_stores
+            .iter()
+            .position(|(v, _)| v == validator)
+            .map(|i| synced_stores.swap_remove(i).1)
+            .expect("every observer synced a store");
+        runner.flip_split_child(node, *validator, ShardId::ROOT, *child, Some(store));
+    }
+
+    // ── Both children run: blocks commit past their genesis on every
+    // seated member, from state continuous with the parent's subtree ──
+    let genesis_height = state.boundaries[&left].height;
+    let run_deadline = runner.now() + epochs(CHILD_RUN_BUDGET_EPOCHS);
+    let progressed = run_until(&mut runner, run_deadline, |r| {
+        [left, right].iter().all(|child| {
+            (0..r.num_hosts()).any(|node| {
+                r.hosts_shard(node, *child)
+                    .is_some_and(|storage| storage.committed_height() > genesis_height)
+            })
+        })
+    });
+    if !progressed {
+        let s = beacon_state(&runner).expect("state");
+        let mut detail = String::new();
+        for child in [left, right] {
+            for node in 0..runner.num_hosts() {
+                if let Some(storage) = runner.hosts_shard(node, child) {
+                    let _ = write!(
+                        detail,
+                        "\n  node {node} {child:?}: committed {:?} root {:?}",
+                        storage.committed_height(),
+                        storage.state_root(),
+                    );
+                }
+            }
+        }
+        panic!(
+            "both children must commit blocks past their genesis (h{}) within \
+             {CHILD_RUN_BUDGET_EPOCHS} epochs; epoch {:?}; stores:{detail}",
+            genesis_height.inner(),
+            s.current_epoch,
+        );
+    }
+
+    // Every committed child chain extends the deterministic genesis the
+    // beacon anchored: the first committed block names the genesis as
+    // its parent and certifies it with a structural genesis QC carrying
+    // the parent chain's terminal clock.
+    for child in [left, right] {
+        let anchor = state.boundaries[&child];
+        for node in 0..runner.num_hosts() {
+            let Some(storage) = runner.hosts_shard(node, child) else {
+                continue;
+            };
+            if storage.committed_height() <= genesis_height {
+                continue;
+            }
+            let first = storage
+                .get_block(genesis_height.next())
+                .expect("committed chains are contiguous from genesis");
+            let header = first.block().header();
+            assert_eq!(header.parent_block_hash(), anchor.block_hash);
+            assert!(header.parent_qc().is_genesis());
+            assert_eq!(header.parent_qc().height(), genesis_height);
+        }
     }
 }

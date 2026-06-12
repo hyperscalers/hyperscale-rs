@@ -363,7 +363,7 @@ fn lock<B>(bootstrap: &Mutex<B>) -> std::sync::MutexGuard<'_, B> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use arc_swap::ArcSwap;
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
@@ -488,6 +488,7 @@ mod tests {
             HashMap::from([(shard, anchor)]),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         );
         Arc::new(ArcSwap::from_pointee(snapshot))
     }

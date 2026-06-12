@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,6 +115,7 @@ fn observer_ready_signal_commits_as_reshape_ready_leaf() {
         HashMap::new(),
         HashMap::new(),
         HashMap::from([(ShardId::ROOT, BTreeMap::from([(observer, left)]))]),
+        BTreeSet::from([ShardId::ROOT]),
     );
     sim.topology = TopologySchedule::single(Arc::new(snapshot));
 

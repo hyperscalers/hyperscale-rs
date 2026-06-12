@@ -13,6 +13,7 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 ///
 /// Stores hydrated JMT nodes directly (no serialization layer).
 /// Thread safety is handled by the outer `RwLock<SharedState>`.
+#[derive(Clone)]
 pub struct SimTreeStore {
     nodes: HashMap<NodeKey, Arc<Node>>,
     /// Prefix this tree is rooted at — the shard's prefix, so the root node is

@@ -19,8 +19,7 @@ use hyperscale_storage::{
     RecoveredState, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, NodeId, QuorumCertificate, StateRoot,
-    Verified,
+    BeaconWitnessLeafCount, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified,
 };
 
 use super::state::{ConsensusState, SharedState, apply_updates};
@@ -171,8 +170,21 @@ impl SimShardStorage {
                 .get(&committed_height.inner())
                 .copied()
                 .unwrap_or(0),
-            chain_origin: ChainOrigin::ROOT,
+            chain_origin: read_or_recover(&self.consensus).chain_origin,
         }
+    }
+
+    /// Committed substate count recorded at `version`, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn substate_count_at_version(&self, version: u64) -> Option<u64> {
+        read_or_recover(&self.state)
+            .substate_counts
+            .get(&version)
+            .copied()
     }
 
     /// Number of live substate entries (current tip). Historical

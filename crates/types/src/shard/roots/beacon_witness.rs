@@ -337,7 +337,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use super::*;
     use crate::{
@@ -365,6 +365,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             HashMap::from([(shard, observers)]),
+            BTreeSet::from([shard]),
         )
     }
 

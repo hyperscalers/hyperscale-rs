@@ -11,7 +11,7 @@ use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
     ExecutionMetadata, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot,
     StoredReceipt, TxHash, WaveCertificate, WaveId,
 };
@@ -30,6 +30,7 @@ use super::tree_store::SimTreeStore;
 /// Using `RwLock` (instead of Mutex) allows concurrent read access: speculative
 /// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
+#[derive(Clone)]
 pub struct SharedState {
     pub tree_store: SimTreeStore,
     pub current_block_height: BlockHeight,
@@ -145,6 +146,10 @@ pub struct ConsensusState {
     /// can serve fetches and replay the accumulator on restart. Shard
     /// is implicit — storage is scoped per-shard.
     pub beacon_witnesses: BTreeMap<u64, ShardWitnessPayload>,
+    /// The chain's origin — `ChainOrigin::ROOT` except for a split
+    /// child's adopted store, where recovery must reconstruct the
+    /// continued height line and clock.
+    pub chain_origin: ChainOrigin,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -165,6 +170,7 @@ impl ConsensusState {
             execution_certs: HashMap::new(),
             wave_certs_by_height: HashMap::new(),
             beacon_witnesses: BTreeMap::new(),
+            chain_origin: ChainOrigin::ROOT,
         }
     }
 

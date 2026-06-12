@@ -32,7 +32,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,6 +312,10 @@ pub struct SimulatedNetwork {
     response_sequence: u64,
     /// Optional traffic analyzer for bandwidth metrics.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+    /// Runtime validator→host bindings for vnodes seated after
+    /// construction (split-child flips, pool draws); checked before the
+    /// hosting-mode formula in [`Self::validator_to_node`].
+    validator_bindings: HashMap<ValidatorId, NodeIndex>,
     /// Per-node gossip dedup: tracks message IDs already delivered to each node.
     /// Matches production gossipsub's content-based deduplication (hash of data + topic).
     gossip_seen: Vec<HashSet<u64>>,
@@ -393,13 +397,17 @@ impl SimulatedNetwork {
             pending_responses: BinaryHeap::new(),
             response_sequence: 0,
             traffic_analyzer: None,
+            validator_bindings: HashMap::new(),
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: FaultInjector::default(),
         }
     }
 
-    /// Translate a `ValidatorId` to its hosting `NodeIndex` under the
-    /// current hosting mode.
+    /// Translate a `ValidatorId` to its hosting `NodeIndex`.
+    ///
+    /// Runtime bindings (vnodes seated after construction — pool draws,
+    /// split-child flips) take precedence; otherwise the hosting-mode
+    /// formula applies:
     ///
     /// - [`HostingMode::SameShardBundled`]: consecutive validators
     ///   share a host. `validator_id / vnodes_per_host`.
@@ -408,6 +416,9 @@ impl SimulatedNetwork {
     ///   for every `s`. So `validator_id % validators_per_shard`.
     #[must_use]
     pub fn validator_to_node(&self, validator: ValidatorId) -> NodeIndex {
+        if let Some(&node) = self.validator_bindings.get(&validator) {
+            return node;
+        }
         match self.config.hosting_mode {
             HostingMode::SameShardBundled => {
                 (validator.inner() / u64::from(self.config.vnodes_per_host)) as NodeIndex
@@ -416,6 +427,14 @@ impl SimulatedNetwork {
                 (validator.inner() % u64::from(self.config.validators_per_shard)) as NodeIndex
             }
         }
+    }
+
+    /// Bind `validator` to `node`, overriding the hosting-mode formula.
+    /// Harnesses call this when seating a vnode at runtime on a host the
+    /// formula doesn't cover (a pool extra has no construction-time
+    /// host).
+    pub fn bind_validator(&mut self, validator: ValidatorId, node: NodeIndex) {
+        self.validator_bindings.insert(validator, node);
     }
 
     /// Builder for installing or removing per-message-type fault rules.
@@ -616,16 +635,12 @@ impl SimulatedNetwork {
     ///   returns all hosts.
     #[must_use]
     pub fn peers_in_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
-        match self.config.hosting_mode {
-            HostingMode::SameShardBundled => {
-                let hosts_per_shard =
-                    self.config.validators_per_shard / self.config.vnodes_per_host;
-                let start = (shard.path() as u32) * hosts_per_shard;
-                let end = start + hosts_per_shard;
-                (start..end).collect()
-            }
-            HostingMode::CrossShard => (0..self.config.validators_per_shard).collect(),
-        }
+        self.registries
+            .iter()
+            .enumerate()
+            .filter(|(_, registry)| registry.hosted_shards().contains(&shard))
+            .map(|(node, _)| node as NodeIndex)
+            .collect()
     }
 
     /// Get all hosts in the network.
@@ -1424,6 +1439,16 @@ mod tests {
 
     // ─── accept_requests() Tests ───
 
+    /// Helper: mark every host as hosting `shard`, so the peer pool the
+    /// request/gossip paths derive from the per-host hosted sets covers
+    /// the whole network — these tests exercise routing infrastructure
+    /// (partitions, latency, peer selection), not shard placement.
+    fn host_shard_everywhere(network: &SimulatedNetwork, shard: ShardId) {
+        for node in network.all_nodes() {
+            network.create_adapter(node).subscribe_shard(shard);
+        }
+    }
+
     /// Helper: register an echo handler on a node's adapter for a given
     /// `type_id` under `shard`.
     ///
@@ -1465,6 +1490,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Register echo handler on node 1
@@ -1497,6 +1523,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
@@ -1525,6 +1552,7 @@ mod tests {
             packet_loss_rate: 1.0, // 100% loss
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
@@ -1549,6 +1577,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Don't register any handler
@@ -1570,6 +1599,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Register handler that returns empty (directly on registry)
@@ -1595,6 +1625,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Register handlers on all nodes
@@ -1646,6 +1677,7 @@ mod tests {
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
@@ -1997,6 +2029,7 @@ mod tests {
             num_shards: 1,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Create adapter for node 1 and register handler through it
@@ -2028,6 +2061,7 @@ mod tests {
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Register per-type handlers for "transaction.gossip" on each node.

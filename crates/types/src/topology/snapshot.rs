@@ -109,6 +109,15 @@ pub struct TopologySnapshot {
     /// its consensus subset; their ready signals classify as
     /// `ReshapeReady` witness leaves.
     reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Shards with an admitted, not-yet-executed split as of this
+    /// window's committee freeze. Frozen with the same discipline as
+    /// `witness_bases`, so both writes of a window's schedule entry
+    /// carry the same set — [`TopologySchedule::split_at_next_boundary`]
+    /// reads it to tell "no split lands at this window's end" apart from
+    /// "the next window's entry isn't committed locally yet".
+    ///
+    /// [`TopologySchedule::split_at_next_boundary`]: crate::TopologySchedule::split_at_next_boundary
+    split_pending: BTreeSet<ShardId>,
     validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -147,6 +156,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -185,6 +195,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -232,6 +243,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -254,7 +266,9 @@ impl TopologySnapshot {
     /// the observer cohorts of pending splits — each splitting shard
     /// mapped to its drawn observers and the pending child each one
     /// syncs; empty cohorts are pruned so an absent shard and a shard
-    /// with no cohort answer queries identically.
+    /// with no cohort answer queries identically. `split_pending` carries
+    /// the shards whose admitted split has not executed as of this
+    /// window's committee freeze.
     ///
     /// # Panics
     ///
@@ -262,6 +276,7 @@ impl TopologySnapshot {
     /// `global_validator_set`, or if a consensus member is not also a
     /// member of the same shard's full committee.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirror of the BeaconState projection, one argument per field
     pub fn from_explicit_committees(
         network: NetworkDefinition,
         global_validator_set: &ValidatorSet,
@@ -270,6 +285,7 @@ impl TopologySnapshot {
         boundaries: HashMap<ShardId, ShardAnchor>,
         witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
         mut reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+        split_pending: BTreeSet<ShardId>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
         let shard_trie = ShardTrie::from_leaves(shard_committees.keys().copied());
@@ -307,6 +323,7 @@ impl TopologySnapshot {
             boundaries,
             witness_bases,
             reshape_observers,
+            split_pending,
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -358,6 +375,15 @@ impl TopologySnapshot {
             .get(&shard)
             .and_then(|cohort| cohort.get(&validator))
             .copied()
+    }
+
+    /// Whether `shard` had an admitted, not-yet-executed split as of this
+    /// window's committee freeze — i.e. whether the trie *might* replace
+    /// it with its children at the end of this window. `false` is
+    /// definitive: no split can land at this window's boundary.
+    #[must_use]
+    pub fn split_pending(&self, shard: ShardId) -> bool {
+        self.split_pending.contains(&shard)
     }
 
     /// Get the ordered committee members for a shard — full membership,
@@ -619,6 +645,7 @@ mod tests {
                 // with no cohort answer identically.
                 (ShardId::leaf(1, 1), BTreeMap::new()),
             ]),
+            BTreeSet::from([shard]),
         );
 
         assert_eq!(snapshot.reshape_observer_child(shard, observer), Some(left));
@@ -786,6 +813,7 @@ mod tests {
             boundaries,
             witness_bases,
             HashMap::new(),
+            BTreeSet::new(),
         );
 
         assert_eq!(snapshot.boundary(ShardId::leaf(1, 0)), Some(anchor));
@@ -826,6 +854,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         );
 
         // Networking view keeps everyone.
@@ -873,6 +902,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            BTreeSet::new(),
         );
     }
 

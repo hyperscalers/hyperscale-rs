@@ -222,7 +222,7 @@ pub fn prospective_parent_witness_leaves(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
@@ -271,6 +271,7 @@ mod tests {
                 ShardId::ROOT,
                 BTreeMap::from([(ValidatorId::new(observer), left)]),
             )]),
+            BTreeSet::from([ShardId::ROOT]),
         )
     }
 

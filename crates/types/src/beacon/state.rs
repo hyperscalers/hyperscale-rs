@@ -375,6 +375,14 @@ pub struct BeaconState {
     /// entry or the re-derived active one — the
     /// [`Self::shard_consensus_members`] discipline.
     pub witness_window_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
+    /// Shards with an admitted, not-yet-executed split as of this
+    /// epoch's promotion, frozen under the
+    /// [`Self::witness_window_bases`] discipline so a window's value is
+    /// byte-identical whether resolved from the lookahead schedule entry
+    /// or the re-derived active one. The schedule's split-at-boundary
+    /// predicate reads it to answer "no split lands at this window's
+    /// end" without the next window's entry.
+    pub split_pending_window: BTreeSet<ShardId>,
     /// Per-shard boundary record: the snap-sync anchor (`state_root` /
     /// `block_hash`), the applied witness high-water mark, and the
     /// liveness history. Seeded for every genesis shard so it is never
@@ -665,12 +673,30 @@ impl BeaconState {
     }
 
     /// Validators eligible to serve on the beacon committee: status is
-    /// `OnShard { ready: true, .. }` on any shard.
+    /// `OnShard { ready: true, .. }` on a shard whose chain has started.
     ///
     /// Every beacon committee member is therefore a signer on some shard
     /// — an offline validator can't escape detection by hiding in the
     /// beacon set. Pooled, jailed, insufficient-stake, and not-yet-ready
     /// validators are all excluded.
+    ///
+    /// The pending-anchor clause covers the one case where `ready` does
+    /// not yet prove a serving consensus node: a split execution places
+    /// its consumed observers `ready: true` (their synced stores carry
+    /// the child's consensus subset from the boundary), but their nodes
+    /// only flip onto the child once its anchor seeds from the parent's
+    /// terminal contribution — folds after the execution. Drafting one
+    /// into the beacon committee before that could cost the beacon its
+    /// quorum exactly when the anchor seeding depends on it. So a
+    /// validator placed at a still-pending child record's creation
+    /// (`placed_at_epoch >= last_live_epoch`, which a pending placeholder
+    /// never advances) is excluded until the record seeds. Parent-half
+    /// members keep their original placement epoch across the flip and
+    /// stay eligible — their hosts have been serving all along — and a
+    /// normal joiner's shard always has a live record. Chains born at
+    /// network genesis (pending placeholders with a `GENESIS` creation
+    /// epoch) start unconditionally — no flip gates them, so their
+    /// members are eligible from the first fold.
     ///
     /// Returned sorted by `ValidatorId` (`BTreeMap` iteration order) for
     /// deterministic Fisher–Yates input downstream.
@@ -678,7 +704,18 @@ impl BeaconState {
     pub fn beacon_eligible(&self) -> Vec<ValidatorId> {
         self.validators
             .iter()
-            .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
+            .filter(|(_, r)| match r.status {
+                ValidatorStatus::OnShard {
+                    shard,
+                    ready: true,
+                    placed_at_epoch,
+                } => !self.boundaries.get(&shard).is_some_and(|b| {
+                    b.block_hash == BlockHash::ZERO
+                        && b.last_live_epoch > Epoch::GENESIS
+                        && placed_at_epoch >= b.last_live_epoch
+                }),
+                _ => false,
+            })
             .map(|(id, _)| *id)
             .collect()
     }
@@ -721,6 +758,7 @@ impl BeaconState {
             &self.shard_committees,
             self.shard_consensus_members.clone(),
             self.witness_window_bases.clone(),
+            self.split_pending_window.clone(),
             network,
         )
     }
@@ -738,6 +776,7 @@ impl BeaconState {
             &self.next_shard_committees,
             self.ready_consensus_members(&self.next_shard_committees),
             self.live_witness_bases(),
+            self.live_split_pending(),
             network,
         )
     }
@@ -784,11 +823,25 @@ impl BeaconState {
             .collect()
     }
 
+    /// Shards with an admitted, not-yet-executed split as `pending_reshapes`
+    /// stand right now — the value the next promotion freezes into
+    /// [`Self::split_pending_window`], and what the lookahead snapshot
+    /// projects for the window it describes.
+    #[must_use]
+    pub fn live_split_pending(&self) -> BTreeSet<ShardId> {
+        self.pending_reshapes
+            .iter()
+            .filter(|(_, r)| matches!(r, PendingReshape::Split { .. }))
+            .map(|(target, _)| *target)
+            .collect()
+    }
+
     fn derive_topology_from(
         &self,
         committees: &BTreeMap<ShardId, ShardCommittee>,
         consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
         witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
+        split_pending: BTreeSet<ShardId>,
         network: NetworkDefinition,
     ) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = self
@@ -855,6 +908,7 @@ impl BeaconState {
             boundaries,
             witness_bases,
             reshape_observers,
+            split_pending,
         )
     }
 
@@ -997,8 +1051,8 @@ impl BeaconState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::JailReason;
     use crate::crypto::keys::bls_keypair_from_seed;
+    use crate::{Hash, JailReason};
 
     fn pubkey(seed: u64) -> Bls12381G1PublicKey {
         let mut s = [0u8; 32];
@@ -1028,6 +1082,7 @@ mod tests {
             next_shard_committees: BTreeMap::new(),
             shard_consensus_members: BTreeMap::new(),
             witness_window_bases: BTreeMap::new(),
+            split_pending_window: BTreeSet::new(),
             boundaries: BTreeMap::new(),
             pending_reshapes: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
@@ -1075,6 +1130,68 @@ mod tests {
             .next_shard_committees
             .insert(shard, ShardCommittee { members });
         state
+    }
+
+    // ─── beacon_eligible ──────────────────────────────────────────────
+
+    /// The pending-anchor exclusion: a member placed at a runtime-born
+    /// child record's creation (an unflipped split observer) is not
+    /// beacon-eligible until the record seeds; a member placed earlier
+    /// (a parent half) and members of genesis-created pending records
+    /// stay eligible throughout.
+    #[test]
+    fn beacon_eligible_excludes_members_of_pending_runtime_chains() {
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(5);
+        let child = ShardId::leaf(1, 0);
+        let genesis_shard = ShardId::leaf(1, 1);
+        let pending = |creation: Epoch| ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: creation,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+        };
+        state.boundaries.insert(child, pending(Epoch::new(4)));
+        state
+            .boundaries
+            .insert(genesis_shard, pending(Epoch::GENESIS));
+        let on = |shard, placed_at_epoch| ValidatorStatus::OnShard {
+            shard,
+            ready: true,
+            placed_at_epoch,
+        };
+        // Observer: placed at the child record's creation.
+        let observer = ValidatorId::new(0);
+        // Parent half: carried its earlier placement across the flip.
+        let parent_half = ValidatorId::new(1);
+        // Genesis-shard member: pending record, but the chain starts
+        // unconditionally at network birth.
+        let genesis_member = ValidatorId::new(2);
+        state
+            .validators
+            .insert(observer, validator_record(0, 0, on(child, Epoch::new(4))));
+        state.validators.insert(
+            parent_half,
+            validator_record(1, 0, on(child, Epoch::new(1))),
+        );
+        state.validators.insert(
+            genesis_member,
+            validator_record(2, 0, on(genesis_shard, Epoch::GENESIS)),
+        );
+
+        assert_eq!(state.beacon_eligible(), vec![parent_half, genesis_member]);
+
+        // The child anchor seeds: the observer's flip can proceed, and
+        // it becomes eligible.
+        state.boundaries.get_mut(&child).unwrap().block_hash =
+            BlockHash::from_raw(Hash::from_bytes(b"seeded"));
+        assert_eq!(
+            state.beacon_eligible(),
+            vec![observer, parent_half, genesis_member],
+        );
     }
 
     // ─── effective_stake ──────────────────────────────────────────────
