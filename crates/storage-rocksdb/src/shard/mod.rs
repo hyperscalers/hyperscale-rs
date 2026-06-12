@@ -21,6 +21,7 @@ pub(crate) mod receipts;
 pub(crate) mod recovery;
 pub(crate) mod shared;
 pub(crate) mod snapshot;
+pub(crate) mod split;
 pub(crate) mod store;
 pub(crate) mod substate_key;
 pub(crate) mod versioned_key;

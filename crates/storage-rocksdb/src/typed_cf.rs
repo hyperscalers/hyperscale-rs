@@ -8,7 +8,9 @@
 
 use std::marker::PhantomData;
 
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, StateRoot};
+use hyperscale_types::{
+    BlockHeight, ChainOrigin, Hash, QuorumCertificate, StateRoot, WeightedTimestamp,
+};
 use rocksdb::{ColumnFamily, DB, DBRawIteratorWithThreadMode, Snapshot, WriteBatch};
 use sbor::prelude::{BasicDecode, BasicEncode};
 use sbor::{basic_decode, basic_encode};
@@ -576,4 +578,35 @@ impl MetadataEntry for JmtMetadataEntry {
     const KEY: &'static [u8] = b"jmt:metadata";
     type Value = (u64, StateRoot);
     type Codec = JmtMetadataCodec;
+}
+
+pub struct ChainOriginEntry;
+impl MetadataEntry for ChainOriginEntry {
+    const KEY: &'static [u8] = b"chain:origin";
+    type Value = ChainOrigin;
+    type Codec = ChainOriginCodec;
+}
+
+/// Chain-origin codec — packed 16-byte format:
+/// `[genesis_height_BE_8B][anchor_wt_millis_BE_8B]`.
+#[derive(Default)]
+pub struct ChainOriginCodec;
+
+impl DbEncode<ChainOrigin> for ChainOriginCodec {
+    fn encode_to(&self, value: &ChainOrigin, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.genesis_height.inner().to_be_bytes());
+        buf.extend_from_slice(&value.anchor_wt.as_millis().to_be_bytes());
+    }
+}
+
+impl DbCodec<ChainOrigin> for ChainOriginCodec {
+    fn decode(&self, bytes: &[u8]) -> ChainOrigin {
+        assert!(bytes.len() == 16, "chain:origin must be 16 bytes");
+        ChainOrigin {
+            genesis_height: BlockHeight::new(u64::from_be_bytes(bytes[..8].try_into().unwrap())),
+            anchor_wt: WeightedTimestamp::from_millis(u64::from_be_bytes(
+                bytes[8..16].try_into().unwrap(),
+            )),
+        }
+    }
 }

@@ -3,12 +3,13 @@
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash,
-    ShardWitnessPayload, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, Hash, ShardWitnessPayload,
+    WeightedTimestamp,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf};
 use super::core::RocksDbShardStorage;
+use super::metadata::read_chain_origin;
 use crate::typed_cf::{TypedCf, get, iter_from};
 
 impl RocksDbShardStorage {
@@ -72,7 +73,7 @@ impl RocksDbShardStorage {
             substate_count: self
                 .substate_count_at_version(committed_height.inner())
                 .unwrap_or(0),
-            chain_origin: ChainOrigin::ROOT,
+            chain_origin: read_chain_origin(&*self.db),
         }
     }
 

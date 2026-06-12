@@ -149,11 +149,15 @@ pub fn hash_value(value: &[u8]) -> ValueHash {
     jmt_value_hash(value)
 }
 
-/// Returns `None` when the JMT is truly empty (height 0 with zero root),
-/// indicating no parent node exists. Otherwise returns `Some(block_height)`.
+/// Returns `None` when the JMT is truly empty (zero root) — no parent
+/// node exists.
+///
+/// An empty tree has no root node at any version, including a split
+/// child that adopted an empty subtree at a nonzero genesis height.
+/// Otherwise returns `Some(block_height)`.
 #[must_use]
 pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<BlockHeight> {
-    if block_height == BlockHeight::GENESIS && root == StateRoot::ZERO {
+    if root == StateRoot::ZERO {
         None
     } else {
         Some(block_height)

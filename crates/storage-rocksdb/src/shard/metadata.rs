@@ -4,12 +4,12 @@
 //! the key bytes, value type, and codec are declared once in `typed_cf.rs`.
 //! These thin wrappers provide domain-specific names and handle default values.
 
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, StateRoot};
+use hyperscale_types::{BlockHeight, ChainOrigin, Hash, QuorumCertificate, StateRoot};
 use rocksdb::WriteBatch;
 
 use crate::typed_cf::{
-    self, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry, JmtMetadataEntry,
-    ReadableStore,
+    self, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry,
+    JmtMetadataEntry, ReadableStore,
 };
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────
@@ -49,4 +49,19 @@ pub fn write_jmt_metadata(batch: &mut WriteBatch, version: u64, root: StateRoot)
 /// Returns `(0, ZERO)` for an uninitialized database.
 pub fn read_jmt_metadata(store: &impl ReadableStore) -> (u64, StateRoot) {
     typed_cf::meta_read::<JmtMetadataEntry>(store).unwrap_or((0, StateRoot::ZERO))
+}
+
+// ─── Chain origin ────────────────────────────────────────────────────────────
+
+pub fn write_chain_origin(batch: &mut WriteBatch, origin: ChainOrigin) {
+    typed_cf::meta_write::<ChainOriginEntry>(batch, &origin);
+}
+
+/// Read the chain's origin — genesis height plus start-time anchor.
+///
+/// Returns [`ChainOrigin::ROOT`] when no record exists: only split-child
+/// adoption writes one, so every store predating it is a chain born at
+/// network genesis.
+pub fn read_chain_origin(store: &impl ReadableStore) -> ChainOrigin {
+    typed_cf::meta_read::<ChainOriginEntry>(store).unwrap_or(ChainOrigin::ROOT)
 }
