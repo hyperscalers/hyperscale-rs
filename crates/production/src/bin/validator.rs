@@ -63,8 +63,8 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_libp2p::{Libp2pConfig, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::{
-    ProductionRunner, StorageFactory, SyncStatus, TelemetryConfig, TelemetryGuard, VnodeConfig,
-    init_telemetry,
+    ProductionRunner, StorageDirResolver, StorageFactory, SyncStatus, TelemetryConfig,
+    TelemetryGuard, VnodeConfig, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -1164,12 +1164,20 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let hosted_shards: std::collections::BTreeSet<u64> =
         config.vnodes.iter().map(|v| v.shard).collect();
     let shard_depth = config.node.num_shards.trailing_zeros();
+    // One directory convention for every open — startup, runtime joins,
+    // and split-flip seeding. Depth qualifies the name: trie paths alone
+    // collide across depths once shards split (a child `leaf(2, 0)` and
+    // its parent `leaf(1, 0)` share the path value 0).
+    let dir_data_dir = config.node.data_dir.clone();
+    let storage_dir: StorageDirResolver = Arc::new(move |shard: ShardId| {
+        dir_data_dir.join(format!("shard-d{}p{}", shard.depth(), shard.path()))
+    });
     let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
     for shard in &hosted_shards {
         let shard_id = ShardId::leaf(shard_depth, *shard);
         // The shard's storage directory: the database lives at `db/`
         // inside it, the snap-sync checkpoint ring at `checkpoints/`.
-        let shard_dir = config.node.data_dir.join(format!("shard-{shard}"));
+        let shard_dir = storage_dir(shard_id);
         let storage = RocksDbShardStorage::open_with_config(
             &shard_dir,
             &rocksdb_config,
@@ -1183,10 +1191,10 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // Opens storage for shards joined at runtime (beacon-driven placement
     // changes), at the same directory convention as the startup loop above
     // so a restart reopens what a runtime join created.
-    let factory_data_dir = config.node.data_dir.clone();
     let factory_rocksdb_config = rocksdb_config.clone();
+    let factory_storage_dir = Arc::clone(&storage_dir);
     let storage_factory: StorageFactory = Arc::new(move |shard: ShardId| {
-        let shard_dir = factory_data_dir.join(format!("shard-{}", shard.path()));
+        let shard_dir = factory_storage_dir(shard);
         RocksDbShardStorage::open_with_config(
             &shard_dir,
             &factory_rocksdb_config,
@@ -1276,6 +1284,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         beacon_storage,
         network_config,
         storage_factory,
+        storage_dir,
     )
     .dispatch(dispatch)
     .rpc_status(rpc_node_status.clone())

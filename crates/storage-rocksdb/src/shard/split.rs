@@ -108,7 +108,12 @@ impl RocksDbShardStorage {
         if checkpoint_version == genesis_version && read_chain_origin(&*self.db) == origin {
             return Ok(current_root);
         }
-        if checkpoint_version + 1 != genesis_version {
+        // The parent chain coasts past its crossing before it stops —
+        // empty blocks whose no-op commits advance the JMT version with a
+        // frozen root — so a checkpoint taken at termination sits at the
+        // genesis height itself; one version below is the exactly-at-the-
+        // crossing case. Anything else is a stale or foreign checkpoint.
+        if checkpoint_version != genesis_version && checkpoint_version + 1 != genesis_version {
             return Err(StorageError::DatabaseError(format!(
                 "split adoption vintage mismatch: checkpoint at version {checkpoint_version}, \
                  genesis height {genesis_version}"

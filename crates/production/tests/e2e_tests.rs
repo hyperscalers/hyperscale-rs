@@ -16,7 +16,9 @@ use std::time::Duration;
 use fixtures::TestFixtures;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-use hyperscale_production::{ProductionRunner, ShardCommand, StorageFactory, VnodeConfig};
+use hyperscale_production::{
+    ProductionRunner, ShardCommand, StorageDirResolver, StorageFactory, VnodeConfig,
+};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
@@ -60,15 +62,17 @@ fn test_bind_args(validator_id: ValidatorId) -> (Arc<Bls12381G1PrivateKey>, Arc<
 /// Storage factory rooted in the test's temp dir. Runtime-joined shards
 /// get `shard-{path}` directories, mirroring the validator binary's
 /// data-dir convention.
-fn temp_storage_factory(dir: &TempDir) -> StorageFactory {
+fn temp_storage_dir(dir: &TempDir) -> StorageDirResolver {
     let root = dir.path().to_path_buf();
+    Arc::new(move |shard: ShardId| root.join(format!("shard-d{}p{}", shard.depth(), shard.path())))
+}
+
+fn temp_storage_factory(dir: &TempDir) -> StorageFactory {
+    let resolve = temp_storage_dir(dir);
     Arc::new(move |shard: ShardId| {
-        RocksDbShardStorage::open(
-            root.join(format!("shard-{}", shard.path())),
-            shard_prefix_path(shard),
-        )
-        .map(Arc::new)
-        .map_err(|e| format!("{e:?}"))
+        RocksDbShardStorage::open(resolve(shard), shard_prefix_path(shard))
+            .map(Arc::new)
+            .map_err(|e| format!("{e:?}"))
     })
 }
 
@@ -503,6 +507,7 @@ async fn test_production_runner_with_network() {
         beacon_storage,
         network_config,
         temp_storage_factory(&temp_dir),
+        temp_storage_dir(&temp_dir),
     )
     .build();
 
@@ -571,6 +576,7 @@ async fn test_graceful_shutdown() {
         beacon_storage,
         network_config,
         temp_storage_factory(&temp_dir),
+        temp_storage_dir(&temp_dir),
     )
     .build()
     .unwrap();
@@ -640,6 +646,7 @@ async fn test_runtime_shard_join_and_leave() {
         beacon_storage,
         network_config,
         temp_storage_factory(&temp_dir),
+        temp_storage_dir(&temp_dir),
     )
     .build()
     .unwrap();
@@ -663,6 +670,7 @@ async fn test_runtime_shard_join_and_leave() {
                 local_shard: shard_b,
                 signing_key: fixtures.signing_key(vnode_b),
             }],
+            adoption: None,
         })
         .await
         .expect("supervisor accepts commands");
@@ -760,6 +768,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
         beacon_storage0,
         network_config0,
         temp_storage_factory(&temp_dir0),
+        temp_storage_dir(&temp_dir0),
     )
     .build()
     .expect("host 0 builder");
@@ -804,6 +813,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
         beacon_storage1,
         network_config1,
         temp_storage_factory(&temp_dir1),
+        temp_storage_dir(&temp_dir1),
     )
     .build()
     .expect("host 1 builder");
@@ -947,6 +957,7 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
         beacon_storage0,
         network_config0,
         temp_storage_factory(&temp_dir0),
+        temp_storage_dir(&temp_dir0),
     )
     .build()
     .expect("host 0 builder");
@@ -994,6 +1005,7 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
         beacon_storage1,
         network_config1,
         temp_storage_factory(&temp_dir1),
+        temp_storage_dir(&temp_dir1),
     )
     .build()
     .expect("host 1 builder");

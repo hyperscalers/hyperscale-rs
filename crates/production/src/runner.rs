@@ -71,7 +71,7 @@ use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
 use crate::status::{ShardSyncState, SyncStatus};
-use crate::supervisor::{ShardCommand, ShardSupervisor, StorageFactory};
+use crate::supervisor::{ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -185,6 +185,8 @@ pub struct ProductionRunnerBuilder {
     channel_capacity: usize,
     /// Opens a runtime-joined shard's `RocksDB` storage.
     storage_factory: StorageFactory,
+    /// Resolves a shard's storage directory for split-flip seeding.
+    storage_dir: StorageDirResolver,
     publishers: RpcPublishers,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
@@ -214,6 +216,7 @@ impl ProductionRunnerBuilder {
         beacon_storage: Arc<dyn BeaconStorage>,
         network_config: Libp2pConfig,
         storage_factory: StorageFactory,
+        storage_dir: StorageDirResolver,
     ) -> Self {
         assert!(
             !vnodes.is_empty(),
@@ -234,6 +237,7 @@ impl ProductionRunnerBuilder {
             mempool_config: MempoolConfig::default(),
             provision_config: ProvisionConfig::default(),
             storage_factory,
+            storage_dir,
         }
     }
 
@@ -577,6 +581,7 @@ impl ProductionRunnerBuilder {
             self.publishers.clone(),
             Arc::clone(&storages),
             self.storage_factory,
+            self.storage_dir,
             participation_tx,
         );
 
@@ -693,6 +698,7 @@ impl ProductionRunner {
         beacon_storage: Arc<dyn BeaconStorage>,
         network_config: Libp2pConfig,
         storage_factory: StorageFactory,
+        storage_dir: StorageDirResolver,
     ) -> ProductionRunnerBuilder {
         ProductionRunnerBuilder::new(
             vnodes,
@@ -702,6 +708,7 @@ impl ProductionRunner {
             beacon_storage,
             network_config,
             storage_factory,
+            storage_dir,
         )
     }
 
@@ -1095,6 +1102,7 @@ impl ProductionRunner {
                 local_shard: shard,
                 signing_key: Arc::clone(signing_key),
             }],
+            adoption: change.split_adoption,
         });
     }
 

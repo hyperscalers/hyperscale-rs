@@ -220,9 +220,28 @@ impl Verified<CertifiedBlock> {
         state_root: StateRoot,
         origin: ChainOrigin,
     ) -> Self {
-        let block = Block::genesis(shard_id, proposer, state_root, origin);
+        Self::genesis_certified(Block::genesis(shard_id, proposer, state_root, origin))
+    }
+
+    /// Verified form of the genesis `CertifiedBlock` for an
+    /// already-built genesis block — the pairing used by a split
+    /// child's flip, whose genesis is
+    /// [`Block::split_child_genesis`](crate::Block::split_child_genesis)
+    /// rather than the empty network-genesis shape. The genesis-shape QC
+    /// is the block's own embedded genesis `parent_qc` with `block_hash`
+    /// substituted, exactly as for a network genesis.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `block` is not structurally genesis.
+    #[must_use]
+    pub fn genesis_certified(block: Block) -> Self {
+        assert!(
+            block.is_genesis(),
+            "genesis pairing for a non-genesis block"
+        );
         let block_hash = block.hash();
-        let base = QuorumCertificate::genesis(shard_id, origin);
+        let base = block.header().parent_qc().clone();
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             base.shard_id(),

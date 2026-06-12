@@ -21,6 +21,7 @@
 
 pub mod observer;
 pub mod snap_sync;
+pub mod split_flip;
 pub mod witness_history;
 
 use hyperscale_storage::{ImportLeaf, RecoveredState};

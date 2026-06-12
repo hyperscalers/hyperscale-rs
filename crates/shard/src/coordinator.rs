@@ -810,6 +810,14 @@ impl ShardCoordinator {
 
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
+        // A chain's genesis height and clock are per-chain properties: a
+        // split child's genesis continues the parent's height line and
+        // anchors at its final canonical weighted timestamp (ZERO and
+        // height 0 for chains born at network genesis).
+        self.committed_height = genesis.height();
+        self.committed_ts = genesis.header().parent_qc().weighted_timestamp();
+        self.committed_anchor_ts = self.committed_ts;
+        self.substate_count_frontier.0 = genesis.height();
 
         // Record genesis time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.

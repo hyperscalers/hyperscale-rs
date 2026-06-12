@@ -34,7 +34,8 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
-    LocalTimestamp, RoutableTransaction, ShardId, TopologySnapshot, TransactionStatus, TxHash,
+    Block, CertifiedBlock, LocalTimestamp, RoutableTransaction, ShardId, TopologySnapshot,
+    TransactionStatus, TxHash, Verified,
 };
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
@@ -498,6 +499,26 @@ where
     /// [`NodeHost::set_time`]: crate::host::NodeHost::set_time
     pub const fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
+    }
+
+    /// Install `genesis` on every hosted vnode and commit it through
+    /// the normal pipeline — the same sequence the startup runners
+    /// perform for a network genesis, used pre-spawn by a split child's
+    /// flip with the deterministic
+    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis).
+    /// The storage's adoption already points the JMT at the genesis
+    /// version, so the commit's genesis arm re-records that height.
+    pub fn install_genesis(&mut self, genesis: &Block) {
+        let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
+            genesis.clone(),
+        ));
+        for vnode_idx in 0..self.vnodes.len() {
+            let actions = self.vnode_mut(vnode_idx).state.initialize_genesis(genesis);
+            self.drain_actions(vnode_idx, actions);
+        }
+        self.step(ShardScopedInput::Protocol(Box::new(
+            ProtocolEvent::BlockCommitted { certified },
+        )));
     }
 
     /// Process one [`ShardScopedInput`] end-to-end: clear per-step

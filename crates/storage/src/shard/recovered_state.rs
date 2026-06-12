@@ -101,7 +101,20 @@ impl RecoveredState {
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
             substate_count,
-            chain_origin: ChainOrigin::ROOT,
+            // A genesis boundary header carries the chain's origin
+            // outright — a straggler joining a split child at its first
+            // anchor recovers the continued height line and clock from
+            // it. A later boundary on a child chain still reads `ROOT`
+            // here; the origin only feeds genesis-QC reconstruction,
+            // which a joiner that far past genesis never performs.
+            chain_origin: if boundary_header.is_genesis() {
+                ChainOrigin {
+                    genesis_height: boundary_header.height(),
+                    anchor_wt: boundary_header.parent_qc().weighted_timestamp(),
+                }
+            } else {
+                ChainOrigin::ROOT
+            },
         }
     }
 
