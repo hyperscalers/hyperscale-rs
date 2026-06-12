@@ -33,4 +33,16 @@ pub trait GenesisCommit {
         jmt_updates: &DatabaseUpdates,
         owner_map: &HashMap<NodeId, NodeId>,
     ) -> StateRoot;
+
+    /// Write `substates` to the substate store without touching the JMT.
+    ///
+    /// The read-availability half of [`install_genesis`](Self::install_genesis):
+    /// a store created after network genesis (a mobility joiner, a split
+    /// observer) replicates the engine bootstrap through this before its
+    /// authenticated span imports, so engine-implicit reads (system
+    /// packages, the intent-hash tracker) resolve on every store. Must run
+    /// on a store with no substates yet — the imports that follow overwrite
+    /// the replicated values for keys inside the store's prefix, never the
+    /// other way around.
+    fn replicate_genesis_substates(&self, substates: &DatabaseUpdates);
 }

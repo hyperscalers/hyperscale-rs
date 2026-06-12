@@ -777,6 +777,10 @@ impl GenesisCommit for RocksDbShardStorage {
         Self::commit_substates_only(self, substates);
         Self::finalize_genesis_jmt(self, jmt_updates, owner_map)
     }
+
+    fn replicate_genesis_substates(&self, substates: &DatabaseUpdates) {
+        Self::commit_substates_only(self, substates);
+    }
 }
 
 impl SubstateDatabase for RocksDbShardStorage {

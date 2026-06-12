@@ -92,6 +92,10 @@ impl GenesisCommit for SharedStorage {
         self.0.commit_substates_only(substates);
         self.0.finalize_genesis_jmt(jmt_updates, owner_map)
     }
+
+    fn replicate_genesis_substates(&self, substates: &DatabaseUpdates) {
+        self.0.commit_substates_only(substates);
+    }
 }
 
 impl SubstateStore for SharedStorage {

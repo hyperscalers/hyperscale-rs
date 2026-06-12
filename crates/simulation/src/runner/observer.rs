@@ -10,11 +10,12 @@
 //! `ReshapeReady` witness leaf, and folds into the split's readiness
 //! gate. Nothing here runs unless a test calls it.
 
+use hyperscale_engine::GenesisConfig;
 use hyperscale_network::Network;
-use hyperscale_node::bootstrap::BootstrapRequest;
 use hyperscale_node::bootstrap::observer::{
     ObserverBootstrap, ObserverTail, TailOutcome, observer_ready_signal,
 };
+use hyperscale_node::bootstrap::{BootstrapRequest, replicate_engine_bootstrap};
 use hyperscale_node::{serve_block_request, serve_state_range_request};
 use hyperscale_storage::BoundaryStore;
 use hyperscale_storage_memory::SimShardStorage;
@@ -57,6 +58,7 @@ impl SimulationRunner {
             .expect("observer duty requires an attested anchor");
 
         let storage = SimShardStorage::new(shard_prefix_path(child));
+        replicate_engine_bootstrap(&storage, snapshot.network(), &GenesisConfig::test_default());
         let mut bootstrap = ObserverBootstrap::new(via, anchor, child);
         let mut peer = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {

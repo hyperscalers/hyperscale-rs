@@ -25,6 +25,7 @@ use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::Network;
 use hyperscale_network_libp2p::Libp2pNetwork;
+use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::bootstrap::observer::observer_ready_signal;
 use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::host::{attach_shard, detach_shard};
@@ -244,6 +245,10 @@ pub struct ShardSupervisor {
     storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
     storage_factory: StorageFactory,
     storage_dir: StorageDirResolver,
+    /// Replicated into every fresh store this supervisor opens — a
+    /// post-genesis joiner or observer store must carry the engine
+    /// bootstrap on its substate side before its span imports.
+    engine_bootstrap: EngineBootstrap,
     /// Cloned into every spawned shard loop's config so placement
     /// deltas reach the runner's reconfiguration loop.
     participation_tx: mpsc::UnboundedSender<ParticipationChange>,
@@ -288,6 +293,7 @@ impl ShardSupervisor {
         storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
+        engine_bootstrap: EngineBootstrap,
         participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -304,6 +310,7 @@ impl ShardSupervisor {
             storages,
             storage_factory,
             storage_dir,
+            engine_bootstrap,
             participation_tx,
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
@@ -424,11 +431,20 @@ impl ShardSupervisor {
         // and lets a `Leave` during the open release memberships.
         self.bootstrapping.insert(shard, vnodes.len());
         let factory = Arc::clone(&self.storage_factory);
+        let engine_bootstrap = self.engine_bootstrap.clone();
         let events = self.events_tx.clone();
         let vnodes = vnodes.to_vec();
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(shard).map(|storage| {
                 let recovered = storage.load_recovered_state();
+                // A brand-new store (no commits, no imported JMT) gets
+                // the engine bootstrap before the snap-sync import or
+                // the from-genesis replay populates it.
+                if recovered.committed_height == BlockHeight::GENESIS
+                    && recovered.jmt_root.is_none()
+                {
+                    engine_bootstrap.replicate_into(storage.as_ref());
+                }
                 (storage, recovered)
             });
             // Send failure means the runner is shutting down; the join
@@ -549,15 +565,18 @@ impl ShardSupervisor {
         let process = Arc::clone(&self.process);
         let events = self.events_tx.clone();
         let factory = Arc::clone(&self.storage_factory);
+        let engine_bootstrap = self.engine_bootstrap.clone();
         let dir = (self.storage_dir)(child);
         self.tokio_handle.spawn(async move {
             let _anchor = wait_for_child_anchor(&process, child).await;
-            let done = spawn_blocking(move || {
+            let done = spawn_blocking(move || -> Result<Arc<RocksDbShardStorage>, String> {
                 if dir.exists() {
                     std::fs::remove_dir_all(&dir)
                         .map_err(|e| format!("stale observer store wipe: {e}"))?;
                 }
-                factory(child)
+                let storage = factory(child)?;
+                engine_bootstrap.replicate_into(storage.as_ref());
+                Ok(storage)
             })
             .await
             .unwrap_or_else(|e| Err(format!("observer reopen task panicked: {e}")));
@@ -786,6 +805,7 @@ impl ShardSupervisor {
             return;
         }
         let factory = Arc::clone(&self.storage_factory);
+        let engine_bootstrap = self.engine_bootstrap.clone();
         let dir = (self.storage_dir)(child);
         let process = Arc::clone(&self.process);
         let events = self.events_tx.clone();
@@ -795,12 +815,14 @@ impl ShardSupervisor {
             // A leftover directory — an abandoned earlier duty or a
             // failed flip — holds state synced against a stale anchor;
             // a fresh duty starts from a fresh store.
-            let opened = spawn_blocking(move || {
+            let opened = spawn_blocking(move || -> Result<Arc<RocksDbShardStorage>, String> {
                 if dir.exists() {
                     std::fs::remove_dir_all(&dir)
                         .map_err(|e| format!("stale observer store wipe: {e}"))?;
                 }
-                factory(child)
+                let storage = factory(child)?;
+                engine_bootstrap.replicate_into(storage.as_ref());
+                Ok(storage)
             })
             .await;
             let storage = match opened {

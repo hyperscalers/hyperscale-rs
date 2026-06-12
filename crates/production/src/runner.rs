@@ -40,6 +40,7 @@ use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
     RequestStreamPool, generate_random_keypair,
 };
+use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::shard_loop::{ShardEvent, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatVnodeGroup, SharedTopologySnapshot, TxStatusCache, VnodeInit,
@@ -534,6 +535,17 @@ impl ProductionRunnerBuilder {
             topology: topology.clone(),
         })?;
 
+        // The bootstrap identity replicated into every fresh store the
+        // supervisor opens for a post-genesis join or observer duty —
+        // the same network + genesis config the startup genesis path
+        // installs, so the substate sides agree across stores.
+        let engine_bootstrap = EngineBootstrap {
+            network: network_definition.clone(),
+            config: self
+                .genesis_config
+                .clone()
+                .unwrap_or_else(GenesisConfig::production),
+        };
         let executor = RadixExecutor::new(network_definition);
 
         // Each shard's `shard_event_senders` entry points at that
@@ -582,6 +594,7 @@ impl ProductionRunnerBuilder {
             Arc::clone(&storages),
             self.storage_factory,
             self.storage_dir,
+            engine_bootstrap,
             participation_tx,
         );
 

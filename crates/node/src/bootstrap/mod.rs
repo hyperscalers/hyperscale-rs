@@ -24,18 +24,79 @@ pub mod snap_sync;
 pub mod split_flip;
 pub mod witness_history;
 
-use hyperscale_storage::{ImportLeaf, RecoveredState};
+use hyperscale_engine::{GenesisConfig, prepared_genesis};
+use hyperscale_storage::{GenesisCommit, ImportLeaf, RecoveredState, ShardChainReader};
 use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
 use hyperscale_types::network::response::{
     GetStateRangeResponse, GetWitnessHistoryResponse, MAX_HASHES_PER_WITNESS_HISTORY,
     MAX_LEAVES_PER_STATE_RANGE,
 };
 use hyperscale_types::{
-    BlockHeader, BlockHeight, Hash, ShardAnchor, ShardId, StateRoot, shard_prefix_path,
+    BlockHeader, BlockHeight, Hash, NetworkDefinition, ShardAnchor, ShardId, StateRoot,
+    shard_prefix_path,
 };
 
 use self::snap_sync::SnapSync;
 use self::witness_history::WitnessHistorySync;
+
+/// Replicate the network's engine bootstrap into a store created after
+/// network genesis — a mobility joiner or a split observer — before its
+/// authenticated span imports.
+///
+/// Every genesis-born store carries the full bootstrap on its substate
+/// side for read availability (`install_engine_genesis` writes it
+/// unfiltered while the JMT takes only the shard's prefix subtree), and
+/// transaction execution assumes it on every store: the engine's
+/// implicit reads — system packages, the intent-hash tracker — resolve
+/// locally, never through provisions. Balances are stripped: account
+/// state is authenticated and arrives through the span import, which
+/// overwrites the replicated values for keys inside the store's prefix.
+///
+/// # Panics
+///
+/// Panics if `storage` already has committed blocks — the replication
+/// would regress an evolved substate side to its birth values.
+pub fn replicate_engine_bootstrap<S>(
+    storage: &S,
+    network: &NetworkDefinition,
+    genesis_config: &GenesisConfig,
+) where
+    S: GenesisCommit + ShardChainReader,
+{
+    assert_eq!(
+        storage.committed_height(),
+        BlockHeight::GENESIS,
+        "engine bootstrap replication requires a store with no committed blocks"
+    );
+    let mut config = genesis_config.clone();
+    config.xrd_balances.clear();
+    let bootstrap = prepared_genesis(network, &config);
+    storage.replicate_genesis_substates(&bootstrap);
+}
+
+/// The identity of the network's engine bootstrap.
+///
+/// What [`replicate_engine_bootstrap`] needs to rebuild it for a fresh
+/// store. Drivers that open stores long after startup (the production
+/// shard supervisor) carry one of these instead of the raw pair.
+#[derive(Clone)]
+pub struct EngineBootstrap {
+    /// Network the engine was bootstrapped for.
+    pub network: NetworkDefinition,
+    /// The network-birth genesis config. Balances are stripped at
+    /// replication; only the shared system state matters.
+    pub config: GenesisConfig,
+}
+
+impl EngineBootstrap {
+    /// [`replicate_engine_bootstrap`] with this identity.
+    pub fn replicate_into<S>(&self, storage: &S)
+    where
+        S: GenesisCommit + ShardChainReader,
+    {
+        replicate_engine_bootstrap(storage, &self.network, &self.config);
+    }
+}
 
 /// State sub-range fan-out: `2^4 = 16` concurrent range fetches.
 const SPLIT_BITS: u8 = 4;
