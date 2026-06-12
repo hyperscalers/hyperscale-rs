@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
@@ -152,7 +151,6 @@ fn test_beacon_coordinator(
     let state = build_genesis_beacon_state(&config);
     let config_hash = genesis_config_hash(&config, &network);
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
-    let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
     BeaconCoordinator::new(
         block,
         vec![state],
@@ -161,7 +159,6 @@ fn test_beacon_coordinator(
         WeightedTimestamp::ZERO,
         network,
         config_hash,
-        pool,
     )
 }
 

@@ -14,8 +14,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, StateRoot, TopologySnapshot,
-    TransactionStatus, TxHash, Verified,
+    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, StateRoot,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -672,6 +672,24 @@ where
         let handles = Arc::clone(&self.process.dispatch_handles);
         let vnode = self.vnode(vnode_idx);
         let me = vnode.validator_id;
+
+        // One beacon signer per validator: a co-hosted vnode that
+        // doesn't hold the validator's signing seat has its beacon
+        // signing actions dropped here, before any signature exists.
+        // The state machines stay single-node — passivity is purely a
+        // driver decision at this funnel.
+        if let Some(epoch) = action.beacon_signing_epoch()
+            && !self.process.allow_beacon_signing(me, shard, epoch)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                epoch = epoch.inner(),
+                action = action.type_name(),
+                "Dropping beacon signing action from a passive vnode"
+            );
+            return;
+        }
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender().clone();
         let signing_key = Arc::clone(&vnode.signing_key);
@@ -693,6 +711,10 @@ where
                 Arc::clone(&shard_handles.pending_chain),
                 Arc::clone(&shard_handles.prepared_commits),
             );
+            let cache_beacon_proposal =
+                |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
+                    handles.beacon_proposal_cache.admit(from, epoch, proposal);
+                };
             let ctx = ActionContext {
                 executor: &handles.executor,
                 topology_snapshot: &topology_snapshot,
@@ -704,6 +726,7 @@ where
                 signing_key: &signing_key,
                 notify,
                 commit_prepared: &commit_prepared,
+                cache_beacon_proposal: &cache_beacon_proposal,
                 par,
             };
             match action.owner() {

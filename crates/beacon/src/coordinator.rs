@@ -143,10 +143,9 @@ pub struct BeaconCoordinator {
 
     /// Per-epoch cache of committee members' `BeaconProposal`s.
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
-    /// reset on commit. Shared with the `GetBeaconProposalRequest`
-    /// network responder and with every co-hosted vnode's
-    /// `BeaconCoordinator` — single `Arc` per host.
-    proposal_pool: Arc<BeaconProposalPool>,
+    /// reset on commit. Vnode-local — inbound fetch serving reads the
+    /// driver's process-level cache, never this pool.
+    proposal_pool: BeaconProposalPool,
 
     /// Committee members whose in-flight-epoch `BeaconProposal` this
     /// vnode has already run the witness-admission gate over, regardless
@@ -231,7 +230,6 @@ impl BeaconCoordinator {
         local_frontier: WeightedTimestamp,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
-        proposal_pool: Arc<BeaconProposalPool>,
     ) -> Self {
         const LATEST_STATE_EXPECT: &str = "history must carry at least the latest committed state";
         if let BeaconCert::Genesis(config_hash) = latest_block.cert() {
@@ -278,7 +276,7 @@ impl BeaconCoordinator {
             shard_source: ShardSourceTracker::new(),
             skip_tracker: SkipTracker::new(),
             equivocations: EquivocationObservations::new(),
-            proposal_pool,
+            proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
             local_shard,
@@ -1786,12 +1784,10 @@ impl BeaconCoordinator {
         }
     }
 
-    /// Shared handle to this coordinator's proposal pool. Lets the
-    /// host hand the same `Arc` to the network-worker responder at
-    /// `crates/node/src/shard_io/fetch/beacon_proposal_serve.rs` and
-    /// lets tests run lookups without going through the network path.
+    /// This coordinator's proposal pool — lets tests and sims run
+    /// lookups without going through the network path.
     #[must_use]
-    pub const fn proposal_pool(&self) -> &Arc<BeaconProposalPool> {
+    pub const fn proposal_pool(&self) -> &BeaconProposalPool {
         &self.proposal_pool
     }
 
@@ -2043,7 +2039,6 @@ mod tests {
 
     fn new_coord(me: ValidatorId) -> BeaconCoordinator {
         let (block, state, config_hash) = genesis_trio();
-        let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         BeaconCoordinator::new(
             block,
             vec![state],
@@ -2052,7 +2047,6 @@ mod tests {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
-            pool,
         )
     }
 
@@ -2465,7 +2459,6 @@ mod tests {
     fn new_carries_latest_block() {
         let (block, state, config_hash) = genesis_trio();
         let block_hash = block.block_hash();
-        let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let coord = BeaconCoordinator::new(
             Arc::clone(&block),
             vec![state],
@@ -2474,7 +2467,6 @@ mod tests {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
-            pool,
         );
         assert_eq!(coord.latest_block().block_hash(), block_hash);
     }
@@ -2486,7 +2478,6 @@ mod tests {
         // resume at the loaded state's epoch, not fall back to genesis.
         let (block, mut state, config_hash) = genesis_trio();
         state.current_epoch = Epoch::new(7);
-        let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let coord = BeaconCoordinator::new(
             block,
             vec![state],
@@ -2495,7 +2486,6 @@ mod tests {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
-            pool,
         );
         assert_eq!(coord.current_epoch(), Epoch::new(7));
     }
@@ -2523,7 +2513,6 @@ mod tests {
         let mismatched_block = Verified::<CertifiedBeaconBlock>::genesis(
             GenesisConfigHash::from_raw(Hash::from_bytes(b"other-config")),
         );
-        let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let _coord = BeaconCoordinator::new(
             Arc::new(mismatched_block),
             vec![state],
@@ -2532,7 +2521,6 @@ mod tests {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             GenesisConfigHash::ZERO,
-            pool,
         );
     }
 
@@ -4032,11 +4020,6 @@ mod tests {
 
     fn coord_from_history(history: Vec<BeaconState>) -> BeaconCoordinator {
         let (block, _genesis_state, config_hash) = genesis_trio();
-        let next_epoch = history
-            .last()
-            .expect("non-empty history")
-            .current_epoch
-            .next();
         BeaconCoordinator::new(
             block,
             history,
@@ -4045,7 +4028,6 @@ mod tests {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
-            Arc::new(BeaconProposalPool::new(next_epoch)),
         )
     }
 

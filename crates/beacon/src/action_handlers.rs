@@ -164,6 +164,7 @@ where
                 equivocations,
             );
             let proposal = Arc::new(verified);
+            (ctx.cache_beacon_proposal)(me, epoch, Arc::clone(&proposal));
             ctx.network.notify(
                 &recipients,
                 &BeaconProposalNotification::new(

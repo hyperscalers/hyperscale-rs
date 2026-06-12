@@ -38,10 +38,11 @@ where
     pub fn initialize_shard_genesis(&mut self, genesis_block: &Block) {
         let shard = genesis_block.header().shard_id();
         let count = self.vnodes_len(shard);
+        let now = self.shard_loop_mut(shard).now;
         for vnode_idx in 0..count {
             let actions = self
                 .vnode_state_mut(shard, vnode_idx)
-                .initialize_genesis(genesis_block);
+                .initialize_genesis(now, genesis_block);
             self.shard_loop_mut(shard).drain_actions(vnode_idx, actions);
         }
     }

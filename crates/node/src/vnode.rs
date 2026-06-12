@@ -16,7 +16,6 @@
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
@@ -62,9 +61,6 @@ pub struct SeatVnodeGroup<'a> {
     /// Host beacon storage; the group's coordinators resume from its
     /// committed tip.
     pub beacon_storage: &'a dyn BeaconStorage,
-    /// Host-wide shared proposal pool (beacon is process-wide
-    /// consensus).
-    pub proposal_pool: Arc<BeaconProposalPool>,
     /// Radix network identity bound into beacon signatures.
     pub beacon_network: NetworkDefinition,
     /// Genesis config hash bound into beacon signatures alongside the
@@ -145,7 +141,6 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 args.recovered.committee_anchor_ts(),
                 args.beacon_network.clone(),
                 args.beacon_config_hash,
-                Arc::clone(&args.proposal_pool),
             );
             let state = NodeStateMachine::new(
                 validator,

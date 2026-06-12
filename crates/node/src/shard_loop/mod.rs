@@ -44,7 +44,7 @@ use crate::batch_accumulator::BatchAccumulator;
 pub use crate::event::{
     EventPriority, FetchFailureKind, ProcessScopedInput, ShardEvent, ShardScopedInput,
 };
-use crate::process_io::ProcessIo;
+use crate::process_io::{BeaconProposalCache, ProcessIo};
 use crate::shard_io::ShardIo;
 use crate::shard_io::block_commit::PreparedCommitMap;
 use crate::shard_io::fetch::FetchInput;
@@ -78,6 +78,11 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: RadixExecutor,
     pub(crate) network: Arc<N>,
     pub(crate) execution_cache: Arc<ProcessExecutionCache>,
+    /// Process-level serve cache for beacon proposals — fed by the
+    /// `BuildAndBroadcastBeaconProposal` handler and the wire
+    /// notification handler, read by the `GetBeaconProposalRequest`
+    /// responder. No coordinator touches it.
+    pub(crate) beacon_proposal_cache: Arc<BeaconProposalCache>,
     pub(crate) per_shard: ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>,
 }
 
@@ -512,8 +517,12 @@ where
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),
         ));
+        let now = self.now;
         for vnode_idx in 0..self.vnodes.len() {
-            let actions = self.vnode_mut(vnode_idx).state.initialize_genesis(genesis);
+            let actions = self
+                .vnode_mut(vnode_idx)
+                .state
+                .initialize_genesis(now, genesis);
             self.drain_actions(vnode_idx, actions);
         }
         self.step(ShardScopedInput::Protocol(Box::new(

@@ -1309,6 +1309,83 @@ impl Action {
         }
     }
 
+    /// The SPC epoch this action signs (or attributably broadcasts)
+    /// beacon consensus for under the emitting validator's identity,
+    /// or `None` for everything else.
+    ///
+    /// A validator can host several vnodes at once (a split's parent
+    /// and child overlap through the drain; a relocation's old and new
+    /// shards likewise), and each runs the full beacon protocol under
+    /// the same identity — two of them emitting independently derived
+    /// SPC messages is equivocation, which the beacon fold jails. The
+    /// dispatch funnel consults this to let exactly one vnode per
+    /// validator emit for any epoch. Maintained as a total match so a
+    /// new signing action can't silently bypass the filter.
+    #[must_use]
+    pub const fn beacon_signing_epoch(&self) -> Option<Epoch> {
+        match self {
+            Self::SignAndBroadcastPcVote1 { epoch, .. }
+            | Self::SignAndBroadcastPcVote2 { epoch, .. }
+            | Self::SignAndBroadcastPcVote3 { epoch, .. }
+            | Self::SignAndBroadcastEmptyView { epoch, .. }
+            | Self::BroadcastSpcNewView { epoch, .. }
+            | Self::BroadcastSpcNewCommit { epoch, .. }
+            | Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some(*epoch),
+            Self::BroadcastSkipRequest { epoch_to_skip, .. } => Some(*epoch_to_skip),
+            Self::BroadcastBlockHeader { .. }
+            | Self::SignAndBroadcastBlockVote { .. }
+            | Self::SignAndBroadcastTimeout { .. }
+            | Self::SignAndBroadcastReadySignal { .. }
+            | Self::SignAndSendExecutionVote { .. }
+            | Self::BroadcastExecutionCertificate { .. }
+            | Self::FetchAndBroadcastProvisions { .. }
+            | Self::BroadcastCertifiedBlockHeader { .. }
+            | Self::SetTimer { .. }
+            | Self::CancelTimer { .. }
+            | Self::Continuation(_)
+            | Self::VerifyAndBuildQuorumCertificate { .. }
+            | Self::VerifyProvisions { .. }
+            | Self::AggregateExecutionCertificate { .. }
+            | Self::VerifyAndAggregateExecutionVotes { .. }
+            | Self::VerifyExecutionCertificateSignature { .. }
+            | Self::VerifyFinalizedWave { .. }
+            | Self::VerifyQcSignature { .. }
+            | Self::VerifyTimeout { .. }
+            | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyStateRoot { .. }
+            | Self::VerifyBeaconWitnessRoot { .. }
+            | Self::VerifyTransactionRoot { .. }
+            | Self::VerifyProvisionRoot { .. }
+            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyProvisionTxRoots { .. }
+            | Self::BuildProposal { .. }
+            | Self::ExecuteTransactions { .. }
+            | Self::ExecuteCrossShardTransactions { .. }
+            | Self::CommitBlock { .. }
+            | Self::CommitBlockByQcOnly { .. }
+            | Self::EmitTransactionStatus { .. }
+            | Self::RecordTxEcCreated { .. }
+            | Self::TopologyChanged { .. }
+            | Self::ReconfigureParticipation(_)
+            | Self::StartBlockSync { .. }
+            | Self::StartBeaconBlockSync { .. }
+            | Self::StartRemoteHeaderSync { .. }
+            | Self::RestoreCommittedState { .. }
+            | Self::Fetch(_)
+            | Self::AbandonFetch(_)
+            | Self::BroadcastBeaconBlock { .. }
+            | Self::VerifyBeaconBlock { .. }
+            | Self::VerifySkipRequest { .. }
+            | Self::VerifyPcVote1 { .. }
+            | Self::VerifyPcVote2 { .. }
+            | Self::VerifyPcVote3 { .. }
+            | Self::VerifySpcNewView { .. }
+            | Self::VerifySpcNewCommit { .. }
+            | Self::VerifySpcEmptyView { .. }
+            | Self::CommitBeaconBlock { .. } => None,
+        }
+    }
+
     /// Which coordinator crate owns this action's delegated work.
     #[must_use]
     pub const fn owner(&self) -> ActionOwner {

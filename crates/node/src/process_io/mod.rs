@@ -9,22 +9,23 @@
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
 mod beacon_commit;
+mod beacon_proposal_cache;
 mod canonical_txs;
 mod network_handlers;
 mod tx_status;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 pub(crate) use beacon_commit::BeaconCommitCoordinator;
+pub(crate) use beacon_proposal_cache::BeaconProposalCache;
 pub(crate) use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
-use hyperscale_types::{RoutableTransaction, ShardId};
+use hyperscale_types::{Epoch, RoutableTransaction, ShardId, ValidatorId};
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
@@ -37,6 +38,48 @@ use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
 pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<ShardEvent>>>>;
+
+/// Beacon-signing seat for one hosted validator: which shard's vnode
+/// currently signs beacon consensus under the validator's identity,
+/// and the highest SPC epoch any holder has signed for — the fence a
+/// successor must clear before claiming a vacated seat.
+struct BeaconSignerSeat {
+    /// Shard loop whose vnode holds the seat; `None` once the holder's
+    /// teardown released it.
+    shard: Option<ShardId>,
+    /// Highest SPC epoch a holder was allowed to sign for. Recorded at
+    /// the dispatch funnel before the signature exists, so the fence is
+    /// conservative even when the dispatched action never sends.
+    max_signed_epoch: Epoch,
+}
+
+impl BeaconSignerSeat {
+    const fn vacant() -> Self {
+        Self {
+            shard: None,
+            max_signed_epoch: Epoch::GENESIS,
+        }
+    }
+
+    /// Whether `my_shard`'s vnode may sign for `epoch` under this seat:
+    /// the holder records the epoch and passes; a vacant seat is
+    /// claimed when `epoch` clears the fence (the teardown handoff);
+    /// anything else is denied.
+    fn allow(&mut self, my_shard: ShardId, epoch: Epoch) -> bool {
+        match self.shard {
+            Some(shard) if shard == my_shard => {
+                self.max_signed_epoch = self.max_signed_epoch.max(epoch);
+                true
+            }
+            None if epoch > self.max_signed_epoch => {
+                self.shard = Some(my_shard);
+                self.max_signed_epoch = epoch;
+                true
+            }
+            Some(_) | None => false,
+        }
+    }
+}
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -98,13 +141,6 @@ where
     /// bottoming out as idempotent no-ops.
     pub(crate) beacon_commit: BeaconCommitCoordinator,
 
-    /// Host-shared per-epoch `BeaconProposal` pool. Same `Arc` lives
-    /// on every co-hosted vnode's `BeaconCoordinator` and on the
-    /// inbound `GetBeaconProposalRequest` network handler closure;
-    /// writes (admit / reset) come only from the shard pinned thread,
-    /// reads from the network worker are wait-free.
-    pub(crate) beacon_proposal_pool: Arc<BeaconProposalPool>,
-
     /// Process-wide latest-status-per-transaction view. Every shard
     /// thread writes through its monotonic merge; RPC threads read
     /// lock-free.
@@ -116,6 +152,17 @@ where
     /// signature/SBOR validation. `Arc` so the gossip handler closure
     /// can hold it without capturing the whole `ProcessIo`.
     pub(crate) canonical_txs: Arc<CanonicalTxs>,
+
+    /// One beacon-signing seat per hosted validator. A validator's
+    /// vnodes overlap across a split flip or a relocation drain, and
+    /// every vnode runs the full beacon protocol under the same
+    /// identity — two of them emitting independently derived SPC
+    /// messages is equivocation, which the beacon fold jails
+    /// permanently. `ShardLoop::dispatch_delegated_action` drops any
+    /// beacon signing action [`Self::allow_beacon_signing`] denies, so
+    /// exactly one vnode per validator signs while the rest track
+    /// passively.
+    beacon_signers: Mutex<HashMap<ValidatorId, BeaconSignerSeat>>,
 }
 
 impl<S, N, D> ProcessIo<S, N, D>
@@ -135,7 +182,6 @@ where
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         tx_validator: Arc<TransactionValidation>,
         beacon_storage: Arc<dyn BeaconStorage>,
-        beacon_proposal_pool: Arc<BeaconProposalPool>,
     ) -> Self {
         Self {
             network,
@@ -146,22 +192,77 @@ where
             tx_validator,
             beacon_storage,
             beacon_commit: BeaconCommitCoordinator::new(),
-            beacon_proposal_pool,
             tx_status: Arc::new(TxStatusCache::new()),
             canonical_txs: Arc::new(CanonicalTxs::new()),
+            beacon_signers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Seat `validator`'s beacon signing on `shard`'s vnode. First
+    /// assign wins: a vnode seated while the validator already holds a
+    /// seat (live or released) is born passive. Claiming a released
+    /// seat happens at the dispatch funnel under the epoch fence, so a
+    /// flip or relocation overlap can never produce two signers for
+    /// one epoch.
+    ///
+    /// # Panics
+    /// Panics if the seat registry mutex is poisoned.
+    pub fn assign_beacon_signer(&self, validator: ValidatorId, shard: ShardId) {
+        self.beacon_signers
+            .lock()
+            .expect("beacon signer registry lock")
+            .entry(validator)
+            .or_insert(BeaconSignerSeat {
+                shard: Some(shard),
+                max_signed_epoch: Epoch::GENESIS,
+            });
+    }
+
+    /// Release `validator`'s beacon-signing seat at `shard`'s teardown.
+    /// The epoch fence stays behind: a surviving vnode claims the
+    /// vacant seat on its next emission for an epoch strictly above
+    /// anything the dead vnode was allowed to sign.
+    ///
+    /// # Panics
+    /// Panics if the seat registry mutex is poisoned.
+    pub fn release_beacon_signer(&self, validator: ValidatorId, shard: ShardId) {
+        if let Some(seat) = self
+            .beacon_signers
+            .lock()
+            .expect("beacon signer registry lock")
+            .get_mut(&validator)
+            && seat.shard == Some(shard)
+        {
+            seat.shard = None;
+        }
+    }
+
+    /// Whether `my_shard`'s vnode may emit a beacon signing action for
+    /// `epoch` under `validator`'s identity — one lock for
+    /// check-and-record, per [`BeaconSignerSeat::allow`]. A validator
+    /// with no seat on record claims one, so single-vnode hosts behave
+    /// identically with or without driver wiring.
+    ///
+    /// # Panics
+    /// Panics if the seat registry mutex is poisoned.
+    pub fn allow_beacon_signing(
+        &self,
+        validator: ValidatorId,
+        my_shard: ShardId,
+        epoch: Epoch,
+    ) -> bool {
+        self.beacon_signers
+            .lock()
+            .expect("beacon signer registry lock")
+            .entry(validator)
+            .or_insert(BeaconSignerSeat::vacant())
+            .allow(my_shard, epoch)
     }
 
     /// Process-level beacon chain storage handle.
     #[must_use]
     pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
         &self.beacon_storage
-    }
-
-    /// Host-shared per-epoch beacon proposal pool.
-    #[must_use]
-    pub const fn beacon_proposal_pool(&self) -> &Arc<BeaconProposalPool> {
-        &self.beacon_proposal_pool
     }
 
     /// Process-wide transaction status cache, shared with external RPC

@@ -27,7 +27,6 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ObserveDelta, ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
@@ -471,16 +470,6 @@ impl ProductionRunnerBuilder {
             self.beacon_storage
                 .commit_beacon_block(&beacon_genesis_block, &beacon_genesis_state);
         }
-        // One `Arc<BeaconProposalPool>` per host (beacon is process-
-        // wide consensus), shared across every co-hosted vnode's
-        // coordinator and the inbound `GetBeaconProposalRequest`
-        // handler.
-        let beacon_proposal_pool = Arc::new(BeaconProposalPool::new(
-            self.beacon_storage
-                .latest_committed_epoch()
-                .expect("beacon chain is non-empty after the genesis commit above")
-                .next(),
-        ));
 
         let mut vnodes_by_shard: BTreeMap<ShardId, Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>> =
             BTreeMap::new();
@@ -495,7 +484,6 @@ impl ProductionRunnerBuilder {
             .flat_map(|(shard, vnodes)| {
                 seat_vnode_group(SeatVnodeGroup {
                     beacon_storage: self.beacon_storage.as_ref(),
-                    proposal_pool: Arc::clone(&beacon_proposal_pool),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
                     now: wall_clock_local(),
@@ -560,7 +548,7 @@ impl ProductionRunnerBuilder {
             vnode_inits,
             shared_storages,
             self.beacon_storage,
-            beacon_proposal_pool,
+            beacon_network.clone(),
             executor,
             libp2p_network,
             (*dispatch).clone(),

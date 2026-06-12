@@ -508,14 +508,22 @@ where
         // Beacon-committee unicast. Fan to every hosted shard's
         // vnodes; each vnode's coordinator decides admission. Wire
         // decode lands the wrapper as `Unverified`; local-dispatched
-        // sends preserve the `Verified` marker.
+        // sends preserve the `Verified` marker. The process-level
+        // serve cache takes a copy (VRF-verified here when the wire
+        // dropped the marker) so `GetBeaconProposalRequest` is
+        // answered without reading any coordinator's pool.
         let senders = self.process.shard_event_senders.clone();
+        let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
+        let topology = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
                 move |gossip: BeaconProposalNotification| {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
+                    if let Some(sender_pk) = topology.load().public_key(from) {
+                        proposal_cache.admit_wire(from, epoch, &gossip.proposal, sender_pk);
+                    }
                     let event = match Arc::unwrap_or_clone(gossip.proposal).into_verified() {
                         Ok(verified) => ProtocolEvent::VerifiedBeaconProposalReceived {
                             from,
@@ -708,7 +716,6 @@ pub fn register_shard_request_handlers<S, N, D>(
         GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
-    use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
     use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
     use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
     use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
@@ -1004,12 +1011,12 @@ pub fn register_shard_request_handlers<S, N, D>(
             serve_shard_witnesses_request(&pending_chain, &req)
         });
 
-    // ── beacon.proposal.request → host-shared pool lookup ──────
-    let beacon_proposal_pool = Arc::clone(&process.beacon_proposal_pool);
+    // ── beacon.proposal.request → process-level serve cache ──────
+    let proposal_cache = Arc::clone(&process.dispatch_handles.beacon_proposal_cache);
     process
         .network
         .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
-            serve_beacon_proposal_request(&beacon_proposal_pool, &req)
+            proposal_cache.serve(&req)
         });
 
     // ── beacon.block.request → committed beacon block by epoch ──

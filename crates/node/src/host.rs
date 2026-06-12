@@ -15,17 +15,18 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
-use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId, TransactionStatus, TxHash};
+use hyperscale_types::{
+    BlockHeight, LocalTimestamp, NetworkDefinition, ShardId, TransactionStatus, TxHash,
+};
 
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::process_io::{ProcessIo, register_shard_request_handlers};
+use crate::process_io::{BeaconProposalCache, ProcessIo, register_shard_request_handlers};
 use crate::shard_io::ShardIo;
 use crate::shard_io::block_commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard_io::caches::SharedCaches;
@@ -111,7 +112,7 @@ where
         vnodes: Vec<VnodeInit>,
         mut storages: HashMap<ShardId, S>,
         beacon_storage: Arc<dyn BeaconStorage>,
-        beacon_proposal_pool: Arc<BeaconProposalPool>,
+        beacon_network: NetworkDefinition,
         executor: RadixExecutor,
         network: N,
         dispatch: D,
@@ -160,6 +161,7 @@ where
             executor,
             network: Arc::clone(&network),
             execution_cache,
+            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(beacon_network)),
             per_shard: ArcSwap::from_pointee(per_shard_dispatch),
         });
         assert_eq!(
@@ -181,7 +183,6 @@ where
             dispatch_handles,
             tx_validator,
             beacon_storage,
-            beacon_proposal_pool,
         ));
 
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.

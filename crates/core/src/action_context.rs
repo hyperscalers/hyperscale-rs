@@ -12,8 +12,8 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, PreparedCommit, ShardId,
-    TopologySnapshot, ValidatorId,
+    BeaconProposal, BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, Epoch,
+    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified,
 };
 
 use crate::ProtocolEvent;
@@ -59,6 +59,12 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
     pub commit_prepared: &'a (dyn Fn(PreparedBlock) + Send + Sync),
+    /// Hand the locally signed `BeaconProposal` to the process-level
+    /// cache that serves inbound `GetBeaconProposalRequest`s. Only
+    /// `BuildAndBroadcastBeaconProposal` produces these; the cache is
+    /// driver-owned, so coordinators never read or reset it.
+    pub cache_beacon_proposal:
+        &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
     /// Parallelism strategy for in-handler batch fan-out. Sourced from
     /// the dispatch backend at spawn time so handlers running on
     /// `PooledDispatch` use rayon `par_iter` (work-stealing across the

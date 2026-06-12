@@ -241,7 +241,17 @@ impl NodeStateMachine {
     /// coordinator's `on_startup`, the latter scheduling the first
     /// `BeaconCommitteeStart` timer so the chain bootstraps from a
     /// fresh runner.
-    pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
+    ///
+    /// `now` seeds the coordinators' clocks before any timer duration
+    /// is computed — this runs outside [`StateMachine::handle`], and a
+    /// split child seats mid-network-life, where a frozen `ZERO` clock
+    /// would turn the next epoch boundary's absolute offset into a
+    /// relative delay and arm the first `BeaconCommitteeStart` an
+    /// entire chain lifetime late.
+    pub fn initialize_genesis(&mut self, now: LocalTimestamp, genesis: &Block) -> Vec<Action> {
+        self.now = now;
+        self.shard_coordinator.set_time(now);
+        self.beacon_coordinator.set_now(now);
         let mut actions = self.shard_coordinator.initialize_genesis(genesis);
         actions.extend(self.beacon_coordinator.on_startup());
         actions

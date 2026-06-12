@@ -11,7 +11,6 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
@@ -329,16 +328,9 @@ impl SimulationRunner {
             if beacon_storage.latest_committed_epoch().is_none() {
                 beacon_storage.commit_beacon_block(&beacon_genesis_block, &beacon_genesis_state);
             }
-            let (beacon_latest_block, beacon_latest_state) = beacon_storage
+            let (beacon_latest_block, _) = beacon_storage
                 .latest_committed()
                 .expect("beacon chain is non-empty after the genesis commit above");
-
-            // One `Arc<BeaconProposalPool>` per host, shared across every
-            // co-hosted vnode's coordinator and the inbound
-            // `GetBeaconProposalRequest` handler.
-            let beacon_proposal_pool = Arc::new(BeaconProposalPool::new(
-                beacon_latest_state.current_epoch.next(),
-            ));
 
             // Load the full committed history: sim vnodes start with fresh
             // shard chains (`RecoveredState::default()` anchors at genesis),
@@ -368,7 +360,6 @@ impl SimulationRunner {
                         WeightedTimestamp::ZERO,
                         beacon_network.clone(),
                         beacon_config_hash,
-                        Arc::clone(&beacon_proposal_pool),
                     );
 
                     let state = NodeStateMachine::new(
@@ -410,7 +401,7 @@ impl SimulationRunner {
                 vnode_inits,
                 storages,
                 beacon_storage,
-                Arc::clone(&beacon_proposal_pool),
+                beacon_network.clone(),
                 executor,
                 network.create_adapter(
                     NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
@@ -421,6 +412,17 @@ impl SimulationRunner {
                 NodeConfig::default(),
                 tx_validator,
             );
+
+            // Seat each genesis vnode's beacon-signing registry entry —
+            // the same wiring the production supervisor runs at spawn.
+            // At genesis every validator hosts one vnode, so each claim
+            // is the first and wins.
+            for (shard, validator_idxs) in &by_shard {
+                for &validator_idx in validator_idxs {
+                    host.process()
+                        .assign_beacon_signer(ValidatorId::new(u64::from(validator_idx)), *shard);
+                }
+            }
 
             hosts.push(host);
             event_rxs.push(event_rx);

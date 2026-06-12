@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
     BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
@@ -212,7 +211,6 @@ impl CoordinatorSim {
         let config_hash = genesis_config_hash(&config, &network);
         let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
 
-        let next_epoch = initial_state.current_epoch.next();
         let coordinators: Vec<BeaconCoordinator> = (0..n)
             .map(|i| {
                 BeaconCoordinator::new(
@@ -223,7 +221,6 @@ impl CoordinatorSim {
                     WeightedTimestamp::ZERO,
                     network.clone(),
                     config_hash,
-                    Arc::new(BeaconProposalPool::new(next_epoch)),
                 )
             })
             .collect();

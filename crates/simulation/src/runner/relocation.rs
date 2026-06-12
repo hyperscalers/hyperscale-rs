@@ -132,6 +132,15 @@ impl SimulationRunner {
         let shard_loop = self.hosts[node as usize]
             .remove_shard(shard)
             .expect("leave of an unhosted shard");
+        // The loop is detached and never steps again — release its
+        // vnodes' beacon-signing seats so each validator's surviving
+        // vnode can claim signing at the funnel's epoch fence,
+        // mirroring the production supervisor's teardown.
+        for vnode in &shard_loop.vnodes {
+            self.hosts[node as usize]
+                .process()
+                .release_beacon_signer(vnode.validator_id, shard);
+        }
         (*shard_loop.io.storage).clone()
     }
 
@@ -198,7 +207,9 @@ impl SimulationRunner {
 
     /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —
     /// the same construction the production supervisor runs at seat
-    /// time.
+    /// time. Seats the beacon-signing registry first-wins, so a flip
+    /// child or relocation joiner whose validator already signs
+    /// elsewhere on the host is born passive.
     pub(super) fn runtime_vnode_init(
         &self,
         node: NodeIndex,
@@ -207,13 +218,13 @@ impl SimulationRunner {
         recovered: &RecoveredState,
     ) -> VnodeInit {
         let host = &self.hosts[node as usize];
+        host.process().assign_beacon_signer(validator, shard);
         let now = LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(0));
         let signing_key = Arc::clone(
             &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
         );
         seat_vnode_group(SeatVnodeGroup {
             beacon_storage: host.beacon_storage().as_ref(),
-            proposal_pool: Arc::clone(host.process().beacon_proposal_pool()),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
             now,

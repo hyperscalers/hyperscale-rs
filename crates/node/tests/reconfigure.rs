@@ -12,7 +12,6 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::unbounded;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
@@ -47,7 +46,6 @@ struct Fixture {
     genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
-    proposal_pool: Arc<BeaconProposalPool>,
     topology: Arc<TopologySnapshot>,
 }
 
@@ -109,14 +107,11 @@ fn fixture() -> Fixture {
             .into_iter()
             .collect::<HashMap<ShardId, Vec<ValidatorId>>>(),
     ));
-    let proposal_pool = Arc::new(BeaconProposalPool::new(genesis_state.current_epoch.next()));
-
     Fixture {
         committee,
         genesis_block,
         genesis_state,
         config_hash,
-        proposal_pool,
         topology,
     }
 }
@@ -133,7 +128,6 @@ impl Fixture {
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             self.config_hash,
-            Arc::clone(&self.proposal_pool),
         );
         let state = NodeStateMachine::new(
             me,
@@ -175,7 +169,7 @@ fn add_and_remove_shard_at_runtime() {
         vec![fix.vnode_init(0, SHARD_A)],
         std::iter::once((SHARD_A, SimShardStorage::new(shard_prefix_path(SHARD_A)))).collect(),
         Arc::clone(&beacon_storage),
-        Arc::clone(&fix.proposal_pool),
+        NetworkDefinition::simulator(),
         RadixExecutor::new(NetworkDefinition::simulator()),
         network,
         SyncDispatch,
@@ -274,7 +268,7 @@ fn remove_unknown_shard_is_none() {
         vec![fix.vnode_init(0, SHARD_A)],
         std::iter::once((SHARD_A, SimShardStorage::new(shard_prefix_path(SHARD_A)))).collect(),
         beacon_storage,
-        Arc::clone(&fix.proposal_pool),
+        NetworkDefinition::simulator(),
         RadixExecutor::new(NetworkDefinition::simulator()),
         network,
         SyncDispatch,

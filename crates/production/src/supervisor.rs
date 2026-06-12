@@ -368,6 +368,9 @@ impl ShardSupervisor {
             .iter()
             .map(|v| v.validator_id.inner())
             .collect();
+        for vnode in &shard_loop.vnodes {
+            self.process.assign_beacon_signer(vnode.validator_id, shard);
+        }
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
         self.shards.insert(
@@ -974,6 +977,12 @@ impl ShardSupervisor {
     ) {
         let inits = self.build_vnode_inits(shard, vnodes, recovered);
         let vnode_count = inits.len();
+        // Seat the beacon-signing registry before the loop can emit:
+        // first assign wins, so a flip child or relocation joiner whose
+        // validator already signs elsewhere is born passive.
+        for cfg in vnodes {
+            self.process.assign_beacon_signer(cfg.validator_id, shard);
+        }
 
         let (timer_tx, timer_rx) = unbounded();
         let (callback_tx, callback_rx) = unbounded();
@@ -1080,6 +1089,13 @@ impl ShardSupervisor {
         self.storages.lock().expect("storages lock").remove(&shard);
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
+        // The thread is joined — the dead vnodes can never emit again.
+        // Releasing their seats lets each validator's surviving vnode
+        // claim beacon signing at the funnel's epoch fence.
+        for id in validator_ids {
+            self.process
+                .release_beacon_signer(ValidatorId::new(*id), shard);
+        }
         info!(shard = ?shard, "Shard left and torn down");
         if let Some(vnodes) = self.pending_joins.remove(&shard) {
             self.join(shard, &vnodes);
@@ -1156,7 +1172,6 @@ impl ShardSupervisor {
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
             beacon_storage: self.process.beacon_storage().as_ref(),
-            proposal_pool: Arc::clone(self.process.beacon_proposal_pool()),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
             now: wall_clock_local(),
