@@ -16,9 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::tree::import_leaf_updates;
-use hyperscale_storage::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf};
-use hyperscale_types::{BlockHeight, Hash, StateRoot};
+use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
+use hyperscale_storage::{
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, JmtSnapshot, ResolveLeaf, filter_updates_to_prefix,
+    merge_owned_nodes, merge_updates_from_receipts,
+};
+use hyperscale_types::{BlockHeight, Hash, StateRoot, StoredReceipt};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{DB, Options, WriteBatch};
 use tracing::warn;
@@ -281,6 +284,60 @@ impl BoundaryStore for RocksDbShardStorage {
             .write(batch)
             .map_err(|e| format!("snap-sync import write: {e}"))?;
         Ok(imported_root)
+    }
+
+    fn follow_block_writes(
+        &self,
+        height: BlockHeight,
+        receipts: &[StoredReceipt],
+    ) -> Result<StateRoot, String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
+        if height.inner() <= base_version {
+            return Err(format!(
+                "follow at height {height} does not advance the store's version {base_version}",
+            ));
+        }
+
+        let owner_map = merge_owned_nodes(receipts);
+        let merged = merge_updates_from_receipts(receipts);
+        let filtered = filter_updates_to_prefix(&merged, &owner_map, &self.root_path);
+        if filtered.node_updates.is_empty() {
+            return Ok(base_root);
+        }
+
+        let (mut batch, reset_old_keys) = self.build_substate_write_batch(
+            &filtered,
+            height.inner(),
+            /* write_history */ true,
+            /* base_reads */ None,
+        );
+        let parent_version =
+            jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
+        let (new_root, collected) = put_at_version(
+            &snapshot_store,
+            parent_version,
+            height.inner(),
+            &[&filtered],
+            &reset_old_keys,
+            &owner_map,
+        );
+        let jmt_snapshot = JmtSnapshot::from_collected_writes(
+            collected,
+            base_root,
+            BlockHeight::new(base_version),
+            new_root,
+            height,
+        );
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, height.inner());
+        self.db
+            .write(batch)
+            .map_err(|e| format!("follow write failed: {e}"))?;
+        Ok(new_root)
     }
 }
 

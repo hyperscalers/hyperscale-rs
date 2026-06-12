@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use hyperscale_jmt::Key;
 use hyperscale_storage::shard::keys;
+use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot,
-    StoredReceipt, TxHash, WaveCertificate, WaveId,
+    ExecutionMetadata, NodeId, QuorumCertificate, RoutableTransaction, ShardWitnessPayload,
+    StateRoot, StoredReceipt, TxHash, WaveCertificate, WaveId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -111,6 +112,61 @@ impl SharedState {
         self.current_block_height = snapshot.new_height;
         self.current_root_hash = snapshot.result_root;
     }
+}
+
+/// Apply `updates` at `height` over the shared state — substate values
+/// (with history), the JMT (owner-routed via `owner_map`), leaf
+/// associations, the substate count, and the tip version/root — and
+/// return the resulting root. The state-level half of a block commit,
+/// shared by the chain writer's sync path and a split observer's
+/// follow path.
+pub fn apply_state_writes(
+    s: &mut SharedState,
+    updates: &DatabaseUpdates,
+    owner_map: &HashMap<NodeId, NodeId>,
+    height: BlockHeight,
+) -> StateRoot {
+    apply_updates(s, updates, height.inner(), /* write_history */ true);
+
+    let parent_version =
+        jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
+    let (new_root, collected) = put_at_version(
+        &s.tree_store,
+        parent_version,
+        height.inner(),
+        &[updates],
+        &HashMap::new(),
+        owner_map,
+    );
+
+    for (key, node) in &collected.nodes {
+        s.tree_store.insert(key.clone(), Arc::clone(node));
+    }
+    // Stale JMT nodes are intentionally NOT deleted here: historical
+    // roots must be retained for provision proof generation at past
+    // block heights. RocksDB GC handles pruning in production. See
+    // also `apply_jmt_snapshot`.
+    for a in collected.leaf_associations {
+        if let Some(storage_key) = a.storage_key {
+            s.associations.insert(a.leaf_key, storage_key);
+        }
+    }
+
+    // Substate count: prior count behind the current version plus
+    // this application's leaf delta — same rule as `apply_jmt_snapshot`.
+    let prior = s
+        .substate_counts
+        .get(&s.current_block_height.inner())
+        .copied()
+        .unwrap_or(0);
+    let count = prior
+        .checked_add_signed(collected.leaf_delta)
+        .expect("substate count must not go negative");
+    s.substate_counts.insert(height.inner(), count);
+
+    s.current_block_height = height;
+    s.current_root_hash = new_root;
+    new_root
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -73,12 +73,23 @@ pub fn jmt_leaf_key(storage_key: &[u8], owner: Option<NodeId>) -> [u8; 32] {
     let node_id = db_node_key_to_node_id(storage_key)
         .expect("jmt_leaf_key requires a db_node_key-prefixed storage key");
     let routing_node = owner.unwrap_or(node_id);
-    let node_hash = blake3_hash(&routing_node.0);
+    let node_hash = node_routing_hash(&routing_node);
     let substate_hash = blake3_hash(storage_key);
     let mut key = [0u8; 32];
-    key[..16].copy_from_slice(&node_hash.as_bytes()[..16]);
+    key[..16].copy_from_slice(&node_hash[..16]);
     key[16..].copy_from_slice(&substate_hash.as_bytes()[..16]);
     key
+}
+
+/// The owner-major routing hash whose leading bytes form a leaf key's
+/// high half — the bits a shard prefix routes and partitions on.
+///
+/// Every substate of one routing node (the entity itself, or the global
+/// owner of an internal node) shares it, so "which shard prefix does
+/// this entity's state sit under" is a test against this hash alone.
+#[must_use]
+pub fn node_routing_hash(routing_node: &NodeId) -> [u8; 32] {
+    *blake3_hash(&routing_node.0).as_bytes()
 }
 
 /// Hash a substate value to the 32-byte value hash held in its JMT leaf.

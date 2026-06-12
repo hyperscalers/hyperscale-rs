@@ -22,7 +22,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
+    ShardWitnessPayload, StateRoot, StoredReceipt, TxHash, Verifiable, Verified, WaveCertificate,
+    WaveId,
 };
 
 use super::core::RocksDbShardStorage;
@@ -172,6 +173,14 @@ impl BoundaryStore for SharedStorage {
         leaves: Vec<ImportLeaf>,
     ) -> Result<StateRoot, String> {
         self.0.import_boundary_state(height, leaves)
+    }
+
+    fn follow_block_writes(
+        &self,
+        height: BlockHeight,
+        receipts: &[StoredReceipt],
+    ) -> Result<StateRoot, String> {
+        self.0.follow_block_writes(height, receipts)
     }
 }
 

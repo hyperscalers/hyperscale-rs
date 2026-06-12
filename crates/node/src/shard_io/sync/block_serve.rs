@@ -109,13 +109,11 @@ pub fn serve_block_request<S: ShardStorage>(
 
     // Sync responses ship raw provision bodies into the wire-typed
     // `Block::Live.provisions`; encoding lands at `Verifiable::Unverified`
-    // on the receiver and verification proceeds from there.
+    // on the receiver and verification proceeds from there. Missing
+    // entries returned `not_found` above, so every body resolves here.
     let provisions: Vec<Arc<Verifiable<Provisions>>> = resolved
         .into_iter()
-        .map(|(_, p)| {
-            let raw = p.expect("missing entries handled above");
-            Arc::new((*raw).clone().into())
-        })
+        .filter_map(|(_, p)| p.map(|raw| Arc::new((*raw).clone().into())))
         .collect();
 
     GetBlockResponse::found(ElidedCertifiedBlock::elide(

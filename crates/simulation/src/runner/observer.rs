@@ -12,12 +12,14 @@
 
 use hyperscale_network::Network;
 use hyperscale_node::bootstrap::BootstrapRequest;
-use hyperscale_node::bootstrap::observer::{ObserverBootstrap, observer_ready_signal};
-use hyperscale_node::serve_state_range_request;
+use hyperscale_node::bootstrap::observer::{
+    ObserverBootstrap, ObserverTail, TailOutcome, observer_ready_signal,
+};
+use hyperscale_node::{serve_block_request, serve_state_range_request};
 use hyperscale_storage::BoundaryStore;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
-use hyperscale_types::{ShardId, StateRoot, ValidatorId, shard_prefix_path};
+use hyperscale_types::{ShardAnchor, ShardId, StateRoot, ValidatorId, shard_prefix_path};
 
 use super::SimulationRunner;
 use super::relocation::MAX_BOOTSTRAP_ROUNDS;
@@ -27,8 +29,10 @@ impl SimulationRunner {
     /// of splitting shard `via`: bootstrap the child's span from
     /// `via`'s committee hosts into a fresh child-rooted store, then
     /// broadcast the self-signed ready signal to that committee.
-    /// Returns the synced store and its imported root — the splitting
-    /// shard's subtree node at the child's prefix as of the anchor.
+    /// Returns the synced store, its imported root — the splitting
+    /// shard's subtree node at the child's prefix as of the anchor —
+    /// and the anchor the sync verified against, which the follow
+    /// resumes from.
     ///
     /// # Panics
     ///
@@ -39,7 +43,7 @@ impl SimulationRunner {
         validator: ValidatorId,
         via: ShardId,
         child: ShardId,
-    ) -> (SimShardStorage, StateRoot) {
+    ) -> (SimShardStorage, StateRoot, ShardAnchor) {
         let serving: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| self.hosts[i].hosted_shards().any(|s| s == via))
             .collect();
@@ -102,6 +106,65 @@ impl SimulationRunner {
             .network()
             .notify(&recipients, &ReadySignalNotification::new(signal));
 
-        (storage, root)
+        (storage, root, anchor)
+    }
+
+    /// Run an observer's stay-current duty: follow `via`'s committed
+    /// chain above the `anchor` the store synced at, applying each
+    /// block's child-prefix writes, until the serving hosts run out of
+    /// blocks (the parent terminated, or its tip is reached). Returns
+    /// the followed root — the splitting shard's subtree node at the
+    /// child's prefix as of the last followed block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `via` has no serving host, or when a served block
+    /// fails the follower's chain or self checks — protocol regressions
+    /// the calling test should surface loudly.
+    pub fn follow_child(
+        &mut self,
+        storage: &SimShardStorage,
+        via: ShardId,
+        child: ShardId,
+        anchor: ShardAnchor,
+        imported_root: StateRoot,
+    ) -> StateRoot {
+        let serving: Vec<usize> = (0..self.hosts.len())
+            .filter(|&i| self.hosts[i].hosted_shards().any(|s| s == via))
+            .collect();
+        assert!(
+            !serving.is_empty(),
+            "no serving host for shard {via:?} — observer duty needs a live committee",
+        );
+        let mut tail = ObserverTail::new(anchor, child, imported_root);
+        let mut peer = 0usize;
+        for _ in 0..MAX_BOOTSTRAP_ROUNDS {
+            if let Some((height, receipts)) = tail.take_apply() {
+                let root = storage
+                    .follow_block_writes(height, &receipts)
+                    .expect("follow application onto the synced child store");
+                tail.on_applied(root)
+                    .expect("followed root matches the carried split child roots");
+                continue;
+            }
+            let Some(request) = tail.next_request() else {
+                unreachable!("tail with no pending application always wants a fetch");
+            };
+            let io = self.hosts[serving[peer % serving.len()]].shard_io(via);
+            peer += 1;
+            let response =
+                serve_block_request(&io.pending_chain, &io.caches.provision_store, &request);
+            match tail.on_response(&response) {
+                TailOutcome::Accepted => {}
+                // The serving hosts hold no block at the next height:
+                // the parent chain stopped (or its tip is reached) and
+                // the follow is current.
+                TailOutcome::NotYetAvailable => return tail.root(),
+                TailOutcome::Rejected(reason) => {
+                    panic!("follow of {via:?} for {child:?} rejected a served block: {reason}")
+                }
+            }
+        }
+        panic!("follow of {via:?} for {child:?} did not reach the parent's tip");
     }
 }

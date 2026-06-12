@@ -21,10 +21,12 @@
 //! never appears — the pending child's accumulator starts empty).
 
 use hyperscale_storage::ImportLeaf;
-use hyperscale_types::network::response::GetStateRangeResponse;
+use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, MAX_READY_WINDOW_BLOCKS, NetworkDefinition, ReadySignal,
-    ShardAnchor, ShardId, StateRoot, ValidatorId, ready_signal_message, shard_prefix_path,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, MAX_READY_WINDOW_BLOCKS, NetworkDefinition,
+    ReadySignal, ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId, ready_signal_message,
+    shard_prefix_path,
 };
 
 use super::snap_sync::SnapSync;
@@ -214,6 +216,190 @@ impl ObserverBootstrap {
     #[must_use]
     pub const fn imported_substate_count(&self) -> u64 {
         self.imported_substate_count
+    }
+}
+
+/// Outcome of feeding one block-sync response to [`ObserverTail`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum TailOutcome {
+    /// The block chains and is queued for application via
+    /// [`ObserverTail::take_apply`].
+    Accepted,
+    /// The peer doesn't hold the requested height — the parent chain
+    /// hasn't reached it yet, or the peer is behind. Re-arm and retry.
+    NotYetAvailable,
+    /// The response is invalid for this follow; the driver rotates peers.
+    Rejected(&'static str),
+}
+
+/// Sans-io tail-follower keeping an observer's synced child store
+/// current with the splitting parent's chain.
+///
+/// The child-span bootstrap imports the parent's child subtree as of an
+/// epoch anchor `A`, but the child genesis adopts the subtree of the
+/// parent's *terminal* root `B` — every parent commit between them
+/// moves the child half. The follower fetches the parent's committed
+/// blocks above `A` one at a time and hands each to the driver to apply
+/// through `BoundaryStore::follow_block_writes` (the store-prefix
+/// subset of the block's writes; partition independence keeps the
+/// store's root exactly the parent tree's child subtree node).
+///
+/// Trust: each accepted block must extend a hash chain seeded by the
+/// beacon-attested anchor's block hash, and in the parent's final epoch
+/// every header carries `split_child_roots` — the follower checks its
+/// own applied root against its side after each application. Neither
+/// authenticates a forged *extension* of the chain on its own (the
+/// driver may additionally verify the served QCs); the flip's
+/// fail-closed equality against the beacon-seeded child anchor is the
+/// end-to-end check, and a corrupted follow costs the duty, never
+/// safety.
+pub struct ObserverTail {
+    child: ShardId,
+    /// Hash-chain cursor: the last accepted block's hash, seeded by the
+    /// attested anchor's.
+    last_hash: BlockHash,
+    /// Next parent height to fetch.
+    next: BlockHeight,
+    /// The store's root after the last application (the imported root
+    /// until the first one).
+    root: StateRoot,
+    in_flight: bool,
+    /// Accepted block waiting for the driver to apply and answer.
+    pending: Option<PendingFollow>,
+}
+
+struct PendingFollow {
+    height: BlockHeight,
+    receipts: Vec<StoredReceipt>,
+    /// The block's `split_child_roots` slot for this child, when the
+    /// header carried the pair — the applied root must reproduce it.
+    expected_root: Option<StateRoot>,
+}
+
+impl ObserverTail {
+    /// Start following the parent chain above the `anchor` a completed
+    /// [`ObserverBootstrap`] imported at, from its `imported_root`.
+    #[must_use]
+    pub const fn new(anchor: ShardAnchor, child: ShardId, imported_root: StateRoot) -> Self {
+        Self {
+            child,
+            last_hash: anchor.block_hash,
+            next: anchor.height.next(),
+            root: imported_root,
+            in_flight: false,
+            pending: None,
+        }
+    }
+
+    /// The next block fetch, when none is outstanding and nothing is
+    /// waiting to be applied.
+    pub fn next_request(&mut self) -> Option<GetBlockRequest> {
+        if self.in_flight || self.pending.is_some() {
+            return None;
+        }
+        self.in_flight = true;
+        Some(GetBlockRequest::new(self.next, self.next))
+    }
+
+    /// Feed the response for the outstanding fetch.
+    pub fn on_response(&mut self, response: &GetBlockResponse) -> TailOutcome {
+        if !self.in_flight {
+            return TailOutcome::Rejected("unsolicited block response");
+        }
+        self.in_flight = false;
+        let Some(elided) = &response.certified else {
+            return TailOutcome::NotYetAvailable;
+        };
+        // The follower advertises no inventory, so every body is inline
+        // and rehydration resolves nothing; this also pins the QC to the
+        // header. The QC's signature is the driver's to verify.
+        let Ok(certified) = elided.try_rehydrate(|_| None, |_| None, |_| None) else {
+            return TailOutcome::Rejected("elided or mispaired block body");
+        };
+        let header = certified.block().header();
+        if header.height() != self.next {
+            return TailOutcome::Rejected("block height does not match the requested height");
+        }
+        if header.parent_block_hash() != self.last_hash {
+            return TailOutcome::Rejected("block does not extend the attested anchor chain");
+        }
+        let receipts: Vec<StoredReceipt> = certified
+            .block()
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts().iter().cloned())
+            .collect();
+        let expected_root = header.split_child_roots().map(|pair| {
+            if self.child.path() & 1 == 0 {
+                pair.left
+            } else {
+                pair.right
+            }
+        });
+        self.pending = Some(PendingFollow {
+            height: header.height(),
+            receipts,
+            expected_root,
+        });
+        self.last_hash = certified.block().hash();
+        self.next = self.next.next();
+        TailOutcome::Accepted
+    }
+
+    /// Re-arm after a transport-level failure.
+    pub const fn on_failure(&mut self) {
+        self.in_flight = false;
+    }
+
+    /// The accepted block's application, ready for
+    /// `BoundaryStore::follow_block_writes` on the observer's store.
+    /// `Some` once per accepted block; the driver answers with the
+    /// resulting root via [`Self::on_applied`].
+    pub fn take_apply(&mut self) -> Option<(BlockHeight, Vec<StoredReceipt>)> {
+        let pending = self.pending.as_mut()?;
+        Some((pending.height, std::mem::take(&mut pending.receipts)))
+    }
+
+    /// Record the applied root, checking it against the header's
+    /// `split_child_roots` slot when the block carried the pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the applied root contradicts the
+    /// followed header — the store has diverged from the parent's child
+    /// subtree and the duty must fail closed (the flip falls back to a
+    /// fresh snap-sync).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless an application was taken via [`Self::take_apply`].
+    pub fn on_applied(&mut self, root: StateRoot) -> Result<(), String> {
+        let pending = self
+            .pending
+            .take()
+            .expect("on_applied outside a taken application");
+        if let Some(expected) = pending.expected_root
+            && expected != root
+        {
+            return Err(format!(
+                "followed store diverged at height {}: applied root {root:?} ≠ carried {expected:?}",
+                pending.height,
+            ));
+        }
+        self.root = root;
+        Ok(())
+    }
+
+    /// The store's root after the last applied block.
+    #[must_use]
+    pub const fn root(&self) -> StateRoot {
+        self.root
+    }
+
+    /// The next parent height the follower wants.
+    #[must_use]
+    pub const fn next_height(&self) -> BlockHeight {
+        self.next
     }
 }
 

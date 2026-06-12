@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use hyperscale_jmt::NibblePath;
+use hyperscale_types::state_key::{db_node_key_to_node_id, node_routing_hash};
 use hyperscale_types::{NodeId, StoredReceipt};
 use indexmap::map::Entry;
 use radix_common::prelude::DatabaseUpdate;
@@ -38,6 +40,47 @@ pub fn merge_owned_nodes<'a>(
         .into_iter()
         .flat_map(|r| r.consensus.owned_nodes().iter().copied())
         .collect()
+}
+
+/// Restrict `updates` to the entities whose JMT leaves fall under
+/// `prefix` — the subset of a followed chain's block writes that
+/// belongs to a store rooted there.
+///
+/// Leaf keys are owner-major ([`node_routing_hash`] forms the high
+/// half), so every substate of one entity shares the prefix decision
+/// and the filter is per entity, resolved through `owner_map` exactly
+/// as the JMT build resolves it. An entity key too short to embed a
+/// `db_node_key` is dropped — nothing the engine commits is shaped that
+/// way, and a store must never bucket a key it cannot route.
+#[must_use]
+#[allow(clippy::implicit_hasher)] // call sites pass std `HashMap`s; generic hasher would require turbofishing every site
+pub fn filter_updates_to_prefix(
+    updates: &DatabaseUpdates,
+    owner_map: &HashMap<NodeId, NodeId>,
+    prefix: &NibblePath,
+) -> DatabaseUpdates {
+    DatabaseUpdates {
+        node_updates: updates
+            .node_updates
+            .iter()
+            .filter(|(entity_key, _)| {
+                db_node_key_to_node_id(entity_key).is_some_and(|node| {
+                    let routing = owner_map.get(&node).copied().unwrap_or(node);
+                    hash_under_prefix(&node_routing_hash(&routing), prefix)
+                })
+            })
+            .map(|(entity_key, node_updates)| (entity_key.clone(), node_updates.clone()))
+            .collect(),
+    }
+}
+
+/// Whether `hash`'s leading bits equal `prefix` — the subtree-membership
+/// test shard prefixes partition the keyspace by.
+fn hash_under_prefix(hash: &[u8; 32], prefix: &NibblePath) -> bool {
+    (0..prefix.len()).all(|i| {
+        let key_bit = (hash[usize::from(i / 8)] >> (7 - (i % 8))) & 1;
+        prefix.bits_at(i, 1) == key_bit
+    })
 }
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.

@@ -22,11 +22,17 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::test_utils::test_transaction;
+use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHash, PendingReshape, ReshapeThresholds, ShardId,
-    SplitChildRoots, StateRoot, ValidatorId, ValidatorStatus,
+    BeaconChainConfig, BeaconState, BlockHash, PendingReshape, ReshapeThresholds, ShardAnchor,
+    ShardId, SplitChildRoots, StateRoot, ValidatorId, ValidatorStatus, ed25519_keypair_from_seed,
+    routable_from_notarized_v1, sign_and_notarize,
 };
+use radix_common::constants::XRD;
+use radix_common::math::Decimal;
+use radix_common::network::NetworkDefinition;
+use radix_common::types::ComponentAddress;
+use radix_transactions::builder::ManifestBuilder;
 use tracing_test::traced_test;
 
 /// 2-second epochs: short enough to run the whole grow inside the
@@ -125,18 +131,18 @@ const fn epochs(n: u64) -> Duration {
 #[allow(clippy::too_many_lines)] // one grow-split lifecycle asserted end to end
 fn observers_grow_a_split_through_its_readiness_gate() {
     let mut runner = SimulationRunner::new(&grow_config(), 11);
-    runner.initialize_genesis();
-    // A handful of committed substates so the child spans the
-    // observers sync carry real state, not just empty trees.
-    for i in 0..6u8 {
-        runner.schedule_initial_event(
-            0,
-            Duration::from_millis(50 + u64::from(i)),
-            ShardEvent::process(ProcessScopedInput::SubmitTransaction {
-                tx: Arc::new(test_transaction(i)),
-            }),
-        );
-    }
+    // Two pre-funded accounts give the grow a real transfer to commit
+    // mid-flight (the engine genesis itself populates both child spans
+    // with substates).
+    let payer_key = ed25519_keypair_from_seed(&[31; 32]);
+    let payer = ComponentAddress::preallocated_account_from_public_key(&payer_key.public_key());
+    let recipient = ComponentAddress::preallocated_account_from_public_key(
+        &ed25519_keypair_from_seed(&[32; 32]).public_key(),
+    );
+    runner.initialize_genesis_with_balances(&[
+        (payer, Decimal::from(10_000)),
+        (recipient, Decimal::from(10_000)),
+    ]);
 
     // ── Admission: the standing trigger folds and draws the cohort ──
     let admitted = run_until(&mut runner, epochs(ADMISSION_BUDGET_EPOCHS), |r| {
@@ -159,16 +165,22 @@ fn observers_grow_a_split_through_its_readiness_gate() {
 
     // ── Observer duty: sync each child span, signal ready ──
     let mut synced: Vec<(ValidatorId, ShardId, StateRoot)> = Vec::new();
-    let mut synced_stores: Vec<(ValidatorId, SimShardStorage)> = Vec::new();
+    let mut synced_stores: Vec<(
+        ValidatorId,
+        ShardId,
+        SimShardStorage,
+        ShardAnchor,
+        StateRoot,
+    )> = Vec::new();
     for (validator, child) in &cohort {
-        let (store, root) = runner.observe_child(*validator, ShardId::ROOT, *child);
+        let (store, root, anchor) = runner.observe_child(*validator, ShardId::ROOT, *child);
         assert_eq!(
             store.state_root(),
             root,
             "the child-rooted store must hold exactly the imported subtree",
         );
         synced.push((*validator, *child, root));
-        synced_stores.push((*validator, store));
+        synced_stores.push((*validator, *child, store, anchor, root));
     }
     // Same child, same anchor: the two observers of each half must have
     // assembled byte-identical subtrees.
@@ -232,10 +244,25 @@ fn observers_grow_a_split_through_its_readiness_gate() {
             other => panic!("parent member {member} must land on a child; got {other:?}"),
         }
     }
-    let parent_terminal_root = runner
-        .node_storage(0)
-        .expect("host 0 carries the parent")
-        .state_root();
+    // ── Staleness pressure: a real transfer commits in the parent's
+    // final window, so the observers' anchor-time stores fall behind
+    // the terminal root their child genesis will adopt ──
+    let manifest = ManifestBuilder::new()
+        .lock_fee(payer, Decimal::from(10))
+        .withdraw_from_account(payer, XRD, Decimal::from(500))
+        .try_deposit_entire_worktop_or_abort(recipient, None)
+        .build();
+    let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 1, &payer_key)
+        .expect("transfer signs");
+    let transfer =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("transfer is routable");
+    runner.schedule_initial_event(
+        0,
+        Duration::from_millis(50),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction {
+            tx: Arc::new(transfer),
+        }),
+    );
 
     // ── Through the boundary: the parent coasts to its crossing and
     // the fold seeds both children from its terminal contribution ──
@@ -284,6 +311,10 @@ fn observers_grow_a_split_through_its_readiness_gate() {
     );
     // Subtree-root continuity, the keystone: the seeded anchors are
     // exactly the parent terminal root's two children.
+    let parent_terminal_root = runner
+        .node_storage(0)
+        .expect("host 0 carries the parent")
+        .state_root();
     let pair = SplitChildRoots {
         left: state.boundaries[&left].state_root,
         right: state.boundaries[&right].state_root,
@@ -292,6 +323,34 @@ fn observers_grow_a_split_through_its_readiness_gate() {
         pair.composes_to(parent_terminal_root),
         "the children's anchors must compose to the parent's terminal root",
     );
+
+    // ── Stay-current duty: the staleness txs moved the parent's tree
+    // past the observers' anchor, so the anchor-time stores no longer
+    // compose to the terminal root — each must follow the parent chain
+    // to its crossing before its child genesis can adopt it ──
+    let stale_pair = SplitChildRoots {
+        left: synced
+            .iter()
+            .find(|(_, c, _)| *c == left)
+            .expect("left observer")
+            .2,
+        right: synced
+            .iter()
+            .find(|(_, c, _)| *c == right)
+            .expect("right observer")
+            .2,
+    };
+    assert!(
+        !stale_pair.composes_to(parent_terminal_root),
+        "the staleness txs must have moved the tree past the observers' anchor",
+    );
+    for (_, child, store, anchor, imported_root) in &synced_stores {
+        let followed = runner.follow_child(store, ShardId::ROOT, *child, *anchor, *imported_root);
+        assert_eq!(
+            followed, state.boundaries[child].state_root,
+            "a followed store must arrive at the beacon-seeded child anchor",
+        );
+    }
 
     // ── The flip: parent halves clone-and-adopt on their own hosts;
     // each observer's synced store reopens on a host whose own vnode
@@ -312,8 +371,8 @@ fn observers_grow_a_split_through_its_readiness_gate() {
         sibling_hosts.push(node);
         let store = synced_stores
             .iter()
-            .position(|(v, _)| v == validator)
-            .map(|i| synced_stores.swap_remove(i).1)
+            .position(|(v, ..)| v == validator)
+            .map(|i| synced_stores.swap_remove(i).2)
             .expect("every observer synced a store");
         runner.flip_split_child(node, *validator, ShardId::ROOT, *child, Some(store));
     }

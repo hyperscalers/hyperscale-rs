@@ -17,7 +17,7 @@ use hyperscale_types::{
 };
 
 use super::core::SimShardStorage;
-use super::state::apply_updates;
+use super::state::{apply_state_writes, apply_updates};
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -253,54 +253,8 @@ impl SimShardStorage {
             s.current_block_height
         );
 
-        // Apply substate writes at this block height.
-        apply_updates(
-            &mut s,
-            merged_updates,
-            block_height.inner(),
-            /* write_history */ true,
-        );
-
-        let parent_version =
-            jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
-
         let owner_map = merge_owned_nodes(receipts);
-        let (new_root, collected) = put_at_version(
-            &s.tree_store,
-            parent_version,
-            block_height.inner(),
-            &[merged_updates],
-            &HashMap::new(),
-            &owner_map,
-        );
-
-        for (key, node) in &collected.nodes {
-            s.tree_store.insert(key.clone(), Arc::clone(node));
-        }
-        // Stale JMT nodes are intentionally NOT deleted here: historical
-        // roots must be retained for provision proof generation at past
-        // block heights. RocksDB GC handles pruning in production. See
-        // also `apply_jmt_snapshot`.
-        for a in collected.leaf_associations {
-            if let Some(storage_key) = a.storage_key {
-                s.associations.insert(a.leaf_key, storage_key);
-            }
-        }
-
-        // Substate count: prior count behind the current version plus
-        // this commit's leaf delta — same rule as `apply_jmt_snapshot`.
-        let prior = s
-            .substate_counts
-            .get(&s.current_block_height.inner())
-            .copied()
-            .unwrap_or(0);
-        let count = prior
-            .checked_add_signed(collected.leaf_delta)
-            .expect("substate count must not go negative");
-        s.substate_counts.insert(block_height.inner(), count);
-
-        s.current_block_height = block_height;
-        s.current_root_hash = new_root;
+        let new_root = apply_state_writes(&mut s, merged_updates, &owner_map, block_height);
 
         drop(s);
 

@@ -11,12 +11,15 @@ use std::sync::{Arc, RwLock};
 use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
-use hyperscale_storage::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf};
-use hyperscale_types::{BlockHeight, StateRoot};
+use hyperscale_storage::{
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, filter_updates_to_prefix,
+    merge_owned_nodes, merge_updates_from_receipts,
+};
+use hyperscale_types::{BlockHeight, StateRoot, StoredReceipt};
 
 use super::core::SimShardStorage;
 use super::snapshot::value_at_version;
-use super::state::SharedState;
+use super::state::{SharedState, apply_state_writes};
 
 /// A pinned boundary served from the live versioned store.
 ///
@@ -117,15 +120,43 @@ impl BoundaryStore for SimShardStorage {
         drop(state);
         Ok(root)
     }
+
+    fn follow_block_writes(
+        &self,
+        height: BlockHeight,
+        receipts: &[StoredReceipt],
+    ) -> Result<StateRoot, String> {
+        let owner_map = merge_owned_nodes(receipts);
+        let merged = merge_updates_from_receipts(receipts);
+        let mut state = write_or_recover(&self.state);
+        if height <= state.current_block_height {
+            return Err(format!(
+                "follow at height {height} does not advance the store's version {}",
+                state.current_block_height,
+            ));
+        }
+        let filtered = filter_updates_to_prefix(&merged, &owner_map, &state.tree_store.root_path());
+        if filtered.node_updates.is_empty() {
+            return Ok(state.current_root_hash);
+        }
+        let root = apply_state_writes(&mut state, &filtered, &owner_map, height);
+        drop(state);
+        Ok(root)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Tree};
-    use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::{
-        make_database_update, test_boundary_import_roundtrip,
+        db_node_key, make_database_update, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+    };
+    use hyperscale_storage::{DatabaseUpdates, SubstateStore};
+    use hyperscale_types::state_key::node_routing_hash;
+    use hyperscale_types::{
+        BoundedVec, ConsensusReceipt, GlobalReceiptHash, Hash, NodeId, ShardId, SplitChildRoots,
+        TxHash, shard_prefix_path,
     };
 
     use super::*;
@@ -207,5 +238,109 @@ mod tests {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
         test_boundary_import_roundtrip(&storage, &fresh, |seed| commit_one(&storage, seed));
+    }
+
+    /// One write to the logical node `[seed; 30]` wrapped as a synced
+    /// receipt — the shape a followed parent block's writes arrive in.
+    fn follow_receipt(seed: u8) -> (DatabaseUpdates, StoredReceipt) {
+        let updates = make_database_update(db_node_key(seed), 0, vec![seed], vec![seed; 4]);
+        let receipt = StoredReceipt::synced(
+            TxHash::from_raw(Hash::from_bytes(&[seed])),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                database_updates: updates.clone(),
+                owned_nodes: BoundedVec::new(),
+                application_events: Vec::new(),
+                beacon_witness_events: Vec::new(),
+            }),
+        );
+        (updates, receipt)
+    }
+
+    /// Which child of the root the logical node `[seed; 30]` routes to —
+    /// the first bit of its routing hash.
+    fn child_of(seed: u8) -> ShardId {
+        let (left, right) = ShardId::ROOT.children();
+        if node_routing_hash(&NodeId([seed; 30]))[0] >> 7 == 0 {
+            left
+        } else {
+            right
+        }
+    }
+
+    /// Partition independence over follows, the keystone: two child
+    /// stores each following only their half of a parent chain's writes
+    /// assemble exactly the parent tree's two child subtrees — their
+    /// roots recompose to the parent's, their counts partition its
+    /// population, and a block with no writes under a store's prefix is
+    /// a no-op that leaves its version line sparse.
+    #[test]
+    fn followed_children_partition_and_recompose_the_parent_root() {
+        let parent = SimShardStorage::default();
+        let (left, right) = ShardId::ROOT.children();
+        let left_store = SimShardStorage::new(shard_prefix_path(left));
+        let right_store = SimShardStorage::new(shard_prefix_path(right));
+
+        let mut counts = [0u64, 0];
+        for seed in 1u8..=12 {
+            let (updates, receipt) = follow_receipt(seed);
+            parent.commit_shared(&updates);
+            let height = BlockHeight::new(u64::from(seed));
+            let receipts = [receipt];
+
+            let left_before = left_store.state_root();
+            let right_before = right_store.state_root();
+            let left_after = left_store.follow_block_writes(height, &receipts).unwrap();
+            let right_after = right_store.follow_block_writes(height, &receipts).unwrap();
+
+            // Exactly the routed side's root moves; the other side's
+            // follow is a no-op.
+            if child_of(seed) == left {
+                counts[0] += 1;
+                assert_ne!(left_after, left_before);
+                assert_eq!(right_after, right_before);
+            } else {
+                counts[1] += 1;
+                assert_eq!(left_after, left_before);
+                assert_ne!(right_after, right_before);
+            }
+        }
+        assert!(
+            counts[0] > 0 && counts[1] > 0,
+            "fixture seeds must straddle the split bit; got {counts:?}",
+        );
+
+        let pair = SplitChildRoots {
+            left: left_store.state_root(),
+            right: right_store.state_root(),
+        };
+        assert!(
+            pair.composes_to(parent.state_root()),
+            "followed child roots must recompose to the parent's root",
+        );
+
+        // Counts partition the parent population, recorded at each
+        // store's own (sparse) tip version.
+        for (store, count) in [(&left_store, counts[0]), (&right_store, counts[1])] {
+            let tip = read_or_recover(&store.state).current_block_height;
+            assert_eq!(store.substate_count_at_version(tip.inner()), Some(count));
+        }
+    }
+
+    /// A follow must advance the store's version; replaying a height the
+    /// store already applied is rejected.
+    #[test]
+    fn follow_rejects_a_non_advancing_height() {
+        let store = SimShardStorage::new(shard_prefix_path(child_of(1)));
+        let (_, receipt) = follow_receipt(1);
+        let receipts = [receipt];
+        store
+            .follow_block_writes(BlockHeight::new(5), &receipts)
+            .unwrap();
+        assert!(
+            store
+                .follow_block_writes(BlockHeight::new(5), &receipts)
+                .is_err(),
+        );
     }
 }

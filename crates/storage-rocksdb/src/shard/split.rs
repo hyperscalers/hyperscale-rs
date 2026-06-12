@@ -388,4 +388,67 @@ mod tests {
         assert_eq!(child.read_jmt_metadata(), (10, StateRoot::ZERO));
         assert_eq!(child.substate_count_at_version(10), Some(0));
     }
+
+    /// Partition independence over follows: two child stores each
+    /// following only their half of a chain's block writes assemble
+    /// exactly the two child subtrees of a root store fed the same
+    /// blocks (a root prefix filters nothing, so it doubles as the
+    /// unfiltered baseline). Foreign-half blocks are no-ops that leave a
+    /// child's version line sparse.
+    #[test]
+    fn followed_children_partition_and_recompose_the_root() {
+        use std::sync::Arc;
+
+        use hyperscale_storage::test_helpers::{db_node_key, make_database_update};
+        use hyperscale_types::state_key::node_routing_hash;
+        use hyperscale_types::{
+            BoundedVec, ConsensusReceipt, GlobalReceiptHash, Hash, NodeId, StoredReceipt, TxHash,
+        };
+
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let whole = RocksDbShardStorage::open(dirs[0].path(), NibblePath::empty()).unwrap();
+        let left = RocksDbShardStorage::open(dirs[1].path(), child_path(0)).unwrap();
+        let right = RocksDbShardStorage::open(dirs[2].path(), child_path(1)).unwrap();
+
+        let mut sides_hit = [false, false];
+        let mut roots = (StateRoot::ZERO, StateRoot::ZERO, StateRoot::ZERO);
+        for seed in 1u8..=8 {
+            let updates = make_database_update(db_node_key(seed), 0, vec![seed], vec![seed; 4]);
+            let receipts = [StoredReceipt::synced(
+                TxHash::from_raw(Hash::from_bytes(&[seed])),
+                Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                    database_updates: updates,
+                    owned_nodes: BoundedVec::new(),
+                    application_events: Vec::new(),
+                    beacon_witness_events: Vec::new(),
+                }),
+            )];
+            let height = BlockHeight::new(u64::from(seed));
+            roots = (
+                whole.follow_block_writes(height, &receipts).unwrap(),
+                left.follow_block_writes(height, &receipts).unwrap(),
+                right.follow_block_writes(height, &receipts).unwrap(),
+            );
+            sides_hit[usize::from(node_routing_hash(&NodeId([seed; 30]))[0] >> 7)] = true;
+        }
+        assert!(
+            sides_hit[0] && sides_hit[1],
+            "fixture seeds must straddle the split bit",
+        );
+        let (whole_root, left_root, right_root) = roots;
+        assert_eq!(
+            Blake3Hasher::hash_internal(&[*left_root.as_bytes(), *right_root.as_bytes()]),
+            *whole_root.as_bytes(),
+            "followed child roots must recompose to the whole tree's root",
+        );
+
+        // The whole store advanced on every block; each child only on
+        // its own half's writes.
+        let (whole_version, _) = whole.read_jmt_metadata();
+        assert_eq!(whole_version, 8);
+        let (left_version, _) = left.read_jmt_metadata();
+        let (right_version, _) = right.read_jmt_metadata();
+        assert!(left_version < 8 || right_version < 8);
+    }
 }
