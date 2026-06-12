@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
     CertifiedBeaconBlock, Epoch, NetworkDefinition, ObserverSeat, PendingReshape,
-    QuorumCertificate, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects,
+    QuorumCertificate, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitAdoption,
     TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
 };
 
@@ -187,6 +187,7 @@ pub fn apply_epoch(
 
     let shard_committee_transitions = diff_shard_committees(state, &pre_shard_members);
     let (observers_drawn, observers_released) = diff_observer_seats(state, &pre_seats);
+    let split_adoptions = diff_split_adoptions(state, &pre_shard_members, &pre_seats);
 
     SlotEffects {
         registered: witness.registered,
@@ -202,7 +203,43 @@ pub fn apply_epoch(
         beacon_committee_transition: Some(beacon_committee_transition),
         observers_drawn,
         observers_released,
+        split_adoptions,
     }
+}
+
+/// Map each member a split execution placed on a fresh child to its
+/// store-adoption path.
+///
+/// A child is fresh when it entered the lookahead this fold while its
+/// parent left it. Each of its members either held an observer seat for
+/// exactly this child at the epoch start (the synced store reopens) or
+/// sat on the parent committee (the store hard-links from a local
+/// checkpoint) — the execution gate admits no third provenance.
+fn diff_split_adoptions(
+    state: &BeaconState,
+    pre_shard_members: &BTreeMap<ShardId, Vec<ValidatorId>>,
+    pre_seats: &BTreeMap<(ValidatorId, ShardId), ShardId>,
+) -> BTreeMap<ValidatorId, SplitAdoption> {
+    let mut adoptions = BTreeMap::new();
+    for (child, committee) in &state.next_shard_committees {
+        if pre_shard_members.contains_key(child) {
+            continue;
+        }
+        let Some(parent) = child.parent() else {
+            continue;
+        };
+        let Some(parent_members) = pre_shard_members.get(&parent) else {
+            continue;
+        };
+        for member in &committee.members {
+            if pre_seats.get(&(*member, parent)) == Some(child) {
+                adoptions.insert(*member, SplitAdoption::Observer { parent });
+            } else if parent_members.contains(member) {
+                adoptions.insert(*member, SplitAdoption::ParentHalf { parent });
+            }
+        }
+    }
+    adoptions
 }
 
 /// Every pending split's cohort seats, keyed `(validator, splitting
@@ -461,10 +498,10 @@ mod tests {
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardBoundary, ShardId, ShardWitness, ShardWitnessPayload,
-        ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePoolId, StateRoot,
-        TransactionRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root_with_proof, zero_bls_signature,
+        QuorumCertificate, Round, ShardBoundary, ShardCommittee, ShardId, ShardWitness,
+        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake,
+        StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
+        WeightedTimestamp, compute_merkle_root_with_proof, zero_bls_signature,
     };
 
     use super::*;
@@ -1373,5 +1410,58 @@ mod tests {
             !state.boundaries.contains_key(&parent),
             "drained and dropped"
         );
+    }
+
+    /// Members a split places on a fresh child classify by provenance:
+    /// observer seats reopen their synced store, parent members
+    /// hard-link a checkpoint. Pre-existing shards contribute nothing.
+    #[test]
+    fn split_adoptions_classify_parent_half_and_observer() {
+        let mut state = single_pool_state(4);
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let observer = ValidatorId::new(1000);
+
+        let pre_members: BTreeMap<ShardId, Vec<ValidatorId>> = state
+            .next_shard_committees
+            .iter()
+            .map(|(s, c)| (*s, c.members.clone()))
+            .collect();
+        let pre_seats: BTreeMap<(ValidatorId, ShardId), ShardId> =
+            std::iter::once(((observer, parent), left)).collect();
+
+        // The execution's committee mutation: parent out, children in.
+        let parent_members = state
+            .next_shard_committees
+            .remove(&parent)
+            .expect("fixture seats the parent")
+            .members;
+        state.next_shard_committees.insert(
+            left,
+            ShardCommittee {
+                members: vec![parent_members[0], parent_members[1], observer],
+            },
+        );
+        state.next_shard_committees.insert(
+            right,
+            ShardCommittee {
+                members: vec![parent_members[2], parent_members[3]],
+            },
+        );
+
+        let adoptions = diff_split_adoptions(&state, &pre_members, &pre_seats);
+        assert_eq!(
+            adoptions.get(&parent_members[0]),
+            Some(&SplitAdoption::ParentHalf { parent })
+        );
+        assert_eq!(
+            adoptions.get(&parent_members[3]),
+            Some(&SplitAdoption::ParentHalf { parent })
+        );
+        assert_eq!(
+            adoptions.get(&observer),
+            Some(&SplitAdoption::Observer { parent })
+        );
+        assert_eq!(adoptions.len(), 5);
     }
 }

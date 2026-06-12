@@ -55,7 +55,7 @@ pub use beacon::{
     SkipEpochCertVerifyError, SkipReport, SkipRequest, SkipRequestVerifyError, SkipVerifyContext,
     SlotEffects, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
     SpcHighTriple, SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcVerifyContext, StakePool,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcVerifyContext, SplitAdoption, StakePool,
     TOKENS_PER_YEAR_TARGET, TransitionCause, UNBONDING_WINDOW_EPOCHS, ValidatorRecord,
     ValidatorStatus, build_indirect_cert, build_qc1, build_qc2, build_qc3, build_skip_cert,
     byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp, qc1_certify,

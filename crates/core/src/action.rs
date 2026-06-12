@@ -14,9 +14,10 @@ use hyperscale_types::{
     PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round,
     RoutableTransaction, ShardId, SharedCertificates, SharedTransactions, SkipRequest,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
+    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitAdoption,
+    SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
+    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -96,6 +97,12 @@ pub struct ParticipationChange {
     /// same shard, when a pool draw immediately re-places the released
     /// observer there as a regular member.
     pub observe: Option<ObserveDelta>,
+    /// Present when `join` names a freshly split child this validator
+    /// was pre-staffed for: the supervisor adopts the store along the
+    /// marked path (parent-half checkpoint hard-link or observer
+    /// reopen) instead of snap-syncing, waiting for the parent chain's
+    /// certified crossing before installing the child genesis.
+    pub split_adoption: Option<SplitAdoption>,
     /// Epoch whose window activates the new placement.
     pub effective_epoch: Epoch,
 }
