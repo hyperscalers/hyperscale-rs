@@ -411,10 +411,22 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
             .validators
             .get_mut(id)
             .expect("keepers come from committee state, must be in validators");
+        // Keepers keep their original placement epoch across the move —
+        // they have been serving their child all along — so the parent's
+        // pending placeholder doesn't exclude them from the beacon
+        // committee (the `beacon_eligible` pending-anchor rule), which
+        // would otherwise strand the beacon with no eligible signers the
+        // moment every member left the children.
+        let placed_at_epoch = match rec.status {
+            ValidatorStatus::OnShard {
+                placed_at_epoch, ..
+            } => placed_at_epoch,
+            other => unreachable!("merge moved a {other:?} validator"),
+        };
         rec.status = ValidatorStatus::OnShard {
             shard: parent,
             ready: seat.ready,
-            placed_at_epoch: state.current_epoch,
+            placed_at_epoch,
         };
         // Placement changed: the per-placement miss scope ends here.
         state.miss_counters.remove(id);
@@ -1157,7 +1169,9 @@ mod tests {
 
         // Each keeper seated on the parent: the three readied carry
         // `ready: true`, the straggler `false` (it completes via the
-        // normal `Ready` path), all placed at the execution epoch.
+        // normal `Ready` path), each keeping its original placement epoch
+        // so the parent's pending placeholder doesn't bar it from the
+        // beacon committee.
         for kid in &keeper_ids {
             let ready = keeper_ids[..quorum].contains(kid);
             assert_eq!(
@@ -1165,7 +1179,7 @@ mod tests {
                 ValidatorStatus::OnShard {
                     shard: parent,
                     ready,
-                    placed_at_epoch: Epoch::new(5),
+                    placed_at_epoch: Epoch::GENESIS,
                 },
             );
             assert!(merged.contains(kid));

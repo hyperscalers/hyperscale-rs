@@ -43,6 +43,7 @@ use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
 
+pub mod merge;
 pub mod observer;
 pub mod relocation;
 mod split;
@@ -128,6 +129,10 @@ pub struct SimulationRunner {
 
     /// Last time gossip dedup caches were pruned.
     last_gossip_dedup_prune: Duration,
+
+    /// Epoch window length from the beacon chain config, retained so a
+    /// merge keeper's flip can recompute the cut the children crossed.
+    epoch_duration_ms: u64,
 }
 
 /// Statistics collected during simulation.
@@ -464,6 +469,10 @@ impl SimulationRunner {
             genesis_executed: vec![false; num_hosts],
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
+            epoch_duration_ms: network_config
+                .beacon_chain_config
+                .unwrap_or_default()
+                .epoch_duration_ms,
         }
     }
 
