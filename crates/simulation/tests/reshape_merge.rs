@@ -22,8 +22,9 @@ use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHash, KeeperSeat, PendingReshape, ReshapeThresholds,
-    ShardId, SplitChildRoots, StateRoot, ValidatorId, ValidatorStatus,
+    BeaconChainConfig, BeaconState, BlockHash, KeeperSeat, PendingReshape,
+    RESHAPE_READY_TTL_EPOCHS, ReshapeThresholds, ShardId, SplitChildRoots, StateRoot, ValidatorId,
+    ValidatorStatus,
 };
 use tracing_test::traced_test;
 
@@ -228,6 +229,10 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
         state.boundaries[&ShardId::ROOT].state_root,
         "the parent anchor must be hash_internal of the two child terminal roots",
     );
+    // Each child's terminal substate population, captured before the
+    // children are torn down — for the account-continuity keystone below.
+    let left_count = child_terminal_count(&runner, left);
+    let right_count = child_terminal_count(&runner, right);
 
     // ── The flip: each keeper builds the merged store from both halves
     // and seats onto the parent ──
@@ -260,6 +265,7 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
 
     // Every merged store holds the deterministic genesis as its committed
     // base, and every committed chain extends it.
+    let mut merged_count = None;
     for node in 0..runner.num_hosts() {
         let Some(storage) = runner.hosts_shard(node, ShardId::ROOT) else {
             continue;
@@ -272,7 +278,23 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
             genesis.block().header().state_root(),
             parent_anchor.state_root
         );
+        merged_count = Some(
+            storage
+                .substate_count_at_version(genesis_height.inner())
+                .expect("the merged genesis recorded its substate count"),
+        );
     }
+
+    // State continuity, the account-level keystone: the merged keyset is
+    // the disjoint union of the two children's — no account lost or
+    // duplicated. The counts add up exactly (a key shared across the
+    // halves would dedup on import and shrink the merged count below the
+    // sum), and the composed-root check already pinned the structure.
+    assert_eq!(
+        merged_count.expect("a host carries the merged shard"),
+        left_count + right_count,
+        "the merged substate population must be the sum of the two children's",
+    );
 }
 
 /// The terminal subtree root of a terminated child, read from a host
@@ -284,4 +306,57 @@ fn child_terminal_root(runner: &SimulationRunner, child: ShardId) -> StateRoot {
         }
     }
     panic!("no host carries the terminated child {child:?}");
+}
+
+/// A terminated child's committed substate count, read from a host still
+/// carrying it.
+fn child_terminal_count(runner: &SimulationRunner, child: ShardId) -> u64 {
+    for node in 0..runner.num_hosts() {
+        if let Some(storage) = runner.hosts_shard(node, child) {
+            return storage
+                .substate_count_at_version(storage.committed_height().inner())
+                .unwrap_or(0);
+        }
+    }
+    panic!("no host carries the terminated child {child:?}");
+}
+
+/// The readiness gate is load-bearing: a merge that pairs but whose
+/// keepers never sync the sibling half — never signal `ReshapeReady` —
+/// must never collapse the trie. The readiness TTL abandons each pairing
+/// and the standing trigger re-pairs, but without `2f+1` ready keepers
+/// the parent never takes the children's place.
+#[traced_test]
+#[test]
+fn the_merge_gate_requires_keeper_readiness() {
+    let (left, right) = ShardId::ROOT.children();
+    let mut runner = SimulationRunner::new(&merge_config(), 8);
+    runner.initialize_genesis();
+
+    let paired = run_until(&mut runner, epochs(ADMISSION_BUDGET_EPOCHS), |r| {
+        pending_keepers(r).is_some()
+    });
+    assert!(
+        paired,
+        "the merge must pair within {ADMISSION_BUDGET_EPOCHS} epochs",
+    );
+
+    // No keeper signals ready across more than the readiness TTL.
+    let watch_deadline = runner.now() + epochs(2 * RESHAPE_READY_TTL_EPOCHS);
+    let executed = run_until(&mut runner, watch_deadline, |r| {
+        beacon_state(r).is_some_and(|s| s.next_shard_committees.contains_key(&ShardId::ROOT))
+    });
+    assert!(
+        !executed,
+        "the merge must not execute without keeper readiness",
+    );
+
+    // The children remain separate active leaves; the parent never formed.
+    let state = beacon_state(&runner).expect("post-watch state");
+    assert!(
+        state.next_shard_committees.contains_key(&left)
+            && state.next_shard_committees.contains_key(&right),
+        "both children must still be active leaves",
+    );
+    assert!(!state.next_shard_committees.contains_key(&ShardId::ROOT));
 }
