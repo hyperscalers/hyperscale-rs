@@ -341,6 +341,27 @@ impl ExecutionCoordinator {
     // Wave Assignment
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// The committed block's **anchored** committee — `at_for_shard(local_shard,
+    /// anchor_wt)`, the same snapshot the proposer classified `waves` against
+    /// and the verifier validated against. Wave and provision classification at
+    /// commit keys on it, not the `ArcSwap` head, so every replica groups a
+    /// block's transactions identically across a reshape boundary (a head-flipped
+    /// replica would otherwise split execution votes). Falls back to the head
+    /// only if the window was evicted — unreachable for a just-committed block,
+    /// whose committee resolved at verification.
+    fn classification_committee<'t>(
+        &self,
+        topology: &'t TopologySchedule,
+        anchor_wt: WeightedTimestamp,
+    ) -> &'t TopologySnapshot {
+        topology
+            .at_for_shard(self.local_shard, anchor_wt)
+            .map_or_else(
+                || topology.head().as_ref(),
+                |(snapshot, _)| snapshot.as_ref(),
+            )
+    }
+
     /// Set up per-wave execution state for a newly committed block.
     ///
     /// For each distinct wave, creates a [`WaveState`], records tx → wave
@@ -357,17 +378,13 @@ impl ExecutionCoordinator {
     fn setup_waves_and_dispatch(
         &mut self,
         topology: &TopologySchedule,
+        classification: &TopologySnapshot,
         block_hash: BlockHash,
         block_height: BlockHeight,
         block_ts: WeightedTimestamp,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> (Vec<Action>, Vec<Verifiable<ExecutionVote>>) {
-        let waves = assign_waves(
-            topology.head(),
-            self.local_shard,
-            block_height,
-            transactions,
-        );
+        let waves = assign_waves(classification, self.local_shard, block_height, transactions);
         // Setup-time leader/quorum key on the wave-start timestamp — a
         // best-effort guess, since the wave's `vote_anchor_ts` isn't fixed
         // until it votes. When that lands in a later epoch, the
@@ -409,7 +426,7 @@ impl ExecutionCoordinator {
                     let conflicts = self.provisioning.register_tx(
                         tx_hash,
                         self.local_shard,
-                        topology.head(),
+                        classification,
                         tx.declared_reads(),
                         tx.declared_writes(),
                     );
@@ -1626,11 +1643,17 @@ impl ExecutionCoordinator {
         let height = header.height();
         let mut actions = Vec::new();
 
+        // Classification anchors on the block's committee, not the head, so
+        // every replica groups its waves and provisions identically across a
+        // reshape boundary.
+        let anchored =
+            self.classification_committee(topology, header.parent_qc().weighted_timestamp());
+
         // ── Provision broadcasting (proposer only) ─────────────────────
         if self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(topology.head(), transactions, self.me, local_shard)
+                build_provision_requests(anchored, transactions, self.me, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
@@ -1651,6 +1674,7 @@ impl ExecutionCoordinator {
 
             let (dispatch_actions, early_votes) = self.setup_waves_and_dispatch(
                 topology,
+                anchored,
                 block_hash,
                 height,
                 self.committed_ts,
@@ -1688,7 +1712,9 @@ impl ExecutionCoordinator {
         if transactions.is_empty() {
             return Vec::new();
         }
-        self.register_sealed_wave_assignments(topology.head(), header.height(), transactions);
+        let anchored =
+            self.classification_committee(topology, header.parent_qc().weighted_timestamp());
+        self.register_sealed_wave_assignments(anchored, header.height(), transactions);
         self.replay_early_wave_attestations(topology, transactions)
     }
 
@@ -4008,6 +4034,47 @@ mod tests {
         let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
         sched.insert(Epoch::new(1), post_split);
         sched
+    }
+
+    /// Commit-time wave/provision classification anchors on the block's
+    /// committee — `at_for_shard(local_shard, parent_qc.wt)` — not the
+    /// `ArcSwap` head, so every replica groups a block's transactions
+    /// identically across a reshape boundary (matching the proposer and the
+    /// verifier).
+    #[test]
+    fn classification_committee_anchors_at_the_block_window_not_the_head() {
+        let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        // Epoch 0 carries ROOT (one shard) — the block's anchor; epoch 1
+        // splits it (two shards) and is installed as the flipped head.
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let pre_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let post_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre_split));
+        sched.insert(Epoch::new(1), Arc::clone(&post_split));
+        sched.set_head(post_split);
+
+        let anchored = state.classification_committee(&sched, WeightedTimestamp::from_millis(500));
+        assert_eq!(
+            anchored.num_shards(),
+            1,
+            "classification anchors at the block's window (ROOT, one shard), not the two-shard head",
+        );
     }
 
     /// A finalized wave whose certificate carries `local`'s EC plus a
