@@ -109,6 +109,13 @@ pub struct TopologySnapshot {
     /// its consensus subset; their ready signals classify as
     /// `ReshapeReady` witness leaves.
     reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Per-child keeper sets of pending merges — each merging child's
+    /// drawn keepers and the parent each one reforms, projected from
+    /// `BeaconState.pending_reshapes`. Keepers stay ordinary `OnShard`
+    /// members of their child (the networking and consensus view both
+    /// see them), but their ready signals classify as `ReshapeReady`
+    /// witness leaves: they signal that the sibling half has synced.
+    reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     /// Shards with an admitted, not-yet-executed split as of this
     /// window's committee freeze. Frozen with the same discipline as
     /// `witness_bases`, so both writes of a window's schedule entry
@@ -156,6 +163,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            reshape_keepers: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -195,6 +203,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            reshape_keepers: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -243,6 +252,7 @@ impl TopologySnapshot {
             boundaries: HashMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
+            reshape_keepers: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -285,6 +295,7 @@ impl TopologySnapshot {
         boundaries: HashMap<ShardId, ShardAnchor>,
         witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
         mut reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+        mut reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
         split_pending: BTreeSet<ShardId>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
@@ -316,6 +327,7 @@ impl TopologySnapshot {
             .collect();
 
         reshape_observers.retain(|_, cohort| !cohort.is_empty());
+        reshape_keepers.retain(|_, keepers| !keepers.is_empty());
         Self {
             network,
             shard_trie,
@@ -323,6 +335,7 @@ impl TopologySnapshot {
             boundaries,
             witness_bases,
             reshape_observers,
+            reshape_keepers,
             split_pending,
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -374,6 +387,20 @@ impl TopologySnapshot {
         self.reshape_observers
             .get(&shard)
             .and_then(|cohort| cohort.get(&validator))
+            .copied()
+    }
+
+    /// The parent `validator` reforms as a keeper of `child` in a pending
+    /// merge, or `None` when the validator holds no keeper seat there.
+    ///
+    /// A `Some` answer marks the validator's ready signals on `child` as
+    /// `ReshapeReady` witness leaves — the keeper has synced the sibling
+    /// half into the merged store.
+    #[must_use]
+    pub fn reshape_keeper_parent(&self, child: ShardId, validator: ValidatorId) -> Option<ShardId> {
+        self.reshape_keepers
+            .get(&child)
+            .and_then(|keepers| keepers.get(&validator))
             .copied()
     }
 
@@ -645,6 +672,7 @@ mod tests {
                 // with no cohort answer identically.
                 (ShardId::leaf(1, 1), BTreeMap::new()),
             ]),
+            HashMap::new(),
             BTreeSet::from([shard]),
         );
 
@@ -813,6 +841,7 @@ mod tests {
             boundaries,
             witness_bases,
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         );
 
@@ -851,6 +880,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -899,6 +929,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

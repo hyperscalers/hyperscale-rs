@@ -213,7 +213,12 @@ pub fn derive_leaves(
     sorted.sort_by_key(|s| s.validator_id());
     for signal in sorted {
         let id = signal.validator_id();
-        out.push(if topology.reshape_observer_child(shard, id).is_some() {
+        // A ready signal from a reshape participant — a split observer of
+        // this shard, or a merge keeper running it — classifies as
+        // `ReshapeReady`; everyone else's is a plain `Ready`.
+        let reshaping = topology.reshape_observer_child(shard, id).is_some()
+            || topology.reshape_keeper_parent(shard, id).is_some();
+        out.push(if reshaping {
             ShardWitnessPayload::ReshapeReady { validator: id }
         } else {
             ShardWitnessPayload::Ready { id }
@@ -365,6 +370,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             HashMap::from([(shard, observers)]),
+            HashMap::new(),
             BTreeSet::from([shard]),
         )
     }
@@ -372,6 +378,31 @@ mod tests {
     /// [`snapshot_with_observers`] with no cohort.
     fn snapshot_with_base(shard: ShardId, base: u64) -> TopologySnapshot {
         snapshot_with_observers(shard, base, std::collections::BTreeMap::new())
+    }
+
+    /// A single-shard snapshot carrying `keepers` as `shard`'s pending
+    /// merge keeper set (each keeper mapped to the parent it reforms).
+    fn snapshot_with_keepers(
+        shard: ShardId,
+        base: u64,
+        keepers: std::collections::BTreeMap<ValidatorId, ShardId>,
+    ) -> TopologySnapshot {
+        let validators = vec![ValidatorInfo {
+            validator_id: ValidatorId::new(0),
+            public_key: generate_bls_keypair().public_key(),
+        }];
+        let vs = ValidatorSet::new(validators);
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            HashMap::from([(shard, vec![ValidatorId::new(0)])]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
+            HashMap::new(),
+            HashMap::from([(shard, keepers)]),
+            BTreeSet::from([shard]),
+        )
     }
 
     fn context_with(
@@ -536,6 +567,43 @@ mod tests {
 
         let unseated = snapshot_with_base(shard, 0);
         let mut ctx = context_with(&unseated, shard, 0, Vec::new(), 1);
+        ctx.ready_signals = &signals;
+        assert!(matches!(
+            expected_root.verify(&ctx),
+            Err(BeaconWitnessRootVerifyError::Mismatch { .. }),
+        ));
+    }
+
+    /// A ready signal from a validator holding a merge keeper seat on
+    /// this shard also derives a `ReshapeReady` leaf — the keeper has
+    /// synced the sibling half.
+    #[test]
+    fn keeper_signals_classify_as_reshape_ready_leaves() {
+        use std::collections::BTreeMap;
+
+        use crate::{BlockHeight as Height, ReadySignal, zero_bls_signature};
+
+        let child = ShardId::leaf(1, 0);
+        let parent = ShardId::ROOT;
+        let keeper = ValidatorId::new(0);
+        let signals = vec![ReadySignal::new(
+            keeper,
+            Height::new(0),
+            Height::new(10),
+            zero_bls_signature(),
+        )];
+        let leaf = ShardWitnessPayload::ReshapeReady { validator: keeper }.leaf_hash();
+        let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
+
+        let seated = snapshot_with_keepers(child, 0, BTreeMap::from([(keeper, parent)]));
+        let mut ctx = context_with(&seated, child, 0, Vec::new(), 1);
+        ctx.ready_signals = &signals;
+        assert!(expected_root.verify(&ctx).is_ok());
+
+        // Without the keeper seat the same signal is a plain `Ready`, so
+        // the `ReshapeReady` root no longer verifies.
+        let unseated = snapshot_with_base(child, 0);
+        let mut ctx = context_with(&unseated, child, 0, Vec::new(), 1);
         ctx.ready_signals = &signals;
         assert!(matches!(
             expected_root.verify(&ctx),

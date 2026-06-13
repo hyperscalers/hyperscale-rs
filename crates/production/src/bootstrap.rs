@@ -641,6 +641,7 @@ mod tests {
             HashMap::from([(shard, anchor)]),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         );
         Arc::new(ArcSwap::from_pointee(snapshot))

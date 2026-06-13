@@ -93,7 +93,7 @@ pub use spc::{
     verify_empty_view_msg, verify_proposal_object,
 };
 pub use state::{
-    BeaconState, CohortSeat, CommitteeTransition, JailReason, KeeperSeat, ObserverSeat,
+    BeaconState, CohortSeat, CommitteeTransition, JailReason, KeeperSeat, KeptSeat, ObserverSeat,
     PendingReshape, PendingWithdrawal, ShardBoundary, ShardCommittee, SlotEffects, SplitAdoption,
     StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };

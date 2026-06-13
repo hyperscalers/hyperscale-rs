@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-    CertifiedBeaconBlock, Epoch, NetworkDefinition, ObserverSeat, PendingReshape,
+    CertifiedBeaconBlock, Epoch, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape,
     QuorumCertificate, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitAdoption,
     SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
 };
@@ -140,6 +140,9 @@ pub fn apply_epoch(
     // end-of-epoch diff surfaces draws and releases through
     // `SlotEffects.observers_drawn` / `observers_released`.
     let pre_seats = cohort_seats(state);
+    // The same for keeper seats, surfaced through
+    // `SlotEffects.keepers_drawn` / `keepers_released`.
+    let pre_keeper_seats = keeper_seats(state);
 
     let (committed, transition_cause): (&[_], TransitionCause) = match input {
         ApplyEpochInput::Normal { committed, .. } => (committed, TransitionCause::NaturalShuffle),
@@ -196,6 +199,7 @@ pub fn apply_epoch(
 
     let shard_committee_transitions = diff_shard_committees(state, &pre_shard_members);
     let (observers_drawn, observers_released) = diff_observer_seats(state, &pre_seats);
+    let (keepers_drawn, keepers_released) = diff_keeper_seats(state, &pre_keeper_seats);
     let split_adoptions = diff_split_adoptions(state, &pre_shard_members, &pre_seats);
 
     SlotEffects {
@@ -213,6 +217,8 @@ pub fn apply_epoch(
         observers_drawn,
         observers_released,
         split_adoptions,
+        keepers_drawn,
+        keepers_released,
     }
 }
 
@@ -301,6 +307,62 @@ fn diff_observer_seats(
         .map(|((validator, shard), child)| ObserverSeat {
             validator: *validator,
             shard: *shard,
+            child: *child,
+        })
+        .collect();
+    (drawn, released)
+}
+
+/// Every pending merge's keeper seats, keyed `(validator, merged
+/// parent) → the child the keeper runs`.
+fn keeper_seats(state: &BeaconState) -> BTreeMap<(ValidatorId, ShardId), ShardId> {
+    state
+        .pending_reshapes
+        .iter()
+        .filter_map(|(parent, reshape)| match reshape {
+            PendingReshape::Merge { keepers, .. } => Some((*parent, keepers)),
+            PendingReshape::Split { .. } => None,
+        })
+        .flat_map(|(parent, keepers)| {
+            keepers
+                .iter()
+                .map(move |(validator, seat)| ((*validator, parent), seat.child))
+        })
+        .collect()
+}
+
+/// Diff the keeper seats against the epoch-start snapshot.
+///
+/// New seats surface as draws — a merge pairing fixes its keeper
+/// committee. Vanished seats surface as releases, except those a merge
+/// consumed, whose holder now sits `OnShard` on the merged parent; their
+/// move surfaces through the committee diff instead.
+fn diff_keeper_seats(
+    state: &BeaconState,
+    pre_keeper_seats: &BTreeMap<(ValidatorId, ShardId), ShardId>,
+) -> (Vec<KeptSeat>, Vec<KeptSeat>) {
+    let post_seats = keeper_seats(state);
+    let drawn = post_seats
+        .iter()
+        .filter(|(key, _)| !pre_keeper_seats.contains_key(key))
+        .map(|((validator, parent), child)| KeptSeat {
+            validator: *validator,
+            parent: *parent,
+            child: *child,
+        })
+        .collect();
+    let released = pre_keeper_seats
+        .iter()
+        .filter(|(key, _)| !post_seats.contains_key(key))
+        .filter(|((validator, parent), _child)| {
+            !matches!(
+                state.validators.get(validator).map(|r| r.status),
+                Some(ValidatorStatus::OnShard { shard, .. }) if shard == *parent
+            )
+        })
+        .map(|((validator, parent), child)| KeptSeat {
+            validator: *validator,
+            parent: *parent,
             child: *child,
         })
         .collect();

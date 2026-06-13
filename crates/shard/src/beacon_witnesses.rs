@@ -271,6 +271,7 @@ mod tests {
                 ShardId::ROOT,
                 BTreeMap::from([(ValidatorId::new(observer), left)]),
             )]),
+            HashMap::new(),
             BTreeSet::from([ShardId::ROOT]),
         )
     }

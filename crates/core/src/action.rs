@@ -68,6 +68,32 @@ pub enum ObserveDelta {
     },
 }
 
+/// A change to the local vnode's reshape-keeper duty, carried on
+/// [`ParticipationChange::keep`].
+///
+/// A keeper stays an ordinary member of its child for transport and
+/// consensus; its extra physical work is a new `parent`-rooted store —
+/// its own child half hard-linked, the `sibling` half synced from the
+/// sibling committee, the root stitched — built so the merged chain can
+/// start instantly at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepDelta {
+    /// Drawn as a keeper of the pending merge under `parent`: build the
+    /// merged store, syncing the `sibling` half this keeper doesn't run.
+    Begin {
+        /// The merged parent this keeper reforms.
+        parent: ShardId,
+        /// The sibling child whose half the keeper must sync.
+        sibling: ShardId,
+    },
+    /// The merge was cancelled before executing — a required half went
+    /// quiet: abandon the keep and drop the half-built merged store.
+    Abandon {
+        /// The merged parent the keeper was reforming.
+        parent: ShardId,
+    },
+}
+
 /// A beacon-driven change to one vnode's physical shard participation,
 /// detected on the lookahead committees one epoch before it takes
 /// effect.
@@ -97,6 +123,11 @@ pub struct ParticipationChange {
     /// same shard, when a pool draw immediately re-places the released
     /// observer there as a regular member.
     pub observe: Option<ObserveDelta>,
+    /// Keeper-duty delta. A keeper is already a member of its child, so
+    /// `Begin`/`Abandon` accompany no placement change — the merge's
+    /// execution surfaces the keeper's move onto the parent as the
+    /// ordinary join/leave pair instead.
+    pub keep: Option<KeepDelta>,
     /// Present when `join` names a freshly split child this validator
     /// was pre-staffed for: the supervisor adopts the store along the
     /// marked path (parent-half checkpoint hard-link or observer

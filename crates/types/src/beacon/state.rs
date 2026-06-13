@@ -500,6 +500,19 @@ pub struct ObserverSeat {
     pub child: ShardId,
 }
 
+/// One keeper seat of a pending merge, as surfaced in [`SlotEffects`]:
+/// who holds it, the parent they reform, and the child they run (and
+/// hard-link the merged store from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct KeptSeat {
+    /// Validator holding the seat.
+    pub validator: ValidatorId,
+    /// The merged parent the keeper reforms.
+    pub parent: ShardId,
+    /// The child the keeper currently runs.
+    pub child: ShardId,
+}
+
 /// Effects of applying one epoch, returned by `apply_epoch`.
 ///
 /// Surfaced for observability, runner-side wiring (committee handover
@@ -558,6 +571,14 @@ pub struct SlotEffects {
     /// the participation delta to pick the pre-staffed install path
     /// instead of snap-sync.
     pub split_adoptions: BTreeMap<ValidatorId, SplitAdoption>,
+    /// Keeper seats drawn into pending merges this epoch — when both
+    /// halves paired and the keeper committee was fixed.
+    pub keepers_drawn: Vec<KeptSeat>,
+    /// Keeper seats released this epoch without executing — the merge
+    /// cancelled (a required half went quiet or the readiness TTL
+    /// elapsed). Seats a merge consumed land on the parent and surface
+    /// through the committee transitions instead.
+    pub keepers_released: Vec<KeptSeat>,
 }
 
 /// How a member joining a freshly split child adopts its store.
@@ -943,6 +964,22 @@ impl BeaconState {
             })
             .collect();
 
+        // Project each pending merge's keepers, keyed by the child each
+        // one runs, so that child's runtime classifies their ready
+        // signals as `ReshapeReady` leaves. One merge contributes both
+        // children's keeper sets.
+        let mut reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> = HashMap::new();
+        for (parent, reshape) in &self.pending_reshapes {
+            if let PendingReshape::Merge { keepers, .. } = reshape {
+                for (validator, seat) in keepers {
+                    reshape_keepers
+                        .entry(seat.child)
+                        .or_default()
+                        .insert(*validator, *parent);
+                }
+            }
+        }
+
         TopologySnapshot::from_explicit_committees(
             network,
             &validator_set,
@@ -951,6 +988,7 @@ impl BeaconState {
             boundaries,
             witness_bases,
             reshape_observers,
+            reshape_keepers,
             split_pending,
         )
     }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, FetchAbandon, FetchRequest, ObserveDelta, ParticipationChange, TimerId,
+    Action, FetchAbandon, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
@@ -1607,7 +1607,33 @@ impl BeaconCoordinator {
                     child: seat.child,
                 })
             });
-        if current == next && observe.is_none() {
+        // A keeper is already a member of its child, so a draw or
+        // abandon accompanies no placement change. `Begin` names the
+        // sibling half the keeper must sync; the merge's execution
+        // surfaces the keeper's move onto the parent as the join/leave
+        // pair, never here.
+        let keep = effects
+            .keepers_drawn
+            .iter()
+            .find(|seat| seat.validator == me)
+            .map(|seat| {
+                let (left, right) = seat.parent.children();
+                let sibling = if seat.child == left { right } else { left };
+                KeepDelta::Begin {
+                    parent: seat.parent,
+                    sibling,
+                }
+            })
+            .or_else(|| {
+                effects
+                    .keepers_released
+                    .iter()
+                    .find(|seat| seat.validator == me)
+                    .map(|seat| KeepDelta::Abandon {
+                        parent: seat.parent,
+                    })
+            });
+        if current == next && observe.is_none() && keep.is_none() {
             return None;
         }
         let moved = current != next;
@@ -1616,6 +1642,7 @@ impl BeaconCoordinator {
             join: next.filter(|_| moved),
             leave: current.filter(|_| moved),
             observe,
+            keep,
             split_adoption: effects.split_adoptions.get(&me).copied(),
             effective_epoch: self.state.current_epoch.next(),
         })
@@ -1974,7 +2001,7 @@ mod tests {
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
-        GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
+        GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, KeptSeat, LeafIndex,
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
         ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
         Round, ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
@@ -4425,5 +4452,87 @@ mod tests {
         assert_eq!(change.join, Some(child));
         assert_eq!(change.leave, Some(via));
         assert_eq!(change.observe, None);
+    }
+
+    /// A keeper draw surfaces as `KeepDelta::Begin` with the sibling half
+    /// to sync — never a placement change, since the keeper is already a
+    /// member of its child.
+    #[test]
+    fn participation_delta_reads_a_keeper_draw_as_keep_begin() {
+        let coord = fresh_coord();
+        let me = coord.me;
+        let child = ShardId::leaf(1, 0); // me's shard from genesis
+        let parent = ShardId::ROOT;
+        let sibling = ShardId::leaf(1, 1);
+
+        let mut effects = SlotEffects::default();
+        effects.keepers_drawn.push(KeptSeat {
+            validator: me,
+            parent,
+            child,
+        });
+
+        let change = coord
+            .participation_delta(&effects)
+            .expect("a keeper draw produces a delta");
+        assert_eq!(change.join, None);
+        assert_eq!(change.leave, None);
+        assert_eq!(change.observe, None);
+        assert_eq!(change.keep, Some(KeepDelta::Begin { parent, sibling }));
+    }
+
+    /// A released keeper seat surfaces as `KeepDelta::Abandon` with no
+    /// placement change — the keeper stays an ordinary member.
+    #[test]
+    fn participation_delta_reads_a_released_keeper_as_keep_abandon() {
+        let coord = fresh_coord();
+        let me = coord.me;
+        let child = ShardId::leaf(1, 0);
+        let parent = ShardId::ROOT;
+
+        let mut effects = SlotEffects::default();
+        effects.keepers_released.push(KeptSeat {
+            validator: me,
+            parent,
+            child,
+        });
+
+        let change = coord
+            .participation_delta(&effects)
+            .expect("a keeper release produces a delta");
+        assert_eq!(change.join, None);
+        assert_eq!(change.leave, None);
+        assert_eq!(change.keep, Some(KeepDelta::Abandon { parent }));
+    }
+
+    /// A merge's execution moves the keeper from its child onto the
+    /// reformed parent — the ordinary join/leave pair, no keep delta (the
+    /// supervisor's keeper duty supplies the merged store).
+    #[test]
+    fn participation_delta_reads_merge_execution_as_the_member_flip() {
+        let mut coord = fresh_coord();
+        let me = coord.me;
+        let child = ShardId::leaf(1, 0); // me's shard from genesis
+        let parent = ShardId::ROOT;
+
+        // Post-execution lookahead: the children collapsed into the
+        // parent; me landed on it as a member.
+        coord.state.next_shard_committees.remove(&child);
+        coord
+            .state
+            .next_shard_committees
+            .insert(parent, ShardCommittee { members: vec![me] });
+        coord.state.validators.get_mut(&me).unwrap().status = ValidatorStatus::OnShard {
+            shard: parent,
+            ready: true,
+            placed_at_epoch: coord.state.current_epoch,
+        };
+
+        let change = coord
+            .participation_delta(&SlotEffects::default())
+            .expect("execution produces the flip");
+        assert_eq!(change.join, Some(parent));
+        assert_eq!(change.leave, Some(child));
+        assert_eq!(change.keep, None);
     }
 }

@@ -969,6 +969,31 @@ mod tests {
         }
     }
 
+    /// A paired merge projects its keepers into the topology snapshot,
+    /// keyed by the child each runs, so that child's runtime classifies
+    /// their ready signals as `ReshapeReady`.
+    #[test]
+    fn merge_pairing_projects_keepers_into_the_snapshot() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+        let keepers = keepers_of(&state, parent);
+
+        let snapshot = state.derive_topology_snapshot(net());
+        for (id, seat) in &keepers {
+            assert_eq!(
+                snapshot.reshape_keeper_parent(seat.child, *id),
+                Some(parent)
+            );
+            // A keeper of one child isn't projected onto the sibling.
+            let sibling = if seat.child == left { right } else { left };
+            assert_eq!(snapshot.reshape_keeper_parent(sibling, *id), None);
+        }
+    }
+
     /// A keeper's `ReshapeReady` rides its own child's chain and marks
     /// only its own seat; the same signal arriving via the sibling
     /// chain is dropped (source pinning).

@@ -40,7 +40,7 @@ mod timer;
 mod traits;
 
 pub use action::{
-    Action, ActionOwner, CrossShardExecutionRequest, ObserveDelta, ParticipationChange,
+    Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParticipationChange,
     ProvisionsRequest,
 };
 pub use action_context::{ActionContext, PreparedBlock};
