@@ -322,6 +322,124 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
     }
 }
 
+/// Execute every paired merge whose readiness gate is met, mutating the
+/// trie into the lookahead committee set.
+///
+/// Symmetric to [`execute_ready_splits`], inverted: a merge keeps no
+/// committee-liveness half — every keeper must sync the sibling half — so
+/// the gate is simply the merged committee's ready keepers reaching
+/// `2f+1` of the target. On the first fold that passes, the parent's two
+/// children leave the lookahead and the parent takes their place: keepers
+/// flip `OnShard` onto the parent with the readiness their `ReshapeReady`
+/// folded (stragglers complete via the normal `Ready` path), and the
+/// non-keeper half of each child returns to the pool. Both children's
+/// boundary records are marked terminal so their chains drain and the
+/// beacon composes the parent anchor from them; the parent gains a
+/// pending placeholder until that composition lands.
+pub(super) fn execute_ready_merges(state: &mut BeaconState) {
+    let targets: Vec<ShardId> = state
+        .pending_reshapes
+        .iter()
+        .filter(|(_, r)| {
+            matches!(
+                r,
+                PendingReshape::Merge {
+                    admitted_at: Some(_),
+                    ..
+                }
+            )
+        })
+        .map(|(target, _)| *target)
+        .collect();
+    for target in targets {
+        try_execute_merge(state, target);
+    }
+}
+
+fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
+    let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.get(&parent) else {
+        return;
+    };
+    let quorum = 2 * byzantine_threshold(state.chain_config.shard_size as usize) + 1;
+    if keepers.values().filter(|seat| seat.ready).count() < quorum {
+        return;
+    }
+    tracing::info!(
+        ?parent,
+        "Shard merge readiness gate met; reshaping the trie"
+    );
+
+    let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.remove(&parent) else {
+        unreachable!("pending merge read above");
+    };
+
+    // Drop the children from the lookahead: keepers move to the parent
+    // below, the rest return to the pool. The children's chains keep
+    // running their in-flight window from the frozen active committee
+    // until their terminal block — the terminal mark keeps each boundary
+    // record sourced (for the contribution the beacon composes into the
+    // parent anchor and the witness drain) without counting the dead
+    // chain as missing.
+    let children: [ShardId; 2] = parent.children().into();
+    for child in children {
+        if let Some(committee) = state.next_shard_committees.remove(&child) {
+            for id in committee.members {
+                if keepers.contains_key(&id) {
+                    continue;
+                }
+                if let Some(rec) = state.validators.get_mut(&id) {
+                    rec.status = ValidatorStatus::Pooled;
+                }
+                state.miss_counters.remove(&id);
+            }
+        }
+        if let Some(boundary) = state.boundaries.get_mut(&child) {
+            boundary.terminal_epoch = Some(state.current_epoch);
+        } else {
+            tracing::warn!(
+                shard = ?child,
+                "merging child has no boundary record; the parent must seed from its own contribution"
+            );
+        }
+    }
+
+    // The merged committee, keepers in id order, each now `OnShard` on
+    // the parent carrying the readiness its `ReshapeReady` folded.
+    let members: Vec<ValidatorId> = keepers.keys().copied().collect();
+    for (id, seat) in &keepers {
+        let rec = state
+            .validators
+            .get_mut(id)
+            .expect("keepers come from committee state, must be in validators");
+        rec.status = ValidatorStatus::OnShard {
+            shard: parent,
+            ready: seat.ready,
+            placed_at_epoch: state.current_epoch,
+        };
+        // Placement changed: the per-placement miss scope ends here.
+        state.miss_counters.remove(id);
+    }
+    state
+        .next_shard_committees
+        .insert(parent, ShardCommittee { members });
+
+    // Pending placeholder, the genesis-seeding pattern: a zero block
+    // hash keeps it from projecting as a snap-sync anchor until the
+    // beacon composes `r_p` from the two terminal child anchors.
+    state.boundaries.insert(
+        parent,
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: state.current_epoch,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+        },
+    );
+}
+
 /// PRNG bound to `(domain, randomness, epoch, shard)` — the seeding
 /// discipline every reshape draw shares.
 fn reshape_prng(domain: &[u8], state: &BeaconState, shard: ShardId) -> ChaCha20Rng {
@@ -765,6 +883,18 @@ mod tests {
             state
                 .next_shard_committees
                 .insert(child, ShardCommittee { members });
+            state.boundaries.insert(
+                child,
+                ShardBoundary {
+                    state_root: StateRoot::ZERO,
+                    block_hash: BlockHash::ZERO,
+                    height: BlockHeight::new(10),
+                    witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    last_live_epoch: Epoch::new(5),
+                    consecutive_misses: 0,
+                    terminal_epoch: None,
+                },
+            );
         }
         for i in 0..pooled {
             let id = ValidatorId::new(1000 + i);
@@ -945,5 +1075,191 @@ mod tests {
         assert!(state.pending_reshapes.is_empty());
         // Keepers returned to ordinary rotation: still OnShard, no longer pinned.
         assert!(!state.is_merge_keeper(left, ValidatorId::new(0)));
+    }
+
+    // ─── merge execution gate ────────────────────────────────────────────
+
+    /// The gate holds until the merged committee's ready keepers reach
+    /// 2f+1 of the target; the first fold that passes drops both children
+    /// from the lookahead, seats the keepers on the parent with their
+    /// folded readiness, returns the non-keepers to the pool, marks the
+    /// children terminal, and leaves the parent a pending placeholder.
+    #[test]
+    fn merge_executes_only_when_keepers_reach_quorum() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+        let keepers = keepers_of(&state, parent);
+        let keeper_ids: Vec<ValidatorId> = keepers.keys().copied().collect();
+        let non_keepers: Vec<ValidatorId> = (0u64..8)
+            .map(ValidatorId::new)
+            .filter(|id| !keepers.contains_key(id))
+            .collect();
+        state.miss_counters.insert(keeper_ids[0], 2);
+
+        // Quorum is 2f+1 = 3 of the four-member target. Two ready: held.
+        let quorum = 3;
+        for id in &keeper_ids[..quorum - 1] {
+            let child = keepers[id].child;
+            apply_shard_payload(
+                &mut state,
+                child,
+                &ShardWitnessPayload::ReshapeReady { validator: *id },
+            );
+        }
+        execute_ready_merges(&mut state);
+        assert!(state.pending_reshapes.contains_key(&parent));
+        assert!(state.next_shard_committees.contains_key(&left));
+
+        // The third keeper readies: the trie collapses, the fourth a
+        // straggler.
+        let third = keeper_ids[quorum - 1];
+        apply_shard_payload(
+            &mut state,
+            keepers[&third].child,
+            &ShardWitnessPayload::ReshapeReady { validator: third },
+        );
+        execute_ready_merges(&mut state);
+
+        assert!(state.pending_reshapes.is_empty());
+        assert!(!state.next_shard_committees.contains_key(&left));
+        assert!(!state.next_shard_committees.contains_key(&right));
+        let merged = state.next_shard_committees[&parent].members.clone();
+        assert_eq!(merged.len(), 4);
+
+        // Each keeper seated on the parent: the three readied carry
+        // `ready: true`, the straggler `false` (it completes via the
+        // normal `Ready` path), all placed at the execution epoch.
+        for kid in &keeper_ids {
+            let ready = keeper_ids[..quorum].contains(kid);
+            assert_eq!(
+                state.validators[kid].status,
+                ValidatorStatus::OnShard {
+                    shard: parent,
+                    ready,
+                    placed_at_epoch: Epoch::new(5),
+                },
+            );
+            assert!(merged.contains(kid));
+        }
+        // Non-keepers returned to the pool.
+        for id in &non_keepers {
+            assert_eq!(state.validators[id].status, ValidatorStatus::Pooled);
+        }
+        // Both children terminal; the parent is a pending placeholder
+        // that can't project as a snap-sync anchor.
+        assert_eq!(state.boundaries[&left].terminal_epoch, Some(Epoch::new(5)));
+        assert_eq!(state.boundaries[&right].terminal_epoch, Some(Epoch::new(5)));
+        assert_eq!(state.boundaries[&parent].block_hash, BlockHash::ZERO);
+        assert_eq!(state.boundaries[&parent].last_live_epoch, Epoch::new(5));
+        // The mover shed its per-placement miss scope.
+        assert!(!state.miss_counters.contains_key(&keeper_ids[0]));
+    }
+
+    /// Two replicas with byte-identical state execute byte-identically —
+    /// the keeper draw and the merged committee are seeded, not
+    /// incidental.
+    #[test]
+    fn merge_execution_is_deterministic_across_replicas() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let mut a = merge_grow_state(0);
+        let mut b = merge_grow_state(0);
+        for state in [&mut a, &mut b] {
+            apply_shard_payload(state, left, &merge);
+            apply_shard_payload(state, right, &merge);
+            for (id, seat) in keepers_of(state, parent) {
+                apply_shard_payload(
+                    state,
+                    seat.child,
+                    &ShardWitnessPayload::ReshapeReady { validator: id },
+                );
+            }
+            execute_ready_merges(state);
+        }
+        assert_eq!(a.next_shard_committees, b.next_shard_committees);
+        assert_eq!(a.validators, b.validators);
+        assert_eq!(a.boundaries, b.boundaries);
+    }
+
+    /// The Phase 5 exit criterion, inverted: after the gate fires, the
+    /// epoch in flight still resolves routing against the two children
+    /// while the lookahead resolves the reunified parent, and the merged
+    /// committee starts at full ready strength.
+    #[test]
+    fn merge_lookahead_resolves_parent_while_active_resolves_children() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let sibling = ShardId::leaf(1, 1);
+        let mut state = merge_grow_state(0);
+        // Staff the sibling so both tries are prefix-complete.
+        let mut sibling_members = Vec::new();
+        for i in 100..104u64 {
+            let id = ValidatorId::new(i);
+            sibling_members.push(id);
+            state.validators.insert(
+                id,
+                validator_record(
+                    i,
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard: sibling,
+                        ready: true,
+                        placed_at_epoch: Epoch::GENESIS,
+                    },
+                ),
+            );
+        }
+        state.shard_committees.insert(
+            sibling,
+            ShardCommittee {
+                members: sibling_members.clone(),
+            },
+        );
+        state.next_shard_committees.insert(
+            sibling,
+            ShardCommittee {
+                members: sibling_members,
+            },
+        );
+
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+        for (id, seat) in keepers_of(&state, parent) {
+            apply_shard_payload(
+                &mut state,
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady { validator: id },
+            );
+        }
+        execute_ready_merges(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+
+        let active = state.derive_topology_snapshot(net());
+        let lookahead = state.derive_next_topology_snapshot(net());
+        for seed in 0..32u8 {
+            let node = NodeId([seed; 30]);
+            let now = active.shard_for_node_id(&node);
+            let next = lookahead.shard_for_node_id(&node);
+            if now == left || now == right {
+                // The children's traffic remaps to their reunified parent.
+                assert_eq!(next, parent, "{node:?} routed to {next:?}");
+            } else {
+                // Anything outside the merge is untouched.
+                assert_eq!(now, sibling);
+                assert_eq!(next, sibling);
+            }
+        }
+        // The merged committee starts at full ready strength.
+        assert_eq!(state.next_shard_committees[&parent].members.len(), 4);
+        let ready = state.ready_consensus_members(&state.next_shard_committees);
+        assert_eq!(ready[&parent].len(), 4);
+        // The pending placeholder never projects as a snap-sync anchor.
+        assert!(lookahead.boundary(parent).is_none());
     }
 }
