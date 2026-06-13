@@ -21,8 +21,8 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, FinalizedWave,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
-    Round, RoutableTransaction, ShardId, TxHash, ValidatorId, Verifiable, Verified, WaveId,
-    WeightedTimestamp,
+    Round, RoutableTransaction, ShardId, TopologySnapshot, TxHash, ValidatorId, Verifiable,
+    Verified, WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -317,6 +317,7 @@ pub fn assemble_build_action(
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     beacon_witness_base: BeaconWitnessLeafCount,
     carry_split_child_roots: bool,
+    classification_topology: Arc<TopologySnapshot>,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -396,6 +397,7 @@ pub fn assemble_build_action(
         beacon_witness_leaf_count,
         beacon_witness_base,
         carry_split_child_roots,
+        classification_topology,
     };
 
     BuildActionPlan {

@@ -701,6 +701,7 @@ where
             beacon_witness_leaf_count,
             beacon_witness_base,
             carry_split_child_roots,
+            classification_topology,
         } => {
             let view = ctx
                 .pending_chain
@@ -720,7 +721,7 @@ where
                 transactions,
                 finalized_waves.clone(),
                 shard_id,
-                ctx.topology_snapshot,
+                &classification_topology,
                 provisions.clone(),
                 parent_in_flight,
                 finalized_tx_count,

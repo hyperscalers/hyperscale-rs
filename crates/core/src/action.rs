@@ -737,6 +737,13 @@ pub enum Action {
         /// from the JMT computation and stamps them into the header as
         /// `split_child_roots`.
         carry_split_child_roots: bool,
+        /// The block's **anchored** committee snapshot, resolved by the
+        /// coordinator as `at_for_shard(local_shard, parent_qc.wt)` — the
+        /// same one the verifier recomputes against. Classification
+        /// (`waves`, `provision_tx_roots`) keys on this, not the `ArcSwap`
+        /// head, so a head-flipped proposer at a reshape boundary produces
+        /// a header that resolves identically on every replica.
+        classification_topology: Arc<TopologySnapshot>,
     },
 
     /// Execute every transaction in a single-shard wave.

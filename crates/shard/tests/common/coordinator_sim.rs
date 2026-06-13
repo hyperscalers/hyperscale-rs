@@ -996,6 +996,7 @@ impl ShardCoordinatorSim {
                 beacon_witness_leaf_count,
                 beacon_witness_base,
                 carry_split_child_roots,
+                classification_topology,
             } => {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
@@ -1014,7 +1015,7 @@ impl ShardCoordinatorSim {
                     transactions,
                     finalized_waves.clone(),
                     shard_id,
-                    self.topology.head(),
+                    &classification_topology,
                     provisions.clone(),
                     parent_in_flight,
                     finalized_tx_count,

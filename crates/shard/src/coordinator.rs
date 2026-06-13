@@ -1539,6 +1539,7 @@ impl ShardCoordinator {
             preview.leaf_count,
             preview.base,
             carry_split_child_roots,
+            Arc::clone(committee),
         );
 
         info!(
@@ -7189,6 +7190,81 @@ mod tests {
         // The retry at the same view must be a no-op, not a sibling build.
         let retry = state.try_propose(&topology, &[], vec![], vec![]);
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
+    }
+
+    #[test]
+    fn build_proposal_classifies_against_the_anchored_committee_not_the_head() {
+        // The proposed block anchors at its `parent_qc` weighted timestamp
+        // (epoch 0, where ROOT is one shard). The schedule's head has
+        // already flipped to the post-split window (two shards). The
+        // verifier recomputes `waves`/`provision_tx_roots` against the
+        // anchored window, so the proposer must classify against it too —
+        // never the flipped head — or every replica rejects the header.
+        let (mut state, _) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = parent;
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(500);
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.latest_qc = Some({
+            let __qc = make_test_qc(parent, BlockHeight::new(3));
+            // SAFETY: synthetic test fixture, no real signature. Anchored at
+            // epoch 0 (wt 500 with a 1000 ms epoch).
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_id(),
+                __qc.height(),
+                BlockHash::ZERO,
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(500),
+            ))
+        });
+        state.view_change.view = Round::new(4);
+
+        // Epoch 0 carries ROOT (one shard) — the proposal's anchor; epoch 1
+        // splits it (two shards) and is installed as the flipped head.
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let pre_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let post_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre_split));
+        sched.insert(Epoch::new(1), Arc::clone(&post_split));
+        sched.set_head(post_split);
+
+        let actions = state.try_propose(&sched, &[], vec![], vec![]);
+        let classification = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::BuildProposal {
+                    classification_topology,
+                    ..
+                } => Some(classification_topology),
+                _ => None,
+            })
+            .expect("a BuildProposal must dispatch");
+        assert_eq!(
+            classification.num_shards(),
+            1,
+            "classification anchors at the parent_qc window (ROOT, pre-split), not the two-shard head",
+        );
     }
 
     #[test]
