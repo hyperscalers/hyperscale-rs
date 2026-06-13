@@ -2013,6 +2013,31 @@ impl ExecutionCoordinator {
             .on_txs_terminated(tx_hashes.iter().copied());
     }
 
+    /// Drop every pending wave and EC expectation. Called once when the
+    /// local chain terminates at a reshape boundary: finalization is a
+    /// wave certificate in a later block, and a terminated chain commits
+    /// no later block, so every pending wave here is permanently
+    /// undecidable. Serving state (aggregated ECs, finalized waves)
+    /// stays — peers still fetch what this chain produced.
+    pub fn abort_pending_waves(&mut self) -> Vec<Action> {
+        let counts = self.waves.drain_all();
+        let mut expected = self.expected_certs.drain_expected();
+        expected.sort();
+        tracing::info!(
+            waves = counts.waves,
+            trackers = counts.trackers,
+            assignments = counts.assignments,
+            expected_certs = expected.len(),
+            "Chain terminated — dropped pending execution state"
+        );
+        if expected.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+            ids: expected,
+        })]
+    }
+
     /// Prune stale wave state (waves, vote trackers, early votes).
     ///
     /// Waves stay alive while their `wave_assignment`s list them — an

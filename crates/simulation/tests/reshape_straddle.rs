@@ -33,8 +33,8 @@ use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, NodeId,
     PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, StateRoot,
-    TxHash, ValidatorId, ValidatorStatus, ed25519_keypair_from_seed, routable_from_notarized_v1,
-    sign_and_notarize,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -382,6 +382,7 @@ fn transfers_around_the_split_boundary_settle_atomically() {
     let mut settled_on_parent = 0u32;
     let mut straddlers = 0u32;
     let mut half_applied = 0u32;
+    let mut unswept_straddlers = 0u32;
     for (offset_ms, hash) in &probes {
         let (p_committed, p_finalized) = scan_chain(parent_store, BlockHeight::new(1), *hash);
         let child_fates: Vec<(ShardId, Option<BlockHeight>, Option<BlockHeight>)> = [left, right]
@@ -408,6 +409,14 @@ fn transfers_around_the_split_boundary_settle_atomically() {
             let settled_children = child_fates.iter().filter(|(_, _, f)| f.is_some()).count();
             if settled_children == 1 {
                 half_applied += 1;
+            }
+            // The parent's terminal sweep must have driven the
+            // undecidable tx to its terminal abort on the parent host.
+            if !matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            ) {
+                unswept_straddlers += 1;
             }
         }
     }
@@ -445,5 +454,11 @@ fn transfers_around_the_split_boundary_settle_atomically() {
         half_applied == 0,
         "{half_applied} straddling transfer(s) finalized on exactly one child \
          — the boundary half-applied a cross-child transfer;\n{report}",
+    );
+    assert!(
+        unswept_straddlers == 0,
+        "{unswept_straddlers} straddling transfer(s) never reached \
+         completed(aborted) on the parent host — the terminal sweep must \
+         abort what no later block can decide;\n{report}",
     );
 }

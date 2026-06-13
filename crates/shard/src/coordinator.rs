@@ -518,7 +518,10 @@ impl ShardCoordinator {
     /// committed chain. From here the chain stops — no proposals, no new
     /// headers, no timeouts; the post-split children take over at the
     /// next boundary and stragglers reach this tip via block sync.
-    fn chain_terminated(&self, topology: &TopologySchedule) -> bool {
+    /// Drivers key the one-shot terminal sweep (aborting in-flight
+    /// transactions that no later block can ever decide) on this flip.
+    #[must_use]
+    pub fn chain_terminated(&self, topology: &TopologySchedule) -> bool {
         self.past_terminal_window(topology, self.committed_anchor_ts)
     }
 

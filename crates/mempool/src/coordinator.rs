@@ -504,6 +504,53 @@ impl MempoolCoordinator {
         self.tombstones.is_tombstoned(tx_hash)
     }
 
+    /// Drive every in-flight (`Committed`) transaction to
+    /// `Completed(Aborted)`. Called once when the local chain terminates
+    /// at a reshape boundary: finalization is a wave certificate in a
+    /// later block, and a terminated chain commits no later block, so an
+    /// in-flight tx here is permanently undecidable — abort is its
+    /// terminal state.
+    ///
+    /// Lock release is deliberately unfiltered (every declared node, not
+    /// just the ones the current topology routes locally): the head trie
+    /// has already re-routed this shard's nodes to its children, so a
+    /// topology-filtered release would miss exactly the locks this chain
+    /// took, and a terminated chain's lock set dies with it regardless.
+    pub fn abort_in_flight(&mut self) -> Vec<Action> {
+        let mut in_flight: Vec<TxHash> = self
+            .pool
+            .iter()
+            .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Committed(_)))
+            .map(|(hash, _)| *hash)
+            .collect();
+        in_flight.sort_unstable();
+
+        let mut actions = Vec::with_capacity(in_flight.len());
+        for tx_hash in in_flight {
+            let Some(entry) = self.pool.remove(&tx_hash) else {
+                continue;
+            };
+            let newly_unlocked = self
+                .locks
+                .unlock_nodes(entry.tx.all_declared_nodes().copied());
+            for node in newly_unlocked {
+                self.promote_transactions_for_node(node);
+            }
+            self.locks.dec_in_flight();
+            self.remove_from_ready_tracking(&tx_hash);
+            self.tombstones
+                .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+            record_transaction_aborted();
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash,
+                status: TransactionStatus::Completed(TransactionDecision::Aborted),
+                cross_shard: entry.cross_shard,
+                submitted_locally: entry.submitted_locally,
+            });
+        }
+        actions
+    }
+
     /// Process a committed block - update statuses and finalize transactions.
     ///
     /// This handles:
@@ -1073,7 +1120,7 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
     use hyperscale_types::Verified;
-    use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
+    use hyperscale_types::test_utils::{test_node, test_transaction, test_transaction_with_nodes};
 
     /// Test-only convenience: wrap any `RoutableTransaction` in a
     /// `Verified` witness via the test-only gate.
@@ -1654,6 +1701,50 @@ mod tests {
             mempool.status(&tx_hash).is_none(),
             "Transaction should be evicted from pool after Aborted"
         );
+    }
+
+    /// A terminated chain commits no later block, so its in-flight
+    /// transactions can never be decided: the terminal sweep aborts
+    /// them — terminal status emitted, locks released, entry
+    /// tombstoned, in-flight count zeroed.
+    #[test]
+    fn abort_in_flight_drives_committed_txs_terminal() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+
+        let tx = test_transaction_with_nodes(b"straddler", vec![test_node(7)], vec![test_node(8)]);
+        let tx_hash = tx.hash();
+
+        // Commit the tx with no deciding wave certificate: in flight,
+        // holding its declared-node locks.
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+            vec![],
+        );
+        mempool.on_block_committed(&topology, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        assert_eq!(mempool.in_flight(), 1);
+        assert!(mempool.lock_contention_stats().locked_nodes > 0);
+
+        let actions = mempool.abort_in_flight();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::EmitTransactionStatus {
+                    tx_hash: h,
+                    status: TransactionStatus::Completed(TransactionDecision::Aborted),
+                    ..
+                } if *h == tx_hash
+            )),
+            "sweep must emit the terminal abort status"
+        );
+        assert_eq!(mempool.in_flight(), 0);
+        assert_eq!(mempool.lock_contention_stats().locked_nodes, 0);
+        assert!(mempool.status(&tx_hash).is_none());
+        assert!(mempool.is_tombstoned(&tx_hash));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

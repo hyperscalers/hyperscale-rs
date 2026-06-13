@@ -265,6 +265,18 @@ impl ExpectedCertTracker {
         });
     }
 
+    /// Drop every active expectation, returning the wave ids so the
+    /// caller can abandon their in-flight fallback fetches. Used when
+    /// the local chain terminates at a reshape boundary — no local wave
+    /// can consume a fetched EC anymore. Fulfilled tombstones stay;
+    /// they only suppress re-registration.
+    pub fn drain_expected(&mut self) -> Vec<WaveId> {
+        self.expected
+            .drain()
+            .map(|(key, _)| key.2.clone())
+            .collect()
+    }
+
     /// Retro-stamp `discovered_at == ZERO` entries with `now_ts`.
     /// Remote headers can register expectations before our first local
     /// commit; without this, every such entry would report a ~57-year age
@@ -331,6 +343,33 @@ mod tests {
 
         assert!(t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w));
         assert_eq!(t.expected_len(), 1);
+    }
+
+    #[test]
+    fn drain_expected_empties_and_returns_wave_ids() {
+        let mut t = ExpectedCertTracker::new();
+        let w5 = wave(5);
+        let w6 = wave(6);
+        t.register(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(5),
+            w5.clone(),
+            ms(1000),
+        );
+        t.register(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(6),
+            w6.clone(),
+            ms(1000),
+        );
+
+        let mut drained = t.drain_expected();
+        drained.sort();
+        let mut registered = vec![w5.clone(), w6];
+        registered.sort();
+        assert_eq!(drained, registered);
+        assert_eq!(t.expected_len(), 0);
+        assert!(!t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w5));
     }
 
     #[test]

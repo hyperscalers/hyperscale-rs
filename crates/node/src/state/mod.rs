@@ -89,6 +89,12 @@ pub struct NodeStateMachine {
 
     /// This validator's home shard.
     local_shard: ShardId,
+
+    /// Latches the one-shot terminal sweep: when the local chain
+    /// terminates at a reshape boundary (the first coast commit), every
+    /// in-flight transaction and pending wave is aborted exactly once —
+    /// no later block can ever decide them.
+    terminal_chain_swept: bool,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -153,6 +159,7 @@ impl NodeStateMachine {
             now: LocalTimestamp::ZERO,
             me,
             local_shard,
+            terminal_chain_swept: false,
         }
     }
 

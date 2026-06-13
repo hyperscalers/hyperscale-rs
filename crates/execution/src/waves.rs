@@ -311,6 +311,25 @@ impl WaveRegistry {
 
     // ─── Pruning ────────────────────────────────────────────────────────
 
+    /// Drop every wave and everything keyed against it, returning the
+    /// counts. Used when the local chain terminates at a reshape
+    /// boundary: finalization is a wave certificate in a later block,
+    /// and a terminated chain commits no later block, so every pending
+    /// wave here is permanently undecidable.
+    pub fn drain_all(&mut self) -> PruneCounts {
+        let counts = PruneCounts {
+            waves: self.states.len(),
+            trackers: self.trackers.len(),
+            assignments: self.assignments.len(),
+        };
+        self.states.clear();
+        self.trackers.clear();
+        self.ec_dispatched.clear();
+        self.retries.clear();
+        self.assignments.clear();
+        counts
+    }
+
     /// Drop resolved waves and everything keyed against them.
     ///
     /// Waves whose `wave_id` no longer appears in `assignments.values()`
@@ -594,6 +613,30 @@ mod tests {
     }
 
     // ─── Pruning ───────────────────────────────────────────────────────
+
+    #[test]
+    fn drain_all_empties_every_table() {
+        let mut r = WaveRegistry::new();
+        let wid1 = wave(1);
+        let wid2 = wave(2);
+        let ws1 = make_wave_state(wid1.clone(), BlockHash::ZERO, 1);
+        let tx1 = ws1.tx_hashes()[0];
+        r.insert_wave(wid1.clone(), ws1);
+        r.assign_tx(tx1, wid1.clone());
+        r.insert_wave(
+            wid2.clone(),
+            make_wave_state(wid2.clone(), BlockHash::ZERO, 2),
+        );
+        r.mark_ec_dispatched(wid2.clone());
+
+        let counts = r.drain_all();
+        assert_eq!(counts.waves, 2);
+        assert_eq!(counts.assignments, 1);
+        assert!(!r.contains_wave(&wid1));
+        assert!(!r.contains_wave(&wid2));
+        assert!(!r.is_ec_dispatched(&wid2));
+        assert!(r.wave_assignment(tx1).is_none());
+    }
 
     #[test]
     fn prune_resolved_drops_waves_without_active_assignments() {

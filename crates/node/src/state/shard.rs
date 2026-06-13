@@ -434,6 +434,24 @@ impl NodeStateMachine {
 
         actions.extend(self.apply_block_to_execution(certified));
 
+        // The first coast commit terminates the chain: finalization is a
+        // wave certificate in a later block, and no later block will
+        // exist, so every still-in-flight transaction is permanently
+        // undecidable here. Drive them to their terminal abort and drop
+        // the execution state that was waiting on them — once, at the
+        // flip. Runs after the fan-out above so a final cert-carrying
+        // block terminalizes its transactions through the normal path
+        // first.
+        if !self.terminal_chain_swept
+            && self
+                .shard_coordinator
+                .chain_terminated(self.beacon_coordinator.topology_schedule())
+        {
+            self.terminal_chain_swept = true;
+            actions.extend(self.mempool_coordinator.abort_in_flight());
+            actions.extend(self.execution_coordinator.abort_pending_waves());
+        }
+
         // In-flight counts changed — latch a proposal attempt so the next
         // proposer can include newly ready transactions.
         self.shard_coordinator.queue_ready_proposal();
