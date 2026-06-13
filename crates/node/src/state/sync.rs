@@ -7,6 +7,7 @@
 //! participate in execution for blocks within the `WAVE_TIMEOUT` window.
 
 use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_shard::SettledWaveSet;
 
 use super::NodeStateMachine;
 
@@ -39,6 +40,19 @@ impl NodeStateMachine {
             // sync-mode state to reconcile on completion, so the event is
             // an acknowledged no-op.
             ProtocolEvent::RemoteHeaderSyncComplete { .. } => vec![],
+            // A past-terminal shard's settled set is reconstructed: record
+            // it for the split-boundary fence, then re-drive any votes
+            // that deferred for want of it.
+            ProtocolEvent::SettledWavesReconstructed {
+                shard,
+                waves,
+                terminal_wt,
+            } => {
+                self.shard_coordinator
+                    .record_settled_waves(shard, SettledWaveSet { waves, terminal_wt });
+                self.shard_coordinator
+                    .redrive_pending_votes(self.beacon_coordinator.topology_schedule())
+            }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }

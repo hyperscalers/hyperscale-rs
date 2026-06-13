@@ -5,6 +5,7 @@
 //! and never reach the state machine. This provides type-level enforcement of the
 //! boundary between protocol logic and I/O orchestration.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
@@ -681,6 +682,20 @@ pub enum ProtocolEvent {
         source_shard: ShardId,
         /// Height the sync caught up to.
         height: BlockHeight,
+    },
+
+    /// The `io_loop`'s settled-set driver finished reconstructing a
+    /// past-terminal shard's settled-wave set (see `SettledSetBuilder`).
+    /// `ShardCoordinator` records it for the split-boundary fence and
+    /// re-drives any votes that deferred for want of it.
+    SettledWavesReconstructed {
+        /// The terminated shard whose settled set this is.
+        shard: ShardId,
+        /// Wave-ids that shard settled at or before its terminal block.
+        waves: BTreeSet<WaveId>,
+        /// The terminated shard's terminal weighted timestamp — bounds
+        /// the fence's retention cutoff.
+        terminal_wt: WeightedTimestamp,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

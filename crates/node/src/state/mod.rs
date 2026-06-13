@@ -338,6 +338,7 @@ impl StateMachine for NodeStateMachine {
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
+            | ProtocolEvent::SettledWavesReconstructed { .. }
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
 
             // ── Beacon ───────────────────────────────────────────────────

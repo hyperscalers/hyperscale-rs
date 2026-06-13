@@ -550,10 +550,31 @@ impl ShardCoordinator {
     /// split-boundary fence. The driver reconstructs it from the
     /// terminated shard's tail chain (see `SettledSetBuilder`) and feeds
     /// it here; voting on a block whose finalized waves name `shard` then
-    /// resolves against the set instead of deferring. After recording,
-    /// the driver re-drives any votes that deferred on this shard.
+    /// resolves against the set instead of deferring. Pair with
+    /// [`Self::redrive_pending_votes`] to re-drive votes that deferred at
+    /// the fence before the set was known.
     pub fn record_settled_waves(&mut self, shard: ShardId, settled: SettledWaveSet) {
         self.settled_sets.insert(shard, settled);
+    }
+
+    /// Re-drive the vote path for every pending complete block. Called
+    /// after a settled set is recorded ([`Self::record_settled_waves`]):
+    /// blocks that deferred at the split-boundary fence for want of that
+    /// set can now resolve. `trigger_qc_verification_or_vote` is
+    /// idempotent (already-verified / already-voted short-circuit), so
+    /// re-driving every pending block is safe.
+    pub fn redrive_pending_votes(&mut self, topology: &TopologySchedule) -> Vec<Action> {
+        let pending: Vec<BlockHash> = self
+            .pending_blocks
+            .values()
+            .filter(|p| p.block().is_some())
+            .map(|p| p.header().hash())
+            .collect();
+        let mut actions = Vec::new();
+        for block_hash in pending {
+            actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
+        }
+        actions
     }
 
     /// The split-boundary fence over a block's committed finalized waves.
