@@ -9,7 +9,7 @@ use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
     CertifiedBeaconBlock, Epoch, NetworkDefinition, ObserverSeat, PendingReshape,
     QuorumCertificate, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitAdoption,
-    TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
+    SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
@@ -346,6 +346,12 @@ fn record_boundaries(
 
     let mut outcome = WitnessOutcome::default();
     let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
+    // Merge children whose terminal contribution — the coast block past
+    // their cut, carrying their frozen terminal root — landed this fold.
+    // A parent composes only once both its children appear here, so the
+    // composition reads each child's actual terminal root, never the
+    // pre-terminal anchor `execute_ready_merges` left on the record.
+    let mut terminal_recorded: BTreeSet<ShardId> = BTreeSet::new();
     for (shard, contribution) in shard_contributions {
         let header = &contribution.boundary_header;
         let block_hash = header.hash();
@@ -401,15 +407,26 @@ fn record_boundaries(
         refreshed.insert(*shard);
 
         // A terminal shard's contribution crossing its final cut is the
-        // chain's terminal block: seed the pending children from its
-        // header, and drop the record once the witness backlog has fully
-        // drained against it.
+        // chain's terminal block. A split parent seeds its pending
+        // children from the header's `split_child_roots`; a merge child
+        // carries none — its parent composes from both children's terminal
+        // roots in the post-loop pass below. Either record drops once its
+        // witness backlog has fully drained, but a merge child holds while
+        // its parent is still pending so the composition can read its root.
         if let Some(t) = terminal_epoch
             && epoch_of_wt(qc.weighted_timestamp(), dur) > t
         {
-            seed_split_children(state, *shard, header, qc, epoch);
-            if chunk_end == boundary_count {
-                state.boundaries.remove(shard);
+            let fully_drained = chunk_end == boundary_count;
+            if header.split_child_roots().is_some() {
+                seed_split_children(state, *shard, header, qc, epoch);
+                if fully_drained {
+                    state.boundaries.remove(shard);
+                }
+            } else {
+                terminal_recorded.insert(*shard);
+                if !merge_parent_pending(state, *shard) && fully_drained {
+                    state.boundaries.remove(shard);
+                }
             }
         }
     }
@@ -424,6 +441,11 @@ fn record_boundaries(
             boundary.consecutive_misses = boundary.consecutive_misses.saturating_add(1);
         }
     }
+
+    // Compose any merge parent whose two children both delivered their
+    // terminal contribution this fold, after the miss bump so the freshly
+    // composed anchor starts clean.
+    compose_merge_parents(state, epoch, dur, &terminal_recorded);
 
     outcome
 }
@@ -496,6 +518,106 @@ fn seed_split_children(
             },
         );
     }
+}
+
+/// Whether `shard` is a merge child whose parent hasn't composed yet —
+/// the parent still carries a pending placeholder boundary (zero hash).
+/// A merge child holds its terminal record until then so its sibling can
+/// still read its root for the composition.
+fn merge_parent_pending(state: &BeaconState, shard: ShardId) -> bool {
+    shard
+        .parent()
+        .and_then(|parent| state.boundaries.get(&parent))
+        .is_some_and(|b| b.block_hash == BlockHash::ZERO)
+}
+
+/// Compose every pending merge parent whose two children both delivered
+/// their terminal contribution this fold (in `terminal_recorded`).
+///
+/// The beacon holds only `r_p0`/`r_p1` and can't decompose a single
+/// `r_p`, so it composes the merged anchor itself —
+/// `r_p = hash_internal(r_p0, r_p1)` — and seeds the placeholder with the
+/// deterministic merged genesis (the same block every keeper installs).
+/// The two children then drain and drop on subsequent folds, once their
+/// parent is no longer pending. Both terminal records linger and are
+/// re-sourced every fold until then, so the fold after the later child
+/// terminates carries both here.
+fn compose_merge_parents(
+    state: &mut BeaconState,
+    epoch: Epoch,
+    epoch_duration_ms: u64,
+    terminal_recorded: &BTreeSet<ShardId>,
+) {
+    let mut parents: BTreeSet<ShardId> = BTreeSet::new();
+    for child in terminal_recorded {
+        let Some(parent) = child.parent() else {
+            continue;
+        };
+        let (left, right) = parent.children();
+        // Both children recorded their terminal this fold, and the parent
+        // is still a pending placeholder (zero hash, post-genesis) — a
+        // split-child placeholder has no children, so this never matches
+        // one.
+        if terminal_recorded.contains(&left)
+            && terminal_recorded.contains(&right)
+            && state.boundaries.get(&parent).is_some_and(|b| {
+                b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS
+            })
+        {
+            parents.insert(parent);
+        }
+    }
+    for parent in parents {
+        compose_merge_parent(state, parent, epoch, epoch_duration_ms);
+    }
+}
+
+fn compose_merge_parent(
+    state: &mut BeaconState,
+    parent: ShardId,
+    epoch: Epoch,
+    epoch_duration_ms: u64,
+) {
+    let (left, right) = parent.children();
+    let left_b = state.boundaries[&left];
+    let right_b = state.boundaries[&right];
+    // Both children cross the same cut, so either terminal epoch yields
+    // it: the merged chain's clock anchors there, placing its first block
+    // in the epoch after the children's final one.
+    let terminal_epoch = left_b
+        .terminal_epoch
+        .expect("filtered as a recorded terminal");
+    let cut_wt = WeightedTimestamp::from_millis(
+        (terminal_epoch.inner() + 1).saturating_mul(epoch_duration_ms),
+    );
+    let composed = SplitChildRoots {
+        left: left_b.state_root,
+        right: right_b.state_root,
+    }
+    .composed_root();
+    let genesis = BlockHeader::merge_parent_genesis(
+        parent,
+        composed,
+        (left_b.block_hash, left_b.height),
+        (right_b.block_hash, right_b.height),
+        cut_wt,
+    );
+    state.boundaries.insert(
+        parent,
+        ShardBoundary {
+            state_root: composed,
+            block_hash: genesis.hash(),
+            height: genesis.height(),
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: epoch,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+        },
+    );
+    tracing::info!(
+        ?parent,
+        "Merged shard anchor composed from terminal child roots"
+    );
 }
 
 #[cfg(test)]
@@ -1418,6 +1540,205 @@ mod tests {
         assert!(
             !state.boundaries.contains_key(&parent),
             "drained and dropped"
+        );
+    }
+
+    // ─── merge parent composition ────────────────────────────────────────
+
+    /// A pending merge parent (zero-hash placeholder, final epoch 1, cut
+    /// at 2000ms) whose two children are live with real anchors marked
+    /// terminal at epoch 1. The terminal roots seed the contributions.
+    fn merge_terminating_state() -> (BeaconState, ShardId, StateRoot, StateRoot) {
+        let mut state = single_pool_state(0);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let left_root = StateRoot::from_raw(Hash::from_bytes(b"left terminal root"));
+        let right_root = StateRoot::from_raw(Hash::from_bytes(b"right terminal root"));
+        for (child, root, height) in [(left, left_root, 7), (right, right_root, 8)] {
+            state.boundaries.insert(
+                child,
+                ShardBoundary {
+                    state_root: root,
+                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+                    height: BlockHeight::new(height),
+                    witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    last_live_epoch: Epoch::new(1),
+                    consecutive_misses: 0,
+                    terminal_epoch: Some(Epoch::new(1)),
+                },
+            );
+        }
+        state.boundaries.insert(
+            parent,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::GENESIS,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::new(1),
+                consecutive_misses: 0,
+                terminal_epoch: None,
+            },
+        );
+        (state, parent, left_root, right_root)
+    }
+
+    /// The merged anchor a keeper installs for the given terminal pair.
+    fn expected_merge_anchor(
+        parent: ShardId,
+        left: &BlockHeader,
+        right: &BlockHeader,
+        cut_ms: u64,
+    ) -> BlockHeader {
+        let composed = SplitChildRoots {
+            left: left.state_root(),
+            right: right.state_root(),
+        }
+        .composed_root();
+        BlockHeader::merge_parent_genesis(
+            parent,
+            composed,
+            (left.hash(), left.height()),
+            (right.hash(), right.height()),
+            WeightedTimestamp::from_millis(cut_ms),
+        )
+    }
+
+    /// Both children's terminal contributions in one fold compose the
+    /// parent — `hash_internal(r_p0, r_p1)` and the deterministic merged
+    /// genesis — while the children hold their terminal records so the
+    /// composition can still read both roots.
+    #[test]
+    fn terminal_children_compose_the_merge_parent() {
+        let (mut state, parent, left_root, right_root) = merge_terminating_state();
+        let (left, right) = parent.children();
+
+        let (lh, lw) = boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None);
+        let (rh, rw) =
+            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None);
+        let proposal = BeaconProposal::new(
+            [
+                (left, Some(qc_over(&lh, 2_500))),
+                (right, Some(qc_over(&rh, 2_500))),
+            ]
+            .into_iter()
+            .collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions = [
+            (
+                left,
+                ShardEpochContribution {
+                    boundary_header: lh.clone(),
+                    witnesses: lw.into(),
+                },
+            ),
+            (
+                right,
+                ShardEpochContribution {
+                    boundary_header: rh.clone(),
+                    witnesses: rw.into(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+
+        let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
+        let record = state.boundaries.get(&parent).expect("parent composed");
+        assert_eq!(record.state_root, anchor.state_root());
+        assert_eq!(record.block_hash, anchor.hash());
+        assert_eq!(record.height, BlockHeight::new(11));
+        assert_eq!(record.terminal_epoch, None);
+        // The children hold their terminal records this fold so both
+        // roots stay readable for the composition.
+        assert!(state.boundaries.contains_key(&left));
+        assert!(state.boundaries.contains_key(&right));
+    }
+
+    /// A lone terminal child holds its record across folds until its
+    /// sibling lands and the parent composes; once the parent is no
+    /// longer pending, the children drain and drop.
+    #[test]
+    fn a_lone_terminal_child_holds_until_its_sibling_composes_the_parent() {
+        let (mut state, parent, left_root, right_root) = merge_terminating_state();
+        let (left, right) = parent.children();
+        let (lh, lw) = boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None);
+        let (rh, rw) =
+            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None);
+
+        // Both children's terminal records, sourced together — the
+        // proposer re-sources every lingering terminal record each fold.
+        let both = |left_qc_wt: u64, right_qc_wt: u64| {
+            let proposal = BeaconProposal::new(
+                [
+                    (left, Some(qc_over(&lh, left_qc_wt))),
+                    (right, Some(qc_over(&rh, right_qc_wt))),
+                ]
+                .into_iter()
+                .collect(),
+                Vec::new(),
+                VrfProof::ZERO,
+            );
+            let committed = vec![(ValidatorId::new(0), proposal)];
+            let contributions = [
+                (
+                    left,
+                    ShardEpochContribution {
+                        boundary_header: lh.clone(),
+                        witnesses: lw.clone().into(),
+                    },
+                ),
+                (
+                    right,
+                    ShardEpochContribution {
+                        boundary_header: rh.clone(),
+                        witnesses: rw.clone().into(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+            (committed, contributions)
+        };
+
+        // Fold E: only the left child terminates. It is held (the parent
+        // can't compose without the sibling) and the parent stays pending.
+        let (committed, contributions) = contribution_for(left, lh.clone(), lw.clone(), 2_500);
+        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        assert!(state.boundaries.contains_key(&left), "left held");
+        assert_eq!(
+            state.boundaries[&parent].block_hash,
+            BlockHash::ZERO,
+            "parent still pending"
+        );
+
+        // Fold E+1: the right child lands while the left re-sources; both
+        // terminals are recorded this fold, so the parent composes.
+        let (committed, contributions) = both(2_500, 2_500);
+        record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
+        assert_eq!(state.boundaries[&parent].block_hash, anchor.hash());
+        assert!(
+            state.boundaries.contains_key(&left),
+            "children held at compose"
+        );
+
+        // Fold E+2: the drained children re-source again and, with the
+        // parent composed, drop.
+        let (committed, contributions) = both(2_500, 2_500);
+        record_boundaries(&mut state, Epoch::new(4), &committed, &contributions);
+        assert!(!state.boundaries.contains_key(&left), "left drops");
+        assert!(!state.boundaries.contains_key(&right), "right drops");
+        assert_eq!(
+            state.boundaries[&parent].block_hash,
+            anchor.hash(),
+            "parent anchor unchanged"
         );
     }
 

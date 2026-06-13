@@ -209,6 +209,69 @@ impl BlockHeader {
         }
     }
 
+    /// The deterministic genesis header of a merged parent adopting
+    /// `state_root` — the internal node `hash_internal(r_p0, r_p1)` over
+    /// its two children's terminal subtree roots.
+    ///
+    /// Pure over `(parent, state_root, both terminal block hashes and
+    /// heights, the cut weighted timestamp)`, so the beacon fold composes
+    /// the same anchor every keeper installs. The merged chain continues
+    /// both children's height lines at `max(h_p0, h_p1) + 1`, its clock
+    /// anchored at the cut (the boundary the children terminated at, which
+    /// places the merged chain's first block in the epoch after their
+    /// final one). Provenance rides `parent_block_hash` — the taller
+    /// child's terminal block, the structural predecessor of `max + 1`,
+    /// ties breaking to the left child. The proposer is a genesis sentinel
+    /// (`0`): a structural genesis is never proposed, so the field carries
+    /// no committee meaning and both sides set it identically.
+    ///
+    /// Each terminal is its child's `(block hash, height)` — exactly what
+    /// the beacon tracks in [`ShardBoundary`](crate::ShardBoundary) and
+    /// what a keeper reads off the child's terminal block.
+    #[must_use]
+    pub fn merge_parent_genesis(
+        parent: ShardId,
+        state_root: StateRoot,
+        left_terminal: (BlockHash, BlockHeight),
+        right_terminal: (BlockHash, BlockHeight),
+        cut_wt: WeightedTimestamp,
+    ) -> Self {
+        let (left_terminal_hash, left_terminal_height) = left_terminal;
+        let (right_terminal_hash, right_terminal_height) = right_terminal;
+        let genesis_height = left_terminal_height.max(right_terminal_height).next();
+        let parent_block_hash = if right_terminal_height > left_terminal_height {
+            right_terminal_hash
+        } else {
+            left_terminal_hash
+        };
+        let origin = ChainOrigin {
+            genesis_height,
+            anchor_wt: cut_wt,
+        };
+        Self {
+            shard_id: parent,
+            height: genesis_height,
+            parent_block_hash,
+            parent_qc: Verified::<QuorumCertificate>::genesis(parent, origin).into(),
+            proposer: ValidatorId::new(0),
+            timestamp: ProposerTimestamp::ZERO,
+            round: Round::INITIAL,
+            is_fallback: false,
+            state_root,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
+            in_flight: InFlightCount::ZERO,
+            beacon_witness_root: BeaconWitnessRoot::ZERO,
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
+            split_child_roots: None,
+        }
+    }
+
     /// Shard group this block belongs to.
     ///
     /// Makes headers self-describing for cross-shard verification. A remote shard
@@ -661,6 +724,48 @@ mod tests {
         assert_eq!(a.parent_block_hash(), parent_terminal.hash());
         assert_eq!(a.state_root(), root);
         assert_eq!(a.split_child_roots(), None);
+    }
+
+    /// A merged parent's genesis is a pure function of its two children's
+    /// terminals: byte-identical across the beacon fold and every keeper,
+    /// structurally genesis, continuing both height lines at `max + 1`
+    /// with the clock at the cut and the taller terminal as provenance.
+    #[test]
+    fn merge_parent_genesis_is_deterministic_and_structural() {
+        let parent = ShardId::ROOT;
+        let root = StateRoot::from_raw(Hash::from_bytes(b"merged subtree"));
+        let cut = WeightedTimestamp::from_millis(50_000);
+        let left = (
+            BlockHash::from_raw(Hash::from_bytes(b"left terminal")),
+            BlockHeight::new(40),
+        );
+        let right = (
+            BlockHash::from_raw(Hash::from_bytes(b"right terminal")),
+            BlockHeight::new(42),
+        );
+
+        let a = BlockHeader::merge_parent_genesis(parent, root, left, right, cut);
+        let b = BlockHeader::merge_parent_genesis(parent, root, left, right, cut);
+        assert_eq!(a.hash(), b.hash());
+
+        assert!(a.is_genesis());
+        // Continues both height lines at max + 1.
+        assert_eq!(a.height(), BlockHeight::new(43));
+        assert_eq!(a.parent_qc().height(), a.height());
+        assert_eq!(a.parent_qc().weighted_timestamp(), cut);
+        // The taller terminal (right, h42) is the structural predecessor.
+        assert_eq!(a.parent_block_hash(), right.0);
+        assert_eq!(a.state_root(), root);
+        assert_eq!(a.split_child_roots(), None);
+
+        // A height tie breaks to the left child.
+        let tied_right = (
+            BlockHash::from_raw(Hash::from_bytes(b"tied right")),
+            BlockHeight::new(40),
+        );
+        let tied = BlockHeader::merge_parent_genesis(parent, root, left, tied_right, cut);
+        assert_eq!(tied.parent_block_hash(), left.0);
+        assert_eq!(tied.height(), BlockHeight::new(41));
     }
 
     /// `split_child_roots` is hash-affecting header content: a populated

@@ -205,6 +205,33 @@ impl Block {
         }
     }
 
+    /// The deterministic genesis block of a merged parent — empty,
+    /// wrapping [`BlockHeader::merge_parent_genesis`]. The beacon fold
+    /// composes the parent's anchor from its children's terminal roots
+    /// and seeds it with this block's hash; the keeper flip installs the
+    /// same block.
+    #[must_use]
+    pub fn merge_parent_genesis(
+        parent: ShardId,
+        state_root: StateRoot,
+        left_terminal: (BlockHash, BlockHeight),
+        right_terminal: (BlockHash, BlockHeight),
+        cut_wt: WeightedTimestamp,
+    ) -> Self {
+        Self::Live {
+            header: BlockHeader::merge_parent_genesis(
+                parent,
+                state_root,
+                left_terminal,
+                right_terminal,
+                cut_wt,
+            ),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
+        }
+    }
+
     /// Block header — present in both variants.
     #[must_use]
     pub const fn header(&self) -> &BlockHeader {
