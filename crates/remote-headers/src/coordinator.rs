@@ -11,14 +11,16 @@
 //! `RemoteHeaderSync` then runs sliding-window catch-up.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ScheduleLookup, ShardId,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
+    AwaitingTopologyBuffer, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock,
+    CertifiedBlockHeader, CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION,
+    ScheduleLookup, ShardId, TopologySchedule, TopologySnapshot, ValidatorId, Verified,
+    WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -37,6 +39,26 @@ const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// batch size, so a single round-trip can close a long gap without
 /// requiring repeated target bumps.
 const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
+
+/// A terminated remote shard's terminal block, captured from the first
+/// coast header that shard's committee gossips after its split cut.
+///
+/// The coast header is the first block past the shard's terminal window;
+/// its parent QC commits the terminal block `B`. A counterpart seeds its
+/// settled-set reconstruction from this anchor (the backward walk starts
+/// at `B`), and the fence's retention cutoff measures against
+/// `terminal_wt`. QC-attested: the parent QC was verified before the
+/// coast header was admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalAnchor {
+    /// Hash of the terminated shard's terminal block `B`.
+    pub block_hash: BlockHash,
+    /// Height of `B`.
+    pub height: BlockHeight,
+    /// `B`'s committee anchor — the weighted timestamp at which the
+    /// shard terminated.
+    pub terminal_wt: WeightedTimestamp,
+}
 
 /// Remote header coordinator memory statistics for monitoring collection sizes.
 #[allow(missing_docs)] // flat counters; field names are the documentation
@@ -142,6 +164,13 @@ pub struct RemoteHeaderCoordinator {
     /// committee isn't globally fixed, so a buffered header means *we* are
     /// behind.
     awaiting: AwaitingTopologyBuffer<(ValidatorId, Arc<CertifiedBlockHeader>)>,
+
+    /// Terminal anchors of remote shards observed to have terminated at a
+    /// split, captured from their coast headers. Seeds a counterpart's
+    /// settled-set reconstruction and the fence's retention cutoff. The
+    /// earliest coast header for a shard wins — it names the true
+    /// terminal block.
+    terminal_anchors: HashMap<ShardId, TerminalAnchor>,
 }
 
 impl RemoteHeaderCoordinator {
@@ -157,6 +186,52 @@ impl RemoteHeaderCoordinator {
             local_committed_ts: WeightedTimestamp::ZERO,
             local_shard,
             awaiting: AwaitingTopologyBuffer::new(),
+            terminal_anchors: HashMap::new(),
+        }
+    }
+
+    /// The terminal anchor of a remote shard observed to have terminated
+    /// at a split, captured from its coast header. `None` until the first
+    /// coast header arrives. Seeds settled-set reconstruction for the
+    /// fence.
+    #[must_use]
+    pub fn terminal_anchor(&self, shard: ShardId) -> Option<TerminalAnchor> {
+        self.terminal_anchors.get(&shard).copied()
+    }
+
+    /// Capture a terminated shard's terminal anchor from a freshly
+    /// verified coast header — one whose parent QC's weighted timestamp
+    /// falls past the shard's terminal window, so the QC commits the
+    /// crossing's terminal block. The earliest such header wins (names
+    /// the true terminal `B`); later coast headers commit higher coast
+    /// blocks and are ignored.
+    fn capture_terminal_anchor(
+        &mut self,
+        topology: &TopologySchedule,
+        header: &CertifiedBlockHeader,
+    ) {
+        let shard = header.shard_id();
+        let parent_qc = header.header().parent_qc();
+        if !topology
+            .lookup_for_shard(shard, parent_qc.weighted_timestamp())
+            .1
+        {
+            return;
+        }
+        let anchor = TerminalAnchor {
+            block_hash: parent_qc.block_hash(),
+            height: parent_qc.height(),
+            terminal_wt: parent_qc.weighted_timestamp(),
+        };
+        match self.terminal_anchors.entry(shard) {
+            Entry::Occupied(mut existing) => {
+                if anchor.height < existing.get().height {
+                    existing.insert(anchor);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(anchor);
+            }
         }
     }
 
@@ -419,6 +494,11 @@ impl RemoteHeaderCoordinator {
             height = height.inner(),
             "Remote header QC verified — promoting"
         );
+
+        // A coast header certifies a split crossing — capture the
+        // terminated shard's terminal block so a counterpart can
+        // reconstruct its settled set and the fence can resolve.
+        self.capture_terminal_anchor(topology, &verified);
 
         let verified = Arc::new(verified);
         self.verified.insert(key, Arc::clone(&verified));
@@ -1028,5 +1108,79 @@ mod tests {
             verify_qc_keys(&drained).is_none(),
             "dropped siblings must not re-dispatch on beacon catch-up",
         );
+    }
+
+    /// A verified `Verified<CertifiedBlockHeader>` for the coast header at
+    /// `height` whose parent QC (committing the terminal block `B` at
+    /// `height - 1`) is anchored at `parent_qc_wt`.
+    fn verified_remote_header(
+        shard: ShardId,
+        height: BlockHeight,
+        parent_qc_wt: u64,
+    ) -> Verified<CertifiedBlockHeader> {
+        let (header, qc) =
+            Arc::unwrap_or_clone(remote_header(shard, height, parent_qc_wt)).into_parts();
+        Verified::<CertifiedBlockHeader>::from_qc_attestation(
+            header,
+            Verified::<QuorumCertificate>::new_unchecked_for_test(qc.into_unverified()),
+        )
+        .expect("fixture qc commits its header")
+    }
+
+    /// A coast header from a terminated shard captures that shard's
+    /// terminal anchor — the parent QC's block as `B`, at its weighted
+    /// timestamp.
+    #[test]
+    fn captures_terminal_anchor_from_coast_header() {
+        const ED: u64 = 1_000;
+        let ids = [0u64, 1, 2, 3];
+        // ROOT governs epoch 0, then splits into its two children for
+        // epoch 1 — so any weighted timestamp in epoch 1 is past ROOT's
+        // terminal window.
+        let mut schedule =
+            TopologySchedule::new(ED, Epoch::new(0), Arc::new(shard_snapshot(1, &ids, 0)));
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 0)));
+
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+        assert!(coord.terminal_anchor(ShardId::ROOT).is_none());
+
+        // ROOT's first coast header (h6) — its parent QC commits the
+        // terminal block at h5, anchored at wt 1500 (epoch 1, past
+        // ROOT's terminal window).
+        let coast = verified_remote_header(ShardId::ROOT, BlockHeight::new(6), 1_500);
+        let _ = coord.on_remote_header_qc_verified(
+            &schedule,
+            ShardId::ROOT,
+            BlockHeight::new(6),
+            ValidatorId::new(0),
+            Ok(coast),
+        );
+
+        let anchor = coord
+            .terminal_anchor(ShardId::ROOT)
+            .expect("coast header captures the terminal anchor");
+        assert_eq!(anchor.height, BlockHeight::new(5));
+        assert_eq!(anchor.terminal_wt, WeightedTimestamp::from_millis(1_500));
+    }
+
+    /// A live remote shard's header — parent QC inside its own window —
+    /// captures no terminal anchor.
+    #[test]
+    fn live_remote_header_captures_no_anchor() {
+        const ED: u64 = 1_000;
+        let ids = [0u64, 1, 2, 3];
+        let remote = ShardId::leaf(1, 1);
+        let schedule = TopologySchedule::single(Arc::new(shard_snapshot(2, &ids, 0)));
+
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+        let live = verified_remote_header(remote, BlockHeight::new(5), ED);
+        let _ = coord.on_remote_header_qc_verified(
+            &schedule,
+            remote,
+            BlockHeight::new(5),
+            ValidatorId::new(1),
+            Ok(live),
+        );
+        assert!(coord.terminal_anchor(remote).is_none());
     }
 }

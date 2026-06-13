@@ -712,8 +712,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use std::sync::Arc;
 
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
-        GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledWavesRequest,
+        GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
     use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
@@ -727,6 +727,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
     use crate::shard_io::sync::block_serve::serve_block_request;
     use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
+    use crate::shard_io::sync::settled_waves_serve::serve_settled_waves_request;
 
     type ProvisionResponse = GetProvisionResponse;
     type ProvisionWaiter = Arc<(
@@ -1009,6 +1010,19 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetShardWitnessesRequest>(shard, move |req| {
             serve_shard_witnesses_request(&pending_chain, &req)
+        });
+
+    // ── settled_waves.request → committed-block settled-wave reveal ──
+    //
+    // A counterpart reconstructing this shard's settled set across a
+    // split boundary walks the tail chain backward; each request reveals
+    // one block's certificates' wave-ids, verifiable against the header's
+    // certificate root.
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetSettledWavesRequest>(shard, move |req| {
+            serve_settled_waves_request(&pending_chain, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

@@ -36,4 +36,4 @@
 
 mod coordinator;
 
-pub use coordinator::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats};
+pub use coordinator::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats, TerminalAnchor};
