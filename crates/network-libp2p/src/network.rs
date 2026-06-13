@@ -15,8 +15,8 @@ use hyperscale_network::{
     ResponseVerdict, Topic, ValidatorKeyMap,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkMessage, Request, ShardId, TopicScope, TopologySnapshot,
-    ValidatorId,
+    GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
+    TopologySnapshot, ValidatorId,
 };
 use libp2p::PeerId;
 use sbor::{basic_decode, basic_encode};
@@ -71,9 +71,15 @@ pub struct Libp2pNetwork {
     /// at init and reconfiguration is single-threaded, so a plain mutex
     /// suffices.
     shard_gossip_types: Mutex<Vec<&'static str>>,
-    /// Topology snapshot used to resolve shard → committee for outbound
+    /// Topology snapshot used to resolve validator identity for outbound
     /// requests. Updated lock-free via [`Self::update_topology`].
     topology: Arc<ArcSwap<TopologySnapshot>>,
+    /// Terminal-clamped per-shard routing committees, covering live shards
+    /// and split parents still draining out of the head. Fetch routing
+    /// resolves `shard → committee` here so a request to a dissolved shard
+    /// still reaches its draining members. Updated lock-free via
+    /// [`Self::update_routing_committees`].
+    routing_committees: Arc<ArcSwap<RoutingCommittees>>,
     /// Count of `PeerUnreachable` errors (cold-start diagnostics).
     /// `Arc` so the wire-fetch path can read it from a spawned task that
     /// the local-serve fallback hands off to.
@@ -113,6 +119,7 @@ impl Libp2pNetwork {
             registry,
             shard_gossip_types: Mutex::new(Vec::new()),
             topology,
+            routing_committees: Arc::new(ArcSwap::from_pointee(RoutingCommittees::new())),
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
             inbound_router,
@@ -154,9 +161,13 @@ impl Network for Libp2pNetwork {
             .map(|v| (v.validator_id, v.public_key))
             .collect();
         self.adapter.update_validator_keys(Arc::new(keys));
-        // Cache the snapshot for shard → committee resolution on outbound
-        // requests. ArcSwap is lock-free; readers in `request` use `.load()`.
+        // Cache the snapshot for validator identity. ArcSwap is lock-free;
+        // readers in `request` use `.load()`.
         self.topology.store(snapshot);
+    }
+
+    fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
+        self.routing_committees.store(committees);
     }
 
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
@@ -348,6 +359,7 @@ impl Network for Libp2pNetwork {
             .contains(&shard)
             .then(|| Arc::clone(&self.registry));
         let topology = Arc::clone(&self.topology);
+        let routing_committees = Arc::clone(&self.routing_committees);
         let adapter = Arc::clone(&self.adapter);
         let rm = Arc::clone(&self.request_manager);
         let peer_unreachable_count = Arc::clone(&self.peer_unreachable_count);
@@ -379,8 +391,16 @@ impl Network for Libp2pNetwork {
             // registry. Filter out every validator-id this host carries —
             // we never round-trip a request through our own peer.
             let type_id = R::message_type_id();
+            // Resolve the committee from the terminal-clamped routing map so
+            // a request to a split parent draining out of the head still
+            // finds its draining members. Fall back to the head snapshot
+            // before the first routing-committees push (cold start).
+            let routing = routing_committees.load();
             let topology_snapshot = topology.load();
-            let committee = topology_snapshot.committee_for_shard(shard);
+            let committee: &[ValidatorId] = routing.get(&shard).map_or_else(
+                || topology_snapshot.committee_for_shard(shard),
+                Vec::as_slice,
+            );
             let self_ids: HashSet<ValidatorId> =
                 adapter.local_validator_ids().iter().copied().collect();
             let resolved_peers: Vec<PeerId> = committee

@@ -1489,6 +1489,7 @@ impl BeaconCoordinator {
             },
             Action::TopologyChanged {
                 topology_snapshot: Arc::clone(self.topology.head()),
+                routing_committees: Arc::new(self.topology.routing_committees()),
             },
             // Re-arm the skip-trigger timer against the new tip. Fires
             // `SKIP_TIMEOUT` after the upcoming epoch's boundary if no

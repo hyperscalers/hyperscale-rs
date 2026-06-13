@@ -14,7 +14,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{Epoch, ReshapeThresholds, ShardId, TopologySnapshot, WeightedTimestamp};
+use crate::{Epoch, ReshapeThresholds, ShardId, TopologySnapshot, ValidatorId, WeightedTimestamp};
+
+/// Per-shard committees for request **routing**, terminal-clamped.
+///
+/// See [`TopologySchedule::routing_committees`]. Keyed by shard so a fetch
+/// resolves the peers of any shard the schedule still retains, including a
+/// split parent draining out of the head.
+pub type RoutingCommittees = BTreeMap<ShardId, Vec<ValidatorId>>;
 
 /// Per-epoch committee snapshots keyed by the epoch each governs, plus the
 /// active head used for routing.
@@ -197,6 +204,31 @@ impl TopologySchedule {
     #[must_use]
     pub const fn head(&self) -> &Arc<TopologySnapshot> {
         &self.head
+    }
+
+    /// Per-shard committees for request **routing**, terminal-clamped.
+    ///
+    /// Every shard appearing in any retained window maps to the committee
+    /// of the most recent window that carried it. A live shard resolves its
+    /// head committee; a shard that has dissolved from the head — a split
+    /// parent draining out — resolves its final committee, so fetches still
+    /// reach the draining members that serve through the retention window.
+    /// A drained shard drops from the map only when
+    /// [`evict_below`](Self::evict_below) trims its last window, which the
+    /// owner derives from the same drain horizon.
+    #[must_use]
+    pub fn routing_committees(&self) -> RoutingCommittees {
+        let mut committees = RoutingCommittees::new();
+        // Newest window first so the first committee seen for each shard —
+        // its most recent — wins.
+        for snapshot in self.by_epoch.values().rev() {
+            for shard in snapshot.shard_trie().leaves() {
+                committees
+                    .entry(shard)
+                    .or_insert_with(|| snapshot.committee_for_shard(shard).to_vec());
+            }
+        }
+        committees
     }
 
     /// [`at`](Self::at) for a shard whose chain may terminate: resolve
@@ -550,5 +582,45 @@ mod tests {
                 .at_for_shard(p, WeightedTimestamp::from_millis(9500))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn routing_committees_retains_a_drained_parent() {
+        use crate::{ValidatorInfo, generate_bls_keypair};
+
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: generate_bls_keypair().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        // Epoch 0: ROOT is one shard (the parent that will split).
+        let pre = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            set.clone(),
+        ));
+        // Epoch 1 (head): ROOT split into its two children.
+        let post = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            set,
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre));
+        sched.insert(Epoch::new(1), Arc::clone(&post));
+        sched.set_head(post);
+
+        let routing = sched.routing_committees();
+        // The split parent has drained from the head but is still routable,
+        // carrying the committee of its final window.
+        assert_eq!(
+            routing.get(&ShardId::ROOT).map(Vec::len),
+            Some(4),
+            "the drained parent ROOT keeps its final committee for routing",
+        );
+        // The live children resolve their head committees.
+        assert!(routing.contains_key(&ShardId::leaf(1, 0)));
+        assert!(routing.contains_key(&ShardId::leaf(1, 1)));
     }
 }

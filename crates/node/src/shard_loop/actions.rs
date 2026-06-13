@@ -14,8 +14,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, StateRoot,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
+    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, RoutingCommittees,
+    StateRoot, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -219,8 +219,11 @@ where
                 let now = self.now;
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
-            Action::TopologyChanged { topology_snapshot } => {
-                self.handle_topology_changed(&topology_snapshot);
+            Action::TopologyChanged {
+                topology_snapshot,
+                routing_committees,
+            } => {
+                self.handle_topology_changed(&topology_snapshot, routing_committees);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_reconfigurations.push(change);
@@ -761,12 +764,20 @@ where
     /// and shard committees off the snapshot). Idempotent across hosted
     /// shards — every same-shard vnode's `Action::TopologyChanged` lands
     /// here, but the final stored value is identical.
-    pub(in crate::shard_loop) fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
+    pub(in crate::shard_loop) fn handle_topology_changed(
+        &self,
+        topology: &Arc<TopologySnapshot>,
+        routing_committees: Arc<RoutingCommittees>,
+    ) {
         self.process.topology_snapshot.store(Arc::clone(topology));
 
-        // Network impl reads validator keys + shard committees off the
-        // snapshot it gets here — no separate keymap push.
+        // Network impl reads validator keys off the snapshot for identity;
+        // fetch routing keys on the terminal-clamped committees so a request
+        // to a split parent draining out of the head still reaches it.
         self.process.network.update_topology(Arc::clone(topology));
+        self.process
+            .network
+            .update_routing_committees(routing_committees);
 
         tracing::info!(
             local_shard = self.shard.inner(),

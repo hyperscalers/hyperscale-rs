@@ -762,14 +762,12 @@ impl MempoolCoordinator {
             .expected_txs
             .due_for_fetch(self.current_ts, EXPECTED_TX_GRACE)
         {
-            if topology.committee_for_shard(source_shard).is_empty() {
-                tracing::warn!(
-                    ?source_shard,
-                    missing_count = ids.len(),
-                    "Expected-tx fetch suppressed: no committee for source shard"
-                );
-                continue;
-            }
+            // Routability is the network's call: it resolves the source
+            // committee against the terminal-clamped routing map, so a split
+            // parent draining out of the head is still reachable. Emitting
+            // here and letting an unroutable shard fall to `PeerUnreachable`
+            // + the retention-horizon drop is sounder than gating on the
+            // head committee, which a drained source no longer carries.
             tracing::debug!(
                 ?source_shard,
                 missing_count = ids.len(),

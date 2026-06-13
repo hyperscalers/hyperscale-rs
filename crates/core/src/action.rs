@@ -13,11 +13,11 @@ use hyperscale_types::{
     LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
     PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round,
-    RoutableTransaction, ShardId, SharedCertificates, SharedTransactions, SkipRequest,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitAdoption,
-    SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp,
+    RoutableTransaction, RoutingCommittees, ShardId, SharedCertificates, SharedTransactions,
+    SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView,
+    SplitAdoption, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -895,6 +895,12 @@ pub enum Action {
     TopologyChanged {
         /// New topology snapshot to propagate.
         topology_snapshot: Arc<TopologySnapshot>,
+        /// Terminal-clamped per-shard routing committees, covering every
+        /// shard the schedule still retains — including a split parent
+        /// draining out of the head, whose committee the head snapshot no
+        /// longer carries. The network keys fetch routing on this so a
+        /// request to a dissolved shard still reaches its draining members.
+        routing_committees: Arc<RoutingCommittees>,
     },
 
     /// The lookahead committees move this vnode's validator onto or off

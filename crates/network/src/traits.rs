@@ -14,8 +14,8 @@ use std::sync::Arc;
 // `hyperscale_types`.
 pub use hyperscale_types::TopicScope;
 use hyperscale_types::{
-    Bls12381G1PublicKey, GossipMessage, MessageClass, NetworkMessage, Request, ShardId,
-    TopologySnapshot, ValidatorId,
+    Bls12381G1PublicKey, GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees,
+    ShardId, TopologySnapshot, ValidatorId,
 };
 
 /// Maps `ValidatorId` to BLS public key for identity verification (e.g. validator-bind).
@@ -242,6 +242,16 @@ pub trait Network: Send + Sync + 'static {
     /// Default is a no-op (simulation impls without committee routing don't
     /// need it).
     fn update_topology(&self, _snapshot: Arc<TopologySnapshot>) {}
+
+    /// Update the terminal-clamped per-shard routing committees, covering
+    /// every shard the schedule still retains — including a split parent
+    /// draining out of the head. Fetch routing keys on these rather than the
+    /// head snapshot, so a request to a dissolved shard still reaches its
+    /// draining members through the retention window.
+    ///
+    /// Default is a no-op — simulation impls route by subscription, not
+    /// committee, so the head snapshot never strands a dissolved shard.
+    fn update_routing_committees(&self, _committees: Arc<RoutingCommittees>) {}
 
     // ── Request-response ──
 
