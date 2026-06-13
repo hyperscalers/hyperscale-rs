@@ -16,43 +16,10 @@ use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_TXS_PER_BLOCK, ProposerTimestamp,
-    ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, ShardId, SplitAtBoundary, StoredReceipt, WaveId, WeightedTimestamp,
-    derive_reshape_trigger,
+    ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
+    SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt, WaveId,
+    WeightedTimestamp, derive_reshape_trigger, settled_set_verdict,
 };
-
-/// A terminated shard's settled-wave set, as this validator has
-/// reconstructed it — the input to the split-boundary fence.
-///
-/// `waves` is the set of that shard's wave-ids whose wave certificate
-/// committed in its chain at or before its terminal block; `terminal_wt`
-/// is the weighted timestamp at which the shard terminated, bounding how
-/// long the fence defers a still-unknown set
-/// ([`RETENTION_HORIZON`](hyperscale_types::RETENTION_HORIZON) past it,
-/// the wave is categorically unreachable everywhere).
-#[derive(Clone, Debug)]
-pub struct SettledWaveSet {
-    /// Wave-ids the terminated shard settled by its terminal block.
-    pub waves: BTreeSet<WaveId>,
-    /// The terminal block's weighted timestamp.
-    pub terminal_wt: WeightedTimestamp,
-}
-
-/// The fence's verdict on one committed block carrying a finalized wave
-/// whose certificate names a past-terminal shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FenceVerdict {
-    /// No past-terminal-shard certificate, or every such certificate's
-    /// wave is in the settled set — the vote may proceed.
-    Pass,
-    /// A past-terminal-shard certificate names a wave that shard did not
-    /// settle (or the wave is past its retention horizon) — decline the
-    /// vote so the block can never commit.
-    Reject,
-    /// A past-terminal-shard certificate's settled set isn't known yet —
-    /// defer the vote (the block stays pending) until it arrives.
-    Defer,
-}
 
 /// Shard consensus statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -108,7 +75,7 @@ pub struct ShardMemoryStats {
     pub pending_assemblies: usize,
 }
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -601,39 +568,19 @@ impl ShardCoordinator {
         topology: &TopologySchedule,
         block: &Block,
         anchored_wt: WeightedTimestamp,
-    ) -> FenceVerdict {
-        let mut defer = false;
-        for fw in block.certificates().iter() {
-            for ec in fw.execution_certificates() {
-                let shard = ec.shard_id();
-                if shard == self.local_shard {
-                    continue;
-                }
-                // Evicted from every retained window — terminated so long
-                // ago its waves can never resolve.
-                let Some((_, past_terminal)) = topology.at_for_shard(shard, anchored_wt) else {
-                    return FenceVerdict::Reject;
-                };
-                if !past_terminal {
-                    continue;
-                }
-                match self.settled_sets.get(&shard) {
-                    Some(settled) if anchored_wt > settled.terminal_wt.plus(RETENTION_HORIZON) => {
-                        return FenceVerdict::Reject;
-                    }
-                    Some(settled) if !settled.waves.contains(ec.wave_id()) => {
-                        return FenceVerdict::Reject;
-                    }
-                    Some(_) => {}
-                    None => defer = true,
-                }
-            }
-        }
-        if defer {
-            FenceVerdict::Defer
-        } else {
-            FenceVerdict::Pass
-        }
+    ) -> SettledSetVerdict {
+        let ecs = block.certificates().iter().flat_map(|fw| {
+            fw.execution_certificates()
+                .iter()
+                .map(|ec| (ec.shard_id(), ec.wave_id()))
+        });
+        settled_set_verdict(
+            &self.settled_sets,
+            topology,
+            self.local_shard,
+            anchored_wt,
+            ecs,
+        )
     }
 
     /// Apply the split-boundary fence at vote time; returns `true` (and
@@ -652,8 +599,8 @@ impl ShardCoordinator {
             block,
             block.header().parent_qc().weighted_timestamp(),
         ) {
-            FenceVerdict::Pass => false,
-            FenceVerdict::Reject => {
+            SettledSetVerdict::Pass => false,
+            SettledSetVerdict::Reject => {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -661,7 +608,7 @@ impl ShardCoordinator {
                 );
                 true
             }
-            FenceVerdict::Defer => {
+            SettledSetVerdict::Defer => {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -4967,10 +4914,10 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, BoundedVec,
         CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RoutableTransaction, ShardId,
-        SignerBitfield, TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, generate_bls_keypair,
-        test_utils, zero_bls_signature,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
+        RoutableTransaction, ShardId, SignerBitfield, TopologySchedule, TopologySnapshot,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -8161,11 +8108,7 @@ mod tests {
             SignerBitfield, TxOutcome, WaveCertificate,
         };
         let ec = |shard: ShardId| {
-            let wave = WaveId::new(
-                shard,
-                BlockHeight::new(height),
-                std::collections::BTreeSet::new(),
-            );
+            let wave = WaveId::new(shard, BlockHeight::new(height), BTreeSet::new());
             ExecutionCertificate::new(
                 wave,
                 WeightedTimestamp::from_millis(height),
@@ -8180,11 +8123,7 @@ mod tests {
                 SignerBitfield::new(4),
             )
         };
-        let local_wave = WaveId::new(
-            local,
-            BlockHeight::new(height),
-            std::collections::BTreeSet::new(),
-        );
+        let local_wave = WaveId::new(local, BlockHeight::new(height), BTreeSet::new());
         let wc = WaveCertificate::new(local_wave, vec![Arc::new(ec(local)), Arc::new(ec(remote))]);
         Arc::new(Verifiable::from(FinalizedWave::new(Arc::new(wc), vec![])))
     }
@@ -8211,7 +8150,7 @@ mod tests {
         )]);
         assert_eq!(
             coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            FenceVerdict::Defer,
+            SettledSetVerdict::Defer,
         );
     }
 
@@ -8221,11 +8160,7 @@ mod tests {
     fn fence_passes_when_wave_settled() {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        let settled_wave = WaveId::new(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            std::collections::BTreeSet::new(),
-        );
+        let settled_wave = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         coord.record_settled_waves(
             ShardId::ROOT,
             SettledWaveSet {
@@ -8240,7 +8175,7 @@ mod tests {
         )]);
         assert_eq!(
             coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            FenceVerdict::Pass,
+            SettledSetVerdict::Pass,
         );
     }
 
@@ -8252,7 +8187,7 @@ mod tests {
         coord.record_settled_waves(
             ShardId::ROOT,
             SettledWaveSet {
-                waves: std::collections::BTreeSet::new(),
+                waves: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
@@ -8263,7 +8198,7 @@ mod tests {
         )]);
         assert_eq!(
             coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            FenceVerdict::Reject,
+            SettledSetVerdict::Reject,
         );
     }
 
@@ -8274,11 +8209,7 @@ mod tests {
     fn fence_rejects_past_retention_horizon() {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        let settled_wave = WaveId::new(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            std::collections::BTreeSet::new(),
-        );
+        let settled_wave = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         coord.record_settled_waves(
             ShardId::ROOT,
             SettledWaveSet {
@@ -8296,7 +8227,7 @@ mod tests {
             .plus(Duration::from_millis(1));
         assert_eq!(
             coord.fence_finalized_waves(&sched, &block, beyond),
-            FenceVerdict::Reject,
+            SettledSetVerdict::Reject,
         );
     }
 
@@ -8315,7 +8246,7 @@ mod tests {
         )]);
         assert_eq!(
             coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            FenceVerdict::Pass,
+            SettledSetVerdict::Pass,
         );
     }
 
@@ -8414,11 +8345,7 @@ mod tests {
         // Record ROOT's settled set including the straddler's wave, then
         // re-drive: the fence now passes, so the block proceeds to
         // verification.
-        let settled_wave = WaveId::new(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            std::collections::BTreeSet::new(),
-        );
+        let settled_wave = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
         coord.record_settled_waves(
             ShardId::ROOT,
             SettledWaveSet {

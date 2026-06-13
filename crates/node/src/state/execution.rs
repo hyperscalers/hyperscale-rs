@@ -24,6 +24,7 @@ impl NodeStateMachine {
                 // Results arriving can (a) finalize a wave whose local EC
                 // landed ahead of the engine, (b) unblock new vote emission.
                 let mut actions = self.execution_coordinator.on_execution_batch_completed(
+                    self.beacon_coordinator.topology_schedule(),
                     &wave_id,
                     results,
                     tx_outcomes,

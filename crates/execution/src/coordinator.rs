@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
@@ -45,9 +45,10 @@ use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
-    RoutableTransaction, ScheduleLookup, ShardId, StoredReceipt, TopologySchedule,
-    TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WAVE_TIMEOUT,
-    WaveCertificate, WaveId, WeightedTimestamp, wave_leader, wave_leader_at,
+    RoutableTransaction, ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId, StoredReceipt,
+    TopologySchedule, TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, settled_set_verdict, wave_leader,
+    wave_leader_at,
 };
 use tracing::instrument;
 
@@ -226,6 +227,22 @@ pub struct ExecutionCoordinator {
     /// re-attempted on `BeaconBlockPersisted`.
     awaiting_waves: AwaitingTopologyBuffer<Arc<Verifiable<FinalizedWave>>>,
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Split-boundary finalize gate
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Settled-wave sets of past-terminal shards, fed by the `io_loop`'s
+    /// reconstruction driver (mirrors the shard coordinator's vote fence).
+    /// The finalize gate reads them so a wave naming a shard that didn't
+    /// settle it is never produced — the shared [`settled_set_verdict`]
+    /// keeps this verdict identical to the vote fence's.
+    settled_sets: HashMap<ShardId, SettledWaveSet>,
+
+    /// Finalized waves built but withheld because a contained EC names a
+    /// past-terminal shard whose settled set isn't known yet (the gate's
+    /// `Defer`). Re-checked when that set is recorded, then emitted if
+    /// settled or dropped if not. Keyed by `WaveId`.
+    gated_finalized: HashMap<WaveId, Arc<Verifiable<FinalizedWave>>>,
+
     /// This validator's identity.
     me: ValidatorId,
 
@@ -274,6 +291,8 @@ impl ExecutionCoordinator {
             pending_finalized_wave_verifications: HashSet::new(),
             awaiting_certs: AwaitingTopologyBuffer::new(),
             awaiting_waves: AwaitingTopologyBuffer::new(),
+            settled_sets: HashMap::new(),
+            gated_finalized: HashMap::new(),
             me,
             local_shard,
         }
@@ -507,6 +526,7 @@ impl ExecutionCoordinator {
     /// here rather than waiting for some unrelated trigger.
     pub fn on_execution_batch_completed(
         &mut self,
+        topology: &TopologySchedule,
         wave_id: &WaveId,
         results: Vec<StoredReceipt>,
         tx_outcomes: Vec<TxOutcome>,
@@ -539,7 +559,7 @@ impl ExecutionCoordinator {
         // finalization from here so the deferred finalize happens on the
         // same event that unblocked it.
         if wave.is_complete() {
-            self.finalize_wave(wave_id)
+            self.finalize_wave(topology, wave_id)
         } else {
             Vec::new()
         }
@@ -1097,7 +1117,7 @@ impl ExecutionCoordinator {
         );
 
         // Feed the EC to the wave-level certificate tracker for finalization.
-        actions.extend(self.handle_wave_attestation(certificate));
+        actions.extend(self.handle_wave_attestation(topology, certificate));
 
         actions
     }
@@ -1302,7 +1322,7 @@ impl ExecutionCoordinator {
             self.exec_certs.insert(Arc::clone(&ec_arc));
         }
 
-        actions.extend(self.handle_wave_attestation(&ec_arc));
+        actions.extend(self.handle_wave_attestation(topology, &ec_arc));
         actions
     }
 
@@ -1621,7 +1641,7 @@ impl ExecutionCoordinator {
                 actions.extend(self.dispatch_execution_vote(topology, vote));
             }
 
-            actions.extend(self.replay_early_wave_attestations(transactions));
+            actions.extend(self.replay_early_wave_attestations(topology, transactions));
         }
 
         // Apply this block's provisions after wave setup so newly-created
@@ -1649,7 +1669,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         }
         self.register_sealed_wave_assignments(topology.head(), header.height(), transactions);
-        self.replay_early_wave_attestations(transactions)
+        self.replay_early_wave_attestations(topology, transactions)
     }
 
     /// Replay buffered early ECs for txs that have just received wave
@@ -1658,6 +1678,7 @@ impl ExecutionCoordinator {
     /// tx target to route to.
     fn replay_early_wave_attestations(
         &mut self,
+        topology: &TopologySchedule,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Vec<Action> {
         let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
@@ -1671,7 +1692,7 @@ impl ExecutionCoordinator {
         );
         let mut actions = Vec::new();
         for ec in &ecs_to_replay {
-            actions.extend(self.handle_wave_attestation(ec));
+            actions.extend(self.handle_wave_attestation(topology, ec));
         }
         actions
     }
@@ -1710,7 +1731,11 @@ impl ExecutionCoordinator {
     /// local assignment are buffered (or kept buffered) via `pending_routing`
     /// until their blocks commit; routed `tx_hashes` are cleared from the
     /// pending set, dropping the EC entirely once fully routed.
-    fn handle_wave_attestation(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+    fn handle_wave_attestation(
+        &mut self,
+        topology: &TopologySchedule,
+        ec: &Arc<Verified<ExecutionCertificate>>,
+    ) -> Vec<Action> {
         let routing = self.waves.classify_attestation(ec);
 
         self.early.clear_routed(ec, &routing.routed_tx_hashes);
@@ -1730,17 +1755,18 @@ impl ExecutionCoordinator {
                 continue;
             };
             if wave.add_execution_certificate(Arc::clone(ec)) && wave.is_complete() {
-                actions.extend(self.finalize_wave(wave_id));
+                actions.extend(self.finalize_wave(topology, wave_id));
             }
         }
         actions
     }
 
-    /// Finalize a wave: build the [`FinalizedWave`], record it, emit events.
+    /// Finalize a wave: build the [`FinalizedWave`], then admit it or hold
+    /// it at the split-boundary gate.
     ///
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
-    fn finalize_wave(&mut self, wave_id: &WaveId) -> Vec<Action> {
+    fn finalize_wave(&mut self, topology: &TopologySchedule, wave_id: &WaveId) -> Vec<Action> {
         let Some(wave) = self.waves.remove_wave(wave_id) else {
             return vec![];
         };
@@ -1756,17 +1782,80 @@ impl ExecutionCoordinator {
         // store, the admission event, and any downstream `PendingBlock`
         // entry share the same `Arc` without further per-consumer cloning.
         let finalized_arc = Arc::new(Verified::<FinalizedWave>::seal(wave.into_finalized()).into());
-        self.finalized
-            .insert(wave_id.clone(), Arc::clone(&finalized_arc));
+        self.emit_or_gate_finalized(topology, finalized_arc)
+    }
 
-        // Single admission event covers both the shard consensus subscriber and the
-        // io_loop serving cache (via the Continuation interception arm).
-        // The state machine latches a proposal-retry on this event.
-        vec![Action::Continuation(
-            ProtocolEvent::FinalizedWavesAdmitted {
-                waves: vec![finalized_arc],
-            },
-        )]
+    /// Admit a freshly built finalized wave downstream, or withhold it at
+    /// the split-boundary gate so we never produce a wave the vote fence
+    /// would reject.
+    ///
+    /// `Pass` records the wave and emits the admission event (one event
+    /// covers both the shard consensus subscriber and the `io_loop`
+    /// serving cache). `Defer` buffers it until the past-terminal shard's
+    /// settled
+    /// set is reconstructed ([`Self::redrive_gated_finalizations`]).
+    /// `Reject` drops it — the wave names a past-terminal shard that
+    /// didn't settle it, so it must never be produced; the counterpart
+    /// abort sweep terminates the underlying transaction.
+    fn emit_or_gate_finalized(
+        &mut self,
+        topology: &TopologySchedule,
+        finalized_arc: Arc<Verifiable<FinalizedWave>>,
+    ) -> Vec<Action> {
+        let wave_id = finalized_arc.wave_id().clone();
+        let verdict = {
+            let ecs = finalized_arc
+                .execution_certificates()
+                .iter()
+                .map(|ec| (ec.shard_id(), ec.wave_id()));
+            settled_set_verdict(
+                &self.settled_sets,
+                topology,
+                self.local_shard,
+                self.committed_ts,
+                ecs,
+            )
+        };
+        match verdict {
+            SettledSetVerdict::Pass => {
+                self.finalized.insert(wave_id, Arc::clone(&finalized_arc));
+                vec![Action::Continuation(
+                    ProtocolEvent::FinalizedWavesAdmitted {
+                        waves: vec![finalized_arc],
+                    },
+                )]
+            }
+            SettledSetVerdict::Defer => {
+                self.gated_finalized.insert(wave_id, finalized_arc);
+                vec![]
+            }
+            SettledSetVerdict::Reject => vec![],
+        }
+    }
+
+    /// Record a past-terminal shard's settled-wave set for the finalize
+    /// gate (mirrors the shard coordinator's fence feed). Pair with
+    /// [`Self::redrive_gated_finalizations`] to release waves that the
+    /// gate held while the set was unknown.
+    pub fn record_settled_waves(&mut self, shard: ShardId, settled: SettledWaveSet) {
+        self.settled_sets.insert(shard, settled);
+    }
+
+    /// Re-check every gate-held finalized wave now that a settled set was
+    /// recorded: emit the ones now settled, drop the ones now known
+    /// unsettled, and re-hold any still naming an unknown past-terminal
+    /// shard.
+    pub fn redrive_gated_finalizations(&mut self, topology: &TopologySchedule) -> Vec<Action> {
+        if self.gated_finalized.is_empty() {
+            return Vec::new();
+        }
+        let gated: Vec<Arc<Verifiable<FinalizedWave>>> =
+            self.gated_finalized.drain().map(|(_, fw)| fw).collect();
+        let mut actions = Vec::new();
+        for finalized_arc in gated {
+            actions.extend(self.emit_or_gate_finalized(topology, finalized_arc));
+        }
+        actions
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
@@ -3724,7 +3813,7 @@ mod tests {
         let (wave_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(wave_id.clone(), wave);
 
-        let _actions = state.finalize_wave(&wave_id);
+        let _actions = state.finalize_wave(&make_test_topology(), &wave_id);
 
         assert!(!state.waves.contains_wave(&wave_id), "wave handed off");
         assert!(
@@ -3740,7 +3829,7 @@ mod tests {
         let (wave_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(wave_id.clone(), wave);
 
-        let actions = state.finalize_wave(&wave_id);
+        let actions = state.finalize_wave(&make_test_topology(), &wave_id);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -3753,9 +3842,137 @@ mod tests {
     fn test_finalize_wave_is_noop_for_absent_wave_id() {
         let mut state = make_test_state();
         let unknown = WaveId::new(ShardId::ROOT, BlockHeight::new(99), BTreeSet::new());
-        let actions = state.finalize_wave(&unknown);
+        let actions = state.finalize_wave(&make_test_topology(), &unknown);
         assert!(actions.is_empty());
         assert!(state.finalized.is_empty());
+    }
+
+    /// A schedule whose final window (epoch 0) is single-shard `ROOT` and
+    /// whose next window (epoch 1) splits it into two children — so any
+    /// weighted timestamp in epoch 1 is past `ROOT`'s terminal window.
+    fn terminating_schedule() -> TopologySchedule {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let final_window = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let post_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
+        sched.insert(Epoch::new(1), post_split);
+        sched
+    }
+
+    /// A finalized wave whose certificate carries `local`'s EC plus a
+    /// remote EC on `remote` — the cross-shard shape the gate inspects.
+    fn cross_shard_finalized_wave(
+        local: ShardId,
+        remote: ShardId,
+        height: u64,
+    ) -> Arc<Verifiable<FinalizedWave>> {
+        let ec = |shard: ShardId| {
+            let wave = WaveId::new(shard, BlockHeight::new(height), BTreeSet::new());
+            ExecutionCertificate::new(
+                wave,
+                WeightedTimestamp::from_millis(height),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(
+                    TxHash::from_raw(Hash::from_bytes(b"tx")),
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )],
+                zero_bls_signature(),
+                SignerBitfield::new(4),
+            )
+        };
+        let local_wave = WaveId::new(local, BlockHeight::new(height), BTreeSet::new());
+        let wc = WaveCertificate::new(local_wave, vec![Arc::new(ec(local)), Arc::new(ec(remote))]);
+        Arc::new(Verifiable::from(FinalizedWave::new(Arc::new(wc), vec![])))
+    }
+
+    /// A wave naming a past-terminal shard whose settled set is unknown is
+    /// withheld at the finalize gate, then released once the set records
+    /// it — the produce-side mirror of the vote fence's defer-and-release.
+    #[test]
+    fn finalize_gate_defers_then_releases() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+        // Past ROOT's terminal window — the gate's anchor is the committed ts.
+        state.committed_ts = WeightedTimestamp::from_millis(1500);
+        let sched = terminating_schedule();
+        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave_id = wave.wave_id().clone();
+
+        let deferred = state.emit_or_gate_finalized(&sched, wave);
+        assert!(
+            deferred.is_empty(),
+            "the gate withholds the wave while the settled set is unknown",
+        );
+        assert!(state.gated_finalized.contains_key(&wave_id));
+        assert!(!state.finalized.contains(&wave_id));
+
+        let settled = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        state.record_settled_waves(
+            ShardId::ROOT,
+            SettledWaveSet {
+                waves: std::iter::once(settled).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let released = state.redrive_gated_finalizations(&sched);
+        assert!(
+            matches!(
+                released.as_slice(),
+                [Action::Continuation(
+                    ProtocolEvent::FinalizedWavesAdmitted { .. }
+                )],
+            ),
+            "recording the settled set releases the held wave for admission",
+        );
+        assert!(state.gated_finalized.is_empty());
+        assert!(state.finalized.contains(&wave_id));
+    }
+
+    /// A wave a past-terminal shard never settled is dropped, not produced
+    /// and not buffered for retry — its transaction aborts via the
+    /// counterpart sweep instead.
+    #[test]
+    fn finalize_gate_drops_unsettled_wave() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+        state.committed_ts = WeightedTimestamp::from_millis(1500);
+        let sched = terminating_schedule();
+        state.record_settled_waves(
+            ShardId::ROOT,
+            SettledWaveSet {
+                waves: BTreeSet::new(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave_id = wave.wave_id().clone();
+
+        let dropped = state.emit_or_gate_finalized(&sched, wave);
+        assert!(
+            dropped.is_empty(),
+            "the gate drops a wave the terminated shard never settled",
+        );
+        assert!(
+            state.gated_finalized.is_empty(),
+            "a rejected wave is not buffered for retry",
+        );
+        assert!(!state.finalized.contains(&wave_id));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3777,7 +3994,7 @@ mod tests {
             .provisioning
             .record_required(tx_hash, std::iter::once(ShardId::leaf(1, 1)).collect());
         // Drive finalize_wave to populate the FinalizedWaveStore naturally.
-        let _ = state.finalize_wave(&wave_id);
+        let _ = state.finalize_wave(&make_test_topology(), &wave_id);
         let finalized = state
             .finalized
             .get(&wave_id)

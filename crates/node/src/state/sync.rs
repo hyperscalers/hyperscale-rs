@@ -48,10 +48,17 @@ impl NodeStateMachine {
                 waves,
                 terminal_wt,
             } => {
-                self.shard_coordinator
-                    .record_settled_waves(shard, SettledWaveSet { waves, terminal_wt });
-                self.shard_coordinator
-                    .redrive_pending_votes(self.beacon_coordinator.topology_schedule())
+                let set = SettledWaveSet { waves, terminal_wt };
+                self.execution_coordinator
+                    .record_settled_waves(shard, set.clone());
+                self.shard_coordinator.record_settled_waves(shard, set);
+                let topology = self.beacon_coordinator.topology_schedule();
+                let mut actions = self.shard_coordinator.redrive_pending_votes(topology);
+                actions.extend(
+                    self.execution_coordinator
+                        .redrive_gated_finalizations(topology),
+                );
+                actions
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }

@@ -172,6 +172,7 @@ pub use time::timestamp::{
 };
 pub use topology::awaiting::AwaitingTopologyBuffer;
 pub use topology::schedule::{ScheduleLookup, SplitAtBoundary, TopologySchedule};
+pub use topology::settled_set::{SettledSetVerdict, SettledWaveSet, settled_set_verdict};
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{
     ShardAnchor, TopologySnapshot, node_id_hash_u64, uniform_shard_for_node,
