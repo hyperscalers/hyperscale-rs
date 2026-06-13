@@ -257,6 +257,21 @@ pub struct CohortSeat {
     pub ready: bool,
 }
 
+/// One keeper drawn into a paired merge's committee.
+///
+/// A keeper stays `OnShard` on its child for the whole grow — it keeps
+/// running that chain and hard-links the merged store from it — so a
+/// seat carries no status, only the child it runs and whether it has
+/// synced the sibling half into the merged `p`-rooted store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct KeeperSeat {
+    /// The child whose half this keeper runs and hard-links from.
+    pub child: ShardId,
+    /// Whether the keeper's `ReshapeReady` witness has folded — it has
+    /// synced the sibling half and stitched the merged root.
+    pub ready: bool,
+}
+
 /// An admitted, not-yet-executed shard reshape, keyed in
 /// [`BeaconState::pending_reshapes`] by its target: the splitting shard
 /// itself, or the parent a merge reforms under.
@@ -285,11 +300,23 @@ pub enum PendingReshape {
         cohort: BTreeMap<ValidatorId, CohortSeat>,
     },
     /// The target parent's two children merge back under it. The merge
-    /// is paired — eligible for scheduling — once both children hold a
-    /// live half.
+    /// is paired — keepers drawn, eligible for execution — once both
+    /// children hold a live half.
     Merge {
-        /// Per-child epoch of the most recent folded assertion.
+        /// Per-child epoch of the most recent folded assertion. Both
+        /// children must keep a live half; a half quiet for
+        /// [`RESHAPE_TRIGGER_TTL_EPOCHS`](crate::RESHAPE_TRIGGER_TTL_EPOCHS)
+        /// cancels the paired merge.
         halves: BTreeMap<ShardId, Epoch>,
+        /// Keeper committee drawn when both halves pair: half the merged
+        /// committee from each child, each seat the child it runs and
+        /// whether it has synced the sibling half. The execution gate
+        /// reads ready seats; rotation on the children skips keepers.
+        /// Empty until paired.
+        keepers: BTreeMap<ValidatorId, KeeperSeat>,
+        /// Epoch the merge paired and drew its keepers — starts the
+        /// readiness TTL. `None` until paired.
+        admitted_at: Option<Epoch>,
     },
 }
 
@@ -670,6 +697,21 @@ impl BeaconState {
                     shard == left || shard == right
                 }
             })
+    }
+
+    /// Whether `validator` holds a keeper seat for the pending merge of
+    /// `child`'s parent. Keepers must sync the sibling half before the
+    /// boundary, so rotation on `child` pins them while the merge pends.
+    #[must_use]
+    pub fn is_merge_keeper(&self, child: ShardId, validator: ValidatorId) -> bool {
+        let Some(parent) = child.parent() else {
+            return false;
+        };
+        matches!(
+            self.pending_reshapes.get(&parent),
+            Some(PendingReshape::Merge { keepers, .. })
+                if keepers.get(&validator).is_some_and(|seat| seat.child == child)
+        )
     }
 
     /// Validators eligible to serve on the beacon committee: status is

@@ -12,7 +12,7 @@ use hyperscale_types::{
 };
 
 use crate::rules;
-use crate::state::reshape::{draw_split_cohort, release_cohort};
+use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, release_cohort};
 use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
@@ -431,10 +431,37 @@ pub(super) fn apply_shard_payload(
                 return None;
             }
             // Record or refresh this child's half. The merge pairs —
-            // becomes schedulable — once both children hold a live
-            // half; a lone half expires via the staleness sweep.
-            if let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get_mut(parent) {
+            // draws its keepers, becomes executable — once both children
+            // hold a live half; a lone half expires via the staleness
+            // sweep.
+            let refreshed = if let Some(PendingReshape::Merge {
+                halves,
+                admitted_at,
+                ..
+            }) = state.pending_reshapes.get_mut(parent)
+            {
                 halves.insert(source_shard, state.current_epoch);
+                Some(halves.len() == 2 && admitted_at.is_none())
+            } else {
+                None
+            };
+            if let Some(pairs_now) = refreshed {
+                if pairs_now {
+                    let keepers = draw_merge_keepers(state, *parent);
+                    if let Some(PendingReshape::Merge {
+                        keepers: seats,
+                        admitted_at,
+                        ..
+                    }) = state.pending_reshapes.get_mut(parent)
+                    {
+                        *seats = keepers;
+                        *admitted_at = Some(state.current_epoch);
+                    }
+                    tracing::info!(
+                        ?parent,
+                        "Shard merge paired; keepers drawn, reshape pending"
+                    );
+                }
                 return None;
             }
             // Neither child may be involved in another reshape (the
@@ -451,22 +478,34 @@ pub(super) fn apply_shard_payload(
                 *parent,
                 PendingReshape::Merge {
                     halves: BTreeMap::from([(source_shard, state.current_epoch)]),
+                    keepers: BTreeMap::new(),
+                    admitted_at: None,
                 },
             );
             None
         }
         ShardWitnessPayload::ReshapeReady { validator } => {
-            // Source pinning: only the splitting shard's own chain
-            // carries its observers' readiness signals, and only a
-            // drawn cohort member holds a seat to mark. Anything else
-            // is silently dropped.
-            let Some(PendingReshape::Split { cohort, .. }) =
+            // Source pinning: a split's observers signal through the
+            // splitting shard's own chain; a merge's keepers signal
+            // through their child's chain (the merge is keyed by the
+            // child's parent). Only the holder of a seat on that pending
+            // reshape can mark it; anything else is silently dropped.
+            if let Some(PendingReshape::Split { cohort, .. }) =
                 state.pending_reshapes.get_mut(&source_shard)
-            else {
+            {
+                if let Some(seat) = cohort.get_mut(validator) {
+                    seat.ready = true;
+                }
                 return None;
-            };
-            let seat = cohort.get_mut(validator)?;
-            seat.ready = true;
+            }
+            if let Some(PendingReshape::Merge { keepers, .. }) = source_shard
+                .parent()
+                .and_then(|parent| state.pending_reshapes.get_mut(&parent))
+                && let Some(seat) = keepers.get_mut(validator)
+                && seat.child == source_shard
+            {
+                seat.ready = true;
+            }
             None
         }
     }
@@ -502,12 +541,25 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                     cancelled.push((*target, "readiness TTL elapsed"));
                 }
             }
-            PendingReshape::Merge { halves } => {
+            PendingReshape::Merge {
+                halves,
+                admitted_at,
+                ..
+            } => {
                 halves.retain(|_, last| {
                     current.saturating_sub(last.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
                 });
-                if halves.is_empty() {
+                // A lone half waits for its sibling, but once the merge
+                // paired both halves must keep asserting — either going
+                // quiet cancels the reshape and returns the keepers to
+                // ordinary rotation.
+                let required = if admitted_at.is_some() { 2 } else { 1 };
+                if halves.len() < required {
                     cancelled.push((*target, "trigger went quiet"));
+                } else if admitted_at.is_some_and(|at| {
+                    current.saturating_sub(at.inner()) >= RESHAPE_READY_TTL_EPOCHS
+                }) {
+                    cancelled.push((*target, "readiness TTL elapsed"));
                 }
             }
         }
@@ -1878,18 +1930,28 @@ mod tests {
         };
 
         apply_shard_payload(&mut state, left, &payload);
-        let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get(&ShardId::ROOT)
+        let Some(PendingReshape::Merge {
+            halves,
+            admitted_at,
+            ..
+        }) = state.pending_reshapes.get(&ShardId::ROOT)
         else {
             panic!("merge half not recorded");
         };
         assert_eq!(halves.len(), 1);
+        assert!(admitted_at.is_none(), "a lone half has not paired");
 
         apply_shard_payload(&mut state, right, &payload);
-        let Some(PendingReshape::Merge { halves }) = state.pending_reshapes.get(&ShardId::ROOT)
+        let Some(PendingReshape::Merge {
+            halves,
+            admitted_at,
+            ..
+        }) = state.pending_reshapes.get(&ShardId::ROOT)
         else {
             panic!("merge record dropped");
         };
         assert_eq!(halves.len(), 2);
+        assert!(admitted_at.is_some(), "both halves pair the merge");
 
         // A fresh lone half goes quiet and expires.
         let mut lone = reshape_state(&[left, right], 0);

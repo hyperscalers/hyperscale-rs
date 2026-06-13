@@ -72,6 +72,10 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
                     Some(ValidatorStatus::OnShard { shard: s, ready: true, .. }) if *s == shard
                 )
             })
+            // A pending merge's keepers must hold their child until they
+            // sync the sibling half, so rotation skips them — their
+            // departure would strand the merged committee below quorum.
+            .filter(|id| !state.is_merge_keeper(shard, *id))
             .collect();
         if ready_members.is_empty() {
             continue;

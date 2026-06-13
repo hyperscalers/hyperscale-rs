@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, PendingReshape,
-    ShardBoundary, ShardCommittee, ShardId, StateRoot, ValidatorId, ValidatorStatus,
-    byzantine_threshold,
+    BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, KeeperSeat,
+    PendingReshape, ShardBoundary, ShardCommittee, ShardId, StateRoot, ValidatorId,
+    ValidatorStatus, byzantine_threshold,
 };
 use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
@@ -33,6 +33,9 @@ const DOMAIN_RESHAPE_COHORT: &[u8] = b"hyperscale-reshape-cohort-v1";
 
 /// Domain tag for the execution-fold parent-half assignment seed.
 const DOMAIN_RESHAPE_PARENT_HALF: &[u8] = b"hyperscale-reshape-parent-half-v1";
+
+/// Domain tag for the pairing-time merge keeper draw seed.
+const DOMAIN_RESHAPE_KEEPER: &[u8] = b"hyperscale-reshape-keeper-v1";
 
 /// Draw a committee-size observer cohort for the pending split of
 /// `target` from the free pool, assigning the first shuffled half to
@@ -83,9 +86,65 @@ pub(super) fn draw_split_cohort(
     cohort
 }
 
+/// Draw the keeper committee for a now-paired merge of `parent`'s two
+/// children: half the merged committee from each child's ready members,
+/// seeded like every reshape draw.
+///
+/// Keepers stay `OnShard` on their child for the whole grow — they keep
+/// running that chain and hard-link the merged store from it — so the
+/// draw changes no statuses; it records seats the execution gate reads
+/// and the shuffle pins. The non-keeper half of each child returns to
+/// the pool at the boundary.
+///
+/// The left child contributes the larger half on an odd target size, so
+/// the two halves total exactly the committee target.
+pub(super) fn draw_merge_keepers(
+    state: &BeaconState,
+    parent: ShardId,
+) -> BTreeMap<ValidatorId, KeeperSeat> {
+    let size = state.chain_config.shard_size as usize;
+    let (left, right) = parent.children();
+    let mut keepers = BTreeMap::new();
+    for (child, take) in [(left, size.div_ceil(2)), (right, size / 2)] {
+        let mut members: Vec<ValidatorId> = state
+            .next_shard_committees
+            .get(&child)
+            .map(|committee| {
+                committee
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        matches!(
+                            state.validators.get(id).map(|r| r.status),
+                            Some(ValidatorStatus::OnShard { shard, ready: true, .. })
+                                if shard == child
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        members.sort_unstable();
+        let mut prng = reshape_prng(DOMAIN_RESHAPE_KEEPER, state, child);
+        shuffle(&mut members, &mut prng);
+        members.truncate(take);
+        for id in members {
+            keepers.insert(
+                id,
+                KeeperSeat {
+                    child,
+                    ready: false,
+                },
+            );
+        }
+    }
+    keepers
+}
+
 /// Return a cancelled or abandoned reshape's cohort to the pool: each
 /// observer leaves the target's lookahead committee and goes back to
-/// `Pooled`. Merges carry no cohort and release nothing.
+/// `Pooled`. A merge's keepers never left their child committees, so a
+/// cancelled merge releases nothing — dropping the record un-pins them.
 pub(super) fn release_cohort(state: &mut BeaconState, target: ShardId, reshape: &PendingReshape) {
     let PendingReshape::Split { cohort, .. } = reshape else {
         return;
@@ -290,9 +349,10 @@ mod tests {
 
     use super::*;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, net, single_pool_state, validator_record,
+        apply_next_epoch, apply_witness_chunk, empty_state, net, single_pool_state,
+        validator_record,
     };
-    use crate::state::witness::apply_shard_payload;
+    use crate::state::witness::{apply_shard_payload, prune_stale_reshapes};
 
     /// `single_pool_state(4)` — four ready members on `leaf(1, 0)`,
     /// promoted into the active slot too — plus `pooled` free
@@ -659,5 +719,231 @@ mod tests {
             assert_eq!(state.shard_committees[&child].members.len(), 4);
             assert_eq!(state.shard_consensus_members[&child].len(), 4);
         }
+    }
+
+    // ─── merge keeper lifecycle ──────────────────────────────────────────
+
+    /// Parent `leaf(1, 0)`'s two children, each a four-member committee
+    /// of ready `OnShard` validators, plus `pooled` free validators with
+    /// a stake-backed pool so the shuffle can refill. `current_epoch =
+    /// 5`, committee target 4.
+    fn merge_grow_state(pooled: u64) -> BeaconState {
+        use hyperscale_types::{MIN_STAKE_FLOOR, Stake, StakePool, StakePoolId};
+
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(5);
+        state.chain_config.shard_size = 4;
+        let children: [ShardId; 2] = ShardId::leaf(1, 0).children().into();
+        let mut validators = BTreeSet::new();
+        let mut next = 0u64;
+        for child in children {
+            let mut members = Vec::new();
+            for _ in 0..4 {
+                let id = ValidatorId::new(next);
+                members.push(id);
+                validators.insert(id);
+                state.validators.insert(
+                    id,
+                    validator_record(
+                        next,
+                        0,
+                        ValidatorStatus::OnShard {
+                            shard: child,
+                            ready: true,
+                            placed_at_epoch: Epoch::GENESIS,
+                        },
+                    ),
+                );
+                next += 1;
+            }
+            state.shard_committees.insert(
+                child,
+                ShardCommittee {
+                    members: members.clone(),
+                },
+            );
+            state
+                .next_shard_committees
+                .insert(child, ShardCommittee { members });
+        }
+        for i in 0..pooled {
+            let id = ValidatorId::new(1000 + i);
+            validators.insert(id);
+            state
+                .validators
+                .insert(id, validator_record(1000 + i, 0, ValidatorStatus::Pooled));
+        }
+        let count = 8 + u128::from(pooled);
+        state.pools.insert(
+            StakePoolId::new(0),
+            StakePool {
+                id: StakePoolId::new(0),
+                total_stake: Stake::from_attos(count * MIN_STAKE_FLOOR.attos()),
+                validators,
+                pending_withdrawals: Vec::new(),
+            },
+        );
+        state
+    }
+
+    fn keepers_of(state: &BeaconState, parent: ShardId) -> BTreeMap<ValidatorId, KeeperSeat> {
+        let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.get(&parent)
+        else {
+            panic!("no pending merge for {parent:?}");
+        };
+        keepers.clone()
+    }
+
+    /// Both halves pairing draws the keeper committee — half the target
+    /// from each child, each seat a member of the child it runs, none
+    /// ready — and stamps the readiness clock.
+    #[test]
+    fn merge_pairing_draws_keepers_from_each_child() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+
+        // The first half waits: no keepers, no readiness clock.
+        apply_shard_payload(&mut state, left, &merge);
+        let Some(PendingReshape::Merge {
+            keepers,
+            admitted_at,
+            ..
+        }) = state.pending_reshapes.get(&parent)
+        else {
+            panic!("merge half not recorded");
+        };
+        assert!(keepers.is_empty());
+        assert!(admitted_at.is_none());
+
+        // The sibling pairs it: keepers drawn on the spot.
+        apply_shard_payload(&mut state, right, &merge);
+        let keepers = keepers_of(&state, parent);
+        let Some(PendingReshape::Merge { admitted_at, .. }) = state.pending_reshapes.get(&parent)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*admitted_at, Some(Epoch::new(5)));
+        assert_eq!(keepers.len(), 4);
+        let from_left = keepers.values().filter(|s| s.child == left).count();
+        let from_right = keepers.values().filter(|s| s.child == right).count();
+        assert_eq!((from_left, from_right), (2, 2));
+        for (id, seat) in &keepers {
+            assert!(!seat.ready);
+            assert!(
+                state.next_shard_committees[&seat.child]
+                    .members
+                    .contains(id)
+            );
+        }
+    }
+
+    /// A keeper's `ReshapeReady` rides its own child's chain and marks
+    /// only its own seat; the same signal arriving via the sibling
+    /// chain is dropped (source pinning).
+    #[test]
+    fn keeper_reshape_ready_marks_only_its_own_seat() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+
+        let keeper = *keepers_of(&state, parent)
+            .iter()
+            .find(|(_, seat)| seat.child == left)
+            .map(|(id, _)| id)
+            .expect("left contributes keepers");
+        let ready = ShardWitnessPayload::ReshapeReady { validator: keeper };
+
+        // Wrong chain: a left keeper's signal arriving on the right is
+        // ignored.
+        apply_shard_payload(&mut state, right, &ready);
+        assert!(!keepers_of(&state, parent)[&keeper].ready);
+
+        // Own chain: the seat flips.
+        apply_shard_payload(&mut state, left, &ready);
+        assert!(keepers_of(&state, parent)[&keeper].ready);
+    }
+
+    /// A pending merge's keepers are pinned on their child: the trickle
+    /// shuffle rotates only non-keeper members.
+    #[test]
+    fn merge_keepers_are_pinned_against_rotation() {
+        use hyperscale_types::SHUFFLE_INTERVAL_EPOCHS;
+
+        use crate::state::committee::run_shuffle_step;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(4);
+        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+        let keepers = keepers_of(&state, parent);
+
+        run_shuffle_step(&mut state);
+
+        // Every keeper still runs its child; a non-keeper rotated in its
+        // place on each child (the pool refilled the freed slot).
+        for (id, seat) in &keepers {
+            assert_eq!(
+                state.validators[id].status,
+                ValidatorStatus::OnShard {
+                    shard: seat.child,
+                    ready: true,
+                    placed_at_epoch: Epoch::GENESIS,
+                },
+            );
+            assert!(
+                state.next_shard_committees[&seat.child]
+                    .members
+                    .contains(id)
+            );
+        }
+        assert_eq!(state.next_shard_committees[&left].members.len(), 4);
+        assert_eq!(state.next_shard_committees[&right].members.len(), 4);
+        // A non-keeper got rotated out — the shuffle wasn't a no-op.
+        assert!(
+            state
+                .pooled_validators()
+                .iter()
+                .any(|id| !keepers.contains_key(id) && id.inner() < 8),
+        );
+    }
+
+    /// Once paired, a required half going quiet cancels the merge and
+    /// un-pins the keepers — unlike a lone half, which simply waits.
+    #[test]
+    fn paired_merge_cancels_when_a_required_half_goes_quiet() {
+        use hyperscale_types::RESHAPE_TRIGGER_TTL_EPOCHS;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+        assert!(state.pending_reshapes.contains_key(&parent));
+
+        // Only the left half keeps re-asserting; the right goes quiet.
+        for epoch in 6..(5 + RESHAPE_TRIGGER_TTL_EPOCHS) {
+            state.current_epoch = Epoch::new(epoch);
+            apply_shard_payload(&mut state, left, &merge);
+            prune_stale_reshapes(&mut state);
+            assert!(
+                state.pending_reshapes.contains_key(&parent),
+                "cancelled early at epoch {epoch}",
+            );
+        }
+        state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
+        apply_shard_payload(&mut state, left, &merge);
+        prune_stale_reshapes(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+        // Keepers returned to ordinary rotation: still OnShard, no longer pinned.
+        assert!(!state.is_merge_keeper(left, ValidatorId::new(0)));
     }
 }

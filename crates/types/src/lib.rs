@@ -38,7 +38,7 @@ pub use beacon::{
     BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent, CertifiedBeaconBlock,
     CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
     CertifiedBeaconBlockVerifyError, CohortSeat, CommitteeTransition, EMISSIONS_PER_EPOCH,
-    EPOCHS_PER_YEAR, GenesisPool, GenesisValidator, JAIL_COOLDOWN_EPOCHS, JailReason,
+    EPOCHS_PER_YEAR, GenesisPool, GenesisValidator, JAIL_COOLDOWN_EPOCHS, JailReason, KeeperSeat,
     MAX_BEACON_COMMITTEE, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER,
     MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SHARDS,
     MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD,
