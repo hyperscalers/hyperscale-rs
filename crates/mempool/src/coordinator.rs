@@ -551,6 +551,49 @@ impl MempoolCoordinator {
         actions
     }
 
+    /// Drive a specific set of in-flight transactions to
+    /// `Completed(Aborted)` — the counterpart abort sweep on a surviving
+    /// shard, once a terminated partner's settled set proves the
+    /// transaction's cross-shard half will never finalize.
+    ///
+    /// Lock release is unfiltered for the same reason as
+    /// [`Self::abort_in_flight`]: the head trie has already re-routed the
+    /// terminated partner's nodes to its children, so a topology-filtered
+    /// release would miss exactly the locks the straddler took. Hashes not
+    /// in the pool (already terminal) are skipped.
+    pub fn abort_transactions(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
+        let mut sorted: Vec<TxHash> = tx_hashes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut actions = Vec::new();
+        for tx_hash in sorted {
+            let Some(entry) = self.pool.remove(&tx_hash) else {
+                continue;
+            };
+            if matches!(entry.status, TransactionStatus::Committed(_)) {
+                let newly_unlocked = self
+                    .locks
+                    .unlock_nodes(entry.tx.all_declared_nodes().copied());
+                for node in newly_unlocked {
+                    self.promote_transactions_for_node(node);
+                }
+                self.locks.dec_in_flight();
+            }
+            self.remove_from_ready_tracking(&tx_hash);
+            self.tombstones
+                .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+            record_transaction_aborted();
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash,
+                status: TransactionStatus::Completed(TransactionDecision::Aborted),
+                cross_shard: entry.cross_shard,
+                submitted_locally: entry.submitted_locally,
+            });
+        }
+        actions
+    }
+
     /// Process a committed block - update statuses and finalize transactions.
     ///
     /// This handles:
@@ -1745,6 +1788,56 @@ mod tests {
         assert_eq!(mempool.lock_contention_stats().locked_nodes, 0);
         assert!(mempool.status(&tx_hash).is_none());
         assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    #[test]
+    fn abort_transactions_releases_only_the_named_txs() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+
+        let doomed = test_transaction_with_nodes(b"doomed", vec![test_node(7)], vec![test_node(8)]);
+        let doomed_hash = doomed.hash();
+        let kept = test_transaction_with_nodes(b"kept", vec![test_node(9)], vec![test_node(10)]);
+        let kept_hash = kept.hash();
+
+        // Both commit with no deciding wave certificate: in flight, holding
+        // their declared-node locks.
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![Arc::new(doomed), Arc::new(kept)],
+            vec![],
+        );
+        mempool.on_block_committed(&topology, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        assert_eq!(mempool.in_flight(), 2);
+
+        let actions = mempool.abort_transactions(&[doomed_hash]);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::EmitTransactionStatus {
+                    tx_hash: h,
+                    status: TransactionStatus::Completed(TransactionDecision::Aborted),
+                    ..
+                } if *h == doomed_hash
+            )),
+            "the named tx is driven to terminal abort",
+        );
+        assert_eq!(
+            mempool.in_flight(),
+            1,
+            "only the named tx releases its slot"
+        );
+        assert!(mempool.is_tombstoned(&doomed_hash));
+        assert!(
+            matches!(
+                mempool.status(&kept_hash),
+                Some(TransactionStatus::Committed(_))
+            ),
+            "the unnamed tx keeps its locks and in-flight slot",
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

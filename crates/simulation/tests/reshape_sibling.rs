@@ -25,8 +25,9 @@ use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, NodeId,
     PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, SplitChildRoots,
-    StateRoot, TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, ed25519_keypair_from_seed,
-    routable_from_notarized_v1, sign_and_notarize, uniform_shard_for_node,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
+    uniform_shard_for_node,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -239,6 +240,9 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         balances.push((*payer, Decimal::from(10_000)));
         balances.push((*recipient, Decimal::from(10_000)));
     }
+    // A surviving-shard recipient for the post-abort lock-release probe.
+    let (_, lock_probe_recipient) = account_in(survivor, 2, &mut taken);
+    balances.push((lock_probe_recipient, Decimal::from(10_000)));
     runner.initialize_genesis_with_balances(&balances);
 
     // ── Admission: leaf(1,1) folds its trigger and draws a cohort; the
@@ -436,11 +440,21 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     }
 
     // ── Settlement window: the survivor reconstructs S_{leaf(1,1)} from
-    // the coast headers it sees and finalizes every straddler it can ──
+    // the coast headers it sees, finalizes the straddlers it settled, and
+    // counterpart-aborts the ones it never did (releasing their locks).
+    // Run until the first abort lands so the status cache is settled ──
+    let survivor_host = runner.network().validator_to_node(ValidatorId::new(0));
     let settle_deadline = runner.now() + epochs(SETTLE_BUDGET_EPOCHS);
-    let _ = run_until(&mut runner, settle_deadline, |_| false);
+    let swept = run_until(&mut runner, settle_deadline, |r| {
+        probes.iter().any(|(_, hash)| {
+            matches!(
+                r.tx_status(survivor_host, hash),
+                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            )
+        })
+    });
 
-    // ── Scan each straddler's fate on both chains ──
+    // ── Scan each straddler's fate on both chains + its survivor status ──
     let cut_wt = WeightedTimestamp::from_millis(u64::try_from(cut.as_millis()).expect("cut fits"));
     let terminal_b = genesis_height
         .prev()
@@ -457,17 +471,26 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     let mut settled = 0u32; // settled on leaf(1,1) and finalized on the survivor
     let mut one_sided = 0u32; // finalized on the survivor but not settled on leaf(1,1)
     let mut straddled = 0u32; // committed on leaf(1,1) but never settled there
-    for (delay, hash) in &probes {
+    let mut doomed = 0u32; // committed on the survivor but unsettled on leaf(1,1)
+    let mut doomed_aborted = 0u32; // ... and driven to Completed(Aborted) on the survivor
+    let mut wrongly_aborted = 0u32; // settled on leaf(1,1) yet aborted on the survivor
+    let mut lock_probe_idx: Option<usize> = None;
+    for (idx, (delay, hash)) in probes.iter().enumerate() {
         let (s_committed, s_finalized, _) = scan_chain(splitter_store, BlockHeight::new(1), *hash);
         let (v_committed, v_finalized, v_wt) =
             scan_chain(survivor_store, BlockHeight::new(1), *hash);
         let settled_on_splitter = s_finalized.is_some_and(|h| h <= terminal_b);
         let finalized_on_survivor = v_finalized.is_some();
         let post_cut = v_wt.is_some_and(|wt| wt > cut_wt);
+        let survivor_status = runner.tx_status(survivor_host, hash);
+        let aborted_on_survivor = matches!(
+            survivor_status,
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+        );
         let _ = write!(
             report,
             "\n  +{delay}ms: leaf(1,1) committed={:?} finalized={:?} settled={settled_on_splitter}; \
-             leaf(1,0) committed={:?} finalized={:?} wt={:?} post_cut={post_cut}",
+             leaf(1,0) committed={:?} finalized={:?} wt={:?} post_cut={post_cut} status={survivor_status:?}",
             s_committed.map(BlockHeight::inner),
             s_finalized.map(BlockHeight::inner),
             v_committed.map(BlockHeight::inner),
@@ -482,6 +505,18 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         }
         if s_committed.is_some() && !settled_on_splitter {
             straddled += 1;
+        }
+        if settled_on_splitter && aborted_on_survivor {
+            wrongly_aborted += 1;
+        }
+        if v_committed.is_some() && !settled_on_splitter {
+            doomed += 1;
+            if aborted_on_survivor {
+                doomed_aborted += 1;
+                if lock_probe_idx.is_none() {
+                    lock_probe_idx = Some(idx);
+                }
+            }
         }
     }
 
@@ -502,11 +537,16 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
 
     // Atomicity: the survivor finalizes a cross-shard wave with leaf(1,1)
     // only when leaf(1,1) settled it by its terminal block — never
-    // one-sided.
+    // one-sided, and never aborts one leaf(1,1) did settle.
     assert_eq!(
         one_sided, 0,
         "the survivor finalized a straddler leaf(1,1) never settled — one-sided cross-shard \
          application:\n{report}",
+    );
+    assert_eq!(
+        wrongly_aborted, 0,
+        "the survivor aborted a straddler leaf(1,1) settled by its terminal block — a settled \
+         half was discarded:\n{report}",
     );
     assert!(
         settled > 0,
@@ -517,5 +557,50 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         straddled > 0,
         "no straddler reached leaf(1,1)'s boundary unsettled — the offsets need retuning so \
          the test actually stresses the cut:\n{report}",
+    );
+
+    // Counterpart abort sweep: every straddler the survivor committed but
+    // leaf(1,1) never settled must reach Completed(Aborted) — it can never
+    // gain leaf(1,1)'s coverage, so its in-flight slot and node locks free.
+    assert!(
+        swept,
+        "the survivor must abort at least one unsettled straddler once it reconstructs \
+         S_{{leaf(1,1)}}:\n{report}",
+    );
+    assert!(
+        doomed > 0,
+        "no straddler committed on the survivor went unsettled — offsets need retuning so the \
+         counterpart sweep has something to abort:\n{report}",
+    );
+    assert_eq!(
+        doomed_aborted, doomed,
+        "the survivor must drive every doomed straddler to Completed(Aborted); \
+         {doomed_aborted}/{doomed} aborted:\n{report}",
+    );
+
+    // ── Lock-release probe: the counterpart abort released the straddler's
+    // declared-node locks, so a fresh single-shard transfer from the same
+    // payer (touching a node the straddler had locked) now completes ──
+    let probe_idx = lock_probe_idx.expect("a doomed straddler was aborted above");
+    let (probe_payer_key, probe_payer, _) = &straddlers[probe_idx];
+    let lock_probe = transfer(probe_payer_key, *probe_payer, lock_probe_recipient);
+    let probe_hash = lock_probe.hash();
+    runner.schedule_initial_event(
+        survivor_host,
+        Duration::from_millis(10),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: lock_probe }),
+    );
+    let probe_deadline = runner.now() + epochs(SETTLE_BUDGET_EPOCHS);
+    let probe_completed = run_until(&mut runner, probe_deadline, |r| {
+        matches!(
+            r.tx_status(survivor_host, &probe_hash),
+            Some(TransactionStatus::Completed(_))
+        )
+    });
+    assert!(
+        probe_completed,
+        "a fresh transfer from an aborted straddler's payer must complete once the counterpart \
+         abort released its locks; got status {:?}\n{report}",
+        runner.tx_status(survivor_host, &probe_hash),
     );
 }

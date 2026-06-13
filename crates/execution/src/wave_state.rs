@@ -709,6 +709,22 @@ impl WaveState {
         true
     }
 
+    /// Whether any non-aborted tx still lacks an execution certificate from
+    /// `shard`. The counterpart abort sweep reads this once a past-terminal
+    /// partner shard's settled set is fully ingested: a wave that still
+    /// lacks the partner's coverage can never gain it, so it is doomed and
+    /// its transactions abort.
+    #[must_use]
+    pub fn lacks_coverage_from(&self, shard: ShardId) -> bool {
+        self.tx_hashes.iter().any(|tx_hash| {
+            !self.tracker_aborted.contains(tx_hash)
+                && self
+                    .covered_shards
+                    .get(tx_hash)
+                    .is_some_and(|covered| !covered.contains(&shard))
+        })
+    }
+
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.

@@ -289,6 +289,21 @@ impl ExpectedCertTracker {
         }
     }
 
+    /// Whether the EC for `(source_shard, block_height, wave_id)` has
+    /// already been ingested (a [`mark_fulfilled`](Self::mark_fulfilled)
+    /// tombstone exists). The counterpart abort sweep reads this to decide
+    /// which settled waves naming us are still outstanding.
+    #[must_use]
+    pub fn is_fulfilled(
+        &self,
+        source_shard: ShardId,
+        block_height: BlockHeight,
+        wave_id: &WaveId,
+    ) -> bool {
+        self.fulfilled
+            .contains_key(&(source_shard, block_height, wave_id.clone()))
+    }
+
     pub fn expected_len(&self) -> usize {
         self.expected.len()
     }
