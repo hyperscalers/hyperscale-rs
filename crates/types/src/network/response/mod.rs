@@ -10,6 +10,7 @@ mod finalized_wave;
 mod local_provision;
 mod provision;
 mod remote_header;
+mod settled_waves;
 mod state_range;
 mod transaction;
 mod witness_history;
@@ -20,6 +21,7 @@ pub use finalized_wave::GetFinalizedWavesResponse;
 pub use local_provision::{GetLocalProvisionsResponse, LocalProvisionEntry};
 pub use provision::GetProvisionResponse;
 pub use remote_header::GetRemoteHeadersResponse;
+pub use settled_waves::{GetSettledWavesResponse, SettledWavesReveal};
 pub use state_range::{
     GetStateRangeResponse, MAX_LEAVES_PER_STATE_RANGE, StateRangeChunk, StateRangeLeaf,
 };

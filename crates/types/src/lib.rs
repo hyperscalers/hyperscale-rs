@@ -136,8 +136,9 @@ pub use shard::roots::{
     CertificateRootContext, LocalReceiptRootContext, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, ProvisionsRootContext, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, TransactionRootContext, TxRootVerifyError, derive_leaves,
-    derive_reshape_trigger, missed_proposals_since_prev_commit,
+    StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
+    certificate_root_from_receipt_hashes, derive_leaves, derive_reshape_trigger,
+    missed_proposals_since_prev_commit,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
@@ -188,7 +189,9 @@ pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use verifiable::{Verifiable, Verified, Verify};
-pub use wave::certificate::WaveCertificate;
+pub use wave::certificate::{
+    MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
+};
 pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
 pub use wave::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,

@@ -31,7 +31,9 @@ pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, derive_leaves, derive_reshape_trigger,
     missed_proposals_since_prev_commit,
 };
-pub use certificate::{CertRootVerifyError, CertificateRootContext};
+pub use certificate::{
+    CertRootVerifyError, CertificateRootContext, certificate_root_from_receipt_hashes,
+};
 pub use local_receipt::{LocalReceiptRootContext, LocalReceiptRootVerifyError};
 pub use provision_tx::{ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError};
 pub use provisions::{ProvisionRootVerifyError, ProvisionsRootContext};

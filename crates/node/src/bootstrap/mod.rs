@@ -20,6 +20,7 @@
 //! it deterministically — both run this exact sequencing.
 
 pub mod observer;
+pub mod settled_set;
 pub mod snap_sync;
 pub mod split_flip;
 pub mod witness_history;

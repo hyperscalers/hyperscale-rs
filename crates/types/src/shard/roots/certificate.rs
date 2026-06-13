@@ -5,8 +5,24 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    CertificateRoot, FinalizedWave, Hash, Verifiable, Verified, Verify, compute_merkle_root,
+    CertificateRoot, FinalizedWave, Hash, Verifiable, Verified, Verify, WaveReceiptHash,
+    compute_merkle_root,
 };
+
+/// The certificate root over `receipt_hashes`, in block order. Empty →
+/// [`CertificateRoot::ZERO`]; otherwise the merkle root of the hashes.
+///
+/// The shared kernel of [`Verified::<CertificateRoot>::compute`] and any
+/// remote verifier that recomputes the root from per-certificate
+/// reveals rather than the certificates themselves.
+#[must_use]
+pub fn certificate_root_from_receipt_hashes(receipt_hashes: &[WaveReceiptHash]) -> CertificateRoot {
+    if receipt_hashes.is_empty() {
+        return CertificateRoot::ZERO;
+    }
+    let leaves: Vec<Hash> = receipt_hashes.iter().map(|h| h.into_raw()).collect();
+    CertificateRoot::from_raw(compute_merkle_root(&leaves))
+}
 
 /// Inputs the [`CertificateRoot`] verifier reads against.
 #[derive(Debug, Clone, Copy)]
@@ -37,14 +53,11 @@ impl Verified<CertificateRoot> {
     /// `Block::Live.certificates` slice without unwrapping.
     #[must_use]
     pub fn compute(certificates: &[Arc<Verifiable<FinalizedWave>>]) -> Self {
-        if certificates.is_empty() {
-            return Self::new_unchecked(CertificateRoot::ZERO);
-        }
-        let leaves: Vec<Hash> = certificates
+        let receipt_hashes: Vec<WaveReceiptHash> = certificates
             .iter()
-            .map(|fw| fw.certificate().receipt_hash().into_raw())
+            .map(|fw| fw.certificate().receipt_hash())
             .collect();
-        Self::new_unchecked(CertificateRoot::from_raw(compute_merkle_root(&leaves)))
+        Self::new_unchecked(certificate_root_from_receipt_hashes(&receipt_hashes))
     }
 
     /// Pipeline-attestation gate for slot prefill. The trust source is

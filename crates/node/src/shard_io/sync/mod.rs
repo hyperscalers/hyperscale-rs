@@ -60,6 +60,7 @@ pub mod block_serve;
 pub mod host;
 pub mod remote_header;
 pub mod remote_header_serve;
+pub mod settled_waves_serve;
 
 pub use host::SyncHost;
 

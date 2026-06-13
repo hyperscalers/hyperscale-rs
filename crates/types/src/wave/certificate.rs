@@ -20,7 +20,31 @@ use crate::{
 /// realistic shard count and bounds the per-element pre-allocation that
 /// would otherwise let a peer claim billions of inner ECs and OOM the
 /// validator at decode time.
-const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
+pub const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
+
+/// Hash a wave certificate's execution-certificate identities into its
+/// [`WaveReceiptHash`] — the leaf a block's `certificate_root` commits.
+///
+/// Each EC contributes its `(shard_id, wave_id)` pair; the shard is the
+/// wave's own (`WaveId::shard_id`), so a verifier holding only the
+/// certificate's EC wave-ids reproduces the hash without the EC bodies.
+/// Order matters and is the certificate's stored order (sorted by
+/// `(shard_id, wave_id)` at construction); callers reproducing the hash
+/// feed the same order.
+///
+/// # Panics
+///
+/// Panics if SBOR encoding of a `ShardId` or `WaveId` fails — closed
+/// SBOR types, infallible in practice.
+#[must_use]
+pub fn wave_receipt_hash<'a>(ec_wave_ids: impl IntoIterator<Item = &'a WaveId>) -> WaveReceiptHash {
+    let mut hasher = Hasher::new();
+    for wave_id in ec_wave_ids {
+        hasher.update(&basic_encode(&wave_id.shard_id()).unwrap());
+        hasher.update(&basic_encode(wave_id).unwrap());
+    }
+    WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
+}
 
 /// Wave certificate — proof of execution finalization for a wave.
 ///
@@ -136,19 +160,21 @@ impl WaveCertificate {
     /// pre-sorted at construction time for deterministic ordering. At most
     /// one valid EC exists per `wave_id` (signature verification upstream
     /// enforces this), so committing to `wave_id` is content-equivalent.
-    ///
-    /// # Panics
-    ///
-    /// Panics if SBOR encoding of a `ShardId` or `WaveId` fails —
-    /// closed SBOR types, infallible in practice.
     #[must_use]
     pub fn receipt_hash(&self) -> WaveReceiptHash {
-        let mut hasher = Hasher::new();
-        for ec in self.execution_certificates.iter() {
-            hasher.update(&basic_encode(&ec.shard_id()).unwrap());
-            hasher.update(&basic_encode(&ec.wave_id()).unwrap());
-        }
-        WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
+        wave_receipt_hash(self.execution_certificates.iter().map(|ec| ec.wave_id()))
+    }
+
+    /// The wave-ids of every execution certificate this certificate
+    /// carries, in stored (`receipt_hash`) order. The minimal reveal a
+    /// remote verifier needs to reproduce [`Self::receipt_hash`] — the
+    /// shard of each is derivable as `WaveId::shard_id`.
+    #[must_use]
+    pub fn ec_wave_ids(&self) -> Vec<WaveId> {
+        self.execution_certificates
+            .iter()
+            .map(|ec| ec.wave_id().clone())
+            .collect()
     }
 }
 
