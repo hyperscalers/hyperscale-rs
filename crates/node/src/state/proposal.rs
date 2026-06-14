@@ -33,12 +33,13 @@ impl NodeStateMachine {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by shard consensus during proposal building.
         let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
-        // Split-boundary quiesce: in a shard's final epoch before a split,
-        // stop selecting transactions that can't settle before the cut.
-        // `None` in steady state, so the mempool filter is inert.
+        // Reshape-boundary quiesce: in a shard's final epoch before it
+        // terminates at a split or merge, stop selecting transactions that
+        // can't settle before the cut. `None` in steady state, so the
+        // mempool filter is inert.
         let quiesce = self
             .shard_coordinator
-            .split_quiesce_cut(self.beacon_coordinator.topology_schedule());
+            .quiesce_cut(self.beacon_coordinator.topology_schedule());
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
             pending_txs,

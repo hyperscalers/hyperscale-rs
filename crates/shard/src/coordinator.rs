@@ -693,26 +693,24 @@ impl ShardCoordinator {
         topology.terminates_at_next_boundary(self.local_shard, wt)
     }
 
-    /// The split-boundary quiesce window when this shard sits in its final
-    /// epoch before a split, anchored on the proposer's tip — `None` in
-    /// steady state, so the proposer's quiesce filter is inert away from a
-    /// reshape boundary. The cut is the end of the tip's epoch window.
-    /// `Unresolved` (the local beacon hasn't seen the next window yet)
-    /// yields `None`: the abort backstop covers any straddler this lets
-    /// through, so quiescing on a guess buys nothing.
+    /// The reshape-boundary quiesce window when this shard sits in its final
+    /// epoch before terminating — a split *or* a merge — anchored on the
+    /// proposer's tip. `None` in steady state, so the proposer's quiesce
+    /// filter is inert away from a reshape boundary. The cut is the end of
+    /// the tip's epoch window. An unresolved boundary (the local beacon
+    /// hasn't seen the next window yet) yields `None`: the abort backstop
+    /// covers any straddler this lets through, so quiescing on a guess buys
+    /// nothing.
     #[must_use]
-    pub fn split_quiesce_cut(&self, topology: &TopologySchedule) -> Option<QuiesceCut> {
+    pub fn quiesce_cut(&self, topology: &TopologySchedule) -> Option<QuiesceCut> {
         let now_wt = self.tip_anchor_ts();
-        match topology.split_at_next_boundary(self.local_shard, now_wt) {
-            SplitAtBoundary::Children(..) => {
-                let windows = topology.windows();
-                Some(QuiesceCut {
-                    now_wt,
-                    cut_wt: windows.window_of(windows.epoch_for(now_wt)).end,
-                })
+        (topology.terminates_at_next_boundary(self.local_shard, now_wt) == Some(true)).then(|| {
+            let windows = topology.windows();
+            QuiesceCut {
+                now_wt,
+                cut_wt: windows.window_of(windows.epoch_for(now_wt)).end,
             }
-            SplitAtBoundary::No | SplitAtBoundary::Unresolved => None,
-        }
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -8263,6 +8261,35 @@ mod tests {
         sched
     }
 
+    /// A schedule whose two genesis leaves merge into their parent `ROOT` at
+    /// the epoch-0→1 boundary — the merge counterpart of
+    /// [`make_terminating_schedule`]: the final window carries both children,
+    /// the next carries only the parent.
+    fn make_merging_schedule(n: usize) -> TopologySchedule {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let pre_merge = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let post_merge = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), pre_merge);
+        sched.insert(Epoch::new(1), post_merge);
+        sched
+    }
+
     fn coordinator_with_committed_anchor(anchor_ms: u64) -> ShardCoordinator {
         let recovered = RecoveredState {
             committed_anchor_ts: Some(WeightedTimestamp::from_millis(anchor_ms)),
@@ -8318,7 +8345,7 @@ mod tests {
     }
 
     #[test]
-    fn split_quiesce_cut_some_in_final_epoch_none_in_steady_state() {
+    fn quiesce_cut_fires_at_split_and_merge_boundaries() {
         // ROOT splits into its children at the epoch-0→1 boundary, so a
         // ROOT proposer anchored in epoch 0 is in its final epoch: the cut
         // is the end of that window (1000 ms), the anchor its tip (genesis,
@@ -8331,13 +8358,29 @@ mod tests {
             RecoveredState::default(),
         );
         let cut = root
-            .split_quiesce_cut(&splitting)
+            .quiesce_cut(&splitting)
             .expect("ROOT is in its final epoch before the split");
         assert_eq!(cut.now_wt, WeightedTimestamp::from_millis(0));
         assert_eq!(cut.cut_wt, WeightedTimestamp::from_millis(1000));
 
+        // A merging child — its two-leaf window collapses to the parent at
+        // the boundary — is likewise in its final epoch and must quiesce.
+        // This is the case the split-only predicate missed.
+        let merging = make_merging_schedule(4);
+        let (left, _) = ShardId::ROOT.children();
+        let child = ShardCoordinator::new(
+            ValidatorId::new(0),
+            left,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+        let merge_cut = child
+            .quiesce_cut(&merging)
+            .expect("a merging child is in its final epoch before the merge");
+        assert_eq!(merge_cut.cut_wt, WeightedTimestamp::from_millis(1000));
+
         // A shard present in both the current and the next window never
-        // splits at the boundary, so the quiesce stays inert.
+        // terminates at the boundary, so the quiesce stays inert.
         let stable = {
             let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
             let validators: Vec<ValidatorInfo> = keys
@@ -8358,8 +8401,8 @@ mod tests {
             sched
         };
         assert!(
-            root.split_quiesce_cut(&stable).is_none(),
-            "no split pending → no quiesce cut",
+            root.quiesce_cut(&stable).is_none(),
+            "no reshape pending → no quiesce cut",
         );
     }
 

@@ -70,16 +70,16 @@ pub enum SplitAtBoundary {
     Children(ShardId, ShardId),
 }
 
-/// A split-boundary quiesce window for a shard in its final epoch.
+/// A reshape-boundary quiesce window for a shard in its final epoch.
 ///
-/// `cut_wt` is the weighted timestamp at which the shard splits (the end
-/// of the current epoch window); `now_wt` is the proposer's current chain
-/// anchor. A proposer stops selecting a transaction once `now_wt + margin`
-/// reaches `cut_wt` — cross-shard work needs a wider margin (a full 2PC
-/// round) than single-shard, so a transaction selected before the cut can
-/// still settle on every shard by the terminal block. Pure proposer
-/// policy: a non-compliant proposer's late transactions simply land in the
-/// counterpart abort backstop.
+/// `cut_wt` is the weighted timestamp at which the shard terminates — a
+/// split or a merge — at the end of the current epoch window; `now_wt` is
+/// the proposer's current chain anchor. A proposer stops selecting a
+/// transaction once `now_wt + margin` reaches `cut_wt` — cross-shard work
+/// needs a wider margin (a full 2PC round) than single-shard, so a
+/// transaction selected before the cut can still settle on every shard by
+/// the terminal block. Pure proposer policy: a non-compliant proposer's
+/// late transactions simply land in the counterpart abort backstop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuiesceCut {
     /// The proposer's current chain anchor.
