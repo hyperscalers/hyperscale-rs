@@ -13,8 +13,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::tree::Jmt;
+use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_storage::tree::count_subtree_leaves;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
 };
@@ -30,10 +30,6 @@ use super::metadata::{
 };
 use crate::StorageError;
 use crate::typed_cf::{TypedCf, batch_put};
-
-/// Leaves counted per tree walk page while seeding the child's substate
-/// count.
-const COUNT_PAGE: usize = 1 << 16;
 
 impl RocksDbShardStorage {
     /// Hard-link a checkpoint of this store's entire database into the
@@ -423,30 +419,8 @@ impl RocksDbShardStorage {
             root_key,
             root_node,
         };
-        let mut count: u64 = 0;
-        let mut start: Key = [0u8; 32];
-        loop {
-            let chunk = Jmt::collect_range(&store, root_key, &start, &[0xFF; 32], COUNT_PAGE)
-                .map_err(|e| StorageError::DatabaseError(format!("split adoption count: {e:?}")))?;
-            count += chunk.leaves.len() as u64;
-            let Some((last, _)) = chunk.leaves.last() else {
-                break;
-            };
-            if !chunk.more {
-                break;
-            }
-            start = *last;
-            // Advance the cursor one key; saturation is unreachable
-            // (`more` implies a successor exists).
-            for byte in start.iter_mut().rev() {
-                let (next, overflow) = byte.overflowing_add(1);
-                *byte = next;
-                if !overflow {
-                    break;
-                }
-            }
-        }
-        Ok(count)
+        count_subtree_leaves(&store, root_key)
+            .map_err(|e| StorageError::DatabaseError(format!("split adoption count: {e:?}")))
     }
 }
 
@@ -479,7 +453,7 @@ impl TreeReader for PreRootStore<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{Blake3Hasher, Hasher, NibblePath};
+    use hyperscale_jmt::{Blake3Hasher, Hasher, Key, NibblePath};
     use hyperscale_storage::{BoundaryStore, ImportLeaf};
     use hyperscale_types::{BlockHash, BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
     use tempfile::TempDir;

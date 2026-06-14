@@ -17,15 +17,11 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
-use hyperscale_storage::tree::Jmt;
+use hyperscale_storage::tree::count_subtree_leaves;
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
 
 use super::core::SimShardStorage;
 use super::state::ConsensusState;
-
-/// Leaves counted per tree-walk page while seeding the child's substate
-/// count.
-const COUNT_PAGE: usize = 1 << 16;
 
 impl SimShardStorage {
     /// The simulation's checkpoint hard-link: a deep copy of this
@@ -267,39 +263,14 @@ fn install_adoption(
         None => 0,
         Some(node) => {
             shared.tree_store.insert(genesis_root_key.clone(), node);
-            count_subtree_leaves(&shared.tree_store, &genesis_root_key)?
+            count_subtree_leaves(&shared.tree_store, &genesis_root_key)
+                .map_err(|e| format!("split adoption count: {e:?}"))?
         }
     };
     shared.substate_counts.insert(genesis_version, count);
     shared.current_block_height = origin.genesis_height;
     shared.current_root_hash = child_root;
     Ok(())
-}
-
-/// Count the live leaves under `root_key` by walking the tree in pages.
-fn count_subtree_leaves(store: &impl TreeReader, root_key: &NodeKey) -> Result<u64, String> {
-    let mut count: u64 = 0;
-    let mut start = [0u8; 32];
-    loop {
-        let chunk = Jmt::collect_range(store, root_key, &start, &[0xFF; 32], COUNT_PAGE)
-            .map_err(|e| format!("split adoption count: {e:?}"))?;
-        count += chunk.leaves.len() as u64;
-        let Some((last, _)) = chunk.leaves.last() else {
-            break;
-        };
-        if !chunk.more {
-            break;
-        }
-        start = *last;
-        for byte in start.iter_mut().rev() {
-            let (next, overflow) = byte.overflowing_add(1);
-            *byte = next;
-            if !overflow {
-                break;
-            }
-        }
-    }
-    Ok(count)
 }
 
 #[cfg(test)]
