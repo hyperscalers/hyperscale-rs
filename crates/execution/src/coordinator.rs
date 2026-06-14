@@ -1563,6 +1563,13 @@ impl ExecutionCoordinator {
         self.early.gc_stale_ecs(self.committed_ts);
         self.provisioning.gc_stale_provisions(self.committed_ts);
 
+        // Re-check gate-held finalized waves against the advanced clock:
+        // emit any the schedule now resolves, and drop any held past their
+        // retention horizon. Runs every block so a settled set that never
+        // reconstructs can't pin the buffer; rejected straddlers ride
+        // `gate_rejected_aborts` into the commit's counterpart sweep.
+        actions.extend(self.redrive_gated_finalizations(topology));
+
         // Re-broadcast outbound ECs that haven't been ACKed via wave
         // finalization. Driven from the commit cadence so the schedule is
         // deterministic across validators.
@@ -1877,7 +1884,23 @@ impl ExecutionCoordinator {
                 )]
             }
             SettledSetVerdict::Defer => {
-                self.gated_finalized.insert(wave_id, finalized_arc);
+                // Hold until the past-terminal partner's settled set
+                // reconstructs — unless the wave has been held past
+                // `RETENTION_HORIZON` of its own execution anchor, at which
+                // point the set is categorically irrelevant everywhere and
+                // can never resolve it. Then it rides the reject path so its
+                // straddlers abort rather than the buffer growing unbounded.
+                let anchor = finalized_arc
+                    .execution_certificates()
+                    .iter()
+                    .map(|ec| ec.vote_anchor_ts())
+                    .max()
+                    .unwrap_or(self.committed_ts);
+                if self.committed_ts > anchor.plus(RETENTION_HORIZON) {
+                    self.gate_rejected_aborts.extend(finalized_arc.tx_hashes());
+                } else {
+                    self.gated_finalized.insert(wave_id, finalized_arc);
+                }
                 vec![]
             }
             SettledSetVerdict::Reject => {
@@ -4231,6 +4254,44 @@ mod tests {
         assert_eq!(
             aborted, tx_hashes,
             "the rejected wave's tx aborts rather than wedging in flight",
+        );
+    }
+
+    /// A gate-held wave whose partner's settled set never reconstructs
+    /// can't defer forever: once the commit clock passes the wave's own
+    /// execution anchor by `RETENTION_HORIZON`, the redrive drops it like a
+    /// reject so its straddler aborts rather than the buffer growing
+    /// unbounded.
+    #[test]
+    fn gate_held_wave_evicts_past_its_retention_horizon() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+        // Past ROOT's terminal window so the gate defers while the settled
+        // set is unknown.
+        state.committed_ts = WeightedTimestamp::from_millis(1500);
+        let sched = terminating_schedule();
+        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave_id = wave.wave_id().clone();
+        let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
+
+        let deferred = state.emit_or_gate_finalized(&sched, wave);
+        assert!(deferred.is_empty(), "held while the settled set is unknown");
+        assert!(state.gated_finalized.contains_key(&wave_id));
+
+        // The set never reconstructs; the commit clock advances past the
+        // wave's anchor (1ms) plus the horizon. The next redrive evicts it.
+        state.committed_ts = WeightedTimestamp::from_millis(2).plus(RETENTION_HORIZON);
+        let released = state.redrive_gated_finalizations(&sched);
+        assert!(released.is_empty(), "an unresolved wave is never finalized");
+        assert!(
+            state.gated_finalized.is_empty(),
+            "the buffer no longer pins the held wave",
+        );
+        assert!(!state.finalized.contains(&wave_id));
+
+        let aborted = state.take_ready_counterpart_aborts();
+        assert_eq!(
+            aborted, tx_hashes,
+            "the held wave's straddler aborts rather than wedging in flight",
         );
     }
 
