@@ -49,11 +49,11 @@ pub struct SharedState {
     /// before the write at that version. Consumed by historical reads
     /// and the retention GC.
     pub state_history: BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,
-    /// Committed substate (JMT leaf) count per version, written in
+    /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
     /// every replica.
-    pub substate_counts: BTreeMap<u64, u64>,
+    pub substate_bytes: BTreeMap<u64, u64>,
 }
 
 impl SharedState {
@@ -69,7 +69,7 @@ impl SharedState {
             current_state: BTreeMap::new(),
             state_history: BTreeMap::new(),
             associations: HashMap::new(),
-            substate_counts: BTreeMap::new(),
+            substate_bytes: BTreeMap::new(),
         }
     }
 
@@ -95,18 +95,18 @@ impl SharedState {
             }
         }
 
-        // Substate count: the count behind the currently applied version
+        // Substate bytes: the byte total behind the currently applied version
         // (equal across any interleaved empty commits) plus this
         // snapshot's leaf delta.
         let prior = self
-            .substate_counts
+            .substate_bytes
             .get(&self.current_block_height.inner())
             .copied()
             .unwrap_or(0);
         let count = prior
-            .checked_add_signed(snapshot.leaf_delta)
-            .expect("substate count must not go negative");
-        self.substate_counts
+            .checked_add_signed(snapshot.bytes_delta)
+            .expect("substate byte total must not go negative");
+        self.substate_bytes
             .insert(snapshot.new_height.inner(), count);
 
         self.current_block_height = snapshot.new_height;
@@ -116,7 +116,7 @@ impl SharedState {
 
 /// Apply `updates` at `height` over the shared state — substate values
 /// (with history), the JMT (owner-routed via `owner_map`), leaf
-/// associations, the substate count, and the tip version/root — and
+/// associations, the substate byte total, and the tip version/root — and
 /// return the resulting root. The state-level half of a block commit,
 /// shared by the chain writer's sync path and a split observer's
 /// follow path.
@@ -152,17 +152,17 @@ pub fn apply_state_writes(
         }
     }
 
-    // Substate count: prior count behind the current version plus
+    // Substate bytes: prior byte total behind the current version plus
     // this application's leaf delta — same rule as `apply_jmt_snapshot`.
     let prior = s
-        .substate_counts
+        .substate_bytes
         .get(&s.current_block_height.inner())
         .copied()
         .unwrap_or(0);
     let count = prior
-        .checked_add_signed(collected.leaf_delta)
-        .expect("substate count must not go negative");
-    s.substate_counts.insert(height.inner(), count);
+        .checked_add_signed(collected.bytes_delta)
+        .expect("substate byte total must not go negative");
+    s.substate_bytes.insert(height.inner(), count);
 
     s.current_block_height = height;
     s.current_root_hash = new_root;

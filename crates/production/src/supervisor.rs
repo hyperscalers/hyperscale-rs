@@ -149,7 +149,7 @@ pub struct CompletedAdoption {
 pub struct CompletedObservation {
     child: ShardId,
     root: StateRoot,
-    substate_count: u64,
+    substate_bytes: u64,
 }
 
 /// An observer duty's boundary handoff, prepared: the followed store is
@@ -841,7 +841,7 @@ impl ShardSupervisor {
                     return;
                 }
             };
-            let (anchor, root, substate_count) = match bootstrap_observer_state(
+            let (anchor, root, substate_bytes) = match bootstrap_observer_state(
                 process.network(),
                 process.topology(),
                 &storage,
@@ -877,7 +877,7 @@ impl ShardSupervisor {
             let _ = events.send(SupervisorEvent::Observed(Ok(CompletedObservation {
                 child,
                 root,
-                substate_count,
+                substate_bytes,
             })));
 
             // Stay current: follow the parent's chain to its crossing,
@@ -919,7 +919,7 @@ impl ShardSupervisor {
                     child = ?observation.child,
                     validator = duty.validator.inner(),
                     root = ?observation.root,
-                    substates = observation.substate_count,
+                    substates = observation.substate_bytes,
                     "Observer duty complete; ready signal broadcast"
                 );
                 // The duty task continues into the stay-current follow;
@@ -1220,11 +1220,11 @@ async fn prepare_observer_flip(
                 genesis.header().state_root(),
             ));
         }
-        let substate_count = storage
-            .substate_count_at_version(origin.genesis_height.inner())
+        let substate_bytes = storage
+            .substate_bytes_at_version(origin.genesis_height.inner())
             .unwrap_or(0);
         let recovered = RecoveredState {
-            substate_count,
+            substate_bytes,
             chain_origin: origin,
             ..RecoveredState::default()
         };
@@ -1307,11 +1307,11 @@ fn adopt_from_parent(
             anchor.state_root,
         ));
     }
-    let substate_count = storage
-        .substate_count_at_version(origin.genesis_height.inner())
+    let substate_bytes = storage
+        .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
     let recovered = RecoveredState {
-        substate_count,
+        substate_bytes,
         chain_origin: origin,
         ..RecoveredState::default()
     };

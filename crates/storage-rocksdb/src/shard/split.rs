@@ -14,14 +14,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::tree::count_subtree_leaves;
+use hyperscale_storage::tree::Jmt;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
 };
 use rocksdb::WriteBatch;
 use rocksdb::checkpoint::Checkpoint;
 
-use super::column_families::{CfHandles, JmtNodesCf, SubstateCountsCf};
+use super::column_families::{CfHandles, JmtNodesCf, SubstateBytesCf};
 use super::core::RocksDbShardStorage;
 use super::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use super::metadata::{
@@ -76,7 +76,7 @@ impl RocksDbShardStorage {
     /// Reads the parent's root node at the checkpoint's committed
     /// version, takes the child-side slot as the adopted `state_root`,
     /// copies the child's root node to the genesis version (the same
-    /// carry-forward an empty block performs), seeds the substate count
+    /// carry-forward an empty block performs), seeds the substate byte total
     /// by walking the subtree, and records the chain origin plus the
     /// `genesis` block as the committed tip — all in one atomic batch,
     /// so a crash at any later point recovers the store as a committed
@@ -165,9 +165,9 @@ impl RocksDbShardStorage {
                 // Empty side: the child starts with an empty tree — no
                 // root node exists at any version, and the zero root
                 // marks it so.
-                batch_put::<SubstateCountsCf>(
+                batch_put::<SubstateBytesCf>(
                     &mut batch,
-                    SubstateCountsCf::handle(&cf),
+                    SubstateBytesCf::handle(&cf),
                     &genesis_version,
                     &0,
                 );
@@ -189,12 +189,12 @@ impl RocksDbShardStorage {
                     &StoredNodeKey::from_jmt(&genesis_root_key),
                     &child_node,
                 );
-                let count = self.count_subtree_leaves(&genesis_root_key, &child_node)?;
-                batch_put::<SubstateCountsCf>(
+                let bytes = self.sum_subtree_value_lens(&genesis_root_key, &child_node)?;
+                batch_put::<SubstateBytesCf>(
                     &mut batch,
-                    SubstateCountsCf::handle(&cf),
+                    SubstateBytesCf::handle(&cf),
                     &genesis_version,
-                    &count,
+                    &bytes,
                 );
                 StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
             }
@@ -214,7 +214,7 @@ impl RocksDbShardStorage {
     /// The store imported the child span at the splitting parent's
     /// anchor and followed the parent's child-half writes to its
     /// crossing, so its tree *is* the adopted subtree: the tip's root
-    /// node is copied to the genesis version, the substate count seeded
+    /// node is copied to the genesis version, the substate byte total seeded
     /// by walking it, and the chain origin plus the `genesis` block
     /// recorded as the committed tip — all in one atomic batch, so a
     /// crash at any later point recovers the store as a committed child
@@ -285,9 +285,9 @@ impl RocksDbShardStorage {
             // An empty half: the sync imported nothing and no follow
             // ever advanced the tip — the child starts from an empty
             // tree at its genesis height.
-            batch_put::<SubstateCountsCf>(
+            batch_put::<SubstateBytesCf>(
                 &mut batch,
-                SubstateCountsCf::handle(&cf),
+                SubstateBytesCf::handle(&cf),
                 &genesis_version,
                 &0,
             );
@@ -307,12 +307,12 @@ impl RocksDbShardStorage {
                 &StoredNodeKey::from_jmt(&genesis_root_key),
                 &own_root,
             );
-            let count = self.count_subtree_leaves(&genesis_root_key, &own_root)?;
-            batch_put::<SubstateCountsCf>(
+            let bytes = self.sum_subtree_value_lens(&genesis_root_key, &own_root)?;
+            batch_put::<SubstateBytesCf>(
                 &mut batch,
-                SubstateCountsCf::handle(&cf),
+                SubstateBytesCf::handle(&cf),
                 &genesis_version,
-                &count,
+                &bytes,
             );
         }
         write_jmt_metadata(&mut batch, genesis_version, current_root);
@@ -405,11 +405,11 @@ impl RocksDbShardStorage {
         delete_committed_qc(batch);
     }
 
-    /// Count the live leaves under the adopted child root by walking the
+    /// Sum the value bytes under the adopted child root by walking the
     /// tree in pages. The root node is supplied directly (it sits in the
     /// not-yet-written batch during adoption), so the walk reads it from
     /// memory and every deeper node from the checkpoint.
-    fn count_subtree_leaves(
+    fn sum_subtree_value_lens(
         &self,
         root_key: &JmtNodeKey,
         root_node: &VersionedStoredNode,
@@ -419,8 +419,8 @@ impl RocksDbShardStorage {
             root_key,
             root_node,
         };
-        count_subtree_leaves(&store, root_key)
-            .map_err(|e| StorageError::DatabaseError(format!("split adoption count: {e:?}")))
+        Jmt::sum_subtree_value_lens(&store, root_key)
+            .map_err(|e| StorageError::DatabaseError(format!("split adoption byte sum: {e:?}")))
     }
 }
 
@@ -551,7 +551,7 @@ mod tests {
 
             assert_eq!(child.read_jmt_metadata(), (10, root));
             assert_eq!(
-                child.substate_count_at_version(10),
+                child.substate_bytes_at_version(10),
                 Some(if side == 0 { 2 } else { 1 }),
             );
             assert_eq!(read_chain_origin(&*child.db), origin_at_10());
@@ -684,7 +684,7 @@ mod tests {
         let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
         assert_eq!(root, StateRoot::ZERO);
         assert_eq!(child.read_jmt_metadata(), (10, StateRoot::ZERO));
-        assert_eq!(child.substate_count_at_version(10), Some(0));
+        assert_eq!(child.substate_bytes_at_version(10), Some(0));
     }
 
     /// Partition independence over follows: two child stores each
@@ -778,7 +778,7 @@ mod tests {
             let adopted = store.adopt_followed_child(origin, &genesis).unwrap();
             assert_eq!(adopted, followed_root);
             assert_eq!(store.read_jmt_metadata(), (9, followed_root));
-            assert!(store.substate_count_at_version(9).is_some());
+            assert!(store.substate_bytes_at_version(9).is_some());
             assert_eq!(read_chain_origin(&*store.db), origin);
             let recovered = store.load_recovered_state();
             assert_eq!(recovered.committed_height, BlockHeight::new(9));

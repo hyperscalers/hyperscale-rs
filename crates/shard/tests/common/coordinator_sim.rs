@@ -169,7 +169,7 @@ enum SimEvent {
         manifest: BlockManifest,
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        substate_delta: i64,
+        bytes_delta: i64,
     },
     QcResult {
         block_hash: BlockHash,
@@ -207,7 +207,7 @@ enum SimEvent {
     StateRootVerified {
         block_hash: BlockHash,
         result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        substate_delta: i64,
+        bytes_delta: i64,
     },
     BlockReadyToCommit {
         certified: Arc<Verified<CertifiedBlock>>,
@@ -755,7 +755,7 @@ impl ShardCoordinatorSim {
                 manifest,
                 finalized_waves,
                 provisions,
-                substate_delta,
+                bytes_delta,
             } => coord.on_proposal_built(
                 topology,
                 height,
@@ -765,7 +765,7 @@ impl ShardCoordinatorSim {
                 &manifest,
                 finalized_waves,
                 provisions,
-                substate_delta,
+                bytes_delta,
             ),
             SimEvent::QcResult {
                 block_hash,
@@ -796,8 +796,8 @@ impl ShardCoordinatorSim {
             SimEvent::StateRootVerified {
                 block_hash,
                 result,
-                substate_delta,
-            } => coord.on_state_root_verified(topology, block_hash, result, substate_delta),
+                bytes_delta,
+            } => coord.on_state_root_verified(topology, block_hash, result, bytes_delta),
             SimEvent::BlockReadyToCommit { certified, source } => {
                 coord.on_block_ready_to_commit(topology, certified, source)
             }
@@ -1028,7 +1028,7 @@ impl ShardCoordinatorSim {
                     &pending_snapshots,
                 );
                 let block_hash = result.block_hash;
-                let substate_delta = result.jmt_snapshot.leaf_delta;
+                let bytes_delta = result.jmt_snapshot.bytes_delta;
                 // Mirror `make_commit_prepared`: stash the JMT
                 // snapshot into `pending_chain` so subsequent
                 // child verifications see the overlay.
@@ -1052,7 +1052,7 @@ impl ShardCoordinatorSim {
                         manifest: result.manifest,
                         finalized_waves,
                         provisions,
-                        substate_delta,
+                        bytes_delta,
                     },
                 });
             }
@@ -1180,7 +1180,7 @@ impl ShardCoordinatorSim {
                 round,
                 ready_signals,
                 reshape_trigger,
-                substate_count,
+                substate_bytes,
                 thresholds,
                 finalized_waves,
                 topology_snapshot,
@@ -1201,7 +1201,7 @@ impl ShardCoordinatorSim {
                     receipts: &receipts,
                     ready_signals: &ready_signals,
                     reshape_trigger,
-                    substate_count,
+                    substate_bytes,
                     thresholds,
                     topology: &topology_snapshot,
                 };
@@ -1260,7 +1260,7 @@ impl ShardCoordinatorSim {
                     claimed_split_child_roots,
                     split_child_roots_required,
                 });
-                let substate_delta = jmt_snapshot.leaf_delta;
+                let bytes_delta = jmt_snapshot.bytes_delta;
                 if verify_result.is_ok() {
                     self.pending_chains[emitter_idx].insert(
                         block_hash,
@@ -1284,7 +1284,7 @@ impl ShardCoordinatorSim {
                     event: SimEvent::StateRootVerified {
                         block_hash,
                         result: verify_result,
-                        substate_delta,
+                        bytes_delta,
                     },
                 });
             }

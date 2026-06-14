@@ -1,5 +1,5 @@
 //! Reshape-trigger behavior pinned by the shard sim: a shard whose
-//! committed substate count satisfies the load predicate asserts the
+//! committed substate byte total satisfies the load predicate asserts the
 //! trigger on its manifest, every replica re-derives and verifies the
 //! assertion as part of the beacon-witness root, the committed
 //! accumulator gains the trigger leaf, and re-assertion is suppressed
@@ -33,7 +33,7 @@ fn split_trigger_asserts_once_per_window_and_verifies() {
     sim.topology = sim
         .topology
         .clone()
-        .with_reshape_thresholds(ReshapeThresholds { split_substates: 0 });
+        .with_reshape_thresholds(ReshapeThresholds { split_bytes: 0 });
     sim.kick_off();
 
     let mut steps = 0;

@@ -204,18 +204,18 @@ pub enum ProtocolEvent {
     ///
     /// Fires after the async `RocksDB` write completes. Used for
     /// persistence-lag bookkeeping, and to reconcile the coordinator's
-    /// substate-count frontier from storage — the path that keeps the
+    /// substate-byte frontier from storage — the path that keeps the
     /// frontier fresh through sync, where blocks commit QC-trusted with
     /// no per-block verification delta.
     /// The `height` is the highest block height in the persistence batch.
     BlockPersisted {
         /// Highest block height in the persistence batch that just completed.
         height: BlockHeight,
-        /// Committed substate count at `height`, read back from
+        /// Committed substate byte total at `height`, read back from
         /// storage. Authoritative when the event reaches the state
         /// machine — the shard loop fills it from storage while
         /// re-dispatching; the io worker's raw emission carries zero.
-        substate_count: u64,
+        substate_bytes: u64,
     },
 
     /// Quorum Certificate verification and building result.
@@ -336,10 +336,10 @@ pub enum ProtocolEvent {
         block_hash: BlockHash,
         /// Typed verification result.
         result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        /// Net substate (JMT leaf) count change the block's JMT replay
+        /// Net substate byte total change the block's JMT replay
         /// produced. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation; meaningful only on success.
-        substate_delta: i64,
+        bytes_delta: i64,
     },
 
     /// Proposal block built by the runner.
@@ -359,10 +359,10 @@ pub enum ProtocolEvent {
         manifest: BlockManifest,
         /// Finalized waves included in the block (carry certs + receipts + ECs).
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
-        /// Net substate (JMT leaf) count change from the build's JMT
+        /// Net substate byte total change from the build's JMT
         /// computation. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation.
-        substate_delta: i64,
+        bytes_delta: i64,
         /// Provisions included in the block.
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     },

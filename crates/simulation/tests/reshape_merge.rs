@@ -1,8 +1,8 @@
 //! End-to-end merge of two cold sibling shards back into their parent.
 //!
 //! Boots a two-shard network whose chain config makes both shards
-//! merge-eligible from genesis (their genesis substate counts sit below
-//! `MERGE_THRESHOLD = split_substates / 8`), lets each child's quorum
+//! merge-eligible from genesis (their genesis substate byte totals sit below
+//! `MERGE_THRESHOLD = split_bytes / 8`), lets each child's quorum
 //! assert the merge and the beacon pair it — drawing half of each
 //! child's committee as the keeper set — then runs each keeper's real
 //! duty: the sibling-half sync served by the sibling's committee, and
@@ -36,10 +36,11 @@ const TEST_EPOCH_MS: u64 = 2000;
 /// Committee size on each child shard.
 const PER_SHARD: u32 = 4;
 
-/// `split_substates / 8` is the merge threshold; at 4000 it is 500,
-/// comfortably above the ~293 substates genesis lays into each child, so
-/// both children assert the merge from genesis and neither splits.
-const SPLIT_SUBSTATES: u64 = 4000;
+/// `split_bytes / 8` is the merge threshold; at `5_200_000` it is
+/// `650_000`, comfortably above the genesis byte total each child carries
+/// (the heavier `leaf(1,0)` half is ~611k, the lighter ~377k), so both
+/// children assert the merge from genesis and neither splits.
+const SPLIT_BYTES: u64 = 5_200_000;
 
 const ADMISSION_BUDGET_EPOCHS: u64 = 8;
 const GATE_BUDGET_EPOCHS: u64 = 8;
@@ -60,7 +61,7 @@ fn merge_config() -> NetworkConfig {
             num_shards: 2,
             shard_size: PER_SHARD,
             reshape_thresholds: ReshapeThresholds {
-                split_substates: SPLIT_SUBSTATES,
+                split_bytes: SPLIT_BYTES,
             },
             ..BeaconChainConfig::default()
         }),
@@ -280,8 +281,8 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
         );
         merged_count = Some(
             storage
-                .substate_count_at_version(genesis_height.inner())
-                .expect("the merged genesis recorded its substate count"),
+                .substate_bytes_at_version(genesis_height.inner())
+                .expect("the merged genesis recorded its substate byte total"),
         );
     }
 
@@ -308,13 +309,13 @@ fn child_terminal_root(runner: &SimulationRunner, child: ShardId) -> StateRoot {
     panic!("no host carries the terminated child {child:?}");
 }
 
-/// A terminated child's committed substate count, read from a host still
+/// A terminated child's committed substate byte total, read from a host still
 /// carrying it.
 fn child_terminal_count(runner: &SimulationRunner, child: ShardId) -> u64 {
     for node in 0..runner.num_hosts() {
         if let Some(storage) = runner.hosts_shard(node, child) {
             return storage
-                .substate_count_at_version(storage.committed_height().inner())
+                .substate_bytes_at_version(storage.committed_height().inner())
                 .unwrap_or(0);
         }
     }

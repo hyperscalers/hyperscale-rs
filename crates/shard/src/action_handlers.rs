@@ -552,7 +552,7 @@ where
             round,
             ready_signals,
             reshape_trigger,
-            substate_count,
+            substate_bytes,
             thresholds,
             finalized_waves,
             topology_snapshot,
@@ -574,7 +574,7 @@ where
                 receipts: &receipts,
                 ready_signals: &ready_signals,
                 reshape_trigger,
-                substate_count,
+                substate_bytes,
                 thresholds,
                 topology: &topology_snapshot,
             };
@@ -650,7 +650,7 @@ where
                 split_child_roots_required,
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
-            let substate_delta = jmt_snapshot.leaf_delta;
+            let bytes_delta = jmt_snapshot.bytes_delta;
             if verify_result.is_ok() {
                 // SAFETY: `prepared` belongs to the same JMT replay that just
                 // produced the matching `computed_root` — only routed when
@@ -675,7 +675,7 @@ where
             ctx.notify_protocol(ProtocolEvent::StateRootVerified {
                 block_hash,
                 result: verify_result,
-                substate_delta,
+                bytes_delta,
             });
         }
 
@@ -734,7 +734,7 @@ where
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;
-            let substate_delta = result.jmt_snapshot.leaf_delta;
+            let bytes_delta = result.jmt_snapshot.bytes_delta;
             (ctx.commit_prepared)(PreparedBlock {
                 block_hash,
                 parent_block_hash,
@@ -751,7 +751,7 @@ where
                 manifest: result.manifest,
                 finalized_waves,
                 provisions,
-                substate_delta,
+                bytes_delta,
             });
         }
 

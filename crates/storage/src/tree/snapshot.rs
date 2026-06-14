@@ -50,8 +50,8 @@ pub struct JmtSnapshot {
     /// computation's writes, persisted so snap-sync serving can
     /// resolve enumerated leaves back to raw substate pairs.
     pub leaf_associations: Vec<LeafSubstateKeyAssociation>,
-    /// Net change to the tree's leaf (substate) count in this block.
-    pub leaf_delta: i64,
+    /// Net change to the tree's total substate value bytes in this block.
+    pub bytes_delta: i64,
 }
 
 impl JmtSnapshot {
@@ -71,7 +71,7 @@ impl JmtSnapshot {
             nodes: collected.nodes,
             stale_node_keys: collected.stale_node_keys,
             leaf_associations: collected.leaf_associations,
-            leaf_delta: collected.leaf_delta,
+            bytes_delta: collected.bytes_delta,
         }
     }
 
@@ -150,7 +150,7 @@ mod tests {
                 .collect(),
             stale_node_keys: Vec::new(),
             leaf_associations: Vec::new(),
-            leaf_delta: 0,
+            bytes_delta: 0,
         };
         (store, snapshot)
     }

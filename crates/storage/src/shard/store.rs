@@ -119,7 +119,7 @@ pub trait VersionedStore: SubstateStore {
     /// Create a snapshot anchored at the given historical block height.
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_>;
 
-    /// Committed substate (JMT leaf) count after the commit at `height`,
+    /// Committed substate byte total after the commit at `height`,
     /// or `None` if no commit at that height recorded one (never
     /// committed, or pruned past the retention horizon).
     ///
@@ -127,5 +127,5 @@ pub trait VersionedStore: SubstateStore {
     /// behind a block's parent state, so the value must be identical on
     /// every replica — it is written atomically with the commit, never
     /// recomputed out-of-band.
-    fn substate_count_at(&self, height: BlockHeight) -> Option<u64>;
+    fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64>;
 }

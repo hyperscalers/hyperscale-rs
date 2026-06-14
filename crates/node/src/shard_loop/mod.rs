@@ -545,19 +545,19 @@ where
     /// store count. Genesis substates (engine bootstrap + funded accounts)
     /// never appear as a commit delta, so without this the frontier reads
     /// zero until the first delta-bearing block and a non-zero reshape
-    /// threshold misfires (a quiet shard below `merge_substates` triggers a
+    /// threshold misfires (a quiet shard below `merge_bytes` triggers a
     /// spurious merge). The engine genesis already committed the substates
     /// before either genesis path reaches here, so the count is readable.
     pub(crate) fn seed_genesis_substate_frontier(&mut self, genesis: &Block) {
         let genesis_count = self
             .io
             .storage
-            .substate_count_at(genesis.height())
+            .substate_bytes_at(genesis.height())
             .unwrap_or(0);
         for vnode_idx in 0..self.vnodes.len() {
             self.vnode_mut(vnode_idx)
                 .state
-                .seed_substate_count_frontier(genesis.height(), genesis_count);
+                .seed_substate_bytes_frontier(genesis.height(), genesis_count);
         }
     }
 

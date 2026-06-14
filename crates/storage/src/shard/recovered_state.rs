@@ -58,10 +58,10 @@ pub struct RecoveredState {
     /// historical topology. Empty on a fresh start.
     pub beacon_witness_leaf_hashes: Vec<Hash>,
 
-    /// Committed substate count behind the committed tip — seeds the
-    /// coordinator's count frontier for reshape-trigger derivation.
+    /// Committed substate byte total behind the committed tip — seeds the
+    /// coordinator's byte frontier for reshape-trigger derivation.
     /// Zero on a fresh start.
-    pub substate_count: u64,
+    pub substate_bytes: u64,
 
     /// The chain's origin — genesis height plus start-time anchor (see
     /// `ChainOrigin`). `ChainOrigin::ROOT` for chains born at network
@@ -90,7 +90,7 @@ impl RecoveredState {
         anchor: &ShardAnchor,
         boundary_header: &BlockHeader,
         witness_leaf_hashes: Vec<Hash>,
-        substate_count: u64,
+        substate_bytes: u64,
     ) -> Self {
         Self {
             committed_height: anchor.height,
@@ -100,7 +100,7 @@ impl RecoveredState {
             jmt_root: Some(anchor.state_root),
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
-            substate_count,
+            substate_bytes,
             // A genesis boundary header carries the chain's origin
             // outright — a straggler joining a split child at its first
             // anchor recovers the continued height line and clock from

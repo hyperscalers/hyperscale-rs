@@ -109,11 +109,11 @@ impl BoundaryStore for SimShardStorage {
             state.current_state.insert(leaf.storage_key, leaf.value);
         }
 
-        // Seed the substate count: a fresh-tree import's leaf delta IS
-        // the imported leaf population.
-        let count = u64::try_from(result.batch.leaf_delta)
-            .map_err(|_| "snap-sync import produced a negative leaf count".to_string())?;
-        state.substate_counts.insert(height.inner(), count);
+        // Seed the substate byte total: a fresh-tree import's byte delta IS
+        // the imported leaves' value bytes.
+        let bytes = u64::try_from(result.batch.bytes_delta)
+            .map_err(|_| "snap-sync import produced a negative byte total".to_string())?;
+        state.substate_bytes.insert(height.inner(), bytes);
 
         state.current_block_height = height;
         state.current_root_hash = root;
@@ -271,7 +271,7 @@ mod tests {
     /// Partition independence over follows, the keystone: two child
     /// stores each following only their half of a parent chain's writes
     /// assemble exactly the parent tree's two child subtrees — their
-    /// roots recompose to the parent's, their counts partition its
+    /// roots recompose to the parent's, their byte totals partition its
     /// population, and a block with no writes under a store's prefix is
     /// a no-op that leaves its version line sparse.
     #[test]
@@ -319,11 +319,16 @@ mod tests {
             "followed child roots must recompose to the parent's root",
         );
 
-        // Counts partition the parent population, recorded at each
-        // store's own (sparse) tip version.
+        // Byte totals partition the parent population, recorded at each
+        // store's own (sparse) tip version. Each follow seeds one leaf
+        // with a 4-byte value (`follow_receipt`'s `vec![seed; 4]`), so a
+        // side's byte total is its leaf count times four.
         for (store, count) in [(&left_store, counts[0]), (&right_store, counts[1])] {
             let tip = read_or_recover(&store.state).current_block_height;
-            assert_eq!(store.substate_count_at_version(tip.inner()), Some(count));
+            assert_eq!(
+                store.substate_bytes_at_version(tip.inner()),
+                Some(count * 4)
+            );
         }
     }
 

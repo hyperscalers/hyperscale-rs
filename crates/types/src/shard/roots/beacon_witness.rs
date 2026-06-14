@@ -47,14 +47,14 @@ pub struct BeaconWitnessRootContext<'a> {
     /// Ready signals carried on the block's manifest.
     pub ready_signals: &'a [ReadySignal],
     /// The manifest's reshape assertion. Verification recomputes the
-    /// load predicate from `substate_count` + `thresholds` and rejects
+    /// load predicate from `substate_bytes` + `thresholds` and rejects
     /// the block when the claim diverges — a committed trigger
     /// therefore carries the committee's quorum behind the load fact.
     pub reshape_trigger: Option<ReshapeTrigger>,
-    /// Committed substate count behind the parent block's post-state —
+    /// Committed substate byte total behind the parent block's post-state —
     /// the load the predicate evaluates. A function of the block's
     /// ancestry, never of the local commit frontier.
-    pub substate_count: u64,
+    pub substate_bytes: u64,
     /// Reshape thresholds in force for this network.
     pub thresholds: ReshapeThresholds,
     /// Topology snapshot anchoring the proposer-rotation rule the
@@ -136,7 +136,7 @@ pub fn missed_proposals_since_prev_commit(
 
 /// Evaluate the load predicate behind a block's reshape assertion.
 ///
-/// Fires `Split` when the committed substate count behind the block's
+/// Fires `Split` when the committed substate byte total behind the block's
 /// parent state reaches the split threshold, `Merge` when it falls
 /// below the merge threshold — except when the would-be trigger's leaf
 /// already sits in `window_leaves` (the block's witness window, i.e.
@@ -151,13 +151,13 @@ pub fn missed_proposals_since_prev_commit(
 #[must_use]
 pub fn derive_reshape_trigger(
     shard: ShardId,
-    substate_count: u64,
+    substate_bytes: u64,
     thresholds: &ReshapeThresholds,
     window_leaves: &[Hash],
 ) -> Option<ReshapeTrigger> {
-    let kind = if substate_count >= thresholds.split_substates {
+    let kind = if substate_bytes >= thresholds.split_bytes {
         ReshapeTrigger::Split
-    } else if substate_count < thresholds.merge_substates() {
+    } else if substate_bytes < thresholds.merge_bytes() {
         ReshapeTrigger::Merge
     } else {
         return None;
@@ -288,12 +288,12 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
         // recomputed load predicate — including the once-per-window
         // dedup, which scans the same trimmed window the root commits.
         let derived =
-            derive_reshape_trigger(ctx.shard, ctx.substate_count, &ctx.thresholds, window);
+            derive_reshape_trigger(ctx.shard, ctx.substate_bytes, &ctx.thresholds, window);
         if derived != ctx.reshape_trigger {
             tracing::warn!(
                 claimed = ?ctx.reshape_trigger,
                 ?derived,
-                substate_count = ctx.substate_count,
+                substate_bytes = ctx.substate_bytes,
                 height = ctx.height.inner(),
                 "Reshape trigger verification FAILED"
             );
@@ -426,7 +426,7 @@ mod tests {
             receipts: &[],
             ready_signals: &[],
             reshape_trigger: None,
-            substate_count: 0,
+            substate_bytes: 0,
             thresholds: ReshapeThresholds::DISABLED,
             topology,
         }
@@ -437,16 +437,14 @@ mod tests {
     /// at most one assertion per witness window.
     #[test]
     fn reshape_predicate_fires_on_load_and_dedups_per_window() {
-        let thresholds = ReshapeThresholds {
-            split_substates: 100,
-        };
+        let thresholds = ReshapeThresholds { split_bytes: 100 };
         let child = ShardId::leaf(1, 0);
 
         assert_eq!(
             derive_reshape_trigger(child, 100, &thresholds, &[]),
             Some(ReshapeTrigger::Split),
         );
-        // merge_substates() == 12; the bound is strict.
+        // merge_bytes() == 12; the bound is strict.
         assert_eq!(
             derive_reshape_trigger(child, 11, &thresholds, &[]),
             Some(ReshapeTrigger::Merge),
@@ -501,10 +499,8 @@ mod tests {
         let shard = ShardId::ROOT;
         let topology = snapshot_with_base(shard, 0);
         let mut ctx = context_with(&topology, shard, 0, Vec::new(), 0);
-        ctx.thresholds = ReshapeThresholds {
-            split_substates: 10,
-        };
-        ctx.substate_count = 10;
+        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.substate_bytes = 10;
 
         assert_eq!(
             BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
@@ -526,10 +522,8 @@ mod tests {
 
         let mut ctx = context_with(&topology, shard, 2, Vec::new(), 3);
         ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
-        ctx.thresholds = ReshapeThresholds {
-            split_substates: 10,
-        };
-        ctx.substate_count = 11;
+        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.substate_bytes = 11;
         ctx.reshape_trigger = Some(ReshapeTrigger::Split);
 
         assert!(expected_root.verify(&ctx).is_ok());

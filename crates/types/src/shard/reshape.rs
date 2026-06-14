@@ -1,7 +1,7 @@
 //! Shard reshape (split/merge) trigger types.
 //!
 //! A shard reshapes automatically from its own attested load: when the
-//! committed substate count crosses [`ReshapeThresholds::split_substates`]
+//! committed substate byte total crosses [`ReshapeThresholds::split_bytes`]
 //! the shard asserts a split, and when it falls below the merge
 //! threshold the shard asserts a merge with its sibling. The assertion
 //! rides the block manifest as a [`ReshapeTrigger`] and projects into a
@@ -14,7 +14,7 @@ use sbor::prelude::*;
 
 use crate::{ShardId, ShardWitnessPayload};
 
-/// Substate-count thresholds driving automatic shard reshaping.
+/// Substate-byte thresholds driving automatic shard reshaping.
 ///
 /// Ships disabled ([`Self::DISABLED`]) — the predicate can never fire —
 /// until a network explicitly configures a split threshold. The merge
@@ -24,26 +24,26 @@ use crate::{ShardId, ShardWitnessPayload};
 /// split-eligible, so reshapes cannot oscillate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
 pub struct ReshapeThresholds {
-    /// Committed substate count at or above which a shard asserts a
+    /// Committed substate byte total at or above which a shard asserts a
     /// split. `u64::MAX` disables reshaping entirely.
-    pub split_substates: u64,
+    pub split_bytes: u64,
 }
 
 impl ReshapeThresholds {
     /// Reshaping disabled: neither trigger can ever fire.
     pub const DISABLED: Self = Self {
-        split_substates: u64::MAX,
+        split_bytes: u64::MAX,
     };
 
-    /// Committed substate count below which a shard asserts a merge
+    /// Committed substate byte total below which a shard asserts a merge
     /// with its sibling. Zero (never fires) when reshaping is disabled
-    /// — a count is never negative, so `count < 0` is unsatisfiable.
+    /// — a byte total is never negative, so `bytes < 0` is unsatisfiable.
     #[must_use]
-    pub const fn merge_substates(&self) -> u64 {
-        if self.split_substates == u64::MAX {
+    pub const fn merge_bytes(&self) -> u64 {
+        if self.split_bytes == u64::MAX {
             0
         } else {
-            self.split_substates / 8
+            self.split_bytes / 8
         }
     }
 }
@@ -61,9 +61,9 @@ impl Default for ReshapeThresholds {
 /// cannot be pointed at another shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
 pub enum ReshapeTrigger {
-    /// The shard's committed substate count reached the split threshold.
+    /// The shard's committed substate byte total reached the split threshold.
     Split,
-    /// The shard's committed substate count fell below the merge
+    /// The shard's committed substate byte total fell below the merge
     /// threshold; the assertion targets the shard's parent (merging the
     /// shard with its sibling).
     Merge,
@@ -94,15 +94,13 @@ mod tests {
     fn disabled_thresholds_never_fire() {
         // Split needs count == u64::MAX (impossible); merge needs
         // count < 0 (unsatisfiable).
-        assert_eq!(ReshapeThresholds::DISABLED.merge_substates(), 0);
+        assert_eq!(ReshapeThresholds::DISABLED.merge_bytes(), 0);
     }
 
     #[test]
     fn merge_threshold_is_an_eighth_of_split() {
-        let t = ReshapeThresholds {
-            split_substates: 8_000,
-        };
-        assert_eq!(t.merge_substates(), 1_000);
+        let t = ReshapeThresholds { split_bytes: 8_000 };
+        assert_eq!(t.merge_bytes(), 1_000);
     }
 
     #[test]

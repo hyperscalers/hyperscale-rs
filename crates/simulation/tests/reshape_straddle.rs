@@ -68,7 +68,7 @@ fn straddle_config() -> NetworkConfig {
             epoch_duration_ms: TEST_EPOCH_MS,
             num_shards: 1,
             shard_size: PER_SHARD,
-            reshape_thresholds: ReshapeThresholds { split_substates: 0 },
+            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
             ..BeaconChainConfig::default()
         }),
         pool_extra_validators: PER_SHARD,

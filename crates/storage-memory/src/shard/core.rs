@@ -165,8 +165,8 @@ impl SimShardStorage {
             jmt_root: Some(self.state_root()),
             beacon_witness_start,
             beacon_witness_leaf_hashes,
-            substate_count: read_or_recover(&self.state)
-                .substate_counts
+            substate_bytes: read_or_recover(&self.state)
+                .substate_bytes
                 .get(&committed_height.inner())
                 .copied()
                 .unwrap_or(0),
@@ -174,15 +174,15 @@ impl SimShardStorage {
         }
     }
 
-    /// Committed substate count recorded at `version`, if any.
+    /// Committed substate byte total recorded at `version`, if any.
     ///
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
-    pub fn substate_count_at_version(&self, version: u64) -> Option<u64> {
+    pub fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
         read_or_recover(&self.state)
-            .substate_counts
+            .substate_bytes
             .get(&version)
             .copied()
     }
@@ -280,8 +280,8 @@ impl SimShardStorage {
         }
 
         let genesis_count =
-            u64::try_from(collected.leaf_delta).expect("genesis leaf delta must be non-negative");
-        s.substate_counts
+            u64::try_from(collected.bytes_delta).expect("genesis leaf delta must be non-negative");
+        s.substate_bytes
             .insert(BlockHeight::GENESIS.inner(), genesis_count);
 
         s.current_block_height = BlockHeight::GENESIS;

@@ -132,7 +132,7 @@ where
 /// Bootstrap an observer's pending-child span against the splitting
 /// shard's beacon-attested boundary anchor, returning the anchor the
 /// assembly completed against, the imported child subtree root, and
-/// the imported substate count. Requests route to `via`'s committee;
+/// the imported substate byte total. Requests route to `via`'s committee;
 /// pacing and the starved-assembly anchor refresh mirror
 /// [`bootstrap_shard_state`].
 ///
@@ -219,10 +219,10 @@ where
             ?via,
             ?child,
             height = anchor.height.inner(),
-            substates = bootstrap.imported_substate_count(),
+            substates = bootstrap.imported_substate_bytes(),
             "Observer bootstrap complete; child span imported"
         );
-        return Ok((anchor, root, bootstrap.imported_substate_count()));
+        return Ok((anchor, root, bootstrap.imported_substate_bytes()));
     }
 }
 
@@ -661,19 +661,25 @@ mod tests {
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 3));
         let topology = shared_topology(anchor, via);
 
-        let mut total = 0u64;
+        let mut total_bytes = 0u64;
         for child in children {
             let store: Arc<SimShardStorage> =
                 Arc::new(SimShardStorage::new(shard_prefix_path(child)));
-            let (used_anchor, root, count) =
+            let (used_anchor, root, bytes) =
                 bootstrap_observer_state(&network, &topology, &store, via, child)
                     .await
                     .expect("observer bootstrap succeeds");
             assert_eq!(used_anchor, anchor);
             assert_eq!(store.state_root(), root);
-            total += count;
+            total_bytes += bytes;
         }
-        assert_eq!(total, u64::from(ENTRIES));
+        let parent_bytes = serving
+            .substate_bytes_at_version(anchor.height.inner())
+            .expect("parent byte total");
+        assert_eq!(
+            total_bytes, parent_bytes,
+            "the two halves' byte totals must sum to the parent's",
+        );
     }
 
     /// The pump end to end over the sequencer: request dispatch with

@@ -37,7 +37,7 @@ use tracing::{Level, Span, instrument};
 use super::column_families::{
     ALL_COLUMN_FAMILIES, CfHandles, HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, LeafAssociationsCf,
     STATE_HISTORY_CF, StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
-    SubstateCountsCf,
+    SubstateBytesCf,
 };
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode};
@@ -385,26 +385,26 @@ impl RocksDbShardStorage {
         // JMT metadata — single key, atomic read.
         write_jmt_metadata(batch, new_version, snapshot.result_root);
 
-        // Committed substate count — derived from the count behind the
+        // Committed substate byte total — derived from the byte total behind the
         // currently committed version (the parent of this commit; equal
         // across any interleaved empty commits) plus this commit's leaf
         // delta. Written in the same batch so the count is
         // crash-consistent with the tree. Consensus-critical: witness
         // derivation reads it, so it must be identical on every replica.
         let (current_version, _) = self.read_jmt_metadata();
-        let prior = self.substate_count_at_version(current_version).unwrap_or(0);
+        let prior = self.substate_bytes_at_version(current_version).unwrap_or(0);
         let count = prior
-            .checked_add_signed(snapshot.leaf_delta)
-            .expect("substate count must not go negative");
-        batch_put::<SubstateCountsCf>(batch, SubstateCountsCf::handle(&cf), &new_version, &count);
+            .checked_add_signed(snapshot.bytes_delta)
+            .expect("substate byte total must not go negative");
+        batch_put::<SubstateBytesCf>(batch, SubstateBytesCf::handle(&cf), &new_version, &count);
     }
 
-    /// Committed substate (JMT leaf) count after the commit at `version`,
+    /// Committed substate byte total after the commit at `version`,
     /// or `None` if no commit at that version recorded one (never
     /// committed, or pruned past the retention horizon).
-    pub fn substate_count_at_version(&self, version: u64) -> Option<u64> {
+    pub fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
         let cf = self.cf();
-        get::<SubstateCountsCf>(&*self.db, SubstateCountsCf::handle(&cf), &version)
+        get::<SubstateBytesCf>(&*self.db, SubstateBytesCf::handle(&cf), &version)
     }
 
     /// Append consensus metadata (`committed_height`, `committed_hash`, `committed_qc`)

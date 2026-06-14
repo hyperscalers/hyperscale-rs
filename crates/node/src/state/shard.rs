@@ -222,12 +222,12 @@ impl NodeStateMachine {
             ProtocolEvent::StateRootVerified {
                 block_hash,
                 result,
-                substate_delta,
+                bytes_delta,
             } => self.shard_coordinator.on_state_root_verified(
                 self.beacon_coordinator.topology_schedule(),
                 block_hash,
                 result,
-                substate_delta,
+                bytes_delta,
             ),
             ProtocolEvent::ProposalBuilt {
                 height,
@@ -237,7 +237,7 @@ impl NodeStateMachine {
                 manifest,
                 finalized_waves,
                 provisions,
-                substate_delta,
+                bytes_delta,
             } => self.shard_coordinator.on_proposal_built(
                 self.beacon_coordinator.topology_schedule(),
                 height,
@@ -247,7 +247,7 @@ impl NodeStateMachine {
                 &manifest,
                 finalized_waves,
                 provisions,
-                substate_delta,
+                bytes_delta,
             ),
             ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(&certified),
             // `BlockPersisted` advances `last_persisted_height`, a fallback
@@ -258,12 +258,12 @@ impl NodeStateMachine {
             // persisted parents unblock here) and for auto-resume-from-sync.
             ProtocolEvent::BlockPersisted {
                 height,
-                substate_count,
+                substate_bytes,
             } => {
                 let mut actions = self.shard_coordinator.on_block_persisted(
                     self.beacon_coordinator.topology_schedule(),
                     height,
-                    substate_count,
+                    substate_bytes,
                 );
                 // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
@@ -680,7 +680,7 @@ mod tests {
             LocalTimestamp::ZERO,
             ProtocolEvent::BlockPersisted {
                 height: BlockHeight::new(10),
-                substate_count: 0,
+                substate_bytes: 0,
             },
         );
 

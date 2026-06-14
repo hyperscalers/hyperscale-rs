@@ -24,16 +24,16 @@ where
     /// Update the commit pipeline before forwarding `BlockPersisted` to the
     /// state machine: the persisted height advances `block_commit`'s gate
     /// and `pending_chain`'s pruning watermark, and the event picks up
-    /// the authoritative substate count from storage so the state
+    /// the authoritative substate byte total from storage so the state
     /// machine's count frontier reconciles even across sync commits.
     pub(in crate::shard_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
-        let substate_count = self.io.storage.substate_count_at(height).unwrap_or(0);
+        let substate_bytes = self.io.storage.substate_bytes_at(height).unwrap_or(0);
         self.dispatch_event(ProtocolEvent::BlockPersisted {
             height,
-            substate_count,
+            substate_bytes,
         });
     }
 

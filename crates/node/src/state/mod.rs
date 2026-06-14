@@ -266,12 +266,12 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Seed the reshape trigger's substate-count frontier from the genesis
+    /// Seed the reshape trigger's substate-byte frontier from the genesis
     /// store count — the I/O loop reads it once the genesis block commits.
-    /// See [`hyperscale_shard::ShardCoordinator::seed_substate_count_frontier`].
-    pub const fn seed_substate_count_frontier(&mut self, height: BlockHeight, count: u64) {
+    /// See [`hyperscale_shard::ShardCoordinator::seed_substate_bytes_frontier`].
+    pub const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
         self.shard_coordinator
-            .seed_substate_count_frontier(height, count);
+            .seed_substate_bytes_frontier(height, count);
     }
 }
 

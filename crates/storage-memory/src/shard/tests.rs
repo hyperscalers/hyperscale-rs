@@ -695,11 +695,11 @@ fn test_len_and_is_empty() {
     assert_eq!(storage.len(), 2);
 }
 
-/// The per-version substate count follows the production block-commit
+/// The per-version substate byte total follows the production block-commit
 /// path: inserts raise it, value updates leave it, deletes lower it,
 /// and historical entries stay readable.
 #[test]
-fn substate_count_tracks_block_commits() {
+fn substate_bytes_tracks_block_commits() {
     let storage = SimShardStorage::default();
 
     let key_a = vec![3u8; 50];
@@ -713,14 +713,14 @@ fn substate_count_tracks_block_commits() {
     let block1 = make_test_block(BlockHeight::new(1));
     let qc1 = make_test_qc(&block1);
     commit_with(&storage, &v1, &block1, &qc1);
-    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
 
     // h2: value update only.
     let v2 = make_database_update(key_a.clone(), 0, vec![7], vec![9]);
     let block2 = make_test_block(BlockHeight::new(2));
     let qc2 = make_test_qc(&block2);
     commit_with(&storage, &v2, &block2, &qc2);
-    assert_eq!(storage.substate_count_at(BlockHeight::new(2)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
 
     // h3: delete one — count drops; history retained.
     let mut v3 = DatabaseUpdates::default();
@@ -740,9 +740,9 @@ fn substate_count_tracks_block_commits() {
     let block3 = make_test_block(BlockHeight::new(3));
     let qc3 = make_test_qc(&block3);
     commit_with(&storage, &v3, &block3, &qc3);
-    assert_eq!(storage.substate_count_at(BlockHeight::new(3)), Some(1));
-    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
-    assert_eq!(storage.substate_count_at(BlockHeight::new(4)), None);
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(4)), None);
 }
 
 #[test]

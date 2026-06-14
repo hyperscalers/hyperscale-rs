@@ -957,7 +957,7 @@ mod tests {
             StubSnapshot
         }
 
-        fn substate_count_at(&self, _height: BlockHeight) -> Option<u64> {
+        fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
         }
     }
@@ -1075,7 +1075,7 @@ mod tests {
             nodes: vec![],
             stale_node_keys: vec![],
             leaf_associations: vec![],
-            leaf_delta: 0,
+            bytes_delta: 0,
         })
     }
 

@@ -92,8 +92,8 @@ impl SimulationRunner {
         );
 
         let recovered = RecoveredState {
-            substate_count: storage
-                .substate_count_at_version(origin.genesis_height.inner())
+            substate_bytes: storage
+                .substate_bytes_at_version(origin.genesis_height.inner())
                 .unwrap_or(0),
             chain_origin: origin,
             ..RecoveredState::default()

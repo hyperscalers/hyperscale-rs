@@ -141,8 +141,8 @@ impl VersionedStore for SharedStorage {
         self.0.snapshot_at(height)
     }
 
-    fn substate_count_at(&self, height: BlockHeight) -> Option<u64> {
-        self.0.substate_count_at(height)
+    fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
+        self.0.substate_bytes_at(height)
     }
 }
 

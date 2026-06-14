@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 pub use collected_writes::CollectedWrites;
 use hyperscale_jmt::{
-    Blake3Hasher, Key, LeafValue, NibblePath, Node as JmtNode, NodeKey, ProofError, Tree,
-    TreeReader, UpdateResult, ValueHash,
+    Blake3Hasher, Key, LeafValue, NibblePath, Node as JmtNode, NodeKey, Tree, TreeReader,
+    UpdateResult, ValueHash,
 };
 use hyperscale_types::state_key::{db_node_key_to_node_id, jmt_leaf_key, jmt_value_hash};
 use hyperscale_types::{BlockHeight, Hash, NodeId, StateRoot};
@@ -155,47 +155,6 @@ pub fn hash_value(value: &[u8]) -> ValueHash {
     jmt_value_hash(value)
 }
 
-/// Count the live leaves under `root_key`.
-///
-/// Walks the subtree in pages. `root_key` pins the version and rooting
-/// prefix, so the count is a consistent point-in-time read whose cost
-/// tracks the subtree's leaf population, not the whole tree's. Used to
-/// seed a reshaped child's substate count at adoption.
-///
-/// # Errors
-///
-/// Propagates [`ProofError`] from the underlying range walk — a root that
-/// does not resolve, or a node pruned underneath the walk.
-pub fn count_subtree_leaves<S: TreeReader>(
-    store: &S,
-    root_key: &NodeKey,
-) -> Result<u64, ProofError> {
-    const PAGE: usize = 1 << 16;
-    let mut count: u64 = 0;
-    let mut start: Key = [0u8; 32];
-    loop {
-        let chunk = Jmt::collect_range(store, root_key, &start, &[0xFF; 32], PAGE)?;
-        count += chunk.leaves.len() as u64;
-        let Some((last, _)) = chunk.leaves.last() else {
-            break;
-        };
-        if !chunk.more {
-            break;
-        }
-        start = *last;
-        // Advance the cursor one key past the last leaf; saturation is
-        // unreachable (`more` implies a successor exists).
-        for byte in start.iter_mut().rev() {
-            let (next, overflow) = byte.overflowing_add(1);
-            *byte = next;
-            if !overflow {
-                break;
-            }
-        }
-    }
-    Ok(count)
-}
-
 /// Returns `None` when the JMT is truly empty (zero root) — no parent
 /// node exists.
 ///
@@ -264,7 +223,7 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
         nodes,
         stale_node_keys: Vec::new(),
         leaf_associations: Vec::new(),
-        leaf_delta: 0,
+        bytes_delta: 0,
     }
 }
 
@@ -433,7 +392,7 @@ pub fn put_at_version<S: TreeReader + Sync>(
         collected.stale_node_keys.push(stale.node_key.clone());
     }
     collected.leaf_associations = leaf_associations;
-    collected.leaf_delta = result.batch.leaf_delta;
+    collected.bytes_delta = result.batch.bytes_delta;
 
     (root_hash, collected)
 }

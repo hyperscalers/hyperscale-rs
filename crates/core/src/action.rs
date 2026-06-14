@@ -614,9 +614,9 @@ pub enum Action {
         /// The manifest's reshape assertion, validated against the
         /// locally recomputed load predicate.
         reshape_trigger: Option<ReshapeTrigger>,
-        /// Committed substate count behind the parent block's
+        /// Committed substate byte total behind the parent block's
         /// post-state — the load the reshape predicate evaluates.
-        substate_count: u64,
+        substate_bytes: u64,
         /// Reshape thresholds in force for this network.
         thresholds: ReshapeThresholds,
         /// Finalized waves whose receipts contribute receipt-sourced

@@ -122,8 +122,8 @@ impl VersionedStore for RocksDbShardStorage {
         }
     }
 
-    fn substate_count_at(&self, height: BlockHeight) -> Option<u64> {
-        self.substate_count_at_version(height.inner())
+    fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
+        self.substate_bytes_at_version(height.inner())
     }
 }
 

@@ -27,7 +27,7 @@ use rocksdb::{DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf, SubstateCountsCf,
+    ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf, SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -268,15 +268,15 @@ impl BoundaryStore for RocksDbShardStorage {
                 &leaf.storage_key,
             );
         }
-        // Seed the substate count: a fresh-tree import's leaf delta IS
-        // the imported leaf population.
-        let count = u64::try_from(result.batch.leaf_delta)
-            .map_err(|_| "snap-sync import produced a negative leaf count".to_string())?;
-        batch_put::<SubstateCountsCf>(
+        // Seed the substate byte total: a fresh-tree import's byte delta IS
+        // the imported leaves' value bytes.
+        let bytes = u64::try_from(result.batch.bytes_delta)
+            .map_err(|_| "snap-sync import produced a negative byte total".to_string())?;
+        batch_put::<SubstateBytesCf>(
             &mut batch,
-            SubstateCountsCf::handle(&cf),
+            SubstateBytesCf::handle(&cf),
             &height.inner(),
-            &count,
+            &bytes,
         );
         write_jmt_metadata(&mut batch, height.inner(), imported_root);
 

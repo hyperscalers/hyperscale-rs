@@ -1225,14 +1225,14 @@ impl VerificationPipeline {
                 return Vec::new();
             }
         };
-        // The reshape predicate reads the substate count behind the
+        // The reshape predicate reads the substate byte total behind the
         // block's parent state. With reshaping disabled the predicate
         // can never fire, so the count is irrelevant and verification
         // proceeds without it — bit-identical to a network without the
         // feature. Enabled, a missing ancestor delta parks the
         // verification exactly like a missing witness ancestor.
         let thresholds = count_source.thresholds;
-        let substate_count = if thresholds == ReshapeThresholds::DISABLED {
+        let substate_bytes = if thresholds == ReshapeThresholds::DISABLED {
             0
         } else {
             match count_source.count_behind(
@@ -1245,7 +1245,7 @@ impl VerificationPipeline {
                     debug!(
                         ?block_hash,
                         ?blocking_hash,
-                        "Deferring beacon-witness verification — substate count not yet known"
+                        "Deferring beacon-witness verification — substate byte total not yet known"
                     );
                     self.deferred_beacon_witness_verifications
                         .entry(blocking_hash)
@@ -1285,7 +1285,7 @@ impl VerificationPipeline {
             round: header.round(),
             ready_signals,
             reshape_trigger,
-            substate_count,
+            substate_bytes,
             thresholds,
             finalized_waves,
             topology_snapshot: topology.clone(),
@@ -1293,7 +1293,7 @@ impl VerificationPipeline {
     }
 
     /// Parents with children parked on them. The coordinator retries
-    /// every entry when the count frontier reconciles from persistence
+    /// every entry when the byte frontier reconciles from persistence
     /// — the blocker for a frontier-lagged park is the committed tip,
     /// which no per-block completion event names.
     pub(crate) fn deferred_beacon_witness_parents(&self) -> Vec<BlockHash> {
@@ -1347,14 +1347,14 @@ impl VerificationPipeline {
     }
 }
 
-/// Inputs for resolving the substate count behind a block's parent —
+/// Inputs for resolving the substate byte total behind a block's parent —
 /// the load the reshape predicate evaluates. Borrowed from the shard
-/// coordinator's count frontier and per-block delta tracking.
+/// coordinator's byte frontier and per-block delta tracking.
 #[derive(Clone, Copy)]
 pub struct SubstateCountSource<'a> {
     /// Network reshape thresholds, from the schedule's chain config.
     pub thresholds: ReshapeThresholds,
-    /// Highest height with a known committed substate count, and that
+    /// Highest height with a known committed substate byte total, and that
     /// count.
     pub frontier: (BlockHeight, u64),
     /// The committed tip the pending chain hangs off.
@@ -1395,7 +1395,7 @@ impl SubstateCountSource<'_> {
             .frontier
             .1
             .checked_add_signed(total)
-            .expect("substate count must not go negative"))
+            .expect("substate byte total must not go negative"))
     }
 }
 

@@ -112,7 +112,7 @@ pub enum ShardWitnessPayload {
         /// Round the missed proposer was scheduled for.
         round: Round,
     },
-    /// The shard's committed substate count reached the split
+    /// The shard's committed substate byte total reached the split
     /// threshold. Derived from the manifest's reshape assertion, which
     /// replicas validate against their own count — so the witness
     /// arrives committee-attested. The beacon admits it (pool gate,
@@ -123,7 +123,7 @@ pub enum ShardWitnessPayload {
         /// emission ever moves off-shard.
         shard: ShardId,
     },
-    /// The shard's committed substate count fell below the merge
+    /// The shard's committed substate byte total fell below the merge
     /// threshold. The beacon parks the assertion until the sibling's
     /// matching half folds, then schedules the merge under `parent`.
     ScheduleMerge {

@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
-use hyperscale_storage::tree::count_subtree_leaves;
+use hyperscale_storage::tree::Jmt;
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
 
 use super::core::SimShardStorage;
@@ -44,7 +44,7 @@ impl SimShardStorage {
     /// Re-point this child-prefix-rooted clone of the parent's store at
     /// its adopted subtree: the child root hangs off the parent root's
     /// child-side slot at the clone's tip version. The node is copied to
-    /// the genesis version, the substate count seeded by walking the
+    /// the genesis version, the substate byte total seeded by walking the
     /// subtree, and the chain origin recorded for recovery.
     ///
     /// Returns the adopted child `state_root` — `ZERO` for an empty
@@ -249,7 +249,7 @@ impl SimShardStorage {
 }
 
 /// Shared adoption tail: copy the child root node (when the side is
-/// non-empty) to the genesis version, seed the substate count, and
+/// non-empty) to the genesis version, seed the substate byte total, and
 /// move the tip to the genesis.
 fn install_adoption(
     shared: &mut super::state::SharedState,
@@ -259,15 +259,15 @@ fn install_adoption(
 ) -> Result<(), String> {
     let genesis_version = origin.genesis_height.inner();
     let genesis_root_key = NodeKey::new(genesis_version, shared.tree_store.root_path());
-    let count = match child_node {
+    let bytes = match child_node {
         None => 0,
         Some(node) => {
             shared.tree_store.insert(genesis_root_key.clone(), node);
-            count_subtree_leaves(&shared.tree_store, &genesis_root_key)
-                .map_err(|e| format!("split adoption count: {e:?}"))?
+            Jmt::sum_subtree_value_lens(&shared.tree_store, &genesis_root_key)
+                .map_err(|e| format!("split adoption byte sum: {e:?}"))?
         }
     };
-    shared.substate_counts.insert(genesis_version, count);
+    shared.substate_bytes.insert(genesis_version, bytes);
     shared.current_block_height = origin.genesis_height;
     shared.current_root_hash = child_root;
     Ok(())
@@ -330,7 +330,7 @@ mod tests {
 
     /// Adoption records the merged genesis as the committed tip over the
     /// already-built tree: the recovered state names the genesis, its
-    /// root, origin, and the imported substate count.
+    /// root, origin, and the imported substate byte total.
     #[test]
     fn merge_adoption_records_the_merged_genesis_tip() {
         let (store, root) = merged_store();
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(recovered.committed_hash, Some(genesis.hash()));
         assert_eq!(recovered.jmt_root, Some(root));
         assert_eq!(recovered.chain_origin, origin);
-        assert_eq!(recovered.substate_count, 2);
+        assert_eq!(recovered.substate_bytes, 2);
     }
 
     /// A genesis claiming a different root than the store holds fails
@@ -429,7 +429,7 @@ mod tests {
             assert_eq!(recovered.committed_height, BlockHeight::new(10));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert_eq!(recovered.chain_origin, origin_at_10());
-            assert_eq!(recovered.substate_count, if side == 0 { 2 } else { 1 });
+            assert_eq!(recovered.substate_bytes, if side == 0 { 2 } else { 1 });
 
             assert_eq!(
                 child.adopt_split_child(origin_at_10(), &genesis).unwrap(),

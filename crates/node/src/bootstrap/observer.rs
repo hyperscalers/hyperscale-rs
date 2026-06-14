@@ -72,10 +72,10 @@ pub struct ObserverBootstrap {
     anchor: ShardAnchor,
     child: ShardId,
     phase: Phase,
-    /// Leaves handed to the driver for the store import — the child
-    /// half's substate population, seeding the count frontier the
-    /// child chain starts from.
-    imported_substate_count: u64,
+    /// Total value bytes across the leaves handed to the driver for the
+    /// store import — the child half's substate byte total, seeding the
+    /// byte frontier the child chain starts from.
+    imported_substate_bytes: u64,
 }
 
 impl ObserverBootstrap {
@@ -103,7 +103,7 @@ impl ObserverBootstrap {
                 SPLIT_BITS,
                 STATE_CHUNK_LIMIT,
             )),
-            imported_substate_count: 0,
+            imported_substate_bytes: 0,
         }
     }
 
@@ -168,7 +168,7 @@ impl ObserverBootstrap {
         };
         let leaves = std::mem::take(leaves);
         self.phase = Phase::Importing;
-        self.imported_substate_count = leaves.len() as u64;
+        self.imported_substate_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
         Some((self.anchor.height, leaves))
     }
 
@@ -210,12 +210,12 @@ impl ObserverBootstrap {
         }
     }
 
-    /// The imported substate population of the child half — the count
+    /// The imported substate byte total of the child half — the byte
     /// frontier the child chain starts from. Zero until the import is
     /// taken.
     #[must_use]
-    pub const fn imported_substate_count(&self) -> u64 {
-        self.imported_substate_count
+    pub const fn imported_substate_bytes(&self) -> u64 {
+        self.imported_substate_bytes
     }
 }
 
@@ -503,9 +503,16 @@ mod tests {
                     }
                 }
             }
-            counts.push(bootstrap.imported_substate_count());
+            counts.push(bootstrap.imported_substate_bytes());
         }
-        assert_eq!(counts.iter().sum::<u64>(), u64::from(ENTRIES));
+        let parent_bytes = serving
+            .substate_bytes_at_version(anchor.height.inner())
+            .expect("parent byte total");
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            parent_bytes,
+            "the two halves' byte totals must sum to the parent's, no leaf lost or duplicated",
+        );
         assert!(
             counts.iter().all(|&c| c > 0),
             "fixture population must straddle the split bit; got {counts:?}",

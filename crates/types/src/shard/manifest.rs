@@ -82,7 +82,7 @@ impl BlockManifest {
     /// against their own load predicate before voting; the witness
     /// derivation projects it into a trigger leaf at block-assembly
     /// time, so the sync path replays it from the manifest under QC
-    /// trust without needing historical substate counts.
+    /// trust without needing historical substate byte totals.
     #[must_use]
     pub const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
         self.reshape_trigger

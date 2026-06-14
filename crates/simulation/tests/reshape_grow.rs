@@ -61,7 +61,7 @@ const SEED_BUDGET_EPOCHS: u64 = 6;
 const CHILD_RUN_BUDGET_EPOCHS: u64 = 4;
 
 /// The single-shard, paced-epoch network with the split trigger armed
-/// from genesis (`split_substates: 0` — every committed count
+/// from genesis (`split_bytes: 0` — every committed count
 /// satisfies the predicate) and exactly one cohort's worth of pooled
 /// extras.
 fn grow_config() -> NetworkConfig {
@@ -75,7 +75,7 @@ fn grow_config() -> NetworkConfig {
             epoch_duration_ms: TEST_EPOCH_MS,
             num_shards: 1,
             shard_size: PER_SHARD,
-            reshape_thresholds: ReshapeThresholds { split_substates: 0 },
+            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
             ..BeaconChainConfig::default()
         }),
         pool_extra_validators: PER_SHARD,

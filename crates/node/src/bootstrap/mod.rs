@@ -151,10 +151,11 @@ enum Phase {
 pub struct ShardBootstrap {
     anchor: ShardAnchor,
     phase: Phase,
-    /// Leaves handed to the driver for the store import — the imported
-    /// substate population, identical to the count the store seeds at
-    /// the anchor height. Seeds the recovered state's count frontier.
-    imported_substate_count: u64,
+    /// Total value bytes across the leaves handed to the driver for the
+    /// store import — the imported substate byte total, identical to the
+    /// total the store seeds at the anchor height. Seeds the recovered
+    /// state's byte frontier.
+    imported_substate_bytes: u64,
 }
 
 impl ShardBootstrap {
@@ -169,7 +170,7 @@ impl ShardBootstrap {
                 SPLIT_BITS,
                 STATE_CHUNK_LIMIT,
             )),
-            imported_substate_count: 0,
+            imported_substate_bytes: 0,
         }
     }
 
@@ -233,7 +234,7 @@ impl ShardBootstrap {
         };
         let leaves = std::mem::take(leaves);
         self.phase = Phase::Importing;
-        self.imported_substate_count = leaves.len() as u64;
+        self.imported_substate_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
         Some((self.anchor.height, leaves))
     }
 
@@ -318,7 +319,7 @@ impl ShardBootstrap {
             &self.anchor,
             &header,
             hashes,
-            self.imported_substate_count,
+            self.imported_substate_bytes,
         )
     }
 }

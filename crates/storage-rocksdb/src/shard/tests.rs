@@ -124,10 +124,10 @@ fn leaf_associations_track_live_substates() {
     assert_eq!(storage.cf_get::<LeafAssociationsCf>(&hashed), None);
 }
 
-/// The per-version substate count tracks inserts, value updates and
+/// The per-version substate byte total tracks inserts, value updates and
 /// deletes; historical entries stay readable and survive a reopen.
 #[test]
-fn substate_count_tracks_commits_and_survives_reopen() {
+fn substate_bytes_tracks_commits_and_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
@@ -140,32 +140,32 @@ fn substate_count_tracks_commits_and_survives_reopen() {
         make_database_update(key_b, 0, vec![8], vec![2]),
     ]);
     storage.commit(&v1).unwrap();
-    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
 
     // v2: value update only — count unchanged.
     storage
         .commit(&make_database_update(key_a.clone(), 0, vec![7], vec![9]))
         .unwrap();
-    assert_eq!(storage.substate_count_at(BlockHeight::new(2)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
 
     // v3: delete one — count drops; the historical entry is untouched.
     storage
         .commit(&make_database_delete(key_a, 0, vec![7]))
         .unwrap();
-    assert_eq!(storage.substate_count_at(BlockHeight::new(3)), Some(1));
-    assert_eq!(storage.substate_count_at(BlockHeight::new(1)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
 
     drop(storage);
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    assert_eq!(reopened.substate_count_at(BlockHeight::new(3)), Some(1));
-    assert_eq!(reopened.substate_count_at(BlockHeight::new(2)), Some(2));
-    assert_eq!(reopened.substate_count_at(BlockHeight::new(4)), None);
+    assert_eq!(reopened.substate_bytes_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(reopened.substate_bytes_at(BlockHeight::new(2)), Some(2));
+    assert_eq!(reopened.substate_bytes_at(BlockHeight::new(4)), None);
 }
 
 /// Recovery seeds the coordinator's count frontier with the substate
 /// count behind the committed tip.
 #[test]
-fn recovered_state_carries_substate_count() {
+fn recovered_state_carries_substate_bytes() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
@@ -177,7 +177,7 @@ fn recovered_state_carries_substate_count() {
         rocks_commit_with(&storage, &updates, &block, &qc);
     }
 
-    assert_eq!(storage.load_recovered_state().substate_count, 3);
+    assert_eq!(storage.load_recovered_state().substate_bytes, 3);
 }
 
 #[test]
@@ -1213,10 +1213,10 @@ fn test_state_history_create_delete_create() {
     }
 }
 
-/// JMT GC prunes per-version substate counts below the retention
+/// JMT GC prunes per-version substate byte totals below the retention
 /// cutoff and retains everything at or above it.
 #[test]
-fn substate_counts_pruned_by_jmt_gc() {
+fn substate_bytes_pruned_by_jmt_gc() {
     let temp_dir = TempDir::new().unwrap();
     let config = RocksDbConfig {
         jmt_history_length: 2,
@@ -1238,9 +1238,9 @@ fn substate_counts_pruned_by_jmt_gc() {
     storage.run_jmt_gc();
 
     // current=10, cutoff=8: below-cutoff entries pruned, the rest intact.
-    assert_eq!(storage.substate_count_at(BlockHeight::new(7)), None);
-    assert_eq!(storage.substate_count_at(BlockHeight::new(8)), Some(8));
-    assert_eq!(storage.substate_count_at(BlockHeight::new(10)), Some(10));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(7)), None);
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(8)), Some(8));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(10)), Some(10));
 }
 
 /// `snapshot_at(V)` must panic when V is below the retention floor.
