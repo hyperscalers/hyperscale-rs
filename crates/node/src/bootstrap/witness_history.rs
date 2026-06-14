@@ -204,6 +204,7 @@ mod tests {
             state_root: StateRoot::ZERO,
             block_hash,
             height: BlockHeight::new(HEIGHT),
+            settled_waves_root: None,
         };
         (PendingChain::new(Arc::new(storage)), anchor)
     }
@@ -281,6 +282,7 @@ mod tests {
             state_root: StateRoot::ZERO,
             block_hash,
             height: BlockHeight::new(HEIGHT),
+            settled_waves_root: None,
         };
         let peer = PendingChain::new(Arc::new(storage));
 

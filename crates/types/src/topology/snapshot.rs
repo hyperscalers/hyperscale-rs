@@ -12,8 +12,8 @@ use blake3::hash as blake3_hash;
 
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId,
-    Round, RoutableTransaction, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet,
-    VoteCount,
+    Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardTrie, StateRoot, ValidatorId,
+    ValidatorSet, VoteCount,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -45,6 +45,11 @@ pub struct ShardAnchor {
     pub block_hash: BlockHash,
     /// Height of that boundary block — where tail block-sync starts.
     pub height: BlockHeight,
+    /// The terminated shard's beacon-attested settled-waves commitment, set
+    /// only on a terminal boundary record. A surviving counterpart reads it
+    /// to resolve split-straddling waves against the terminated shard's
+    /// settled set; `None` for a live shard's anchor.
+    pub settled_waves_root: Option<SettledWavesRoot>,
 }
 
 /// Hash a `NodeId` to a u64 using blake3 (first 8 bytes, little-endian).
@@ -826,6 +831,7 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             height: BlockHeight::new(42),
+            settled_waves_root: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);

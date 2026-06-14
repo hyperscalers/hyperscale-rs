@@ -40,7 +40,7 @@ use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, Randomness,
-    ShardId, Stake, StakePoolId, StateRoot, ValidatorId,
+    SettledWavesRoot, ShardId, Stake, StakePoolId, StateRoot, ValidatorId,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -247,6 +247,13 @@ pub struct ShardBoundary {
     /// parent) and drain the witness backlog, and drops once both have
     /// happened. `None` for a live shard.
     pub terminal_epoch: Option<Epoch>,
+    /// The terminal header's `settled_waves_root` — the beacon-attested
+    /// commitment over the wave-ids this shard settled in its retention
+    /// window up to its terminal block. `Some` only on a terminated
+    /// shard's boundary record; a surviving counterpart projects it onto
+    /// [`ShardAnchor`](crate::ShardAnchor) and resolves split-straddling
+    /// waves against it. `None` for a live shard.
+    pub settled_waves_root: Option<SettledWavesRoot>,
 }
 
 /// One observer drawn into a pending split's cohort.
@@ -941,6 +948,7 @@ impl BeaconState {
                         state_root: b.state_root,
                         block_hash: b.block_hash,
                         height: b.height,
+                        settled_waves_root: b.settled_waves_root,
                     },
                 )
             })
@@ -1234,6 +1242,7 @@ mod tests {
             last_live_epoch: creation,
             consecutive_misses: 0,
             terminal_epoch: None,
+            settled_waves_root: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
         state
@@ -1492,6 +1501,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);
 

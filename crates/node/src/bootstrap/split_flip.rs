@@ -129,6 +129,7 @@ mod tests {
             state_root: child_root,
             block_hash: expected.hash(),
             height: BlockHeight::new(10),
+            settled_waves_root: None,
         };
 
         let (genesis, origin) =

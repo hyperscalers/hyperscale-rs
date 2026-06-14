@@ -166,6 +166,7 @@ mod tests {
             state_root: composed,
             block_hash: expected.hash(),
             height: BlockHeight::new(10),
+            settled_waves_root: None,
         };
 
         let (genesis, origin) = merge_genesis_from_terminals(
@@ -211,6 +212,7 @@ mod tests {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::new(10),
+            settled_waves_root: None,
         };
         assert!(
             merge_genesis_from_terminals(

@@ -464,6 +464,7 @@ fn record_boundaries(
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch,
+                settled_waves_root: header.settled_waves_root(),
             },
         );
         refreshed.insert(*shard);
@@ -569,6 +570,7 @@ fn seed_split_children(
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
     }
@@ -664,6 +666,7 @@ fn compose_merge_parent(
             last_live_epoch: epoch,
             consecutive_misses: 0,
             terminal_epoch: None,
+            settled_waves_root: None,
         },
     );
     tracing::info!(
@@ -681,9 +684,9 @@ mod tests {
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardBoundary, ShardCommittee, ShardId, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake,
-        StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
+        QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee, ShardId,
+        ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots,
+        Stake, StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
         WeightedTimestamp, compute_merkle_root_with_proof, zero_bls_signature,
     };
 
@@ -703,7 +706,9 @@ mod tests {
         root: BeaconWitnessRoot,
         leaf_count: u64,
     ) -> BlockHeader {
-        boundary_block_full(shard, height, pred_wt, state_root, root, leaf_count, None)
+        boundary_block_full(
+            shard, height, pred_wt, state_root, root, leaf_count, None, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)] // test fixture mirroring the header fields it sets
@@ -715,6 +720,7 @@ mod tests {
         root: BeaconWitnessRoot,
         leaf_count: u64,
         split_child_roots: Option<SplitChildRoots>,
+        settled_waves_root: Option<SettledWavesRoot>,
     ) -> BlockHeader {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
@@ -747,7 +753,7 @@ mod tests {
             BeaconWitnessLeafCount::new(leaf_count),
             BeaconWitnessLeafCount::ZERO,
             split_child_roots,
-            None,
+            settled_waves_root,
         )
     }
 
@@ -779,7 +785,7 @@ mod tests {
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
     ) -> (BlockHeader, Vec<ShardWitness>) {
-        boundary_block_with_payloads_full(shard, height, pred_wt, state_root, payloads, None)
+        boundary_block_with_payloads_full(shard, height, pred_wt, state_root, payloads, None, None)
     }
 
     /// [`boundary_block_with_payloads`] with `split_child_roots` set at
@@ -792,6 +798,7 @@ mod tests {
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
         split_child_roots: Option<SplitChildRoots>,
+        settled_waves_root: Option<SettledWavesRoot>,
     ) -> (BlockHeader, Vec<ShardWitness>) {
         let leaf_count = payloads.len() as u64;
         let leaf_hashes: Vec<Hash> = payloads
@@ -811,6 +818,7 @@ mod tests {
             root,
             leaf_count,
             split_child_roots,
+            settled_waves_root,
         );
         let block_hash = header.hash();
         let witnesses = payloads
@@ -923,6 +931,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
         state.witness_window_bases = state.live_witness_bases();
@@ -996,6 +1005,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
         assert_eq!(
@@ -1053,6 +1063,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
 
@@ -1386,6 +1397,7 @@ mod tests {
         pair: SplitChildRoots,
         state_root: StateRoot,
         leaf_count: u64,
+        settled_waves_root: Option<SettledWavesRoot>,
     ) -> (BlockHeader, Vec<ShardWitness>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -1393,7 +1405,15 @@ mod tests {
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();
-        boundary_block_with_payloads_full(shard, height, pred_wt, state_root, payloads, Some(pair))
+        boundary_block_with_payloads_full(
+            shard,
+            height,
+            pred_wt,
+            state_root,
+            payloads,
+            Some(pair),
+            settled_waves_root,
+        )
     }
 
     /// A terminal-marked parent (final epoch 1, cut at 2000ms) with both
@@ -1412,6 +1432,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: Some(Epoch::new(1)),
+                settled_waves_root: None,
             },
         );
         for child in <[ShardId; 2]>::from(parent.children()) {
@@ -1425,6 +1446,7 @@ mod tests {
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: None,
+                    settled_waves_root: None,
                 },
             );
         }
@@ -1473,7 +1495,7 @@ mod tests {
         let (left, right) = parent.children();
 
         let (header, witnesses) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3);
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header.clone(), witnesses, 2_500);
 
         record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
@@ -1509,7 +1531,7 @@ mod tests {
             right: pair.right,
         };
         let (header, witnesses) =
-            terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3);
+            terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
 
         record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
@@ -1528,7 +1550,8 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let (left, _) = parent.children();
 
-        let (header, witnesses) = terminal_block_with_witnesses(parent, 9, 900, pair, composed, 3);
+        let (header, witnesses) =
+            terminal_block_with_witnesses(parent, 9, 900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 1_500);
 
         record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
@@ -1567,7 +1590,7 @@ mod tests {
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
 
         let (header, witnesses) =
-            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total);
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, None);
 
         let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
         let (committed, contributions) =
@@ -1596,6 +1619,37 @@ mod tests {
         );
     }
 
+    /// A terminal contribution carrying a `settled_waves_root` folds it
+    /// onto the parent's boundary record and projects it onto the
+    /// snap-sync anchor — the path a surviving counterpart reads the
+    /// terminated shard's settled-waves commitment from. Folded with a
+    /// lingering backlog so the terminal record survives the fold (a
+    /// fully drained one drops in-fold).
+    #[test]
+    fn terminal_settled_waves_root_folds_and_projects() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
+        let root = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled waves"));
+
+        let (header, witnesses) =
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
+        let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
+        let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
+        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+
+        let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
+        assert_eq!(folded.settled_waves_root, Some(root));
+
+        // The projection carries the root onto the anchor regardless of
+        // trie membership: a terminated parent leaves the trie, but its
+        // boundary record projects from the global map.
+        let anchor = state
+            .derive_topology_snapshot(net())
+            .boundary(parent)
+            .expect("terminal record projects");
+        assert_eq!(anchor.settled_waves_root, Some(root));
+    }
+
     // ─── merge parent composition ────────────────────────────────────────
 
     /// A pending merge parent (zero-hash placeholder, final epoch 1, cut
@@ -1619,6 +1673,7 @@ mod tests {
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
+                    settled_waves_root: None,
                 },
             );
         }
@@ -1632,6 +1687,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
         (state, parent, left_root, right_root)
@@ -1667,9 +1723,10 @@ mod tests {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
 
-        let (lh, lw) = boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None);
+        let (lh, lw) =
+            boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
         let (rh, rw) =
-            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None);
+            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
         let proposal = BeaconProposal::new(
             [
                 (left, Some(qc_over(&lh, 2_500))),
@@ -1721,9 +1778,10 @@ mod tests {
     fn a_lone_terminal_child_holds_until_its_sibling_composes_the_parent() {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
-        let (lh, lw) = boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None);
+        let (lh, lw) =
+            boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
         let (rh, rw) =
-            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None);
+            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
 
         // Both children's terminal records, sourced together — the
         // proposer re-sources every lingering terminal record each fold.

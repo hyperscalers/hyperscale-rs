@@ -317,6 +317,7 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
                 last_live_epoch: state.current_epoch,
                 consecutive_misses: 0,
                 terminal_epoch: None,
+                settled_waves_root: None,
             },
         );
     }
@@ -448,6 +449,7 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
             last_live_epoch: state.current_epoch,
             consecutive_misses: 0,
             terminal_epoch: None,
+            settled_waves_root: None,
         },
     );
 }
@@ -904,6 +906,7 @@ mod tests {
                     last_live_epoch: Epoch::new(5),
                     consecutive_misses: 0,
                     terminal_epoch: None,
+                    settled_waves_root: None,
                 },
             );
         }
