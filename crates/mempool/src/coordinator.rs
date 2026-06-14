@@ -550,18 +550,47 @@ impl MempoolCoordinator {
         self.tombstones.is_tombstoned(tx_hash)
     }
 
-    /// Drive every in-flight (`Committed`) transaction to
-    /// `Completed(Aborted)`. Called once when the local chain terminates
-    /// at a reshape boundary: finalization is a wave certificate in a
-    /// later block, and a terminated chain commits no later block, so an
-    /// in-flight tx here is permanently undecidable — abort is its
-    /// terminal state.
+    /// Drive one transaction to `Completed(Aborted)`: drop it from the
+    /// pool, release its locks if it was in flight, tombstone it, and
+    /// return its terminal status action. `None` for a hash not in the
+    /// pool (already terminal).
     ///
     /// Lock release is deliberately unfiltered (every declared node, not
-    /// just the ones the current topology routes locally): the head trie
-    /// has already re-routed this shard's nodes to its children, so a
-    /// topology-filtered release would miss exactly the locks this chain
-    /// took, and a terminated chain's lock set dies with it regardless.
+    /// just the ones the current topology routes locally): at a reshape
+    /// boundary the head trie has already re-routed this shard's nodes to
+    /// its children, so a topology-filtered release would miss exactly the
+    /// locks the aborted chain took, and a terminated chain's lock set
+    /// dies with it regardless. A tx that never reached `Committed` holds
+    /// no in-flight lock, so the release is skipped for it.
+    fn abort_one(&mut self, tx_hash: TxHash) -> Option<Action> {
+        let entry = self.pool.remove(&tx_hash)?;
+        if matches!(entry.status, TransactionStatus::Committed(_)) {
+            let newly_unlocked = self
+                .locks
+                .unlock_nodes(entry.tx.all_declared_nodes().copied());
+            for node in newly_unlocked {
+                self.promote_transactions_for_node(node);
+            }
+            self.locks.dec_in_flight();
+        }
+        self.remove_from_ready_tracking(&tx_hash);
+        self.tombstones
+            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+        record_transaction_aborted();
+        Some(Action::EmitTransactionStatus {
+            tx_hash,
+            status: TransactionStatus::Completed(TransactionDecision::Aborted),
+            cross_shard: entry.cross_shard,
+            submitted_locally: entry.submitted_locally,
+        })
+    }
+
+    /// Drive every in-flight (`Committed`) transaction to
+    /// `Completed(Aborted)` via [`Self::abort_one`]. Called once when the
+    /// local chain terminates at a reshape boundary: finalization is a
+    /// wave certificate in a later block, and a terminated chain commits
+    /// no later block, so an in-flight tx here is permanently undecidable —
+    /// abort is its terminal state.
     pub fn abort_in_flight(&mut self) -> Vec<Action> {
         let mut in_flight: Vec<TxHash> = self
             .pool
@@ -573,69 +602,24 @@ impl MempoolCoordinator {
 
         let mut actions = Vec::with_capacity(in_flight.len());
         for tx_hash in in_flight {
-            let Some(entry) = self.pool.remove(&tx_hash) else {
-                continue;
-            };
-            let newly_unlocked = self
-                .locks
-                .unlock_nodes(entry.tx.all_declared_nodes().copied());
-            for node in newly_unlocked {
-                self.promote_transactions_for_node(node);
-            }
-            self.locks.dec_in_flight();
-            self.remove_from_ready_tracking(&tx_hash);
-            self.tombstones
-                .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
-            record_transaction_aborted();
-            actions.push(Action::EmitTransactionStatus {
-                tx_hash,
-                status: TransactionStatus::Completed(TransactionDecision::Aborted),
-                cross_shard: entry.cross_shard,
-                submitted_locally: entry.submitted_locally,
-            });
+            actions.extend(self.abort_one(tx_hash));
         }
         actions
     }
 
-    /// Drive a specific set of in-flight transactions to
-    /// `Completed(Aborted)` — the counterpart abort sweep on a surviving
+    /// Drive a specific set of transactions to `Completed(Aborted)` via
+    /// [`Self::abort_one`] — the counterpart abort sweep on a surviving
     /// shard, once a terminated partner's settled set proves the
-    /// transaction's cross-shard half will never finalize.
-    ///
-    /// Lock release is unfiltered for the same reason as
-    /// [`Self::abort_in_flight`]: the head trie has already re-routed the
-    /// terminated partner's nodes to its children, so a topology-filtered
-    /// release would miss exactly the locks the straddler took. Hashes not
-    /// in the pool (already terminal) are skipped.
+    /// transaction's cross-shard half will never finalize. Hashes not in
+    /// the pool (already terminal) are skipped.
     pub fn abort_transactions(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
         let mut sorted: Vec<TxHash> = tx_hashes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
 
-        let mut actions = Vec::new();
+        let mut actions = Vec::with_capacity(sorted.len());
         for tx_hash in sorted {
-            let Some(entry) = self.pool.remove(&tx_hash) else {
-                continue;
-            };
-            if matches!(entry.status, TransactionStatus::Committed(_)) {
-                let newly_unlocked = self
-                    .locks
-                    .unlock_nodes(entry.tx.all_declared_nodes().copied());
-                for node in newly_unlocked {
-                    self.promote_transactions_for_node(node);
-                }
-                self.locks.dec_in_flight();
-            }
-            self.remove_from_ready_tracking(&tx_hash);
-            self.tombstones
-                .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
-            record_transaction_aborted();
-            actions.push(Action::EmitTransactionStatus {
-                tx_hash,
-                status: TransactionStatus::Completed(TransactionDecision::Aborted),
-                cross_shard: entry.cross_shard,
-                submitted_locally: entry.submitted_locally,
-            });
+            actions.extend(self.abort_one(tx_hash));
         }
         actions
     }
