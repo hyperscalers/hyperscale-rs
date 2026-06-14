@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 pub use collected_writes::CollectedWrites;
 use hyperscale_jmt::{
-    Blake3Hasher, Key, NibblePath, Node as JmtNode, NodeKey, ProofError, Tree, TreeReader,
-    UpdateResult, ValueHash,
+    Blake3Hasher, Key, LeafValue, NibblePath, Node as JmtNode, NodeKey, ProofError, Tree,
+    TreeReader, UpdateResult, ValueHash,
 };
 use hyperscale_types::state_key::{db_node_key_to_node_id, jmt_leaf_key, jmt_value_hash};
 use hyperscale_types::{BlockHeight, Hash, NodeId, StateRoot};
@@ -134,9 +134,15 @@ pub fn import_leaf_updates<S: TreeReader>(
     height: BlockHeight,
     leaves: &[ImportLeaf],
 ) -> Result<(StateRoot, UpdateResult), String> {
-    let updates: BTreeMap<Key, Option<ValueHash>> = leaves
+    let updates: BTreeMap<Key, Option<LeafValue>> = leaves
         .iter()
-        .map(|leaf| (leaf.leaf_key, Some(hash_value(&leaf.value))))
+        .map(|leaf| {
+            let len = leaf.value.len() as u64;
+            (
+                leaf.leaf_key,
+                Some(LeafValue::new(hash_value(&leaf.value), len)),
+            )
+        })
         .collect();
     let result = Jmt::apply_updates_at(store, None, height.inner(), root_path, &updates)
         .map_err(|e| format!("snap-sync JMT import: {e}"))?;
@@ -378,11 +384,11 @@ pub fn put_at_version<S: TreeReader + Sync>(
 
     // Parallel phase: BLAKE3 hash each storage key and value. Each item is
     // independent — this parallelizes the per-entry hashing work.
-    let mut updates: Vec<(Key, Option<ValueHash>)> = work_items
+    let mut updates: Vec<(Key, Option<LeafValue>)> = work_items
         .par_iter()
         .map(|(storage_key, value_ref)| {
             let jmt_key = hash_storage_key(storage_key, owner_map);
-            let jmt_value = value_ref.map(hash_value);
+            let jmt_value = value_ref.map(|v| LeafValue::new(hash_value(v), v.len() as u64));
             (jmt_key, jmt_value)
         })
         .collect();
@@ -404,7 +410,7 @@ pub fn put_at_version<S: TreeReader + Sync>(
 
     updates.par_sort_by(|a, b| a.0.cmp(&b.0));
 
-    let updates_btree: BTreeMap<Key, Option<ValueHash>> = updates.into_iter().collect();
+    let updates_btree: BTreeMap<Key, Option<LeafValue>> = updates.into_iter().collect();
 
     let result = Jmt::apply_updates_at(
         store,

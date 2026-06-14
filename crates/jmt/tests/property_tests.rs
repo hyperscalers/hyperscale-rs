@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_jmt::{
-    Blake3Hasher, EMPTY_HASH, Hash, Key, MemoryStore, MultiProof, NodeKey, Tree, TreeReader,
-    ValueHash,
+    Blake3Hasher, EMPTY_HASH, Hash, Key, LeafValue, MemoryStore, MultiProof, NodeKey, Tree,
+    TreeReader, ValueHash,
 };
 use proptest::prelude::*;
 
@@ -54,8 +54,10 @@ fn build_tree(entries: &BTreeMap<Key, ValueHash>) -> (MemoryStore, Option<NodeKe
     if entries.is_empty() {
         return (store, None, EMPTY_HASH);
     }
-    let updates: BTreeMap<Key, Option<ValueHash>> =
-        entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+    let updates: BTreeMap<Key, Option<LeafValue>> = entries
+        .iter()
+        .map(|(k, v)| (*k, Some(LeafValue::new(*v, 1))))
+        .collect();
     let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
     let root_hash = res.root_hash;
     store.apply(&res);
@@ -104,13 +106,13 @@ proptest! {
 
         // Approach B: first half at v1, second half at v2.
         let mut store_b = MemoryStore::new();
-        let u1: BTreeMap<Key, Option<ValueHash>> =
-            first_half.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let u1: BTreeMap<Key, Option<LeafValue>> =
+            first_half.iter().map(|(k, v)| (*k, Some(LeafValue::new(*v, 1)))).collect();
         let r1 = Jmt::apply_updates(&store_b, None, 1, &u1).unwrap();
         store_b.apply(&r1);
 
-        let u2: BTreeMap<Key, Option<ValueHash>> =
-            second_half.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let u2: BTreeMap<Key, Option<LeafValue>> =
+            second_half.iter().map(|(k, v)| (*k, Some(LeafValue::new(*v, 1)))).collect();
         let root_b = if u2.is_empty() {
             r1.root_hash
         } else {
@@ -274,7 +276,7 @@ proptest! {
         let keys: Vec<Key> = entries.keys().copied().collect();
         let target = keys[delete_idx % keys.len()];
 
-        let updates: BTreeMap<Key, Option<ValueHash>> =
+        let updates: BTreeMap<Key, Option<LeafValue>> =
             std::iter::once((target, None)).collect();
         let res = Jmt::apply_updates(&store, Some(1), 2, &updates).unwrap();
         store.apply(&res);
@@ -301,14 +303,14 @@ proptest! {
         v2_updates in entries_strategy(),
     ) {
         let mut store = MemoryStore::new();
-        let u1: BTreeMap<Key, Option<ValueHash>> =
-            v1_entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let u1: BTreeMap<Key, Option<LeafValue>> =
+            v1_entries.iter().map(|(k, v)| (*k, Some(LeafValue::new(*v, 1)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &u1).unwrap();
         store.apply(&r1);
 
         if !v2_updates.is_empty() {
-            let u2: BTreeMap<Key, Option<ValueHash>> =
-                v2_updates.iter().map(|(k, v)| (*k, Some(*v))).collect();
+            let u2: BTreeMap<Key, Option<LeafValue>> =
+                v2_updates.iter().map(|(k, v)| (*k, Some(LeafValue::new(*v, 1)))).collect();
             let r2 = Jmt::apply_updates(&store, Some(1), 2, &u2).unwrap();
             store.apply(&r2);
         }
@@ -334,8 +336,8 @@ proptest! {
         let old_value = *entries.get(&target).unwrap();
         prop_assume!(old_value != new_value);
 
-        let u2: BTreeMap<Key, Option<ValueHash>> =
-            std::iter::once((target, Some(new_value))).collect();
+        let u2: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((target, Some(LeafValue::new(new_value, 1)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &u2).unwrap();
         store.apply(&r2);
 
@@ -453,8 +455,8 @@ proptest! {
         ),
     ) {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> =
-            entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let v1: BTreeMap<Key, Option<LeafValue>> =
+            entries.iter().map(|(k, v)| (*k, Some(LeafValue::new(*v, 1)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         prop_assert_eq!(r1.batch.leaf_delta, i64::try_from(entries.len()).unwrap());
         store.apply(&r1);
@@ -463,16 +465,19 @@ proptest! {
         // probability; existing-key ops overlay them so collisions
         // resolve identically in the batch and the model.
         let keys: Vec<Key> = entries.keys().copied().collect();
-        let mut batch: BTreeMap<Key, Option<ValueHash>> = fresh_ops;
+        let mut batch: BTreeMap<Key, Option<LeafValue>> = fresh_ops
+            .into_iter()
+            .map(|(k, op)| (k, op.map(|v| LeafValue::new(v, 1))))
+            .collect();
         for (idx, op) in &existing_ops {
-            batch.insert(*idx.get(&keys), *op);
+            batch.insert(*idx.get(&keys), op.map(|v| LeafValue::new(v, 1)));
         }
 
         let mut model = entries.clone();
         for (k, op) in &batch {
             match op {
                 Some(v) => {
-                    model.insert(*k, *v);
+                    model.insert(*k, v.hash);
                 }
                 None => {
                     model.remove(k);

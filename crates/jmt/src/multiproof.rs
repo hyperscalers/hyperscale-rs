@@ -880,7 +880,7 @@ mod tests {
 
     use super::*;
     use crate::hasher::Blake3Hasher;
-    use crate::node::NibblePath;
+    use crate::node::{LeafValue, NibblePath};
     use crate::storage::MemoryStore;
     use crate::test_utils::{build_store, k, v};
     use crate::tree::Tree;
@@ -959,8 +959,10 @@ mod tests {
             .collect();
 
         let mut store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            entries.iter().map(|(k, val)| (*k, Some(*val))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> = entries
+            .iter()
+            .map(|(k, val)| (*k, Some(LeafValue::new(*val, 1))))
+            .collect();
         let res = Jmt::apply_updates_at(&store, None, 1, &prefix, &updates).unwrap();
         store.apply(&res);
 
@@ -1088,8 +1090,10 @@ mod tests {
         type Jmt4 = Tree<Blake3Hasher, 2>;
         let mut store = MemoryStore::new();
         let entries: Vec<(Key, ValueHash)> = (0u8..16).map(|i| (k(i), v(i * 3))).collect();
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> = entries
+            .iter()
+            .map(|(k, v)| (*k, Some(LeafValue::new(*v, 1))))
+            .collect();
         let res = Jmt4::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);
         let root = store.get_root_key(1).unwrap();

@@ -136,11 +136,14 @@ pub struct StoredChildEntry {
     pub is_leaf: bool,
 }
 
-/// Leaf node: full key + value hash.
+/// Leaf node: full key + value hash + value byte length.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
 pub struct StoredLeafNode {
     pub key: Vec<u8>,
     pub value_hash: Vec<u8>,
+    /// Byte length of the stored value. Tracked for byte-total
+    /// accounting; not part of the leaf hash.
+    pub value_len: u64,
 }
 
 /// Identifies a region of the tree eligible for pruning.
@@ -186,6 +189,7 @@ impl StoredNode {
             Node::Leaf(leaf) => Self::Leaf(StoredLeafNode {
                 key: leaf.key.to_vec(),
                 value_hash: leaf.value_hash.to_vec(),
+                value_len: leaf.value_len,
             }),
         }
     }
@@ -227,6 +231,7 @@ impl StoredNode {
             Self::Leaf(leaf) => Node::Leaf(LeafNode {
                 key: key_from_bytes(&leaf.key),
                 value_hash: hash_from_bytes(&leaf.value_hash),
+                value_len: leaf.value_len,
             }),
         }
     }
@@ -264,13 +269,14 @@ mod tests {
 
     #[test]
     fn roundtrip_leaf() {
-        let leaf = Node::Leaf(JmtLeaf::new([1u8; 32], [2u8; 32]));
+        let leaf = Node::Leaf(JmtLeaf::new([1u8; 32], [2u8; 32], 17));
         let stored = StoredNode::from_jmt(&leaf);
         let back = stored.to_jmt();
         match (leaf, back) {
             (Node::Leaf(a), Node::Leaf(b)) => {
                 assert_eq!(a.key, b.key);
                 assert_eq!(a.value_hash, b.value_hash);
+                assert_eq!(a.value_len, b.value_len);
             }
             _ => panic!("expected leaf"),
         }

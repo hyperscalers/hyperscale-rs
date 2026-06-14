@@ -6,7 +6,7 @@ use std::hint::black_box;
 
 use blake3::hash as blake3_hash;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hyperscale_jmt::{Blake3Hasher, Key, MemoryStore, MultiProof, Tree, ValueHash};
+use hyperscale_jmt::{Blake3Hasher, Key, LeafValue, MemoryStore, MultiProof, Tree, ValueHash};
 
 type Jmt = Tree<Blake3Hasher>;
 
@@ -19,15 +19,15 @@ fn make_key(i: u32) -> Key {
     k
 }
 
-fn make_value(i: u32) -> ValueHash {
+fn make_value(i: u32) -> LeafValue {
     let mut v = [0u8; 32];
     v[28..32].copy_from_slice(&i.to_be_bytes());
-    v
+    LeafValue::new(v, 32)
 }
 
 fn build_store(n: u32) -> MemoryStore {
     let mut store = MemoryStore::new();
-    let updates: BTreeMap<Key, Option<ValueHash>> =
+    let updates: BTreeMap<Key, Option<LeafValue>> =
         (0..n).map(|i| (make_key(i), Some(make_value(i)))).collect();
     let result = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
     store.apply(&result);
@@ -37,7 +37,7 @@ fn build_store(n: u32) -> MemoryStore {
 fn bench_build_fresh(c: &mut Criterion) {
     let mut group = c.benchmark_group("build_fresh");
     for &n in &[1_000u32, 10_000, 100_000] {
-        let updates: BTreeMap<Key, Option<ValueHash>> =
+        let updates: BTreeMap<Key, Option<LeafValue>> =
             (0..n).map(|i| (make_key(i), Some(make_value(i)))).collect();
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
@@ -56,7 +56,7 @@ fn bench_update_existing(c: &mut Criterion) {
         let store = build_store(n);
         for &batch_n in &[100u32, 1_000, 10_000] {
             // Mix: half overwrites, half new keys.
-            let updates: BTreeMap<Key, Option<ValueHash>> = (0..batch_n)
+            let updates: BTreeMap<Key, Option<LeafValue>> = (0..batch_n)
                 .map(|i| {
                     let k = if i % 2 == 0 {
                         make_key(i % n)

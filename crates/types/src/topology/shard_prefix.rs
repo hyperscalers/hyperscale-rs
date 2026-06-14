@@ -47,7 +47,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blake3::hash as blake3_hash;
-    use hyperscale_jmt::{Blake3Hasher, Hasher, MemoryStore, NibblePath, Tree};
+    use hyperscale_jmt::{Blake3Hasher, Hasher, LeafValue, MemoryStore, NibblePath, Tree};
 
     use super::shard_prefix_path;
     use crate::{Hash, ShardId, ShardTrie, StateRoot};
@@ -104,7 +104,7 @@ mod tests {
     /// a shard prefix = that shard's subtree root.
     fn jmt_root_at(
         root_path: &NibblePath,
-        updates: &BTreeMap<[u8; 32], Option<[u8; 32]>>,
+        updates: &BTreeMap<[u8; 32], Option<LeafValue>>,
     ) -> [u8; 32] {
         let store = MemoryStore::new();
         Jmt::apply_updates_at(&store, None, 1, root_path, updates)
@@ -133,8 +133,8 @@ mod tests {
     /// the global tree. The whole sharding substrate (cross-shard proofs,
     /// snap-sync anchors, zero-copy resharding) rests on this identity.
     fn assert_identity(trie: &ShardTrie, keys_per_shard: u64) {
-        let mut all: BTreeMap<[u8; 32], Option<[u8; 32]>> = BTreeMap::new();
-        let mut per_shard: BTreeMap<ShardId, BTreeMap<[u8; 32], Option<[u8; 32]>>> =
+        let mut all: BTreeMap<[u8; 32], Option<LeafValue>> = BTreeMap::new();
+        let mut per_shard: BTreeMap<ShardId, BTreeMap<[u8; 32], Option<LeafValue>>> =
             BTreeMap::new();
 
         for leaf in trie.leaves() {
@@ -146,8 +146,11 @@ mod tests {
                     leaf,
                     "key routed to wrong shard"
                 );
-                all.insert(key, Some(value));
-                per_shard.entry(leaf).or_default().insert(key, Some(value));
+                all.insert(key, Some(LeafValue::new(value, 1)));
+                per_shard
+                    .entry(leaf)
+                    .or_default()
+                    .insert(key, Some(LeafValue::new(value, 1)));
             }
         }
 
@@ -212,10 +215,10 @@ mod tests {
 
         // All keys under p0 → one-sided at p's split bit; p1 is empty.
         let root_over = |root_path: &NibblePath, n: u64| -> [u8; 32] {
-            let mut updates: BTreeMap<[u8; 32], Option<[u8; 32]>> = BTreeMap::new();
+            let mut updates: BTreeMap<[u8; 32], Option<LeafValue>> = BTreeMap::new();
             for i in 0..n {
                 let key = key_in_shard(p0, i);
-                updates.insert(key, Some(*blake3_hash(&key).as_bytes()));
+                updates.insert(key, Some(LeafValue::new(*blake3_hash(&key).as_bytes(), 1)));
             }
             jmt_root_at(root_path, &updates)
         };

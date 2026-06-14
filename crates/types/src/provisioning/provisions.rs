@@ -484,7 +484,7 @@ mod tests {
     mod verify {
         use std::collections::BTreeMap;
 
-        use hyperscale_jmt::{Blake3Hasher, MemoryStore, NodeKey, Tree};
+        use hyperscale_jmt::{Blake3Hasher, LeafValue, MemoryStore, NodeKey, Tree};
 
         use super::*;
         use crate::state_key::{jmt_leaf_key, jmt_value_hash};
@@ -506,11 +506,11 @@ mod tests {
 
         fn build_jmt(entries: &[(Vec<u8>, Vec<u8>)]) -> (StateRoot, MerkleInclusionProof) {
             let mut store = MemoryStore::new();
-            let updates: BTreeMap<[u8; 32], Option<[u8; 32]>> = entries
+            let updates: BTreeMap<[u8; 32], Option<LeafValue>> = entries
                 .iter()
                 .map(|(k, v)| {
                     let key = jmt_leaf_key(k, None);
-                    let val = jmt_value_hash(v);
+                    let val = LeafValue::new(jmt_value_hash(v), v.len() as u64);
                     (key, Some(val))
                 })
                 .collect();

@@ -15,8 +15,8 @@ use std::ops::Range;
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 use crate::node::{
-    Child, ChildKind, InternalNode, Key, LeafNode, NibblePath, Node, NodeKey, StaleNodeIndex,
-    TreeUpdateBatch, ValueHash, bits_at,
+    Child, ChildKind, InternalNode, Key, LeafNode, LeafValue, NibblePath, Node, NodeKey,
+    StaleNodeIndex, TreeUpdateBatch, ValueHash, bits_at,
 };
 use crate::storage::TreeReader;
 
@@ -42,7 +42,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         store: &S,
         parent_version: Option<u64>,
         new_version: u64,
-        updates: &BTreeMap<Key, Option<ValueHash>>,
+        updates: &BTreeMap<Key, Option<LeafValue>>,
     ) -> Result<UpdateResult, UpdateError>
     where
         S: TreeReader,
@@ -68,8 +68,8 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     ///   that prefix (its root node sits at the prefix depth, so the root hash is
     ///   the subtree root at that prefix). All keys in `updates` must share
     ///   `root_path`, and incremental updates must reuse it.
-    /// - `updates`: `Some(value_hash)` to insert or update, `None` to delete.
-    ///   The map's key ordering sorts updates by key.
+    /// - `updates`: `Some(value)` (hash + byte length) to insert or update,
+    ///   `None` to delete. The map's key ordering sorts updates by key.
     ///
     /// Returns an [`UpdateResult`] whose `batch` must be persisted to make the
     /// new version visible to reads.
@@ -86,7 +86,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         parent_version: Option<u64>,
         new_version: u64,
         root_path: &NibblePath,
-        updates: &BTreeMap<Key, Option<ValueHash>>,
+        updates: &BTreeMap<Key, Option<LeafValue>>,
     ) -> Result<UpdateResult, UpdateError>
     where
         S: TreeReader,
@@ -101,7 +101,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         }
 
         // BTreeMap iteration is sorted by key.
-        let kvs: Vec<(&Key, Option<ValueHash>)> = updates.iter().map(|(k, v)| (k, *v)).collect();
+        let kvs: Vec<(&Key, Option<LeafValue>)> = updates.iter().map(|(k, v)| (k, *v)).collect();
 
         let mut batch = TreeUpdateBatch::default();
 
@@ -122,7 +122,9 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
                 &mut batch,
             )?
         } else {
-            batch.leaf_delta += count_inserts(&kvs);
+            let (leaves, bytes) = insert_deltas(&kvs);
+            batch.leaf_delta += leaves;
+            batch.bytes_delta += bytes;
             build_fresh::<H, ARITY_BITS>(root_path, new_version, &kvs, &mut batch)
         };
 
@@ -238,18 +240,26 @@ fn child_path(parent: &NibblePath, bucket: u8, count: u8) -> NibblePath {
     p
 }
 
-/// Number of `Some`-valued entries in `kvs` — the leaves a fresh build
-/// at an empty slot creates. Every such key is new by construction
-/// (the slot held nothing), so each counts +1 toward `leaf_delta`.
-fn count_inserts(kvs: &[(&Key, Option<ValueHash>)]) -> i64 {
-    i64::try_from(kvs.iter().filter(|(_, v)| v.is_some()).count())
-        .expect("update batch size fits i64")
+/// Leaf-count and byte deltas for a fresh build at an empty slot. Every
+/// `Some`-valued entry in `kvs` is new by construction (the slot held
+/// nothing), so each counts +1 toward `leaf_delta` and adds its value
+/// length toward `bytes_delta`. Returns `(leaf_delta, bytes_delta)`.
+fn insert_deltas(kvs: &[(&Key, Option<LeafValue>)]) -> (i64, i64) {
+    let mut leaves: i64 = 0;
+    let mut bytes: i64 = 0;
+    for (_, v) in kvs {
+        if let Some(value) = v {
+            leaves += 1;
+            bytes += i64::try_from(value.len).expect("value length fits i64");
+        }
+    }
+    (leaves, bytes)
 }
 
 /// Iterator yielding `(bucket, range)` tuples over contiguous ranges of
 /// sorted `kvs` that share the same `count`-bit chunk at `depth_bits`.
 struct BitRangeIter<'a> {
-    kvs: &'a [(&'a Key, Option<ValueHash>)],
+    kvs: &'a [(&'a Key, Option<LeafValue>)],
     depth_bits: u16,
     bits_per_level: u8,
     pos: usize,
@@ -257,7 +267,7 @@ struct BitRangeIter<'a> {
 
 impl<'a> BitRangeIter<'a> {
     const fn new(
-        kvs: &'a [(&'a Key, Option<ValueHash>)],
+        kvs: &'a [(&'a Key, Option<LeafValue>)],
         depth_bits: u16,
         bits_per_level: u8,
     ) -> Self {
@@ -308,7 +318,7 @@ fn update_existing<S, H, const ARITY_BITS: u8>(
     version: u64,
     path: &NibblePath,
     new_version: u64,
-    kvs: &[(&Key, Option<ValueHash>)],
+    kvs: &[(&Key, Option<LeafValue>)],
     batch: &mut TreeUpdateBatch,
 ) -> Result<Option<Node>, UpdateError>
 where
@@ -362,7 +372,7 @@ fn update_existing_internal<S, H, const ARITY_BITS: u8>(
     parent_path: &NibblePath,
     existing: &InternalNode,
     new_version: u64,
-    kvs: &[(&Key, Option<ValueHash>)],
+    kvs: &[(&Key, Option<LeafValue>)],
     batch: &mut TreeUpdateBatch,
 ) -> Result<Option<Node>, UpdateError>
 where
@@ -399,7 +409,9 @@ where
                 sub_batch,
             )
         } else {
-            sub_batch.leaf_delta += count_inserts(sub_kvs);
+            let (leaves, bytes) = insert_deltas(sub_kvs);
+            sub_batch.leaf_delta += leaves;
+            sub_batch.bytes_delta += bytes;
             Ok(build_fresh::<H, ARITY_BITS>(
                 sub_path,
                 new_version,
@@ -438,6 +450,7 @@ where
             batch.new_nodes.extend(local_batch.new_nodes);
             batch.stale_nodes.extend(local_batch.stale_nodes);
             batch.leaf_delta += local_batch.leaf_delta;
+            batch.bytes_delta += local_batch.bytes_delta;
             updated.push((bucket, new_subnode));
         }
         updated
@@ -514,20 +527,20 @@ where
 fn build_fresh<H: Hasher, const ARITY_BITS: u8>(
     path: &NibblePath,
     new_version: u64,
-    kvs: &[(&Key, Option<ValueHash>)],
+    kvs: &[(&Key, Option<LeafValue>)],
     batch: &mut TreeUpdateBatch,
 ) -> Option<Node> {
     // Drop deletions — nothing to delete from an empty subtree.
-    let present: Vec<(&Key, ValueHash)> = kvs
+    let present: Vec<(&Key, LeafValue)> = kvs
         .iter()
-        .filter_map(|(k, v)| v.map(|vh| (*k, vh)))
+        .filter_map(|(k, v)| v.map(|value| (*k, value)))
         .collect();
 
     match present.len() {
         0 => None,
         1 => {
-            let (k, vh) = present[0];
-            Some(Node::Leaf(LeafNode::new(*k, vh)))
+            let (k, value) = present[0];
+            Some(Node::Leaf(LeafNode::new(*k, value.hash, value.len)))
         }
         _ => build_fresh_multi::<H, ARITY_BITS>(path, new_version, &present, batch),
     }
@@ -536,7 +549,7 @@ fn build_fresh<H: Hasher, const ARITY_BITS: u8>(
 fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     path: &NibblePath,
     new_version: u64,
-    present: &[(&Key, ValueHash)],
+    present: &[(&Key, LeafValue)],
     batch: &mut TreeUpdateBatch,
 ) -> Option<Node> {
     let arity = 1usize << ARITY_BITS as usize;
@@ -554,7 +567,7 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     if present.len() >= 4096 {
         use rayon::prelude::*;
 
-        let mut bucket_slices: Vec<(u8, &[(&Key, ValueHash)])> = Vec::new();
+        let mut bucket_slices: Vec<(u8, &[(&Key, LeafValue)])> = Vec::new();
         let mut pos = 0;
         while pos < present.len() {
             let bucket = bits_at(present[pos].0, depth, ARITY_BITS);
@@ -569,7 +582,7 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
             .into_par_iter()
             .map(|(bucket, sub)| {
                 let sub_path = child_path(path, bucket, ARITY_BITS);
-                let sub_kvs: Vec<(&Key, Option<ValueHash>)> =
+                let sub_kvs: Vec<(&Key, Option<LeafValue>)> =
                     sub.iter().map(|(k, v)| (*k, Some(*v))).collect();
                 let mut local_batch = TreeUpdateBatch::default();
                 let node = build_fresh::<H, ARITY_BITS>(
@@ -586,6 +599,7 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
             batch.new_nodes.extend(local_batch.new_nodes);
             batch.stale_nodes.extend(local_batch.stale_nodes);
             batch.leaf_delta += local_batch.leaf_delta;
+            batch.bytes_delta += local_batch.bytes_delta;
             if let Some(node) = node_opt {
                 let hash = node.hash::<H>();
                 let kind = kind_of(&node);
@@ -625,7 +639,7 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
         let sub = &present[start..pos];
         sub_path_buf.truncate(base_bits);
         sub_path_buf.push_bits(bucket, ARITY_BITS);
-        let sub_kvs: Vec<(&Key, Option<ValueHash>)> =
+        let sub_kvs: Vec<(&Key, Option<LeafValue>)> =
             sub.iter().map(|(k, v)| (*k, Some(*v))).collect();
 
         if let Some(node) =
@@ -665,35 +679,49 @@ fn merge_leaf<H: Hasher, const ARITY_BITS: u8>(
     existing: &LeafNode,
     path: &NibblePath,
     new_version: u64,
-    kvs: &[(&Key, Option<ValueHash>)],
+    kvs: &[(&Key, Option<LeafValue>)],
     batch: &mut TreeUpdateBatch,
 ) -> Option<Node> {
+    let existing_len = i64::try_from(existing.value_len).expect("value length fits i64");
+
     // Single-kv case matching existing leaf: update or delete in place.
+    // The leaf count is unchanged by an update but its bytes move by the
+    // size difference; a delete drops both the leaf and its bytes.
     if kvs.len() == 1 && *kvs[0].0 == existing.key {
-        return if let Some(vh) = kvs[0].1 {
-            Some(Node::Leaf(LeafNode::new(existing.key, vh)))
+        return if let Some(value) = kvs[0].1 {
+            batch.bytes_delta +=
+                i64::try_from(value.len).expect("value length fits i64") - existing_len;
+            Some(Node::Leaf(LeafNode::new(
+                existing.key,
+                value.hash,
+                value.len,
+            )))
         } else {
             batch.leaf_delta -= 1;
+            batch.bytes_delta -= existing_len;
             None
         };
     }
 
     // Form a combined "present" set = existing leaf superseded by any
     // matching update, plus non-matching inserts.
-    let mut combined: Vec<(Key, ValueHash)> = Vec::with_capacity(kvs.len() + 1);
+    let mut combined: Vec<(Key, LeafValue)> = Vec::with_capacity(kvs.len() + 1);
     let mut existing_covered = false;
     for (k, v) in kvs {
         if **k == existing.key {
             existing_covered = true;
-            if let Some(vh) = v {
-                combined.push((**k, *vh));
+            if let Some(value) = v {
+                combined.push((**k, *value));
             }
-        } else if let Some(vh) = v {
-            combined.push((**k, *vh));
+        } else if let Some(value) = v {
+            combined.push((**k, *value));
         }
     }
     if !existing_covered {
-        combined.push((existing.key, existing.value_hash));
+        combined.push((
+            existing.key,
+            LeafValue::new(existing.value_hash, existing.value_len),
+        ));
     }
     combined.sort_by_key(|(k, _)| *k);
 
@@ -701,17 +729,23 @@ fn merge_leaf<H: Hasher, const ARITY_BITS: u8>(
     // `combined.len()` after. Deletes of absent keys never enter
     // `combined`, so they contribute zero. The fresh rebuild below must
     // not count again — its keys are not new inserts from the tree's
-    // perspective, they're this subtree's contents.
+    // perspective, they're this subtree's contents. The byte total moves
+    // from the single prior leaf to the sum of the combined leaves.
     batch.leaf_delta += i64::try_from(combined.len()).expect("update batch size fits i64") - 1;
+    let combined_bytes: i64 = combined
+        .iter()
+        .map(|(_, value)| i64::try_from(value.len).expect("value length fits i64"))
+        .sum();
+    batch.bytes_delta += combined_bytes - existing_len;
 
     match combined.len() {
         0 => None,
         1 => {
-            let (k, vh) = combined[0];
-            Some(Node::Leaf(LeafNode::new(k, vh)))
+            let (k, value) = combined[0];
+            Some(Node::Leaf(LeafNode::new(k, value.hash, value.len)))
         }
         _ => {
-            let kvs: Vec<(&Key, Option<ValueHash>)> =
+            let kvs: Vec<(&Key, Option<LeafValue>)> =
                 combined.iter().map(|(k, v)| (k, Some(*v))).collect();
             build_fresh::<H, ARITY_BITS>(path, new_version, &kvs, batch)
         }
@@ -826,15 +860,15 @@ mod tests {
     use super::*;
     use crate::hasher::Blake3Hasher;
     use crate::storage::MemoryStore;
-    use crate::test_utils::{k, v};
+    use crate::test_utils::{k, v, vl};
 
     type Jmt = Tree<Blake3Hasher, 1>;
 
     #[test]
     fn single_insert_produces_leaf_root() {
         let store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            std::iter::once((k(1), Some(v(10)))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(1), Some(vl(10)))).collect();
         let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         let expected = Blake3Hasher::hash_leaf(&k(1), &v(10));
         assert_eq!(res.root_hash, expected);
@@ -843,10 +877,10 @@ mod tests {
     #[test]
     fn insert_then_read_roundtrip() {
         let mut store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = [
-            (k(1), Some(v(10))),
-            (k(2), Some(v(20))),
-            (k(3), Some(v(30))),
+        let updates: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(vl(10))),
+            (k(2), Some(vl(20))),
+            (k(3), Some(vl(30))),
         ]
         .into_iter()
         .collect();
@@ -863,13 +897,13 @@ mod tests {
     #[test]
     fn update_value_changes_root() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
+        let v1: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(10))), (k(2), Some(vl(20)))]
             .into_iter()
             .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(99)))).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(99)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -882,13 +916,13 @@ mod tests {
     #[test]
     fn delete_removes_key_and_collapses() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
+        let v1: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(10))), (k(2), Some(vl(20)))]
             .into_iter()
             .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), None)).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), None)).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -905,10 +939,10 @@ mod tests {
     #[test]
     fn leaf_delta_counts_fresh_inserts_and_ignores_absent_deletes() {
         let store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = [
-            (k(1), Some(v(10))),
-            (k(2), Some(v(20))),
-            (k(3), Some(v(30))),
+        let updates: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(vl(10))),
+            (k(2), Some(vl(20))),
+            (k(3), Some(vl(30))),
             (k(4), None), // delete of a key that never existed
         ]
         .into_iter()
@@ -920,13 +954,13 @@ mod tests {
     #[test]
     fn leaf_delta_zero_for_value_updates() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
+        let v1: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(10))), (k(2), Some(vl(20)))]
             .into_iter()
             .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(11))), (k(2), Some(v(21)))]
+        let v2: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(11))), (k(2), Some(vl(21)))]
             .into_iter()
             .collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
@@ -936,22 +970,22 @@ mod tests {
     #[test]
     fn leaf_delta_negative_for_deletes() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [
-            (k(1), Some(v(10))),
-            (k(2), Some(v(20))),
-            (k(3), Some(v(30))),
+        let v1: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(vl(10))),
+            (k(2), Some(vl(20))),
+            (k(3), Some(vl(30))),
         ]
         .into_iter()
         .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), None)).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), None)).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
         assert_eq!(r2.batch.leaf_delta, -1);
 
-        let v3: BTreeMap<Key, Option<ValueHash>> =
+        let v3: BTreeMap<Key, Option<LeafValue>> =
             [(k(2), None), (k(3), None)].into_iter().collect();
         let r3 = Jmt::apply_updates(&store, Some(2), 3, &v3).unwrap();
         assert_eq!(r3.batch.leaf_delta, -2);
@@ -960,13 +994,13 @@ mod tests {
     #[test]
     fn leaf_delta_counts_split_of_a_bare_leaf_root() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
+        let v1: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         // Root is a bare leaf; inserting a second key takes the
         // merge_leaf rebuild path.
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(2), Some(v(20)))).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(2), Some(vl(20)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         assert_eq!(r2.batch.leaf_delta, 1);
     }
@@ -974,7 +1008,7 @@ mod tests {
     #[test]
     fn leaf_delta_mixed_batch() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
+        let v1: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(10))), (k(2), Some(vl(20)))]
             .into_iter()
             .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
@@ -982,10 +1016,10 @@ mod tests {
 
         // Two new inserts, one value update, one real delete, one
         // delete of an absent key: +2 + 0 − 1 + 0 = +1.
-        let v2: BTreeMap<Key, Option<ValueHash>> = [
-            (k(3), Some(v(30))),
-            (k(4), Some(v(40))),
-            (k(1), Some(v(11))),
+        let v2: BTreeMap<Key, Option<LeafValue>> = [
+            (k(3), Some(vl(30))),
+            (k(4), Some(vl(40))),
+            (k(1), Some(vl(11))),
             (k(2), None),
             (k(5), None),
         ]
@@ -996,12 +1030,150 @@ mod tests {
     }
 
     #[test]
-    fn historical_reads_see_prior_version() {
+    fn bytes_delta_sums_insert_lengths() {
+        let store = MemoryStore::new();
+        let updates: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(LeafValue::new(v(10), 100))),
+            (k(2), Some(LeafValue::new(v(20), 250))),
+            (k(3), None), // delete of an absent key contributes nothing
+        ]
+        .into_iter()
+        .collect();
+        let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
+        assert_eq!(res.batch.leaf_delta, 2);
+        assert_eq!(res.batch.bytes_delta, 350);
+    }
+
+    #[test]
+    fn bytes_delta_signed_for_in_place_value_size_change() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
+        let v1: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(1), Some(LeafValue::new(v(10), 100)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(99)))).collect();
+
+        // Grow the value in place: leaf count unchanged, bytes +150.
+        let v2: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(1), Some(LeafValue::new(v(11), 250)))).collect();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
+        store.apply(&r2);
+        assert_eq!(r2.batch.leaf_delta, 0);
+        assert_eq!(r2.batch.bytes_delta, 150);
+
+        // Shrink it: -200.
+        let v3: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(1), Some(LeafValue::new(v(12), 50)))).collect();
+        let r3 = Jmt::apply_updates(&store, Some(2), 3, &v3).unwrap();
+        assert_eq!(r3.batch.leaf_delta, 0);
+        assert_eq!(r3.batch.bytes_delta, -200);
+    }
+
+    #[test]
+    fn bytes_delta_subtracts_deleted_length() {
+        let mut store = MemoryStore::new();
+        let v1: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(LeafValue::new(v(10), 100))),
+            (k(2), Some(LeafValue::new(v(20), 70))),
+        ]
+        .into_iter()
+        .collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
+        store.apply(&r1);
+
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), None)).collect();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
+        assert_eq!(r2.batch.leaf_delta, -1);
+        assert_eq!(r2.batch.bytes_delta, -100);
+    }
+
+    #[test]
+    fn bytes_delta_through_merge_leaf_rebuild() {
+        let mut store = MemoryStore::new();
+        let v1: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(1), Some(LeafValue::new(v(10), 100)))).collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
+        store.apply(&r1);
+
+        // Inserting a second key splits the bare-leaf root (the
+        // merge_leaf rebuild path): +1 leaf, + the new value's bytes,
+        // the prior leaf's bytes carried through unchanged.
+        let v2: BTreeMap<Key, Option<LeafValue>> =
+            std::iter::once((k(2), Some(LeafValue::new(v(20), 80)))).collect();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
+        assert_eq!(r2.batch.leaf_delta, 1);
+        assert_eq!(r2.batch.bytes_delta, 80);
+    }
+
+    #[test]
+    fn bytes_delta_mixed_batch() {
+        let mut store = MemoryStore::new();
+        let v1: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(LeafValue::new(v(10), 100))),
+            (k(2), Some(LeafValue::new(v(20), 200))),
+        ]
+        .into_iter()
+        .collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
+        store.apply(&r1);
+
+        // insert 30 (+90), insert 40 (+40), grow k1 100→130 (+30),
+        // delete k2 (−200), delete absent k5 (0): net −40 bytes, +1 leaf.
+        let v2: BTreeMap<Key, Option<LeafValue>> = [
+            (k(3), Some(LeafValue::new(v(30), 90))),
+            (k(4), Some(LeafValue::new(v(40), 40))),
+            (k(1), Some(LeafValue::new(v(11), 130))),
+            (k(2), None),
+            (k(5), None),
+        ]
+        .into_iter()
+        .collect();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
+        assert_eq!(r2.batch.leaf_delta, 1);
+        assert_eq!(r2.batch.bytes_delta, -40);
+    }
+
+    #[test]
+    fn value_length_does_not_affect_root() {
+        let mk = |len_a: u64, len_b: u64| {
+            let store = MemoryStore::new();
+            let updates: BTreeMap<Key, Option<LeafValue>> = [
+                (k(1), Some(LeafValue::new(v(10), len_a))),
+                (k(2), Some(LeafValue::new(v(20), len_b))),
+            ]
+            .into_iter()
+            .collect();
+            Jmt::apply_updates(&store, None, 1, &updates)
+                .unwrap()
+                .root_hash
+        };
+        // Same keys and value hashes, wildly different lengths → identical
+        // root: value_len sits outside the leaf hash preimage.
+        assert_eq!(mk(1, 2), mk(9_999, 12_345));
+    }
+
+    #[test]
+    fn sum_subtree_value_lens_totals_leaf_lengths() {
+        let mut store = MemoryStore::new();
+        let updates: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(LeafValue::new(v(10), 100))),
+            (k(2), Some(LeafValue::new(v(20), 250))),
+            (k(3), Some(LeafValue::new(v(30), 7))),
+        ]
+        .into_iter()
+        .collect();
+        let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
+        store.apply(&res);
+        let root = store.get_root_key(1).unwrap();
+        assert_eq!(Jmt::sum_subtree_value_lens(&store, &root).unwrap(), 357);
+    }
+
+    #[test]
+    fn historical_reads_see_prior_version() {
+        let mut store = MemoryStore::new();
+        let v1: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(10)))).collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
+        store.apply(&r1);
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(99)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -1019,27 +1191,27 @@ mod tests {
             let mut key = [0u8; 32];
             key[0] = i;
             key[31] = i.wrapping_mul(7);
-            updates.insert(key, Some([i; 32]));
+            updates.insert(key, Some(LeafValue::new([i; 32], 1)));
         }
         let r = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&r);
 
         let root = store.get_root_key(1).unwrap();
         for (k, v) in &updates {
-            assert_eq!(Jmt::get(&store, &root, k), *v);
+            assert_eq!(Jmt::get(&store, &root, k), v.map(|lv| lv.hash));
         }
     }
 
     #[test]
     fn delete_all_keys_produces_empty_tree() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
+        let v1: BTreeMap<Key, Option<LeafValue>> = [(k(1), Some(vl(10))), (k(2), Some(vl(20)))]
             .into_iter()
             .collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> =
+        let v2: BTreeMap<Key, Option<LeafValue>> =
             [(k(1), None), (k(2), None)].into_iter().collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
@@ -1051,12 +1223,12 @@ mod tests {
     #[test]
     fn delete_nonexistent_is_noop() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
+        let v1: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         // Delete a key that isn't in the tree.
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(99), None)).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(99), None)).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
 
         assert_eq!(r1.root_hash, r2.root_hash);
@@ -1065,11 +1237,11 @@ mod tests {
     #[test]
     fn non_monotonic_version_rejected() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
+        let v1: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(1), Some(vl(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 5, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(2), Some(v(20)))).collect();
+        let v2: BTreeMap<Key, Option<LeafValue>> = std::iter::once((k(2), Some(vl(20)))).collect();
         let err = Jmt::apply_updates(&store, Some(5), 5, &v2).unwrap_err();
         assert!(matches!(err, UpdateError::NonMonotonicVersion { .. }));
     }
@@ -1089,8 +1261,8 @@ mod tests {
         k1[20] = 0x00;
         k2[20] = 0xFF;
 
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            [(k1, Some(v(1))), (k2, Some(v(2)))].into_iter().collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> =
+            [(k1, Some(vl(1))), (k2, Some(vl(2)))].into_iter().collect();
         let r = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&r);
 
@@ -1107,11 +1279,11 @@ mod tests {
         assert_eq!(Jmt4::ARITY, 4);
 
         let mut store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = [
-            (k(1), Some(v(10))),
-            (k(2), Some(v(20))),
-            (k(3), Some(v(30))),
-            (k(4), Some(v(40))),
+        let updates: BTreeMap<Key, Option<LeafValue>> = [
+            (k(1), Some(vl(10))),
+            (k(2), Some(vl(20))),
+            (k(3), Some(vl(30))),
+            (k(4), Some(vl(40))),
         ]
         .into_iter()
         .collect();
@@ -1120,7 +1292,7 @@ mod tests {
 
         let root = store.get_root_key(1).unwrap();
         for (key, val) in &updates {
-            assert_eq!(Jmt4::get(&store, &root, key), *val);
+            assert_eq!(Jmt4::get(&store, &root, key), val.map(|lv| lv.hash));
         }
     }
 }

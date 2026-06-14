@@ -109,7 +109,7 @@ impl JmtSnapshot {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_jmt::{Blake3Hasher, Hasher, Key, MemoryStore, ValueHash};
+    use hyperscale_jmt::{Blake3Hasher, Hasher, Key, LeafValue, MemoryStore, ValueHash};
 
     use super::*;
     use crate::tree::{Jmt, noop_jmt_snapshot};
@@ -131,9 +131,9 @@ mod tests {
     /// produces for the block at height 1.
     fn snapshot_of(entries: &[(Key, ValueHash)]) -> (MemoryStore, JmtSnapshot) {
         let mut store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = entries
+        let updates: BTreeMap<Key, Option<LeafValue>> = entries
             .iter()
-            .map(|(key, val)| (*key, Some(*val)))
+            .map(|(key, val)| (*key, Some(LeafValue::new(*val, 1))))
             .collect();
         let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);

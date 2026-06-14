@@ -111,6 +111,32 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         Ok(RangeChunk { leaves, more })
     }
 
+    /// Sum the byte lengths of every live leaf under `root_key`.
+    ///
+    /// `root_key` pins both the version and the rooting prefix, so the
+    /// sum is a consistent point-in-time read whose cost tracks the
+    /// subtree's leaf population, not the whole tree's. Used to seed a
+    /// reshaped child's byte total at adoption, the byte-measured analogue
+    /// of a leaf count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::RootMissing`] if `root_key` does not resolve
+    /// in `store`, or [`ProofError::MissingNode`] if a referenced child
+    /// has been pruned underneath the walk.
+    pub fn sum_subtree_value_lens<S>(store: &S, root_key: &NodeKey) -> Result<u64, ProofError>
+    where
+        S: TreeReader,
+    {
+        if store.get_node(root_key).is_none() {
+            return Err(ProofError::RootMissing);
+        }
+        let mut total: u64 = 0;
+        let mut current = root_key.clone();
+        sum_value_lens_rec::<S, ARITY_BITS>(store, &mut current, &mut total)?;
+        Ok(total)
+    }
+
     /// Build a [`MultiProof`] covering a collected chunk over the range
     /// `[start, requested_end]`.
     ///
@@ -341,6 +367,46 @@ where
     Ok(())
 }
 
+/// Walk every leaf under `node_key`, adding each leaf's `value_len` to
+/// `total`. Whole-subtree (no span), so no interval test is needed.
+fn sum_value_lens_rec<S, const ARITY_BITS: u8>(
+    store: &S,
+    node_key: &mut NodeKey,
+    total: &mut u64,
+) -> Result<(), ProofError>
+where
+    S: TreeReader,
+{
+    let node = store
+        .get_node(node_key)
+        .ok_or_else(|| ProofError::MissingNode {
+            key: node_key.clone(),
+        })?;
+    let depth = node_key.path.len();
+
+    match &*node {
+        Node::Leaf(leaf) => {
+            *total = total.saturating_add(leaf.value_len);
+        }
+        Node::Internal(internal) => {
+            for bucket in 0..(1usize << ARITY_BITS) {
+                let Some(child) = internal.children.get(bucket).and_then(|c| c.as_ref()) else {
+                    continue;
+                };
+                let bucket_u8 = u8::try_from(bucket).unwrap_or(u8::MAX);
+                let saved_version = node_key.version;
+                node_key.version = child.version;
+                node_key.path.push_bits(bucket_u8, ARITY_BITS);
+                let result = sum_value_lens_rec::<S, ARITY_BITS>(store, node_key, total);
+                node_key.path.truncate(depth);
+                node_key.version = saved_version;
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconstruct the subtree hash for `claims`, rejecting any non-empty
 /// sibling whose key interval overlaps the claimed-complete `span`.
 ///
@@ -508,6 +574,7 @@ mod tests {
 
     use super::*;
     use crate::hasher::Blake3Hasher;
+    use crate::node::LeafValue;
     use crate::storage::MemoryStore;
     use crate::test_utils::{build_store, k, v};
 
@@ -537,8 +604,10 @@ mod tests {
         sorted.sort_unstable_by_key(|(k, _)| *k);
 
         let mut store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            sorted.iter().map(|(k, val)| (*k, Some(*val))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> = sorted
+            .iter()
+            .map(|(k, val)| (*k, Some(LeafValue::new(*val, 1))))
+            .collect();
         let res = Jmt::apply_updates_at(&store, None, 1, &prefix, &updates).unwrap();
         store.apply(&res);
         let root_key = store.get_root_key(1).unwrap();
@@ -578,10 +647,10 @@ mod tests {
 
         // Verified import: the chunk rebuilds an identical tree.
         let imported_store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = chunk
+        let updates: BTreeMap<Key, Option<LeafValue>> = chunk
             .leaves
             .iter()
-            .map(|(key, val)| (*key, Some(*val)))
+            .map(|(key, val)| (*key, Some(LeafValue::new(*val, 1))))
             .collect();
         let res = Jmt::apply_updates(&imported_store, None, 1, &updates).unwrap();
         assert_eq!(res.root_hash, root_hash);
@@ -609,9 +678,9 @@ mod tests {
 
         // Verified import at the same prefix reproduces the attested root.
         let imported_store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = collected
+        let updates: BTreeMap<Key, Option<LeafValue>> = collected
             .iter()
-            .map(|(key, val)| (*key, Some(*val)))
+            .map(|(key, val)| (*key, Some(LeafValue::new(*val, 1))))
             .collect();
         let res = Jmt::apply_updates_at(&imported_store, None, 1, &prefix, &updates).unwrap();
         assert_eq!(res.root_hash, root_hash);
@@ -992,8 +1061,10 @@ mod tests {
         type Jmt4 = Tree<Blake3Hasher, 2>;
         let mut store = MemoryStore::new();
         let entries: Vec<(Key, ValueHash)> = (0u8..16).map(|i| (k(i), v(i * 3))).collect();
-        let updates: BTreeMap<Key, Option<ValueHash>> =
-            entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> = entries
+            .iter()
+            .map(|(k, v)| (*k, Some(LeafValue::new(*v, 1))))
+            .collect();
         let res = Jmt4::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);
         let root = store.get_root_key(1).unwrap();

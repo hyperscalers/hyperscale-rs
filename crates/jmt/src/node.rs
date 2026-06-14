@@ -417,21 +417,49 @@ pub enum ChildKind {
     Leaf,
 }
 
-/// A leaf node. Stores the full key (for divergence detection during
-/// non-inclusion proofs) and the value hash.
+/// A value's content hash plus its byte length, as carried into a tree
+/// update. The length rides alongside the hash so the tree can account a
+/// byte total; it is **not** part of the leaf hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafValue {
+    /// Hash of the stored value.
+    pub hash: ValueHash,
+    /// Byte length of the stored value.
+    pub len: u64,
+}
+
+impl LeafValue {
+    /// Pair a value hash with its byte length.
+    #[must_use]
+    pub const fn new(hash: ValueHash, len: u64) -> Self {
+        Self { hash, len }
+    }
+}
+
+/// A terminal leaf carrying a key, its value hash, and the value length.
+///
+/// The full key is stored for divergence detection during non-inclusion
+/// proofs. The value's byte length is carried for byte-total accounting
+/// and sits **outside** the leaf hash preimage — see [`Hasher::hash_leaf`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafNode {
     /// Full 32-byte key located at this leaf.
     pub key: Key,
     /// Pre-computed hash of the stored value.
     pub value_hash: ValueHash,
+    /// Byte length of the stored value. Not hashed into the leaf.
+    pub value_len: u64,
 }
 
 impl LeafNode {
-    /// Construct a leaf node from its key and value hash.
+    /// Construct a leaf node from its key, value hash, and value length.
     #[must_use]
-    pub const fn new(key: Key, value_hash: ValueHash) -> Self {
-        Self { key, value_hash }
+    pub const fn new(key: Key, value_hash: ValueHash, value_len: u64) -> Self {
+        Self {
+            key,
+            value_hash,
+            value_len,
+        }
     }
 }
 
@@ -462,6 +490,10 @@ pub struct TreeUpdateBatch {
     /// existing keys. Value updates and deletes of absent keys
     /// contribute zero.
     pub leaf_delta: i64,
+    /// Net change to the total stored value bytes: each insert adds its
+    /// value length, each delete subtracts the prior length, and a value
+    /// update contributes the signed size difference.
+    pub bytes_delta: i64,
 }
 
 #[cfg(test)]
