@@ -27,7 +27,7 @@ use hyperscale_storage::{ChainEntry, PendingChain, ShardChainWriter, ShardStorag
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, EpochWindows,
     FinalizedWave, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
-    Verified, WeightedTimestamp,
+    Verified, WeightedTimestamp, local_settled_wave_ids,
 };
 use tracing::debug;
 
@@ -202,12 +202,14 @@ where
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
     let parent_block_hash = block.header().parent_block_hash();
+    let settled_waves = local_settled_wave_ids(finalized_waves.iter(), block.header().shard_id());
     pending_chain.insert(
         block_hash,
         ChainEntry {
             parent_block_hash,
             height,
             receipts,
+            settled_waves,
             jmt_snapshot,
             certified_block: None,
         },
@@ -251,6 +253,7 @@ where
             prepared,
             jmt_snapshot,
             receipts,
+            settled_waves,
         } = prep;
         pending_chain.insert(
             block_hash,
@@ -258,6 +261,7 @@ where
                 parent_block_hash,
                 height: block_height,
                 receipts,
+                settled_waves,
                 jmt_snapshot,
                 certified_block: None,
             },

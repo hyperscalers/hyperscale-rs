@@ -12,8 +12,10 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
-    MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
+    MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RETENTION_HORIZON,
+    RoutableTransaction, SettledWavesRoot, ShardId, ShardWitnessPayload, StateRoot, TxHash,
+    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, local_settled_wave_ids,
+    settled_waves_root_from_ids,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -44,6 +46,12 @@ pub struct ChainEntry {
     pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
     pub receipts: Vec<Arc<ConsensusReceipt>>,
+    /// Wave-ids this shard settled in this block — the local execution
+    /// certificate of each committed wave. Carried from insert (the
+    /// certificates exist before the QC attaches `certified_block`), so a
+    /// settled-waves window walk reaches a pending ancestor's contribution
+    /// during the proposer's build, not just after commit.
+    pub settled_waves: Vec<WaveId>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
     /// shard-committed block paired with its QC. `None` until the entry's
@@ -226,6 +234,90 @@ where
             });
         }
         self.base.get_block_for_sync(height)
+    }
+
+    /// The wave-ids `local_shard` settled across `[anchor_wt −
+    /// RETENTION_HORIZON, parent]`, unioned with `own` (the block being
+    /// built or verified). Walks the parent's pending prefix by hash
+    /// (each entry carries its settled wave-ids from insert, so a
+    /// not-yet-attached ancestor still contributes), then the committed
+    /// tail by height until a block falls below the retention floor.
+    ///
+    /// A terminating shard's settled-waves root over `[anchor_wt −
+    /// RETENTION_HORIZON, parent]`, including `own_certificates` (the block
+    /// being built or verified). `anchor_wt` is the block's parent-QC
+    /// weighted timestamp — the same value on the proposer and every
+    /// verifier — so the floored window, and thus the root, agree.
+    #[must_use]
+    pub fn settled_waves_root_in_window(
+        &self,
+        local_shard: ShardId,
+        parent_block_hash: BlockHash,
+        parent_block_height: BlockHeight,
+        anchor_wt: WeightedTimestamp,
+        own_certificates: &[Arc<Verifiable<FinalizedWave>>],
+    ) -> SettledWavesRoot {
+        let set = self.settled_waves_in_window(
+            local_shard,
+            parent_block_hash,
+            parent_block_height,
+            anchor_wt,
+            local_settled_wave_ids(own_certificates, local_shard),
+        );
+        settled_waves_root_from_ids(set.iter())
+    }
+
+    /// Pure over the parent chain: the proposer (parent still pending) and
+    /// every verifier (parent committed) walk the same ancestors and
+    /// produce the same set, so the settled-waves root they derive agrees.
+    fn settled_waves_in_window(
+        &self,
+        local_shard: ShardId,
+        parent_block_hash: BlockHash,
+        parent_block_height: BlockHeight,
+        anchor_wt: WeightedTimestamp,
+        own: Vec<WaveId>,
+    ) -> std::collections::BTreeSet<WaveId> {
+        let mut set: std::collections::BTreeSet<WaveId> = own.into_iter().collect();
+        // Pending prefix: walk by hash so a certified-but-unattached
+        // ancestor still resolves. These ancestors sit within the window by
+        // construction (they are the recent uncommitted tip), so they need
+        // no floor test — and a pending entry carries no QC to test against.
+        let mut hash = parent_block_hash;
+        let mut height = parent_block_height;
+        {
+            let entries = read_or_recover(&self.entries);
+            while let Some(entry) = entries.get(&hash) {
+                set.extend(entry.settled_waves.iter().cloned());
+                hash = entry.parent_block_hash;
+                let Some(prev) = height.prev() else { break };
+                height = prev;
+            }
+        }
+        // Committed tail: read by height (the committed chain is linear, so
+        // height is unambiguous) until a block's weighted timestamp falls
+        // below the retention floor.
+        let floor = WeightedTimestamp::from_millis(
+            anchor_wt
+                .as_millis()
+                .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
+        );
+        let mut h = height;
+        loop {
+            let Some(entry) = self.block_for_sync(h) else {
+                break;
+            };
+            if entry.qc.weighted_timestamp().as_millis() < floor.as_millis() {
+                break;
+            }
+            set.extend(local_settled_wave_ids(
+                entry.block.certificates().iter(),
+                local_shard,
+            ));
+            let Some(prev) = h.prev() else { break };
+            h = prev;
+        }
+        set
     }
 
     /// Most recent QC observed by this chain. Pending entries shadow the
@@ -853,11 +945,14 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::PoisonError;
 
     use hyperscale_types::{
-        BoundedVec, CertifiedBlock, CertifiedBlockHeader, ExecutionCertificate, GlobalReceiptHash,
-        Hash, RoutableTransaction, TxHash, WaveCertificate, WaveId,
+        Block, Bls12381G2Signature, BoundedVec, CertifiedBlock, CertifiedBlockHeader,
+        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, Round, RoutableTransaction, SignerBitfield, TxHash, TxOutcome,
+        WaveCertificate, WaveId,
     };
     use indexmap::IndexMap;
     use radix_substate_store_interface::interface::{DatabaseUpdates, PartitionDatabaseUpdates};
@@ -871,6 +966,11 @@ mod tests {
     #[derive(Default)]
     struct StubStore {
         blocks: HashMap<BlockHeight, CertifiedBlock>,
+        /// Persisted blocks served through [`ShardChainReader::get_block_for_sync`]
+        /// — opt-in so the committed-tail walk can be exercised without the
+        /// default-`None` boundary that `block_for_sync_falls_through_to_storage`
+        /// pins.
+        sync_blocks: HashMap<BlockHeight, BlockForSync>,
         /// Heights observed via [`VersionedStore::snapshot_at`]. Tests use
         /// this to assert that `view_at(hash, height)` anchors base reads
         /// at the supplied height rather than the live JMT tip.
@@ -880,6 +980,11 @@ mod tests {
     impl StubStore {
         fn with_block(mut self, certified: CertifiedBlock) -> Self {
             self.blocks.insert(certified.height(), certified);
+            self
+        }
+
+        fn with_sync_block(mut self, height: BlockHeight, block: BlockForSync) -> Self {
+            self.sync_blocks.insert(height, block);
             self
         }
     }
@@ -998,8 +1103,8 @@ mod tests {
         fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
             None
         }
-        fn get_block_for_sync(&self, _height: BlockHeight) -> Option<BlockForSync> {
-            None
+        fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
+            self.sync_blocks.get(&height).cloned()
         }
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
             Vec::new()
@@ -1084,6 +1189,7 @@ mod tests {
             parent_block_hash: parent,
             height,
             receipts: vec![make_receipt(updates)],
+            settled_waves: Vec::new(),
             jmt_snapshot: empty_snapshot(),
             certified_block: None,
         }
@@ -1315,6 +1421,7 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height,
                 receipts: Vec::new(),
+                settled_waves: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
             },
@@ -1439,5 +1546,151 @@ mod tests {
         // considered "latest committed."
         let _unattached = insert_pending(&chain, BlockHeight::new(9), false);
         assert!(chain.latest_qc().is_none());
+    }
+
+    fn wave(n: u64) -> WaveId {
+        WaveId::new(ShardId::ROOT, BlockHeight::new(n), BTreeSet::new())
+    }
+
+    fn ec_for(wave: &WaveId) -> Arc<ExecutionCertificate> {
+        Arc::new(ExecutionCertificate::new(
+            wave.clone(),
+            WeightedTimestamp::from_millis(1),
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
+    }
+
+    /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
+    /// single finalized wave settles `settles` (a local-shard wave).
+    fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &WaveId) -> BlockForSync {
+        let Block::Live {
+            header,
+            transactions,
+            provisions,
+            ..
+        } = make_test_block(height)
+        else {
+            unreachable!("make_test_block returns a Live block")
+        };
+        let mut certs = BoundedVec::new();
+        certs.push(Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(settles.clone(), vec![ec_for(settles)])),
+                vec![],
+            )
+            .into(),
+        ));
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates: Arc::new(certs),
+            provisions,
+        };
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            height,
+            block.header().parent_block_hash(),
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0u8; 96]),
+            WeightedTimestamp::from_millis(wt_ms),
+        );
+        BlockForSync {
+            block,
+            qc,
+            provision_hashes: Vec::new(),
+        }
+    }
+
+    /// The pending prefix contributes a parent and an ancestor whose
+    /// `certified_block` has not attached yet — the exact state that left
+    /// `block_for_sync` blind and made a proposer's settled-waves root
+    /// diverge from the verifiers'. The walk reads `settled_waves` straight
+    /// off the entry, so both sides agree.
+    #[test]
+    fn settled_waves_window_collects_unattached_pending_ancestors() {
+        let chain = empty_chain();
+        let ancestor = BlockHash::from_raw(Hash::from_bytes(b"ancestor"));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        let (wa, wb, own) = (wave(100), wave(101), wave(102));
+        chain.insert(
+            ancestor,
+            ChainEntry {
+                parent_block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(4),
+                receipts: Vec::new(),
+                settled_waves: vec![wa.clone()],
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+            },
+        );
+        chain.insert(
+            parent,
+            ChainEntry {
+                parent_block_hash: ancestor,
+                height: BlockHeight::new(5),
+                receipts: Vec::new(),
+                settled_waves: vec![wb.clone()],
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+            },
+        );
+        let set = chain.settled_waves_in_window(
+            ShardId::ROOT,
+            parent,
+            BlockHeight::new(5),
+            WeightedTimestamp::from_millis(10_000),
+            vec![own.clone()],
+        );
+        assert_eq!(set, BTreeSet::from([wa, wb, own]));
+    }
+
+    /// The committed tail walks by height and stops at the retention floor:
+    /// a block within `[anchor − RETENTION_HORIZON, anchor]` contributes,
+    /// one below it does not.
+    #[test]
+    fn settled_waves_window_floors_the_committed_tail() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // floor = 10_000
+        let (in_window, below_floor, parent_wave) = (wave(200), wave(201), wave(202));
+        let stub = StubStore::default()
+            .with_sync_block(
+                BlockHeight::new(3),
+                settled_sync_block(BlockHeight::new(3), anchor.as_millis(), &in_window),
+            )
+            .with_sync_block(
+                BlockHeight::new(2),
+                settled_sync_block(BlockHeight::new(2), 9_999, &below_floor),
+            );
+        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        chain.insert(
+            parent,
+            ChainEntry {
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
+                height: BlockHeight::new(4),
+                receipts: Vec::new(),
+                settled_waves: vec![parent_wave.clone()],
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+            },
+        );
+        let set = chain.settled_waves_in_window(
+            ShardId::ROOT,
+            parent,
+            BlockHeight::new(4),
+            anchor,
+            Vec::new(),
+        );
+        assert_eq!(set, BTreeSet::from([parent_wave, in_window]));
     }
 }

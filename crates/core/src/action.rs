@@ -13,11 +13,11 @@ use hyperscale_types::{
     LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
     PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round,
-    RoutableTransaction, RoutingCommittees, ShardId, SharedCertificates, SharedTransactions,
-    SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView,
-    SplitAdoption, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    VoteCount, WaveId, WeightedTimestamp,
+    RoutableTransaction, RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates,
+    SharedTransactions, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitAdoption, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -570,6 +570,14 @@ pub enum Action {
         /// final epoch before a split), resolved by the coordinator from
         /// the schedule.
         split_child_roots_required: bool,
+        /// The header's `settled_waves_root` claim, recomputed beside the
+        /// state root over the committed retention window when the block
+        /// terminates the shard at a boundary.
+        claimed_settled_waves_root: Option<SettledWavesRoot>,
+        /// The block's parent-QC weighted timestamp — the anchor the
+        /// settled-waves window walk floors at (`anchor − RETENTION_HORIZON`),
+        /// resolved identically by the proposer and every verifier.
+        parent_weighted_timestamp: WeightedTimestamp,
     },
 
     /// Verify a block's beacon-witness root + leaf count.

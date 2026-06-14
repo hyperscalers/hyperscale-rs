@@ -15,9 +15,9 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, ShardId,
-    SplitChildRoots, StateRoot, TopologySnapshot, TransactionRoot, Verifiable, Verified,
-    VerifiedBlockAssembleError,
+    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, SettledWavesRoot,
+    ShardId, SplitChildRoots, StateRoot, TopologySnapshot, TransactionRoot, Verifiable, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -112,6 +112,12 @@ pub struct ReadyStateRootVerification {
     /// Whether the block's window requires the claim (the shard's final
     /// epoch before a split).
     pub split_child_roots_required: bool,
+    /// The header's `settled_waves_root` claim, verified beside the state
+    /// root over the committed retention window.
+    pub claimed_settled_waves_root: Option<SettledWavesRoot>,
+    /// The block's parent-QC weighted timestamp — the settled-waves window
+    /// anchor.
+    pub parent_weighted_timestamp: WeightedTimestamp,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -138,6 +144,8 @@ pub struct PendingStateRootVerification {
     pub block_height: BlockHeight,
     pub claimed_split_child_roots: Option<SplitChildRoots>,
     pub split_child_roots_required: bool,
+    pub claimed_settled_waves_root: Option<SettledWavesRoot>,
+    pub parent_weighted_timestamp: WeightedTimestamp,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -966,6 +974,8 @@ impl VerificationPipeline {
             block_height: block.height(),
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
+            claimed_settled_waves_root: block.header().settled_waves_root(),
+            parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1633,6 +1643,8 @@ impl VerificationPipeline {
                     block_height: pending.block_height,
                     claimed_split_child_roots: pending.claimed_split_child_roots,
                     split_child_roots_required: pending.split_child_roots_required,
+                    claimed_settled_waves_root: pending.claimed_settled_waves_root,
+                    parent_weighted_timestamp: pending.parent_weighted_timestamp,
                 })
             })
             .collect()

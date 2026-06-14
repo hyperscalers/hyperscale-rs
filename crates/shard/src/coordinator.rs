@@ -2409,6 +2409,10 @@ impl ShardCoordinator {
         let parent_qc_round = header.map_or(self.locked_round, |h| h.parent_qc().round());
         // Sign over the block's own parent so the QC commits to which block it extends.
         let parent_block_hash = header.map_or(self.committed_hash, BlockHeader::parent_block_hash);
+        // The weighted timestamp the block's committee resolves against, used
+        // below to route the vote — terminal-clamped, so a coasting shard
+        // already dropped from the head still reaches its own committee.
+        let anchored_wt = header.map(|h| h.parent_qc().weighted_timestamp());
         self.last_voted_round = round;
         self.locked_round = self.locked_round.max(parent_qc_round);
 
@@ -2430,8 +2434,22 @@ impl ShardCoordinator {
         );
 
         // Vote recipients are a routing hint (next-round proposers for
-        // pipelining), self-healing via gossip — resolved on the head.
-        let next_proposers = vote_recipients(topology.head(), self.local_shard, self.me, round);
+        // pipelining), self-healing via gossip — resolved on the head. Once a
+        // coasting shard drops from the head the head carries no committee for
+        // it, so fall back to the terminal-clamped committee the block
+        // anchors against, which still certifies the coast.
+        let head_has_committee = !topology
+            .head()
+            .consensus_committee_for_shard(self.local_shard)
+            .is_empty();
+        let recipient_snapshot = if head_has_committee {
+            topology.head()
+        } else {
+            anchored_wt
+                .and_then(|wt| topology.at_for_shard(self.local_shard, wt))
+                .map_or_else(|| topology.head(), |(snapshot, _)| snapshot)
+        };
+        let next_proposers = vote_recipients(recipient_snapshot, self.local_shard, self.me, round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local

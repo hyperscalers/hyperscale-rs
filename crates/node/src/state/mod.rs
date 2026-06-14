@@ -402,6 +402,8 @@ impl StateMachine for NodeStateMachine {
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
+                claimed_settled_waves_root: ready.claimed_settled_waves_root,
+                parent_weighted_timestamp: ready.parent_weighted_timestamp,
             });
         }
 

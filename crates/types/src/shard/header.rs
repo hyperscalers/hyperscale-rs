@@ -923,8 +923,8 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BlockHeader has 20 fields.
-            enc.write_size(20).unwrap();
+            // BlockHeader has 21 fields.
+            enc.write_size(21).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();
@@ -963,7 +963,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(20).unwrap();
+            enc.write_size(21).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();

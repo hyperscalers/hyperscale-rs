@@ -21,11 +21,11 @@ use hyperscale_types::{
     FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
     NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Round, RoutableTransaction, ShardId,
-    SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot,
+    ShardId, SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
     TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
     Verify, VoteCount, WeightedTimestamp, block_header_message, block_vote_message,
-    certified_block_header_message, compute_waves, ready_signal_message,
+    certified_block_header_message, compute_waves, local_settled_wave_ids, ready_signal_message,
 };
 
 /// Result of QC verification and assembly.
@@ -211,6 +211,7 @@ pub fn build_proposal<S: ShardChainWriter>(
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     beacon_witness_base: BeaconWitnessLeafCount,
     carry_split_child_roots: bool,
+    settled_waves_root: Option<SettledWavesRoot>,
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult {
     let (state_root, jmt_snapshot, prepared) = storage.prepare_block_commit(
@@ -298,7 +299,7 @@ pub fn build_proposal<S: ShardChainWriter>(
         beacon_witness_leaf_count,
         beacon_witness_base,
         split_child_roots,
-        None,
+        settled_waves_root,
     );
 
     let block = Block::Live {
@@ -598,6 +599,8 @@ where
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
+            claimed_settled_waves_root,
+            parent_weighted_timestamp,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -645,10 +648,26 @@ where
                 &pending_snapshots,
                 None,
             );
+            // A terminating shard's boundary header carries the root over
+            // the wave-ids it settled within the retention window; recompute
+            // it from the committed chain when the same schedule entry that
+            // requires `split_child_roots` requires it.
+            let computed_settled_waves_root = split_child_roots_required.then(|| {
+                ctx.pending_chain.settled_waves_root_in_window(
+                    ctx.shard,
+                    parent_block_hash,
+                    parent_block_height,
+                    parent_weighted_timestamp,
+                    &finalized_waves,
+                )
+            });
             let verify_result = expected_root.verify(&StateRootContext {
                 computed_root: &computed_root,
                 claimed_split_child_roots,
                 split_child_roots_required,
+                claimed_settled_waves_root,
+                computed_settled_waves_root,
+                settled_waves_root_required: split_child_roots_required,
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
@@ -663,6 +682,7 @@ where
                     prepared,
                     jmt_snapshot,
                     receipts: collect_finalized_receipts(&finalized_waves),
+                    settled_waves: local_settled_wave_ids(&finalized_waves, ctx.shard),
                 });
             } else if let Err(e) = &verify_result {
                 tracing::warn!(
@@ -708,6 +728,18 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
+            // A terminating shard's boundary header carries the root over
+            // the wave-ids it settled within the retention window; the same
+            // schedule entry that requires `split_child_roots` requires it.
+            let settled_waves_root = carry_split_child_roots.then(|| {
+                ctx.pending_chain.settled_waves_root_in_window(
+                    shard_id,
+                    parent_block_hash,
+                    parent_block_height,
+                    parent_qc.weighted_timestamp(),
+                    &finalized_waves,
+                )
+            });
             let result = build_proposal(
                 &view,
                 proposer,
@@ -732,6 +764,7 @@ where
                 beacon_witness_leaf_count,
                 beacon_witness_base,
                 carry_split_child_roots,
+                settled_waves_root,
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;
@@ -743,6 +776,7 @@ where
                 prepared: result.prepared_commit,
                 jmt_snapshot: result.jmt_snapshot,
                 receipts: collect_finalized_receipts(&finalized_waves),
+                settled_waves: local_settled_wave_ids(&finalized_waves, shard_id),
             });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
                 height,

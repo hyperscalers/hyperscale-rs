@@ -13,7 +13,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, PendingChain, ShardStorage};
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, Epoch,
-    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified,
+    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified, WaveId,
 };
 
 use crate::ProtocolEvent;
@@ -90,4 +90,5 @@ pub struct PreparedBlock {
     pub prepared: PreparedCommit,
     pub jmt_snapshot: Arc<JmtSnapshot>,
     pub receipts: Vec<Arc<ConsensusReceipt>>,
+    pub settled_waves: Vec<WaveId>,
 }
