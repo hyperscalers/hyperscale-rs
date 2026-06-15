@@ -71,7 +71,7 @@ mod runner;
 mod status;
 mod supervisor;
 mod telemetry;
-pub use runner::{ProductionRunner, RunnerError, VnodeConfig};
+pub use runner::{ProductionRunner, RunnerError, ShutdownHandle, VnodeConfig};
 pub use status::SyncStatus;
 pub use supervisor::{ShardCommand, StorageDirResolver, StorageFactory};
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

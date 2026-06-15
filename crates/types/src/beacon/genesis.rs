@@ -47,6 +47,17 @@ pub struct BeaconChainConfig {
     /// assertion diverges from their own predicate, so every validator
     /// must run the same values. Disabled by default.
     pub reshape_thresholds: ReshapeThresholds,
+    /// Wall-clock instant (ms since the Unix epoch) at which the chain's
+    /// genesis epoch begins — the origin the consensus clock measures
+    /// against, so weighted-time and the synthetic beacon epoch clock
+    /// (`epoch × epoch_duration_ms`) both start near zero at `Epoch::GENESIS`
+    /// instead of ~1.7e12 ms into the Unix epoch. Without this anchor a
+    /// runner started against raw wall-clock would have to cascade through
+    /// every epoch between the Unix epoch and now before it could pace.
+    /// Consensus-critical and agreed across validators via the genesis
+    /// config hash. Zero (the default) leaves the clock at raw wall-clock —
+    /// correct for the simulator, whose logical clock already starts at zero.
+    pub genesis_timestamp_ms: u64,
 }
 
 impl BeaconChainConfig {
@@ -75,6 +86,7 @@ impl Default for BeaconChainConfig {
             shard_size: u32::try_from(SHARD_CAPACITY).unwrap_or(u32::MAX),
             beacon_committee_size: u32::try_from(BEACON_SIGNER_COUNT).unwrap_or(u32::MAX),
             reshape_thresholds: ReshapeThresholds::DISABLED,
+            genesis_timestamp_ms: 0,
         }
     }
 }

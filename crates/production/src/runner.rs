@@ -501,7 +501,7 @@ impl ProductionRunnerBuilder {
                     beacon_storage: self.beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
-                    now: wall_clock_local(),
+                    now: consensus_clock(chain_config.genesis_timestamp_ms),
                     shard,
                     recovered: &recovered,
                     shard_config: &shard_config,
@@ -600,6 +600,7 @@ impl ProductionRunnerBuilder {
             engine_bootstrap,
             participation_tx,
             chain_config.epoch_duration_ms,
+            chain_config.genesis_timestamp_ms,
         );
 
         Ok(ProductionRunner {
@@ -1411,6 +1412,24 @@ pub fn wall_clock_local() -> LocalTimestamp {
     LocalTimestamp::from_millis(ms)
 }
 
+/// The chain's consensus clock: [`wall_clock_local`] measured relative to
+/// the genesis instant (`BeaconChainConfig::genesis_timestamp_ms`).
+///
+/// Weighted-time and the synthetic beacon epoch clock are anchored at
+/// `epoch × epoch_duration_ms` from zero, so the state machine must be fed
+/// a `now` that also starts near zero at genesis (`Epoch::GENESIS`).
+/// Subtracting the genesis instant puts the runner in the same small-`now`
+/// regime the simulator runs in; the beacon then paces one epoch at a time
+/// instead of trying to cascade through every epoch since the Unix epoch.
+/// The default offset of zero leaves the clock at raw wall-clock.
+pub fn consensus_clock(genesis_offset_ms: u64) -> LocalTimestamp {
+    LocalTimestamp::from_millis(
+        wall_clock_local()
+            .as_millis()
+            .saturating_sub(genesis_offset_ms),
+    )
+}
+
 /// Per-shard pinned-thread configuration.
 pub struct ShardLoopConfig {
     pub(crate) timer_tx: Sender<ShardEvent>,
@@ -1429,6 +1448,10 @@ pub struct ShardLoopConfig {
     /// racing on the same `ArcSwap` lose at most one second of
     /// staleness on their slot.
     pub(crate) publishers: RpcPublishers,
+    /// Genesis instant (ms since the Unix epoch) the consensus clock is
+    /// measured against, from `BeaconChainConfig::genesis_timestamp_ms`.
+    /// Zero leaves the loop on raw wall-clock.
+    pub(crate) genesis_offset_ms: u64,
 }
 
 /// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
@@ -1457,7 +1480,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
             break;
         }
 
-        let now = wall_clock_local();
+        let now = consensus_clock(config.genesis_offset_ms);
         shard_loop.set_time(now);
 
         let event = 'recv: {
@@ -1507,7 +1530,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
             }
         }
 
-        shard_loop.flush_expired_batches(wall_clock_local());
+        shard_loop.flush_expired_batches(consensus_clock(config.genesis_offset_ms));
 
         // Per-shard prometheus emission + RPC status writes. Process-wide
         // memory + RocksDB gauges are emitted from the runner's tokio

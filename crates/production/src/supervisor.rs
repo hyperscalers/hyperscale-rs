@@ -53,7 +53,7 @@ use crate::bootstrap::{
 };
 use crate::rpc::RpcPublishers;
 use crate::runner::{
-    ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop, wall_clock_local,
+    ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, consensus_clock, spawn_shard_loop,
 };
 
 /// The process-scoped resource bundle as the production runner types it.
@@ -334,6 +334,11 @@ pub struct ShardSupervisor {
     /// Beacon epoch length, for the keeper's deterministic merged-genesis
     /// cut derivation. Matches the beacon's own chain config.
     epoch_duration_ms: u64,
+    /// Genesis instant (ms since the Unix epoch) the consensus clock is
+    /// measured against, from `BeaconChainConfig::genesis_timestamp_ms`.
+    /// Threaded into every shard the supervisor seats so a runtime join
+    /// shares the runner's clock origin.
+    genesis_offset_ms: u64,
     /// Shards whose teardown is parked on the off-loop thread join.
     /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
     draining: HashSet<ShardId>,
@@ -365,6 +370,7 @@ impl ShardSupervisor {
         engine_bootstrap: EngineBootstrap,
         participation_tx: mpsc::UnboundedSender<ParticipationChange>,
         epoch_duration_ms: u64,
+        genesis_offset_ms: u64,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
@@ -382,6 +388,7 @@ impl ShardSupervisor {
             storage_dir,
             engine_bootstrap,
             participation_tx,
+            genesis_offset_ms,
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
             observers: HashMap::new(),
@@ -1295,7 +1302,7 @@ impl ShardSupervisor {
             SharedStorage::new(Arc::clone(&storage)),
             callback_tx,
         );
-        shard_loop.set_time(wall_clock_local());
+        shard_loop.set_time(consensus_clock(self.genesis_offset_ms));
         if let Some(genesis) = genesis {
             shard_loop.install_genesis(genesis);
         }
@@ -1459,6 +1466,7 @@ impl ShardSupervisor {
             initial_timer_ops,
             participation_tx: Some(self.participation_tx.clone()),
             publishers: self.publishers.clone(),
+            genesis_offset_ms: self.genesis_offset_ms,
         }
     }
 
@@ -1475,7 +1483,7 @@ impl ShardSupervisor {
             beacon_storage: self.process.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
-            now: wall_clock_local(),
+            now: consensus_clock(self.genesis_offset_ms),
             shard,
             recovered,
             shard_config: &self.shard_config,

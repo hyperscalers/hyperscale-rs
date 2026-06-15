@@ -41,6 +41,13 @@ pub struct TestFixtures {
 
     /// Validators per shard.
     pub validators_per_shard: u32,
+
+    /// Validators registered in the global set (and beacon genesis pool)
+    /// beyond the seated committees — the production analog of the sim's
+    /// `pool_extra_validators`. A split's child cohort is drawn from this
+    /// surplus, so the reshape suite needs it; it is zero for the
+    /// committee-only fixtures.
+    pub pool_surplus: u32,
 }
 
 impl TestFixtures {
@@ -52,10 +59,25 @@ impl TestFixtures {
         Self::with_shards(seed, num_validators, 1)
     }
 
-    /// Create test fixtures with multiple shards.
+    /// Create test fixtures with multiple shards (no pool surplus).
     pub fn with_shards(seed: u64, validators_per_shard: u32, num_shards: u64) -> Self {
-        let num_validators = validators_per_shard
+        Self::with_shards_and_surplus(seed, validators_per_shard, num_shards, 0)
+    }
+
+    /// Create test fixtures with multiple shards plus `pool_surplus`
+    /// validators registered in the global set and beacon genesis pool but
+    /// seated in no committee. Validator ids `[0, seated)` fill the shard
+    /// committees (`validators_per_shard` consecutive ids per shard); ids
+    /// `[seated, seated + pool_surplus)` are the surplus a reshape draws on.
+    pub fn with_shards_and_surplus(
+        seed: u64,
+        validators_per_shard: u32,
+        num_shards: u64,
+        pool_surplus: u32,
+    ) -> Self {
+        let seated = validators_per_shard
             * u32::try_from(num_shards).expect("num_shards fits in u32 for tests");
+        let num_validators = seated + pool_surplus;
 
         // Generate BLS keys deterministically
         let bls_keys: Vec<Bls12381G1PrivateKey> = (0..num_validators)
@@ -130,6 +152,7 @@ impl TestFixtures {
             num_validators,
             num_shards,
             validators_per_shard,
+            pool_surplus,
         }
     }
 
@@ -253,5 +276,37 @@ mod tests {
                 .contains(&ValidatorId::new(0))
         );
         assert_eq!(topology.num_shards(), 1);
+    }
+
+    #[test]
+    fn test_fixtures_pool_surplus() {
+        // 4 seated in one shard, 2 surplus registered but in no committee.
+        let fixtures = TestFixtures::with_shards_and_surplus(42, 4, 1, 2);
+
+        assert_eq!(fixtures.num_validators, 6);
+        assert_eq!(fixtures.pool_surplus, 2);
+        assert_eq!(fixtures.bls_keys.len(), 6);
+
+        let topology = fixtures.topology();
+        let committee = topology.committee_for_shard(ShardId::ROOT);
+        assert_eq!(
+            committee.len(),
+            4,
+            "only the seated validators form the committee"
+        );
+        // Surplus ids 4 and 5 are in the global set but not the committee.
+        let global = topology.global_validator_set();
+        assert!(
+            global
+                .validators
+                .iter()
+                .any(|v| v.validator_id == ValidatorId::new(5)),
+            "surplus validator is registered globally"
+        );
+        assert!(
+            !committee.contains(&ValidatorId::new(4)),
+            "surplus validator is seated in no committee"
+        );
+        assert!(!committee.contains(&ValidatorId::new(5)));
     }
 }
