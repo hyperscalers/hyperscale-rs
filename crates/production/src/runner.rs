@@ -197,6 +197,10 @@ pub struct ProductionRunnerBuilder {
     mempool_config: MempoolConfig,
     /// Provision coordinator configuration.
     provision_config: ProvisionConfig,
+    /// Beacon chain sizing knobs (epoch duration, reshape thresholds,
+    /// committee and shard sizing). `None` uses
+    /// [`BeaconChainConfig::default`].
+    beacon_chain_config: Option<BeaconChainConfig>,
 }
 
 impl ProductionRunnerBuilder {
@@ -236,6 +240,7 @@ impl ProductionRunnerBuilder {
             network_definition: None,
             mempool_config: MempoolConfig::default(),
             provision_config: ProvisionConfig::default(),
+            beacon_chain_config: None,
             storage_factory,
             storage_dir,
         }
@@ -273,6 +278,16 @@ impl ProductionRunnerBuilder {
     #[must_use]
     pub const fn provision_config(mut self, config: ProvisionConfig) -> Self {
         self.provision_config = config;
+        self
+    }
+
+    /// Set the beacon chain configuration (epoch duration, reshape
+    /// thresholds, committee and shard sizing). Defaults to
+    /// [`BeaconChainConfig::default`] when unset; the reshape suite uses
+    /// this to enable a trigger and shorten epochs.
+    #[must_use]
+    pub const fn beacon_chain_config(mut self, config: BeaconChainConfig) -> Self {
+        self.beacon_chain_config = Some(config);
         self
     }
 
@@ -333,6 +348,7 @@ impl ProductionRunnerBuilder {
         let shard_config = self.shard_config;
         let storages = self.storages;
         let network_config = self.network_config;
+        let chain_config = self.beacon_chain_config.unwrap_or_default();
         let dispatch = match self.dispatch {
             Some(pools) => pools,
             None => Arc::new(
@@ -434,7 +450,6 @@ impl ProductionRunnerBuilder {
                 id: pool_id,
                 total_stake: Stake::from_attos(n * MIN_STAKE_FLOOR.attos()),
             }];
-            let chain_config = BeaconChainConfig::default();
             let beacon_committee_size = initial_validators
                 .len()
                 .min(chain_config.beacon_committee_size as usize);
@@ -584,7 +599,7 @@ impl ProductionRunnerBuilder {
             self.storage_dir,
             engine_bootstrap,
             participation_tx,
-            BeaconChainConfig::default().epoch_duration_ms,
+            chain_config.epoch_duration_ms,
         );
 
         Ok(ProductionRunner {

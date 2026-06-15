@@ -2,6 +2,11 @@
 //!
 //! Provides deterministic test setup including key generation and topology construction.
 
+// Shared fixture surface consumed piecemeal across several test binaries
+// (`e2e_tests`, `reshape_e2e`); each compiles its own copy and exercises a
+// different subset, so unused helpers in any one binary aren't dead code.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -175,13 +180,11 @@ impl TestFixtures {
     }
 
     /// Create a listen address using port 0 (OS-assigned).
-    #[allow(dead_code)]
     pub fn listen_addr() -> Multiaddr {
         "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()
     }
 
     /// Create a listen address with a specific port.
-    #[allow(dead_code)]
     pub fn listen_addr_with_port(port: u16) -> Multiaddr {
         format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
             .parse()
