@@ -10,7 +10,7 @@ use hyperscale_types::{
     CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
     PendingReshape, QuorumCertificate, RETENTION_HORIZON, ShardBoundary, ShardEpochContribution,
     ShardId, SlotEffects, SplitAdoption, SplitChildRoots, TransitionCause, ValidatorId,
-    ValidatorStatus,
+    ValidatorStatus, WeightedTimestamp,
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
@@ -424,6 +424,12 @@ fn record_boundaries(
     // composition reads each child's actual terminal root, never the
     // pre-terminal anchor `execute_ready_merges` left on the record.
     let mut terminal_recorded: BTreeSet<ShardId> = BTreeSet::new();
+    // Each terminal contribution's certifying QC weighted timestamp, the
+    // clock anchor the merged genesis floors to its epoch start. It is the
+    // same value the keeper reads off the child's terminal QC, so both
+    // reconstruct identical genesis bytes regardless of how far the child
+    // coasted past its cut.
+    let mut terminal_qc_wts: BTreeMap<ShardId, WeightedTimestamp> = BTreeMap::new();
     for (shard, contribution) in shard_contributions {
         let header = &contribution.boundary_header;
         let block_hash = header.hash();
@@ -494,6 +500,7 @@ fn record_boundaries(
                 seed_split_children(state, *shard, header, qc, epoch);
             } else {
                 terminal_recorded.insert(*shard);
+                terminal_qc_wts.insert(*shard, qc.weighted_timestamp());
             }
         }
     }
@@ -512,7 +519,7 @@ fn record_boundaries(
     // Compose any merge parent whose two children both delivered their
     // terminal contribution this fold, after the miss bump so the freshly
     // composed anchor starts clean.
-    compose_merge_parents(state, epoch, windows, &terminal_recorded);
+    compose_merge_parents(state, epoch, windows, &terminal_recorded, &terminal_qc_wts);
 
     // Drop terminal records past their retention horizon. A terminated
     // shard's record lingers only to project its `settled_waves_root` to
@@ -608,6 +615,7 @@ fn compose_merge_parents(
     epoch: Epoch,
     windows: EpochWindows,
     terminal_recorded: &BTreeSet<ShardId>,
+    terminal_qc_wts: &BTreeMap<ShardId, WeightedTimestamp>,
 ) {
     let mut parents: BTreeSet<ShardId> = BTreeSet::new();
     for child in terminal_recorded {
@@ -629,7 +637,7 @@ fn compose_merge_parents(
         }
     }
     for parent in parents {
-        compose_merge_parent(state, parent, epoch, windows);
+        compose_merge_parent(state, parent, epoch, windows, terminal_qc_wts);
     }
 }
 
@@ -638,17 +646,20 @@ fn compose_merge_parent(
     parent: ShardId,
     epoch: Epoch,
     windows: EpochWindows,
+    terminal_qc_wts: &BTreeMap<ShardId, WeightedTimestamp>,
 ) {
     let (left, right) = parent.children();
     let left_b = state.boundaries[&left];
     let right_b = state.boundaries[&right];
-    // Both children cross the same cut, so either terminal epoch yields
-    // it: the merged chain's clock anchors there, placing its first block
-    // in the epoch after the children's final one.
-    let terminal_epoch = left_b
-        .terminal_epoch
-        .expect("filtered as a recorded terminal");
-    let cut_wt = windows.window_of(terminal_epoch).end;
+    // The merged chain's clock anchors at the start of the epoch the left
+    // child's terminal block fell in — floored from its certifying QC's
+    // weighted timestamp, the same value the keeper derives off the same
+    // QC in `merge_genesis_from_terminals`. Flooring `terminal_epoch`'s
+    // window end instead would diverge whenever a child coasted more than
+    // one epoch past its cut, so the keeper's reconstruction would not
+    // reproduce this genesis hash.
+    let left_terminal_wt = terminal_qc_wts[&left];
+    let cut_wt = windows.window_of(windows.epoch_for(left_terminal_wt)).start;
     let composed = SplitChildRoots {
         left: left_b.state_root,
         right: right_b.state_root,
