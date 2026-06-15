@@ -1552,8 +1552,15 @@ mod tests {
         assert!(chain.latest_qc().is_none());
     }
 
+    /// A cross-shard wave keyed on `ShardId::ROOT` — the only kind that
+    /// lands in the settled set, since `local_settled_wave_ids` drops
+    /// single-shard (`is_zero`) waves.
     fn wave(n: u64) -> WaveId {
-        WaveId::new(ShardId::ROOT, BlockHeight::new(n), BTreeSet::new())
+        WaveId::new(
+            ShardId::ROOT,
+            BlockHeight::new(n),
+            BTreeSet::from([ShardId::from_heap_index(2)]),
+        )
     }
 
     fn ec_for(wave: &WaveId) -> Arc<ExecutionCertificate> {
