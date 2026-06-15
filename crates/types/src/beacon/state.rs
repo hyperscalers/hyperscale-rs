@@ -418,6 +418,25 @@ pub struct BeaconState {
     /// predicate reads it to answer "no split lands at this window's
     /// end" without the next window's entry.
     pub split_pending_window: BTreeSet<ShardId>,
+    /// Each pending split's observer cohort (keyed by parent, mapping
+    /// observer → child sub-shard) as of this epoch's promotion, frozen
+    /// under the [`Self::split_pending_window`] discipline. A window's
+    /// `ReshapeReady` leaf classification reads it, so freezing keeps it
+    /// byte-identical whether a node resolves the window from the
+    /// lookahead schedule entry or the re-derived active one — the split
+    /// execution fold flips the cohort to `OnShard` mid-fold, so a live
+    /// projection would differ between the two writes and fork the
+    /// beacon-witness root across replicas at different fold heights.
+    pub reshape_observers_window: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Each pending merge's keepers (keyed by the child each keeper runs,
+    /// mapping keeper → merging parent) as of this epoch's promotion,
+    /// frozen under the same discipline. Drives both a child's
+    /// `ReshapeReady` leaf classification and the merge-terminal
+    /// settled-waves carry (`TopologySnapshot::merge_pending`); the merge
+    /// execution fold consumes the keepers mid-fold, so a live projection
+    /// would diverge between the lookahead and active writes of the
+    /// execution window.
+    pub reshape_keepers_window: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     /// Per-shard boundary record: the snap-sync anchor (`state_root` /
     /// `block_hash`), the applied witness high-water mark, and the
     /// liveness history. Seeded for every genesis shard so it is never
@@ -689,6 +708,21 @@ impl StakePool {
     }
 }
 
+/// The per-window projections subject to the freeze discipline. Each is
+/// frozen at promotion and read on the active path, or re-derived live and
+/// read on the lookahead path, so a window's schedule entry is byte-identical
+/// whether resolved from its lookahead write or its active overwrite. They
+/// travel together because they share that discipline — and because
+/// `reshape_observers`/`reshape_keepers` are the same type, a named struct
+/// keeps a positional swap from compiling silently.
+struct WindowProjection {
+    consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
+    witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
+    reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    split_pending: BTreeSet<ShardId>,
+}
+
 impl BeaconState {
     /// Validators currently waiting in the global pool.
     ///
@@ -827,9 +861,13 @@ impl BeaconState {
     pub fn derive_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
         self.derive_topology_from(
             &self.shard_committees,
-            self.shard_consensus_members.clone(),
-            self.witness_window_bases.clone(),
-            self.split_pending_window.clone(),
+            WindowProjection {
+                consensus_members: self.shard_consensus_members.clone(),
+                witness_bases: self.witness_window_bases.clone(),
+                reshape_observers: self.reshape_observers_window.clone(),
+                reshape_keepers: self.reshape_keepers_window.clone(),
+                split_pending: self.split_pending_window.clone(),
+            },
             network,
         )
     }
@@ -845,9 +883,13 @@ impl BeaconState {
     pub fn derive_next_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
         self.derive_topology_from(
             &self.next_shard_committees,
-            self.ready_consensus_members(&self.next_shard_committees),
-            self.live_witness_bases(),
-            self.live_split_pending(),
+            WindowProjection {
+                consensus_members: self.ready_consensus_members(&self.next_shard_committees),
+                witness_bases: self.live_witness_bases(),
+                reshape_observers: self.live_reshape_observers(),
+                reshape_keepers: self.live_reshape_keepers(),
+                split_pending: self.live_split_pending(),
+            },
             network,
         )
     }
@@ -907,14 +949,58 @@ impl BeaconState {
             .collect()
     }
 
+    /// Each pending split's observer cohort (parent → observer → child
+    /// sub-shard) as `pending_reshapes` stand right now — the value the
+    /// next promotion freezes into [`Self::reshape_observers_window`], and
+    /// what the lookahead snapshot projects for the window it describes.
+    #[must_use]
+    pub fn live_reshape_observers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
+        self.pending_reshapes
+            .iter()
+            .filter_map(|(target, reshape)| match reshape {
+                PendingReshape::Split { cohort, .. } => Some((
+                    *target,
+                    cohort.iter().map(|(id, seat)| (*id, seat.child)).collect(),
+                )),
+                PendingReshape::Merge { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Each pending merge's keepers keyed by the child each one runs
+    /// (child → keeper → merging parent) as `pending_reshapes` stand right
+    /// now — the value the next promotion freezes into
+    /// [`Self::reshape_keepers_window`]. One merge contributes both
+    /// children's keeper sets.
+    #[must_use]
+    pub fn live_reshape_keepers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
+        let mut keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> = BTreeMap::new();
+        for (parent, reshape) in &self.pending_reshapes {
+            if let PendingReshape::Merge { keepers: seats, .. } = reshape {
+                for (validator, seat) in seats {
+                    keepers
+                        .entry(seat.child)
+                        .or_default()
+                        .insert(*validator, *parent);
+                }
+            }
+        }
+        keepers
+    }
+
     fn derive_topology_from(
         &self,
         committees: &BTreeMap<ShardId, ShardCommittee>,
-        consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
-        witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
-        split_pending: BTreeSet<ShardId>,
+        projection: WindowProjection,
         network: NetworkDefinition,
     ) -> TopologySnapshot {
+        let WindowProjection {
+            consensus_members,
+            witness_bases,
+            reshape_observers,
+            reshape_keepers,
+            split_pending,
+        } = projection;
         let validators: Vec<ValidatorInfo> = self
             .validators
             .values()
@@ -957,36 +1043,15 @@ impl BeaconState {
         let witness_bases: HashMap<ShardId, BeaconWitnessLeafCount> =
             witness_bases.into_iter().collect();
 
-        // Project each pending split's observer cohort so shard runtimes
-        // can classify cohort ready signals as `ReshapeReady` leaves and
-        // observers can resolve the child sub-prefix they sync.
-        let reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> = self
-            .pending_reshapes
-            .iter()
-            .filter_map(|(target, reshape)| match reshape {
-                PendingReshape::Split { cohort, .. } => Some((
-                    *target,
-                    cohort.iter().map(|(id, seat)| (*id, seat.child)).collect(),
-                )),
-                PendingReshape::Merge { .. } => None,
-            })
-            .collect();
-
-        // Project each pending merge's keepers, keyed by the child each
-        // one runs, so that child's runtime classifies their ready
-        // signals as `ReshapeReady` leaves. One merge contributes both
-        // children's keeper sets.
-        let mut reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> = HashMap::new();
-        for (parent, reshape) in &self.pending_reshapes {
-            if let PendingReshape::Merge { keepers, .. } = reshape {
-                for (validator, seat) in keepers {
-                    reshape_keepers
-                        .entry(seat.child)
-                        .or_default()
-                        .insert(*validator, *parent);
-                }
-            }
-        }
+        // The reshape-seat projections — each pending split's observer
+        // cohort and each pending merge's keepers, keyed by the child they
+        // run — are passed in already frozen (active) or live (lookahead),
+        // so a window's `ReshapeReady` leaf classification is byte-identical
+        // across both writes of its schedule entry.
+        let reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> =
+            reshape_observers.into_iter().collect();
+        let reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> =
+            reshape_keepers.into_iter().collect();
 
         TopologySnapshot::from_explicit_committees(
             network,
@@ -1172,6 +1237,8 @@ mod tests {
             shard_consensus_members: BTreeMap::new(),
             witness_window_bases: BTreeMap::new(),
             split_pending_window: BTreeSet::new(),
+            reshape_observers_window: BTreeMap::new(),
+            reshape_keepers_window: BTreeMap::new(),
             boundaries: BTreeMap::new(),
             pending_reshapes: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
@@ -1520,9 +1587,11 @@ mod tests {
 
     // ─── reshape observer projection ──────────────────────────────────
 
-    /// A pending split's cohort projects into both the head and the
-    /// lookahead snapshot — and drops with the pending record, whether
-    /// execution consumed it or a cancel released it.
+    /// A pending split's cohort projects live into the lookahead snapshot,
+    /// and into the active snapshot only once a promotion freezes it. The
+    /// frozen active window stays stable while the live set mutates, so a
+    /// window's `ReshapeReady` classification is identical whether resolved
+    /// from its lookahead write or its active overwrite.
     #[test]
     fn pending_split_cohort_projects_into_snapshots() {
         let mut state = single_pool_state(4);
@@ -1562,16 +1631,47 @@ mod tests {
             },
         );
 
-        let head = state.derive_topology_snapshot(NetworkDefinition::simulator());
-        assert_eq!(head.reshape_observer_child(p, observer), Some(left));
-        assert_eq!(head.reshape_observer_child(p, ValidatorId::new(0)), None);
-        assert_eq!(head.reshape_observer_child(right, observer), None);
+        // Live in the lookahead immediately; absent from the active
+        // snapshot until a promotion freezes the projection.
         let lookahead = state.derive_next_topology_snapshot(NetworkDefinition::simulator());
         assert_eq!(lookahead.reshape_observer_child(p, observer), Some(left));
+        assert_eq!(
+            lookahead.reshape_observer_child(p, ValidatorId::new(0)),
+            None
+        );
+        assert_eq!(lookahead.reshape_observer_child(right, observer), None);
+        assert_eq!(
+            state
+                .derive_topology_snapshot(NetworkDefinition::simulator())
+                .reshape_observer_child(p, observer),
+            None,
+        );
 
+        // Promotion freezes the projection into the active window.
+        state.reshape_observers_window = state.live_reshape_observers();
+        assert_eq!(
+            state
+                .derive_topology_snapshot(NetworkDefinition::simulator())
+                .reshape_observer_child(p, observer),
+            Some(left),
+        );
+
+        // Dropping the pending record clears the lookahead at once; the
+        // frozen active window holds until the next promotion re-freezes it.
         state.pending_reshapes.clear();
-        let head = state.derive_topology_snapshot(NetworkDefinition::simulator());
-        assert_eq!(head.reshape_observer_child(p, observer), None);
+        assert_eq!(
+            state
+                .derive_next_topology_snapshot(NetworkDefinition::simulator())
+                .reshape_observer_child(p, observer),
+            None,
+        );
+        state.reshape_observers_window = state.live_reshape_observers();
+        assert_eq!(
+            state
+                .derive_topology_snapshot(NetworkDefinition::simulator())
+                .reshape_observer_child(p, observer),
+            None,
+        );
     }
 
     // ─── miss counter sanity ──────────────────────────────────────────

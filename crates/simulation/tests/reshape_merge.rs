@@ -132,7 +132,7 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
         "both children must assert the merge and pair a full keeper set within \
          {ADMISSION_BUDGET_EPOCHS} epochs",
     );
-    let keepers = pending_keepers(&runner).expect("keepers just observed");
+    let mut keepers = pending_keepers(&runner).expect("keepers just observed");
     for child in [left, right] {
         assert_eq!(
             keepers.iter().filter(|(_, c)| *c == child).count(),
@@ -141,23 +141,42 @@ fn keepers_merge_two_cold_siblings_into_their_parent() {
         );
     }
 
-    // ── Keeper duty: sync the sibling half, signal ready ──
+    // ── Keeper duty: prove each keeper's sibling-half sync once. ──
     for (validator, own_child) in &keepers {
         let sibling = if *own_child == left { right } else { left };
         runner.merge_keeper(*validator, *own_child, sibling);
     }
 
-    // ── The gate fires: the trie collapses both children into the
-    // parent in the lookahead ──
+    // ── The gate fires: each keeper re-asserts its ready signal until the
+    // merge collapses both children into the parent in the lookahead. The
+    // keepers promote into the active reshape-keeper window only a window
+    // after pairing (the freeze discipline), and a child chain's blocks
+    // anchor in that window only as their `parent_qc.wt` catches up, so a
+    // one-shot signal can land while it still classifies as a plain
+    // `Ready`. A production keeper re-asserts until it is placed; the
+    // harness does the same, re-reading the live keeper set so a re-pair
+    // is followed and stopping once the merge executes. ──
     let gate_deadline = runner.now() + epochs(GATE_BUDGET_EPOCHS);
-    let reshaped = run_until(&mut runner, gate_deadline, |r| {
-        beacon_state(r).is_some_and(|s| {
+    let mut reshaped = false;
+    while runner.now() < gate_deadline {
+        if let Some(current) = pending_keepers(&runner) {
+            keepers = current;
+            for (validator, own_child) in &keepers {
+                runner.broadcast_keeper_ready(*validator, *own_child);
+            }
+        }
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        if beacon_state(&runner).is_some_and(|s| {
             s.pending_reshapes.is_empty() && s.next_shard_committees.contains_key(&ShardId::ROOT)
-        })
-    });
+        }) {
+            reshaped = true;
+            break;
+        }
+    }
     assert!(
         reshaped,
-        "the folded ReshapeReady signals must fire the merge gate within \
+        "the re-asserted ReshapeReady signals must fire the merge gate within \
          {GATE_BUDGET_EPOCHS} epochs",
     );
     let state = beacon_state(&runner).expect("post-gate state");

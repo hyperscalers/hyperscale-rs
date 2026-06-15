@@ -323,16 +323,32 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     }
 
     // ── The gate fires: leaf(1,0) reshapes into the lookahead; leaf(1,1)
-    // keeps its committee ──
+    // keeps its committee. Each observer re-asserts its ready signal until
+    // then — the cohort promotes into the active reshape-observer window a
+    // window after admission (the freeze discipline), and the busy
+    // splitter's blocks anchor in that window only as their `parent_qc.wt`
+    // catches up, so a one-shot signal can land while it still classifies
+    // as a plain `Ready`. ──
     let gate_deadline = runner.now() + epochs(GATE_BUDGET_EPOCHS);
-    let reshaped = run_until(&mut runner, gate_deadline, |r| {
-        beacon_state(r).is_some_and(|s| {
+    let mut reshaped = false;
+    while runner.now() < gate_deadline {
+        if let Some(current) = pending_cohort_for(&runner, splitter) {
+            for (validator, _child) in &current {
+                runner.broadcast_observer_ready(*validator, splitter);
+            }
+        }
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        if beacon_state(&runner).is_some_and(|s| {
             s.pending_reshapes.is_empty() && s.next_shard_committees.contains_key(&left_child)
-        })
-    });
+        }) {
+            reshaped = true;
+            break;
+        }
+    }
     assert!(
         reshaped,
-        "leaf(1,0)'s ReshapeReady signals must fire the gate"
+        "leaf(1,0)'s re-asserted ReshapeReady signals must fire the gate"
     );
     let state = beacon_state(&runner).expect("post-gate state");
     assert!(

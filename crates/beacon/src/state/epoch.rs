@@ -128,6 +128,15 @@ pub fn apply_epoch(
     // resolved from the lookahead schedule entry or the re-derived
     // active one.
     state.split_pending_window = state.live_split_pending();
+    // Freeze the reshape-seat projections under the same discipline.
+    // The execution fold flips a split's observer cohort to `OnShard`
+    // and consumes a merge's keepers mid-fold, so a live projection
+    // would differ between a window's lookahead write and its active
+    // overwrite — diverging the `ReshapeReady` leaf classification (and
+    // the merge-terminal settled-waves carry) across replicas at
+    // different fold heights, which forks the beacon-witness root.
+    state.reshape_observers_window = state.live_reshape_observers();
+    state.reshape_keepers_window = state.live_reshape_keepers();
 
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface

@@ -88,10 +88,41 @@ impl SimulationRunner {
         );
         let root = bootstrap.imported_root().expect("complete bootstrap");
 
-        // Broadcast the ready signal through a committee host's
-        // adapter: BLS verification, pool admission, the manifest
-        // drain, and the ReshapeReady classification all run the real
-        // receive path.
+        // Broadcast the ready signal through a committee host's adapter:
+        // BLS verification, pool admission, the manifest drain, and the
+        // ReshapeReady classification all run the real receive path.
+        self.broadcast_observer_ready(validator, via);
+
+        (storage, root, anchor)
+    }
+
+    /// Broadcast `validator`'s self-signed observer ready signal to the
+    /// splitting shard `via`'s committee, where it classifies as a
+    /// `ReshapeReady` leaf and folds into the split readiness gate.
+    ///
+    /// Split out of [`Self::observe_child`] so a test can re-assert
+    /// readiness — the way a production observer does until it is placed —
+    /// without redoing the child-span sync. The cohort promotes into the
+    /// active reshape-observer window only a window after admission (the
+    /// freeze discipline), and a busy splitter's blocks anchor in that
+    /// window only as their `parent_qc.wt` catches up, so a one-shot signal
+    /// can land while it still classifies as a plain `Ready`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `via` has no serving host or attested anchor.
+    pub fn broadcast_observer_ready(&mut self, validator: ValidatorId, via: ShardId) {
+        let serving: Vec<usize> = (0..self.hosts.len())
+            .filter(|&i| self.hosts[i].hosted_shards().any(|s| s == via))
+            .collect();
+        assert!(
+            !serving.is_empty(),
+            "no serving host for shard {via:?} — observer duty needs a live committee",
+        );
+        let snapshot = self.hosts[serving[0]].process().topology().load_full();
+        let anchor = snapshot
+            .boundary(via)
+            .expect("observer duty requires an attested anchor");
         let signal = observer_ready_signal(
             &self.beacon_network,
             validator,
@@ -107,8 +138,6 @@ impl SimulationRunner {
         self.hosts[serving[0]]
             .network()
             .notify(&recipients, &ReadySignalNotification::new(signal));
-
-        (storage, root, anchor)
     }
 
     /// Run an observer's stay-current duty: follow `via`'s committed

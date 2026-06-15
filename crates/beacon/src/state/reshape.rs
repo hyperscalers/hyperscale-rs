@@ -983,9 +983,11 @@ mod tests {
         }
     }
 
-    /// A paired merge projects its keepers into the topology snapshot,
-    /// keyed by the child each runs, so that child's runtime classifies
-    /// their ready signals as `ReshapeReady`.
+    /// A paired merge projects its keepers into the lookahead topology
+    /// snapshot, keyed by the child each runs, so that child's runtime
+    /// classifies their ready signals as `ReshapeReady`. Under the freeze
+    /// discipline the active snapshot picks them up only at the next
+    /// promotion, so a fresh pairing is not yet visible there.
     #[test]
     fn merge_pairing_projects_keepers_into_the_snapshot() {
         let parent = ShardId::leaf(1, 0);
@@ -996,15 +998,18 @@ mod tests {
         apply_shard_payload(&mut state, right, &merge);
         let keepers = keepers_of(&state, parent);
 
-        let snapshot = state.derive_topology_snapshot(net());
+        let lookahead = state.derive_next_topology_snapshot(net());
+        let active = state.derive_topology_snapshot(net());
         for (id, seat) in &keepers {
             assert_eq!(
-                snapshot.reshape_keeper_parent(seat.child, *id),
+                lookahead.reshape_keeper_parent(seat.child, *id),
                 Some(parent)
             );
             // A keeper of one child isn't projected onto the sibling.
             let sibling = if seat.child == left { right } else { left };
-            assert_eq!(snapshot.reshape_keeper_parent(sibling, *id), None);
+            assert_eq!(lookahead.reshape_keeper_parent(sibling, *id), None);
+            // Frozen out of the active window until the next promotion.
+            assert_eq!(active.reshape_keeper_parent(seat.child, *id), None);
         }
     }
 

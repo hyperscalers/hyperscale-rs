@@ -49,7 +49,22 @@ impl SimulationRunner {
     pub fn merge_keeper(&mut self, validator: ValidatorId, own_child: ShardId, sibling: ShardId) {
         // The grow-phase work: pull the sibling half from its committee.
         let _ = self.collect_shard_leaves(sibling);
+        self.broadcast_keeper_ready(validator, own_child);
+    }
 
+    /// Broadcast `validator`'s self-signed keeper ready signal to its own
+    /// child's committee, where it classifies as a `ReshapeReady` leaf and
+    /// folds into the merge readiness gate.
+    ///
+    /// Split out of [`Self::merge_keeper`] so a test can re-assert
+    /// readiness — the way a production keeper does until it is placed —
+    /// without redoing the sibling sync, which only proves the
+    /// cross-committee path and would race an actively committing child.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `own_child` has no serving host or attested anchor.
+    pub fn broadcast_keeper_ready(&mut self, validator: ValidatorId, own_child: ShardId) {
         let serving: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| self.hosts[i].hosted_shards().any(|s| s == own_child))
             .collect();

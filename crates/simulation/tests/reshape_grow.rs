@@ -197,16 +197,32 @@ fn observers_grow_a_split_through_its_readiness_gate() {
         );
     }
 
-    // ── The gate fires: the trie reshapes into the lookahead ──
+    // ── The gate fires: the trie reshapes into the lookahead. Each
+    // observer re-asserts its ready signal until then — the cohort promotes
+    // into the active reshape-observer window only a window after admission
+    // (the freeze discipline), and the parent's blocks anchor in that
+    // window only as their `parent_qc.wt` catches up, so a one-shot signal
+    // can land while it still classifies as a plain `Ready`. ──
     let gate_deadline = runner.now() + epochs(GATE_BUDGET_EPOCHS);
-    let reshaped = run_until(&mut runner, gate_deadline, |r| {
-        beacon_state(r).is_some_and(|s| {
+    let mut reshaped = false;
+    while runner.now() < gate_deadline {
+        if let Some(current) = pending_cohort(&runner) {
+            for (validator, _child) in &current {
+                runner.broadcast_observer_ready(*validator, ShardId::ROOT);
+            }
+        }
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        if beacon_state(&runner).is_some_and(|s| {
             s.pending_reshapes.is_empty() && s.next_shard_committees.contains_key(&left)
-        })
-    });
+        }) {
+            reshaped = true;
+            break;
+        }
+    }
     assert!(
         reshaped,
-        "the folded ReshapeReady signals must fire the gate within \
+        "the re-asserted ReshapeReady signals must fire the gate within \
          {GATE_BUDGET_EPOCHS} epochs",
     );
 

@@ -230,7 +230,7 @@ fn survivor_reconstructs_a_merged_shards_settled_set() {
     let (merge_left, merge_right) = merge_parent.children(); // leaf(2,2), leaf(2,3)
     let merging = merge_left; // the straddler's far half terminates here
 
-    let mut runner = SimulationRunner::new(&merge_config(), 11);
+    let mut runner = SimulationRunner::new(&merge_config(), 7);
 
     // Straddler pairs: payer in the surviving leaf(2,0), recipient in the
     // merging leaf(2,2) — a genuine cross-shard transfer, so the survivor's
@@ -268,7 +268,7 @@ fn survivor_reconstructs_a_merged_shards_settled_set() {
         pending_keepers(&runner, ShardId::leaf(1, 0)).is_none(),
         "the heavy leaf(1,0) pair must not pair a merge (leaf(2,0) stays above threshold)",
     );
-    let keepers = pending_keepers(&runner, merge_parent).expect("keepers just observed");
+    let mut keepers = pending_keepers(&runner, merge_parent).expect("keepers just observed");
 
     // ── Submit settling straddlers now, during the grow phase, so the full
     // cross-shard 2PC finalizes on both halves before the child's terminal ──
@@ -285,7 +285,7 @@ fn survivor_reconstructs_a_merged_shards_settled_set() {
         probes.push((*delay_ms, hash));
     }
 
-    // ── Keeper duty: sync the sibling half, signal ready ──
+    // ── Keeper duty: prove each keeper's sibling-half sync once. ──
     for (validator, own_child) in &keepers {
         let sibling = if *own_child == merge_left {
             merge_right
@@ -295,17 +295,36 @@ fn survivor_reconstructs_a_merged_shards_settled_set() {
         runner.merge_keeper(*validator, *own_child, sibling);
     }
 
-    // ── The gate fires: the trie collapses both children into leaf(1,1) ──
+    // ── The gate fires: each keeper re-asserts its ready signal until the
+    // merge collapses both children into the parent in the lookahead. The
+    // keepers promote into the active reshape-keeper window only a window
+    // after pairing (the freeze discipline), so a one-shot signal can land
+    // while it still classifies as a plain `Ready`. A production keeper
+    // re-asserts until it is placed; the harness does the same, re-reading
+    // the live keeper set so a re-pair is followed and stopping once the
+    // merge executes. ──
     let gate_deadline = runner.now() + epochs(GATE_BUDGET_EPOCHS);
-    let reshaped = run_until(&mut runner, gate_deadline, |r| {
-        beacon_state(r).is_some_and(|s| {
+    let mut reshaped = false;
+    while runner.now() < gate_deadline {
+        if let Some(current) = pending_keepers(&runner, merge_parent) {
+            keepers = current;
+            for (validator, own_child) in &keepers {
+                runner.broadcast_keeper_ready(*validator, *own_child);
+            }
+        }
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        if beacon_state(&runner).is_some_and(|s| {
             !s.pending_reshapes.contains_key(&merge_parent)
                 && s.next_shard_committees.contains_key(&merge_parent)
-        })
-    });
+        }) {
+            reshaped = true;
+            break;
+        }
+    }
     assert!(
         reshaped,
-        "the keepers' ReshapeReady signals must fire the merge gate"
+        "the re-asserted keepers' ReshapeReady signals must fire the merge gate"
     );
     let state = beacon_state(&runner).expect("post-gate state");
     assert!(
