@@ -26,6 +26,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::Network;
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::bootstrap::EngineBootstrap;
+use hyperscale_node::bootstrap::merge_flip::merge_genesis_from_terminals;
 use hyperscale_node::bootstrap::observer::observer_ready_signal;
 use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::host::{attach_shard, detach_shard};
@@ -33,7 +34,7 @@ use hyperscale_node::process_io::ProcessIo;
 use hyperscale_node::{NodeConfig, SeatVnodeGroup, TimerOp, VnodeInit, seat_vnode_group};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{RecoveredState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::{
@@ -46,7 +47,10 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::bootstrap::{bootstrap_observer_state, bootstrap_shard_state, follow_observer_store};
+use crate::bootstrap::{
+    bootstrap_observer_state, bootstrap_shard_state, collect_half_leaves, fetch_certified_terminal,
+    follow_observer_store,
+};
 use crate::rpc::RpcPublishers;
 use crate::runner::{
     ProdShardLoop, ShardChannels, ShardLoopConfig, VnodeConfig, spawn_shard_loop, wall_clock_local,
@@ -118,6 +122,30 @@ pub enum ShardCommand {
         /// The pending child whose duty ends.
         child: ShardId,
     },
+    /// Begin a reshape-keeper duty: prove the `sibling` half's sync,
+    /// broadcast the ready signal on `own_child`'s committee, then build
+    /// the merged `parent` store from both terminated halves at the
+    /// boundary. The keeper keeps running `own_child` until the merge
+    /// executes; the prepared parent store waits for the placement delta.
+    Keep {
+        /// The merged parent the keeper reforms.
+        parent: ShardId,
+        /// The other child, whose half the keeper does not run and must
+        /// sync to compose the merged tree.
+        sibling: ShardId,
+        /// The child the keeper currently runs.
+        own_child: ShardId,
+        /// The local vnode holding the keeper seat.
+        validator: ValidatorId,
+        /// Its signing key, for the self-signed ready signal.
+        signing_key: Arc<Bls12381G1PrivateKey>,
+    },
+    /// Abandon a keeper duty — the merge was cancelled. Aborts an
+    /// in-flight build; a prepared one just drops its registry entry.
+    Unkeep {
+        /// The merged parent whose duty ends.
+        parent: ShardId,
+    },
 }
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
@@ -163,6 +191,17 @@ pub struct PreparedObserverFlip {
     recovered: RecoveredState,
 }
 
+/// A keeper duty's boundary handoff, prepared: the merged parent store is
+/// built from both terminated halves and adopted at the deterministic
+/// merged genesis, verified against the beacon's composed parent anchor.
+/// Seating waits only for the placement delta's vnodes.
+pub struct PreparedMergeFlip {
+    parent: ShardId,
+    storage: Arc<RocksDbShardStorage>,
+    genesis: Block,
+    recovered: RecoveredState,
+}
+
 /// A background-work completion fed back into the supervisor by the
 /// runner's select loop. All blocking membership work (storage opens,
 /// thread joins) and async snap-sync bootstraps land here, so every
@@ -188,6 +227,9 @@ pub enum SupervisorEvent {
     /// An observer duty's boundary handoff settled (`Err` carries the
     /// failed child).
     ObserverPrepared(Result<Box<PreparedObserverFlip>, ShardId>),
+    /// A keeper duty's boundary handoff settled (`Err` carries the failed
+    /// merged parent).
+    KeeperPrepared(Result<Box<PreparedMergeFlip>, ShardId>),
     /// A departing shard's thread joined; the unwire can finish.
     TornDown {
         /// Shard whose thread exited.
@@ -214,6 +256,24 @@ struct ObserverDuty {
     /// The prepared boundary handoff, once the follow reaches the
     /// parent's crossing — waiting for the placement delta to seat it.
     prepared: Option<Box<PreparedObserverFlip>>,
+}
+
+/// One keeper duty, keyed by its merging parent in
+/// [`ShardSupervisor::keepers`].
+struct KeeperDuty {
+    /// The other child, whose half the keeper syncs.
+    sibling: ShardId,
+    /// The child the keeper currently runs.
+    own_child: ShardId,
+    /// The local vnode holding the seat.
+    validator: ValidatorId,
+    /// The duty task — the sibling-half sync proof and ready broadcast,
+    /// then the boundary handoff that builds the merged parent store.
+    /// Aborted by `Unkeep`; `None` once the handoff is prepared.
+    task: Option<JoinHandle<()>>,
+    /// The prepared boundary handoff, once both halves have terminated
+    /// and the merged store is built — waiting for the placement delta.
+    prepared: Option<Box<PreparedMergeFlip>>,
 }
 
 /// One hosted shard's runtime: its pinned thread plus the handles the
@@ -265,6 +325,15 @@ pub struct ShardSupervisor {
     /// handoff was still preparing, seated by the
     /// [`SupervisorEvent::ObserverPrepared`] handler.
     pending_observer_joins: HashMap<ShardId, Vec<VnodeConfig>>,
+    /// Keeper duties, in flight or prepared, keyed by merging parent.
+    keepers: HashMap<ShardId, KeeperDuty>,
+    /// Merge joins that arrived while their keeper duty's boundary
+    /// handoff was still building, seated by the
+    /// [`SupervisorEvent::KeeperPrepared`] handler.
+    pending_keeper_joins: HashMap<ShardId, Vec<VnodeConfig>>,
+    /// Beacon epoch length, for the keeper's deterministic merged-genesis
+    /// cut derivation. Matches the beacon's own chain config.
+    epoch_duration_ms: u64,
     /// Shards whose teardown is parked on the off-loop thread join.
     /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
     draining: HashSet<ShardId>,
@@ -295,6 +364,7 @@ impl ShardSupervisor {
         storage_dir: StorageDirResolver,
         engine_bootstrap: EngineBootstrap,
         participation_tx: mpsc::UnboundedSender<ParticipationChange>,
+        epoch_duration_ms: u64,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
@@ -316,6 +386,9 @@ impl ShardSupervisor {
             bootstrapping: HashMap::new(),
             observers: HashMap::new(),
             pending_observer_joins: HashMap::new(),
+            keepers: HashMap::new(),
+            pending_keeper_joins: HashMap::new(),
+            epoch_duration_ms,
             draining: HashSet::new(),
             pending_joins: HashMap::new(),
             events_tx,
@@ -343,6 +416,7 @@ impl ShardSupervisor {
             SupervisorEvent::Observed(done) => self.finish_observation(done),
             SupervisorEvent::SplitAdopted(done) => self.finish_adoption(done),
             SupervisorEvent::ObserverPrepared(done) => self.finish_observer_preparation(done),
+            SupervisorEvent::KeeperPrepared(done) => self.finish_keeper_preparation(done),
             SupervisorEvent::TornDown {
                 shard,
                 validator_ids,
@@ -403,6 +477,14 @@ impl ShardSupervisor {
                 signing_key,
             } => self.observe(via, child, validator, &signing_key),
             ShardCommand::Unobserve { child } => self.unobserve(child),
+            ShardCommand::Keep {
+                parent,
+                sibling,
+                own_child,
+                validator,
+                signing_key,
+            } => self.keep(parent, sibling, own_child, validator, &signing_key),
+            ShardCommand::Unkeep { parent } => self.unkeep(parent),
         }
     }
 
@@ -425,6 +507,14 @@ impl ShardSupervisor {
             if self.pending_joins.insert(shard, vnodes.to_vec()).is_some() {
                 warn!(shard = ?shard, "Replaced an earlier queued join for the shard");
             }
+            return;
+        }
+
+        // A merge keeper pre-built this parent's store: seat from the
+        // boundary handoff instead of snap-syncing (or park until it
+        // finishes building).
+        if self.keepers.contains_key(&shard) {
+            self.seat_or_park_keeper(shard, vnodes);
             return;
         }
 
@@ -951,6 +1041,217 @@ impl ShardSupervisor {
         );
     }
 
+    /// Begin a keeper duty: prove the sibling-half sync, broadcast the
+    /// ready signal on the keeper's own child committee (where it
+    /// classifies as a `ReshapeReady` witness leaf and folds into the
+    /// merge readiness gate), then build the merged parent store at the
+    /// boundary. The keeper keeps running `own_child` throughout; the
+    /// prepared parent store waits for the merge-execution placement
+    /// delta's join.
+    fn keep(
+        &mut self,
+        parent: ShardId,
+        sibling: ShardId,
+        own_child: ShardId,
+        validator: ValidatorId,
+        signing_key: &Arc<Bls12381G1PrivateKey>,
+    ) {
+        if self.keepers.contains_key(&parent) {
+            warn!(?parent, "Keep rejected: duty already running");
+            return;
+        }
+        if self.shards.contains_key(&parent) {
+            warn!(?parent, "Keep rejected: merged parent already hosted");
+            return;
+        }
+        let process = Arc::clone(&self.process);
+        let events = self.events_tx.clone();
+        let beacon_network = self.beacon_network.clone();
+        let signing_key = Arc::clone(signing_key);
+        let factory = Arc::clone(&self.storage_factory);
+        let storage_dir = Arc::clone(&self.storage_dir);
+        let engine_bootstrap = self.engine_bootstrap.clone();
+        let epoch_duration_ms = self.epoch_duration_ms;
+        let task = self.tokio_handle.spawn(async move {
+            // Grow phase: prove the sibling half can be pulled from its
+            // committee, then signal readiness on the own-child committee.
+            if let Err(error) =
+                collect_half_leaves(process.network(), process.topology(), sibling).await
+            {
+                warn!(
+                    ?parent,
+                    ?sibling,
+                    error,
+                    "Keeper sibling-half sync failed; duty abandoned"
+                );
+                let _ = events.send(SupervisorEvent::KeeperPrepared(Err(parent)));
+                return;
+            }
+            let Some(anchor) = process.topology().load().boundary(own_child) else {
+                warn!(
+                    ?parent,
+                    ?own_child,
+                    "Keeper duty has no own-child anchor; abandoned"
+                );
+                let _ = events.send(SupervisorEvent::KeeperPrepared(Err(parent)));
+                return;
+            };
+            let signal = observer_ready_signal(&beacon_network, validator, &signing_key, anchor);
+            let recipients: Vec<ValidatorId> = process
+                .topology()
+                .load()
+                .committee_for_shard(own_child)
+                .iter()
+                .copied()
+                .filter(|&v| v != validator)
+                .collect();
+            process
+                .network()
+                .notify(&recipients, &ReadySignalNotification::new(signal));
+
+            // Boundary handoff: build the merged parent store from both
+            // terminated halves and adopt the deterministic genesis.
+            let done = prepare_merge_flip(
+                &process,
+                &factory,
+                &storage_dir,
+                &engine_bootstrap,
+                parent,
+                own_child,
+                epoch_duration_ms,
+            )
+            .await
+            .map_err(|error| {
+                warn!(?parent, error, "Keeper boundary handoff failed");
+                parent
+            });
+            let _ = events.send(SupervisorEvent::KeeperPrepared(done));
+        });
+        self.keepers.insert(
+            parent,
+            KeeperDuty {
+                sibling,
+                own_child,
+                validator,
+                task: Some(task),
+                prepared: None,
+            },
+        );
+    }
+
+    /// Abandon a keeper duty: abort an in-flight build, drop the registry
+    /// entry. Any half-built parent directory is wiped by a later
+    /// re-`Keep` or the fallback join's fresh open.
+    fn unkeep(&mut self, parent: ShardId) {
+        let Some(duty) = self.keepers.remove(&parent) else {
+            warn!(?parent, "Unkeep rejected: no duty for the parent");
+            return;
+        };
+        if let Some(task) = duty.task {
+            task.abort();
+        }
+        info!(
+            ?parent,
+            sibling = ?duty.sibling,
+            own_child = ?duty.own_child,
+            validator = duty.validator.inner(),
+            "Keeper duty abandoned"
+        );
+    }
+
+    /// Settle a keeper duty's boundary handoff: seat a parked merge join
+    /// with the prepared store, stash the preparation for a join still to
+    /// come, or — on failure — fall back to a fresh snap-sync for a
+    /// parked join.
+    fn finish_keeper_preparation(&mut self, done: Result<Box<PreparedMergeFlip>, ShardId>) {
+        match done {
+            Ok(prepared) => {
+                let parent = prepared.parent;
+                if !self.keepers.contains_key(&parent) {
+                    info!(
+                        ?parent,
+                        "Keeper handoff prepared for an abandoned duty; dropped"
+                    );
+                    return;
+                }
+                if let Some(vnodes) = self.pending_keeper_joins.remove(&parent) {
+                    self.keepers.remove(&parent);
+                    let Some(pending) = self.bootstrapping.remove(&parent) else {
+                        info!(
+                            ?parent,
+                            "Keeper handoff prepared for an abandoned join; dropped"
+                        );
+                        return;
+                    };
+                    if self.shards.contains_key(&parent) {
+                        warn!(
+                            ?parent,
+                            "Keeper handoff prepared for an already-hosted shard; dropped"
+                        );
+                        return;
+                    }
+                    self.seat_shard_with_genesis(
+                        parent,
+                        &vnodes[..pending.min(vnodes.len())],
+                        prepared.storage,
+                        &prepared.recovered,
+                        Some(&prepared.genesis),
+                    );
+                } else {
+                    let duty = self
+                        .keepers
+                        .get_mut(&parent)
+                        .expect("duty presence checked above");
+                    duty.task = None;
+                    duty.prepared = Some(prepared);
+                }
+            }
+            Err(parent) => {
+                // The build failed closed; drop the duty. A parked join
+                // falls back to a fresh snap-sync against the merged
+                // parent's committee (other keepers that succeeded serve
+                // it); a join still to come takes the normal path, since
+                // the duty entry is gone.
+                self.keepers.remove(&parent);
+                if let Some(vnodes) = self.pending_keeper_joins.remove(&parent) {
+                    self.bootstrapping.remove(&parent);
+                    self.join(parent, &vnodes);
+                }
+            }
+        }
+    }
+
+    /// Seat a merge join from its keeper duty's prepared parent store, or
+    /// park it until the boundary handoff finishes building.
+    fn seat_or_park_keeper(&mut self, parent: ShardId, vnodes: &[VnodeConfig]) {
+        self.bootstrapping.insert(parent, vnodes.len());
+        let duty = self
+            .keepers
+            .get_mut(&parent)
+            .expect("keeper presence checked by the caller");
+        if let Some(prepared) = duty.prepared.take() {
+            self.keepers.remove(&parent);
+            self.bootstrapping.remove(&parent);
+            if self.shards.contains_key(&parent) {
+                warn!(?parent, "Keeper flip for an already-hosted shard; dropped");
+                return;
+            }
+            self.seat_shard_with_genesis(
+                parent,
+                vnodes,
+                prepared.storage,
+                &prepared.recovered,
+                Some(&prepared.genesis),
+            );
+        } else {
+            info!(
+                ?parent,
+                "Merge join parked on the keeper duty's boundary handoff"
+            );
+            self.pending_keeper_joins.insert(parent, vnodes.to_vec());
+        }
+    }
+
     /// Wire a shard's vnodes into the process maps and spawn its pinned
     /// thread, booting the state machines from `recovered`.
     fn seat_shard(
@@ -1237,6 +1538,107 @@ async fn prepare_observer_flip(
     })
     .await
     .unwrap_or_else(|e| Err(format!("observer adoption task panicked: {e}")))
+}
+
+/// Build a merge keeper's parent store and adopt its genesis for the
+/// boundary handoff.
+///
+/// Waits for the beacon to compose the merged parent anchor (both
+/// children terminated, the fold seeded the parent's genesis record),
+/// fetches both children's certified terminals to derive the
+/// deterministic merged genesis, collects both halves' full leaf sets at
+/// their terminal anchors, and unions them into a fresh parent-rooted
+/// store — the import rebuilds the merged tree with the composed root by
+/// construction. Adoption then records the genesis as the committed tip,
+/// fail-closed if the built root or the adopted root disagrees with the
+/// beacon's composed anchor.
+async fn prepare_merge_flip(
+    process: &ProdProcessIo,
+    factory: &StorageFactory,
+    storage_dir: &StorageDirResolver,
+    engine_bootstrap: &EngineBootstrap,
+    parent: ShardId,
+    own_child: ShardId,
+    epoch_duration_ms: u64,
+) -> Result<Box<PreparedMergeFlip>, String> {
+    let anchor = wait_for_child_anchor(process, parent).await;
+    let (left, right) = parent.children();
+    let sibling = if own_child == left { right } else { left };
+    // Both children's terminal records linger as boundary anchors; each
+    // terminal block sits one below its anchor height.
+    let left_anchor = wait_for_child_anchor(process, left).await;
+    let right_anchor = wait_for_child_anchor(process, right).await;
+    let left_terminal_height = left_anchor
+        .height
+        .prev()
+        .ok_or("left child anchor at the absolute height floor")?;
+    let right_terminal_height = right_anchor
+        .height
+        .prev()
+        .ok_or("right child anchor at the absolute height floor")?;
+    let (left_header, left_qc) =
+        fetch_certified_terminal(process.network(), left, left_terminal_height).await;
+    let (right_header, right_qc) =
+        fetch_certified_terminal(process.network(), right, right_terminal_height).await;
+    let (genesis, origin) = merge_genesis_from_terminals(
+        parent,
+        (&left_header, &left_qc),
+        (&right_header, &right_qc),
+        epoch_duration_ms,
+        &anchor,
+    )?;
+
+    let own_leaves = collect_half_leaves(process.network(), process.topology(), own_child).await?;
+    let sibling_leaves =
+        collect_half_leaves(process.network(), process.topology(), sibling).await?;
+
+    let factory = Arc::clone(factory);
+    let storage_dir = Arc::clone(storage_dir);
+    let engine_bootstrap = engine_bootstrap.clone();
+    spawn_blocking(move || {
+        let dir = storage_dir(parent);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("stale keeper store wipe: {e}"))?;
+        }
+        let storage = factory(parent)?;
+        engine_bootstrap.replicate_into(storage.as_ref());
+        let mut leaves = own_leaves;
+        leaves.extend(sibling_leaves);
+        let merged = storage
+            .import_boundary_state(origin.genesis_height, leaves)
+            .map_err(|e| format!("merged half union import: {e}"))?;
+        if merged != anchor.state_root {
+            return Err(format!(
+                "merged root {merged:?} does not match the beacon anchor {:?}",
+                anchor.state_root,
+            ));
+        }
+        let adopted = storage
+            .adopt_merge_parent(origin, &genesis)
+            .map_err(|e| format!("merge adoption: {e}"))?;
+        if adopted != anchor.state_root {
+            return Err(format!(
+                "adopted merged root {adopted:?} does not match the beacon anchor {:?}",
+                anchor.state_root,
+            ));
+        }
+        let substate_bytes = storage
+            .substate_bytes_at_version(origin.genesis_height.inner())
+            .unwrap_or(0);
+        let recovered = RecoveredState {
+            substate_bytes,
+            chain_origin: origin,
+            ..RecoveredState::default()
+        };
+        Ok(Box::new(PreparedMergeFlip {
+            parent,
+            storage,
+            genesis,
+            recovered,
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("merge adoption task panicked: {e}")))
 }
 
 /// Poll the process topology until the beacon's child anchor projects —

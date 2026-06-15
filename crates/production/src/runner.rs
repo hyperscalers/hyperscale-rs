@@ -27,7 +27,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{ObserveDelta, ParticipationChange, ProtocolEvent, TimerId};
+use hyperscale_core::{KeepDelta, ObserveDelta, ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
@@ -584,6 +584,7 @@ impl ProductionRunnerBuilder {
             self.storage_dir,
             engine_bootstrap,
             participation_tx,
+            BeaconChainConfig::default().epoch_duration_ms,
         );
 
         Ok(ProductionRunner {
@@ -1022,6 +1023,38 @@ impl ProductionRunner {
     /// drains gracefully: the shard keeps serving until the validator's
     /// window observably closes plus the DA retention grace, so its
     /// replacement can snap-sync from it during the overlap.
+    /// Dispatch a merge-keeper delta to the supervisor: begin a keeper
+    /// duty (deriving the keeper's own child as the non-sibling child of
+    /// the merging parent) or abandon one. A keeper carries no join/leave
+    /// — it stays on its child until the merge executes — so this is its
+    /// only signal until the placement delta.
+    fn dispatch_keep(&self, supervisor: &mut ShardSupervisor, change: &ParticipationChange) {
+        match change.keep {
+            Some(KeepDelta::Begin { parent, sibling }) => {
+                if let Some(signing_key) = self.vnode_keys.get(&change.validator) {
+                    let (left, right) = parent.children();
+                    let own_child = if sibling == left { right } else { left };
+                    supervisor.handle(ShardCommand::Keep {
+                        parent,
+                        sibling,
+                        own_child,
+                        validator: change.validator,
+                        signing_key: Arc::clone(signing_key),
+                    });
+                } else {
+                    warn!(
+                        validator = change.validator.inner(),
+                        "Keeper seat for a validator without a local signing key; ignored"
+                    );
+                }
+            }
+            Some(KeepDelta::Abandon { parent }) => {
+                supervisor.handle(ShardCommand::Unkeep { parent });
+            }
+            None => {}
+        }
+    }
+
     fn apply_participation_change(
         &self,
         supervisor: &mut ShardSupervisor,
@@ -1036,13 +1069,7 @@ impl ProductionRunner {
             effective_epoch = change.effective_epoch.inner(),
             "Beacon placement change detected"
         );
-        if let Some(keep) = change.keep {
-            warn!(
-                validator = change.validator.inner(),
-                ?keep,
-                "Keeper delta received but merge-keeper duty has no supervisor wiring; ignoring"
-            );
-        }
+        self.dispatch_keep(supervisor, change);
         match change.observe {
             Some(ObserveDelta::Begin { via, child }) => {
                 if let Some(signing_key) = self.vnode_keys.get(&change.validator) {

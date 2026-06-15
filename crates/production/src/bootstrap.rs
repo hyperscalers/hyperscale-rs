@@ -20,7 +20,7 @@ use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_node::bootstrap::observer::{ObserverBootstrap, ObserverTail, TailOutcome};
 use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::bootstrap::{BootstrapOutcome, BootstrapRequest, ShardBootstrap};
-use hyperscale_storage::{RecoveredState, ShardStorage};
+use hyperscale_storage::{ImportLeaf, RecoveredState, ShardStorage};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, ChainOrigin, QuorumCertificate, Request, ShardAnchor, ShardId,
@@ -126,6 +126,64 @@ where
             "Snap-sync bootstrap complete; state verified against the anchor"
         );
         return Ok(bootstrap.into_recovered_state());
+    }
+}
+
+/// Collect a terminated child shard's full leaf set against its
+/// beacon-attested terminal anchor — without importing into a store. The
+/// merge keeper unions both halves' leaf sets into a fresh parent-rooted
+/// store, so it needs the leaves themselves rather than an imported
+/// child store. Requests route to `shard`'s committee (its surviving
+/// members serve the terminal state from their hard-linked checkpoints);
+/// pacing and the starved-assembly anchor refresh mirror
+/// [`bootstrap_shard_state`]. An empty half collects an empty set.
+///
+/// # Errors
+///
+/// Returns a description of the failure; terminal for the keeper's build.
+pub async fn collect_half_leaves<N>(
+    network: &Arc<N>,
+    topology: &SharedTopologySnapshot,
+    shard: ShardId,
+) -> Result<Vec<ImportLeaf>, String>
+where
+    N: Network,
+{
+    'anchor: loop {
+        let Some(anchor) = topology.load().boundary(shard) else {
+            return Err(format!("merging child {shard:?} has no attested anchor"));
+        };
+        let bootstrap = Arc::new(Mutex::new(ShardBootstrap::new(shard, anchor)));
+        let mut fruitless = 0u32;
+        loop {
+            let import = lock(&bootstrap).take_import();
+            if let Some((_, leaves)) = import {
+                return Ok(leaves);
+            }
+            if lock(&bootstrap).is_complete() {
+                // An empty half: assembly completed with no leaves.
+                return Ok(Vec::new());
+            }
+            let requests = lock(&bootstrap).next_requests();
+            let accepted = run_round(network, shard, &bootstrap, requests).await;
+            if accepted == 0 {
+                fruitless += 1;
+                if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
+                    fruitless = 0;
+                    if lock(&bootstrap).is_assembling_state()
+                        && topology
+                            .load()
+                            .boundary(shard)
+                            .is_some_and(|latest| latest != anchor)
+                    {
+                        continue 'anchor;
+                    }
+                }
+                sleep(FRUITLESS_ROUND_PAUSE).await;
+            } else {
+                fruitless = 0;
+            }
+        }
     }
 }
 
@@ -344,7 +402,7 @@ where
 /// its certifying QC ride inline on every block response; the caller's
 /// derivation self-verifies the pairing, so no body rehydration is
 /// needed.
-async fn fetch_certified_terminal<N: Network>(
+pub async fn fetch_certified_terminal<N: Network>(
     network: &Arc<N>,
     shard: ShardId,
     height: BlockHeight,
