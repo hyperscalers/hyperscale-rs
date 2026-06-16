@@ -219,3 +219,99 @@ async fn split_seats_both_children_from_composed_anchors() {
 
     cluster.shutdown().await;
 }
+
+/// A real production merge: two sibling shards, each below the merge
+/// threshold from genesis, collapse back into their parent. Each child's
+/// committee asserts the merge; the beacon pairs it and draws half of each
+/// committee as the keeper set. Each keeper runs the production keep duty —
+/// syncing the sibling half off its committee, signalling `ReshapeReady` on
+/// its own child, then building the merged parent store — and once the
+/// ready keepers clear the gate the children coast to their crossing, the
+/// beacon composes the parent anchor from their terminal roots, and the
+/// keepers flip onto the parent. Exercises the production `ShardSupervisor`
+/// keep path and the `RocksDbShardStorage` merge adoption.
+///
+/// Real-time and `#[serial]` like its split sibling.
+#[tokio::test]
+#[serial]
+#[ignore = "real-time merge e2e: the keeper re-assertion fires the gate, the children compose the parent anchor, and the keeper-derived merged genesis reconstructs it — but the keepers do not reliably finish building their merged-parent stores and seat the parent. The post-crossing half-syncs (and the pairing fold before them) stall under the single-process harness load running eight hosts, two active child shards, and four concurrent keeper duties, so fewer than a quorum of keepers seat and the parent never advances. Passes intermittently; stays ignored until the keeper seat is reliable"]
+async fn keepers_merge_two_siblings_into_their_parent() {
+    let _ = fmt().with_test_writer().try_init();
+
+    // Two sibling shards with a committee of four each; the merge draws
+    // half of each committee, so the merged parent starts at full strength
+    // with four keepers.
+    let fixtures = TestFixtures::with_shards(13, 4, 2);
+    let parent = ShardId::ROOT;
+    let (left, right) = parent.children();
+
+    let chain_config = BeaconChainConfig {
+        epoch_duration_ms: EPOCH_MS,
+        num_shards: 2,
+        // merge_bytes is split_bytes / 8 = 650_000, above each child's
+        // genesis byte total (the heavier half is ~611k, the lighter
+        // ~373k), so both children assert the merge from genesis and
+        // neither ever splits.
+        reshape_thresholds: ReshapeThresholds {
+            split_bytes: 5_200_000,
+        },
+        ..BeaconChainConfig::default()
+    };
+
+    // One validator per host across eight hosts: hosts 0-3 run the left
+    // child's committee, hosts 4-7 the right's. One vnode per host so a
+    // keeper's freshly built merged-parent store never collides with
+    // another seat on the same shard's directory lock.
+    let cluster = Cluster::start(ClusterSpec {
+        topology: fixtures.topology(),
+        hosts: (0..8)
+            .map(|v| {
+                let shard = if v < 4 { left } else { right };
+                HostSpec::new(vec![vnode(&fixtures, v, shard)])
+            })
+            .collect(),
+        beacon_chain_config: chain_config,
+        genesis_config: None,
+        // Pace each shard's consensus to a realistic RTT so the loadless
+        // committees don't race the single-process harness's clock — see
+        // the split scenario above.
+        simulated_outbound_latency: Duration::from_millis(60),
+    })
+    .await;
+
+    // The beacon pairs the merge: a pending Merge for ROOT with half of
+    // each child committee (four validators) drawn as keepers.
+    cluster
+        .await_merge_paired(parent, 4, Duration::from_secs(90))
+        .await;
+
+    // The merged parent seats: the keepers sync their sibling halves and
+    // signal ready, the gate fires, the children coast to their crossing,
+    // and the keepers flip onto ROOT from the composed anchor.
+    cluster
+        .await_any_host_serves(parent, Duration::from_secs(120))
+        .await;
+
+    // The merged parent commits past its genesis — the union-imported
+    // store, derived genesis, and keeper committee are coherent.
+    cluster
+        .await_height_advances(parent, Duration::from_secs(60))
+        .await;
+
+    // Root fidelity: the merged committed root reproduces the
+    // beacon-composed anchor (the `hash_internal` of the two child terminal
+    // roots).
+    cluster
+        .await_root_matches_anchor(parent, Duration::from_secs(30))
+        .await;
+
+    // The children stop: their chains are terminal once they cross.
+    cluster
+        .assert_height_frozen(left, Duration::from_secs(3 * EPOCH_MS / 1000))
+        .await;
+    cluster
+        .assert_height_frozen(right, Duration::from_secs(3 * EPOCH_MS / 1000))
+        .await;
+
+    cluster.shutdown().await;
+}

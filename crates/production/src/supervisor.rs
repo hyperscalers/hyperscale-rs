@@ -1094,27 +1094,42 @@ impl ShardSupervisor {
                 let _ = events.send(SupervisorEvent::KeeperPrepared(Err(parent)));
                 return;
             }
-            let Some(anchor) = process.topology().load().boundary(own_child) else {
-                warn!(
-                    ?parent,
-                    ?own_child,
-                    "Keeper duty has no own-child anchor; abandoned"
-                );
-                let _ = events.send(SupervisorEvent::KeeperPrepared(Err(parent)));
-                return;
-            };
-            let signal = observer_ready_signal(&beacon_network, validator, &signing_key, anchor);
-            let recipients: Vec<ValidatorId> = process
-                .topology()
-                .load()
-                .committee_for_shard(own_child)
-                .iter()
-                .copied()
-                .filter(|&v| v != validator)
-                .collect();
-            process
-                .network()
-                .notify(&recipients, &ReadySignalNotification::new(signal));
+            // Re-assert the ready signal on the own-child committee until
+            // the merge executes (the parent anchor composes). The keeper
+            // seat promotes into the active reshape-keeper window only a
+            // window after pairing, so a single early signal classifies as
+            // a plain Ready leaf and never fires the gate; re-signing
+            // against the current own-child anchor each round lands a
+            // recognized ReshapeReady once the seat is active. `unkeep`
+            // aborts this task if the pairing is abandoned.
+            loop {
+                let Some(anchor) = process.topology().load().boundary(own_child) else {
+                    warn!(
+                        ?parent,
+                        ?own_child,
+                        "Keeper duty has no own-child anchor; abandoned"
+                    );
+                    let _ = events.send(SupervisorEvent::KeeperPrepared(Err(parent)));
+                    return;
+                };
+                let signal =
+                    observer_ready_signal(&beacon_network, validator, &signing_key, anchor);
+                let recipients: Vec<ValidatorId> = process
+                    .topology()
+                    .load()
+                    .committee_for_shard(own_child)
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != validator)
+                    .collect();
+                process
+                    .network()
+                    .notify(&recipients, &ReadySignalNotification::new(signal));
+                if process.topology().load().boundary(parent).is_some() {
+                    break;
+                }
+                sleep(KEEPER_READY_REASSERT_INTERVAL).await;
+            }
 
             // Boundary handoff: build the merged parent store from both
             // terminated halves and adopt the deterministic genesis.
@@ -1573,22 +1588,17 @@ async fn prepare_merge_flip(
     let anchor = wait_for_child_anchor(process, parent).await;
     let (left, right) = parent.children();
     let sibling = if own_child == left { right } else { left };
-    // Both children's terminal records linger as boundary anchors; each
-    // terminal block sits one below its anchor height.
+    // A merge child's terminal record anchors at its crossing block's own
+    // height — the beacon stores that block's hash and height directly —
+    // so the certified terminal is the block at the anchor height itself,
+    // not one below it (the split convention, where a child genesis sits
+    // one above the parent terminal).
     let left_anchor = wait_for_child_anchor(process, left).await;
     let right_anchor = wait_for_child_anchor(process, right).await;
-    let left_terminal_height = left_anchor
-        .height
-        .prev()
-        .ok_or("left child anchor at the absolute height floor")?;
-    let right_terminal_height = right_anchor
-        .height
-        .prev()
-        .ok_or("right child anchor at the absolute height floor")?;
     let (left_header, left_qc) =
-        fetch_certified_terminal(process.network(), left, left_terminal_height).await;
+        fetch_certified_terminal(process.network(), left, left_anchor.height).await;
     let (right_header, right_qc) =
-        fetch_certified_terminal(process.network(), right, right_terminal_height).await;
+        fetch_certified_terminal(process.network(), right, right_anchor.height).await;
     let (genesis, origin) = merge_genesis_from_terminals(
         parent,
         (&left_header, &left_qc),
@@ -1668,6 +1678,12 @@ async fn wait_for_child_anchor(process: &ProdProcessIo, child: ShardId) -> Shard
 /// terminal commit. The wait spans the parent's coast (a couple of
 /// block intervals) plus one beacon fold.
 const ANCHOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How often a keeper re-signs and re-broadcasts its ready signal while
+/// waiting for the merge to execute. Frequent enough to land a recognized
+/// `ReshapeReady` soon after the keeper seat promotes, refreshed against
+/// the own-child anchor as the child chain advances.
+const KEEPER_READY_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The parent-half adoption, blocking: wait is done; seed the child
 /// directory from a parent checkpoint, open it at the child prefix,

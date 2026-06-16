@@ -285,6 +285,39 @@ impl Cluster {
             .unwrap_or_else(|| panic!("split for {parent:?} not admitted within {within:?}"));
     }
 
+    /// The number of keepers drawn for a merge into `parent`, once the
+    /// beacon has paired it (both children hold a live half). `None` before
+    /// pairing.
+    pub fn merge_keeper_count(&self, parent: ShardId) -> Option<usize> {
+        self.beacon_state()
+            .and_then(|state| match state.pending_reshapes.get(&parent) {
+                Some(PendingReshape::Merge {
+                    keepers,
+                    admitted_at: Some(_),
+                    ..
+                }) => Some(keepers.len()),
+                _ => None,
+            })
+    }
+
+    /// Wait until the beacon pairs a merge into `parent` with exactly
+    /// `keepers` keepers drawn. Panics on timeout.
+    pub async fn await_merge_paired(&self, parent: ShardId, keepers: usize, within: Duration) {
+        self.poll(within, || {
+            self.merge_keeper_count(parent)
+                .filter(|count| *count == keepers)
+                .map(|_| ())
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "merge into {parent:?} did not pair {keepers} keepers within {within:?}; \
+                 latest keeper count = {:?}",
+                self.merge_keeper_count(parent)
+            )
+        });
+    }
+
     /// The beacon-composed anchor root for `shard` (hex of the
     /// `boundaries` `state_root`), to compare against a flipped shard's
     /// committed root.
