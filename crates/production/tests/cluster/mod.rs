@@ -48,15 +48,6 @@ const LISTEN_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence for the `await_*` observation polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Simulated one-way inter-host RTT injected on every outbound libp2p send.
-/// Zero-latency localhost lets a loadless committee form quorum certificates
-/// dozens of times a second — far faster than any real deployment — which
-/// floods this single-process harness and lags the consensus clock behind
-/// wall-clock. Pacing each send to a realistic delay throttles quorum
-/// formation to a few blocks a second so the beacon clock tracks wall-clock
-/// and reshape duties seat inside the real-time budget.
-const SIMULATED_OUTBOUND_LATENCY: Duration = Duration::from_millis(60);
-
 /// Graceful-shutdown budget per host on teardown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -106,6 +97,15 @@ pub struct ClusterSpec {
     /// production genesis (the liveness baseline needs no funded
     /// accounts).
     pub genesis_config: Option<GenesisConfig>,
+    /// Per-message outbound latency injected on every host's libp2p sends.
+    /// Zero-latency localhost lets a loadless committee form quorum
+    /// certificates dozens of times a second — far faster than any real
+    /// deployment — which floods this single-process harness and lags the
+    /// consensus clock behind wall-clock. A scenario whose reshape duties
+    /// must seat inside the real-time budget sets a realistic delay to pace
+    /// quorum formation to a few blocks a second; scenarios that only check
+    /// liveness leave it at [`Duration::ZERO`].
+    pub simulated_outbound_latency: Duration,
 }
 
 /// A running host: its network adapter, RPC status slot, beacon store,
@@ -137,6 +137,7 @@ impl Cluster {
             hosts,
             beacon_chain_config,
             genesis_config,
+            simulated_outbound_latency,
         } = spec;
         assert!(!hosts.is_empty(), "cluster needs at least one host");
 
@@ -163,6 +164,7 @@ impl Cluster {
                 beacon_chain_config: chain_config,
                 genesis_config: genesis_config.clone(),
                 bootstrap_peers,
+                simulated_outbound_latency,
             });
             if idx == 0 {
                 bootstrap_addr = Some(wait_for_listen_addr(&built_host.adapter).await);
@@ -447,6 +449,7 @@ struct BuildHostArgs<'a> {
     beacon_chain_config: BeaconChainConfig,
     genesis_config: Option<GenesisConfig>,
     bootstrap_peers: Vec<Multiaddr>,
+    simulated_outbound_latency: Duration,
 }
 
 /// Open a host's stores and build its runner (the adapter binds and
@@ -475,7 +478,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
     let network_config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: args.bootstrap_peers,
-        simulated_outbound_latency: SIMULATED_OUTBOUND_LATENCY,
+        simulated_outbound_latency: args.simulated_outbound_latency,
         ..Default::default()
     };
 

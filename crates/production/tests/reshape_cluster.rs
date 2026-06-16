@@ -65,6 +65,9 @@ async fn cluster_folds_epochs_and_commits_blocks() {
         ],
         beacon_chain_config: chain_config,
         genesis_config: None,
+        // No reshape duties to seat in real time; run at native localhost
+        // speed without simulated latency.
+        simulated_outbound_latency: Duration::ZERO,
     })
     .await;
 

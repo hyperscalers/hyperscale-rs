@@ -122,15 +122,16 @@ async fn beacon_chain_config_reaches_genesis() {
 /// until the beacon draws them as the observer cohort. The beacon admits
 /// the split, the observers snap-sync the children and signal ready, the
 /// readiness gate fires, the parent coasts to its terminal crossing, and
-/// the children seat from the beacon-composed anchors — all through the
-/// production `ShardSupervisor` duty chain and `RocksDbShardStorage` flips.
+/// the children seat from the beacon-composed anchors and commit past
+/// their genesis — all through the production `ShardSupervisor` duty chain
+/// and `RocksDbShardStorage` flips.
 ///
-/// Slow by nature: the split spans many real-time epochs (trigger fold,
-/// admission, observer sync, gate, terminal coast, child seating). Run
-/// explicitly with `--ignored`.
+/// Real-time and `#[serial]`: the split spans several wall-clock epochs
+/// (trigger fold, admission, observer sync, gate, terminal coast, child
+/// seating), so the simulated network latency paces ROOT to keep the
+/// consensus clock on wall-clock. Runs in tens of seconds.
 #[tokio::test]
 #[serial]
-#[ignore = "real-time split e2e: the simulated network latency now paces ROOT so the gate fires early and both children seat from the composed anchors, but the freshly seated children stall at their genesis — only the round proposer's coordinator runs while the other committee members receive no child consensus messages (a production-only runtime-joined-shard delivery gap the sim never hits). Stays ignored until that is fixed"]
 async fn split_seats_both_children_from_composed_anchors() {
     let _ = fmt().with_test_writer().try_init();
 
@@ -165,6 +166,13 @@ async fn split_seats_both_children_from_composed_anchors() {
             .collect(),
         beacon_chain_config: chain_config,
         genesis_config: None,
+        // Pace each outbound send to a realistic inter-host RTT. Without it
+        // the loadless committee forms quorum certificates dozens of times a
+        // second, floods this single-process harness, and lags the consensus
+        // clock behind wall-clock — so the gate and child seating miss the
+        // real-time budget. At ~60 ms ROOT commits a few blocks a second and
+        // the clock tracks wall-clock.
+        simulated_outbound_latency: Duration::from_millis(60),
     })
     .await;
 
