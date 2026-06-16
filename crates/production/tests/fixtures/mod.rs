@@ -2,9 +2,10 @@
 //!
 //! Provides deterministic test setup including key generation and topology construction.
 
-// Shared fixture surface consumed piecemeal across several test binaries
-// (`e2e_tests`, `reshape_e2e`); each compiles its own copy and exercises a
-// different subset, so unused helpers in any one binary aren't dead code.
+// Shared fixture surface consumed piecemeal across several production e2e
+// test binaries (the bind, runner, multi-vnode, and reshape suites); each
+// compiles its own copy and exercises a different subset, so unused helpers
+// in any one binary aren't dead code.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

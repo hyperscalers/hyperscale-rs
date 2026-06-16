@@ -45,11 +45,11 @@ fn vnode(fixtures: &TestFixtures, idx: u32, shard: ShardId) -> VnodeConfig {
 
 /// A custom `beacon_chain_config` threads through the builder into the
 /// committed beacon genesis state. This is the single production hook the
-/// rest of the suite depends on: the default path (every `e2e_tests.rs`
-/// test) leaves the setter unused and is unaffected, so a custom
+/// rest of the suite depends on: the default path (every other production
+/// e2e test) leaves the setter unused and is unaffected, so a custom
 /// `epoch_duration_ms` + reshape `split_bytes` reach the genesis state
 /// only when set explicitly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[serial]
 async fn beacon_chain_config_reaches_genesis() {
     let _ = fmt().with_test_writer().try_init();
@@ -129,8 +129,10 @@ async fn beacon_chain_config_reaches_genesis() {
 /// Real-time and `#[serial]`: the split spans several wall-clock epochs
 /// (trigger fold, admission, observer sync, gate, terminal coast, child
 /// seating), so the simulated network latency paces ROOT to keep the
-/// consensus clock on wall-clock. Runs in tens of seconds.
-#[tokio::test]
+/// consensus clock on wall-clock. Runs in tens of seconds on a
+/// multi-threaded runtime, matching the deployed host (a single-threaded
+/// test runtime serializing the eight hosts lags the fold).
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[serial]
 async fn split_seats_both_children_from_composed_anchors() {
     let _ = fmt().with_test_writer().try_init();

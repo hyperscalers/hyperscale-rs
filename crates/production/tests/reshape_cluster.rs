@@ -2,7 +2,7 @@
 //!
 //! Proves a multi-host production cluster can fold real beacon epochs and
 //! advance a shard committee's committed height in a real-time test. The
-//! `e2e_tests.rs` suite deliberately stops at construction + bind
+//! network and bind suites deliberately stop at construction + bind
 //! ("consensus exercised separately by the simulator"), so this is the
 //! first coverage that drives the `ProductionRunner` to commit a
 //! non-genesis block. No reshape here — the reshape scenarios in
@@ -42,7 +42,7 @@ fn vnode(fixtures: &TestFixtures, idx: u32, shard: ShardId) -> VnodeConfig {
 /// is the full validator set — a clean baseline with no pool surplus and
 /// reshaping disabled. Assert the beacon folds several epochs and the
 /// shard's committed height advances past genesis, both under timeout.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[serial]
 async fn cluster_folds_epochs_and_commits_blocks() {
     let _ = fmt().with_test_writer().try_init();
