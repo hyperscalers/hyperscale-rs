@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use hex::encode as hex_encode;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::rpc::NodeStatusState;
@@ -31,7 +32,10 @@ use hyperscale_production::{
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
-use hyperscale_types::{BeaconChainConfig, Epoch, ShardId, TopologySnapshot, shard_prefix_path};
+use hyperscale_types::{
+    BeaconChainConfig, BeaconState, Epoch, PendingReshape, ShardId, TopologySnapshot,
+    shard_prefix_path,
+};
 use libp2p::Multiaddr;
 use tempfile::TempDir;
 use tokio::task::{JoinHandle, spawn};
@@ -206,6 +210,132 @@ impl Cluster {
                     .collect::<Vec<_>>()
             })
             .max()
+    }
+
+    /// The hex-encoded committed JMT root observed for `shard` across all
+    /// hosts' RPC status (`state_root_hash`). All committee members converge
+    /// on the same root, so any one host's entry suffices; `None` until some
+    /// host reports a vnode in `shard`.
+    pub fn committed_state_root(&self, shard: ShardId) -> Option<String> {
+        let key = shard.inner();
+        self.hosts.iter().find_map(|h| {
+            h.rpc_status
+                .load()
+                .vnodes
+                .iter()
+                .find(|v| v.shard == key)
+                .map(|v| v.state_root_hash.clone())
+        })
+    }
+
+    /// Whether any host in the cluster currently serves `shard` — the
+    /// "the reshape seated this shard" signal (a split's children, the
+    /// merged parent).
+    pub fn any_host_serves(&self, shard: ShardId) -> bool {
+        self.hosts
+            .iter()
+            .any(|h| h.adapter.local_shards().contains(&shard))
+    }
+
+    /// The latest committed beacon state across all hosts (highest epoch) —
+    /// the source of truth for `pending_reshapes` (a split's admitted
+    /// cohort) and `boundaries` (the beacon-composed per-shard anchor a
+    /// flip must reproduce).
+    pub fn beacon_state(&self) -> Option<Arc<BeaconState>> {
+        self.hosts
+            .iter()
+            .filter_map(|h| h.beacon_storage.latest_committed())
+            .max_by_key(|(_, state)| state.current_epoch)
+            .map(|(_, state)| state)
+    }
+
+    /// Wait until any host serves `shard`. Panics on timeout.
+    pub async fn await_any_host_serves(&self, shard: ShardId, within: Duration) {
+        self.poll(within, || self.any_host_serves(shard).then_some(()))
+            .await
+            .unwrap_or_else(|| panic!("no host served {shard:?} within {within:?}"));
+    }
+
+    /// Whether the beacon has admitted a split for `parent` — a pending
+    /// `Split` record carrying the drawn observer cohort.
+    pub fn split_admitted(&self, parent: ShardId) -> bool {
+        self.beacon_state().is_some_and(|state| {
+            matches!(
+                state.pending_reshapes.get(&parent),
+                Some(PendingReshape::Split { .. })
+            )
+        })
+    }
+
+    /// Wait until the beacon admits a split for `parent`. Panics on timeout.
+    pub async fn await_split_admitted(&self, parent: ShardId, within: Duration) {
+        self.poll(within, || self.split_admitted(parent).then_some(()))
+            .await
+            .unwrap_or_else(|| panic!("split for {parent:?} not admitted within {within:?}"));
+    }
+
+    /// The beacon-composed anchor root for `shard` (hex of the
+    /// `boundaries` `state_root`), to compare against a flipped shard's
+    /// committed root.
+    pub fn anchor_root(&self, shard: ShardId) -> Option<String> {
+        self.beacon_state().and_then(|state| {
+            state
+                .boundaries
+                .get(&shard)
+                .map(|b| hex_encode(b.state_root.as_bytes()))
+        })
+    }
+
+    /// Wait until `shard`'s committed root matches the beacon-composed
+    /// anchor — the subtree-root-continuity check a flip must satisfy. The
+    /// adopted child seats at the composed root, so the two agree at the
+    /// child's genesis. Panics on timeout.
+    pub async fn await_root_matches_anchor(&self, shard: ShardId, within: Duration) {
+        self.poll(within, || {
+            let committed = self.committed_state_root(shard)?;
+            let anchor = self.anchor_root(shard)?;
+            (committed == anchor).then_some(())
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "{shard:?} committed root never matched the anchor within {within:?}; \
+                 committed = {:?}, anchor = {:?}",
+                self.committed_state_root(shard),
+                self.anchor_root(shard),
+            )
+        });
+    }
+
+    /// Assert `shard`'s committed height does not change over `window` —
+    /// the "this shard stopped" signal (a terminated split parent). Unlike
+    /// the `await_*` helpers this is a confirm-no-change check, so it sleeps
+    /// the full window rather than polling for a condition.
+    pub async fn assert_height_frozen(&self, shard: ShardId, window: Duration) {
+        let before = self.committed_height(shard);
+        sleep(window).await;
+        let after = self.committed_height(shard);
+        assert_eq!(
+            before, after,
+            "{shard:?} height changed from {before:?} to {after:?} over {window:?}; expected frozen"
+        );
+    }
+
+    /// Wait for `shard` to report a committed height and then advance past
+    /// it — proof the seated store + committee commit blocks. Returns the
+    /// advanced height. Panics on timeout.
+    pub async fn await_height_advances(&self, shard: ShardId, within: Duration) -> u64 {
+        let baseline = self
+            .poll(within, || self.committed_height(shard))
+            .await
+            .unwrap_or_else(|| panic!("{shard:?} reported no committed height within {within:?}"));
+        self.poll(within, || {
+            self.committed_height(shard).filter(|h| *h > baseline)
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!("{shard:?} height did not advance past {baseline} within {within:?}")
+        })
     }
 
     /// Highest committed beacon epoch across all hosts' beacon stores.
