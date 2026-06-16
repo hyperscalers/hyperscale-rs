@@ -16,8 +16,8 @@ use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, SettledWavesRoot,
-    ShardId, SplitChildRoots, StateRoot, TopologySnapshot, TransactionRoot, Verifiable, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp,
+    ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot,
+    Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1217,6 +1217,7 @@ impl VerificationPipeline {
         committed_hash: BlockHash,
         local_shard: ShardId,
         topology: &TopologySnapshot,
+        schedule: &TopologySchedule,
         count_source: SubstateCountSource<'_>,
     ) -> Vec<Action> {
         let header = block.header();
@@ -1226,7 +1227,7 @@ impl VerificationPipeline {
             header.parent_block_hash(),
             pending_blocks,
             local_shard,
-            topology,
+            schedule,
         ) {
             Ok(window) => window,
             Err(blocking_hash) => {
@@ -1436,6 +1437,7 @@ impl VerificationPipeline {
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology: &TopologySnapshot,
+        schedule: &TopologySchedule,
         local_shard: ShardId,
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
@@ -1509,6 +1511,7 @@ impl VerificationPipeline {
                 committed_hash,
                 local_shard,
                 topology,
+                schedule,
                 count_source,
             ));
         }
@@ -1907,13 +1910,20 @@ mod tests {
         }
     }
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot,
+        BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Epoch, Hash, LocalReceiptRoot,
         LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardId,
         SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
     use crate::pending::PendingBlock;
+
+    /// A single-entry schedule wrapping `snapshot` — the deferral tests
+    /// never reach a per-ancestor committee resolution (the walk stops at
+    /// the missing parent), so the grid contents are immaterial.
+    fn dummy_schedule(snapshot: &TopologySnapshot) -> TopologySchedule {
+        TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()))
+    }
 
     fn header(height: BlockHeight, parent_block_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader::new(
@@ -2183,6 +2193,7 @@ mod tests {
             BlockHash::ZERO,
             ShardId::ROOT,
             &topology,
+            &dummy_schedule(&topology),
             disabled_count_source(),
         );
 
@@ -2224,6 +2235,7 @@ mod tests {
                 BlockHash::ZERO,
                 ShardId::ROOT,
                 &topology,
+                &dummy_schedule(&topology),
                 disabled_count_source(),
             );
         }
@@ -2265,6 +2277,7 @@ mod tests {
             BlockHash::ZERO,
             ShardId::ROOT,
             &topology,
+            &dummy_schedule(&topology),
             disabled_count_source(),
         );
         assert!(vp.is_beacon_witness_deferred(child_hash));

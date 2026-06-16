@@ -1436,7 +1436,7 @@ impl ShardCoordinator {
             parent_block_hash,
             &self.pending_blocks,
             self.local_shard,
-            committee,
+            topology,
         )
         .unwrap_or_else(|blocking| {
             warn!(
@@ -2365,6 +2365,7 @@ impl ShardCoordinator {
             }
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
+                topology,
                 self.local_shard,
                 &self.pending_blocks,
                 &self.beacon_witness_accumulator,
@@ -3104,6 +3105,7 @@ impl ShardCoordinator {
                 self.committed_hash,
                 self.local_shard,
                 committee,
+                topology,
                 SubstateCountSource {
                     thresholds: topology.reshape_thresholds(),
                     frontier: self.substate_bytes_frontier,

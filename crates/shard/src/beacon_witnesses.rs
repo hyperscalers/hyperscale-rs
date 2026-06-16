@@ -14,7 +14,7 @@
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, Hash, ShardId, ShardWitnessPayload,
-    StoredReceipt, TopologySnapshot, compute_merkle_root, derive_leaves,
+    StoredReceipt, TopologySchedule, compute_merkle_root, derive_leaves,
     missed_proposals_since_prev_commit,
 };
 
@@ -144,28 +144,33 @@ impl BeaconWitnessAccumulator {
 /// Walks from `parent_block_hash` back through the pending chain to
 /// the committed tip, re-deriving each ancestor's witness-leaf delta
 /// from its receipts + manifest's `ready_signals` + missed-round scan,
-/// then prepends the committed accumulator's retained window. The
-/// derivation is byte-identical to what the proposer ran, so the
-/// returned window is exactly the input the verifier must apply the
-/// block's own new leaves to.
+/// then prepends the committed accumulator's retained window. Each
+/// ancestor's leaves resolve against *its own* committee — the schedule
+/// entry at the ancestor's `parent_qc.weighted_timestamp()`, matching the
+/// commit-time derivation (`committee_of_block`). A pending chain that
+/// straddles an epoch boundary therefore reproduces exactly what each
+/// block committed, rather than re-deriving an older epoch's
+/// missed-proposal leaves under the tip's committee. The result is the
+/// input the verifier applies the block's own new leaves to.
 ///
-/// Returns `Err(blocking_hash)` when the walk hits an ancestor that
-/// is either absent from `pending_blocks` or present but not yet
-/// assembled — the verifier can't compute a meaningful parent-leaf
-/// snapshot until that ancestor's data arrives. Callers defer the
-/// verification keyed on `blocking_hash` and retry once it becomes
-/// available.
+/// Returns `Err(blocking_hash)` when the walk hits an ancestor that is
+/// absent from `pending_blocks`, present but not yet assembled, or whose
+/// committee the local beacon schedule can't yet resolve — the snapshot
+/// is meaningless until that ancestor's data (or the beacon epoch behind
+/// it) arrives. Callers defer the verification keyed on `blocking_hash`
+/// and retry once it becomes available.
 ///
 /// # Errors
 ///
-/// `Err(blocking_hash)` for a missing or unassembled ancestor.
+/// `Err(blocking_hash)` for a missing or unassembled ancestor, or one
+/// whose committee is unresolvable in `schedule`.
 pub fn prospective_parent_witness_leaves(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
     parent_block_hash: BlockHash,
     pending_blocks: &PendingBlocks,
     local_shard: ShardId,
-    topology: &TopologySnapshot,
+    schedule: &TopologySchedule,
 ) -> Result<(BeaconWitnessLeafCount, Vec<Hash>), BlockHash> {
     let start_index = accumulator.start_index();
     let committed_leaves = accumulator.leaves();
@@ -182,6 +187,17 @@ pub fn prospective_parent_witness_leaves(
             return Err(current);
         };
         let header = block.header();
+        // This ancestor's leaves committed under its own committee — the
+        // schedule entry at its `parent_qc.weighted_timestamp()`. Resolving
+        // it per ancestor (rather than under the walk's tip committee) keeps
+        // a boundary-straddling pending chain byte-identical to what each
+        // block committed.
+        let Some((committee, _)) =
+            schedule.at_for_shard(local_shard, header.parent_qc().weighted_timestamp())
+        else {
+            return Err(current);
+        };
+        let committee = committee.as_ref();
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
@@ -192,11 +208,11 @@ pub fn prospective_parent_witness_leaves(
             header.height(),
             header.parent_qc().round(),
             header.round(),
-            topology,
+            committee,
         );
         let new_leaves = derive_leaves(
             local_shard,
-            topology,
+            committee,
             &receipts,
             &missed,
             pending.manifest().ready_signals().as_slice(),
