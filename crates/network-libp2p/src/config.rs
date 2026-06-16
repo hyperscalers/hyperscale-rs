@@ -68,6 +68,17 @@ pub struct Libp2pConfig {
     ///
     /// Default: Strict
     pub version_interop_mode: VersionInteroperabilityMode,
+
+    /// Artificial per-message delay applied on every outbound send path
+    /// (notifications, requests, and gossipsub publishes) before the frame
+    /// hits the wire.
+    ///
+    /// `Duration::ZERO` (the default) is a no-op, so production is
+    /// unaffected. It exists for localhost test clusters where zero network
+    /// latency lets consensus race far faster than any real deployment:
+    /// injecting a uniform one-way delay makes quorum-certificate formation
+    /// pace to round-trips the way real inter-host RTTs do.
+    pub simulated_outbound_latency: Duration,
 }
 
 /// Mode for version interoperability checks.
@@ -128,6 +139,7 @@ impl Default for Libp2pConfig {
             idle_connection_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(15),
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
+            simulated_outbound_latency: Duration::ZERO,
         }
     }
 }
@@ -203,6 +215,7 @@ impl Libp2pConfig {
             idle_connection_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(10),
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
+            simulated_outbound_latency: Duration::ZERO,
         }
     }
 
@@ -210,6 +223,13 @@ impl Libp2pConfig {
     #[must_use]
     pub const fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
         self.version_interop_mode = mode;
+        self
+    }
+
+    /// Set the simulated per-message outbound latency (test clusters only).
+    #[must_use]
+    pub const fn with_simulated_outbound_latency(mut self, latency: Duration) -> Self {
+        self.simulated_outbound_latency = latency;
         self
     }
 }

@@ -13,7 +13,7 @@
 //! period elapses.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures::AsyncWriteExt;
@@ -21,6 +21,7 @@ use hyperscale_metrics::record_libp2p_bandwidth;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::warn;
 
 use crate::adapter::Libp2pAdapter;
@@ -39,6 +40,12 @@ const PEER_CHANNEL_CAPACITY: usize = 256;
 struct PendingFrame {
     type_id: &'static str,
     compressed_data: Vec<u8>,
+    /// When the frame was enqueued. The actor holds it until
+    /// `queued_at + simulated latency`, so each frame leaves the wire a
+    /// fixed delay after it was produced — modelling propagation delay
+    /// without throttling drain rate (a burst still flushes back to back
+    /// once the delay elapses, so the bounded channel never backs up).
+    queued_at: TokioInstant,
 }
 
 /// Handle to a per-peer stream actor. Dropping the sender closes the channel,
@@ -60,15 +67,18 @@ pub struct NotifyStreamPool {
     backoff: Arc<DashMap<PeerId, BackoffState>>,
     /// Tokio runtime handle for spawning actor tasks.
     tokio_handle: Handle,
+    /// Per-frame outbound delay (`Duration::ZERO` in production).
+    latency: Duration,
 }
 
 impl NotifyStreamPool {
-    pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle) -> Self {
+    pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle, latency: Duration) -> Self {
         Self {
             adapter,
             peers: Arc::new(DashMap::new()),
             backoff: Arc::new(DashMap::new()),
             tokio_handle,
+            latency,
         }
     }
 
@@ -85,6 +95,7 @@ impl NotifyStreamPool {
         let frame = PendingFrame {
             type_id,
             compressed_data,
+            queued_at: TokioInstant::now(),
         };
 
         if let Err(frame_back) = try_enqueue_existing(&self.peers, &peer_id, frame) {
@@ -112,9 +123,10 @@ impl NotifyStreamPool {
         let peers = self.peers.clone();
         let backoff = self.backoff.clone();
         let adapter = self.adapter.clone();
+        let latency = self.latency;
 
         self.tokio_handle.spawn(async move {
-            Self::run_stream_actor(peer_id, frame_rx, adapter, peers, backoff).await;
+            Self::run_stream_actor(peer_id, frame_rx, adapter, peers, backoff, latency).await;
         });
     }
 
@@ -128,6 +140,7 @@ impl NotifyStreamPool {
         adapter: Arc<Libp2pAdapter>,
         peers: Arc<DashMap<PeerId, PeerStreamActor>>,
         backoff_map: Arc<DashMap<PeerId, BackoffState>>,
+        latency: Duration,
     ) {
         // Open the persistent stream.
         let mut stream = match adapter.open_notify_stream(peer_id).await {
@@ -145,6 +158,9 @@ impl NotifyStreamPool {
 
         // Read frames from channel and write to stream.
         while let Some(frame) = frame_rx.recv().await {
+            if !latency.is_zero() {
+                sleep_until(frame.queued_at + latency).await;
+            }
             match stream_framing::write_precompressed_typed_frame_no_close(
                 &mut stream,
                 frame.type_id,
@@ -211,6 +227,7 @@ mod tests {
         PendingFrame {
             type_id: "test.notify",
             compressed_data: vec![tag],
+            queued_at: TokioInstant::now(),
         }
     }
 

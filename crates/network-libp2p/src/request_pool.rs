@@ -123,18 +123,21 @@ pub struct RequestStreamPool {
     peers: Arc<DashMap<ActorKey, PeerRequestActor>>,
     backoff: Arc<DashMap<ActorKey, BackoffState>>,
     tokio_handle: Handle,
+    /// Per-request outbound delay (`Duration::ZERO` in production).
+    latency: Duration,
 }
 
 impl RequestStreamPool {
     /// Build an empty pool that lazily spawns one per-(peer,shard) request
     /// actor on demand.
     #[must_use]
-    pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle) -> Self {
+    pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle, latency: Duration) -> Self {
         Self {
             adapter,
             peers: Arc::new(DashMap::new()),
             backoff: Arc::new(DashMap::new()),
             tokio_handle,
+            latency,
         }
     }
 
@@ -215,9 +218,10 @@ impl RequestStreamPool {
         let peers = self.peers.clone();
         let backoff = self.backoff.clone();
         let adapter = self.adapter.clone();
+        let latency = self.latency;
 
         self.tokio_handle.spawn(async move {
-            Self::run_actor(key, req_rx, adapter, peers, backoff).await;
+            Self::run_actor(key, req_rx, adapter, peers, backoff, latency).await;
         });
 
         Ok(())
@@ -232,6 +236,7 @@ impl RequestStreamPool {
         adapter: Arc<Libp2pAdapter>,
         peers: Arc<DashMap<ActorKey, PeerRequestActor>>,
         backoff_map: Arc<DashMap<ActorKey, BackoffState>>,
+        latency: Duration,
     ) {
         let (peer, shard) = key;
         let mut stream = match adapter.open_request_stream(peer, shard).await {
@@ -261,6 +266,13 @@ impl RequestStreamPool {
                     break;
                 }
             };
+
+            // Hold the request for the simulated one-way delay before it hits
+            // the wire (test clusters only; `Duration::ZERO` in production).
+            // Outside the per-request I/O timeout so it doesn't eat that budget.
+            if !latency.is_zero() {
+                sleep(latency).await;
+            }
 
             let outcome = tokio_timeout(
                 req.timeout,

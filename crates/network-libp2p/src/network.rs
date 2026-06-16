@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use hyperscale_metrics::record_request_retry;
@@ -21,6 +22,7 @@ use hyperscale_types::{
 use libp2p::PeerId;
 use sbor::{basic_decode, basic_encode};
 use tokio::runtime::Handle;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adapter::Libp2pAdapter;
@@ -86,6 +88,9 @@ pub struct Libp2pNetwork {
     peer_unreachable_count: Arc<AtomicUsize>,
     /// Persistent per-peer notification stream pool.
     notify_pool: NotifyStreamPool,
+    /// Artificial outbound delay applied to gossipsub publishes, matching
+    /// the per-peer pools. `Duration::ZERO` in production.
+    simulated_outbound_latency: Duration,
     /// Inbound router handle — spawned eagerly at construction. Kept
     /// alive to prevent the background tasks from being aborted; also
     /// the seam for starting/stopping a shard's request accept loop on
@@ -104,13 +109,18 @@ impl Libp2pNetwork {
         tokio_handle: Handle,
         registry: Arc<HandlerRegistry>,
         topology: Arc<ArcSwap<TopologySnapshot>>,
+        simulated_outbound_latency: Duration,
     ) -> Self {
         // Eagerly spawn the inbound router. It will dispatch incoming
         // requests to handlers as they are registered in the registry.
         let _guard = tokio_handle.enter();
         let inbound_router = spawn_inbound_router(&adapter, registry.clone());
 
-        let notify_pool = NotifyStreamPool::new(adapter.clone(), tokio_handle.clone());
+        let notify_pool = NotifyStreamPool::new(
+            adapter.clone(),
+            tokio_handle.clone(),
+            simulated_outbound_latency,
+        );
 
         Self {
             adapter,
@@ -122,6 +132,7 @@ impl Libp2pNetwork {
             routing_committees: Arc::new(ArcSwap::from_pointee(RoutingCommittees::new())),
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
+            simulated_outbound_latency,
             inbound_router,
         }
     }
@@ -142,10 +153,25 @@ impl Libp2pNetwork {
     /// the swarm event loop.
     fn spawn_publish<M: GossipMessage + 'static>(&self, topic: Topic, message: M) {
         let adapter = Arc::clone(&self.adapter);
+        let latency = self.simulated_outbound_latency;
+        let handle = self.tokio_handle.clone();
         self.tokio_handle.spawn_blocking(move || {
             let data = compress(&basic_encode(&message).expect("SBOR encode failed"));
-            if let Err(e) = adapter.publish(&topic, data, M::class()) {
-                warn!(topic = %topic, error = ?e, "Libp2pNetwork: publish failed");
+            let publish = move || {
+                if let Err(e) = adapter.publish(&topic, data, M::class()) {
+                    warn!(topic = %topic, error = ?e, "Libp2pNetwork: publish failed");
+                }
+            };
+            if latency.is_zero() {
+                publish();
+            } else {
+                // Test clusters only: hold the encoded frame for the simulated
+                // one-way delay so gossip paces with the per-peer notify/request
+                // pools instead of racing at localhost speed.
+                handle.spawn(async move {
+                    sleep(latency).await;
+                    publish();
+                });
             }
         });
     }
