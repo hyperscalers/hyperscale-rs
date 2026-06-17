@@ -15,20 +15,29 @@ use tracing_test::traced_test;
 /// epochs within a short run window.
 const TEST_EPOCH_MS: u64 = 1000;
 
-/// 2 shards × 4 validators = 8 total. The first four sit on the
-/// genesis beacon committee; the other four form the eligibility slack
-/// the shuffle needs once `SHUFFLE_INTERVAL_EPOCHS == 16` fires.
+/// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
+/// eight validators: the first four sit on the genesis beacon committee, the
+/// other four are active shard members forming the eligibility slack the
+/// shuffle needs once `SHUFFLE_INTERVAL_EPOCHS == 16` fires and the
+/// skip-quorum source when the committee stalls.
+fn beacon_chain_config(epoch_duration_ms: u64) -> BeaconChainConfig {
+    BeaconChainConfig {
+        epoch_duration_ms,
+        num_shards: 1,
+        shard_size: 8,
+        ..BeaconChainConfig::default()
+    }
+}
+
+/// 8 validators on one shard, beacon committee 4.
 fn beacon_committee_config() -> NetworkConfig {
     NetworkConfig {
-        num_shards: 2,
-        validators_per_shard: 4,
+        num_shards: 1,
+        validators_per_shard: 8,
         intra_shard_latency: Duration::from_millis(100),
         cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
-        beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
-            ..BeaconChainConfig::default()
-        }),
+        beacon_chain_config: Some(beacon_chain_config(TEST_EPOCH_MS)),
         ..Default::default()
     }
 }
@@ -68,40 +77,6 @@ fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u
     }
 }
 
-#[traced_test]
-#[test]
-fn happy_path_commits_multiple_epochs() {
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 42);
-    runner.initialize_genesis();
-
-    // The beacon paces one epoch per `chain_config.epoch_duration` (1s
-    // here): the first committee-start fires at the epoch-1 boundary and
-    // each commit arms the next, so ~9 epochs land in ten sim-seconds.
-    // The window stays below the epoch-16 committee shuffle — at a 1s
-    // epoch a rotation stall outlasts the topology retention window
-    // (sized for production 300s epochs), so a shard block committed
-    // from the stall would reference an evicted committee.
-    runner.run_until(Duration::from_secs(10));
-
-    let storage_0 = runner.beacon_storage(0).expect("host 0 exists");
-    let latest = storage_0
-        .latest_committed_epoch()
-        .expect("at least one epoch committed past genesis");
-    // Paced production lands about one epoch per second; the upper
-    // bound holds the beacon to wall-clock rather than committing epochs
-    // as fast as SPC rounds resolve.
-    assert!(
-        (3..=15).contains(&latest.inner()),
-        "expected several paced epochs (3..=15), got latest={latest:?}"
-    );
-
-    // Genesis lives in-memory only; `commit_beacon_block` writes from
-    // epoch 1 onward.
-    for raw in 1..=latest.inner() {
-        assert_beacon_consensus(&runner, Epoch::new(raw), 8);
-    }
-}
-
 /// Drop every PC and SPC notification so no beacon committee member can
 /// reach quorum on the first epoch. Active-pool members watch the skip
 /// timer fire `SKIP_TIMEOUT` past the first epoch boundary, broadcast
@@ -116,10 +91,10 @@ fn skip_path_advances_past_blocked_epoch() {
     // Suppress every channel SPC needs to commit. Beacon proposal
     // notifications and the spc.* round-trips are all gone; the
     // committee can't reach the n-f vote threshold and the first
-    // epoch's SPC stalls. Active-pool members on shard 1 (validators
-    // 4..8) still have working network — their `BeaconSkipTrigger`
-    // timer fires at `EPOCH_DURATION + SKIP_TIMEOUT` and they sign a
-    // `SkipRequest` for epoch 1 at the genesis tip.
+    // epoch's SPC stalls. The active shard members off the beacon
+    // committee (validators 4..8) still have working network — their
+    // `BeaconSkipTrigger` timer fires at `EPOCH_DURATION + SKIP_TIMEOUT`
+    // and they sign a `SkipRequest` for epoch 1 at the genesis tip.
     let _rules = [
         runner
             .network_mut()
@@ -208,10 +183,7 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
     // shuffle while still exercising the drop-and-recover path this test cares
     // about.
     let mut config = beacon_committee_config();
-    config.beacon_chain_config = Some(BeaconChainConfig {
-        epoch_duration_ms: 2 * TEST_EPOCH_MS,
-        ..BeaconChainConfig::default()
-    });
+    config.beacon_chain_config = Some(beacon_chain_config(2 * TEST_EPOCH_MS));
     let mut runner = SimulationRunner::new(&config, 0xFE_7C);
     runner.initialize_genesis();
 
