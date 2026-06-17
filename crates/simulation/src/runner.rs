@@ -602,6 +602,27 @@ impl SimulationRunner {
         None
     }
 
+    /// Every live vnode on `shard`, across all hosts.
+    ///
+    /// Walks each host, keeps those that carry `shard`, and collects every
+    /// matching vnode's state machine. Use this — not host-indexed
+    /// [`Self::node`] — to assert over a committee after a split: a flip
+    /// leaves the terminated parent vnodes lingering on their hosts under the
+    /// parent shard, and a host seated cross-shard carries a second vnode that
+    /// host-indexing hides.
+    #[must_use]
+    pub fn shard_vnodes(&self, shard: ShardId) -> Vec<&NodeStateMachine> {
+        let mut vnodes = Vec::new();
+        for host in &self.hosts {
+            if host.hosted_shards().any(|s| s == shard) {
+                for v in 0..host.vnodes_len(shard) {
+                    vnodes.push(host.vnode_state(shard, v));
+                }
+            }
+        }
+        vnodes
+    }
+
     /// Host `node`'s current topology snapshot, or `None` if `node` is out of
     /// range.
     #[must_use]

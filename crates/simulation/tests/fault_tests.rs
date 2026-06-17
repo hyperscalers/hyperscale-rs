@@ -7,17 +7,20 @@
 //! 3. End-to-end liveness: submitted transactions reach a terminal
 //!    state on every node.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::{NetworkConfig, RuleHandle};
+use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TxHash,
+    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, NodeId, ReshapeThresholds,
+    RoutableTransaction, ShardId, TimestampRange, TxHash, ValidatorId, WeightedTimestamp,
     ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
     uniform_shard_for_node,
 };
@@ -50,13 +53,25 @@ fn single_shard_config() -> NetworkConfig {
     }
 }
 
-fn multi_shard_config() -> NetworkConfig {
+/// Single-shard genesis with the split trigger armed, short paced epochs, and
+/// one cohort of pooled extras — `grow_to(2)` drives it to two shards through
+/// the real split lifecycle, mirroring a network that launches single-shard
+/// and fans out under load.
+fn cross_shard_grow_config() -> NetworkConfig {
     NetworkConfig {
-        num_shards: 2,
+        num_shards: 1,
         validators_per_shard: 4,
         intra_shard_latency: Duration::from_millis(100),
         cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
+        beacon_chain_config: Some(BeaconChainConfig {
+            epoch_duration_ms: 2000,
+            num_shards: 1,
+            shard_size: 4,
+            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+            ..BeaconChainConfig::default()
+        }),
+        pool_extra_validators: 4,
         ..Default::default()
     }
 }
@@ -132,6 +147,47 @@ fn tx_reached_terminal_state(runner: &SimulationRunner, node_idx: u32, tx_hash: 
         || node.mempool_coordinator().is_tombstoned(&tx_hash)
 }
 
+/// As [`tx_reached_terminal_state`], but against one vnode's state machine
+/// directly — used to walk a grown shard's live committee via
+/// [`SimulationRunner::shard_vnodes`] rather than host-indexed nodes.
+fn vnode_reached_terminal_state(vnode: &NodeStateMachine, tx_hash: TxHash) -> bool {
+    vnode.execution_coordinator().is_finalized(tx_hash)
+        || vnode.mempool_coordinator().is_tombstoned(&tx_hash)
+}
+
+/// Poll the sim in one-second slices until every live committee member across
+/// `live_leaves` reaches a terminal outcome for `tx_hash`, or `deadline`
+/// passes. A successful tx finalizes and is then cleaned up (status returns to
+/// `None`), so latch the first terminal observation per validator rather than
+/// reading the post-cleanup state. Returns the validators ever observed
+/// terminal.
+fn await_all_terminal(
+    runner: &mut SimulationRunner,
+    live_leaves: &[ShardId],
+    tx_hash: TxHash,
+    deadline: Duration,
+) -> HashSet<ValidatorId> {
+    let mut latched: HashSet<ValidatorId> = HashSet::new();
+    while runner.now() < deadline {
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        let all_terminal = live_leaves.iter().all(|&leaf| {
+            runner.shard_vnodes(leaf).iter().all(|&vnode| {
+                if vnode_reached_terminal_state(vnode, tx_hash) {
+                    latched.insert(vnode.validator_id());
+                    true
+                } else {
+                    latched.contains(&vnode.validator_id())
+                }
+            })
+        });
+        if all_terminal {
+            break;
+        }
+    }
+    latched
+}
+
 #[traced_test]
 #[test]
 fn transaction_fetch_fallback_when_gossip_dropped() {
@@ -204,19 +260,24 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
     });
 }
 
-/// Run a multi-shard fault scenario end-to-end and assert universal
-/// recovery.
+/// Grow target every cross-shard fault scenario reaches before installing
+/// faults: genesis at one shard, split to two, then exercise cross-shard
+/// recovery between the children.
+const GROW_TARGET: u32 = 2;
+
+/// Run a cross-shard fault scenario end-to-end and assert universal recovery.
 ///
-/// Common shape across cross-shard fault tests: 2 shards × 3 validators,
-/// genesis-funded accounts on each shard, 1s warm-up, install faults,
-/// submit a withdraw-deposit cross-shard tx, run 30s, then assert:
+/// Genesis at one shard funds two accounts on ROOT, `grow_to(2)` splits them
+/// onto the two children by prefix, then faults install and a withdraw-deposit
+/// tx crosses between the children. Asserts:
 ///   - L1: every installed rule fired ≥ 1
 ///   - L2: for each `fetch_kind`, `fetch_started` / `fetch_completed` /
 ///     `fetch_items_sent` ≥ 1
-///   - L3: every validator reached terminal state for the tx, and
+///   - L3: every live committee member reached terminal state for the tx, and
 ///     `transactions_aborted == 0` across the system
 ///
-/// `install_faults` runs after warm-up so genesis can settle cleanly.
+/// `install_faults` runs after the grow so the split lifecycle settles cleanly
+/// on its own broadcasts before any are suppressed.
 fn run_cross_shard_fault_scenario<F>(install_faults: F, fetch_kinds: &[&'static str])
 where
     F: FnOnce(&mut SimulationRunner) -> Vec<RuleHandle>,
@@ -232,10 +293,12 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
     F: FnOnce(&mut SimulationRunner) -> Vec<RuleHandle>,
 {
     with_test_recorder(|recorder| {
-        let config = multi_shard_config();
-        let num_shards = u64::from(config.num_shards);
-        let mut runner = SimulationRunner::new(&config, seed);
+        let mut runner = SimulationRunner::new(&cross_shard_grow_config(), seed);
 
+        // Accounts route by prefix, which equals their post-grow shard; fund
+        // them on ROOT at genesis and the split partitions them across the
+        // children exactly as a multi-shard genesis once placed them.
+        let num_shards = u64::from(GROW_TARGET);
         let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(num_shards);
         let initial_balance = Decimal::from(10_000);
         runner.initialize_genesis_with_balances(&[
@@ -243,13 +306,22 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
             (acc_b, initial_balance),
         ]);
 
-        runner.run_until(Duration::from_secs(1));
+        runner.grow_to(GROW_TARGET);
+
         let rules = install_faults(&mut runner);
         assert!(
             !rules.is_empty(),
             "install_faults must return at least one rule handle"
         );
 
+        // A tx built after the grow must bracket the current weighted time:
+        // the genesis-anchored `test_validity_range()` (`[0, 1min]`) has long
+        // expired by the time the split lifecycle finishes.
+        let now = runner.now();
+        let validity = TimestampRange::new(
+            WeightedTimestamp::ZERO.plus(now.saturating_sub(Duration::from_secs(5))),
+            WeightedTimestamp::ZERO.plus(now + Duration::from_secs(150)),
+        );
         let manifest = ManifestBuilder::new()
             .lock_fee(acc_a, Decimal::from(10))
             .withdraw_from_account(acc_a, XRD, Decimal::from(500))
@@ -258,7 +330,7 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
         let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 200, &kp_a)
             .expect("sign tx");
         let tx: RoutableTransaction =
-            routable_from_notarized_v1(notarized, test_validity_range()).expect("valid tx");
+            routable_from_notarized_v1(notarized, validity).expect("valid tx");
         let tx_hash = tx.hash();
 
         let touched_shards: std::collections::BTreeSet<ShardId> = tx
@@ -272,13 +344,25 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
             "tx is not cross-shard: only touches {touched_shards:?}"
         );
 
+        // The grow shuffles validator placement, so submit on whichever host
+        // now carries the source account's shard rather than assuming node 0.
+        let depth = GROW_TARGET.trailing_zeros();
+        let live_leaves: Vec<ShardId> = (0..num_shards).map(|p| ShardId::leaf(depth, p)).collect();
+        let source_shard = ShardId::leaf(depth, 0);
+        let submit_host = (0..runner.num_hosts())
+            .find(|&node| runner.hosts_shard(node, source_shard).is_some())
+            .expect("a host carries the source shard");
         runner.schedule_initial_event(
-            0,
-            runner.now(),
+            submit_host,
+            Duration::ZERO,
             ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
 
-        runner.run_until(runner.now() + Duration::from_secs(30));
+        // Cross-shard recovery in the grown sim runs a few cleanup-timer
+        // fallback-fetch cycles, so poll until every live committee member
+        // reaches a terminal outcome rather than racing a fixed window.
+        let deadline = runner.now() + Duration::from_secs(150);
+        let latched = await_all_terminal(&mut runner, &live_leaves, tx_hash, deadline);
 
         // Layer 1: every installed rule actually intercepted at least one
         // message. Catches misconfigured matchers that silently match nothing.
@@ -314,14 +398,18 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
             );
         }
 
-        // Layer 3: every validator reaches terminal state for the tx, and
-        // the tx was successfully executed (not aborted).
-        let total_nodes = config.num_shards * config.validators_per_shard;
-        for node_idx in 0..total_nodes {
-            assert!(
-                tx_reached_terminal_state(&runner, node_idx, tx_hash),
-                "node {node_idx} did not reach terminal state for tx {tx_hash:?}",
-            );
+        // Layer 3: every live committee member reached a terminal outcome for
+        // the tx, and the tx was successfully executed (not aborted). Walk each
+        // leaf's live vnodes — the grow leaves terminated parent vnodes on
+        // hosts and seats observers cross-shard, so host-indexing misses some.
+        for &leaf in &live_leaves {
+            for vnode in runner.shard_vnodes(leaf) {
+                assert!(
+                    latched.contains(&vnode.validator_id()),
+                    "{:?} on {leaf:?} never reached a terminal outcome for tx {tx_hash:?}",
+                    vnode.validator_id(),
+                );
+            }
         }
         let aborts = recorder.counter("transactions_aborted", None);
         assert_eq!(
@@ -426,11 +514,11 @@ fn cross_shard_transaction_da_fallback_when_gossip_dropped() {
     );
 }
 
-/// Time-bounded fault: `provisions.broadcast` drops during a 5s window
-/// shortly after the cross-shard tx is submitted, then the fault lifts.
-/// The cross-shard tx falls inside the fault window and must recover via
-/// the fetch fallback. Once the fault lifts, subsequent provision
-/// broadcasts flow normally.
+/// Time-bounded fault: `provisions.broadcast` drops during a 30s window
+/// from submission, then the fault lifts. The window must outlast the
+/// grown shard's commit-then-broadcast latency so the tx's provision
+/// broadcast actually falls inside it and recovers via the fetch fallback;
+/// once the fault lifts, subsequent provision broadcasts flow normally.
 ///
 /// Exercises the `during(range)` matcher on `FaultInjector` and confirms
 /// the system gracefully resumes normal flow after a transient gossip
@@ -445,7 +533,7 @@ fn cross_shard_provisions_recovers_after_transient_broadcast_outage() {
                     .network_mut()
                     .fault()
                     .drop_type("provisions.broadcast")
-                    .during(now..now + Duration::from_secs(5))
+                    .during(now..now + Duration::from_secs(30))
                     .install(),
             ]
         },
