@@ -183,12 +183,18 @@ pub use transaction::constructors::{
     routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,
 };
 pub use transaction::limits::{MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN};
-pub use transaction::notarize::{sign_and_notarize, sign_and_notarize_with_options};
+pub use transaction::notarize::{
+    NotarizeOptions, sign_and_notarize, sign_and_notarize_with_options,
+};
 pub use transaction::routable::{
     RoutableTransaction, RoutableTransactionContext, RoutableTransactionVerifyError,
 };
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
+};
+pub use transaction::system_action::{
+    SYSTEM_ACTION_TAG, decode_system_action, encode_system_action, plaintext_message_bytes,
+    system_action,
 };
 pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::{

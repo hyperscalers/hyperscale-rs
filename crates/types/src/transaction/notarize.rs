@@ -12,6 +12,34 @@ use radix_transactions::prelude::{PreparationSettings, TransactionManifestV1};
 
 use crate::TransactionError;
 
+/// Optional transaction header parameters for
+/// [`sign_and_notarize_with_options`].
+///
+/// [`Default`] mirrors the values [`sign_and_notarize`] uses: no tip, the
+/// genesis epoch start, the ~100-epoch Radix validity ceiling, and no message.
+pub struct NotarizeOptions {
+    /// Tip percentage offered to the proposer.
+    pub tip_percentage: u16,
+    /// First epoch the transaction is valid in.
+    pub start_epoch: Epoch,
+    /// First epoch the transaction is no longer valid in.
+    pub end_epoch: Epoch,
+    /// Message carried in the intent — a system action rides here.
+    pub message: MessageV1,
+}
+
+impl Default for NotarizeOptions {
+    fn default() -> Self {
+        Self {
+            tip_percentage: 0,
+            start_epoch: Epoch::of(0),
+            // Radix caps the validity range at ~100 epochs.
+            end_epoch: Epoch::of(100),
+            message: MessageV1::None,
+        }
+    }
+}
+
 /// Sign and notarize a transaction manifest.
 ///
 /// This takes a pre-built manifest and signs it with the provided keypair,
@@ -36,15 +64,7 @@ pub fn sign_and_notarize(
     nonce: u32,
     signer: &Ed25519PrivateKey,
 ) -> Result<NotarizedTransactionV1, TransactionError> {
-    sign_and_notarize_with_options(
-        manifest,
-        network,
-        nonce,
-        0,              // tip_percentage
-        Epoch::of(0),   // start_epoch
-        Epoch::of(100), // end_epoch (Radix has ~100 epoch max range)
-        signer,
-    )
+    sign_and_notarize_with_options(manifest, network, nonce, NotarizeOptions::default(), signer)
 }
 
 /// Sign and notarize a transaction manifest with full options.
@@ -61,11 +81,15 @@ pub fn sign_and_notarize_with_options(
     manifest: TransactionManifestV1,
     network: &NetworkDefinition,
     nonce: u32,
-    tip_percentage: u16,
-    start_epoch: Epoch,
-    end_epoch: Epoch,
+    options: NotarizeOptions,
     signer: &Ed25519PrivateKey,
 ) -> Result<NotarizedTransactionV1, TransactionError> {
+    let NotarizeOptions {
+        tip_percentage,
+        start_epoch,
+        end_epoch,
+        message,
+    } = options;
     let (instructions, blobs) = manifest.for_intent();
     let notary_public_key = PublicKey::Ed25519(signer.public_key());
 
@@ -81,7 +105,7 @@ pub fn sign_and_notarize_with_options(
         },
         instructions,
         blobs,
-        message: MessageV1::None,
+        message,
     };
 
     // Prepare and sign the intent

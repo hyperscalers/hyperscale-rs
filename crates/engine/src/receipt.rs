@@ -15,9 +15,9 @@
 use std::collections::{HashMap, HashSet};
 
 use hyperscale_types::{
-    ApplicationEvent, BeaconWitnessRoot, ConsensusReceipt, EventData, EventRoot, ExecutionMetadata,
-    FeeSummary, GlobalReceipt, GlobalReceiptHash, Hash, LogLevel, NodeId, RoutableTransaction,
-    ShardId, ShardTrie, TxHash, compute_merkle_root,
+    ApplicationEvent, BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, EventData,
+    EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, GlobalReceiptHash, Hash, LogLevel,
+    NodeId, RoutableTransaction, ShardId, ShardTrie, TxHash, compute_merkle_root, system_action,
 };
 use radix_engine::transaction::{
     CommitResult, TransactionOutcome, TransactionReceipt, TransactionResult,
@@ -68,6 +68,12 @@ enum CachedVmOutputBody {
         declared_set: HashSet<NodeId>,
         application_events: Vec<ApplicationEvent>,
         receipt_hash: GlobalReceiptHash,
+        /// A beacon action the transaction carried in its plaintext message,
+        /// paired with the node that routes its emission (the transaction's
+        /// lowest declared write). [`project_to_shard`] lifts it into
+        /// `beacon_witness_events` only on the shard owning that node, so a
+        /// committed system transaction reports the action exactly once.
+        system_witness: Option<(NodeId, BeaconWitnessEvent)>,
     },
 }
 
@@ -191,6 +197,16 @@ pub fn compute_vm_output(
     )
     .receipt_hash();
 
+    // A system transaction carries a beacon action in its plaintext message;
+    // committing it successfully reports the action to the beacon. The lowest
+    // declared write anchors the emission to a single shard. Only the success
+    // path reaches here, so a transaction that fails to pay its fee reports
+    // nothing.
+    let system_witness = system_action(tx.transaction()).and_then(|event| {
+        let anchor = tx.declared_writes().iter().copied().min()?;
+        Some((anchor, event))
+    });
+
     CachedVmOutput {
         metadata,
         body: CachedVmOutputBody::Succeeded {
@@ -198,6 +214,7 @@ pub fn compute_vm_output(
             declared_set,
             application_events,
             receipt_hash,
+            system_witness,
         },
     }
 }
@@ -229,6 +246,7 @@ pub fn project_to_shard(
             declared_set,
             application_events,
             receipt_hash,
+            system_witness,
         } => {
             let mut database_updates = filter_updates_for_shard(
                 raw_updates,
@@ -245,12 +263,20 @@ pub fn project_to_shard(
             // build owner-prefixes their leaves identically on executor,
             // verifier, and syncer without rediscovering ownership.
             let owned_nodes = owned_nodes_in_updates(&database_updates, ownership).into();
+            // The shard owning the action's anchor node emits its witness; every
+            // other participating shard emits none, so the beacon folds it once.
+            let beacon_witness_events = match system_witness {
+                Some((anchor, event)) if shard_trie.shard_for(anchor) == local_shard => {
+                    vec![event.clone()]
+                }
+                _ => Vec::new(),
+            };
             let consensus = ConsensusReceipt::Succeeded {
                 receipt_hash: *receipt_hash,
                 database_updates,
                 owned_nodes,
                 application_events: application_events.clone(),
-                beacon_witness_events: Vec::new(),
+                beacon_witness_events,
             };
             ExecutedTx::new(tx_hash, consensus, cached.metadata.clone())
         }
@@ -339,6 +365,7 @@ mod tests {
     use radix_engine::transaction::{
         AbortReason, AbortResult, RejectResult, TransactionOutcome as RadixTransactionOutcome,
     };
+    use radix_transactions::model::MessageV1;
 
     use super::*;
 
@@ -447,5 +474,147 @@ mod tests {
         let updates = extract_database_updates(&receipt);
 
         assert!(updates.node_updates.is_empty());
+    }
+
+    fn deposit_event() -> BeaconWitnessEvent {
+        use hyperscale_types::{Stake, StakePoolId};
+        BeaconWitnessEvent::StakeDeposit {
+            pool_id: StakePoolId::new(3),
+            amount: Stake::from_whole_tokens(500),
+        }
+    }
+
+    fn tagged_message(event: &BeaconWitnessEvent) -> MessageV1 {
+        use hyperscale_types::encode_system_action;
+        use radix_transactions::model::{MessageContentsV1, PlaintextMessageV1};
+        MessageV1::Plaintext(PlaintextMessageV1 {
+            mime_type: "application/octet-stream".to_string(),
+            message: MessageContentsV1::Bytes(encode_system_action(event)),
+        })
+    }
+
+    /// A `lock_fee` no-op transaction carrying `message`, routed by the payer
+    /// account it locks fees from.
+    fn lock_fee_tx(message: MessageV1) -> RoutableTransaction {
+        use std::time::Duration;
+
+        use hyperscale_types::{
+            NotarizeOptions, TimestampRange, WeightedTimestamp, routable_from_notarized_v1,
+            sign_and_notarize_with_options,
+        };
+        use radix_common::crypto::Ed25519PrivateKey;
+        use radix_common::math::Decimal;
+        use radix_common::network::NetworkDefinition;
+        use radix_common::types::ComponentAddress;
+        use radix_transactions::builder::ManifestBuilder;
+
+        let key = Ed25519PrivateKey::from_u64(1).unwrap();
+        let payer = ComponentAddress::preallocated_account_from_public_key(&key.public_key());
+        let manifest = ManifestBuilder::new()
+            .lock_fee(payer, Decimal::from(10))
+            .build();
+        let notarized = sign_and_notarize_with_options(
+            manifest,
+            &NetworkDefinition::simulator(),
+            1,
+            NotarizeOptions {
+                message,
+                ..Default::default()
+            },
+            &key,
+        )
+        .unwrap();
+        let validity = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO.plus(Duration::from_mins(1)),
+        );
+        routable_from_notarized_v1(notarized, validity).unwrap()
+    }
+
+    fn witness_events(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
+        match &executed.consensus {
+            ConsensusReceipt::Succeeded {
+                beacon_witness_events,
+                ..
+            } => beacon_witness_events.clone(),
+            ConsensusReceipt::Failed => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn system_tx_emits_witness_on_its_shard() {
+        let event = deposit_event();
+        let tx = lock_fee_tx(tagged_message(&event));
+        let cached = compute_vm_output(
+            &tx,
+            &TransactionReceipt::empty_commit_success(),
+            &HashMap::new(),
+        );
+        let executed = project_to_shard(
+            &cached,
+            tx.hash(),
+            ShardId::ROOT,
+            &ShardTrie::single(),
+            &HashMap::new(),
+        );
+        assert_eq!(witness_events(&executed), vec![event]);
+    }
+
+    #[test]
+    fn ordinary_tx_emits_no_witness() {
+        let tx = lock_fee_tx(MessageV1::None);
+        let cached = compute_vm_output(
+            &tx,
+            &TransactionReceipt::empty_commit_success(),
+            &HashMap::new(),
+        );
+        let executed = project_to_shard(
+            &cached,
+            tx.hash(),
+            ShardId::ROOT,
+            &ShardTrie::single(),
+            &HashMap::new(),
+        );
+        assert!(witness_events(&executed).is_empty());
+    }
+
+    #[test]
+    fn failed_system_tx_emits_no_witness() {
+        let tx = lock_fee_tx(tagged_message(&deposit_event()));
+        let cached = compute_vm_output(&tx, &make_reject_receipt(), &HashMap::new());
+        let executed = project_to_shard(
+            &cached,
+            tx.hash(),
+            ShardId::ROOT,
+            &ShardTrie::single(),
+            &HashMap::new(),
+        );
+        assert!(matches!(executed.consensus, ConsensusReceipt::Failed));
+    }
+
+    #[test]
+    fn system_tx_emits_on_exactly_one_shard() {
+        let event = deposit_event();
+        let tx = lock_fee_tx(tagged_message(&event));
+        let trie = ShardTrie::uniform_from_count(2);
+        let anchor = *tx
+            .declared_writes()
+            .iter()
+            .min()
+            .expect("lock_fee declares the faucet as a write");
+        let owner = trie.shard_for(&anchor);
+        let other = owner
+            .sibling()
+            .expect("a uniform 2-shard leaf has a sibling");
+
+        let cached = compute_vm_output(
+            &tx,
+            &TransactionReceipt::empty_commit_success(),
+            &HashMap::new(),
+        );
+        let on_owner = project_to_shard(&cached, tx.hash(), owner, &trie, &HashMap::new());
+        let on_other = project_to_shard(&cached, tx.hash(), other, &trie, &HashMap::new());
+        assert_eq!(witness_events(&on_owner), vec![event]);
+        assert!(witness_events(&on_other).is_empty());
     }
 }

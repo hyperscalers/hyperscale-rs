@@ -9,6 +9,7 @@
 //!   (private helpers used by [`constructors`]).
 //! - [`notarize`]: helpers for signing and notarizing a `TransactionManifestV1`.
 //! - [`limits`]: per-transaction wire-limit constants.
+//! - [`system_action`]: beacon actions carried in a transaction's plaintext message.
 
 pub mod constructors;
 pub mod limits;
@@ -16,3 +17,4 @@ mod manifest_analysis;
 pub mod notarize;
 pub mod routable;
 pub mod status;
+pub mod system_action;
