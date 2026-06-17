@@ -22,6 +22,7 @@ hyperscale-dispatch-sync.workspace = true
 
 # Radix dependencies for real execution
 radix-common.workspace = true
+radix-transactions.workspace = true
 
 arc-swap.workspace = true
 crossbeam.workspace = true
@@ -30,9 +31,6 @@ rand.workspace = true
 rand_chacha.workspace = true
 
 [dev-dependencies]
-
-# Radix dependencies for e2e tests
-radix-transactions.workspace = true
 
 # Re-import types crate with the test-utils feature so tests can share
 # `test_validity_range()` rather than redefining it per test file.

@@ -48,6 +48,7 @@ pub mod merge;
 pub mod observer;
 pub mod relocation;
 mod split;
+pub mod system_action;
 
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
