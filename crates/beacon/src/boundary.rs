@@ -77,16 +77,20 @@ pub fn proposal_boundary_qcs_admissible(
 /// observed crossing whose chunk hasn't fetched yet — are absent; one
 /// honest reporter is enough to mark a shard live, so partial coverage is
 /// fine.
+///
+/// A terminated shard's record lingers past its final epoch — to carry the
+/// terminal contribution to the fold and project its settled-waves root —
+/// so its terminal crossing stays sourced until the fold consumes it. Once
+/// a split parent's terminal has folded (the boundary record names it, its
+/// children seeded), re-sourcing only forces every beacon member that never
+/// synced the dead parent to abstain on the whole proposal, so it stops. A
+/// merge child keeps sourcing its folded terminal: the parent composes only
+/// when both children's terminals are recorded in one fold.
 #[must_use]
 pub fn source_boundary_qcs(
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
 ) -> BTreeMap<ShardId, Option<QuorumCertificate>> {
-    // Active shards, plus terminated shards whose boundary records still
-    // linger: a split parent leaves the committee map at the promotion
-    // after its final epoch, but its terminal contribution (which seeds
-    // the children) and any witness backlog still need to reach the fold.
-    // The record drops once both have, ending the sourcing.
     let sourced: BTreeSet<ShardId> = state
         .shard_committees
         .keys()
@@ -104,6 +108,14 @@ pub fn source_boundary_qcs(
         .filter_map(|shard| {
             let crossing = shard_source.latest_crossing(shard)?;
             let qc = crossing.canonical_qc();
+            let split_parent_terminal = crossing.boundary_header().split_child_roots().is_some();
+            let folded = state
+                .boundaries
+                .get(&shard)
+                .is_some_and(|b| b.terminal_epoch.is_some() && b.block_hash == qc.block_hash());
+            if split_parent_terminal && folded {
+                return None;
+            }
             let (prior, chunk_end) =
                 rules::witness_chunk_bounds(state, shard, crossing.boundary_header());
             // Coupling: only report a shard whose chunk we can supply.
