@@ -195,6 +195,26 @@ impl ShardSourceTracker {
         (prior..chunk_end).all(|leaf| map.contains_key(&LeafIndex::new(leaf)))
     }
 
+    /// The leaves of `[prior, chunk_end)` anchored to `anchor` not yet
+    /// held. Unlike [`register_pending_fetch`](Self::register_pending_fetch),
+    /// this ignores in-flight status, so a re-drive can re-request a leaf
+    /// whose earlier fetch response never landed — otherwise it stays
+    /// pinned in `pending_fetches` and the chunk never completes.
+    #[must_use]
+    pub fn missing_chunk_leaves(
+        &self,
+        shard: ShardId,
+        anchor: BlockHash,
+        prior: u64,
+        chunk_end: u64,
+    ) -> Vec<LeafIndex> {
+        let held = self.witness_chunks.get(&(shard, anchor));
+        (prior..chunk_end)
+            .map(LeafIndex::new)
+            .filter(|li| held.is_none_or(|m| !m.contains_key(li)))
+            .collect()
+    }
+
     /// The contiguous witness chunk `[prior, chunk_end)` anchored to
     /// `anchor`, in leaf-index order, or `None` if any leaf in the range
     /// isn't held yet (the assembler defers). An empty range

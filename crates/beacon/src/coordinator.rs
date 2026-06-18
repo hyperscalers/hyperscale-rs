@@ -1425,6 +1425,61 @@ impl BeaconCoordinator {
         })]
     }
 
+    /// Re-issue witness-chunk fetches for terminated shards whose terminal
+    /// crossing hasn't folded yet.
+    ///
+    /// A terminated shard emits no new source header, so
+    /// [`fetch_witness_chunk`](Self::fetch_witness_chunk) — driven off header
+    /// observation — never re-issues for it. A leaf whose first fetch
+    /// response never landed then stays pinned in the tracker's in-flight
+    /// set, the terminal chunk never completes, and the fold that seeds a
+    /// split's children or composes a merge's parent never runs. Re-sending
+    /// for the still-missing leaves each commit breaks that pin; once the
+    /// chunk folds the boundary advances its watermark and the terminal
+    /// record drops, ending the re-drive.
+    fn redrive_terminal_witness_fetches(&mut self) -> Vec<Action> {
+        if !self.is_on_committee() {
+            return Vec::new();
+        }
+        let terminals: Vec<ShardId> = self
+            .state
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.terminal_epoch.is_some())
+            .map(|(shard, _)| *shard)
+            .collect();
+        let mut actions = Vec::new();
+        for shard in terminals {
+            let Some(crossing) = self.shard_source.latest_crossing(shard) else {
+                continue;
+            };
+            let anchor = crossing.canonical_qc().block_hash();
+            let block_height = crossing.boundary_header().height();
+            let (prior, chunk_end) =
+                rules::witness_chunk_bounds(&self.state, shard, crossing.boundary_header());
+            let window_end = chunk_end.min(prior.saturating_add(MAX_WITNESSES_PER_FETCH as u64));
+            let missing = self
+                .shard_source
+                .missing_chunk_leaves(shard, anchor, prior, window_end);
+            if missing.is_empty() {
+                continue;
+            }
+            for &leaf in &missing {
+                self.shard_source
+                    .register_pending_fetch(shard, block_height, anchor, leaf);
+            }
+            actions.push(Action::Fetch(FetchRequest::ShardWitnesses {
+                source_shard: shard,
+                block_height,
+                committed_block_hash: anchor,
+                leaf_indices: missing,
+                preferred: None,
+                class: None,
+            }));
+        }
+        actions
+    }
+
     /// Advance `self.state` / `self.latest_block` to `block` after
     /// running `apply_epoch` over its committed proposals. Resets
     /// per-epoch caches, bootstraps next epoch's SPC if local is on
@@ -1553,6 +1608,7 @@ impl BeaconCoordinator {
                 ids: abandoned_witness_ids,
             }));
         }
+        actions.extend(self.redrive_terminal_witness_fetches());
 
         // Self-perpetuate the next epoch's SPC, but only once wall-clock has
         // reached its boundary. While the beacon is behind real time (catch-up
