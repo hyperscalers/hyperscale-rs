@@ -50,6 +50,28 @@ use crate::sim_network::{
 };
 use crate::traffic::NetworkTrafficAnalyzer;
 
+/// Modeled time the production `RequestManager` spends before it surfaces a
+/// failure for a peer that never answers (partition, packet loss, a dropping
+/// fault rule). The libp2p transport makes up to `MODELED_RETRY_ATTEMPTS`
+/// attempts across rotated peers, each bounded by a stream timeout and spaced
+/// by exponential backoff (100ms→500ms), before returning
+/// [`RequestError::Exhausted`]. Charging that latency here is what gives the
+/// sim parity with the transport: a failed request costs simulated time, so a
+/// persistently failing fetch re-dispatches on a real cadence instead of
+/// spinning at zero delay — which, under the single-clock event loop, freezes
+/// time outright.
+const REQUEST_FAILURE_LATENCY: Duration = Duration::from_secs(5);
+
+/// Modeled time to discover the target committee is empty. The transport
+/// returns [`RequestError::NoPeers`] without attempting a send, so this is
+/// short — but still positive so a node re-requesting an unpopulated committee
+/// paces itself rather than spinning the clock.
+const NO_PEERS_LATENCY: Duration = Duration::from_millis(200);
+
+/// Attempt count reported on a modeled [`RequestError::Exhausted`], mirroring
+/// `RequestManagerConfig::max_total_attempts` in the libp2p transport.
+const MODELED_RETRY_ATTEMPTS: u32 = 15;
+
 /// How simulated validators are bundled into hosts (`IoLoop` instances).
 ///
 /// See [`NetworkConfig::hosting_mode`].
@@ -245,15 +267,17 @@ impl Scheduled for ScheduledNotification {
 
 /// A request-response callback scheduled for future delivery.
 ///
-/// The handler was already invoked at accept-time (it's a data lookup);
-/// only the callback delivery is delayed to model round-trip latency.
+/// Both outcomes are deferred to model transport latency: a success carries
+/// the bytes the handler produced at accept-time (a data lookup), while a
+/// failure carries the [`RequestError`] the production `RequestManager` would
+/// surface only after spending its retry budget.
 struct ScheduledResponse {
     delivery_time: Duration,
     sequence: u64,
     #[allow(dead_code)]
     requester_node: NodeIndex,
     on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
-    response: Vec<u8>,
+    result: Result<Vec<u8>, RequestError>,
 }
 
 impl PartialEq for ScheduledResponse {
@@ -728,40 +752,66 @@ impl SimulatedNetwork {
                 if let Some(&p) = shuffled.first() {
                     p
                 } else {
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                        u64::from(requester),
-                    ))));
+                    // No committee member to try: the transport returns
+                    // `NoPeers` without a send, so surface it after only the
+                    // short discovery delay.
+                    self.schedule_response(
+                        now,
+                        NO_PEERS_LATENCY,
+                        requester,
+                        Err(RequestError::NoPeers),
+                        on_response,
+                    );
                     continue;
                 }
             };
 
-            // Partition check — immediate error.
+            // Partition check — the peer never answers, so the transport
+            // burns its retry budget before surfacing `Exhausted`.
             if self.is_partitioned(requester, peer) {
                 stats.messages_dropped_partition += 1;
                 trace!(requester, peer, "Request dropped: partition");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                    u64::from(peer),
-                ))));
+                self.schedule_response(
+                    now,
+                    REQUEST_FAILURE_LATENCY,
+                    requester,
+                    Err(RequestError::Exhausted {
+                        attempts: MODELED_RETRY_ATTEMPTS,
+                    }),
+                    on_response,
+                );
                 continue;
             }
 
-            // Packet loss (request direction) — immediate error.
+            // Packet loss (request direction) — no answer, transport exhausts.
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Request dropped: packet loss");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                    u64::from(peer),
-                ))));
+                self.schedule_response(
+                    now,
+                    REQUEST_FAILURE_LATENCY,
+                    requester,
+                    Err(RequestError::Exhausted {
+                        attempts: MODELED_RETRY_ATTEMPTS,
+                    }),
+                    on_response,
+                );
                 continue;
             }
 
-            // Packet loss (response direction) — immediate error.
+            // Packet loss (response direction) — no answer, transport exhausts.
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Response dropped: packet loss");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                    u64::from(peer),
-                ))));
+                self.schedule_response(
+                    now,
+                    REQUEST_FAILURE_LATENCY,
+                    requester,
+                    Err(RequestError::Exhausted {
+                        attempts: MODELED_RETRY_ATTEMPTS,
+                    }),
+                    on_response,
+                );
                 continue;
             }
 
@@ -779,9 +829,15 @@ impl SimulatedNetwork {
                 Decision::Drop => {
                     stats.messages_dropped_fault += 1;
                     trace!(requester, peer, type_id, "Request dropped: fault rule");
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                        u64::from(peer),
-                    ))));
+                    self.schedule_response(
+                        now,
+                        REQUEST_FAILURE_LATENCY,
+                        requester,
+                        Err(RequestError::Exhausted {
+                            attempts: MODELED_RETRY_ATTEMPTS,
+                        }),
+                        on_response,
+                    );
                     continue;
                 }
                 Decision::Pass => Duration::ZERO,
@@ -802,9 +858,15 @@ impl SimulatedNetwork {
                 Decision::Drop => {
                     stats.messages_dropped_fault += 1;
                     trace!(requester, peer, type_id, "Response dropped: fault rule");
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
-                        u64::from(peer),
-                    ))));
+                    self.schedule_response(
+                        now,
+                        REQUEST_FAILURE_LATENCY,
+                        requester,
+                        Err(RequestError::Exhausted {
+                            attempts: MODELED_RETRY_ATTEMPTS,
+                        }),
+                        on_response,
+                    );
                     continue;
                 }
                 Decision::Pass => Duration::ZERO,
@@ -832,9 +894,17 @@ impl SimulatedNetwork {
                 .get(peer as usize)
                 .and_then(|r| r.get_request(type_id, shard))
             else {
-                let _ = on_response(Err(RequestError::PeerError(format!(
-                    "no handler for {type_id} on node {peer}"
-                ))));
+                // Peer answered with an application-level error; the transport
+                // rotates and exhausts before surfacing it.
+                self.schedule_response(
+                    now,
+                    REQUEST_FAILURE_LATENCY,
+                    requester,
+                    Err(RequestError::PeerError(format!(
+                        "no handler for {type_id} on node {peer}"
+                    ))),
+                    on_response,
+                );
                 continue;
             };
 
@@ -842,9 +912,15 @@ impl SimulatedNetwork {
             let response_bytes = handler(&request_bytes);
 
             if response_bytes.is_empty() {
-                let _ = on_response(Err(RequestError::PeerError(
-                    "handler returned empty response".to_string(),
-                )));
+                self.schedule_response(
+                    now,
+                    REQUEST_FAILURE_LATENCY,
+                    requester,
+                    Err(RequestError::PeerError(
+                        "handler returned empty response".to_string(),
+                    )),
+                    on_response,
+                );
                 continue;
             }
 
@@ -865,17 +941,33 @@ impl SimulatedNetwork {
                 );
             }
 
-            self.response_sequence += 1;
-            self.pending_responses.push(Reverse(ScheduledResponse {
-                delivery_time: now + round_trip,
-                sequence: self.response_sequence,
-                requester_node: requester,
-                on_response,
-                response: response_bytes,
-            }));
+            self.schedule_response(now, round_trip, requester, Ok(response_bytes), on_response);
         }
 
         stats
+    }
+
+    /// Queue a request-response callback to fire at `now + latency`.
+    ///
+    /// Both successes and failures route through here so an error costs the
+    /// same kind of simulated time the production transport spends before
+    /// surfacing it — never the zero delay that would freeze the event loop.
+    fn schedule_response(
+        &mut self,
+        now: Duration,
+        latency: Duration,
+        requester: NodeIndex,
+        result: Result<Vec<u8>, RequestError>,
+        on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
+    ) {
+        self.response_sequence += 1;
+        self.pending_responses.push(Reverse(ScheduledResponse {
+            delivery_time: now + latency,
+            sequence: self.response_sequence,
+            requester_node: requester,
+            on_response,
+            result,
+        }));
     }
 
     // ─── Notification Acceptance (Latency-Modeled) ───
@@ -1166,7 +1258,7 @@ impl SimulatedNetwork {
     /// response bytes. Returns the number of responses delivered.
     pub fn flush_responses(&mut self, now: Duration) -> usize {
         flush_heap(&mut self.pending_responses, now, |scheduled| {
-            (scheduled.on_response)(Ok(scheduled.response));
+            (scheduled.on_response)(scheduled.result);
             true
         })
     }
@@ -1539,9 +1631,12 @@ mod tests {
         assert_eq!(stats.messages_dropped_partition, 1);
         assert_eq!(stats.messages_sent, 0);
 
-        // Error callbacks are immediate — no flush needed
+        // Failure is deferred by the modeled retry budget, mirroring the
+        // transport spending its attempts before surfacing `Exhausted`.
+        assert!(result.lock().unwrap().is_none());
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
-        assert!(matches!(captured, Err(RequestError::PeerUnreachable(_))));
+        assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
     }
 
     #[test]
@@ -1565,9 +1660,11 @@ mod tests {
         assert_eq!(stats.messages_dropped_loss, 1);
         assert_eq!(stats.messages_sent, 0);
 
-        // Error callbacks are immediate
+        // Deferred by the modeled retry budget; the dropped packet exhausts.
+        assert!(result.lock().unwrap().is_none());
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
-        assert!(matches!(captured, Err(RequestError::PeerUnreachable(_))));
+        assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
     }
 
     #[test]
@@ -1587,7 +1684,9 @@ mod tests {
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
-        // Error callbacks are immediate
+        // Application-level errors are deferred too.
+        assert!(result.lock().unwrap().is_none());
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::PeerError(_))));
     }
@@ -1613,7 +1712,9 @@ mod tests {
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
-        // Error callbacks are immediate
+        // Deferred; the descriptive empty-response error is preserved.
+        assert!(result.lock().unwrap().is_none());
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::PeerError(ref s)) if s.contains("empty")));
     }
@@ -1664,9 +1765,11 @@ mod tests {
         let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
-        // Error callbacks are immediate
+        // An empty committee surfaces `NoPeers` after the short discovery delay.
+        assert!(result.lock().unwrap().is_none());
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
-        assert!(matches!(captured, Err(RequestError::PeerUnreachable(_))));
+        assert!(matches!(captured, Err(RequestError::NoPeers)));
     }
 
     #[test]
