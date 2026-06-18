@@ -21,13 +21,12 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, NodeId,
     PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, SplitChildRoots,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
-    WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
-    uniform_shard_for_node,
+    StateRoot, TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    ValidatorStatus, WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1,
+    sign_and_notarize, uniform_shard_for_node,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -178,11 +177,15 @@ fn member_of(runner: &SimulationRunner, shard: ShardId) -> ValidatorId {
         .expect("shard has a seated member")
 }
 
-/// A payer-to-recipient XRD transfer, signed and routable.
+/// A payer-to-recipient XRD transfer, signed and routable, with a validity
+/// window bracketing `anchor` — the approximate weighted time it commits at.
+/// A genesis-anchored range would expire by the time the split lifecycle has
+/// run for several epochs of weighted time.
 fn transfer(
     payer_key: &Ed25519PrivateKey,
     payer: ComponentAddress,
     recipient: ComponentAddress,
+    anchor: Duration,
 ) -> Arc<RoutableTransaction> {
     let manifest = ManifestBuilder::new()
         .lock_fee(payer, Decimal::from(10))
@@ -191,7 +194,11 @@ fn transfer(
         .build();
     let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 1, payer_key)
         .expect("transfer signs");
-    Arc::new(routable_from_notarized_v1(notarized, test_validity_range()).expect("routable"))
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO.plus(anchor.saturating_sub(Duration::from_secs(5))),
+        WeightedTimestamp::ZERO.plus(anchor + Duration::from_secs(150)),
+    );
+    Arc::new(routable_from_notarized_v1(notarized, validity).expect("routable"))
 }
 
 /// Walk a committed chain from `from` to its tip: the heights at which
@@ -296,7 +303,12 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     let mut probes: Vec<(u64, TxHash)> = Vec::new();
     for (delay_ms, pair) in SETTLE_DELAYS_MS.iter().zip(&straddlers) {
         let (payer_key, payer, recipient) = pair;
-        let tx = transfer(payer_key, *payer, *recipient);
+        let tx = transfer(
+            payer_key,
+            *payer,
+            *recipient,
+            runner.now() + Duration::from_millis(*delay_ms),
+        );
         let hash = tx.hash();
         runner.schedule_initial_event(
             0,
@@ -366,9 +378,9 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         .iter()
         .zip(&straddlers[SETTLE_DELAYS_MS.len()..])
     {
-        let tx = transfer(payer_key, *payer, *recipient);
-        let hash = tx.hash();
         let target = cut.saturating_sub(Duration::from_millis(*offset_ms));
+        let tx = transfer(payer_key, *payer, *recipient, target);
+        let hash = tx.hash();
         let delay = target
             .saturating_sub(runner.now())
             .max(Duration::from_millis(10));
@@ -502,16 +514,17 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
 
     // ── Settlement window: the survivor reconstructs S_{leaf(1,0)} from
     // the coast headers it sees, finalizes the straddlers it settled, and
-    // counterpart-aborts the ones it never did (releasing their locks).
-    // Run until the first abort lands so the status cache is settled ──
+    // counterpart-aborts the ones it never did (releasing their locks). Run
+    // until every straddler reaches a terminal survivor outcome so the
+    // snapshot below sees the sweep fully drained, not a single early abort ──
     let survivor_validator = member_of(&runner, survivor);
     let survivor_host = runner.network().validator_to_node(survivor_validator);
     let settle_deadline = runner.now() + epochs(SETTLE_BUDGET_EPOCHS);
     let swept = run_until(&mut runner, settle_deadline, |r| {
-        probes.iter().any(|(_, hash)| {
+        probes.iter().all(|(_, hash)| {
             matches!(
                 r.tx_status(survivor_host, hash),
-                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+                Some(TransactionStatus::Completed(_))
             )
         })
     });
@@ -530,8 +543,8 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         terminal_b.inner(),
         genesis_height.inner(),
     );
-    let mut settled = 0u32; // settled on leaf(1,0) and finalized on the survivor
-    let mut one_sided = 0u32; // finalized on the survivor but not settled on leaf(1,0)
+    let mut settled = 0u32; // settled on leaf(1,0) and accepted on the survivor
+    let mut one_sided = 0u32; // accepted on the survivor but not settled on leaf(1,0)
     let mut straddled = 0u32; // committed on leaf(1,0) but never settled there
     let mut doomed = 0u32; // committed on the survivor but unsettled on leaf(1,0)
     let mut doomed_aborted = 0u32; // ... and driven to Completed(Aborted) on the survivor
@@ -542,9 +555,14 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         let (v_committed, v_finalized, v_wt) =
             scan_chain(survivor_store, BlockHeight::new(1), *hash);
         let settled_on_splitter = s_finalized.is_some_and(|h| h <= terminal_b);
-        let finalized_on_survivor = v_finalized.is_some();
         let post_cut = v_wt.is_some_and(|wt| wt > cut_wt);
         let survivor_status = runner.tx_status(survivor_host, hash);
+        // The survivor *applied* the cross-shard wave only on an accept
+        // outcome; an abort finalize names the hash too but moves no state.
+        let accepted_on_survivor = matches!(
+            survivor_status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        );
         let aborted_on_survivor = matches!(
             survivor_status,
             Some(TransactionStatus::Completed(TransactionDecision::Aborted))
@@ -559,10 +577,10 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
             v_finalized.map(BlockHeight::inner),
             v_wt.map(WeightedTimestamp::as_millis),
         );
-        if finalized_on_survivor && !settled_on_splitter {
+        if accepted_on_survivor && !settled_on_splitter {
             one_sided += 1;
         }
-        if settled_on_splitter && finalized_on_survivor {
+        if settled_on_splitter && accepted_on_survivor {
             settled += 1;
         }
         if s_committed.is_some() && !settled_on_splitter {
@@ -626,8 +644,8 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     // gain leaf(1,0)'s coverage, so its in-flight slot and node locks free.
     assert!(
         swept,
-        "the survivor must abort at least one unsettled straddler once it reconstructs \
-         S_{{leaf(1,0)}}:\n{report}",
+        "every straddler must reach a terminal survivor outcome — the sweep that reconstructs \
+         S_{{leaf(1,0)}} and aborts the unsettled ones never drained:\n{report}",
     );
     assert!(
         doomed > 0,
@@ -645,7 +663,12 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     // payer (touching a node the straddler had locked) now completes ──
     let probe_idx = lock_probe_idx.expect("a doomed straddler was aborted above");
     let (probe_payer_key, probe_payer, _) = &straddlers[probe_idx];
-    let lock_probe = transfer(probe_payer_key, *probe_payer, lock_probe_recipient);
+    let lock_probe = transfer(
+        probe_payer_key,
+        *probe_payer,
+        lock_probe_recipient,
+        runner.now(),
+    );
     let probe_hash = lock_probe.hash();
     runner.schedule_initial_event(
         survivor_host,

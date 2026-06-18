@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
-use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch};
+use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT};
 use tracing_test::traced_test;
 
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
@@ -127,10 +127,12 @@ fn skip_path_advances_past_blocked_epoch() {
             .install(),
     ];
 
-    // Need to cross `EPOCH_DURATION + SKIP_TIMEOUT` (1 sec + 45 sec
-    // here) plus a few seconds for the skip cert to assemble and the
-    // skip block to broadcast.
-    runner.run_until(Duration::from_mins(1));
+    // Cross the epoch-1 boundary (`EPOCH_MS`) plus the skip timeout (the
+    // epoch length clamped into `[SPC_VIEW_TIMEOUT, SKIP_TIMEOUT]`), then
+    // leave slack for the skip cert to assemble and the skip block to
+    // broadcast.
+    let skip_timeout = Duration::from_millis(EPOCH_MS).clamp(SPC_VIEW_TIMEOUT, SKIP_TIMEOUT);
+    runner.run_until(Duration::from_millis(EPOCH_MS) + skip_timeout + Duration::from_secs(30));
 
     let storage_0 = runner.beacon_storage(0).expect("host 0 exists");
     let block_1 = storage_0
@@ -186,7 +188,9 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
         .to(0)
         .install();
 
-    runner.run_until(Duration::from_secs(30));
+    // Several epochs so every host — including the dropped peer catching
+    // up via fetch — commits well past the >=3 the assertion needs.
+    runner.run_until(Duration::from_millis(EPOCH_MS) * 5);
 
     assert!(
         drop_rule.fired() >= 1,

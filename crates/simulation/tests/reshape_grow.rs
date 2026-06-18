@@ -22,11 +22,10 @@ use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, PendingReshape, ReshapeThresholds, ShardAnchor,
-    ShardId, SplitChildRoots, StateRoot, ValidatorId, ValidatorStatus, ed25519_keypair_from_seed,
-    routable_from_notarized_v1, sign_and_notarize,
+    ShardId, SplitChildRoots, StateRoot, TimestampRange, ValidatorId, ValidatorStatus,
+    WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -262,8 +261,14 @@ fn observers_grow_a_split_through_its_readiness_gate() {
         .build();
     let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 1, &payer_key)
         .expect("transfer signs");
-    let transfer =
-        routable_from_notarized_v1(notarized, test_validity_range()).expect("transfer is routable");
+    // The grow has consumed many epochs of weighted time, so a genesis-anchored
+    // validity range has long expired. Bracket the current weighted time.
+    let now = runner.now();
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO.plus(now.saturating_sub(Duration::from_secs(5))),
+        WeightedTimestamp::ZERO.plus(now + Duration::from_secs(150)),
+    );
+    let transfer = routable_from_notarized_v1(notarized, validity).expect("transfer is routable");
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),

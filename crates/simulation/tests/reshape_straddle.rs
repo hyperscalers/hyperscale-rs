@@ -29,12 +29,11 @@ use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::state_key::node_routing_hash;
-use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, NodeId,
     PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, StateRoot,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
-    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -50,11 +49,12 @@ const SEED_BUDGET_EPOCHS: u64 = 6;
 const CHILD_RUN_BUDGET_EPOCHS: u64 = 4;
 const CONTROL_BUDGET_EPOCHS: u64 = 8;
 
-/// Submission offsets before the parent's terminal cut, in
-/// milliseconds. The early offsets leave room for the full
-/// commit-execute-certify-finalize pipeline on the parent; the late
-/// ones commit but straddle.
-const PROBE_OFFSETS_MS: [u64; 5] = [1200, 600, 450, 300, 150];
+/// Submission offsets before the parent's terminal cut, in milliseconds.
+/// The early offsets leave room for the full commit-execute-certify-finalize
+/// pipeline on the parent; the late ones commit but straddle. Sized against
+/// the network's default intra-shard latency — the pipeline depth, not the
+/// epoch length, sets where the settle/straddle boundary falls.
+const PROBE_OFFSETS_MS: [u64; 5] = [3600, 1800, 1350, 900, 450];
 
 fn straddle_config() -> NetworkConfig {
     NetworkConfig {
@@ -139,11 +139,15 @@ fn account_in(child: ShardId, taken: &mut Vec<u8>) -> (Ed25519PrivateKey, Compon
     panic!("no account seed routes to {child:?}");
 }
 
-/// A payer-to-recipient XRD transfer, signed and routable.
+/// A payer-to-recipient XRD transfer, signed and routable, with a validity
+/// window bracketing `anchor` — the approximate weighted time it commits at.
+/// A genesis-anchored range would expire by the time the split lifecycle has
+/// run for several epochs of weighted time.
 fn transfer(
     payer_key: &Ed25519PrivateKey,
     payer: ComponentAddress,
     recipient: ComponentAddress,
+    anchor: Duration,
 ) -> Arc<RoutableTransaction> {
     let manifest = ManifestBuilder::new()
         .lock_fee(payer, Decimal::from(10))
@@ -152,7 +156,11 @@ fn transfer(
         .build();
     let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 1, payer_key)
         .expect("transfer signs");
-    Arc::new(routable_from_notarized_v1(notarized, test_validity_range()).expect("routable"))
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO.plus(anchor.saturating_sub(Duration::from_secs(5))),
+        WeightedTimestamp::ZERO.plus(anchor + Duration::from_secs(150)),
+    );
+    Arc::new(routable_from_notarized_v1(notarized, validity).expect("routable"))
 }
 
 /// Walk a committed chain from `from` to its tip: the heights at which
@@ -290,9 +298,9 @@ fn transfers_around_the_split_boundary_settle_atomically() {
     // ── Probe transfers staggered against the cut ──
     let mut probes: Vec<(u64, TxHash)> = Vec::new();
     for (offset_ms, (payer_key, payer, recipient)) in PROBE_OFFSETS_MS.iter().zip(&pairs) {
-        let tx = transfer(payer_key, *payer, *recipient);
-        let hash = tx.hash();
         let target = cut.saturating_sub(Duration::from_millis(*offset_ms));
+        let tx = transfer(payer_key, *payer, *recipient, target);
+        let hash = tx.hash();
         let delay = target
             .saturating_sub(runner.now())
             .max(Duration::from_millis(10));
@@ -366,7 +374,12 @@ fn transfers_around_the_split_boundary_settle_atomically() {
     // committed on both children, provisions and certificates routed
     // between them, finalized on both chains ──
     let (control_key, control_payer, control_recipient) = &pairs[PROBE_OFFSETS_MS.len()];
-    let control_tx = transfer(control_key, *control_payer, *control_recipient);
+    let control_tx = transfer(
+        control_key,
+        *control_payer,
+        *control_recipient,
+        runner.now(),
+    );
     let control_hash = control_tx.hash();
     runner.schedule_initial_event(
         0,
