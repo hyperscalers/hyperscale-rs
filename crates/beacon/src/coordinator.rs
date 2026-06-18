@@ -1339,7 +1339,10 @@ impl BeaconCoordinator {
                 }
             }
         }
-        Vec::new()
+        // Pull the next gap now that this batch landed — a chunk wider than
+        // one fetch completes across responses without waiting for the
+        // shard's next source header (a terminated shard sends none).
+        self.fetch_witness_chunk(shard_id)
     }
 
     /// Record a verified source-shard header — a remote shard's via the
@@ -1375,15 +1378,19 @@ impl BeaconCoordinator {
         self.fetch_witness_chunk(certified_header.header().shard_id())
     }
 
-    /// Fetch the missing leaves of `shard`'s current witness chunk,
-    /// anchored to its latest observed crossing's boundary block.
+    /// Fetch the lowest still-missing leaves of `shard`'s current witness
+    /// chunk, anchored to its latest observed crossing's boundary block.
     ///
     /// The anchor is the boundary block `B` (not whichever header just
     /// arrived): a witness proves against `B`'s `beacon_witness_root`, and
     /// the chunk is the leaves `[prior, chunk_end)` the boundary fold will
-    /// apply next (`prior` = the applied watermark). Bounded to
-    /// [`MAX_WITNESSES_PER_FETCH`] leaves per call; later commits advance
-    /// the watermark and the next observation re-issues for the rest.
+    /// apply next (`prior` = the applied watermark). At most
+    /// [`MAX_WITNESSES_PER_FETCH`] leaves per call, taken from where the
+    /// held leaves end rather than a fixed offset from `prior`: the chunk
+    /// folds (advancing `prior`) only once every leaf is in hand, so a
+    /// chunk wider than one fetch is pulled across successive calls, each
+    /// re-issue — next observation, fetch response, or commit — picking up
+    /// the next gap.
     fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
         let (anchor, block_height, prior, chunk_end) = {
             let Some(crossing) = self.shard_source.latest_crossing(shard) else {
@@ -1399,21 +1406,22 @@ impl BeaconCoordinator {
                 chunk_end,
             )
         };
-        let window_end = chunk_end.min(prior.saturating_add(MAX_WITNESSES_PER_FETCH as u64));
-        let mut leaves_to_fetch: Vec<LeafIndex> = Vec::new();
-        let mut leaf = prior;
-        while leaf < window_end {
-            let li = LeafIndex::new(leaf);
-            if self
-                .shard_source
-                .register_pending_fetch(shard, block_height, anchor, li)
-            {
-                leaves_to_fetch.push(li);
-            }
-            leaf = leaf.saturating_add(1);
-        }
+        let leaves_to_fetch: Vec<LeafIndex> = self
+            .shard_source
+            .missing_chunk_leaves(shard, anchor, prior, chunk_end)
+            .into_iter()
+            .take(MAX_WITNESSES_PER_FETCH)
+            .collect();
         if leaves_to_fetch.is_empty() {
             return Vec::new();
+        }
+        // Re-send even leaves already marked in flight: a response that
+        // never landed leaves a leaf pinned, and a chunk only folds once
+        // every leaf is held. The batch advances as held leaves drop out
+        // of `missing_chunk_leaves` on each re-issue.
+        for &leaf in &leaves_to_fetch {
+            self.shard_source
+                .register_pending_fetch(shard, block_height, anchor, leaf);
         }
         vec![Action::Fetch(FetchRequest::ShardWitnesses {
             source_shard: shard,
@@ -1428,19 +1436,19 @@ impl BeaconCoordinator {
     /// Re-issue witness-chunk fetches for terminated shards whose terminal
     /// crossing hasn't folded yet.
     ///
-    /// A terminated shard emits no new source header, so
-    /// [`fetch_witness_chunk`](Self::fetch_witness_chunk) — driven off header
-    /// observation — never re-issues for it. A leaf whose first fetch
-    /// response never landed then stays pinned in the tracker's in-flight
-    /// set, the terminal chunk never completes, and the fold that seeds a
-    /// split's children or composes a merge's parent never runs. Re-sending
-    /// for the still-missing leaves each commit breaks that pin; once the
-    /// chunk folds the boundary advances its watermark and the terminal
-    /// record drops, ending the re-drive.
+    /// [`fetch_witness_chunk`](Self::fetch_witness_chunk) is otherwise driven
+    /// by source-header observation, and a terminated shard emits no new
+    /// header — so its terminal chunk would stall mid-fetch. Re-issuing it
+    /// each commit advances the chunk (and re-sends any leaf whose response
+    /// never landed); once it folds, the boundary advances its watermark and
+    /// the terminal record drops, ending the re-drive. The fold seeds a
+    /// split's children or composes a merge's parent.
     fn redrive_terminal_witness_fetches(&mut self) -> Vec<Action> {
         if !self.is_on_committee() {
             return Vec::new();
         }
+        // Collected up front: the loop body borrows `self` mutably through
+        // `fetch_witness_chunk`, so it can't hold the `boundaries` iterator.
         let terminals: Vec<ShardId> = self
             .state
             .boundaries
@@ -1450,32 +1458,7 @@ impl BeaconCoordinator {
             .collect();
         let mut actions = Vec::new();
         for shard in terminals {
-            let Some(crossing) = self.shard_source.latest_crossing(shard) else {
-                continue;
-            };
-            let anchor = crossing.canonical_qc().block_hash();
-            let block_height = crossing.boundary_header().height();
-            let (prior, chunk_end) =
-                rules::witness_chunk_bounds(&self.state, shard, crossing.boundary_header());
-            let window_end = chunk_end.min(prior.saturating_add(MAX_WITNESSES_PER_FETCH as u64));
-            let missing = self
-                .shard_source
-                .missing_chunk_leaves(shard, anchor, prior, window_end);
-            if missing.is_empty() {
-                continue;
-            }
-            for &leaf in &missing {
-                self.shard_source
-                    .register_pending_fetch(shard, block_height, anchor, leaf);
-            }
-            actions.push(Action::Fetch(FetchRequest::ShardWitnesses {
-                source_shard: shard,
-                block_height,
-                committed_block_hash: anchor,
-                leaf_indices: missing,
-                preferred: None,
-                class: None,
-            }));
+            actions.extend(self.fetch_witness_chunk(shard));
         }
         actions
     }
