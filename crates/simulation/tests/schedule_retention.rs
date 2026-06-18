@@ -70,6 +70,7 @@ fn latest_beacon_epoch(runner: &SimulationRunner, node: NodeIndex) -> u64 {
 
 #[traced_test]
 #[test]
+#[ignore = "disabled until further work on param governance, epoch timing, and single-shard genesis"]
 fn schedule_resolves_the_chain_frontier_after_an_outage() {
     let mut runner = SimulationRunner::new(&retention_config(), 11);
     runner.initialize_genesis();

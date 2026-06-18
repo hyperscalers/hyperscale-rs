@@ -15,7 +15,8 @@ use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BeaconWitnessEvent, Bls12381G1PublicKey, Ed25519PrivateKey,
-    Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus, bls_keypair_from_seed,
+    Stake, StakePool, StakePoolId, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
+    bls_keypair_from_seed,
 };
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
@@ -48,8 +49,14 @@ fn booted(validators: u32, seed: u64, payer: &Ed25519PrivateKey) -> SimulationRu
     let mut runner = SimulationRunner::new(&single_shard_config(validators), seed);
     let account = ComponentAddress::preallocated_account_from_public_key(&payer.public_key());
     runner.initialize_genesis_with_balances(&[(account, Decimal::from(100_000))]);
-    runner.run_until(Duration::from_secs(8));
+    runner.run_until(epochs(1) + Duration::from_secs(2));
     runner
+}
+
+/// `n` beacon epochs as wall-clock — the unit every fold and lifecycle budget
+/// is counted in, since a witness folds at the next epoch boundary.
+const fn epochs(n: u64) -> Duration {
+    Duration::from_millis(EPOCH_MS * n)
 }
 
 /// Host 0's latest committed beacon state.
@@ -137,7 +144,7 @@ fn stake_deposit_folds_into_beacon_state() {
     );
 
     assert!(
-        run_until(&mut runner, Duration::from_secs(60), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool) == Some(amount)
         }),
         "beacon never folded the stake deposit",
@@ -161,7 +168,7 @@ fn register_validator_pools_a_node() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool).is_some()
         }),
         "deposit never folded",
@@ -177,7 +184,7 @@ fn register_validator_pools_a_node() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             validator_status(r, newcomer) == Some(ValidatorStatus::Pooled)
         }),
         "registered validator never reached the pool",
@@ -202,7 +209,7 @@ fn register_without_capacity_is_rejected() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool).is_some()
         }),
         "deposit never folded",
@@ -219,7 +226,7 @@ fn register_without_capacity_is_rejected() {
     );
     // Run long enough that the registration has committed and folded; an
     // accepted one would surface within a couple of epochs.
-    run_until(&mut runner, Duration::from_secs(20), |_| false);
+    run_until(&mut runner, epochs(3), |_| false);
     assert_eq!(
         validator_status(&runner, newcomer),
         None,
@@ -246,7 +253,7 @@ fn stake_withdraw_drops_effective_stake() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool) == Some(deposited)
         }),
         "deposit never folded",
@@ -261,7 +268,7 @@ fn stake_withdraw_drops_effective_stake() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_effective_stake(r, pool) == Some(remaining)
         }),
         "withdrawal never dropped effective stake",
@@ -292,7 +299,7 @@ fn registered_validator_activates_onto_a_shard() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, GENESIS_POOL)
                 .is_some_and(|s| s >= Stake::from_whole_tokens(13_000_000))
         }),
@@ -310,7 +317,7 @@ fn registered_validator_activates_onto_a_shard() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             validator_status(r, newcomer) == Some(ValidatorStatus::Pooled)
         }),
         "newcomer never reached the pool",
@@ -329,7 +336,7 @@ fn registered_validator_activates_onto_a_shard() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(40), |r| {
+        run_until(&mut runner, epochs(4), |r| {
             matches!(
                 validator_status(r, newcomer),
                 Some(ValidatorStatus::OnShard { .. })
@@ -369,7 +376,7 @@ fn withdrawal_ejects_a_validator_that_a_deposit_reactivates() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(120), |r| {
+        run_until(&mut runner, epochs(UNBONDING_WINDOW_EPOCHS + 6), |r| {
             validator_status(r, victim) == Some(ValidatorStatus::InsufficientStake)
         }),
         "the matured withdrawal never ejected the over-capacity validator",
@@ -386,7 +393,7 @@ fn withdrawal_ejects_a_validator_that_a_deposit_reactivates() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(4), |r| {
             matches!(
                 validator_status(r, victim),
                 Some(ValidatorStatus::Pooled | ValidatorStatus::OnShard { .. })
@@ -415,7 +422,7 @@ fn re_registration_of_a_live_validator_is_a_no_op() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool).is_some()
         }),
         "deposit never folded",
@@ -431,7 +438,7 @@ fn re_registration_of_a_live_validator_is_a_no_op() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             validator_pubkey(r, id) == Some(first)
         }),
         "validator never registered",
@@ -448,7 +455,7 @@ fn re_registration_of_a_live_validator_is_a_no_op() {
             pubkey: second,
         },
     );
-    run_until(&mut runner, Duration::from_secs(20), |_| false);
+    run_until(&mut runner, epochs(3), |_| false);
     assert_eq!(
         validator_pubkey(&runner, id),
         Some(first),
@@ -478,7 +485,7 @@ fn pool_capacity_caps_registrations() {
         },
     );
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             pool_total_stake(r, pool).is_some()
         }),
         "deposit never folded",
@@ -498,7 +505,7 @@ fn pool_capacity_caps_registrations() {
         );
     }
     assert!(
-        run_until(&mut runner, Duration::from_secs(30), |r| {
+        run_until(&mut runner, epochs(3), |r| {
             candidates
                 .iter()
                 .filter(|id| validator_status(r, **id).is_some())
@@ -508,7 +515,7 @@ fn pool_capacity_caps_registrations() {
         "registrations never folded",
     );
     // Let any fourth attempt commit; the cap must hold at three.
-    run_until(&mut runner, Duration::from_secs(10), |_| false);
+    run_until(&mut runner, epochs(2), |_| false);
     let registered = candidates
         .iter()
         .filter(|id| validator_status(&runner, **id).is_some())

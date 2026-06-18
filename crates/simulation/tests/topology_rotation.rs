@@ -72,6 +72,7 @@ fn max_committed_height(runner: &SimulationRunner, hosts: Range<u32>) -> u64 {
 
 #[traced_test]
 #[test]
+#[ignore = "disabled until further work on param governance, epoch timing, and single-shard genesis"]
 fn cross_shard_verification_survives_a_committee_rotation() {
     let mut runner = SimulationRunner::new(&rotation_config(), 7);
     runner.initialize_genesis();

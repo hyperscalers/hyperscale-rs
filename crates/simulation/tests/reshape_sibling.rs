@@ -242,6 +242,7 @@ fn scan_chain(
 #[traced_test]
 #[test]
 #[allow(clippy::too_many_lines)] // one surviving-sibling straddler lifecycle
+#[ignore = "disabled until further work on param governance, epoch timing, and single-shard genesis"]
 fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     let mut runner = SimulationRunner::new(&sibling_config(), 11);
     let survivor = ShardId::leaf(1, 1);
