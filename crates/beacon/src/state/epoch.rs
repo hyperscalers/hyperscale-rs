@@ -20,7 +20,8 @@ use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
-    WitnessOutcome, apply_contribution_witnesses, ingest_equivocations, prune_stale_reshapes,
+    WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
+    prune_stale_reshapes,
 };
 
 /// Discriminator for [`apply_epoch`] — distinguishes a Normal epoch
@@ -174,10 +175,15 @@ pub fn apply_epoch(
         WitnessOutcome::default()
     };
 
-    // Sweep pending reshapes whose triggers went quiet — after the
-    // epoch's witnesses applied, so an assertion folded this epoch is
-    // never swept.
-    prune_stale_reshapes(state);
+    // A normal epoch folded its witnesses above, so sweep reshapes whose
+    // triggers went quiet — an assertion folded this epoch is never swept.
+    // A skip folds nothing, so no trigger could re-assert; carry the TTL
+    // anchors forward instead, sparing a reshape that only looks quiet
+    // because the beacon stalled.
+    match input {
+        ApplyEpochInput::Normal { .. } => prune_stale_reshapes(state),
+        ApplyEpochInput::Skip => defer_reshape_ttls(state),
+    }
 
     let vrf = filter_and_roll_randomness(state, network, epoch, committed);
     // Equivocation evidence rides committed proposals; shard-witness lifts

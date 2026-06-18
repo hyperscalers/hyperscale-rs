@@ -573,6 +573,43 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
     }
 }
 
+/// Carry every pending reshape's staleness and readiness anchors forward
+/// one epoch.
+///
+/// The trigger and readiness TTLs measure how many epochs a reshape has
+/// gone without asserting or readying, against `current_epoch`. A skip
+/// epoch folds no witnesses, so no trigger can re-assert and no readiness
+/// can advance; charging that epoch against the TTLs would cancel a
+/// reshape that only looks quiet because the beacon stalled. Advancing the
+/// anchors in lockstep with the skipped epoch holds each TTL's elapsed
+/// count fixed across the stall.
+pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
+    for reshape in state.pending_reshapes.values_mut() {
+        match reshape {
+            PendingReshape::Split {
+                last_asserted,
+                admitted_at,
+                ..
+            } => {
+                *last_asserted = last_asserted.next();
+                *admitted_at = admitted_at.next();
+            }
+            PendingReshape::Merge {
+                halves,
+                admitted_at,
+                ..
+            } => {
+                for last in halves.values_mut() {
+                    *last = last.next();
+                }
+                if let Some(at) = admitted_at {
+                    *at = at.next();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1917,6 +1954,36 @@ mod tests {
         assert!(state.pending_reshapes.is_empty());
         assert_eq!(state.pooled_validators().len(), 4);
         assert!(state.next_shard_committees[&p].members.is_empty());
+    }
+
+    /// Skip epochs fold no witnesses, so deferring the TTL anchors across
+    /// each one holds both clocks fixed: a split admitted just before a
+    /// long beacon stall survives the sweep, then ages normally once real
+    /// epochs resume.
+    #[test]
+    fn skip_epochs_defer_the_reshape_ttls() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 4);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+
+        // Stall past the readiness TTL purely on skips; each defers the
+        // anchors, so the split is intact when the sweep resumes.
+        let stall = RESHAPE_READY_TTL_EPOCHS + 2;
+        for _ in 0..stall {
+            state.current_epoch = state.current_epoch.next();
+            defer_reshape_ttls(&mut state);
+        }
+        prune_stale_reshapes(&mut state);
+        assert!(state.pending_reshapes.contains_key(&p));
+
+        // Real quiet epochs without a re-assertion age the trigger TTL
+        // from where the stall left it and cancel as usual.
+        for _ in 0..RESHAPE_TRIGGER_TTL_EPOCHS {
+            state.current_epoch = state.current_epoch.next();
+        }
+        prune_stale_reshapes(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+        assert_eq!(state.pooled_validators().len(), 4);
     }
 
     /// Merge halves pair across the two children; a lone half expires
