@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::test_validity_range;
@@ -34,12 +34,6 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
 use tracing_test::traced_test;
-
-/// 2-second epochs: short enough to run the whole grow inside the
-/// test budget, long enough that the beacon paces (one epoch per
-/// `epoch_duration_ms`) rather than stalling against its
-/// production-sized SPC/skip timeouts.
-const TEST_EPOCH_MS: u64 = 2000;
 
 /// Committee validators on the one shard — also the cohort size the
 /// admission draws, so `pool_extra_validators` matches it exactly.
@@ -68,11 +62,9 @@ fn grow_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: PER_SHARD,
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
@@ -123,7 +115,7 @@ fn run_until(
 }
 
 const fn epochs(n: u64) -> Duration {
-    Duration::from_millis(TEST_EPOCH_MS * n)
+    Duration::from_millis(EPOCH_MS * n)
 }
 
 #[traced_test]

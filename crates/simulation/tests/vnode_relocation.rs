@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use hyperscale_core::ParticipationChange;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_simulation::{JoinKind, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
@@ -28,7 +28,7 @@ use hyperscale_types::{
 use tracing_test::traced_test;
 
 mod common;
-use common::{TEST_EPOCH_MS, rotation_config};
+use common::rotation_config;
 
 /// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
 /// move: one shard's rotation victim is drawn straight into the other
@@ -100,7 +100,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
 
     // ── Detection: the epoch-16 shuffle surfaces a direct move ──────
     let shuffle =
-        Duration::from_millis(TEST_EPOCH_MS * (SHUFFLE_INTERVAL_EPOCHS + SHUFFLE_SLACK_EPOCHS));
+        Duration::from_millis(EPOCH_MS * (SHUFFLE_INTERVAL_EPOCHS + SHUFFLE_SLACK_EPOCHS));
     let mut moves: Vec<(NodeIndex, ParticipationChange)> = Vec::new();
     run_until_or(&mut runner, shuffle, &mut moves, |_| false);
     let (node, change) = moves
@@ -137,7 +137,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     // The joiner's self-signed ReadySignal must flip `ready: true`
     // within a few epochs — far inside READY_TIMEOUT_EPOCHS, so the
     // flip is signal-driven, not the timeout fallback.
-    let ready_deadline = runner.now() + Duration::from_millis(TEST_EPOCH_MS * READY_BUDGET_EPOCHS);
+    let ready_deadline = runner.now() + Duration::from_millis(EPOCH_MS * READY_BUDGET_EPOCHS);
     let became_ready = run_until_or(&mut runner, ready_deadline, &mut moves, |r| {
         matches!(
             mover_status(r, node, validator),
@@ -157,8 +157,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .shard_coordinator()
         .committed_height();
     let peer = member_host(&runner, to, node);
-    let proposed_deadline =
-        runner.now() + Duration::from_millis(TEST_EPOCH_MS * PROPOSAL_BUDGET_EPOCHS);
+    let proposed_deadline = runner.now() + Duration::from_millis(EPOCH_MS * PROPOSAL_BUDGET_EPOCHS);
     let proposed = run_until_or(&mut runner, proposed_deadline, &mut moves, |r| {
         let tip = r
             .vnode_state_in(peer, to)
@@ -235,7 +234,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .expect("origin member host")
         .shard_coordinator()
         .committed_height();
-    let drain_deadline = runner.now() + Duration::from_millis(TEST_EPOCH_MS * DRAIN_BUDGET_EPOCHS);
+    let drain_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
     let origin_alive = run_until_or(&mut runner, drain_deadline, &mut moves, |r| {
         r.vnode_state_in(origin_peer, from)
             .expect("origin member host")

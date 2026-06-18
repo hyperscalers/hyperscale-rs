@@ -15,12 +15,12 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{BlockHeight, Epoch, SHUFFLE_INTERVAL_EPOCHS, ShardId};
 use tracing_test::traced_test;
 
 mod common;
-use common::{PER_SHARD, TEST_EPOCH_MS, rotation_config};
+use common::{PER_SHARD, rotation_config};
 
 /// Host index range for `shard`. Under `SameShardBundled` with one vnode per
 /// host, shard `s`'s committee validators occupy hosts
@@ -51,8 +51,8 @@ fn highest_verified_committee_epoch(
                 // parent QC's weighted timestamp, so that epoch is what the
                 // verifier had to resolve to admit it.
                 let anchor = verified.header().parent_qc().weighted_timestamp();
-                best = Some(best.map_or(anchor.as_millis() / TEST_EPOCH_MS, |b| {
-                    b.max(anchor.as_millis() / TEST_EPOCH_MS)
+                best = Some(best.map_or(anchor.as_millis() / EPOCH_MS, |b| {
+                    b.max(anchor.as_millis() / EPOCH_MS)
                 }));
                 break;
             }

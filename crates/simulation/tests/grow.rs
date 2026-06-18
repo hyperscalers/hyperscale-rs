@@ -5,15 +5,12 @@
 //! asserts the reached topology: every leaf the splits reshaped into stands at
 //! full committee strength and commits past its child genesis on a seated host.
 
-use std::time::Duration;
-
 use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ReshapeThresholds, ShardId};
 use tracing_test::traced_test;
 
-const TEST_EPOCH_MS: u64 = 2000;
 const PER_SHARD: u32 = 4;
 
 /// A single-shard, paced-epoch network with the split trigger armed from
@@ -22,11 +19,9 @@ fn grow_config(target_shards: u32) -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: PER_SHARD,
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::test_validity_range;
@@ -36,7 +36,6 @@ use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
 use tracing_test::traced_test;
 
-const TEST_EPOCH_MS: u64 = 2000;
 const PER_SHARD: u32 = 4;
 
 /// `leaf(1,0)`'s genesis byte total (~627k — the heavier engine-bootstrap
@@ -76,11 +75,9 @@ fn sibling_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 2,
         validators_per_shard: PER_SHARD,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 2,
             shard_size: PER_SHARD,
             reshape_thresholds: ReshapeThresholds {
@@ -132,7 +129,7 @@ fn run_until(
 }
 
 const fn epochs(n: u64) -> Duration {
-    Duration::from_millis(TEST_EPOCH_MS * n)
+    Duration::from_millis(EPOCH_MS * n)
 }
 
 /// A fresh keypair whose preallocated account routes to `shard` under a
@@ -361,7 +358,7 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
         "the lookahead must carry leaf(1,0)'s children, not leaf(1,0)",
     );
     let final_epoch = state.current_epoch;
-    let cut = Duration::from_millis((final_epoch.inner() + 1) * TEST_EPOCH_MS);
+    let cut = Duration::from_millis((final_epoch.inner() + 1) * EPOCH_MS);
 
     // ── Submit the straddle straddlers against the now-known cut: each
     // lands `offset` ms before leaf(1,0)'s terminal boundary ──

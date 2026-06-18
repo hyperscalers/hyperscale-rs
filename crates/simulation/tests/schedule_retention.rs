@@ -21,14 +21,9 @@
 use std::time::Duration;
 
 use hyperscale_network_memory::{NetworkConfig, NodeIndex};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{BeaconChainConfig, Epoch, WeightedTimestamp};
 use tracing_test::traced_test;
-
-/// 5-second epochs: short enough that the outage spans several epochs within
-/// the run window, long enough that SPC keeps wall-clock pace with one
-/// committee member isolated.
-const TEST_EPOCH_MS: u64 = 5000;
 
 /// Four validators: one beacon committee of four (PC quorum 3), so beacon
 /// consensus keeps committing with one node isolated.
@@ -45,11 +40,9 @@ fn retention_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: VALIDATORS,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: VALIDATORS,
             ..BeaconChainConfig::default()
@@ -133,7 +126,7 @@ fn schedule_resolves_the_chain_frontier_after_an_outage() {
     // adoption, keeping the stalled shard chain verifiable. A frontier-blind
     // window would have evicted it during replay, wedging shard sync on a
     // committee lookup that can never resolve.
-    let frontier_wt = WeightedTimestamp::from_millis(frontier_epoch * TEST_EPOCH_MS);
+    let frontier_wt = WeightedTimestamp::from_millis(frontier_epoch * EPOCH_MS);
     assert!(
         runner
             .node(LAGGER)

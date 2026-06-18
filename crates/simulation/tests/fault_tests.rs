@@ -16,7 +16,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::{NetworkConfig, RuleHandle};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, NodeId, ReshapeThresholds,
@@ -46,26 +46,22 @@ fn single_shard_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         ..Default::default()
     }
 }
 
-/// Single-shard genesis with the split trigger armed, short paced epochs, and
-/// one cohort of pooled extras — `grow_to(2)` drives it to two shards through
-/// the real split lifecycle, mirroring a network that launches single-shard
-/// and fans out under load.
+/// Single-shard genesis with the split trigger armed, production-parity
+/// paced epochs, and one cohort of pooled extras — `grow_to(2)` drives it
+/// to two shards through the real split lifecycle, mirroring a network that
+/// launches single-shard and fans out under load.
 fn cross_shard_grow_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: 2000,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: 4,
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
@@ -287,7 +283,7 @@ const GROW_TARGET: u32 = 2;
 /// least one seed. Pinning a single seed conflates the two and makes coverage
 /// fragile: an unrelated shift in the RNG stream can route around a path
 /// without anything real breaking.
-const FAULT_SCENARIO_SEEDS: [u64; 3] = [1, 13, 42];
+const FAULT_SCENARIO_SEEDS: [u64; 6] = [1, 3, 13, 20, 42, 1337];
 
 /// Run one cross-shard fault scenario at `seed`, asserting liveness — Layer 1
 /// (every installed rule fired) and Layer 3 (every live member reached a

@@ -21,8 +21,6 @@ fn test_network_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         ..Default::default()
     }
@@ -1779,14 +1777,13 @@ fn test_packet_loss_application() {
     let config = NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.10, // 10% packet loss
         vnodes_per_host: 1,
         hosting_mode: HostingMode::SameShardBundled,
         beacon_chain_config: None,
         pool_extra_validators: 0,
+        ..Default::default()
     };
 
     let mut runner = SimulationRunner::new(&config, 42);
@@ -1845,14 +1842,13 @@ fn test_packet_loss_determinism() {
     let config = NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.2, // 20% packet loss for more variation
         vnodes_per_host: 1,
         hosting_mode: HostingMode::SameShardBundled,
         beacon_chain_config: None,
         pool_extra_validators: 0,
+        ..Default::default()
     };
 
     let seed = 12345u64;

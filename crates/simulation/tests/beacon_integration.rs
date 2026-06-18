@@ -7,13 +7,9 @@
 use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch};
 use tracing_test::traced_test;
-
-/// 1-second epoch boundary so paced epoch production lands several
-/// epochs within a short run window.
-const TEST_EPOCH_MS: u64 = 1000;
 
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
 /// eight validators: the first four sit on the genesis beacon committee, the
@@ -34,10 +30,8 @@ fn beacon_committee_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: 8,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
-        beacon_chain_config: Some(beacon_chain_config(TEST_EPOCH_MS)),
+        beacon_chain_config: Some(beacon_chain_config(EPOCH_MS)),
         ..Default::default()
     }
 }
@@ -176,14 +170,12 @@ fn skip_path_advances_past_blocked_epoch() {
 #[traced_test]
 #[test]
 fn fetch_recovery_path_unblocks_dropped_peer() {
-    // 2s epochs: a 30s run at 1s would cross the epoch-16 committee shuffle,
-    // where a rotation stall outlasts the 3-epoch topology retention window
-    // (sized for production 300s epochs), so a fetch-recovered block could
-    // commit against an evicted committee. At 2s the run stays below the
-    // shuffle while still exercising the drop-and-recover path this test cares
-    // about.
+    // At the production epoch the whole drop-and-recover run sits well
+    // within one epoch, below the committee shuffle, so a fetch-recovered
+    // block never commits against an evicted committee — the 3-epoch
+    // topology retention window is sized for exactly this epoch.
     let mut config = beacon_committee_config();
-    config.beacon_chain_config = Some(beacon_chain_config(2 * TEST_EPOCH_MS));
+    config.beacon_chain_config = Some(beacon_chain_config(EPOCH_MS));
     let mut runner = SimulationRunner::new(&config, 0xFE_7C);
     runner.initialize_genesis();
 

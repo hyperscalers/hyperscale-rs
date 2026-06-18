@@ -17,11 +17,10 @@
 use std::time::Duration;
 
 use hyperscale_network_memory::{NetworkConfig, NodeIndex};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{BeaconChainConfig, Epoch};
 use tracing_test::traced_test;
 
-const TEST_EPOCH_MS: u64 = 5000;
 const VALIDATORS: u32 = 4;
 const LAGGER: NodeIndex = 3;
 
@@ -33,11 +32,9 @@ fn pacing_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: VALIDATORS,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: VALIDATORS,
             ..BeaconChainConfig::default()
@@ -83,7 +80,7 @@ fn beacon_never_commits_an_epoch_ahead_of_wall_clock() {
     while now_secs < 140 {
         now_secs += 2;
         runner.run_until(Duration::from_secs(now_secs));
-        let wall_epoch = now_secs * 1000 / TEST_EPOCH_MS;
+        let wall_epoch = now_secs * 1000 / EPOCH_MS;
         for node in 0..VALIDATORS {
             let committed = latest_beacon_epoch(&runner, node);
             assert!(
@@ -97,7 +94,7 @@ fn beacon_never_commits_an_epoch_ahead_of_wall_clock() {
     // The run must actually have exercised steady-state pacing, not ended
     // mid-catch-up.
     let final_epoch = latest_beacon_epoch(&runner, 0);
-    let wall_epoch = now_secs * 1000 / TEST_EPOCH_MS;
+    let wall_epoch = now_secs * 1000 / EPOCH_MS;
     assert!(
         final_epoch + 3 >= wall_epoch,
         "beacon never caught back up to wall-clock (at {final_epoch} of {wall_epoch})",

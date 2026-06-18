@@ -17,8 +17,6 @@ fn metrics_recorder_collects_values_from_running_sim() {
     let config = NetworkConfig {
         num_shards: 1,
         validators_per_shard: 4,
-        intra_shard_latency: Duration::from_millis(10),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         ..Default::default()
     };

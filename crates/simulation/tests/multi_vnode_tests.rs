@@ -24,12 +24,11 @@ fn test_v2_same_shard_hosting_makes_progress() {
         validators_per_shard: 4,
         vnodes_per_host: 2,
         hosting_mode: HostingMode::SameShardBundled,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.0,
         beacon_chain_config: None,
         pool_extra_validators: 0,
+        ..Default::default()
     };
 
     let mut runner = SimulationRunner::new(&config, 7);

@@ -21,7 +21,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_types::{
     BeaconChainConfig, Ed25519PrivateKey, NodeId, ReshapeThresholds, RoutableTransaction, ShardId,
     TimestampRange, TxHash, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
@@ -32,12 +32,6 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
-
-/// 2-second epochs: short enough to reach the shuffle within the run
-/// window, long enough that the beacon paces (one epoch per
-/// `epoch_duration_ms`) rather than stalling against its
-/// production-sized SPC/skip timeouts.
-pub const TEST_EPOCH_MS: u64 = 2000;
 
 /// Committee validators per shard. The shuffle retires one member at
 /// the boundary; seven keeps both committees above quorum through the
@@ -55,11 +49,9 @@ pub fn rotation_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 2,
         validators_per_shard: PER_SHARD,
-        intra_shard_latency: Duration::from_millis(50),
-        cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 2,
             shard_size: PER_SHARD,
             ..BeaconChainConfig::default()
@@ -91,11 +83,9 @@ pub fn cross_shard_grow_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 1,
         validators_per_shard: GROW_PER_SHARD,
-        intra_shard_latency: Duration::from_millis(100),
-        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: TEST_EPOCH_MS,
+            epoch_duration_ms: EPOCH_MS,
             num_shards: 1,
             shard_size: GROW_PER_SHARD,
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
