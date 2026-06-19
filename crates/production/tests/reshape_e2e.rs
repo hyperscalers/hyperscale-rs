@@ -123,8 +123,8 @@ async fn beacon_chain_config_reaches_genesis() {
         "custom epoch duration reaches the beacon genesis state"
     );
     assert_eq!(
-        state.chain_config.reshape_thresholds.split_bytes, 50_000,
-        "custom split threshold reaches the beacon genesis state"
+        state.params.reshape_thresholds.split_bytes, 50_000,
+        "custom split threshold seeds the live network params at genesis"
     );
 }
 

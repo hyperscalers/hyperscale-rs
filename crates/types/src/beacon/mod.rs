@@ -10,6 +10,8 @@
 //! - [`genesis`]: [`BeaconGenesisConfig`] and the chain-identity hash
 //!   embedded in [`BeaconCert::Genesis`](crate::BeaconCert::Genesis).
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
+//! - [`params`]: [`NetworkParams`] — the governable subset of chain
+//!   parameters, seeded from genesis and mutated only by the fold.
 //! - [`pc`]: Prefix Consensus vote / QC wire types, verify / sign /
 //!   build helpers.
 //! - [`prefix_ops`]: prefix algebra ([`mcp`], [`mce`], [`qc1_certify`])
@@ -36,6 +38,7 @@ pub mod certified;
 pub mod constants;
 pub mod genesis;
 pub mod limits;
+pub mod params;
 pub mod pc;
 pub mod prefix_ops;
 pub mod proposal;
@@ -66,6 +69,7 @@ pub use limits::{
     MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_SHARDS, MAX_VOTE_VECTOR_LEN,
     MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD,
 };
+pub use params::NetworkParams;
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
     PcQc2VerifyError, PcQc3, PcQc3VerifyError, PcSignerLengths, PcValueElement, PcVector, PcVote1,

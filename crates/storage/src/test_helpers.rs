@@ -15,12 +15,12 @@ use hyperscale_types::{
     BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBlock, ChainOrigin, ConsensusReceipt, Epoch, EventData, ExecutionCertificate,
     ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash,
-    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3,
-    PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-    Randomness, Round, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
-    Stake, StakePoolId, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
-    compute_merkle_root, zero_bls_signature,
+    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NetworkParams, NodeId,
+    PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Randomness, Round, ShardAnchor, ShardId, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root, compute_merkle_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -264,6 +264,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
     randomness[..copy_len].copy_from_slice(&tag[..copy_len]);
     Arc::new(BeaconState {
         chain_config: BeaconChainConfig::default(),
+        params: NetworkParams::default(),
         current_epoch: Epoch::new(epoch),
         validators: BTreeMap::new(),
         pools: BTreeMap::new(),

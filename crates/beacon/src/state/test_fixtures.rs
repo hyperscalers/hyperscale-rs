@@ -12,10 +12,10 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR,
-    NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Randomness, Round, ShardCommittee, ShardEpochContribution, ShardId,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake,
-    StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord,
+    NetworkDefinition, NetworkParams, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardCommittee, ShardEpochContribution,
+    ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects,
+    Stake, StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord,
     ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
     compute_merkle_root_with_proof, vrf_sign, zero_bls_signature,
 };
@@ -68,6 +68,7 @@ pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> Validato
 pub fn empty_state() -> BeaconState {
     BeaconState {
         chain_config: BeaconChainConfig::default(),
+        params: NetworkParams::default(),
         current_epoch: Epoch::GENESIS,
         validators: BTreeMap::new(),
         pools: BTreeMap::new(),

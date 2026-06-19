@@ -36,6 +36,7 @@ use crate::beacon::cert::BeaconCert;
 use crate::beacon::certified::CertifiedBeaconBlock;
 use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
+use crate::beacon::params::NetworkParams;
 use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
@@ -362,9 +363,20 @@ pub enum PendingReshape {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconState {
     /// Sizing knobs copied from `BeaconGenesisConfig.chain_config` at
-    /// genesis. Frozen for the chain's lifetime — every consensus path
-    /// reads from here instead of compile-time constants.
+    /// genesis. Frozen for the chain's lifetime and authenticated by the
+    /// genesis hash — the home for the structural and historical
+    /// parameters (`num_shards`, `genesis_timestamp_ms`) and the
+    /// not-yet-governable sizing knobs. Governable policy parameters
+    /// (today `reshape_thresholds`) are seeded into [`Self::params`] at
+    /// genesis and read from there; resolve a governable parameter
+    /// against `params`, never here.
     pub chain_config: BeaconChainConfig,
+    /// Live, governable network parameters — the policy subset a running
+    /// network retunes through committed parameter-change votes. Seeded
+    /// from `chain_config` at genesis and mutated only by the fold, so it
+    /// stays a pure function of committed beacon history and every
+    /// replica resolves the same value at every epoch.
+    pub params: NetworkParams,
     /// Highest epoch whose block has been applied. Advances by 1 per
     /// successful `apply_epoch`.
     pub current_epoch: Epoch,
@@ -1253,6 +1265,7 @@ mod tests {
     fn empty_state() -> BeaconState {
         BeaconState {
             chain_config: BeaconChainConfig::default(),
+            params: NetworkParams::default(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),

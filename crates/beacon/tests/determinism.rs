@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Bls12381G1PublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    NetworkParams, Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool,
+    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 const V: usize = 3;
@@ -108,6 +108,7 @@ fn initial_state() -> BeaconState {
 
     let mut state = BeaconState {
         chain_config: BeaconChainConfig::default(),
+        params: NetworkParams::default(),
         current_epoch: Epoch::GENESIS,
         validators,
         pools,

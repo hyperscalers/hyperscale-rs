@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
     MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
-    ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StateRoot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, WeightedTimestamp,
+    NetworkParams, ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, WeightedTimestamp,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
@@ -140,6 +140,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 
     let mut state = BeaconState {
         chain_config: config.chain_config,
+        params: NetworkParams::from_genesis(&config.chain_config),
         current_epoch: Epoch::GENESIS,
         validators,
         pools,
