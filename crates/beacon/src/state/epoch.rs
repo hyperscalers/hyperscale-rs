@@ -538,13 +538,49 @@ fn record_boundaries(
     // split-boundary fence rejects any wave naming it regardless, so the
     // record is dead weight. Bounded so a terminated shard can't
     // accumulate forever.
+    //
+    // A split parent whose children are still placeholders is exempt: its
+    // terminal record is what `seed_split_children` folds the children from,
+    // and that fold can only happen on an epoch the beacon commits a proposal
+    // carrying the parent's terminal QC. The beacon can commit empty for
+    // several epochs across the reshape's committee transition, so the horizon
+    // alone would drop the record before any non-empty commit folds it —
+    // stranding both children on their placeholders forever. Holding it until
+    // both children carry a real anchor (seeded here, or from their own first
+    // contributions) keeps the parent sourced until it folds; the fold then
+    // marks the record so it stops being re-sourced and the next horizon sweep
+    // collects it.
     let now = windows.window_of(epoch).start;
-    state.boundaries.retain(|_, b| {
-        b.terminal_epoch
-            .is_none_or(|t| now <= windows.window_of(t).end.plus(RETENTION_HORIZON))
+    let unseeded_split_parents: BTreeSet<ShardId> = state
+        .boundaries
+        .iter()
+        .filter(|(shard, b)| {
+            b.terminal_epoch.is_some() && children_unseeded(&state.boundaries, **shard)
+        })
+        .map(|(shard, _)| *shard)
+        .collect();
+    state.boundaries.retain(|shard, b| {
+        b.terminal_epoch.is_none_or(|t| {
+            unseeded_split_parents.contains(shard)
+                || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
+        })
     });
 
     outcome
+}
+
+/// Whether either of `parent`'s two children holds a placeholder boundary —
+/// present but still on the zero anchor a split execution seeds. A `false`
+/// here means both children carry a real anchor (a parent never split, or its
+/// children have folded), so the parent's terminal record no longer needs to
+/// outlive the retention horizon.
+fn children_unseeded(boundaries: &BTreeMap<ShardId, ShardBoundary>, parent: ShardId) -> bool {
+    let children: [ShardId; 2] = parent.children().into();
+    children.iter().any(|child| {
+        boundaries
+            .get(child)
+            .is_some_and(|b| b.block_hash == BlockHash::ZERO)
+    })
 }
 
 /// Seed a terminated parent's pending children from its terminal header.
@@ -1702,6 +1738,54 @@ mod tests {
         assert!(
             !state.boundaries.contains_key(&parent),
             "terminal record drops past the retention horizon",
+        );
+    }
+
+    /// A split parent whose children are still placeholders outlives the
+    /// retention horizon. The children seed only from the parent's terminal
+    /// fold, and the beacon can commit empty for several epochs across the
+    /// reshape's committee transition before any non-empty commit carries
+    /// that fold — dropping the record on the horizon alone would strand
+    /// both children on their placeholders forever.
+    #[test]
+    fn unseeded_split_parent_outlives_the_retention_horizon() {
+        let (mut state, parent, pair, composed) = terminating_state();
+
+        // The beacon commits empty well past the horizon: no terminal fold
+        // yet, so both children stay on their placeholder anchors.
+        let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
+        record_boundaries(&mut state, past, &[], &BTreeMap::new());
+        assert!(
+            state.boundaries.contains_key(&parent),
+            "an unseeded split parent is held past the horizon",
+        );
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            assert_eq!(
+                state.boundaries.get(&child).unwrap().block_hash,
+                BlockHash::ZERO,
+                "children still pending",
+            );
+        }
+
+        // The terminal contribution finally lands: it seeds both children,
+        // and the now-seeded parent is collected by the same fold's horizon
+        // sweep.
+        let (header, witnesses) =
+            terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
+        let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
+        let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
+        record_boundaries(&mut state, later, &committed, &contributions);
+
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            assert_ne!(
+                state.boundaries.get(&child).unwrap().block_hash,
+                BlockHash::ZERO,
+                "children seed from the terminal fold",
+            );
+        }
+        assert!(
+            !state.boundaries.contains_key(&parent),
+            "the seeded parent drops on the next horizon sweep",
         );
     }
 
