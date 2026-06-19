@@ -69,6 +69,7 @@ pub fn empty_state() -> BeaconState {
     BeaconState {
         chain_config: BeaconChainConfig::default(),
         params: NetworkParams::default(),
+        param_votes: BTreeMap::new(),
         current_epoch: Epoch::GENESIS,
         validators: BTreeMap::new(),
         pools: BTreeMap::new(),

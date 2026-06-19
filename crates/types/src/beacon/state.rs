@@ -36,7 +36,7 @@ use crate::beacon::cert::BeaconCert;
 use crate::beacon::certified::CertifiedBeaconBlock;
 use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
-use crate::beacon::params::NetworkParams;
+use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
@@ -377,6 +377,14 @@ pub struct BeaconState {
     /// stays a pure function of committed beacon history and every
     /// replica resolves the same value at every epoch.
     pub params: NetworkParams,
+    /// Each stake pool's one active parameter-change vote — the proposal
+    /// `(params, activate_at)` it backs. Folded from `ParamVote`
+    /// witnesses (cast/replace/clear); a pool with no entry abstains.
+    /// Each epoch the tally buckets these by proposal, sums backers'
+    /// stake, and applies any proposal a majority of total pool stake
+    /// backs at its `activate_at`, then prunes spent votes — so the set
+    /// stays bounded at one slot per pool.
+    pub param_votes: BTreeMap<StakePoolId, ParamProposal>,
     /// Highest epoch whose block has been applied. Advances by 1 per
     /// successful `apply_epoch`.
     pub current_epoch: Epoch,
@@ -1266,6 +1274,7 @@ mod tests {
         BeaconState {
             chain_config: BeaconChainConfig::default(),
             params: NetworkParams::default(),
+            param_votes: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),

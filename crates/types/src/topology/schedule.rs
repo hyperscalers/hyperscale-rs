@@ -45,9 +45,12 @@ pub struct TopologySchedule {
     /// Zero means a single fixed committee (every timestamp maps to genesis).
     epoch_duration_ms: u64,
     /// Substate-count thresholds for automatic shard reshaping, sourced
-    /// from the folded `BeaconState`'s chain config like
-    /// `epoch_duration_ms`. Consensus-critical; `DISABLED` unless the
-    /// network configured reshaping.
+    /// from the folded `BeaconState`'s live `params` — seeded at
+    /// construction and refreshed by [`set_reshape_thresholds`](Self::set_reshape_thresholds)
+    /// on each commit so a governance-activated change reaches proposers.
+    /// Consensus-critical; `DISABLED` unless the network configured
+    /// reshaping. One value, not a per-epoch entry: a change takes hold
+    /// the commit after its tally applies.
     reshape_thresholds: ReshapeThresholds,
     /// Active committee for routing / gossip ("who is in the committee now?").
     head: Arc<TopologySnapshot>,
@@ -117,13 +120,22 @@ impl TopologySchedule {
         }
     }
 
-    /// Set the network's reshape thresholds (from the folded
-    /// `BeaconState`'s chain config). Construction-time only — the
-    /// thresholds are a chain constant, not per-epoch state.
+    /// Seed the network's reshape thresholds from the folded
+    /// `BeaconState`'s live `params` at construction. The owner refreshes
+    /// them on each commit via [`set_reshape_thresholds`](Self::set_reshape_thresholds),
+    /// since a governance vote can retune them mid-chain.
     #[must_use]
     pub const fn with_reshape_thresholds(mut self, thresholds: ReshapeThresholds) -> Self {
         self.reshape_thresholds = thresholds;
         self
+    }
+
+    /// Refresh the reshape thresholds from the folded `BeaconState`'s live
+    /// `params`. The beacon coordinator calls this on every commit so a
+    /// governance-activated change reaches the shard proposers that read
+    /// [`reshape_thresholds`](Self::reshape_thresholds) off this schedule.
+    pub const fn set_reshape_thresholds(&mut self, thresholds: ReshapeThresholds) {
+        self.reshape_thresholds = thresholds;
     }
 
     /// Substate-count thresholds for automatic shard reshaping.

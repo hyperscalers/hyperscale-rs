@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, BoundedVec, CertifiedBlockHeader,
-    Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, Round, ShardId, Stake, StakePoolId, ValidatorId,
-    Verified, Verify, verify_merkle_inclusion,
+    Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId, Stake, StakePoolId,
+    ValidatorId, Verified, Verify, verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -89,6 +89,14 @@ pub enum ShardWitnessPayload {
         /// Validator requesting unjail.
         id: ValidatorId,
     },
+    /// A stake pool cast or cleared its network-parameter vote. Recorded
+    /// into [`BeaconState::param_votes`](crate::BeaconState); the
+    /// per-epoch tally applies any proposal a stake majority backs at its
+    /// activation epoch. Rides the system-transaction rail like the
+    /// staking variants — the beacon trusts the committee-attested witness
+    /// that `pool` voted this way and weights the tally by `pool`'s stake,
+    /// with the signer's authority over the pool enforced in the VM.
+    ParamVote(ParamVote),
     /// A validator on a shard has signalled they've finished syncing
     /// the shard's state. Transitions the validator to ready;
     /// silently dropped if the validator's status doesn't match.
@@ -212,6 +220,8 @@ pub enum BeaconWitnessEvent {
         /// Validator requesting unjail.
         id: ValidatorId,
     },
+    /// Mirrors [`ShardWitnessPayload::ParamVote`].
+    ParamVote(ParamVote),
 }
 
 impl From<BeaconWitnessEvent> for ShardWitnessPayload {
@@ -236,6 +246,7 @@ impl From<BeaconWitnessEvent> for ShardWitnessPayload {
                 Self::DeactivateValidator { validator_id }
             }
             BeaconWitnessEvent::Unjail { id } => Self::Unjail { id },
+            BeaconWitnessEvent::ParamVote(vote) => Self::ParamVote(vote),
         }
     }
 }
@@ -382,6 +393,19 @@ impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
 mod tests {
     use super::*;
 
+    fn sample_param_vote() -> ParamVote {
+        use crate::{Epoch, NetworkParams, ParamProposal, ReshapeThresholds};
+        ParamVote {
+            pool: StakePoolId::new(5),
+            proposal: Some(ParamProposal {
+                params: NetworkParams {
+                    reshape_thresholds: ReshapeThresholds { split_bytes: 4_096 },
+                },
+                activate_at: Epoch::new(9),
+            }),
+        }
+    }
+
     fn sample_shard_witness() -> ShardWitness {
         ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
@@ -437,6 +461,7 @@ mod tests {
             ShardWitnessPayload::ReshapeReady {
                 validator: ValidatorId::new(13),
             },
+            ShardWitnessPayload::ParamVote(sample_param_vote()),
         ];
         for p in payloads {
             let bytes = basic_encode(&p).unwrap();
@@ -547,6 +572,12 @@ mod tests {
             BeaconWitnessEvent::Unjail {
                 id: ValidatorId::new(10),
             },
+            BeaconWitnessEvent::ParamVote(sample_param_vote()),
+            // The clear case carries no proposal.
+            BeaconWitnessEvent::ParamVote(ParamVote {
+                pool: StakePoolId::new(5),
+                proposal: None,
+            }),
         ];
         for e in events {
             let bytes = basic_encode(&e).unwrap();
@@ -606,6 +637,10 @@ mod tests {
                 ShardWitnessPayload::Unjail {
                     id: ValidatorId::new(10),
                 },
+            ),
+            (
+                BeaconWitnessEvent::ParamVote(sample_param_vote()),
+                ShardWitnessPayload::ParamVote(sample_param_vote()),
             ),
         ];
         for (event, expected) in cases {

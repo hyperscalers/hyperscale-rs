@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_types::{
-    BeaconWitnessEvent, Ed25519PrivateKey, NodeId, NotarizeOptions, TimestampRange, TxHash,
+    BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NodeId, NotarizeOptions,
+    ParamProposal, ParamVote, ReshapeThresholds, StakePoolId, TimestampRange, TxHash,
     WeightedTimestamp, encode_system_action, routable_from_notarized_v1,
     sign_and_notarize_with_options,
 };
@@ -93,5 +94,39 @@ impl SimulationRunner {
             ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
         tx_hash
+    }
+
+    /// Cast a network-parameter vote retuning the live reshape `split_bytes`,
+    /// activating at `activate_at`. The vote comes from the simulation's
+    /// single genesis pool (id 0), which holds all stake — so one vote is an
+    /// outright majority and the change lands at `activate_at`. It rides the
+    /// system-action rail like any other action, paid by `payer`. Returns the
+    /// transaction hash.
+    ///
+    /// Raise `split_bytes` above a grown topology's per-shard byte total to
+    /// drive its small children below the derived merge threshold and trigger
+    /// a consolidating wave of merges.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same conditions as
+    /// [`submit_system_action`](Self::submit_system_action).
+    pub fn vote_reshape_thresholds(
+        &mut self,
+        payer: &Ed25519PrivateKey,
+        nonce: u32,
+        split_bytes: u64,
+        activate_at: Epoch,
+    ) -> TxHash {
+        let vote = BeaconWitnessEvent::ParamVote(ParamVote {
+            pool: StakePoolId::new(0),
+            proposal: Some(ParamProposal {
+                params: NetworkParams {
+                    reshape_thresholds: ReshapeThresholds { split_bytes },
+                },
+                activate_at,
+            }),
+        });
+        self.submit_system_action(payer, nonce, &vote)
     }
 }

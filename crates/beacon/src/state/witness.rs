@@ -312,6 +312,29 @@ pub(super) fn apply_shard_payload(
                 .status = ValidatorStatus::Pooled;
             Some(ShardEvent::Unjailed(*id))
         }
+        ShardWitnessPayload::ParamVote(vote) => {
+            // The source committee attests `pool` voted this way; the
+            // beacon takes the witness as ground truth and records the
+            // pool's one active slot — `None` clears it. A cast is dropped
+            // unless its pool exists, its params are in bounds, and it can
+            // still activate (a past-epoch proposal is dead on arrival).
+            // The per-epoch tally (`tally_param_votes`) then reads the
+            // accumulated slots.
+            match vote.proposal {
+                None => {
+                    state.param_votes.remove(&vote.pool);
+                }
+                Some(proposal) => {
+                    if state.pools.contains_key(&vote.pool)
+                        && proposal.activate_at >= state.current_epoch
+                        && proposal.params.validate().is_ok()
+                    {
+                        state.param_votes.insert(vote.pool, proposal);
+                    }
+                }
+            }
+            None
+        }
         ShardWitnessPayload::Ready { id } => {
             // Flip `ready: false → true` for an `OnShard` validator.
             // Other statuses (including already-ready `OnShard`) are

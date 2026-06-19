@@ -15,6 +15,7 @@ use hyperscale_types::{
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
+use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
 use crate::state::vrf::filter_and_roll_randomness;
@@ -181,7 +182,14 @@ pub fn apply_epoch(
     // anchors forward instead, sparing a reshape that only looks quiet
     // because the beacon stalled.
     match input {
-        ApplyEpochInput::Normal { .. } => prune_stale_reshapes(state),
+        ApplyEpochInput::Normal { .. } => {
+            prune_stale_reshapes(state);
+            // Tally the parameter votes the boundary fold just recorded and
+            // apply any majority-backed change at its activation epoch. A
+            // skip folds no votes and activates none, carrying live
+            // proposals forward to a real epoch.
+            tally_param_votes(state);
+        }
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
 

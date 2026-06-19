@@ -141,6 +141,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     let mut state = BeaconState {
         chain_config: config.chain_config,
         params: NetworkParams::from_genesis(&config.chain_config),
+        param_votes: BTreeMap::new(),
         current_epoch: Epoch::GENESIS,
         validators,
         pools,

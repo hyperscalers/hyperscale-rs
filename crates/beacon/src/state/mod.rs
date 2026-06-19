@@ -12,6 +12,8 @@
 //! - [`committee`]: shuffle step, beacon-committee resample, per-shard
 //!   membership diff.
 //! - [`epoch`]: top-level [`apply_epoch`] orchestration.
+//! - [`governance`]: per-epoch network-parameter vote tally
+//!   ([`tally_param_votes`](governance::tally_param_votes)).
 //! - [`lifecycle`]: auto-reactivation, reward distribution, auto-ready
 //!   timeout.
 //! - [`pool`]: [`pool_draw`] — draw a `Pooled` validator onto a shard —
@@ -26,6 +28,7 @@
 
 mod committee;
 mod epoch;
+mod governance;
 mod lifecycle;
 mod pool;
 mod reshape;

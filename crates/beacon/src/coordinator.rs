@@ -1510,6 +1510,11 @@ impl BeaconCoordinator {
                     .derive_next_topology_snapshot(self.network.clone()),
             ),
         );
+        // Carry a governance-activated reshape-threshold change into the
+        // live schedule so the shard proposers reading off it assert
+        // split/merge against the new value.
+        self.topology
+            .set_reshape_thresholds(self.state.params.reshape_thresholds);
         self.topology
             .evict_below(retention_floor(&self.state, self.local_frontier, self.now));
 

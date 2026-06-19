@@ -22,7 +22,7 @@ use crate::{ShardId, ShardWitnessPayload};
 /// threshold, a fresh child (≈ half the split threshold) is far from
 /// merge-eligible and a fresh merge (≤ a quarter of it) is far from
 /// split-eligible, so reshapes cannot oscillate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BasicSbor)]
 pub struct ReshapeThresholds {
     /// Committed substate byte total at or above which a shard asserts a
     /// split. `u64::MAX` disables reshaping entirely.
