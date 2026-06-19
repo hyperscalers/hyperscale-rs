@@ -12,7 +12,7 @@ use hyperscale_types::{
 };
 
 use crate::rules;
-use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, release_cohort};
+use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
 use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
@@ -375,12 +375,33 @@ pub(super) fn apply_shard_payload(
             if source_shard != *shard {
                 return None;
             }
-            // Re-assertion of an in-flight split refreshes the
-            // staleness clock and nothing else.
-            if let Some(PendingReshape::Split { last_asserted, .. }) =
-                state.pending_reshapes.get_mut(shard)
-            {
-                *last_asserted = state.current_epoch;
+            // An existing split's re-assertion refreshes its trigger
+            // clock. If a lapse emptied the cohort, the re-assertion also
+            // re-staffs it from the frozen seed over the now-refilled
+            // pool, re-deriving the identical selection and assignment.
+            let existing = match state.pending_reshapes.get(shard) {
+                Some(PendingReshape::Split {
+                    cohort,
+                    cohort_seed,
+                    ..
+                }) => Some((cohort.is_empty(), *cohort_seed)),
+                _ => None,
+            };
+            if let Some((lapsed, seed)) = existing {
+                let restaffed = (lapsed
+                    && state.pooled_validators().len() >= state.chain_config.shard_size as usize)
+                    .then(|| draw_split_cohort(state, *shard, &seed));
+                if let Some(PendingReshape::Split {
+                    cohort,
+                    last_asserted,
+                    ..
+                }) = state.pending_reshapes.get_mut(shard)
+                {
+                    if let Some(restaffed) = restaffed {
+                        *cohort = restaffed;
+                    }
+                    *last_asserted = state.current_epoch;
+                }
                 return None;
             }
             // The target must be an active trie leaf, free of any
@@ -406,13 +427,18 @@ pub(super) fn apply_shard_payload(
                 return None;
             }
             tracing::info!(?shard, "Shard split admitted; reshape pending");
-            let cohort = draw_split_cohort(state, *shard);
+            // Freeze the current beacon randomness as the split's cohort
+            // seed for its whole life, so a re-staff after a lapse draws
+            // the identical cohort rather than re-rolling a fresh one.
+            let cohort_seed = state.randomness;
+            let cohort = draw_split_cohort(state, *shard, &cohort_seed);
             state.pending_reshapes.insert(
                 *shard,
                 PendingReshape::Split {
                     last_asserted: state.current_epoch,
                     admitted_at: state.current_epoch,
                     cohort,
+                    cohort_seed,
                 },
             );
             None
@@ -511,34 +537,40 @@ pub(super) fn apply_shard_payload(
     }
 }
 
-/// Cancel pending reshapes whose triggers went quiet or whose
+/// Lapse or cancel pending reshapes whose triggers went quiet or whose
 /// readiness gate never fired.
 ///
 /// Triggers re-derive once per witness window while the load condition
-/// holds, so every live assertion refreshes each epoch. A split whose
-/// target stopped asserting (it drained below the threshold), or a
-/// merge half whose child stopped (it regrew), drops once the silence
-/// reaches [`RESHAPE_TRIGGER_TTL_EPOCHS`]; a merge record with no live
-/// halves left drops entirely. A split still pending
-/// [`RESHAPE_READY_TTL_EPOCHS`] after admission is abandoned — a
-/// stalled grow must not park a committee's worth of validators
-/// indefinitely. Either way the observer cohort returns to the pool.
+/// holds, so every live assertion refreshes each epoch. The readiness
+/// TTL is checked first and unconditionally: a split (or paired merge)
+/// still ungated [`RESHAPE_READY_TTL_EPOCHS`] after admission is removed
+/// outright — a stalled grow must not park a committee indefinitely, and
+/// this is what bounds how long a lapsed split (and its frozen seed)
+/// survives. Below that deadline, a split whose trigger has gone quiet
+/// for [`RESHAPE_TRIGGER_TTL_EPOCHS`] *lapses*: its cohort returns to the
+/// pool but the record is kept, so a re-assertion re-staffs the same
+/// cohort. A merge whose half goes quiet for the trigger TTL cancels
+/// outright (keepers never left their committees, so nothing to retain).
 /// Runs after the epoch's witnesses apply, so an assertion folded this
 /// epoch is never swept.
 pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
     let current = state.current_epoch.inner();
-    let mut cancelled: Vec<(ShardId, &str)> = Vec::new();
+    let mut removed: Vec<(ShardId, &str)> = Vec::new();
+    let mut lapsed: Vec<ShardId> = Vec::new();
     for (target, reshape) in &mut state.pending_reshapes {
         match reshape {
             PendingReshape::Split {
                 last_asserted,
                 admitted_at,
+                cohort,
                 ..
             } => {
-                if current.saturating_sub(last_asserted.inner()) >= RESHAPE_TRIGGER_TTL_EPOCHS {
-                    cancelled.push((*target, "trigger went quiet"));
-                } else if current.saturating_sub(admitted_at.inner()) >= RESHAPE_READY_TTL_EPOCHS {
-                    cancelled.push((*target, "readiness TTL elapsed"));
+                if current.saturating_sub(admitted_at.inner()) >= RESHAPE_READY_TTL_EPOCHS {
+                    removed.push((*target, "readiness TTL elapsed"));
+                } else if !cohort.is_empty()
+                    && current.saturating_sub(last_asserted.inner()) >= RESHAPE_TRIGGER_TTL_EPOCHS
+                {
+                    lapsed.push(*target);
                 }
             }
             PendingReshape::Merge {
@@ -555,20 +587,29 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                 // ordinary rotation.
                 let required = if admitted_at.is_some() { 2 } else { 1 };
                 if halves.len() < required {
-                    cancelled.push((*target, "trigger went quiet"));
+                    removed.push((*target, "trigger went quiet"));
                 } else if admitted_at.is_some_and(|at| {
                     current.saturating_sub(at.inner()) >= RESHAPE_READY_TTL_EPOCHS
                 }) {
-                    cancelled.push((*target, "readiness TTL elapsed"));
+                    removed.push((*target, "readiness TTL elapsed"));
                 }
             }
         }
     }
-    for (target, cause) in cancelled {
+    for target in lapsed {
+        lapse_split(state, target);
+        tracing::info!(
+            ?target,
+            "Pending split lapsed; cohort released, awaiting re-assertion"
+        );
+    }
+    for (target, cause) in removed {
         let Some(reshape) = state.pending_reshapes.remove(&target) else {
             continue;
         };
-        release_cohort(state, target, &reshape);
+        if let PendingReshape::Split { cohort, .. } = &reshape {
+            release_cohort(state, target, cohort);
+        }
         tracing::info!(?target, cause, "Pending reshape cancelled");
     }
 }
@@ -616,9 +657,9 @@ mod tests {
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHeight, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, JAIL_COOLDOWN_EPOCHS, JailReason,
-        MAX_SHARDS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Round,
-        ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId,
-        ValidatorStatus,
+        MAX_SHARDS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Randomness,
+        Round, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
+        ValidatorId, ValidatorStatus,
     };
 
     use super::*;
@@ -1704,6 +1745,7 @@ mod tests {
             last_asserted,
             admitted_at,
             cohort,
+            ..
         }) = state.pending_reshapes.get(&p)
         else {
             panic!("split not recorded");
@@ -1739,8 +1781,8 @@ mod tests {
     }
 
     /// Two replicas with byte-identical state draw byte-identical
-    /// cohorts — the draw is seeded from `(randomness, epoch, shard)`
-    /// under a reshape-specific domain tag.
+    /// cohorts — the draw is seeded from the frozen `cohort_seed` and
+    /// shard under a reshape-specific domain tag.
     #[test]
     fn cohort_draw_is_deterministic_across_replicas() {
         let p = ShardId::leaf(1, 0);
@@ -1897,37 +1939,83 @@ mod tests {
     }
 
     /// Re-assertion refreshes the staleness clock; silence for
-    /// `RESHAPE_TRIGGER_TTL_EPOCHS` cancels the pending reshape and
-    /// returns the cohort to the pool.
+    /// `RESHAPE_TRIGGER_TTL_EPOCHS` *lapses* the split — the cohort
+    /// returns to the pool but the record (and its seed) is kept — and a
+    /// later re-assertion re-staffs the identical cohort from that seed.
     #[test]
-    fn split_reassertion_refreshes_and_silence_cancels() {
+    fn silence_lapses_a_split_and_reassertion_restaffs_it_identically() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
         apply_shard_payload(&mut state, p, &split_payload(p));
+        let original = cohort_of(&state, p).clone();
+        assert_eq!(original.len(), 4);
 
-        state.current_epoch = Epoch::new(6);
-        apply_shard_payload(&mut state, p, &split_payload(p));
+        // Quiet epochs inside the trigger bound survive untouched.
+        state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS - 1);
+        prune_stale_reshapes(&mut state);
+        assert_eq!(cohort_of(&state, p), &original);
+
+        // Reaching the trigger TTL (still inside the readiness TTL)
+        // lapses: the cohort returns to the pool, the record stays with
+        // an empty cohort retaining its seed, and `admitted_at` is
+        // unchanged so the readiness TTL keeps counting from first admit.
+        state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
+        prune_stale_reshapes(&mut state);
         let Some(PendingReshape::Split {
-            last_asserted,
+            cohort,
             admitted_at,
             ..
         }) = state.pending_reshapes.get(&p)
         else {
-            panic!("split not recorded");
+            panic!("a lapsed split keeps its record");
         };
-        assert_eq!(*last_asserted, Epoch::new(6));
+        assert!(cohort.is_empty(), "the lapse empties the cohort");
         assert_eq!(*admitted_at, Epoch::new(5));
-
-        // Quiet epochs inside the bound survive the sweep; reaching it
-        // cancels and releases the cohort.
-        state.current_epoch = Epoch::new(6 + RESHAPE_TRIGGER_TTL_EPOCHS - 1);
-        prune_stale_reshapes(&mut state);
-        assert!(state.pending_reshapes.contains_key(&p));
-        state.current_epoch = Epoch::new(6 + RESHAPE_TRIGGER_TTL_EPOCHS);
-        prune_stale_reshapes(&mut state);
-        assert!(state.pending_reshapes.is_empty());
         assert_eq!(state.pooled_validators().len(), 4);
         assert!(state.next_shard_committees[&p].members.is_empty());
+
+        // A re-assertion re-staffs the same cohort: the draw seeds on the
+        // frozen `cohort_seed` over the now-refilled pool, so an
+        // observer's synced child never moves under it.
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        assert_eq!(cohort_of(&state, p), &original);
+        assert!(state.pooled_validators().is_empty());
+    }
+
+    /// A lapsed split that is never re-asserted is removed at the
+    /// readiness TTL — bounding how long its frozen seed lives — so a
+    /// split admitted later snapshots current randomness afresh rather
+    /// than resurrecting the removed split's seed.
+    #[test]
+    fn readiness_ttl_removes_a_lapsed_split_and_a_later_split_reseeds() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = reshape_state(&[p], 4);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+
+        // Trigger silence lapses it, then quiet through the readiness TTL
+        // removes the lapsed record outright.
+        state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
+        prune_stale_reshapes(&mut state);
+        assert!(
+            cohort_of(&state, p).is_empty(),
+            "trigger silence lapses the split"
+        );
+        state.current_epoch = Epoch::new(5 + RESHAPE_READY_TTL_EPOCHS);
+        prune_stale_reshapes(&mut state);
+        assert!(
+            state.pending_reshapes.is_empty(),
+            "the readiness TTL removes a lapsed split",
+        );
+        assert_eq!(state.pooled_validators().len(), 4);
+
+        // A later split snapshots the current randomness — proof the seed
+        // is freshly drawn, not carried over from the removed record.
+        state.randomness = Randomness::new([7u8; 32]);
+        apply_shard_payload(&mut state, p, &split_payload(p));
+        let Some(PendingReshape::Split { cohort_seed, .. }) = state.pending_reshapes.get(&p) else {
+            panic!("re-admitted split not recorded");
+        };
+        assert_eq!(*cohort_seed, Randomness::new([7u8; 32]));
     }
 
     /// A split whose gate never fires is abandoned once
@@ -1977,12 +2065,19 @@ mod tests {
         assert!(state.pending_reshapes.contains_key(&p));
 
         // Real quiet epochs without a re-assertion age the trigger TTL
-        // from where the stall left it and cancel as usual.
+        // from where the stall left it and lapse the split as usual.
         for _ in 0..RESHAPE_TRIGGER_TTL_EPOCHS {
             state.current_epoch = state.current_epoch.next();
         }
         prune_stale_reshapes(&mut state);
-        assert!(state.pending_reshapes.is_empty());
+        assert!(
+            state.pending_reshapes.contains_key(&p),
+            "a lapse keeps the record"
+        );
+        assert!(
+            cohort_of(&state, p).is_empty(),
+            "the lapse empties the cohort"
+        );
         assert_eq!(state.pooled_validators().len(), 4);
     }
 

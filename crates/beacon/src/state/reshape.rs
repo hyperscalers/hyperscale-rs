@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, Epoch, KeeperSeat,
-    PendingReshape, ShardBoundary, ShardCommittee, ShardId, StateRoot, ValidatorId,
+    PendingReshape, Randomness, ShardBoundary, ShardCommittee, ShardId, StateRoot, ValidatorId,
     ValidatorStatus, WeightedTimestamp, byzantine_threshold,
 };
 use rand::RngExt;
@@ -27,8 +27,10 @@ use rand_chacha::ChaCha20Rng;
 use crate::sampling::prng_from;
 
 /// Domain tag for the cohort draw + child assignment seed. Distinct
-/// from the pool-draw and shuffle-exit tags so the three PRNG streams
-/// never collide on the same `(randomness, epoch, shard)` input.
+/// from the parent-half and keeper tags so the reshape PRNG streams
+/// never collide. The cohort stream seeds on the split's frozen
+/// `cohort_seed` (not the running `(randomness, epoch)`), so a re-staff
+/// after a lapse re-derives an identical cohort.
 const DOMAIN_RESHAPE_COHORT: &[u8] = b"hyperscale-reshape-cohort-v1";
 
 /// Domain tag for the execution-fold parent-half assignment seed.
@@ -45,15 +47,21 @@ const DOMAIN_RESHAPE_KEEPER: &[u8] = b"hyperscale-reshape-keeper-v1";
 /// shard_size`). Each drawn validator becomes `Observing { shard:
 /// target }` and joins the target's lookahead committee; the returned
 /// seats record the child assignments with `ready: false`.
+///
+/// `cohort_seed` is the split's frozen entropy — the same value the
+/// record carries for its whole life — so re-staffing a lapsed split
+/// over an unchanged free pool reproduces the exact selection and child
+/// assignment, leaving an observer's already-synced child in place.
 pub(super) fn draw_split_cohort(
     state: &mut BeaconState,
     target: ShardId,
+    cohort_seed: &Randomness,
 ) -> BTreeMap<ValidatorId, CohortSeat> {
     let mut pool = state.pooled_validators();
     let size = state.chain_config.shard_size as usize;
     debug_assert!(pool.len() >= size, "caller enforces the pool gate");
 
-    let mut prng = reshape_prng(DOMAIN_RESHAPE_COHORT, state, target);
+    let mut prng = cohort_prng(cohort_seed, target);
     shuffle(&mut pool, &mut prng);
     pool.truncate(size);
 
@@ -141,14 +149,16 @@ pub(super) fn draw_merge_keepers(
     keepers
 }
 
-/// Return a cancelled or abandoned reshape's cohort to the pool: each
-/// observer leaves the target's lookahead committee and goes back to
-/// `Pooled`. A merge's keepers never left their child committees, so a
-/// cancelled merge releases nothing — dropping the record un-pins them.
-pub(super) fn release_cohort(state: &mut BeaconState, target: ShardId, reshape: &PendingReshape) {
-    let PendingReshape::Split { cohort, .. } = reshape else {
-        return;
-    };
+/// Return a split's `cohort` to the pool: each observer leaves the
+/// target's lookahead committee and goes back to `Pooled`. Used both
+/// when a split is abandoned (cohort dropped with the record) and when
+/// it lapses (cohort emptied, record kept). A merge's keepers never
+/// left their child committees, so a cancelled merge releases nothing.
+pub(super) fn release_cohort(
+    state: &mut BeaconState,
+    target: ShardId,
+    cohort: &BTreeMap<ValidatorId, CohortSeat>,
+) {
     if let Some(committee) = state.next_shard_committees.get_mut(&target) {
         committee.members.retain(|m| !cohort.contains_key(m));
     }
@@ -160,6 +170,17 @@ pub(super) fn release_cohort(state: &mut BeaconState, target: ShardId, reshape: 
             rec.status = ValidatorStatus::Pooled;
         }
     }
+}
+
+/// Empty a lapsed split's cohort and return its observers to the pool,
+/// keeping the record (and its frozen `cohort_seed`) so a re-assertion
+/// before the readiness TTL re-staffs the identical cohort.
+pub(super) fn lapse_split(state: &mut BeaconState, target: ShardId) {
+    let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get_mut(&target) else {
+        return;
+    };
+    let drained = std::mem::take(cohort);
+    release_cohort(state, target, &drained);
 }
 
 /// Execute every pending split whose readiness gate is met, mutating
@@ -453,12 +474,24 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
 }
 
 /// PRNG bound to `(domain, randomness, epoch, shard)` — the seeding
-/// discipline every reshape draw shares.
+/// discipline the parent-half and keeper draws share.
 fn reshape_prng(domain: &[u8], state: &BeaconState, shard: ShardId) -> ChaCha20Rng {
     let mut h = Hasher::new();
     h.update(domain);
     h.update(state.randomness.as_bytes());
     h.update(&state.current_epoch.inner().to_le_bytes());
+    h.update(&shard.inner().to_le_bytes());
+    prng_from(h.finalize().as_bytes())
+}
+
+/// PRNG for the cohort draw, bound to `(cohort_seed, shard)` only — no
+/// epoch — so re-staffing a lapsed split re-derives the identical
+/// cohort. `cohort_seed` is the beacon randomness frozen at the split's
+/// first admission, so the draw stays unbiasable while idempotent.
+fn cohort_prng(cohort_seed: &Randomness, shard: ShardId) -> ChaCha20Rng {
+    let mut h = Hasher::new();
+    h.update(DOMAIN_RESHAPE_COHORT);
+    h.update(cohort_seed.as_bytes());
     h.update(&shard.inner().to_le_bytes());
     prng_from(h.finalize().as_bytes())
 }
@@ -676,9 +709,9 @@ mod tests {
     }
 
     /// The fold surfaces cohort-seat changes through `SlotEffects`:
-    /// the admission draw with its child assignments, the cancel
-    /// sweep's release, and silence at execution — consumed seats land
-    /// on their children through the committee transitions instead.
+    /// the admission draw with its child assignments, the lapse sweep's
+    /// release, and silence at execution — consumed seats land on their
+    /// children through the committee transitions instead.
     #[test]
     fn slot_effects_surface_seat_draws_and_releases() {
         use hyperscale_types::RESHAPE_TRIGGER_TTL_EPOCHS;
@@ -704,15 +737,22 @@ mod tests {
             .map(|seat| seat.validator)
             .collect();
 
-        // The trigger goes quiet; the staleness cancel releases every
-        // seat, once.
+        // The trigger goes quiet; the staleness sweep *lapses* the split,
+        // releasing every seat once but keeping the record for a re-staff.
         let mut released = Vec::new();
         for _ in 0..RESHAPE_TRIGGER_TTL_EPOCHS {
             let effects = apply_next_epoch(&mut state, &[]);
             assert!(effects.observers_drawn.is_empty());
             released.extend(effects.observers_released);
         }
-        assert!(state.pending_reshapes.is_empty());
+        assert!(
+            state.pending_reshapes.contains_key(&p),
+            "the lapse keeps the record",
+        );
+        assert!(
+            cohort_of(&state, p).is_empty(),
+            "the lapse empties the cohort"
+        );
         assert_eq!(
             released
                 .iter()

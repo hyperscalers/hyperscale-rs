@@ -300,13 +300,16 @@ pub struct KeeperSeat {
 ///
 /// Liveness is assertion-driven: a shard's trigger re-derives once per
 /// witness window while its load condition holds, each fold refreshing
-/// the recorded epoch. A record whose every required assertion goes
-/// quiet for [`RESHAPE_TRIGGER_TTL_EPOCHS`](crate::RESHAPE_TRIGGER_TTL_EPOCHS)
-/// epochs cancels — a drained split target or regrown merge child
-/// self-cancels by falling silent. A split additionally cancels when
-/// its readiness gate isn't met within
+/// the recorded epoch. A split whose trigger goes quiet for
+/// [`RESHAPE_TRIGGER_TTL_EPOCHS`](crate::RESHAPE_TRIGGER_TTL_EPOCHS)
+/// epochs *lapses*: its cohort returns to the pool but the record is
+/// retained, so a re-assertion before the deadline re-staffs the same
+/// cohort from `cohort_seed`. The record is only removed — abandoning
+/// the split outright — when its readiness gate isn't met within
 /// [`RESHAPE_READY_TTL_EPOCHS`](crate::RESHAPE_READY_TTL_EPOCHS) of
-/// admission. Either way the cohort returns to the pool.
+/// admission, which also bounds how long a lapsed record (and its seed)
+/// survives. A merge child that goes quiet for the trigger TTL cancels
+/// the paired merge outright, returning its keepers to rotation.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum PendingReshape {
     /// The target shard splits into its two children.
@@ -318,8 +321,16 @@ pub enum PendingReshape {
         /// Observer cohort drawn at admission, each seat assigned the
         /// child it syncs. Seats drop with the validator's jail or
         /// deactivation; the execution gate reads ready seats per
-        /// child.
+        /// child. Empty while the record is lapsed (trigger went quiet
+        /// but the readiness TTL hasn't elapsed) — a re-assertion
+        /// re-staffs it from [`cohort_seed`](Self::Split::cohort_seed).
         cohort: BTreeMap<ValidatorId, CohortSeat>,
+        /// Beacon randomness snapshotted at the split's first admission,
+        /// the sole entropy the cohort draw seeds on. Frozen for the
+        /// record's life so a re-staff after a lapse re-derives the
+        /// identical selection and child assignment (given an unchanged
+        /// free pool) — an observer's synced child never moves under it.
+        cohort_seed: Randomness,
     },
     /// The target parent's two children merge back under it. The merge
     /// is paired — keepers drawn, eligible for execution — once both
@@ -1647,6 +1658,7 @@ mod tests {
                         ready: false,
                     },
                 )]),
+                cohort_seed: Randomness::ZERO,
             },
         );
 
