@@ -479,19 +479,7 @@ impl RemoteHeaderCoordinator {
             }
         }
 
-        // Seed expected headers for remote shards we haven't seen yet.
-        for shard in topology.head().shard_trie().leaves() {
-            if shard == self.local_shard {
-                continue;
-            }
-            self.expected
-                .entry(shard)
-                .or_insert_with(|| ExpectedHeader {
-                    discovered_at: self.local_committed_ts,
-                    last_verified_height: BlockHeight::new(0),
-                    last_verified_at: None,
-                });
-        }
+        self.refresh_expected(topology);
 
         // Check for timed-out remote shards.
         let mut actions = vec![];
@@ -533,6 +521,38 @@ impl RemoteHeaderCoordinator {
         }
 
         actions
+    }
+
+    /// Reconcile `expected` with the routable topology: seed an entry for
+    /// every remote shard that appears in any retained window — live head
+    /// leaves and a drained reshape shard still inside its retention window
+    /// alike — and drop any whose shard has fully evicted.
+    ///
+    /// Seeding from the routable set rather than the head leaves alone is what
+    /// keeps a freshly-seated member — a merge keeper, a resampled beacon
+    /// committee member, a node that came up after the shard left the head —
+    /// syncing a departing shard's terminal crossing into the beacon fold.
+    /// A drained reshape shard is absent from the head trie the instant its
+    /// children (or merged parent) take over, so a member that never tracked
+    /// it would otherwise never probe it, and the beacon could fall short of
+    /// the `2f+1` that admits its terminal boundary QC. The terminal clamp on
+    /// the schedule retains the shard until the drain horizon, exactly long
+    /// enough for its terminal to fold.
+    fn refresh_expected(&mut self, topology: &TopologySchedule) {
+        let routable = topology.routable_shards();
+        self.expected.retain(|shard, _| routable.contains(shard));
+        for shard in routable {
+            if shard == self.local_shard {
+                continue;
+            }
+            self.expected
+                .entry(shard)
+                .or_insert_with(|| ExpectedHeader {
+                    discovered_at: self.local_committed_ts,
+                    last_verified_height: BlockHeight::new(0),
+                    last_verified_at: None,
+                });
+        }
     }
 
     /// Immediately raise the sync target for all remote shards that are
@@ -931,6 +951,49 @@ mod tests {
         assert_eq!(
             *keys, expected_b,
             "must verify under the epoch-1 committee at the parent QC's WT, not the head",
+        );
+    }
+
+    #[test]
+    fn expected_headers_seed_a_drained_reshape_shard_not_just_head_leaves() {
+        // Post-split schedule: ROOT (epoch 0) drained into its two children
+        // (epoch 1, the head). A coordinator born on a child shard never saw
+        // ROOT as a head leaf, yet must still sync ROOT's terminal crossing
+        // so the beacon fold can admit it. Seeding from the routable set —
+        // every shard in any retained window, terminal-clamped — covers the
+        // drained parent; the old head-leaves-only seeding would miss it,
+        // stranding ROOT's terminal boundary QC below `2f+1`.
+        const ED: u64 = 1_000;
+        let (left, right) = ShardId::ROOT.children();
+        let pre = Arc::new(shard_snapshot(1, &[0, 1, 2, 3], 0)); // ROOT only
+        let post = Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)); // both children
+        let mut sched = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&pre));
+        sched.insert(Epoch::new(1), Arc::clone(&post));
+        sched.set_head(post);
+
+        let mut coord = RemoteHeaderCoordinator::new(left);
+        coord.refresh_expected(&sched);
+
+        assert!(
+            coord.expected.contains_key(&ShardId::ROOT),
+            "the drained parent must be seeded for sync, not just head leaves",
+        );
+        assert!(
+            coord.expected.contains_key(&right),
+            "the live sibling resolves its head committee and is seeded",
+        );
+        assert!(
+            !coord.expected.contains_key(&left),
+            "the local shard is never expected",
+        );
+
+        // Once the parent's window evicts, the entry is dropped — nothing
+        // left to sync.
+        let head_only = TopologySchedule::single(Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)));
+        coord.refresh_expected(&head_only);
+        assert!(
+            !coord.expected.contains_key(&ShardId::ROOT),
+            "a fully evicted shard is pruned from the expected set",
         );
     }
 

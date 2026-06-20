@@ -11,7 +11,7 @@
 //! nothing above `hyperscale-types`. The beacon coordinator owns one and
 //! advances it on each commit; shard and execution verification borrow it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
@@ -249,6 +249,21 @@ impl TopologySchedule {
             }
         }
         committees
+    }
+
+    /// Every shard appearing in any retained window — the key set of
+    /// [`routing_committees`](Self::routing_committees) without building the
+    /// committees. Includes a drained reshape shard (a split parent draining
+    /// out, a merge child) whose final window the schedule still retains, so a
+    /// consumer that syncs from this set keeps following a departing shard's
+    /// terminal crossing until [`evict_below`](Self::evict_below) trims its
+    /// last window.
+    #[must_use]
+    pub fn routable_shards(&self) -> BTreeSet<ShardId> {
+        self.by_epoch
+            .values()
+            .flat_map(|snapshot| snapshot.shard_trie().leaves())
+            .collect()
     }
 
     /// [`at`](Self::at) for a shard whose chain may terminate: resolve
