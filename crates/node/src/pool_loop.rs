@@ -62,8 +62,10 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Build a pool driver over the host's shard-less vnodes.
-    pub(crate) const fn new(process: Arc<ProcessIo<S, N, D>>, vnodes: Vec<Vnode>) -> Self {
+    /// Build a pool driver over the host's shard-less vnodes. Used by
+    /// `NodeHost::new` at construction and by the production supervisor when
+    /// it builds a follower pool at runtime.
+    pub const fn new(process: Arc<ProcessIo<S, N, D>>, vnodes: Vec<Vnode>) -> Self {
         Self {
             process,
             vnodes,

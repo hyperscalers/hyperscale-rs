@@ -30,9 +30,12 @@ use hyperscale_node::bootstrap::merge_flip::merge_genesis_from_terminals;
 use hyperscale_node::bootstrap::observer::observer_ready_signal;
 use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::host::{attach_shard, detach_shard};
+use hyperscale_node::pool_loop::PoolLoop;
 use hyperscale_node::process_io::ProcessIo;
 use hyperscale_node::shard_loop::HostEvent;
-use hyperscale_node::{NodeConfig, SeatVnodeGroup, TimerOp, VnodeInit, seat_vnode_group};
+use hyperscale_node::{
+    NodeConfig, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit, seat_follower, seat_vnode_group,
+};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, ImportLeaf, RecoveredState, ShardChainReader};
@@ -320,10 +323,15 @@ struct ShardThread {
     validator_ids: Vec<u64>,
 }
 
-/// The host's pinned pool thread plus the handle to stop it.
+/// The host's pinned pool thread plus the handle to stop it, and the
+/// follower validators it currently drives — a membership change rebuilds
+/// the pool with the adjusted set.
 struct PoolThread {
     join: std::thread::JoinHandle<()>,
     shutdown_tx: Sender<()>,
+    /// Validators currently followed by the pool. A drain off the last
+    /// shard adds one; a seat removes one; the pool tears down at zero.
+    validators: Vec<ValidatorId>,
 }
 
 /// Owns the per-shard pinned threads and executes runtime membership
@@ -394,6 +402,10 @@ pub struct ShardSupervisor {
     /// thread the supervisor spawns. The host-level gossip handler pushes
     /// committed beacon blocks onto the paired sender.
     beacon_event_rx: Receiver<HostEvent>,
+    /// Signing keys for the host's local validators, used to build a
+    /// follower when a validator drains off its last shard. A follower
+    /// never signs, but the bundle carries the real key for the later seat.
+    vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
 }
 
 impl ShardSupervisor {
@@ -415,6 +427,7 @@ impl ShardSupervisor {
         epoch_duration_ms: u64,
         genesis_offset_ms: u64,
         beacon_event_rx: Receiver<HostEvent>,
+        vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
@@ -443,6 +456,7 @@ impl ShardSupervisor {
             pending_joins: HashMap::new(),
             pool: None,
             beacon_event_rx,
+            vnode_keys,
             events_tx,
             events_rx: Some(events_rx),
         }
@@ -521,10 +535,12 @@ impl ShardSupervisor {
         self.start_pool_thread(pool);
     }
 
-    /// Spawn a pinned thread for `pool`, recording its handle. The thread
-    /// drains a clone of the host's beacon channel; the host-level gossip
-    /// handler pushes committed beacon blocks onto the paired sender.
+    /// Spawn a pinned thread for `pool`, recording its handle and follower
+    /// set. The thread drains a clone of the host's beacon channel; the
+    /// host-level gossip handler pushes committed beacon blocks onto the
+    /// paired sender.
     fn start_pool_thread(&mut self, pool: ProdPoolLoop) {
+        let validators: Vec<ValidatorId> = pool.vnodes.iter().map(|v| v.validator_id).collect();
         let (shutdown_tx, shutdown_rx) = unbounded();
         let cfg = PoolLoopConfig {
             beacon_rx: self.beacon_event_rx.clone(),
@@ -533,7 +549,11 @@ impl ShardSupervisor {
             genesis_offset_ms: self.genesis_offset_ms,
         };
         let join = spawn_pool_loop(pool, cfg);
-        self.pool = Some(PoolThread { join, shutdown_tx });
+        self.pool = Some(PoolThread {
+            join,
+            shutdown_tx,
+            validators,
+        });
     }
 
     /// Stop the pool thread if one runs, joining it.
@@ -544,6 +564,95 @@ impl ShardSupervisor {
                 warn!("Pool thread panicked before teardown");
             }
         }
+    }
+
+    /// Rebuild the pool thread to follow exactly `validators`: tear the
+    /// current thread down, and — unless the set is now empty — build a
+    /// fresh follower per validator from the host's warm beacon storage and
+    /// spawn a new thread. Tearing down and rebuilding (rather than mutating
+    /// a running thread) keeps the follower set a single owned value; a
+    /// follower resumes cheaply from the warm storage tip.
+    fn rebuild_pool(&mut self, validators: &[ValidatorId]) {
+        self.teardown_pool();
+        if validators.is_empty() {
+            return;
+        }
+        let vnodes: Vec<_> = validators
+            .iter()
+            .filter_map(|&validator| self.build_follower(validator))
+            .map(VnodeInit::into_vnode)
+            .collect();
+        if vnodes.is_empty() {
+            return;
+        }
+        let pool = PoolLoop::new(Arc::clone(&self.process), vnodes);
+        self.start_pool_thread(pool);
+    }
+
+    /// Build one shard-less follower for `validator` from the host's warm
+    /// beacon storage. `None` when the validator has no local signing key
+    /// (it isn't ours to follow for).
+    fn build_follower(&self, validator: ValidatorId) -> Option<VnodeInit> {
+        let signing_key = self.vnode_keys.get(&validator).cloned().or_else(|| {
+            warn!(
+                validator = validator.inner(),
+                "No local signing key for a drained validator; not following it"
+            );
+            None
+        })?;
+        Some(seat_follower(SeatFollower {
+            beacon_storage: self.process.beacon_storage().as_ref(),
+            beacon_network: self.beacon_network.clone(),
+            beacon_config_hash: self.beacon_config_hash,
+            now: consensus_clock(self.genesis_offset_ms),
+            validator,
+            signing_key,
+        }))
+    }
+
+    /// Begin following the beacon for `validator` in the pool — it drained
+    /// off its last shard and would otherwise go dark, never raising its own
+    /// re-seat trigger. No-op if it is already a follower.
+    fn follow_in_pool(&mut self, validator: ValidatorId) {
+        let mut validators = self
+            .pool
+            .as_ref()
+            .map(|p| p.validators.clone())
+            .unwrap_or_default();
+        if validators.contains(&validator) {
+            return;
+        }
+        validators.push(validator);
+        self.rebuild_pool(&validators);
+        info!(
+            validator = validator.inner(),
+            "Following the beacon in the pool after draining off the last shard"
+        );
+    }
+
+    /// Drop `validator` from the pool — it was seated onto a shard, so its
+    /// shard vnode now drives its beacon. No-op if it isn't a follower; the
+    /// pool thread tears down once its last follower leaves.
+    fn unfollow_in_pool(&mut self, validator: ValidatorId) {
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        if !pool.validators.contains(&validator) {
+            return;
+        }
+        let validators: Vec<ValidatorId> = pool
+            .validators
+            .iter()
+            .copied()
+            .filter(|&v| v != validator)
+            .collect();
+        self.rebuild_pool(&validators);
+    }
+
+    /// Whether `validator` runs a vnode on any shard this host still hosts.
+    fn validator_on_any_shard(&self, validator: ValidatorId) -> bool {
+        let id = validator.inner();
+        self.shards.values().any(|t| t.validator_ids.contains(&id))
     }
 
     /// Execute one membership command.
@@ -1446,6 +1555,12 @@ impl ShardSupervisor {
                 validator_ids,
             },
         );
+        // A seated validator now drives its beacon from this shard's thread,
+        // so retire its pool follower if it had one (it drained here from a
+        // prior shard, or started pooled and was just drawn into a committee).
+        for cfg in vnodes {
+            self.unfollow_in_pool(cfg.validator_id);
+        }
         info!(shard = ?shard, vnodes = vnode_count, "Shard joined at runtime");
     }
 
@@ -1520,6 +1635,18 @@ impl ShardSupervisor {
                 .release_beacon_signer(ValidatorId::new(*id), shard);
         }
         info!(shard = ?shard, "Shard left and torn down");
+        // A departed validator that runs no other shard would go dark — no
+        // vnode to fold the beacon and raise its own re-seat trigger. Keep
+        // it following in the pool instead; the host's beacon storage stays
+        // warm for the eventual re-seat. A relocation that already seated
+        // the destination leaves the validator on that shard, so it is not
+        // pooled; a race that pools it is undone when the seat lands.
+        for &id in validator_ids {
+            let validator = ValidatorId::new(id);
+            if !self.validator_on_any_shard(validator) {
+                self.follow_in_pool(validator);
+            }
+        }
         if let Some(vnodes) = self.pending_joins.remove(&shard) {
             self.join(shard, &vnodes);
         }

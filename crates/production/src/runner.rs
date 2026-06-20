@@ -609,6 +609,7 @@ impl ProductionRunnerBuilder {
             chain_config.epoch_duration_ms,
             chain_config.genesis_timestamp_ms,
             beacon_event_rx,
+            vnode_keys.clone(),
         );
 
         Ok(ProductionRunner {

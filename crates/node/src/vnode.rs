@@ -23,7 +23,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_types::{
     BeaconState, Bls12381G1PrivateKey, GenesisConfigHash, LocalTimestamp, NetworkDefinition,
-    ShardId, ValidatorId,
+    ShardId, ValidatorId, WeightedTimestamp,
 };
 
 use crate::NodeStateMachine;
@@ -158,6 +158,68 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
             VnodeInit { state, signing_key }
         })
         .collect()
+}
+
+/// Caller-supplied bundle for constructing one shard-less beacon
+/// follower — the pooled counterpart of [`SeatVnodeGroup`].
+pub struct SeatFollower<'a> {
+    /// Host beacon storage; the follower's coordinator resumes from its
+    /// committed tip and stays warm by committing every block it folds.
+    pub beacon_storage: &'a dyn BeaconStorage,
+    /// Radix network identity bound into beacon signatures.
+    pub beacon_network: NetworkDefinition,
+    /// Genesis config hash bound into beacon signatures alongside the
+    /// network.
+    pub beacon_config_hash: GenesisConfigHash,
+    /// Wall clock (production) or sim time; bounds the resume floor.
+    pub now: LocalTimestamp,
+    /// The validator this host follows the beacon for.
+    pub validator: ValidatorId,
+    /// Its signing key. A follower never signs (it is never
+    /// `beacon_eligible`), but the bundle carries the real key so a later
+    /// seat does not have to thread one in separately.
+    pub signing_key: Arc<Bls12381G1PrivateKey>,
+}
+
+/// Build one shard-less beacon-follower [`VnodeInit`].
+///
+/// A beacon coordinator resumed from the host's committed beacon chain
+/// wrapped in a `shard: None` [`NodeStateMachine`]. The coordinator carries
+/// [`ShardId::ROOT`] as its placeholder home — it only seeds the retention
+/// floor and has no consensus effect for a follower.
+///
+/// # Panics
+///
+/// Panics if `beacon_storage` holds no committed beacon block — every host
+/// commits the genesis pair before it follows or seats.
+#[must_use]
+pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
+    let (latest_block, latest_state) = args
+        .beacon_storage
+        .latest_committed()
+        .expect("beacon chain is non-empty after the genesis commit");
+    // A follower has no committed shard frontier, so the floor is bounded
+    // by the chain tip and `now` alone.
+    let boot_floor = retention_floor(&latest_state, WeightedTimestamp::ZERO, args.now);
+    let beacon_history: Vec<BeaconState> = args
+        .beacon_storage
+        .states_since(boot_floor)
+        .into_iter()
+        .map(|state| state.as_ref().clone())
+        .collect();
+    let beacon_coordinator = BeaconCoordinator::new(
+        latest_block,
+        beacon_history,
+        args.validator,
+        ShardId::ROOT,
+        WeightedTimestamp::ZERO,
+        args.beacon_network,
+        args.beacon_config_hash,
+    );
+    VnodeInit {
+        state: NodeStateMachine::follower(args.validator, beacon_coordinator),
+        signing_key: args.signing_key,
+    }
 }
 
 /// Per-validator bundle hosted by the `NodeHost`.

@@ -52,4 +52,4 @@ pub use shard_io::sync::block_serve::serve_block_request;
 pub use shard_io::sync::settled_waves_serve::serve_settled_waves_request;
 pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
-pub use vnode::{SeatVnodeGroup, Vnode, VnodeInit, seat_vnode_group};
+pub use vnode::{SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, seat_follower, seat_vnode_group};
