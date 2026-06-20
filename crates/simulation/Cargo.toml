@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "Simulation runner"
 
+[features]
+# Run the sims at the production 5-minute beacon epoch. Off by default so
+# local runs use a fast 30s epoch; CI turns it on for production parity.
+ci = []
+
 [dependencies]
 hyperscale-beacon.workspace = true
 hyperscale-core.workspace = true
