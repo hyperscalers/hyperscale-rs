@@ -1,10 +1,13 @@
 //! A surviving sibling reconstructs a split shard's settled set.
 //!
-//! Two genesis shards, `leaf(1,1)` and `leaf(1,0)`. `leaf(1,0)` is funded
-//! past the split threshold and splits into `leaf(2,0)`/`leaf(2,1)` while
-//! `leaf(1,1)` stays under it and keeps running — the surviving-sibling
-//! shape the split-boundary fence needs and that `reshape_straddle`
-//! (a single ROOT split, both children fresh) cannot produce.
+//! Reached the way mainnet would: a single-shard genesis grows into the two
+//! sibling shards `leaf(1,0)`/`leaf(1,1)` through the real split lifecycle,
+//! then a stake-pool parameter vote lowers `split_bytes` so the heavier
+//! `leaf(1,0)` (bulk-funded past the lowered threshold) splits into
+//! `leaf(2,0)`/`leaf(2,1)` while the lighter `leaf(1,1)` stays under it and
+//! keeps running — the surviving-sibling shape the split-boundary fence
+//! needs and that `reshape_straddle` (a single ROOT split, both children
+//! fresh) cannot produce.
 //!
 //! This file builds the lifecycle first: the trigger fires for `leaf(1,0)`
 //! alone, its observers grow the split through the readiness gate, the
@@ -16,13 +19,13 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
+use hyperscale_network_memory::{NetworkConfig, NodeIndex};
 use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, NodeId,
+    BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, Epoch, NodeId,
     PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, SplitChildRoots,
     StateRoot, TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
     ValidatorStatus, WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1,
@@ -37,24 +40,36 @@ use tracing_test::traced_test;
 
 const PER_SHARD: u32 = 4;
 
-/// `leaf(1,0)`'s genesis byte total (~627k — the heavier engine-bootstrap
-/// half plus 20 bulk accounts) sits above this; `leaf(1,1)`'s (~377k) sits
-/// below — so the trigger fires for `leaf(1,0)` alone. A cross-shard
-/// transfer moves no substates, so `leaf(1,1)` stays under the threshold
-/// throughout.
+/// Reshape threshold armed for the grow: ROOT's full genesis byte total
+/// (both halves plus the bulk accounts, ~1M) sits above it so ROOT splits
+/// once, while each child's half (`leaf(1,0)` ~627k, `leaf(1,1)` ~377k)
+/// sits below it so neither child re-splits during the grow.
+const GROW_SPLIT_BYTES: u64 = 800_000;
+
+/// The threshold the parameter vote installs after the grow: `leaf(1,0)`'s
+/// byte total (~627k — the heavier engine-bootstrap half plus 20 bulk
+/// accounts) sits above this; `leaf(1,1)`'s (~377k) sits below — so the
+/// trigger fires for `leaf(1,0)` alone. A cross-shard transfer moves no
+/// substates, so `leaf(1,1)` stays under the threshold throughout.
 const SPLIT_BYTES: u64 = 500_000;
+
+/// Epochs after the post-grow epoch at which the threshold vote activates —
+/// enough lead for the vote transaction to commit and fold into
+/// `param_votes` before the tally reads it.
+const ACTIVATE_LEAD: u64 = 4;
 
 /// Bulk accounts funded into `leaf(1,0)` to widen its margin over the
 /// threshold.
 const RIGHT_BULK: usize = 20;
 
-/// Fixed delays from admission for the straddlers meant to *settle* on
-/// `leaf(1,0)`. Submitted during the grow phase, they have the full
-/// runway to commit-execute-certify-finalize on `leaf(1,0)` well before
-/// its terminal block (the survivor finalizes them once it reconstructs
-/// `S_{leaf(1,0)}`). The gate-to-cut window alone is far too short for
-/// that pipeline, so these cannot ride the cut-anchored offsets below.
-const SETTLE_DELAYS_MS: [u64; 2] = [1500, 3000];
+/// Submission offsets *before* `leaf(1,0)`'s terminal cut for the straddlers
+/// meant to *settle*: far enough ahead that the cross-shard 2PC finalizes on
+/// `leaf(1,0)` before its terminal, yet close enough that the settled wave is
+/// still in the settled set `leaf(1,0)`'s terminal attests — so the survivor
+/// reconstructs a non-empty `S_{leaf(1,0)}`. (At a five-minute epoch a settle
+/// anchored to admission would finalize epochs before the terminal and be
+/// pruned out of the attested set.)
+const SETTLE_OFFSETS_MS: [u64; 2] = [80_000, 60_000];
 
 /// Submission offsets *before* `leaf(1,0)`'s terminal cut for the
 /// straddlers meant to *straddle*. Anchored to the now-known cut so they
@@ -64,28 +79,30 @@ const SETTLE_DELAYS_MS: [u64; 2] = [1500, 3000];
 /// before settling, so neither side finalizes them.
 const STRADDLE_OFFSETS_MS: [u64; 3] = [700, 400, 200];
 
-const ADMISSION_BUDGET_EPOCHS: u64 = 8;
-const GATE_BUDGET_EPOCHS: u64 = 8;
+const ADMISSION_BUDGET_EPOCHS: u64 = 24;
+const GATE_BUDGET_EPOCHS: u64 = 10;
 const SEED_BUDGET_EPOCHS: u64 = 6;
 const CHILD_RUN_BUDGET_EPOCHS: u64 = 6;
 const SETTLE_BUDGET_EPOCHS: u64 = 6;
 
+/// Single-shard genesis with the split trigger armed for the grow and two
+/// cohorts of pooled extras — one staffs `grow_to(2)`'s ROOT split, the
+/// other staffs `leaf(1,0)`'s split once the vote lowers the threshold.
 fn sibling_config() -> NetworkConfig {
     NetworkConfig {
-        num_shards: 2,
+        num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
-            num_shards: 2,
+            num_shards: 1,
             shard_size: PER_SHARD,
             reshape_thresholds: ReshapeThresholds {
-                split_bytes: SPLIT_BYTES,
+                split_bytes: GROW_SPLIT_BYTES,
             },
             ..BeaconChainConfig::default()
         }),
-        // One cohort's worth of pooled extras to staff leaf(1,0)'s split.
-        pool_extra_validators: PER_SHARD,
+        pool_extra_validators: 2 * PER_SHARD,
         ..Default::default()
     }
 }
@@ -242,16 +259,23 @@ fn scan_chain(
 #[traced_test]
 #[test]
 #[allow(clippy::too_many_lines)] // one surviving-sibling straddler lifecycle
-#[ignore = "disabled until further work on param governance, epoch timing, and single-shard genesis"]
 fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     let mut runner = SimulationRunner::new(&sibling_config(), 11);
     let survivor = ShardId::leaf(1, 1);
     let splitter = ShardId::leaf(1, 0);
     let (left_child, right_child) = splitter.children();
 
-    // Bulk-fund leaf(1,0) past the threshold.
+    // The threshold vote is a fee-paying system transaction; fund the payer
+    // at genesis so its `lock_fee` succeeds.
+    let vote_payer = Ed25519PrivateKey::from_u64(9_999).expect("vote payer key");
+    let vote_account =
+        ComponentAddress::preallocated_account_from_public_key(&vote_payer.public_key());
+
+    // Bulk-fund the heavier half past the post-vote threshold. These accounts
+    // route to leaf(1,0) by prefix, so the grow's ROOT split partitions them
+    // there and `leaf(1,0)` lands above `SPLIT_BYTES` once the vote activates.
     let mut taken = Vec::new();
-    let mut balances = Vec::new();
+    let mut balances = vec![(vote_account, Decimal::from(100_000))];
     for _ in 0..RIGHT_BULK {
         let (_, a) = account_in(splitter, 2, &mut taken);
         balances.push((a, Decimal::from(10_000)));
@@ -260,7 +284,7 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     // splitting leaf(1,0) — a genuine cross-shard transfer between the two,
     // so leaf(1,1)'s wave names the terminating leaf(1,0).
     let straddlers: Vec<(Ed25519PrivateKey, ComponentAddress, ComponentAddress)> = (0
-        ..SETTLE_DELAYS_MS.len() + STRADDLE_OFFSETS_MS.len())
+        ..SETTLE_OFFSETS_MS.len() + STRADDLE_OFFSETS_MS.len())
         .map(|_| {
             let (payer_key, payer) = account_in(survivor, 2, &mut taken);
             let (_, recipient) = account_in(splitter, 2, &mut taken);
@@ -276,14 +300,26 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     balances.push((lock_probe_recipient, Decimal::from(10_000)));
     runner.initialize_genesis_with_balances(&balances);
 
-    // ── Admission: leaf(1,0) folds its trigger and draws a cohort; the
-    // under-threshold leaf(1,1) folds none ──
+    // ── Grow the single-shard genesis into the two sibling shards through
+    // the real split lifecycle, then vote `split_bytes` down so the heavier
+    // leaf(1,0) crosses the threshold while the lighter leaf(1,1) stays under
+    // it — the surviving-sibling shape, reached the way mainnet would ──
+    runner.grow_to(2);
+    let post_grow_epoch = beacon_state(&runner)
+        .expect("post-grow beacon state")
+        .current_epoch;
+    let activate_at = Epoch::new(post_grow_epoch.inner() + ACTIVATE_LEAD);
+    runner.vote_reshape_thresholds(&vote_payer, 1, SPLIT_BYTES, activate_at);
+
+    // ── Admission: the vote activates, leaf(1,0) folds its trigger and draws
+    // a cohort; the under-threshold leaf(1,1) folds none ──
     let admitted = run_until(&mut runner, epochs(ADMISSION_BUDGET_EPOCHS), |r| {
         pending_cohort_for(r, splitter).is_some_and(|c| c.len() == PER_SHARD as usize)
     });
     assert!(
         admitted,
-        "leaf(1,0)'s trigger must fold and draw a full cohort"
+        "the vote must activate and leaf(1,0)'s trigger must fold a full cohort within \
+         {ADMISSION_BUDGET_EPOCHS} epochs",
     );
     assert!(
         pending_cohort_for(&runner, survivor).is_none(),
@@ -296,27 +332,6 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
             2,
             "the cohort halves must split evenly; got {cohort:?}",
         );
-    }
-
-    // ── Settle straddlers: submitted now, during the grow phase, so the
-    // full cross-shard 2PC finalizes on leaf(1,0) before its terminal.
-    // The straddle straddlers ride the cut-anchored offsets, below ──
-    let mut probes: Vec<(u64, TxHash)> = Vec::new();
-    for (delay_ms, pair) in SETTLE_DELAYS_MS.iter().zip(&straddlers) {
-        let (payer_key, payer, recipient) = pair;
-        let tx = transfer(
-            payer_key,
-            *payer,
-            *recipient,
-            runner.now() + Duration::from_millis(*delay_ms),
-        );
-        let hash = tx.hash();
-        runner.schedule_initial_event(
-            0,
-            Duration::from_millis(*delay_ms).max(Duration::from_millis(10)),
-            ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
-        probes.push((*delay_ms, hash));
     }
 
     // ── Observer duty: each cohort member syncs its child span ──
@@ -373,11 +388,16 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
     let final_epoch = state.current_epoch;
     let cut = Duration::from_millis((final_epoch.inner() + 1) * EPOCH_MS);
 
-    // ── Submit the straddle straddlers against the now-known cut: each
-    // lands `offset` ms before leaf(1,0)'s terminal boundary ──
-    for (offset_ms, (payer_key, payer, recipient)) in STRADDLE_OFFSETS_MS
+    // ── Submit every straddler against the now-known cut. The settle
+    // straddlers land far enough ahead (60–80s) for the 2PC to finalize on
+    // leaf(1,0) before its terminal yet close enough to stay in the attested
+    // settled set; the straddle straddlers land sub-second before the cut, so
+    // they commit on leaf(1,0) but cross its terminal before settling ──
+    let mut probes: Vec<(u64, TxHash)> = Vec::new();
+    for (offset_ms, (payer_key, payer, recipient)) in SETTLE_OFFSETS_MS
         .iter()
-        .zip(&straddlers[SETTLE_DELAYS_MS.len()..])
+        .chain(&STRADDLE_OFFSETS_MS)
+        .zip(&straddlers)
     {
         let target = cut.saturating_sub(Duration::from_millis(*offset_ms));
         let tx = transfer(payer_key, *payer, *recipient, target);
@@ -454,17 +474,24 @@ fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
             "a followed store must arrive at the beacon-seeded child anchor",
         );
     }
-    for (validator, child) in &parent_halves {
-        let node = u32::try_from(validator.inner()).expect("host per parent member");
-        runner.flip_split_child(node, *validator, splitter, *child, None);
+    // After the grow the validator→host map is the split shuffle's, not the
+    // contiguous genesis layout, so resolve each member's host through the
+    // network. Parent halves adopt on their own hosts; observers reopen their
+    // synced store on a host whose own vnode flipped to the sibling child.
+    let parent_half_hosts: Vec<(NodeIndex, ShardId)> = parent_halves
+        .iter()
+        .map(|(v, c)| (runner.network().validator_to_node(*v), *c))
+        .collect();
+    for ((validator, child), (node, _)) in parent_halves.iter().zip(&parent_half_hosts) {
+        runner.flip_split_child(*node, *validator, splitter, *child, None);
     }
     let observer_seats: Vec<(ValidatorId, ShardId)> =
         synced_stores.iter().map(|(v, c, ..)| (*v, *c)).collect();
-    let mut sibling_hosts: Vec<u32> = Vec::new();
+    let mut sibling_hosts: Vec<NodeIndex> = Vec::new();
     for (validator, child) in &observer_seats {
-        let (node, _) = parent_halves
+        let (node, _) = parent_half_hosts
             .iter()
-            .map(|(v, c)| (u32::try_from(v.inner()).expect("host index"), *c))
+            .copied()
             .find(|(node, host_child)| host_child != child && !sibling_hosts.contains(node))
             .expect("a free host whose own vnode flipped to the sibling");
         sibling_hosts.push(node);
