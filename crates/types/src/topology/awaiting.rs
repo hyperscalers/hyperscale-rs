@@ -6,7 +6,7 @@
 //! artifact here, keyed by its source shard, and replay every buffered item on
 //! `BeaconBlockPersisted` once the beacon catches up.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::ShardId;
 
@@ -25,13 +25,13 @@ const MAX_AWAITING_TOPOLOGY_PER_SHARD: usize = 256;
 /// [`drain`](Self::drain) flattens every per-shard queue for replay and
 /// discards the shard key, which replay re-derives.
 pub struct AwaitingTopologyBuffer<V> {
-    by_shard: HashMap<ShardId, VecDeque<V>>,
+    by_shard: BTreeMap<ShardId, VecDeque<V>>,
 }
 
 impl<V> Default for AwaitingTopologyBuffer<V> {
     fn default() -> Self {
         Self {
-            by_shard: HashMap::new(),
+            by_shard: BTreeMap::new(),
         }
     }
 }
@@ -53,10 +53,14 @@ impl<V> AwaitingTopologyBuffer<V> {
         }
     }
 
-    /// Remove and return every buffered value across all shards. The shard key
-    /// is dropped; replay re-derives it from each value.
+    /// Remove and return every buffered value across all shards, in ascending
+    /// shard order then per-shard FIFO. The shard key is dropped; replay
+    /// re-derives it from each value.
     pub fn drain(&mut self) -> Vec<V> {
-        self.by_shard.drain().flat_map(|(_, queue)| queue).collect()
+        std::mem::take(&mut self.by_shard)
+            .into_values()
+            .flatten()
+            .collect()
     }
 
     /// Total buffered count across all shards.

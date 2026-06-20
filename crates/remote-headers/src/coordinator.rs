@@ -10,7 +10,7 @@
 //! within the staleness threshold — the I/O loop's
 //! `RemoteHeaderSync` then runs sliding-window catch-up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,7 +94,7 @@ pub struct RemoteHeaderCoordinator {
     /// Inner key: `sender` — one slot per validator. Multiple senders may
     /// gossip the same header; we keep all candidates until QC verification
     /// picks the valid one.
-    pending: HashMap<(ShardId, BlockHeight), HashMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
+    pending: HashMap<(ShardId, BlockHeight), BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Verified Headers
@@ -116,7 +116,7 @@ pub struct RemoteHeaderCoordinator {
     /// Per-shard liveness tracking. Populated when topology tells us
     /// remote shards exist. Drives `Action::StartRemoteHeaderSync` when a
     /// shard hasn't sent headers within `HEADER_LIVENESS_TIMEOUT`.
-    expected: HashMap<ShardId, ExpectedHeader>,
+    expected: BTreeMap<ShardId, ExpectedHeader>,
 
     /// Current local committed height (updated on each block commit).
     local_committed_height: BlockHeight,
@@ -152,7 +152,7 @@ impl RemoteHeaderCoordinator {
             pending: HashMap::new(),
             verified: HashMap::new(),
             tips: HashMap::new(),
-            expected: HashMap::new(),
+            expected: BTreeMap::new(),
             local_committed_height: BlockHeight::new(0),
             local_committed_ts: WeightedTimestamp::ZERO,
             local_shard,
@@ -611,7 +611,7 @@ impl RemoteHeaderCoordinator {
         &self,
         shard: ShardId,
         height: BlockHeight,
-    ) -> Option<&HashMap<ValidatorId, Arc<CertifiedBlockHeader>>> {
+    ) -> Option<&BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>> {
         self.pending.get(&(shard, height))
     }
 
@@ -641,7 +641,7 @@ impl RemoteHeaderCoordinator {
     #[must_use]
     pub fn memory_stats(&self) -> RemoteHeaderMemoryStats {
         RemoteHeaderMemoryStats {
-            pending_headers: self.pending.values().map(HashMap::len).sum(),
+            pending_headers: self.pending.values().map(BTreeMap::len).sum(),
             verified_headers: self.verified.len(),
             expected_headers: self.expected.len(),
         }
@@ -796,7 +796,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -892,7 +892,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
