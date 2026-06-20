@@ -5,12 +5,17 @@
 //! the remote ECs that ack them).
 
 use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_types::TopologySchedule;
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Dispatch a provision-category `ProtocolEvent`.
-    pub(super) fn handle_provisions(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(in crate::state) fn handle_provisions(
+        &mut self,
+        sched: &TopologySchedule,
+        event: ProtocolEvent,
+    ) -> Vec<Action> {
         match event {
             ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
@@ -27,10 +32,9 @@ impl NodeStateMachine {
                 self.now,
             ),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
-                let actions = self.shard_coordinator.on_provisions_admitted(
-                    self.beacon_coordinator.topology_schedule(),
-                    &[provisions],
-                );
+                let actions = self
+                    .shard_coordinator
+                    .on_provisions_admitted(sched, &[provisions]);
                 self.shard_coordinator.queue_ready_proposal();
                 actions
             }
@@ -65,7 +69,7 @@ mod tests {
         WeightedTimestamp,
     };
 
-    use super::super::test_support::TestNode;
+    use crate::state::test_support::TestNode;
 
     /// `ProvisionsAdmitted` latches a proposal-retry the same way
     /// `TransactionsAdmitted` does. Verify the latch+post-dispatch chain

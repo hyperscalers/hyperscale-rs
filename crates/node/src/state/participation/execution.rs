@@ -9,12 +9,17 @@
 //! a follow-up `OutboundEcObserved` to feed the outbound provision tracker.
 
 use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_types::TopologySchedule;
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Dispatch an execution-category `ProtocolEvent`.
-    pub(super) fn handle_execution(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(in crate::state) fn handle_execution(
+        &mut self,
+        sched: &TopologySchedule,
+        event: ProtocolEvent,
+    ) -> Vec<Action> {
         match event {
             ProtocolEvent::ExecutionBatchCompleted {
                 wave_id,
@@ -24,29 +29,26 @@ impl NodeStateMachine {
                 // Results arriving can (a) finalize a wave whose local EC
                 // landed ahead of the engine, (b) unblock new vote emission.
                 let mut actions = self.execution_coordinator.on_execution_batch_completed(
-                    self.beacon_coordinator.topology_schedule(),
+                    sched,
                     &wave_id,
                     results,
                     tx_outcomes,
                 );
-                actions.extend(
-                    self.execution_coordinator
-                        .emit_vote_actions(self.beacon_coordinator.topology_schedule()),
-                );
+                actions.extend(self.execution_coordinator.emit_vote_actions(sched));
                 actions
             }
             ProtocolEvent::VerifiedExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_verified_execution_vote(self.beacon_coordinator.topology_schedule(), vote),
+                .on_verified_execution_vote(sched, vote),
             ProtocolEvent::UnverifiedExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_unverified_execution_vote(self.beacon_coordinator.topology_schedule(), vote),
+                .on_unverified_execution_vote(sched, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
                 verified_votes,
             } => self.execution_coordinator.on_votes_verified(
-                self.beacon_coordinator.topology_schedule(),
+                sched,
                 wave_id,
                 block_hash,
                 verified_votes,
@@ -54,13 +56,12 @@ impl NodeStateMachine {
             ProtocolEvent::ExecutionCertificateAggregated {
                 wave_id,
                 certificate,
-            } => self.execution_coordinator.on_certificate_aggregated(
-                self.beacon_coordinator.topology_schedule(),
-                &wave_id,
-                &certificate,
-            ),
+            } => {
+                self.execution_coordinator
+                    .on_certificate_aggregated(sched, &wave_id, &certificate)
+            }
             ProtocolEvent::ExecutionCertificatesReceived { certificates } => {
-                let topology = self.beacon_coordinator.topology_schedule();
+                let topology = sched;
                 let mut actions = Vec::new();
                 for cert in certificates {
                     actions.extend(
@@ -71,7 +72,7 @@ impl NodeStateMachine {
                 actions
             }
             ProtocolEvent::FinalizedWavesReceived { waves } => {
-                let topology = self.beacon_coordinator.topology_schedule();
+                let topology = sched;
                 let mut actions = Vec::new();
                 for wave in waves {
                     actions.extend(
@@ -86,7 +87,7 @@ impl NodeStateMachine {
                 .on_finalized_wave_verified(result),
             ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
                 .execution_coordinator
-                .on_certificate_verified(self.beacon_coordinator.topology_schedule(), result),
+                .on_certificate_verified(sched, result),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 let local_shard = self.local_shard;
                 let mut actions = Vec::new();
@@ -102,10 +103,7 @@ impl NodeStateMachine {
                     }));
                 }
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
-                actions.extend(
-                    self.execution_coordinator
-                        .emit_vote_actions(self.beacon_coordinator.topology_schedule()),
-                );
+                actions.extend(self.execution_coordinator.emit_vote_actions(sched));
                 actions
             }
             _ => unreachable!("non-execution event routed to handle_execution"),
@@ -125,7 +123,7 @@ mod tests {
         WaveId, WeightedTimestamp,
     };
 
-    use super::super::test_support::TestNode;
+    use crate::state::test_support::TestNode;
     use crate::{assert_no_emit, extract_one};
 
     fn make_ec(

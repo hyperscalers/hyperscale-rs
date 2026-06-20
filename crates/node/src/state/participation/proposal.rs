@@ -8,25 +8,27 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, Verifiable, Verified,
+    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, TopologySchedule,
+    Verifiable, Verified,
 };
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
 /// Inputs gathered for building a block proposal.
-pub(super) struct ProposalInputs {
+pub(in crate::state) struct ProposalInputs {
     pub ready_txs: Vec<Arc<Verified<RoutableTransaction>>>,
     pub finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
 }
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Gather all inputs needed for a block proposal.
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + abort intents + certificates gathering logic.
-    pub(super) fn gather_proposal_inputs(
+    pub(in crate::state) fn gather_proposal_inputs(
         &self,
+        sched: &TopologySchedule,
         pending_txs: usize,
         pending_certs: usize,
     ) -> ProposalInputs {
@@ -37,9 +39,7 @@ impl NodeStateMachine {
         // terminates at a split or merge, stop selecting transactions that
         // can't settle before the cut. `None` in steady state, so the
         // mempool filter is inert.
-        let quiesce = self
-            .shard_coordinator
-            .quiesce_cut(self.beacon_coordinator.topology_schedule());
+        let quiesce = self.shard_coordinator.quiesce_cut(sched);
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
             pending_txs,
@@ -67,12 +67,15 @@ impl NodeStateMachine {
 
     /// Shared proposal logic for the post-dispatch retry hook and the
     /// QC-formed path.
-    pub(super) fn try_event_driven_proposal(&mut self) -> Vec<Action> {
+    pub(in crate::state) fn try_event_driven_proposal(
+        &mut self,
+        sched: &TopologySchedule,
+    ) -> Vec<Action> {
         let (pending_txs, pending_certs) = self.shard_coordinator.pending_block_counts();
-        let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
+        let inputs = self.gather_proposal_inputs(sched, pending_txs, pending_certs);
 
         self.shard_coordinator.try_propose(
-            self.beacon_coordinator.topology_schedule(),
+            sched,
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,

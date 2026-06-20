@@ -23,6 +23,7 @@ use hyperscale_types::{
 use tracing::warn;
 
 use super::NodeStateMachine;
+use super::participation::ShardParticipation;
 
 impl NodeStateMachine {
     #[allow(clippy::too_many_lines)] // single dispatch over beacon ProtocolEvent variants
@@ -163,80 +164,18 @@ impl NodeStateMachine {
                 self.beacon_coordinator.on_spc_input_dwell_timer()
             }
             ProtocolEvent::BeaconBlockPersisted { .. } => {
-                // Beacon advanced an epoch — replay any cross-shard artifacts
-                // buffered because their committee epoch wasn't yet in the
-                // schedule (remote headers, ECs, finalized waves).
-                let mut actions = self
-                    .remote_headers_coordinator
-                    .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule());
-                actions.extend(
-                    self.execution_coordinator
-                        .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
-                );
-                actions.extend(
-                    self.shard_coordinator
-                        .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
-                );
-                // A proposer whose committee lookup stalled on the missing
-                // epoch has no other retry signal: without this kick the
-                // view-change timer fires first, the height is re-proposed in
-                // a later round, and the round-contiguous commit rule never
-                // sees the consecutive rounds it needs. The post-dispatch
-                // hook turns the latch into one `try_propose` with fresh
-                // transaction selection.
-                self.shard_coordinator.queue_ready_proposal();
-                // The fold may now attest a newly terminated shard's
-                // settled-waves root; acquire any `S_P` the fence needs.
-                actions.extend(self.scan_settled_waves_acquisitions());
-                actions
+                // Beacon advanced an epoch — drive the shard coordinators to
+                // replay buffered cross-shard artifacts (remote headers, ECs,
+                // finalized waves) and acquire any newly-attested settled-waves
+                // set the fence needs. Skipped for a vnode that only follows the
+                // beacon.
+                self.with_shard(ShardParticipation::on_beacon_block_persisted)
             }
             ProtocolEvent::BeaconBlockSyncReadyToApply { block } => self
                 .beacon_coordinator
                 .on_beacon_block_sync_ready_to_apply(block),
             _ => unreachable!("handle_beacon called with non-beacon ProtocolEvent"),
         }
-    }
-
-    /// Start a one-shot settled-waves acquisition for every past-terminal
-    /// shard whose beacon-attested `settled_waves_root` this node's own
-    /// fold now carries and whose `S_P` the fence doesn't yet hold.
-    ///
-    /// Everything the acquisition needs comes from the node's beacon
-    /// projection: the terminal block and attested root from the boundary
-    /// anchor, the terminal weighted timestamp from the schedule's
-    /// terminal cut, and the peers from the terminal-clamped routing
-    /// committees. A shard already recorded (or live) is skipped, so the
-    /// scan re-runs harmlessly each commit until the set is acquired.
-    fn scan_settled_waves_acquisitions(&self) -> Vec<Action> {
-        let schedule = self.beacon_coordinator.topology_schedule();
-        let head = schedule.head();
-        let mut actions = Vec::new();
-        for (shard, peers) in schedule.routing_committees() {
-            if shard == self.local_shard {
-                continue;
-            }
-            let Some(anchor) = head.boundary(shard) else {
-                continue;
-            };
-            let Some(attested_root) = anchor.settled_waves_root else {
-                continue;
-            };
-            if self.shard_coordinator.settled_set(shard).is_some() {
-                continue;
-            }
-            let Some(terminal_wt) = schedule.terminal_cut_wt(shard) else {
-                continue;
-            };
-            actions.push(Action::StartSettledWavesAcquisition {
-                shard,
-                terminal_height: anchor.height,
-                terminal_block_hash: anchor.block_hash,
-                terminal_wt,
-                attested_root,
-                peers,
-            });
-        }
-        actions
     }
 
     /// VRF-verify an inbound `BeaconProposal` against the sender's

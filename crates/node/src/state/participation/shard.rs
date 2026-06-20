@@ -65,21 +65,30 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verifiable, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, TopologySchedule, Verifiable,
+    Verified,
 };
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Dispatch a shard-category `ProtocolEvent`.
+    ///
+    /// `BlockCommitted` and `RemoteHeaderAdmitted` are not routed here — they
+    /// also drive the beacon coordinator, so they stay on
+    /// [`NodeStateMachine`](crate::state::NodeStateMachine) as orchestrators.
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per shard variant
-    pub(super) fn handle_shard(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(in crate::state) fn handle_shard(
+        &mut self,
+        sched: &TopologySchedule,
+        event: ProtocolEvent,
+    ) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
-                self.on_block_header_received(&header, manifest)
+                self.on_block_header_received(sched, &header, manifest)
             }
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
-                self.on_qc_formed(block_hash, &qc)
+                self.on_qc_formed(sched, block_hash, &qc)
             }
             ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header,
@@ -88,7 +97,7 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = self.beacon_coordinator.topology_schedule();
+                let topology = sched;
                 self.remote_headers_coordinator.on_remote_header_received(
                     topology,
                     certified_header,
@@ -101,47 +110,36 @@ impl NodeStateMachine {
             } => self
                 .remote_headers_coordinator
                 .on_verified_remote_header_received(certified_header, sender),
-            ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
-                .shard_coordinator
-                .on_verified_block_vote(self.beacon_coordinator.topology_schedule(), vote),
-            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
-                .shard_coordinator
-                .on_unverified_block_vote(self.beacon_coordinator.topology_schedule(), vote),
-            ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
-                .shard_coordinator
-                .on_verified_timeout(self.beacon_coordinator.topology_schedule(), timeout),
+            ProtocolEvent::VerifiedBlockVoteReceived { vote } => {
+                self.shard_coordinator.on_verified_block_vote(sched, vote)
+            }
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => {
+                self.shard_coordinator.on_unverified_block_vote(sched, vote)
+            }
+            ProtocolEvent::VerifiedTimeoutReceived { timeout } => {
+                self.shard_coordinator.on_verified_timeout(sched, timeout)
+            }
             ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
                 .shard_coordinator
-                .on_unverified_timeout(self.beacon_coordinator.topology_schedule(), &timeout),
+                .on_unverified_timeout(sched, &timeout),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
-                    .on_ready_signal_received(self.beacon_coordinator.topology_schedule(), signal);
+                    .on_ready_signal_received(sched, signal);
                 Vec::new()
             }
-            ProtocolEvent::BlockReadyToCommit { certified, source } => {
-                self.shard_coordinator.on_block_ready_to_commit(
-                    self.beacon_coordinator.topology_schedule(),
-                    certified,
-                    source,
-                )
-            }
+            ProtocolEvent::BlockReadyToCommit { certified, source } => self
+                .shard_coordinator
+                .on_block_ready_to_commit(sched, certified, source),
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self.shard_coordinator.on_qc_result(
-                self.beacon_coordinator.topology_schedule(),
-                block_hash,
-                qc,
-                verified_votes,
-            ),
-            ProtocolEvent::QcSignatureVerified { block_hash, result } => {
-                self.shard_coordinator.on_qc_signature_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
+            } => self
+                .shard_coordinator
+                .on_qc_result(sched, block_hash, qc, verified_votes),
+            ProtocolEvent::QcSignatureVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_qc_signature_verified(sched, block_hash, result),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -149,82 +147,31 @@ impl NodeStateMachine {
                 result,
             } => self
                 .remote_headers_coordinator
-                .on_remote_header_qc_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    shard,
-                    height,
-                    sender,
-                    *result,
-                ),
-            ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
-                // Fan out the verified header to downstream consumers. Shard consensus
-                // already received the header in `RemoteHeaderQcVerified`
-                // (early insertion for deferral proof validation).
-                let shard = certified_header.shard_id();
-
-                self.execution_coordinator.on_verified_remote_header(
-                    shard,
-                    certified_header.header().height(),
-                    certified_header.header().waves(),
-                );
-
-                let mut actions = self
-                    .provisions_coordinator
-                    .on_verified_remote_header(&certified_header);
-                actions.extend(
-                    self.beacon_coordinator
-                        .on_verified_source_header(&certified_header),
-                );
-                actions
-            }
-            ProtocolEvent::TransactionRootVerified { block_hash, result } => {
-                self.shard_coordinator.on_transaction_root_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
-            ProtocolEvent::CertificateRootVerified { block_hash, result } => {
-                self.shard_coordinator.on_certificate_root_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
-            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => {
-                self.shard_coordinator.on_local_receipt_root_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
-            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => {
-                self.shard_coordinator.on_provisions_root_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
-            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => {
-                self.shard_coordinator.on_provision_tx_roots_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
-            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => {
-                self.shard_coordinator.on_beacon_witness_root_verified(
-                    self.beacon_coordinator.topology_schedule(),
-                    block_hash,
-                    result,
-                )
-            }
+                .on_remote_header_qc_verified(sched, shard, height, sender, *result),
+            ProtocolEvent::TransactionRootVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_transaction_root_verified(sched, block_hash, result),
+            ProtocolEvent::CertificateRootVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_certificate_root_verified(sched, block_hash, result),
+            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_local_receipt_root_verified(sched, block_hash, result),
+            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_provisions_root_verified(sched, block_hash, result),
+            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_provision_tx_roots_verified(sched, block_hash, result),
+            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_beacon_witness_root_verified(sched, block_hash, result),
             ProtocolEvent::StateRootVerified {
                 block_hash,
                 result,
                 bytes_delta,
             } => self.shard_coordinator.on_state_root_verified(
-                self.beacon_coordinator.topology_schedule(),
+                sched,
                 block_hash,
                 result,
                 bytes_delta,
@@ -239,7 +186,7 @@ impl NodeStateMachine {
                 provisions,
                 bytes_delta,
             } => self.shard_coordinator.on_proposal_built(
-                self.beacon_coordinator.topology_schedule(),
+                sched,
                 height,
                 round,
                 &block,
@@ -249,7 +196,6 @@ impl NodeStateMachine {
                 provisions,
                 bytes_delta,
             ),
-            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(&certified),
             // `BlockPersisted` advances `last_persisted_height`, a fallback
             // gate for deferred state root verifications. Steady-state
             // unblocking happens on `BlockCommitted`; this still matters for
@@ -260,11 +206,9 @@ impl NodeStateMachine {
                 height,
                 substate_bytes,
             } => {
-                let mut actions = self.shard_coordinator.on_block_persisted(
-                    self.beacon_coordinator.topology_schedule(),
-                    height,
-                    substate_bytes,
-                );
+                let mut actions =
+                    self.shard_coordinator
+                        .on_block_persisted(sched, height, substate_bytes);
                 // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {
@@ -276,7 +220,7 @@ impl NodeStateMachine {
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
-                .on_finalized_waves_admitted(self.beacon_coordinator.topology_schedule(), &waves),
+                .on_finalized_waves_admitted(sched, &waves),
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }
@@ -284,6 +228,7 @@ impl NodeStateMachine {
     /// Validate in-flight before letting shard ingest a received header.
     fn on_block_header_received(
         &mut self,
+        sched: &TopologySchedule,
         header: &BlockHeader,
         manifest: BlockManifest,
     ) -> Vec<Action> {
@@ -332,7 +277,7 @@ impl NodeStateMachine {
         }
 
         self.shard_coordinator.on_block_header(
-            self.beacon_coordinator.topology_schedule(),
+            sched,
             header,
             manifest,
             |h| {
@@ -352,6 +297,7 @@ impl NodeStateMachine {
     /// QC formed — may trigger immediate next proposal.
     fn on_qc_formed(
         &mut self,
+        sched: &TopologySchedule,
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
@@ -362,10 +308,10 @@ impl NodeStateMachine {
         // commits) and certificates that will DECREASE it (completions).
         let (pending_tx_count, pending_cert_count) =
             self.shard_coordinator.pending_commit_counts(qc);
-        let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
+        let inputs = self.gather_proposal_inputs(sched, pending_tx_count, pending_cert_count);
 
         self.shard_coordinator.on_qc_formed(
-            self.beacon_coordinator.topology_schedule(),
+            sched,
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -374,104 +320,15 @@ impl NodeStateMachine {
         )
     }
 
-    /// Block committed — notify all subsystems in commit order.
-    fn on_block_committed(&mut self, certified: &Verified<CertifiedBlock>) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let block_hash = certified.block().hash();
-
-        // Mark this block as a usable parent for child state-root
-        // verifications. By the time `BlockCommitted` fires, the block's JMT
-        // snapshot is in `PendingChain` (populated either by a prior
-        // `VerifyStateRoot` or by the inline `CommitBlockByQcOnly`
-        // computation), so children verify against it without waiting on
-        // RocksDB persistence.
-        self.shard_coordinator
-            .on_block_committed_verification(block_hash);
-
-        // Mempool: marks Pending → Committed for `block.transactions`, then
-        // drives each tx in `block.certificates` to its terminal state
-        // (Completed + tombstone). Same behavior for consensus and sync
-        // commit paths.
-        actions.extend(self.mempool_coordinator.on_block_committed(
-            self.beacon_coordinator.current_topology_snapshot(),
-            certified,
-        ));
-
-        // Remote header coordinator: update liveness and check for timeouts.
-        // The schedule (not the head snapshot) so the probe can terminal-clamp
-        // a drained reshape shard to the committee still serving it.
-        actions.extend(
-            self.remote_headers_coordinator
-                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
-        );
-
-        // Provisions coordinator: prune + schedule fallback timeouts. Reads
-        // provision hashes directly off the block — `Live` carries them
-        // inline, `Sealed` has none (empty slice).
-        actions.extend(self.provisions_coordinator.on_block_committed(certified));
-
-        // Outbound provision safety sweep — runs on the shard consensus-authenticated
-        // weighted timestamp so every validator evicts deterministically.
-        self.outbound_provisions
-            .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
-
-        // Beacon coordinator: advance the local chain's committee anchor so
-        // topology schedule eviction tracks this shard's verification
-        // frontier.
-        self.beacon_coordinator
-            .on_local_block_committed(certified.block().header().parent_qc().weighted_timestamp());
-
-        // The commit stream is the beacon's source view of the *local*
-        // shard — remote shards' headers arrive via the remote-header
-        // path, but a validator is never on that path for its own
-        // shard. Feeding each committed certified header here is what
-        // makes the local shard's epoch crossings observable, its
-        // boundary QCs verifiable at proposal admission, and its
-        // witness chunks fetchable for local proposers.
-        let certified_header = Arc::new(certified.certified_header());
-        actions.extend(
-            self.beacon_coordinator
-                .on_verified_source_header(&certified_header),
-        );
-
-        actions.extend(self.apply_block_to_execution(certified));
-
-        // Surviving-shard counterpart sweep: any straddler doomed by a
-        // terminated partner whose settled coverage just completed (its
-        // settled certificates landed during this commit's execution
-        // processing) aborts here — locks released, status finalized.
-        actions.extend(self.sweep_ready_counterpart_straddlers());
-
-        // The first coast commit terminates the chain: finalization is a
-        // wave certificate in a later block, and no later block will
-        // exist, so every still-in-flight transaction is permanently
-        // undecidable here. Drive them to their terminal abort and drop
-        // the execution state that was waiting on them — once, at the
-        // flip. Runs after the fan-out above so a final cert-carrying
-        // block terminalizes its transactions through the normal path
-        // first.
-        if !self.terminal_chain_swept
-            && self
-                .shard_coordinator
-                .chain_terminated(self.beacon_coordinator.topology_schedule())
-        {
-            self.terminal_chain_swept = true;
-            actions.extend(self.mempool_coordinator.abort_in_flight());
-            actions.extend(self.execution_coordinator.abort_pending_waves());
-        }
-
-        // In-flight counts changed — latch a proposal attempt so the next
-        // proposer can include newly ready transactions.
-        self.shard_coordinator.queue_ready_proposal();
-
-        actions
-    }
-
     /// Apply a committed block to execution: cert cleanup, wave setup +
     /// dispatch (Live) or wave-assignment recording only (Sealed), and
     /// vote emission. Provisions live inline on `Block::Live` — no separate
     /// argument needed.
-    fn apply_block_to_execution(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
+    pub(in crate::state) fn apply_block_to_execution(
+        &mut self,
+        sched: &TopologySchedule,
+        certified: &CertifiedBlock,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         // Release execution's per-wave bookkeeping for wave certs included
@@ -483,7 +340,7 @@ impl NodeStateMachine {
 
         actions.extend(
             self.execution_coordinator
-                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
+                .on_block_committed(sched, certified),
         );
 
         // Round voting: scan all incomplete waves and emit votes for
@@ -491,10 +348,7 @@ impl NodeStateMachine {
         // have already been processed above (with override semantics), so
         // the accumulator state is deterministic at this height. All
         // validators at this height produce the same votes.
-        actions.extend(
-            self.execution_coordinator
-                .emit_vote_actions(self.beacon_coordinator.topology_schedule()),
-        );
+        actions.extend(self.execution_coordinator.emit_vote_actions(sched));
 
         actions
     }
@@ -504,7 +358,7 @@ impl NodeStateMachine {
     /// hands back their transaction hashes; the mempool releases their locks
     /// and drives them to `Completed(Aborted)`. A no-op when no partner is
     /// past-terminal.
-    pub(super) fn sweep_ready_counterpart_straddlers(&mut self) -> Vec<Action> {
+    pub(in crate::state) fn sweep_ready_counterpart_straddlers(&mut self) -> Vec<Action> {
         let aborts = self.execution_coordinator.take_ready_counterpart_aborts();
         if aborts.is_empty() {
             return Vec::new();
@@ -528,7 +382,7 @@ mod tests {
         Round, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
     };
 
-    use super::super::test_support::TestNode;
+    use crate::state::test_support::TestNode;
 
     /// `RemoteHeaderAdmitted` must fan out to **both** execution and
     /// provisions: execution registers expected ECs from the header's
@@ -585,10 +439,10 @@ mod tests {
             )));
 
         let pre_exec = node
-            .execution_coordinator
+            .execution_coordinator()
             .memory_stats()
             .expected_exec_certs;
-        let pre_prov = node.provisions_coordinator.verified_remote_header_count();
+        let pre_prov = node.provisions_coordinator().verified_remote_header_count();
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
@@ -596,14 +450,14 @@ mod tests {
         );
 
         assert_eq!(
-            node.execution_coordinator
+            node.execution_coordinator()
                 .memory_stats()
                 .expected_exec_certs,
             pre_exec + 1,
             "execution must register the wave from the verified header as an expected EC",
         );
         assert_eq!(
-            node.provisions_coordinator.verified_remote_header_count(),
+            node.provisions_coordinator().verified_remote_header_count(),
             pre_prov + 1,
             "provisions must record the verified remote header",
         );

@@ -13,25 +13,27 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent};
-use hyperscale_types::{RoutableTransaction, Verified};
+use hyperscale_types::{RoutableTransaction, TopologySchedule, Verified};
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Dispatch a transaction-category `ProtocolEvent`.
-    pub(super) fn handle_transaction(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(in crate::state) fn handle_transaction(
+        &mut self,
+        sched: &TopologySchedule,
+        event: ProtocolEvent,
+    ) -> Vec<Action> {
         match event {
             ProtocolEvent::TransactionValidated {
                 tx,
                 submitted_locally,
-            } => self.on_transaction_validated(tx, submitted_locally),
+            } => self.on_transaction_validated(sched, tx, submitted_locally),
             ProtocolEvent::TransactionsReceived { transactions } => {
-                self.on_transactions_fetched(transactions)
+                self.on_transactions_fetched(sched, transactions)
             }
             ProtocolEvent::TransactionsAdmitted { txs } => {
-                let actions = self
-                    .shard_coordinator
-                    .on_transactions_admitted(self.beacon_coordinator.topology_schedule(), &txs);
+                let actions = self.shard_coordinator.on_transactions_admitted(sched, &txs);
                 self.shard_coordinator.queue_ready_proposal();
                 actions
             }
@@ -45,19 +47,16 @@ impl NodeStateMachine {
     /// here.
     fn on_transaction_validated(
         &mut self,
+        sched: &TopologySchedule,
         tx: Arc<Verified<RoutableTransaction>>,
         submitted_locally: bool,
     ) -> Vec<Action> {
-        if !self
-            .beacon_coordinator
-            .current_topology_snapshot()
-            .involves_shard(self.local_shard, &tx)
-        {
+        if !sched.head().involves_shard(self.local_shard, &tx) {
             return vec![];
         }
 
         self.mempool_coordinator.on_transaction_gossip(
-            self.beacon_coordinator.current_topology_snapshot(),
+            sched.head(),
             tx,
             submitted_locally,
             self.now,
@@ -72,16 +71,14 @@ impl NodeStateMachine {
     /// admission arm latches the proposal-retry.
     fn on_transactions_fetched(
         &mut self,
+        sched: &TopologySchedule,
         txs: Vec<Arc<Verified<RoutableTransaction>>>,
     ) -> Vec<Action> {
         if txs.is_empty() {
             return vec![];
         }
-        self.mempool_coordinator.on_fetched_transactions(
-            self.beacon_coordinator.current_topology_snapshot(),
-            txs,
-            self.now,
-        )
+        self.mempool_coordinator
+            .on_fetched_transactions(sched.head(), txs, self.now)
     }
 }
 
@@ -93,7 +90,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
     use hyperscale_types::{LocalTimestamp, Verified};
 
-    use super::super::test_support::TestNode;
+    use crate::state::test_support::TestNode;
 
     /// Validated gossip transactions are gated by the local-shard filter
     /// before reaching mempool. A tx with empty reads/writes never
@@ -121,7 +118,7 @@ mod tests {
 
         assert!(actions.is_empty());
         assert_eq!(
-            node.mempool_coordinator.len(),
+            node.mempool_coordinator().len(),
             0,
             "non-local tx must not enter the mempool",
         );
@@ -146,7 +143,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.mempool_coordinator.len(),
+            node.mempool_coordinator().len(),
             1,
             "local-shard tx must be admitted to the mempool",
         );
@@ -178,7 +175,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.mempool_coordinator.len(),
+            node.mempool_coordinator().len(),
             2,
             "fetched txs must be admitted via the fetch path",
         );

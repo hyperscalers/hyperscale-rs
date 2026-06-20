@@ -8,29 +8,29 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_shard::SettledWaveSet;
+use hyperscale_types::TopologySchedule;
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
-impl NodeStateMachine {
+impl ShardParticipation {
     /// Dispatch a sync-category `ProtocolEvent`.
-    pub(super) fn handle_sync(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(in crate::state) fn handle_sync(
+        &mut self,
+        sched: &TopologySchedule,
+        event: ProtocolEvent,
+    ) -> Vec<Action> {
         match event {
-            ProtocolEvent::BlockSyncReadyToApply { certified } => {
-                self.shard_coordinator.on_sync_block_ready_to_apply(
-                    self.beacon_coordinator.topology_schedule(),
-                    std::sync::Arc::unwrap_or_clone(certified),
-                )
-            }
+            ProtocolEvent::BlockSyncReadyToApply { certified } => self
+                .shard_coordinator
+                .on_sync_block_ready_to_apply(sched, std::sync::Arc::unwrap_or_clone(certified)),
             // BlockSync finished fetching: exit shard consensus sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
-                let mut actions = self
-                    .shard_coordinator
-                    .on_block_sync_complete(self.beacon_coordinator.topology_schedule());
+                let mut actions = self.shard_coordinator.on_block_sync_complete(sched);
                 actions.extend(
                     self.remote_headers_coordinator
-                        .flush_expected_headers(self.beacon_coordinator.topology_schedule()),
+                        .flush_expected_headers(sched),
                 );
                 actions.extend(self.provisions_coordinator.flush_expected_provisions());
                 actions
@@ -54,7 +54,7 @@ impl NodeStateMachine {
                 self.execution_coordinator
                     .record_settled_waves(shard, set.clone());
                 self.shard_coordinator.record_settled_waves(shard, set);
-                let topology = self.beacon_coordinator.topology_schedule();
+                let topology = sched;
                 let mut actions = self.shard_coordinator.redrive_pending_votes(topology);
                 actions.extend(
                     self.execution_coordinator
@@ -68,6 +68,71 @@ impl NodeStateMachine {
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
+    }
+
+    /// Beacon advanced an epoch — replay any cross-shard artifacts buffered
+    /// because their committee epoch wasn't yet in the schedule (remote headers,
+    /// ECs, finalized waves), then acquire any newly-attested settled-waves set
+    /// the fence needs. Dispatched from `handle_beacon`'s `BeaconBlockPersisted`
+    /// arm via the option guard, so a vnode that only follows the beacon no-ops.
+    pub(in crate::state) fn on_beacon_block_persisted(
+        &mut self,
+        sched: &TopologySchedule,
+    ) -> Vec<Action> {
+        let mut actions = self
+            .remote_headers_coordinator
+            .on_beacon_block_persisted(sched);
+        actions.extend(self.execution_coordinator.on_beacon_block_persisted(sched));
+        actions.extend(self.shard_coordinator.on_beacon_block_persisted(sched));
+        // A proposer whose committee lookup stalled on the missing epoch has no
+        // other retry signal: without this kick the view-change timer fires
+        // first, the height is re-proposed in a later round, and the
+        // round-contiguous commit rule never sees the consecutive rounds it
+        // needs. The post-dispatch hook turns the latch into one `try_propose`.
+        self.shard_coordinator.queue_ready_proposal();
+        actions.extend(self.scan_settled_waves_acquisitions(sched));
+        actions
+    }
+
+    /// Start a one-shot settled-waves acquisition for every past-terminal shard
+    /// whose beacon-attested `settled_waves_root` this node's own fold now
+    /// carries and whose `S_P` the fence doesn't yet hold.
+    ///
+    /// Everything the acquisition needs comes from the node's beacon projection:
+    /// the terminal block and attested root from the boundary anchor, the
+    /// terminal weighted timestamp from the schedule's terminal cut, and the
+    /// peers from the terminal-clamped routing committees. A shard already
+    /// recorded (or live) is skipped, so the scan re-runs harmlessly each commit
+    /// until the set is acquired.
+    fn scan_settled_waves_acquisitions(&self, sched: &TopologySchedule) -> Vec<Action> {
+        let head = sched.head();
+        let mut actions = Vec::new();
+        for (shard, peers) in sched.routing_committees() {
+            if shard == self.local_shard {
+                continue;
+            }
+            let Some(anchor) = head.boundary(shard) else {
+                continue;
+            };
+            let Some(attested_root) = anchor.settled_waves_root else {
+                continue;
+            };
+            if self.shard_coordinator.settled_set(shard).is_some() {
+                continue;
+            }
+            let Some(terminal_wt) = sched.terminal_cut_wt(shard) else {
+                continue;
+            };
+            actions.push(Action::StartSettledWavesAcquisition {
+                shard,
+                terminal_height: anchor.height,
+                terminal_block_hash: anchor.block_hash,
+                terminal_wt,
+                attested_root,
+                peers,
+            });
+        }
+        actions
     }
 }
 
@@ -84,8 +149,8 @@ mod tests {
         Verified, WaveId,
     };
 
-    use super::super::test_support::TestNode;
     use crate::assert_emits;
+    use crate::state::test_support::TestNode;
 
     /// `BlockSyncComplete` fans out to shard consensus, remote-headers, and
     /// provisions in one pass. The provisions flush is the most

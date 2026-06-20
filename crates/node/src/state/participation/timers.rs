@@ -6,19 +6,20 @@
 //! coordinator, not a timer.
 
 use hyperscale_core::{Action, TimerId};
+use hyperscale_types::TopologySchedule;
 use tracing::instrument;
 
-use super::NodeStateMachine;
+use super::ShardParticipation;
 
 /// Consecutive cleanup ticks of unchanged committed height before the
 /// cross-shard fallback fetches are flushed. At the default one-second cleanup
 /// interval this is ~5s — aligned with the per-fallback gossip grace, so it
 /// fires only on a genuine stall, not a transient gap between commits.
-const STALL_RECOVERY_TICKS: u32 = 5;
+pub(in crate::state) const STALL_RECOVERY_TICKS: u32 = 5;
 
-impl NodeStateMachine {
-    #[instrument(skip(self))]
-    pub(super) fn on_cleanup_timer(&mut self) -> Vec<Action> {
+impl ShardParticipation {
+    #[instrument(skip(self, sched))]
+    pub(in crate::state) fn on_cleanup_timer(&mut self, sched: &TopologySchedule) -> Vec<Action> {
         let mut actions = vec![Action::SetTimer {
             id: TimerId::Cleanup,
             duration: self.shard_coordinator.config().cleanup_interval,
@@ -33,7 +34,7 @@ impl NodeStateMachine {
         // but we're stuck.
         actions.extend(self.shard_coordinator.check_sync_health());
 
-        actions.extend(self.recover_stalled_fallback_fetches());
+        actions.extend(self.recover_stalled_fallback_fetches(sched));
 
         // Drop tombstones whose `end_timestamp_exclusive` has passed — past
         // expiry, validator-side validity check rejects re-submission anyway.
@@ -56,7 +57,7 @@ impl NodeStateMachine {
     /// height has gone unchanged for [`STALL_RECOVERY_TICKS`] cleanup ticks,
     /// flush all four eagerly. The fetches are idempotent and dedupe in flight,
     /// so flushing while still genuinely waiting is harmless.
-    fn recover_stalled_fallback_fetches(&mut self) -> Vec<Action> {
+    fn recover_stalled_fallback_fetches(&mut self, sched: &TopologySchedule) -> Vec<Action> {
         let height = self.shard_coordinator.committed_height();
         if self.last_cleanup_height == Some(height) {
             self.cleanup_stall_ticks = self.cleanup_stall_ticks.saturating_add(1);
@@ -70,18 +71,18 @@ impl NodeStateMachine {
 
         let mut actions = self
             .remote_headers_coordinator
-            .flush_expected_headers(self.beacon_coordinator.topology_schedule());
+            .flush_expected_headers(sched);
         actions.extend(self.provisions_coordinator.flush_expected_provisions());
         actions.extend(self.execution_coordinator.flush_expected_certs());
         actions.extend(self.mempool_coordinator.flush_expected_txs());
         actions
     }
 
-    pub(super) fn on_view_change_timer(&mut self) -> Vec<Action> {
-        if let Some(actions) = self
-            .shard_coordinator
-            .check_round_timeout(self.beacon_coordinator.topology_schedule())
-        {
+    pub(in crate::state) fn on_view_change_timer(
+        &mut self,
+        sched: &TopologySchedule,
+    ) -> Vec<Action> {
+        if let Some(actions) = self.shard_coordinator.check_round_timeout(sched) {
             actions
         } else {
             // Conditions not met yet. Reschedule for the remaining time
@@ -100,8 +101,8 @@ mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
     use hyperscale_types::LocalTimestamp;
 
-    use super::super::test_support::TestNode;
     use crate::assert_emits;
+    use crate::state::test_support::TestNode;
 
     /// `CleanupTimer` is the only thing keeping its own loop alive — it
     /// must reschedule itself before doing anything else, so a missed
@@ -131,7 +132,7 @@ mod tests {
     #[test]
     fn view_change_timer_reschedules_with_remaining_timeout() {
         let TestNode { mut node, .. } = TestNode::new();
-        let expected = node.shard_coordinator.remaining_view_change_timeout();
+        let expected = node.shard_coordinator().remaining_view_change_timeout();
 
         let actions = node.handle(LocalTimestamp::ZERO, ProtocolEvent::ViewChangeTimer);
 
