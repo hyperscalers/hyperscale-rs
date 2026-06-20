@@ -20,7 +20,7 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidat
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, NetworkDefinition, ShardId, TransactionStatus, TxHash,
+    BlockHeight, LocalTimestamp, NetworkDefinition, ShardId, TransactionStatus, TxHash, ValidatorId,
 };
 
 use crate::NodeStateMachine;
@@ -334,6 +334,17 @@ where
     #[must_use]
     pub fn pooled_len(&self) -> usize {
         self.pool.as_ref().map_or(0, PoolLoop::len)
+    }
+
+    /// Remove `validator`'s shard-less follower vnode from the host's pool,
+    /// once it has been seated onto a shard (the seat rebuilt its
+    /// `BeaconCoordinator` from the host's warm beacon storage). No-op if
+    /// the host runs no pool or holds no such follower. Leaves an empty pool
+    /// in place — its beacon channel simply carries no further work.
+    pub fn drop_pooled_vnode(&mut self, validator: ValidatorId) {
+        if let Some(pool) = &mut self.pool {
+            pool.vnodes.retain(|v| v.validator_id != validator);
+        }
     }
 
     /// Access the state machine of the vnode at index `vnode_idx` within

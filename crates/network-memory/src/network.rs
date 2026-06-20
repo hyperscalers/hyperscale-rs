@@ -143,6 +143,17 @@ pub struct NetworkConfig {
     /// shuffle refill stock (rotation skips shards it cannot refill) at
     /// the cost of one unresponsive committee member per draw.
     pub pool_extra_validators: u32,
+    /// Give each `pool_extra_validators` entry its own host running a
+    /// shard-less beacon follower instead of leaving it host-less. With
+    /// this set, a `grow_to` cohort seats each observer on its own
+    /// dedicated host rather than co-hosting it on a sibling, so every
+    /// committee member runs a single shard — the layout the shuffle's
+    /// cross-shard relocation needs (a vnode can move onto a host that
+    /// does not already serve the destination). The follower keeps the
+    /// host's beacon storage warm so the seat rebuilds a current
+    /// coordinator. Default `false` preserves the co-hosting layout the
+    /// other grow tests rely on.
+    pub dedicated_pool_hosts: bool,
 }
 
 impl Default for NetworkConfig {
@@ -158,7 +169,29 @@ impl Default for NetworkConfig {
             hosting_mode: HostingMode::SameShardBundled,
             beacon_chain_config: None,
             pool_extra_validators: 0,
+            dedicated_pool_hosts: false,
         }
+    }
+}
+
+/// Hosts that carry a shard committee at construction — the formula-derived
+/// count, excluding any dedicated pool-extra hosts appended past them.
+const fn committee_host_count(config: &NetworkConfig) -> usize {
+    match config.hosting_mode {
+        HostingMode::SameShardBundled => {
+            (config.num_shards * config.validators_per_shard / config.vnodes_per_host) as usize
+        }
+        HostingMode::CrossShard => config.validators_per_shard as usize,
+    }
+}
+
+/// Hosts appended past the committee for the pool extras when
+/// [`NetworkConfig::dedicated_pool_hosts`] is set; zero otherwise.
+const fn dedicated_pool_host_count(config: &NetworkConfig) -> usize {
+    if config.dedicated_pool_hosts {
+        config.pool_extra_validators as usize
+    } else {
+        0
     }
 }
 
@@ -462,38 +495,47 @@ impl SimulatedNetwork {
             config.vnodes_per_host >= 1,
             "vnodes_per_host must be at least 1"
         );
-        let num_hosts = match config.hosting_mode {
-            HostingMode::SameShardBundled => {
-                assert_eq!(
-                    config.validators_per_shard % config.vnodes_per_host,
-                    0,
-                    "vnodes_per_host must divide validators_per_shard"
-                );
-                let total_validators = (config.num_shards * config.validators_per_shard) as usize;
-                total_validators / config.vnodes_per_host as usize
-            }
-            HostingMode::CrossShard => {
-                // One host per validator slot per shard; each host hosts
-                // one validator from every shard, so num_hosts =
-                // validators_per_shard.
-                config.validators_per_shard as usize
-            }
-        };
+        if matches!(config.hosting_mode, HostingMode::SameShardBundled) {
+            assert_eq!(
+                config.validators_per_shard % config.vnodes_per_host,
+                0,
+                "vnodes_per_host must divide validators_per_shard"
+            );
+        }
+        // Dedicated pool hosts are appended at validator-index host slots, so
+        // the `validator_to_node` formula (id / vnodes_per_host) lands each
+        // pool extra on its own host only under one-vnode same-shard bundling.
+        assert!(
+            !config.dedicated_pool_hosts
+                || (matches!(config.hosting_mode, HostingMode::SameShardBundled)
+                    && config.vnodes_per_host == 1),
+            "dedicated_pool_hosts requires SameShardBundled with vnodes_per_host == 1"
+        );
+        let committee_hosts = committee_host_count(&config);
+        let num_hosts = committee_hosts + dedicated_pool_host_count(&config);
         let num_shards = u64::from(config.num_shards);
         let registries = (0..num_hosts)
             .map(|host_index| {
-                let host_index = u32::try_from(host_index).expect("host_index fits u32");
-                let hosted: BTreeSet<ShardId> = match config.hosting_mode {
-                    HostingMode::SameShardBundled => {
-                        let hosts_per_shard = config.validators_per_shard / config.vnodes_per_host;
-                        std::iter::once(ShardId::leaf(
-                            num_shards.trailing_zeros(),
-                            u64::from(host_index / hosts_per_shard),
-                        ))
-                        .collect()
-                    }
-                    HostingMode::CrossShard => {
-                        ShardTrie::uniform_from_count(num_shards).leaves().collect()
+                // Dedicated pool-extra hosts (appended past the committee
+                // hosts) serve no shard until a grow or shuffle seats one;
+                // their shard-less follower receives global beacon gossip.
+                let hosted: BTreeSet<ShardId> = if host_index >= committee_hosts {
+                    BTreeSet::new()
+                } else {
+                    let host_index = u32::try_from(host_index).expect("host_index fits u32");
+                    match config.hosting_mode {
+                        HostingMode::SameShardBundled => {
+                            let hosts_per_shard =
+                                config.validators_per_shard / config.vnodes_per_host;
+                            std::iter::once(ShardId::leaf(
+                                num_shards.trailing_zeros(),
+                                u64::from(host_index / hosts_per_shard),
+                            ))
+                            .collect()
+                        }
+                        HostingMode::CrossShard => {
+                            ShardTrie::uniform_from_count(num_shards).leaves().collect()
+                        }
                     }
                 };
                 Arc::new(HandlerRegistry::new(hosted))
@@ -758,28 +800,22 @@ impl SimulatedNetwork {
     }
 
     /// Get all hosts in the network.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host count exceeds `NodeIndex` — test harnesses are far
+    /// smaller.
     #[must_use]
     pub fn all_nodes(&self) -> Vec<NodeIndex> {
-        let total = match self.config.hosting_mode {
-            HostingMode::SameShardBundled => {
-                self.config.num_shards * self.config.validators_per_shard
-                    / self.config.vnodes_per_host
-            }
-            HostingMode::CrossShard => self.config.validators_per_shard,
-        };
+        let total = NodeIndex::try_from(self.total_nodes()).expect("host count fits NodeIndex");
         (0..total).collect()
     }
 
-    /// Get the total number of hosts (`IoLoop`s).
+    /// Get the total number of hosts (`IoLoop`s), including any dedicated
+    /// pool-extra hosts.
     #[must_use]
     pub const fn total_nodes(&self) -> usize {
-        match self.config.hosting_mode {
-            HostingMode::SameShardBundled => {
-                (self.config.num_shards * self.config.validators_per_shard
-                    / self.config.vnodes_per_host) as usize
-            }
-            HostingMode::CrossShard => self.config.validators_per_shard as usize,
-        }
+        committee_host_count(&self.config) + dedicated_pool_host_count(&self.config)
     }
 
     /// Get network configuration.

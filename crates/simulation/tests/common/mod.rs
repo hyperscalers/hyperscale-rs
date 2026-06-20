@@ -33,30 +33,43 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
 
-/// Committee validators per shard. The shuffle retires one member at
-/// the boundary; seven keeps both committees above quorum through the
-/// rotation even where a replacement runs no host.
+/// Committee validators per shard. The shuffle retires one member at the
+/// boundary and refills it; the refill seats on its own dedicated host but the
+/// test drives only the direct move, so the other refills run no shard vnode.
+/// Seven keeps both committees above quorum (five) through the rotation even
+/// with an unseated replacement.
 pub const PER_SHARD: u32 = 7;
 
-/// Hostless `Pooled` validators registered in genesis. The shuffle
-/// only rotates a shard it can refill, so an empty pool would mean no
-/// rotation at all — these give each shard's draw stock.
-pub const POOL_EXTRAS: u32 = 2;
+/// `Pooled` validators left over once `grow_to(2)` has seated its cohort.
+/// Exactly one: the shuffle processes the two shards in order, so shard 0
+/// refills from this lone surplus, leaving only shard 0's just-rotated victim
+/// in the pool for shard 1 to re-draw — a *direct* cross-shard move every seed
+/// (`pool_draw` re-draws an earlier shard's victim, and the beacon resample
+/// runs after the shuffle, so it can't drain the pool first). An empty pool
+/// would skip the rotation entirely.
+pub const POOL_EXTRAS: u32 = 1;
 
-/// The 2-shard, paced-epoch network both rotation tests run on.
+/// Single-shard, paced-epoch network both rotation tests grow to two shards
+/// (`grow_to(2)`) before exercising the committee shuffle. The split trigger is
+/// armed from genesis; the pool carries one cohort (`PER_SHARD`) for the grow
+/// plus `POOL_EXTRAS` surplus for the shuffle to refill from, each on its own
+/// dedicated beacon-follower host so every committee member ends on a single
+/// shard.
 #[must_use]
 pub fn rotation_config() -> NetworkConfig {
     NetworkConfig {
-        num_shards: 2,
+        num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
-            num_shards: 2,
+            num_shards: 1,
             shard_size: PER_SHARD,
+            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
             ..BeaconChainConfig::default()
         }),
-        pool_extra_validators: POOL_EXTRAS,
+        pool_extra_validators: PER_SHARD + POOL_EXTRAS,
+        dedicated_pool_hosts: true,
         ..Default::default()
     }
 }

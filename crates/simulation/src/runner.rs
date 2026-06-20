@@ -300,12 +300,13 @@ impl SimulationRunner {
         let mut event_rxs = Vec::with_capacity(num_hosts);
         let mut host_event_txs = Vec::with_capacity(num_hosts);
 
-        for (host_index, host_vnodes) in host_layout.iter().enumerate() {
-            // Group this host's vnodes by shard. For cross-shard
+        for (host_index, plan) in host_layout.iter().enumerate() {
+            // Group this host's seated vnodes by shard. For cross-shard
             // hosting each group has one vnode; for same-shard hosting
-            // there's one group per host with `vnodes_per_host` entries.
+            // there's one group per host with `vnodes_per_host` entries. A
+            // dedicated pool host has no seated vnodes — only followers.
             let mut by_shard: BTreeMap<ShardId, Vec<u32>> = BTreeMap::new();
-            for &(validator_idx, shard) in host_vnodes {
+            for &(validator_idx, shard) in &plan.seated {
                 by_shard.entry(shard).or_default().push(validator_idx);
             }
 
@@ -348,7 +349,8 @@ impl SimulationRunner {
                 .map(|state| state.as_ref().clone())
                 .collect();
 
-            let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(host_vnodes.len());
+            let mut vnode_inits: Vec<VnodeInit> =
+                Vec::with_capacity(plan.seated.len() + plan.followers.len());
             for (shard, validator_idxs) in &by_shard {
                 let (provision_store, tx_store, exec_cert_store, fw_store) =
                     shard_stores.get(shard).expect("shard bundle just inserted");
@@ -385,6 +387,32 @@ impl SimulationRunner {
 
                     vnode_inits.push(VnodeInit { state, signing_key });
                 }
+            }
+
+            // Shard-less beacon followers (dedicated pool hosts). Each runs
+            // the beacon spine with `shard: None`, keeping the host's beacon
+            // storage and topology warm until a grow or shuffle seats it; its
+            // `BeaconCoordinator` carries `ShardId::ROOT` as the placeholder
+            // home (only seeds the retention floor — no consensus effect).
+            for &validator_idx in &plan.followers {
+                let validator_id = ValidatorId::new(u64::from(validator_idx));
+                let key_bytes = keys[validator_idx as usize].to_bytes();
+                let signing_key = Arc::new(
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
+                );
+                let beacon_coordinator = BeaconCoordinator::new(
+                    Arc::clone(&beacon_latest_block),
+                    beacon_history.clone(),
+                    validator_id,
+                    ShardId::ROOT,
+                    WeightedTimestamp::ZERO,
+                    beacon_network.clone(),
+                    beacon_config_hash,
+                );
+                vnode_inits.push(VnodeInit {
+                    state: NodeStateMachine::follower(validator_id, beacon_coordinator),
+                    signing_key,
+                });
             }
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
@@ -1088,8 +1116,8 @@ impl SimulationRunner {
 
 /// Compute the host→validators layout for a simulation network.
 ///
-/// Returns one entry per host, each a list of `(validator_idx, shard)`
-/// tuples the host carries. The shape depends on `config.hosting_mode`:
+/// Returns one [`HostPlan`] per host. The committee hosts carry seated
+/// `(validator_idx, shard)` vnodes per `config.hosting_mode`:
 ///
 /// - [`HostingMode::SameShardBundled`]: hosts are
 ///   `num_shards * validators_per_shard / vnodes_per_host`. Host `h`
@@ -1098,7 +1126,47 @@ impl SimulationRunner {
 /// - [`HostingMode::CrossShard`]: hosts are `validators_per_shard`.
 ///   Host `h` carries one validator from every shard — specifically
 ///   `{s * validators_per_shard + h : s in 0..num_shards}`.
-fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardId)>> {
+///
+/// When [`NetworkConfig::dedicated_pool_hosts`] is set, one shard-less
+/// follower host per pool extra is appended past the committee hosts, at
+/// the validator-index slot the `validator_to_node` formula maps it to.
+fn build_host_layout(config: &NetworkConfig) -> Vec<HostPlan> {
+    let mut plans: Vec<HostPlan> = build_committee_host_layout(config)
+        .into_iter()
+        .map(|seated| HostPlan {
+            seated,
+            followers: Vec::new(),
+        })
+        .collect();
+    if config.dedicated_pool_hosts {
+        // Each pool extra gets its own host running a shard-less beacon
+        // follower. Pool-extra validator ids start past the committee
+        // validators, and the `vnodes_per_host == 1` invariant the
+        // dedicated layout requires puts each at its own node.
+        let total_validators = config.num_shards * config.validators_per_shard;
+        for k in 0..config.pool_extra_validators {
+            plans.push(HostPlan {
+                seated: Vec::new(),
+                followers: vec![total_validators + k],
+            });
+        }
+    }
+    plans
+}
+
+/// One host's construction plan: seated `(validator_idx, shard)` vnodes plus
+/// any shard-less beacon-follower validator ids.
+struct HostPlan {
+    /// Seated vnodes the host runs shard consensus for.
+    seated: Vec<(u32, ShardId)>,
+    /// Shard-less validators the host follows the beacon for (the pool).
+    followers: Vec<u32>,
+}
+
+/// The committee host layout — one entry per host that carries a shard at
+/// construction, per the hosting mode. Dedicated pool-extra hosts are
+/// appended separately by [`build_host_layout`].
+fn build_committee_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardId)>> {
     match config.hosting_mode {
         HostingMode::SameShardBundled => {
             assert_eq!(

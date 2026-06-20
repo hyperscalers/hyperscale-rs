@@ -14,6 +14,7 @@
 //!
 //! [`topology_rotation`]: ./topology_rotation.rs
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use hyperscale_core::ParticipationChange;
@@ -33,7 +34,8 @@ use common::rotation_config;
 /// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
 /// move: one shard's rotation victim is drawn straight into the other
 /// shard's freed slot, yielding a single `ParticipationChange` with
-/// both `join` and `leave` set on a hosted vnode.
+/// both `join` and `leave` set on a hosted vnode. `RELOC_SEED` overrides
+/// it to search for a direct move under a different grown placement.
 const SEED: u64 = 7;
 
 /// Epochs past the shuffle boundary the placement delta gets to
@@ -83,20 +85,43 @@ fn mover_status(
     state.validators.get(&validator).map(|r| r.status)
 }
 
-/// A host (other than `except`) whose first vnode sits in `shard`,
-/// for reading the shard's chain from a settled member.
+/// A host (other than `except`) of a *current* consensus member of `shard`,
+/// for reading the shard's chain from a member that tracks the live tip. A
+/// shuffle rotates members out, but an ex-member's host keeps running the
+/// shard as a stalled non-member, so membership must be read from the
+/// committee, not from "hosts a `shard` vnode".
 fn member_host(runner: &SimulationRunner, shard: ShardId, except: NodeIndex) -> NodeIndex {
-    (0..runner.num_hosts())
+    let (_, state) = runner
+        .beacon_storage(except)
+        .expect("host exists")
+        .latest_committed()
+        .expect("beacon committed");
+    let members = state
+        .shard_consensus_members
+        .get(&shard)
+        .expect("shard has a consensus committee");
+    members
+        .iter()
+        .map(|m| runner.network().validator_to_node(*m))
         .find(|&h| h != except && runner.vnode_state_in(h, shard).is_some())
-        .expect("every shard has settled member hosts")
+        .expect("a current consensus member host other than `except`")
 }
 
 #[traced_test]
 #[test]
 #[allow(clippy::too_many_lines)] // one relocation lifecycle asserted end to end
 fn vnode_relocates_across_shards_at_the_shuffle() {
-    let mut runner = SimulationRunner::new(&rotation_config(), SEED);
+    let seed = std::env::var("RELOC_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SEED);
+    let mut runner = SimulationRunner::new(&rotation_config(), seed);
     runner.initialize_genesis();
+    // Grow the single-shard genesis into the two shards the shuffle rotates,
+    // then discard the grow's placement deltas so only the shuffle's move is
+    // collected below.
+    runner.grow_to(2);
+    let _ = runner.take_reconfigurations();
 
     // ── Detection: the epoch-16 shuffle surfaces a direct move ──────
     let shuffle =
@@ -108,7 +133,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .find(|(_, c)| c.join.is_some() && c.leave.is_some())
         .cloned()
         .unwrap_or_else(|| {
-            panic!("seed {SEED} must yield a direct cross-shard move; got {moves:?}")
+            panic!("seed {seed} must yield a direct cross-shard move; got {moves:?}")
         });
     let validator = change.validator;
     let from = change.leave.expect("direct move carries a leave");
@@ -164,7 +189,9 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
             .expect("member host carries the shard")
             .shard_coordinator()
             .committed_height();
-        let storage = r.node_storage(peer).expect("member host has storage");
+        let storage = r
+            .hosts_shard(peer, to)
+            .expect("member host serves the shard");
         (watch_from.inner()..=tip.inner()).any(|h| {
             storage
                 .get_block(BlockHeight::new(h))
@@ -178,14 +205,23 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         let mover_tip = runner
             .vnode_state_in(node, to)
             .map(|s| s.shard_coordinator().committed_height());
-        let members = runner
+        let mut per_member = String::new();
+        if let Some((_, state)) = runner
             .beacon_storage(node)
             .and_then(|b| b.latest_committed())
-            .map(|(_, state)| state.shard_consensus_members.get(&to).cloned());
+        {
+            for m in state.shard_consensus_members.get(&to).into_iter().flatten() {
+                let h = runner.network().validator_to_node(*m);
+                let tip = runner
+                    .vnode_state_in(h, to)
+                    .map(|s| s.shard_coordinator().committed_height());
+                let _ = write!(per_member, "\n  v{m:?} host{h} tip={tip:?}");
+            }
+        }
         panic!(
-            "no committed proposal from the mover; watch_from={watch_from:?} \
-             peer_tip={peer_tip:?} mover_tip={mover_tip:?} members={members:?} \
-             validator={validator:?}"
+            "no committed proposal from the mover in {to:?}; watch_from={watch_from:?} \
+             peer={peer} peer_tip={peer_tip:?} mover_tip={mover_tip:?} \
+             validator={validator:?} consensus members:{per_member}"
         );
     }
     let mover_tip = runner
