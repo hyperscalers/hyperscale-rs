@@ -276,7 +276,7 @@ impl SimulationRunner {
             let node = self.network.validator_to_node(*member);
             self.flip_split_child(node, *member, parent, *child, None);
         }
-        let dedicated = self.network.config().dedicated_pool_hosts;
+        let dedicated = self.config.dedicated_pool_hosts;
         let mut sibling_hosts: Vec<NodeIndex> = Vec::new();
         for (validator, child, store, _, _) in synced {
             let node = if dedicated {

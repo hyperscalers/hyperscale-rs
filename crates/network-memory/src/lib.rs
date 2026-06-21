@@ -15,7 +15,7 @@ pub use fault::{
     Decision, FaultAction, FaultBuilder, FaultInjector, MessageContext, RuleBuilder, RuleHandle,
     Tier,
 };
-pub use network::{FulfillmentStats, HostLayout, HostingMode, NetworkConfig, SimulatedNetwork};
+pub use network::{FulfillmentStats, HostLayout, NetworkConfig, SimulatedNetwork};
 pub use sim_network::{OutboxEntry, PendingNotification, SimNetworkAdapter};
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 

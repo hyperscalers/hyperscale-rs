@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_memory::{NetworkConfig, RuleHandle};
+use hyperscale_network_memory::RuleHandle;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, NodeId, ReshapeThresholds,
@@ -42,8 +42,8 @@ fn with_test_recorder<R>(f: impl FnOnce(&MemoryRecorder) -> R) -> R {
     with_scoped_recorder(arc, || f(&recorder))
 }
 
-fn single_shard_config() -> NetworkConfig {
-    NetworkConfig {
+fn single_shard_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,
@@ -55,8 +55,8 @@ fn single_shard_config() -> NetworkConfig {
 /// paced epochs, and one cohort of pooled extras — `grow_to(2)` drives it
 /// to two shards through the real split lifecycle, mirroring a network that
 /// launches single-shard and fans out under load.
-fn cross_shard_grow_config() -> NetworkConfig {
-    NetworkConfig {
+fn cross_shard_grow_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,

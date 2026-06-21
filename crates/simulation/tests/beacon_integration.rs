@@ -6,8 +6,7 @@
 
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT};
 use tracing_test::traced_test;
 
@@ -26,8 +25,8 @@ fn beacon_chain_config(epoch_duration_ms: u64) -> BeaconChainConfig {
 }
 
 /// 8 validators on one shard, beacon committee 4.
-fn beacon_committee_config() -> NetworkConfig {
-    NetworkConfig {
+fn beacon_committee_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 8,
         jitter_fraction: 0.1,

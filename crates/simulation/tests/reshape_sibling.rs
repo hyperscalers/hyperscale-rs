@@ -19,9 +19,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::{NetworkConfig, NodeIndex};
+use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
@@ -88,8 +88,8 @@ const SETTLE_BUDGET_EPOCHS: u64 = 6;
 /// Single-shard genesis with the split trigger armed for the grow and two
 /// cohorts of pooled extras — one staffs `grow_to(2)`'s ROOT split, the
 /// other staffs `leaf(1,0)`'s split once the vote lowers the threshold.
-fn sibling_config() -> NetworkConfig {
-    NetworkConfig {
+fn sibling_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,

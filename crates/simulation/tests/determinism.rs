@@ -8,17 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network_memory::{HostingMode, NetworkConfig};
 use hyperscale_node::shard_loop::HostEvent;
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{HostingMode, SimConfig, SimulationRunner};
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, NetworkDefinition, Round, ShardId, TransactionStatus,
 };
 use tracing_test::traced_test;
 
 /// Create a basic network configuration for testing.
-fn test_network_config() -> NetworkConfig {
-    NetworkConfig {
+fn test_network_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,
@@ -1774,7 +1773,7 @@ fn test_consensus_during_partition() {
 /// 2. Results remain deterministic under packet loss
 #[test]
 fn test_packet_loss_application() {
-    let config = NetworkConfig {
+    let config = SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,
@@ -1839,7 +1838,7 @@ fn test_packet_loss_application() {
 /// Test that packet loss is deterministic (same seed = same drops).
 #[test]
 fn test_packet_loss_determinism() {
-    let config = NetworkConfig {
+    let config = SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,

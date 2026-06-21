@@ -18,10 +18,9 @@ use std::time::Duration;
 
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{
     BeaconChainConfig, Ed25519PrivateKey, NodeId, ReshapeThresholds, RoutableTransaction, ShardId,
     TimestampRange, TxHash, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
@@ -56,8 +55,8 @@ pub const POOL_EXTRAS: u32 = 1;
 /// dedicated beacon-follower host so every committee member ends on a single
 /// shard.
 #[must_use]
-pub fn rotation_config() -> NetworkConfig {
-    NetworkConfig {
+pub fn rotation_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,
@@ -92,8 +91,8 @@ pub const GROW_PER_SHARD: u32 = 4;
 /// the real split lifecycle, mirroring a network that launches single-shard
 /// and fans out under load.
 #[must_use]
-pub fn cross_shard_grow_config() -> NetworkConfig {
-    NetworkConfig {
+pub fn cross_shard_grow_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: GROW_PER_SHARD,
         jitter_fraction: 0.1,

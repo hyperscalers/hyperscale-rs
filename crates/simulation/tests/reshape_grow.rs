@@ -17,9 +17,8 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
@@ -57,8 +56,8 @@ const CHILD_RUN_BUDGET_EPOCHS: u64 = 4;
 /// from genesis (`split_bytes: 0` — every committed count
 /// satisfies the predicate) and exactly one cohort's worth of pooled
 /// extras.
-fn grow_config() -> NetworkConfig {
-    NetworkConfig {
+fn grow_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,

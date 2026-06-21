@@ -14,9 +14,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BeaconChainConfig, Ed25519PrivateKey, RoutableTransaction, TransactionStatus,
@@ -35,8 +34,8 @@ use radix_transactions::builder::ManifestBuilder;
 /// slack to survive past `SHUFFLE_INTERVAL_EPOCHS`; a four-validator committee
 /// churns down to n=3 once the shuffle starts. These tests exercise shard-local
 /// mempool and provision mechanics, so one shard is sufficient.
-fn backpressure_config() -> NetworkConfig {
-    NetworkConfig {
+fn backpressure_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 8,
         jitter_fraction: 0.1,

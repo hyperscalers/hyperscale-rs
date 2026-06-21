@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
-use hyperscale_types::{BeaconChainConfig, ShardId, ValidatorId};
+use hyperscale_types::{ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
@@ -89,71 +89,22 @@ const HEALTH_WEIGHT_FLOOR: f64 = 0.05;
 /// matching the tracker's treatment of unknown peers.
 const HEALTH_WEIGHT_NEUTRAL: f64 = 0.5;
 
-/// How simulated validators are bundled into hosts (`IoLoop` instances).
+/// Transport configuration for the simulated network: per-message latency
+/// tiers, jitter, and packet loss.
 ///
-/// See [`NetworkConfig::hosting_mode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostingMode {
-    /// Each host hosts `vnodes_per_host` consecutive validators from
-    /// the **same** shard. Host count = `num_shards * validators_per_shard
-    /// / vnodes_per_host`. `vnodes_per_host` must divide
-    /// `validators_per_shard`. This is the default.
-    SameShardBundled,
-    /// Each host hosts **one validator from every shard** —
-    /// `vnodes_per_host` becomes `num_shards` implicitly. Host count
-    /// equals `validators_per_shard`. Validator id layout: shard `s`
-    /// owns ids `[s * validators_per_shard, (s+1) * validators_per_shard)`;
-    /// host `h` carries `{V_h, V_{h+VPS}, V_{h+2*VPS}, ...}` — one
-    /// per shard. Used to exercise cross-shard hosting end-to-end.
-    CrossShard,
-}
-
-/// Configuration for simulated network.
+/// Cluster layout — which validators run on which hosts and serve which
+/// shards — is the harness's concern and reaches the transport as a
+/// [`HostLayout`], never as config fields here.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
-    /// Base latency for intra-shard messages.
+    /// Base latency between two hosts that serve a shard in common.
     pub intra_shard_latency: Duration,
-    /// Base latency for cross-shard messages.
+    /// Base latency between two hosts that serve no shard in common.
     pub cross_shard_latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
-    /// Number of validators per shard.
-    pub validators_per_shard: u32,
-    /// Number of shards.
-    pub num_shards: u32,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
-    /// Number of consecutive validators bundled into each simulated
-    /// host (i.e. each `IoLoop`). Default `1` means one validator per
-    /// host. With `> 1`, validators `[k*N .. (k+1)*N)` share host
-    /// index `k`. Must divide `validators_per_shard`. Ignored when
-    /// `hosting_mode == HostingMode::CrossShard` (the cross-shard mode
-    /// fixes bundling at one vnode per shard per host).
-    pub vnodes_per_host: u32,
-    /// How validators are bundled into hosts. See [`HostingMode`].
-    pub hosting_mode: HostingMode,
-    /// Override the beacon chain config (epoch duration, committee
-    /// sizes, etc.). `None` uses the defaults from
-    /// [`BeaconChainConfig::default`], which match the legacy
-    /// compile-time constants (5-minute epochs, committee 4). Tests
-    /// that want fast beacon kickoff override `epoch_duration_ms` here.
-    pub beacon_chain_config: Option<BeaconChainConfig>,
-    /// Validators registered in beacon genesis beyond the shard
-    /// committees. They land `Pooled` and run no host, so they give the
-    /// shuffle refill stock (rotation skips shards it cannot refill) at
-    /// the cost of one unresponsive committee member per draw.
-    pub pool_extra_validators: u32,
-    /// Give each `pool_extra_validators` entry its own host running a
-    /// shard-less beacon follower instead of leaving it host-less. With
-    /// this set, a `grow_to` cohort seats each observer on its own
-    /// dedicated host rather than co-hosting it on a sibling, so every
-    /// committee member runs a single shard — the layout the shuffle's
-    /// cross-shard relocation needs (a vnode can move onto a host that
-    /// does not already serve the destination). The follower keeps the
-    /// host's beacon storage warm so the seat rebuilds a current
-    /// coordinator. Default `false` preserves the co-hosting layout the
-    /// other grow tests rely on.
-    pub dedicated_pool_hosts: bool,
 }
 
 impl Default for NetworkConfig {
@@ -162,14 +113,7 @@ impl Default for NetworkConfig {
             intra_shard_latency: Duration::from_millis(150),
             cross_shard_latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
-            validators_per_shard: 4,
-            num_shards: 2,
             packet_loss_rate: 0.0,
-            vnodes_per_host: 1,
-            hosting_mode: HostingMode::SameShardBundled,
-            beacon_chain_config: None,
-            pool_extra_validators: 0,
-            dedicated_pool_hosts: false,
         }
     }
 }
@@ -704,12 +648,8 @@ impl SimulatedNetwork {
         a_shards.iter().any(|shard| b_shards.contains(shard))
     }
 
-    /// Get all hosts (`IoLoop` indices) that have at least one
-    /// validator in `shard`.
-    ///
-    /// - [`HostingMode::SameShardBundled`]: hosts mapped to `shard`.
-    /// - [`HostingMode::CrossShard`]: every host serves every shard, so
-    ///   returns all hosts.
+    /// Get all hosts (`IoLoop` indices) whose registry hosts `shard` — the
+    /// reshape-aware peer pool the request and gossip paths route on.
     #[must_use]
     pub fn peers_in_shard(&self, shard: ShardId) -> Vec<NodeIndex> {
         self.registries

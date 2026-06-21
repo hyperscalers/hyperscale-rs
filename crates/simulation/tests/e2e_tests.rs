@@ -13,9 +13,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, RoutableTransaction, TransactionStatus,
@@ -35,8 +34,8 @@ use common::{
 };
 
 /// Create a basic single-shard network configuration.
-fn single_shard_config() -> NetworkConfig {
-    NetworkConfig {
+fn single_shard_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,

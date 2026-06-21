@@ -23,8 +23,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHash, Ed25519PrivateKey, Epoch, KeeperSeat,
@@ -64,8 +63,8 @@ const PARENT_RUN_BUDGET_EPOCHS: u64 = 6;
 /// Single-shard genesis with the split trigger armed for one generation and
 /// one cohort of pooled extras — `grow_to(2)` drives it to the two sibling
 /// shards (`leaf(1,0)`, `leaf(1,1)`) through the real split lifecycle.
-fn merge_config() -> NetworkConfig {
-    NetworkConfig {
+fn merge_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,

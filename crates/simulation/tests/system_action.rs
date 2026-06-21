@@ -11,8 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BeaconWitnessEvent, Bls12381G1PublicKey, Ed25519PrivateKey,
     Stake, StakePool, StakePoolId, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
@@ -27,8 +26,8 @@ const GENESIS_POOL: StakePoolId = StakePoolId::new(0);
 /// One shard of `validators` nodes, the committee sized to the whole set. With
 /// no validators left over for the pool, the shuffle has no stock and never
 /// fires, so committee membership stays put for the test's duration.
-fn single_shard_config(validators: u32) -> NetworkConfig {
-    NetworkConfig {
+fn single_shard_config(validators: u32) -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: validators,
         jitter_fraction: 0.1,

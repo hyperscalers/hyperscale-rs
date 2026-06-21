@@ -15,7 +15,7 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    BandwidthReport, HostLayout, HostingMode, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
+    BandwidthReport, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::shard_loop::{HostEvent, StepOutput};
@@ -28,7 +28,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconGenesisConfig, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    BeaconChainConfig, BeaconGenesisConfig, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, GenesisConfigHash, GenesisPool,
     GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NodeId, Randomness, ShardId, Stake,
     StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
@@ -50,6 +50,87 @@ pub mod observer;
 pub mod relocation;
 mod split;
 pub mod system_action;
+
+/// How simulated validators are bundled into hosts (`IoLoop` instances).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostingMode {
+    /// Each host hosts `vnodes_per_host` consecutive validators from the same
+    /// shard. Host count = `num_shards * validators_per_shard /
+    /// vnodes_per_host`; `vnodes_per_host` must divide `validators_per_shard`.
+    SameShardBundled,
+    /// Each host hosts one validator from every shard. Host count equals
+    /// `validators_per_shard`; shard `s` owns ids `[s * VPS, (s+1) * VPS)` and
+    /// host `h` carries `{s * VPS + h : s in 0..num_shards}`. Exercises
+    /// cross-shard hosting end to end.
+    CrossShard,
+}
+
+/// Cluster and transport configuration for a simulation.
+///
+/// The cluster fields (shards, validators, hosting) describe placement; the
+/// latency / jitter / loss fields configure the transport, which the runner
+/// hands over as a [`NetworkConfig`].
+#[derive(Debug, Clone)]
+pub struct SimConfig {
+    /// Number of validators per shard.
+    pub validators_per_shard: u32,
+    /// Number of shards.
+    pub num_shards: u32,
+    /// Consecutive validators bundled into each host. Must divide
+    /// `validators_per_shard`; ignored under [`HostingMode::CrossShard`].
+    pub vnodes_per_host: u32,
+    /// How validators are bundled into hosts.
+    pub hosting_mode: HostingMode,
+    /// Validators registered in beacon genesis beyond the shard committees.
+    /// They land `Pooled` and run no host, giving the shuffle refill stock.
+    pub pool_extra_validators: u32,
+    /// Give each pool extra its own shard-less follower host instead of
+    /// leaving it host-less — the layout the shuffle's cross-shard relocation
+    /// needs (a vnode can move onto a host not already serving the
+    /// destination). Default `false` preserves the co-hosting layout.
+    pub dedicated_pool_hosts: bool,
+    /// Override the beacon chain config (epoch duration, committee sizes).
+    /// `None` uses [`BeaconChainConfig::default`].
+    pub beacon_chain_config: Option<BeaconChainConfig>,
+    /// Base latency between two hosts that serve a shard in common.
+    pub intra_shard_latency: Duration,
+    /// Base latency between two hosts that serve no shard in common.
+    pub cross_shard_latency: Duration,
+    /// Jitter as a fraction of base latency (0.0 - 1.0).
+    pub jitter_fraction: f64,
+    /// Packet loss rate (0.0 - 1.0).
+    pub packet_loss_rate: f64,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            validators_per_shard: 4,
+            num_shards: 2,
+            vnodes_per_host: 1,
+            hosting_mode: HostingMode::SameShardBundled,
+            pool_extra_validators: 0,
+            dedicated_pool_hosts: false,
+            beacon_chain_config: None,
+            intra_shard_latency: Duration::from_millis(150),
+            cross_shard_latency: Duration::from_millis(150),
+            jitter_fraction: 0.1,
+            packet_loss_rate: 0.0,
+        }
+    }
+}
+
+impl SimConfig {
+    /// The transport-only config the simulated network consumes.
+    const fn network_config(&self) -> NetworkConfig {
+        NetworkConfig {
+            intra_shard_latency: self.intra_shard_latency,
+            cross_shard_latency: self.cross_shard_latency,
+            jitter_fraction: self.jitter_fraction,
+            packet_loss_rate: self.packet_loss_rate,
+        }
+    }
+}
 
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
@@ -125,6 +206,10 @@ pub struct SimulationRunner {
     /// Epoch window length from the beacon chain config, retained so a
     /// merge keeper's flip can recompute the cut the children crossed.
     epoch_duration_ms: u64,
+
+    /// Cluster + transport config, retained so reshape paths can read the
+    /// host layout the transport no longer carries.
+    config: SimConfig,
 }
 
 /// Statistics collected during simulation.
@@ -183,7 +268,7 @@ impl SimulationRunner {
     /// constructor produces canonical bytes).
     #[must_use]
     #[allow(clippy::too_many_lines)] // straight-line construction of per-shard hosts
-    pub fn new(network_config: &NetworkConfig, seed: u64) -> Self {
+    pub fn new(network_config: &SimConfig, seed: u64) -> Self {
         assert!(
             network_config.vnodes_per_host >= 1,
             "vnodes_per_host must be at least 1"
@@ -192,7 +277,10 @@ impl SimulationRunner {
         // transport's routing tables and the per-host vnode seating below.
         let host_layout = build_host_layout(network_config);
         let num_hosts = host_layout.len();
-        let network = SimulatedNetwork::new(network_config.clone(), network_layout(&host_layout));
+        let network = SimulatedNetwork::new(
+            network_config.network_config(),
+            network_layout(&host_layout),
+        );
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
         // Generate keys for all registered validators using deterministic
@@ -449,12 +537,13 @@ impl SimulationRunner {
                 .beacon_chain_config
                 .unwrap_or_default()
                 .epoch_duration_ms,
+            config: network_config.clone(),
         }
     }
 
     /// Create a new simulation runner with traffic analysis enabled.
     #[must_use]
-    pub fn with_traffic_analysis(network_config: &NetworkConfig, seed: u64) -> Self {
+    pub fn with_traffic_analysis(network_config: &SimConfig, seed: u64) -> Self {
         let mut runner = Self::new(network_config, seed);
         let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
         runner.network.set_traffic_analyzer(Arc::clone(&analyzer));
@@ -703,9 +792,8 @@ impl SimulationRunner {
     /// Panics if a Radix `ComponentAddress` payload is shorter than 30 bytes
     /// (unreachable: `ComponentAddress` is always 30 bytes).
     pub fn initialize_genesis_with_balances(&mut self, balances: &[(ComponentAddress, Decimal)]) {
-        let num_shards = u64::from(self.network.config().num_shards);
-        let hosts_per_shard =
-            self.network.config().validators_per_shard / self.network.config().vnodes_per_host;
+        let num_shards = u64::from(self.config.num_shards);
+        let hosts_per_shard = self.config.validators_per_shard / self.config.vnodes_per_host;
 
         // Pre-group balances by shard so we don't re-filter for every node.
         let mut balances_by_shard: HashMap<ShardId, Vec<_>> = HashMap::new();
@@ -734,8 +822,8 @@ impl SimulationRunner {
             .collect();
         let empty_config = GenesisConfig::test_default();
 
-        let shard_depth = self.network.config().num_shards.trailing_zeros();
-        for shard_idx in 0..self.network.config().num_shards {
+        let shard_depth = self.config.num_shards.trailing_zeros();
+        for shard_idx in 0..self.config.num_shards {
             let shard_id = ShardId::leaf(shard_depth, u64::from(shard_idx));
             let config = configs_by_shard.get(&shard_id).unwrap_or(&empty_config);
             self.install_engine_genesis(config, |node_idx| {
@@ -784,7 +872,7 @@ impl SimulationRunner {
         use hyperscale_storage::SubstateStore;
         use hyperscale_types::Block;
 
-        let num_shards = self.network.config().num_shards;
+        let num_shards = self.config.num_shards;
         let shard_depth = num_shards.trailing_zeros();
 
         for shard_id in 0..num_shards {
@@ -811,9 +899,7 @@ impl SimulationRunner {
 
             // Proposer = first validator in the shard's committee
             // (shard_id * validators_per_shard).
-            let proposer = ValidatorId::new(u64::from(
-                shard_id * self.network.config().validators_per_shard,
-            ));
+            let proposer = ValidatorId::new(u64::from(shard_id * self.config.validators_per_shard));
             let genesis_block =
                 Block::genesis(shard, proposer, genesis_jmt_root, ChainOrigin::ROOT);
 
@@ -1118,7 +1204,7 @@ fn network_layout(plans: &[HostPlan]) -> HostLayout {
 /// When [`NetworkConfig::dedicated_pool_hosts`] is set, one shard-less
 /// follower host per pool extra is appended past the committee hosts, at
 /// the validator-index slot the `validator_to_node` formula maps it to.
-fn build_host_layout(config: &NetworkConfig) -> Vec<HostPlan> {
+fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
     let mut plans: Vec<HostPlan> = build_committee_host_layout(config)
         .into_iter()
         .map(|seated| HostPlan {
@@ -1154,7 +1240,7 @@ struct HostPlan {
 /// The committee host layout — one entry per host that carries a shard at
 /// construction, per the hosting mode. Dedicated pool-extra hosts are
 /// appended separately by [`build_host_layout`].
-fn build_committee_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardId)>> {
+fn build_committee_host_layout(config: &SimConfig) -> Vec<Vec<(u32, ShardId)>> {
     match config.hosting_mode {
         HostingMode::SameShardBundled => {
             assert_eq!(

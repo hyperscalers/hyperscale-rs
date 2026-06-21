@@ -6,15 +6,14 @@ use std::time::Duration;
 
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_memory::NetworkConfig;
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{SimConfig, SimulationRunner};
 
 #[test]
 fn metrics_recorder_collects_values_from_running_sim() {
     let recorder = MemoryRecorder::new();
     set_global_recorder(Box::new(recorder.clone()));
 
-    let config = NetworkConfig {
+    let config = SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         jitter_fraction: 0.1,

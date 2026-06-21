@@ -20,8 +20,8 @@
 
 use std::time::Duration;
 
-use hyperscale_network_memory::{NetworkConfig, NodeIndex};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_network_memory::NodeIndex;
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconChainConfig, Epoch, WeightedTimestamp};
 use tracing_test::traced_test;
 
@@ -36,8 +36,8 @@ const LAGGER: NodeIndex = 3;
 /// past any fixed few-epoch retention window.
 const OUTAGE_EPOCHS: u64 = 6;
 
-fn retention_config() -> NetworkConfig {
-    NetworkConfig {
+fn retention_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: VALIDATORS,
         jitter_fraction: 0.1,

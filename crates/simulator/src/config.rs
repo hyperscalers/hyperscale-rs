@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
+use hyperscale_simulation::SimConfig;
 use hyperscale_spammer::SelectionMode;
 use radix_common::math::Decimal;
 
@@ -82,10 +82,10 @@ impl SimulatorConfig {
         self.num_shards as usize * self.accounts_per_shard
     }
 
-    /// Convert to a `NetworkConfig` for the underlying simulation.
+    /// Convert to a `SimConfig` for the underlying simulation.
     #[must_use]
-    pub fn to_network_config(&self) -> NetworkConfig {
-        NetworkConfig {
+    pub fn to_sim_config(&self) -> SimConfig {
+        SimConfig {
             num_shards: self.num_shards,
             validators_per_shard: self.validators_per_shard,
             ..Default::default()

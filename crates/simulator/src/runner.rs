@@ -71,7 +71,7 @@ impl Simulator {
     /// Returns [`SimulatorError::AccountPool`] if the requested account pool
     /// can't be allocated (e.g. zero-shard or zero-account configuration).
     pub fn new(config: SimulatorConfig) -> Result<Self, SimulatorError> {
-        let network_config = config.to_network_config();
+        let network_config = config.to_sim_config();
         let runner = SimulationRunner::new(&network_config, config.seed);
 
         let accounts =

@@ -27,9 +27,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
@@ -90,8 +89,8 @@ const RESOLVE_BUDGET_EPOCHS: u64 = 12;
 /// of pooled extras, so `grow_to(4)` drives the two split generations
 /// (ROOT → `leaf(1,*)` → `leaf(2,*)`) through the real lifecycle. The merge
 /// arrives once the vote raises `split_bytes`.
-fn merge_config() -> NetworkConfig {
-    NetworkConfig {
+fn merge_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,

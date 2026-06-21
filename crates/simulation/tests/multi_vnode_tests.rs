@@ -8,8 +8,7 @@
 
 use std::time::Duration;
 
-use hyperscale_network_memory::{HostingMode, NetworkConfig};
-use hyperscale_simulation::SimulationRunner;
+use hyperscale_simulation::{HostingMode, SimConfig, SimulationRunner};
 use hyperscale_types::{BlockHeight, ValidatorId};
 use tracing_test::traced_test;
 
@@ -19,7 +18,7 @@ use tracing_test::traced_test;
 #[traced_test]
 #[test]
 fn test_v2_same_shard_hosting_makes_progress() {
-    let config = NetworkConfig {
+    let config = SimConfig {
         num_shards: 1,
         validators_per_shard: 4,
         vnodes_per_host: 2,

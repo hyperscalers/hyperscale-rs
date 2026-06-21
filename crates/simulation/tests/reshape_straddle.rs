@@ -23,9 +23,8 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
 use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::state_key::node_routing_hash;
@@ -56,8 +55,8 @@ const CONTROL_BUDGET_EPOCHS: u64 = 8;
 /// epoch length, sets where the settle/straddle boundary falls.
 const PROBE_OFFSETS_MS: [u64; 5] = [3600, 1800, 1350, 900, 450];
 
-fn straddle_config() -> NetworkConfig {
-    NetworkConfig {
+fn straddle_config() -> SimConfig {
+    SimConfig {
         num_shards: 1,
         validators_per_shard: PER_SHARD,
         jitter_fraction: 0.1,
