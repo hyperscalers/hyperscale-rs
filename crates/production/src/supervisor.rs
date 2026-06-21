@@ -554,11 +554,17 @@ impl ShardSupervisor {
             shutdown_tx,
             validators,
         });
+        // The thread is now draining the host's beacon channel; let the
+        // host-level gossip handler route committed blocks to it.
+        self.process.set_beacon_route_active(true);
     }
 
     /// Stop the pool thread if one runs, joining it.
     fn teardown_pool(&mut self) {
         if let Some(pt) = self.pool.take() {
+            // Stop routing before the drain ends so the channel can't back
+            // up between the shutdown signal and the thread's exit.
+            self.process.set_beacon_route_active(false);
             let _ = pt.shutdown_tx.send(());
             if pt.join.join().is_err() {
                 warn!("Pool thread panicked before teardown");

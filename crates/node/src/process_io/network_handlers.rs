@@ -172,24 +172,25 @@ where
         // ── beacon.block → pool follower (additive, shard-less hosts) ──
         //
         // The per-hosted-shard Global fan above never reaches a host with
-        // no hosted shards. When this host runs a follower pool, register
-        // an additive host-level handler that routes the committed block to
-        // the pool's beacon channel. Shard hosts run no pool and register
-        // nothing here, so their delivery is untouched.
-        if self.pool.is_some() {
-            let beacon_sender = self.process.beacon_event_sender.clone();
-            self.process
-                .network
-                .register_host_gossip_handler::<BeaconBlockGossip>(
-                    move |gossip: BeaconBlockGossip| {
-                        let _ = beacon_sender.send(HostEvent::beacon(
-                            ProtocolEvent::BeaconBlockReceived {
-                                block: gossip.block,
-                            },
-                        ));
-                    },
-                );
-        }
+        // no hosted shards. Register an additive host-level handler on
+        // every host that routes the committed block to the pool's beacon
+        // channel — but only while a pool is actually draining that channel
+        // (`beacon_route_active`). Registering unconditionally lets a pool
+        // built at runtime (a validator draining off its last shard) be
+        // fed, while the gate keeps a host with no live pool from either
+        // dropping the registration or backing the channel up unbounded.
+        let beacon_sender = self.process.beacon_event_sender.clone();
+        let route_active = self.process.beacon_route_active();
+        self.process
+            .network
+            .register_host_gossip_handler::<BeaconBlockGossip>(move |gossip: BeaconBlockGossip| {
+                if !route_active.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let _ = beacon_sender.send(HostEvent::beacon(ProtocolEvent::BeaconBlockReceived {
+                    block: gossip.block,
+                }));
+            });
 
         // ── beacon.skip_request → ProtocolEvent::UnverifiedSkipRequestReceived ──
         let senders = self.process.shard_event_senders.clone();

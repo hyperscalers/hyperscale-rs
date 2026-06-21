@@ -238,6 +238,11 @@ where
                 pool_inits.into_iter().map(VnodeInit::into_vnode).collect(),
             )
         });
+        // Route committed beacon blocks to the pool only while one exists to
+        // fold them; the sim drives the pool through this channel directly,
+        // and the production runner re-asserts the flag when it (re)spawns
+        // the pool thread after `into_parts`.
+        process.set_beacon_route_active(pool.is_some());
 
         Self {
             shards,
@@ -350,6 +355,9 @@ where
         if let Some(pool) = &mut self.pool {
             pool.vnodes.retain(|v| v.validator_id != validator);
         }
+        // An emptied pool no longer needs the beacon channel; stop routing so
+        // the host doesn't fold blocks into a pool with no followers.
+        self.process.set_beacon_route_active(self.has_active_pool());
     }
 
     /// Add a shard-less beacon follower to the host's pool, creating the
@@ -362,6 +370,14 @@ where
             Some(pool) => pool.vnodes.push(vnode),
             None => self.pool = Some(PoolLoop::new(Arc::clone(&self.process), vec![vnode])),
         }
+        // The host now drives a pool; route committed beacon blocks to it.
+        self.process.set_beacon_route_active(true);
+    }
+
+    /// Whether the host holds a pool with at least one follower — the
+    /// condition under which committed beacon blocks should route to it.
+    fn has_active_pool(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| !p.is_empty())
     }
 
     /// Whether this host runs a vnode for `validator` on any hosted shard.

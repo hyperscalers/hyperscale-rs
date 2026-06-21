@@ -15,6 +15,7 @@ mod network_handlers;
 mod tx_status;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -122,9 +123,20 @@ where
     /// shard-less follower pool. In the sim this is the host's single event
     /// channel (shared with the per-shard senders); the beacon-block gossip
     /// follower pushes [`HostEvent::Beacon`] here for the pool to fold.
-    /// Carries no traffic on a host with no follower pool (none is
-    /// registered).
+    /// The host-level beacon handler is registered on every host but only
+    /// pushes when [`Self::beacon_route_active`] is set, so the channel
+    /// carries no traffic until a pool is draining it.
     pub(crate) beacon_event_sender: Sender<HostEvent>,
+
+    /// Whether a follower pool is currently draining
+    /// [`Self::beacon_event_sender`]. The host-level beacon gossip handler
+    /// is registered unconditionally (so a pool built at runtime is fed),
+    /// but routes a block only while this is set — toggled true when a pool
+    /// is built and false when it is torn down. Without the gate, a host
+    /// with no live pool would either silently swallow blocks (handler
+    /// missing) or back the channel up unbounded (handler pushing into a
+    /// drained-by-no-one channel).
+    beacon_route_active: Arc<AtomicBool>,
 
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs. The pinned thread is the sole writer
@@ -207,6 +219,7 @@ where
             dispatch,
             shard_event_senders: Arc::new(ArcSwap::from_pointee(shard_event_senders)),
             beacon_event_sender,
+            beacon_route_active: Arc::new(AtomicBool::new(false)),
             topology_snapshot,
             dispatch_handles,
             tx_validator,
@@ -216,6 +229,23 @@ where
             canonical_txs: Arc::new(CanonicalTxs::new()),
             beacon_signers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Mark whether a follower pool is draining the beacon channel. Set
+    /// true when a pool is built (host construction with followers,
+    /// `add_pooled_vnode`, or the production supervisor's pool thread) and
+    /// false when it is torn down. The host-level beacon gossip handler
+    /// reads this before routing a committed block, so a pool built after
+    /// startup is fed and a host with no live pool drops blocks rather than
+    /// backing the channel up.
+    pub fn set_beacon_route_active(&self, active: bool) {
+        self.beacon_route_active.store(active, Ordering::Release);
+    }
+
+    /// A clone of the route-active flag for the host-level beacon handler
+    /// closure to read per block, without capturing the whole `ProcessIo`.
+    pub(crate) fn beacon_route_active(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.beacon_route_active)
     }
 
     /// Seat `validator`'s beacon signing on `shard`'s vnode. First

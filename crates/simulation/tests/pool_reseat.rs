@@ -73,6 +73,22 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
         "the drained shards are gone from the host"
     );
 
+    // ── The drained follower keeps folding the beacon while pooled ──
+    // The host started with a shard, so the only thing that can advance its
+    // beacon storage now is the pool follower folding gossiped blocks — no
+    // shard loop is left on the host. A rising committed tip proves the
+    // runtime-built pool is actually fed (the routing gap this guards against
+    // left such a follower dark, never raising its own re-seat trigger).
+    let before = committed_beacon_epoch(&runner, node);
+    runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
+    let after = committed_beacon_epoch(&runner, node);
+    assert!(
+        after > before,
+        "the drained pool follower must keep folding committed beacon blocks \
+         ({before} -> {after})"
+    );
+    let _ = runner.take_reconfigurations();
+
     let kind = runner.join_shard(
         node,
         validator,

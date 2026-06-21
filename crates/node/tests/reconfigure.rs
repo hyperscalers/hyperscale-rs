@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::unbounded;
+use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -336,6 +336,92 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
         out.reconfigurations.is_empty(),
         "re-delivering the tip raises no participation change"
     );
+}
+
+/// A host that starts with a shard runs no pool, so a Global beacon block
+/// fans to the seated shard's channel but routes no pool envelope. When a
+/// validator later drains onto a pool via `add_pooled_vnode`, the same block
+/// reaches the pool's beacon channel — the host-level handler is registered
+/// unconditionally and gated on the live-pool flag, so a pool built after
+/// startup is fed. Regression for the routing gap where the handler was only
+/// registered when a pool existed at construction time.
+#[test]
+fn runtime_built_pool_is_fed_beacon_blocks() {
+    let fix = fixture();
+    let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD_A).collect()));
+    let network = SimNetworkAdapter::new(Arc::clone(&registry));
+    let (event_tx, event_rx) = unbounded::<HostEvent>();
+    let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
+    beacon_storage.commit_beacon_block(&fix.genesis_block, &Arc::new(fix.genesis_state.clone()));
+
+    let mut host = NodeHost::new(
+        vec![fix.vnode_init(0, SHARD_A)],
+        std::iter::once((SHARD_A, SimShardStorage::new(shard_prefix_path(SHARD_A)))).collect(),
+        Arc::clone(&beacon_storage),
+        NetworkDefinition::simulator(),
+        RadixExecutor::new(NetworkDefinition::simulator()),
+        network,
+        SyncDispatch,
+        std::iter::once((SHARD_A, event_tx.clone())).collect(),
+        event_tx,
+        Arc::new(ArcSwap::from(Arc::clone(&fix.topology))),
+        NodeConfig::default(),
+        Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
+    );
+    host.register_inbound_handlers();
+    while event_rx.try_recv().is_ok() {}
+
+    let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
+
+    // No pool yet: the seated shard receives the block, but the inactive
+    // route emits no beacon envelope.
+    let _ = registry.local_dispatch_gossip(&gossip, None);
+    let (saw_shard, mut saw_beacon) = drain_routing(&event_rx);
+    assert!(saw_shard, "the seated shard receives the beacon block");
+    assert!(
+        !saw_beacon,
+        "with no live pool the host routes no beacon envelope"
+    );
+
+    // A validator drains onto the pool at runtime (mirrors the supervisor's
+    // `follow_in_pool` / the sim's `leave_shard`).
+    host.add_pooled_vnode(fix.pooled_vnode_init(1));
+    assert_eq!(
+        host.pooled_len(),
+        1,
+        "the drained validator follows in the pool"
+    );
+
+    // The same block now reaches the pool's beacon channel.
+    let _ = registry.local_dispatch_gossip(&gossip, None);
+    (_, saw_beacon) = drain_routing(&event_rx);
+    assert!(
+        saw_beacon,
+        "the runtime-built pool follower is fed a beacon block"
+    );
+
+    // Dropping the follower retires the route again.
+    host.drop_pooled_vnode(fix.committee.validator_id(1));
+    let _ = registry.local_dispatch_gossip(&gossip, None);
+    (_, saw_beacon) = drain_routing(&event_rx);
+    assert!(
+        !saw_beacon,
+        "an emptied pool stops routing beacon envelopes"
+    );
+}
+
+/// Drain the host's event channel, reporting whether a shard-A envelope and a
+/// beacon envelope were seen.
+fn drain_routing(event_rx: &Receiver<HostEvent>) -> (bool, bool) {
+    let (mut saw_shard, mut saw_beacon) = (false, false);
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            HostEvent::Shard(s, _) if s == SHARD_A => saw_shard = true,
+            HostEvent::Beacon(_) => saw_beacon = true,
+            _ => {}
+        }
+    }
+    (saw_shard, saw_beacon)
 }
 
 /// `remove_shard` on a shard the host never carried is a no-op.
