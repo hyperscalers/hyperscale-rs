@@ -20,9 +20,8 @@ use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{CertifiedBeaconBlock, Epoch, Verifiable};
 
-use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::beacon_block::{BeaconBlockSyncInput, BeaconBlockSyncOutput};
-use crate::shard_loop::step::block_sync::classify_fetch_error;
+use crate::shard_io::sync::{SyncOutput, classify_fetch_error};
 use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>

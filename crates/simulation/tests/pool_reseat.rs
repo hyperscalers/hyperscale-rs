@@ -110,6 +110,64 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     );
 }
 
+/// A follower partitioned past the gossip horizon catches up via beacon sync.
+///
+/// While partitioned the follower's tip freezes and the network advances
+/// several epochs. Those gap epochs are no longer gossiped once the partition
+/// heals — only the live tip is — so any advance past the frozen tip proves
+/// the follower fetched the gap via `GetBeaconBlockRequest`, since the
+/// coordinator commits serially and cannot skip the missing epochs.
+#[traced_test]
+#[test]
+fn partitioned_follower_catches_up_via_beacon_sync() {
+    let mut runner = SimulationRunner::new(&rotation_config(), SEED);
+    runner.initialize_genesis();
+    runner.grow_to(2);
+    let _ = runner.take_reconfigurations();
+
+    let pool_host = (0..runner.num_hosts())
+        .find(|&n| runner.pooled_len(n) > 0)
+        .expect("the grow's surplus pool extra follows the beacon on its host");
+    let others: Vec<NodeIndex> = (0..runner.num_hosts())
+        .filter(|&n| n != pool_host)
+        .collect();
+
+    // Let the follower get current before isolating it.
+    runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 2));
+    let frozen_tip = committed_beacon_epoch(&runner, pool_host);
+
+    // Isolate the follower: no beacon gossip in or out.
+    runner.network_mut().partition_groups(&[pool_host], &others);
+    runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
+    assert_eq!(
+        committed_beacon_epoch(&runner, pool_host),
+        frozen_tip,
+        "the isolated follower receives no gossip, so its tip is frozen"
+    );
+    let network_tip = committed_beacon_epoch(&runner, others[0]);
+    assert!(
+        network_tip > frozen_tip + 1,
+        "the network must advance past the follower by more than one epoch \
+         ({frozen_tip} -> {network_tip})"
+    );
+
+    // Heal: the live gossip tip is now several epochs ahead of the follower,
+    // so its coordinator opens a catch-up sync to fill the gap.
+    runner.network_mut().heal_all();
+    runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
+    let caught_up = committed_beacon_epoch(&runner, pool_host);
+    assert!(
+        caught_up > frozen_tip,
+        "the follower must fetch the gap epochs over beacon sync — gossip no \
+         longer carries them ({frozen_tip} -> {caught_up})"
+    );
+    assert!(
+        caught_up >= network_tip,
+        "the follower catches up to where the network was during the outage \
+         ({caught_up} >= {network_tip})"
+    );
+}
+
 /// The host's committed beacon-chain tip epoch.
 fn committed_beacon_epoch(runner: &SimulationRunner, node: NodeIndex) -> u64 {
     runner

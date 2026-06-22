@@ -41,7 +41,7 @@ use hyperscale_network_libp2p::{
 };
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::PoolLoop;
-use hyperscale_node::shard_loop::{HostEvent, ShardLoop, TimerOp, timer_event};
+use hyperscale_node::shard_loop::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot, TxStatusCache,
     VnodeInit, seat_follower, seat_vnode_group,
@@ -1750,23 +1750,36 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
             break;
         }
         pool.set_time(consensus_clock(genesis_offset_ms));
+        // Wake on a beacon block, or — while a catch-up sync is in flight —
+        // on the retry tick so a deferred fetch eventually rotates to another
+        // peer. An idle follower just blocks on the next gossiped block.
         let event = crossbeam::channel::select! {
             recv(shutdown_rx) -> _ => {
                 info!("Pool event loop received shutdown signal (select)");
                 return;
             }
             recv(beacon_rx) -> e => e.ok(),
+            default(POOL_FETCH_TICK_INTERVAL) => None,
         };
-        let Some(HostEvent::Beacon(input)) = event else {
-            continue;
+        let changes = match event {
+            Some(HostEvent::Beacon(input)) => pool.run_step(input),
+            // A timeout with a sync in flight retries deferred fetches; an
+            // idle timeout, or a stray non-beacon envelope, is a no-op.
+            None if pool.is_beacon_syncing() => pool.run_step(PoolScopedInput::FetchTick),
+            _ => continue,
         };
-        for change in pool.run_step(input) {
+        for change in changes {
             // Send failure means the runner is shutting down.
             let _ = participation_tx.send(change);
         }
     }
     info!("Pool event loop exiting");
 }
+
+/// Cadence at which a syncing pool retries deferred beacon-block fetches.
+/// Matches the shard loop's fetch-tick granularity; an idle pool never fires
+/// it (the select simply re-checks shutdown each interval).
+const POOL_FETCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spawn the host's pool thread, mirroring [`spawn_shard_loop`].
 pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::thread::JoinHandle<()> {

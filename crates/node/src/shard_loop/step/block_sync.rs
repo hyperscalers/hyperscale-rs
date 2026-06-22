@@ -19,24 +19,6 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network::RequestError;
-
-use crate::shard_loop::{FetchFailureKind, ShardScopedInput};
-
-/// Classify a transport-level request error for the sync FSM. `Exhausted`
-/// already absorbed retries against rotated peers — re-queue immediately;
-/// other variants reflect transport conditions where a brief deferral is
-/// appropriate.
-pub(in crate::shard_loop) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
-    match err {
-        RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
-        RequestError::NoPeers => FetchFailureKind::NoPeers,
-        RequestError::Timeout
-        | RequestError::PeerUnreachable(_)
-        | RequestError::PeerError(_)
-        | RequestError::Shutdown => FetchFailureKind::Transport,
-    }
-}
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{
     record_sync_block_filtered, record_sync_response_error, record_sync_round_completed,
@@ -51,9 +33,9 @@ use hyperscale_types::{
     Verified,
 };
 
-use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::block::{BlockSyncInput, BlockSyncOutput};
-use crate::shard_loop::{ShardLoop, push_shard_input};
+use crate::shard_io::sync::{SyncOutput, classify_fetch_error};
+use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

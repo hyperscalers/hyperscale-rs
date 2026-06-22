@@ -490,13 +490,36 @@ impl ProcessScopedInput {
 /// A follower folds the beacon and tracks topology but runs no shard
 /// consensus, so its input set is small: gossiped beacon blocks — and the
 /// self-driven verify/adopt continuations they spawn — arrive as
-/// [`Self::Protocol`].
-#[derive(Debug, Clone)]
+/// [`Self::Protocol`], and the catch-up sync the pool drives when a follower
+/// falls behind delivers its fetch results through the remaining variants.
+#[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum PoolScopedInput {
     /// Pass-through to every pooled vnode's state machine. Boxed because
     /// `ProtocolEvent` dwarfs every other variant and would inflate the
     /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
+
+    /// A beacon-block sync response landed for the pool's catch-up fetch.
+    /// `block` is `None` when the peer couldn't serve the epoch. The pool
+    /// delivers the block to every follower and advances its sync FSM.
+    BeaconBlockSyncResponseReceived {
+        /// Epoch of the block being synced.
+        epoch: Epoch,
+        /// The fetched block, or `None` if the peer didn't have it.
+        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+    },
+
+    /// A beacon-block sync fetch failed at the transport layer.
+    BeaconBlockSyncFetchFailed {
+        /// Epoch that failed to fetch.
+        epoch: Epoch,
+        /// Why the fetch failed — drives the sync FSM's re-queue vs. deferral.
+        kind: FetchFailureKind,
+    },
+
+    /// Periodic tick driving the catch-up sync FSM's deferred-fetch retries.
+    /// The pool driver fires it while a sync is in flight.
+    FetchTick,
 }
 
 impl PoolScopedInput {
@@ -510,15 +533,20 @@ impl PoolScopedInput {
                 ProtocolEvent::BeaconBlockReceived { .. } => EventPriority::Network,
                 _ => EventPriority::Internal,
             },
+            // Sync-fetch callbacks are processed consequences, not raw inputs.
+            Self::BeaconBlockSyncResponseReceived { .. }
+            | Self::BeaconBlockSyncFetchFailed { .. } => EventPriority::Internal,
+            Self::FetchTick => EventPriority::Timer,
         }
     }
 
     /// Telemetry label. `Protocol` delegates to the inner
-    /// [`ProtocolEvent::type_name`].
+    /// [`ProtocolEvent::type_name`]; the rest use their variant names.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Protocol(event) => event.type_name(),
+            other => other.into(),
         }
     }
 }
@@ -567,6 +595,19 @@ impl HostEvent {
     #[must_use]
     pub fn beacon(event: ProtocolEvent) -> Self {
         Self::Beacon(PoolScopedInput::Protocol(Box::new(event)))
+    }
+
+    /// Construct the pool's catch-up sync retry tick.
+    #[must_use]
+    pub const fn beacon_fetch_tick() -> Self {
+        Self::Beacon(PoolScopedInput::FetchTick)
+    }
+
+    /// Whether this is the pool's catch-up sync retry tick. The simulation
+    /// harness uses it to re-arm the next tick while a pool sync is in flight.
+    #[must_use]
+    pub const fn is_pool_fetch_tick(&self) -> bool {
+        matches!(self, Self::Beacon(PoolScopedInput::FetchTick))
     }
 
     /// Priority for ordering events at the same simulation timestamp.

@@ -22,13 +22,22 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_network::Network;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::{CertifiedBeaconBlockVerifyContext, LocalTimestamp};
+use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
+use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
+use hyperscale_types::{
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, Epoch, LocalTimestamp, ShardId,
+    Verifiable,
+};
 use tracing::warn;
 
-use crate::event::PoolScopedInput;
+use crate::event::{FetchFailureKind, HostEvent, PoolScopedInput};
 use crate::process_io::ProcessIo;
+use crate::shard_io::sync::beacon_block::{
+    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, beacon_block_sync_config,
+};
+use crate::shard_io::sync::{SyncOutput, classify_fetch_error};
 use crate::vnode::Vnode;
 
 /// Active driver for a host's shard-less, beacon-following vnodes.
@@ -55,6 +64,13 @@ where
 
     /// Per-step scratch: count of actions the pooled vnodes produced.
     pub(crate) actions_generated: usize,
+
+    /// Beacon-block catch-up sync, scope `()`. A follower's coordinator
+    /// emits `Action::StartBeaconBlockSync` when a gossiped block sits more
+    /// than one epoch ahead of its tip; this FSM drives the
+    /// `GetBeaconBlockRequest` fetches that close the gap, fed back through
+    /// the host's beacon channel.
+    beacon_block: BeaconBlockSync,
 }
 
 impl<S, N, D> PoolLoop<S, N, D>
@@ -66,13 +82,14 @@ where
     /// Build a pool driver over the host's shard-less vnodes. Used by
     /// `NodeHost::new` at construction and by the production supervisor when
     /// it builds a follower pool at runtime.
-    pub const fn new(process: Arc<ProcessIo<S, N, D>>, vnodes: Vec<Vnode>) -> Self {
+    pub fn new(process: Arc<ProcessIo<S, N, D>>, vnodes: Vec<Vnode>) -> Self {
         Self {
             process,
             vnodes,
             now: LocalTimestamp::ZERO,
             pending_reconfigurations: Vec::new(),
             actions_generated: 0,
+            beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
         }
     }
 
@@ -112,10 +129,18 @@ where
         std::mem::take(&mut self.pending_reconfigurations)
     }
 
-    /// Route a [`PoolScopedInput`] to the pooled vnodes.
+    /// Route a [`PoolScopedInput`] to the pooled vnodes or the catch-up
+    /// sync FSM.
     pub(crate) fn dispatch_event(&mut self, input: PoolScopedInput) {
         match input {
             PoolScopedInput::Protocol(event) => self.dispatch_protocol(*event),
+            PoolScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
+                self.handle_beacon_sync_response(epoch, block);
+            }
+            PoolScopedInput::BeaconBlockSyncFetchFailed { epoch, kind } => {
+                self.feed_beacon_sync_failed(epoch, kind);
+            }
+            PoolScopedInput::FetchTick => self.beacon_sync_tick(),
         }
     }
 
@@ -183,12 +208,21 @@ where
                 queue.push_back(ProtocolEvent::BeaconBlockVerified { result });
             }
             Action::CommitBeaconBlock { block, state } => {
+                let epoch = block.epoch();
                 // Process-scoped dedup: the first vnode to reach this
                 // `(epoch, hash)` writes to the host's beacon storage. A pooled
                 // vnode no-ops `BeaconBlockPersisted`, so it isn't fed back.
                 self.process
                     .beacon_commit
                     .commit(&self.process.beacon_storage, &block, &state);
+                // Advance the sync FSM's committed watermark on every commit
+                // (gossip or sync) so a serial catch-up unblocks the next
+                // epoch's fetch and a later sync starts from current+1.
+                let outputs = self.beacon_block.handle(BeaconBlockSyncInput::Admitted {
+                    scope: (),
+                    height: epoch,
+                });
+                self.process_beacon_sync_outputs(outputs);
             }
             Action::TopologyChanged {
                 topology_snapshot,
@@ -206,10 +240,10 @@ where
             Action::SetTimer { .. }
             | Action::CancelTimer { .. }
             | Action::BroadcastBeaconBlock { .. } => {}
-            // Catch-up sync is a backstop for dropped gossip; deferred until a
-            // pooled host's standalone beacon-sync driver lands.
-            Action::StartBeaconBlockSync { .. } => {
-                warn!("PoolLoop: StartBeaconBlockSync not yet driven (gossip-only follower)");
+            // Catch-up sync: a follower fell behind a gossiped block, so drive
+            // the FSM to fetch the missing epochs from a live committee.
+            Action::StartBeaconBlockSync { target } => {
+                self.start_beacon_block_sync(target);
             }
             other => {
                 warn!(
@@ -218,5 +252,139 @@ where
                 );
             }
         }
+    }
+
+    /// Drive the catch-up sync FSM's periodic tick, re-dispatching any
+    /// deferred fetch whose backoff has expired.
+    fn beacon_sync_tick(&mut self) {
+        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::Tick {
+            now: std::time::Instant::now(),
+        });
+        self.process_beacon_sync_outputs(outputs);
+    }
+
+    /// Whether a catch-up sync is in flight — actively fetching or holding
+    /// epochs deferred behind a backoff. The driver ticks the pool while true
+    /// and lets it idle otherwise.
+    #[must_use]
+    pub fn is_beacon_syncing(&self) -> bool {
+        self.beacon_block.is_syncing() || self.beacon_block.has_deferred()
+    }
+
+    /// Begin (or extend) a beacon-block catch-up sync toward `target`. Seeds
+    /// the FSM's committed watermark from the host's beacon tip so a serial
+    /// sync starts from `tip + 1` rather than `genesis + 1`, then dispatches
+    /// whatever fetch the FSM emits.
+    fn start_beacon_block_sync(&mut self, target: Epoch) {
+        if let Some(tip) = self.process.beacon_storage.latest_committed_epoch() {
+            let _ = self.beacon_block.handle(BeaconBlockSyncInput::Admitted {
+                scope: (),
+                height: tip,
+            });
+        }
+        let outputs = self
+            .beacon_block
+            .handle(BeaconBlockSyncInput::StartSync { scope: (), target });
+        self.process_beacon_sync_outputs(outputs);
+    }
+
+    /// A beacon-block sync response landed. `None` (peer didn't have the
+    /// epoch) re-queues via fetch-failed. Otherwise deliver the block to every
+    /// follower — each runs the verify/adopt/commit cascade — and tell the FSM
+    /// the epoch's bytes arrived.
+    fn handle_beacon_sync_response(
+        &mut self,
+        epoch: Epoch,
+        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+    ) {
+        let Some(block) = block else {
+            self.feed_beacon_sync_failed(epoch, FetchFailureKind::NotFound);
+            return;
+        };
+        self.dispatch_protocol(ProtocolEvent::BeaconBlockSyncReadyToApply { block });
+        let outputs = self
+            .beacon_block
+            .handle(BeaconBlockSyncInput::FetchSucceeded {
+                scope: (),
+                from: epoch,
+                count: 1,
+                delivered_heights: vec![epoch],
+                now: std::time::Instant::now(),
+            });
+        self.process_beacon_sync_outputs(outputs);
+    }
+
+    /// Re-queue an epoch via `FetchFailed`, applying the FSM's deferral.
+    fn feed_beacon_sync_failed(&mut self, epoch: Epoch, kind: FetchFailureKind) {
+        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::FetchFailed {
+            scope: (),
+            from: epoch,
+            count: 1,
+            kind,
+            now: std::time::Instant::now(),
+        });
+        self.process_beacon_sync_outputs(outputs);
+    }
+
+    /// Turn the FSM's scheduling outputs into network fetches.
+    fn process_beacon_sync_outputs(&self, outputs: Vec<BeaconBlockSyncOutput>) {
+        for output in outputs {
+            match output {
+                SyncOutput::Fetch { from, .. } => self.dispatch_beacon_fetch(from),
+                SyncOutput::Complete { height, .. } => {
+                    tracing::debug!(epoch = height.inner(), "Pool beacon block sync complete");
+                }
+            }
+        }
+    }
+
+    /// Dispatch a single-epoch beacon block fetch against a live committee.
+    /// The callback routes the response — or failure — back through the host's
+    /// beacon channel as a [`PoolScopedInput`].
+    fn dispatch_beacon_fetch(&self, epoch: Epoch) {
+        let Some(shard) = self.fetch_shard() else {
+            warn!("PoolLoop: no live shard to fetch beacon blocks from; deferring");
+            return;
+        };
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        self.process.network.request(
+            shard,
+            None,
+            GetBeaconBlockRequest::new(epoch),
+            None,
+            Box::new(
+                move |result: Result<GetBeaconBlockResponse, RequestError>| {
+                    let input = match result {
+                        Ok(resp) => PoolScopedInput::BeaconBlockSyncResponseReceived {
+                            epoch,
+                            block: resp.block,
+                        },
+                        Err(err) => PoolScopedInput::BeaconBlockSyncFetchFailed {
+                            epoch,
+                            kind: classify_fetch_error(&err),
+                        },
+                    };
+                    let _ = beacon_tx.send(HostEvent::Beacon(input));
+                    // "Peer doesn't have this epoch" is ambiguous (it may be
+                    // behind us) — never Reject.
+                    ResponseVerdict::Accept
+                },
+            ),
+        );
+    }
+
+    /// Pick a live shard whose committee can serve the follower's beacon
+    /// fetch. Every shard member holds the beacon chain, so any live leaf
+    /// answers; spreading by the follower's own id keeps a host of followers
+    /// from all hammering one committee.
+    fn fetch_shard(&self) -> Option<ShardId> {
+        let vnode = self.vnodes.first()?;
+        let leaves: Vec<ShardId> = vnode.state.topology().shard_trie().leaves().collect();
+        if leaves.is_empty() {
+            return None;
+        }
+        let idx = usize::try_from(vnode.validator_id.inner() % leaves.len() as u64)
+            .expect("modulo of leaves.len() fits usize");
+        Some(leaves[idx])
     }
 }

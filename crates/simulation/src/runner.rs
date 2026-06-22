@@ -133,6 +133,11 @@ impl SimConfig {
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
+/// Logical cadence at which a syncing follower pool retries deferred
+/// beacon-block fetches. Mirrors the production pool thread's tick interval;
+/// an idle pool schedules none.
+const POOL_FETCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Deterministic simulation runner.
 ///
 /// Processes events in deterministic order using [`NodeHost`] for action handling.
@@ -208,6 +213,12 @@ pub struct SimulationRunner {
     /// Cluster + transport config, retained so reshape paths can read the
     /// host layout the transport no longer carries.
     config: SimConfig,
+
+    /// Per-host flag: whether a beacon-sync retry tick is already queued for
+    /// the host's follower pool. Keeps the harness from scheduling duplicate
+    /// ticks while a catch-up sync runs; production's pool thread self-ticks
+    /// off its `select!` timeout instead.
+    pool_tick_pending: Vec<bool>,
 }
 
 /// Statistics collected during simulation.
@@ -529,6 +540,7 @@ impl SimulationRunner {
                 .unwrap_or_default()
                 .epoch_duration_ms,
             config: network_config.clone(),
+            pool_tick_pending: vec![false; num_hosts],
         }
     }
 
@@ -1015,6 +1027,10 @@ impl SimulationRunner {
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
 
+                // A fired pool tick clears its pending slot so the post-step
+                // refresh can re-arm the next one if the sync is still running.
+                let fired_pool_tick = event.is_pool_fetch_tick();
+
                 self.hosts[node_index as usize].set_time(LocalTimestamp::from_millis(
                     u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),
                 ));
@@ -1023,6 +1039,7 @@ impl SimulationRunner {
 
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
+                self.refresh_pool_tick(node_index, fired_pool_tick);
             }
         }
 
@@ -1106,6 +1123,26 @@ impl SimulationRunner {
         }
         for change in output.reconfigurations {
             self.pending_reconfigurations.push((node, change));
+        }
+    }
+
+    /// Re-arm the follower pool's catch-up retry tick. Called after every host
+    /// step: while the pool is syncing, keep exactly one tick queued so a
+    /// deferred fetch eventually retries; once the pool catches up, stop. The
+    /// production pool thread self-ticks off its `select!` timeout instead.
+    fn refresh_pool_tick(&mut self, node: NodeIndex, fired_tick: bool) {
+        let i = node as usize;
+        if fired_tick {
+            self.pool_tick_pending[i] = false;
+        }
+        if !self.hosts[i].pool_is_syncing() {
+            self.pool_tick_pending[i] = false;
+            return;
+        }
+        if !self.pool_tick_pending[i] {
+            self.pool_tick_pending[i] = true;
+            let fire = self.now + POOL_FETCH_TICK_INTERVAL;
+            self.schedule_event(node, fire, HostEvent::beacon_fetch_tick());
         }
     }
 

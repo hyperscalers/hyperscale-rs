@@ -346,6 +346,14 @@ where
         self.pool.as_ref().map_or(0, PoolLoop::len)
     }
 
+    /// Whether the host's pool is running a beacon-block catch-up sync. The
+    /// simulation harness polls this to keep the pool's retry tick armed;
+    /// production's pool thread reads it directly off its `PoolLoop`.
+    #[must_use]
+    pub fn pool_is_syncing(&self) -> bool {
+        self.pool.as_ref().is_some_and(PoolLoop::is_beacon_syncing)
+    }
+
     /// Remove `validator`'s shard-less follower vnode from the host's pool,
     /// once it has been seated onto a shard (the seat rebuilt its
     /// `BeaconCoordinator` from the host's warm beacon storage). No-op if
