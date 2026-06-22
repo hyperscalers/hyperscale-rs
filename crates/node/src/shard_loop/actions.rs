@@ -20,17 +20,17 @@ use hyperscale_types::{
 use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
-use crate::shard_io::block_commit::{
-    AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
-    make_commit_prepared, run_qc_only_prep,
-};
-use crate::shard_io::fetch::FetchInput;
-use crate::shard_io::fetch::binding::{
+use crate::fetch::FetchInput;
+use crate::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
     ProvisionBinding, ShardWitnessBinding, TransactionBinding,
 };
-use crate::shard_io::sync::beacon_block::BeaconBlockSyncInput;
-use crate::shard_io::sync::block::BlockSyncInput;
+use crate::shard::commit::{
+    AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
+    make_commit_prepared, run_qc_only_prep,
+};
+use crate::sync::beacon_block::BeaconBlockSyncInput;
+use crate::sync::block::BlockSyncInput;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -471,7 +471,7 @@ where
     /// decision: feed the sync protocol with the new committed height and,
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
-    /// [`BlockCommitCoordinator`]: crate::shard_io::block_commit::BlockCommitCoordinator
+    /// [`BlockCommitCoordinator`]: crate::shard::commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, commit: PendingCommit) {
         let now = self.now;
         let decision = self.io.block_commit.accumulate(commit, now);
@@ -523,7 +523,7 @@ where
     /// out under the per-tick cap. The tick timer is refreshed once at
     /// the end of `NodeHost::step`.
     ///
-    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
+    /// [`FetchHost`]: crate::fetch::FetchHost
     #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
@@ -639,7 +639,7 @@ where
     /// `record_fetch_abandoned` so the cancellation is observable
     /// separately from genuine admissions.
     ///
-    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
+    /// [`FetchHost`]: crate::fetch::FetchHost
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
     fn process_fetch_abandon(&mut self, req: FetchAbandon) {
         match req {

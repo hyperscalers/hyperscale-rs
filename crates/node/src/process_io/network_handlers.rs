@@ -31,8 +31,8 @@ use tracing::warn;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process_io::ProcessIo;
-use crate::shard_io::ShardIo;
-use crate::shard_io::verify::{
+use crate::shard::ShardIo;
+use crate::shard::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
 };
@@ -739,18 +739,18 @@ pub fn register_shard_request_handlers<S, N, D>(
         GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
-    use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
-    use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
-    use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
-    use crate::shard_io::fetch::provision_serve::serve_provision_request;
-    use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
-    use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
-    use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
-    use crate::shard_io::fetch::witness_history_serve::serve_witness_history_request;
-    use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
-    use crate::shard_io::sync::block_serve::serve_block_request;
-    use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
-    use crate::shard_io::sync::settled_waves_serve::serve_settled_waves_request;
+    use crate::fetch::exec_cert_serve::serve_execution_certs_request;
+    use crate::fetch::finalized_wave_serve::serve_finalized_waves_request;
+    use crate::fetch::local_provision_serve::serve_local_provisions_request;
+    use crate::fetch::provision_serve::serve_provision_request;
+    use crate::fetch::shard_witness_serve::serve_shard_witnesses_request;
+    use crate::fetch::state_range_serve::serve_state_range_request;
+    use crate::fetch::transaction_serve::serve_transaction_request;
+    use crate::fetch::witness_history_serve::serve_witness_history_request;
+    use crate::sync::beacon_block_serve::serve_beacon_block_request;
+    use crate::sync::block_serve::serve_block_request;
+    use crate::sync::remote_header_serve::serve_remote_headers_request;
+    use crate::sync::settled_waves_serve::serve_settled_waves_request;
 
     type ProvisionResponse = GetProvisionResponse;
     type ProvisionWaiter = Arc<(

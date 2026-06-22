@@ -32,12 +32,12 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
-use crate::event::{FetchFailureKind, HostEvent, PoolScopedInput};
+use crate::event::{FetchFailureKind, HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process_io::ProcessIo;
-use crate::shard_io::sync::beacon_block::{
+use crate::sync::SyncOutput;
+use crate::sync::beacon_block::{
     BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, beacon_block_sync_config,
 };
-use crate::shard_io::sync::{SyncOutput, classify_fetch_error};
 use crate::vnode::Vnode;
 
 /// Active driver for a host's shard-less, beacon-following vnodes.

@@ -45,14 +45,14 @@ pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
 };
-use crate::process_io::{BeaconProposalCache, ProcessIo};
-use crate::shard_io::ShardIo;
-use crate::shard_io::block_commit::PreparedCommitMap;
-use crate::shard_io::fetch::FetchInput;
-use crate::shard_io::fetch::binding::{
+use crate::fetch::FetchInput;
+use crate::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
     ProvisionBinding, ShardWitnessBinding, TransactionBinding,
 };
+use crate::process_io::{BeaconProposalCache, ProcessIo};
+use crate::shard::ShardIo;
+use crate::shard::commit::PreparedCommitMap;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.

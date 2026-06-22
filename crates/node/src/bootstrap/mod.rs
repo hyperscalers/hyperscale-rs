@@ -333,8 +333,8 @@ mod tests {
     use hyperscale_types::ShardWitnessPayload;
 
     use super::*;
-    use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
-    use crate::shard_io::fetch::witness_history_serve::serve_witness_history_request;
+    use crate::fetch::state_range_serve::serve_state_range_request;
+    use crate::fetch::witness_history_serve::serve_witness_history_request;
 
     const ENTRIES: u8 = 12;
 

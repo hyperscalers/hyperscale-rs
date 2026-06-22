@@ -26,20 +26,20 @@ use hyperscale_types::{
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
+use crate::fetch::FetchHost;
 use crate::pool_loop::PoolLoop;
 use crate::process_io::{BeaconProposalCache, ProcessIo, register_shard_request_handlers};
-use crate::shard_io::ShardIo;
-use crate::shard_io::block_commit::{BlockCommitCoordinator, BoundaryMemo};
-use crate::shard_io::caches::SharedCaches;
-use crate::shard_io::fetch::FetchHost;
-use crate::shard_io::phase_times::TxPhaseTimesCache;
-use crate::shard_io::settled_set::SettledWavesAcquisitionHost;
-use crate::shard_io::sync::SyncHost;
-use crate::shard_io::sync::block::BlockSyncInput;
+use crate::shard::ShardIo;
+use crate::shard::caches::SharedCaches;
+use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
+use crate::shard::phase_times::TxPhaseTimesCache;
+use crate::shard::settled_set::SettledWavesAcquisitionHost;
 use crate::shard_loop::{
     DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardLoop,
     SharedTopologySnapshot, StepOutput,
 };
+use crate::sync::SyncHost;
+use crate::sync::block::BlockSyncInput;
 use crate::vnode::{Vnode, VnodeInit};
 
 /// Output of [`NodeHost::into_parts`].

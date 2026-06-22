@@ -7,14 +7,6 @@
 //! multi-vnode hosting captures the natural sharing structure without
 //! leaking state across `NodeHost`s.
 
-pub mod block_commit;
-pub mod caches;
-pub mod fetch;
-pub mod phase_times;
-pub mod settled_set;
-pub mod sync;
-pub mod verify;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -25,12 +17,12 @@ use hyperscale_types::{
 };
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::shard_io::block_commit::BlockCommitCoordinator;
-pub use crate::shard_io::caches::SharedCaches;
-use crate::shard_io::fetch::FetchHost;
-use crate::shard_io::phase_times::TxPhaseTimesCache;
-use crate::shard_io::settled_set::SettledWavesAcquisitionHost;
-use crate::shard_io::sync::SyncHost;
+use crate::fetch::FetchHost;
+use crate::shard::caches::SharedCaches;
+use crate::shard::commit::BlockCommitCoordinator;
+use crate::shard::phase_times::TxPhaseTimesCache;
+use crate::shard::settled_set::SettledWavesAcquisitionHost;
+use crate::sync::SyncHost;
 
 /// A certified header pending sender-signature verification, queued in
 /// `ShardIo::certified_header_batch` and drained on the crypto pool.

@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{CommitSource, ProtocolEvent};
+use hyperscale_network::RequestError;
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
     BoundedVec, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ElidedCertifiedBlock,
@@ -26,7 +27,7 @@ use hyperscale_types::{
     RoutableTransaction, ShardId, TxHash, ValidatorId, Verifiable, Verified, WaveId,
 };
 
-use crate::shard_io::block_commit::QcOnlyDivergence;
+use crate::shard::commit::QcOnlyDivergence;
 
 /// Priority levels for event ordering within the same timestamp.
 ///
@@ -79,6 +80,23 @@ pub enum FetchFailureKind {
     /// yet. Distinct from `Exhausted`, which re-queues immediately for a
     /// height that's known to exist.
     NotFound,
+}
+
+/// Classify a transport-level request error for the sync/fetch FSMs.
+///
+/// `Exhausted` already absorbed retries against rotated peers — re-queue
+/// immediately; other variants reflect transport conditions where a brief
+/// deferral is appropriate.
+#[must_use]
+pub const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
+    match err {
+        RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
+        RequestError::NoPeers => FetchFailureKind::NoPeers,
+        RequestError::Timeout
+        | RequestError::PeerUnreachable(_)
+        | RequestError::PeerError(_)
+        | RequestError::Shutdown => FetchFailureKind::Transport,
+    }
 }
 
 /// Inputs whose dispatch is anchored to a specific hosted shard.

@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::shard_io::fetch::FetchConfig;
-use crate::shard_io::sync::block::BlockSyncConfig;
+use crate::fetch::FetchConfig;
+use crate::sync::block::BlockSyncConfig;
 
 /// Configuration for [`NodeHost`](crate::host::NodeHost).
 ///

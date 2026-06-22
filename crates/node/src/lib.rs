@@ -23,7 +23,7 @@
 //! # Provision DA fallback
 //!
 //! Cross-shard provisions are gossiped optimistically; if a target shard
-//! misses the broadcast, [`shard_io::fetch::provision_serve`] answers
+//! misses the broadcast, [`fetch::provision_serve`] answers
 //! `provision.request` from `RocksDB` and the historical JMT. Reads are
 //! bounded by `jmt_history_length` (256 blocks by default).
 //!
@@ -33,23 +33,25 @@ mod batch_accumulator;
 pub mod bootstrap;
 mod config;
 pub mod event;
+mod fetch;
 pub mod host;
 pub mod pool_loop;
 pub mod process_io;
-mod shard_io;
+mod shard;
 pub mod shard_loop;
 mod state;
+mod sync;
 mod vnode;
 
 pub use config::NodeConfig;
+pub use fetch::state_range_serve::serve_state_range_request;
+pub use fetch::witness_history_serve::serve_witness_history_request;
 pub use host::NodeHost;
 pub use process_io::TxStatusCache;
-pub use shard_io::ShardIo;
-pub use shard_io::fetch::state_range_serve::serve_state_range_request;
-pub use shard_io::fetch::witness_history_serve::serve_witness_history_request;
-pub use shard_io::sync::block::BlockSyncStateKind;
-pub use shard_io::sync::block_serve::serve_block_request;
-pub use shard_io::sync::settled_waves_serve::serve_settled_waves_request;
+pub use shard::ShardIo;
 pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
+pub use sync::block::BlockSyncStateKind;
+pub use sync::block_serve::serve_block_request;
+pub use sync::settled_waves_serve::serve_settled_waves_request;
 pub use vnode::{SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, seat_follower, seat_vnode_group};

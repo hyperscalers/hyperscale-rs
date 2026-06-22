@@ -1,7 +1,7 @@
 //! Settled-waves acquisition I/O glue.
 //!
 //! Bridges
-//! [`SettledWavesAcquisitionHost`](crate::shard_io::settled_set::SettledWavesAcquisitionHost)'s
+//! [`SettledWavesAcquisitionHost`](crate::shard::settled_set::SettledWavesAcquisitionHost)'s
 //! scheduling to the network and to the state machine. The host owns the
 //! one-shot fetch-and-verify; this layer turns its
 //! [`SettledWavesAcquisitionOutput`]s into `GetSettledWavesRequest`
@@ -18,7 +18,7 @@ use hyperscale_types::{
     ValidatorId, WaveId, WeightedTimestamp,
 };
 
-use crate::shard_io::settled_set::SettledWavesAcquisitionOutput;
+use crate::shard::settled_set::SettledWavesAcquisitionOutput;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>

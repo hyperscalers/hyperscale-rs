@@ -27,10 +27,10 @@ use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardId, TxHash, Verified};
 
 use crate::batch_accumulator::BatchAccumulator;
+use crate::fetch::FetchInput;
+use crate::fetch::binding::TransactionBinding;
 use crate::host::NodeHost;
 use crate::process_io::SubmitFanout;
-use crate::shard_io::fetch::FetchInput;
-use crate::shard_io::fetch::binding::TransactionBinding;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>

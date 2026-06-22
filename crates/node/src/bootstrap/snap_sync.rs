@@ -288,7 +288,7 @@ mod tests {
     use hyperscale_types::BlockHeight;
 
     use super::*;
-    use crate::shard_io::fetch::state_range_serve::serve_state_range_request;
+    use crate::fetch::state_range_serve::serve_state_range_request;
 
     const ENTRIES: u8 = 12;
 

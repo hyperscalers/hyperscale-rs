@@ -49,7 +49,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-use hyperscale_network::RequestError;
 use hyperscale_types::{BlockHeight, Epoch};
 use serde::Serialize;
 use tracing::{info, trace};
@@ -64,21 +63,6 @@ pub mod remote_header_serve;
 pub mod settled_waves_serve;
 
 pub use host::SyncHost;
-
-/// Classify a transport-level request error for the sync FSM. `Exhausted`
-/// already absorbed retries against rotated peers — re-queue immediately;
-/// other variants reflect transport conditions where a brief deferral is
-/// appropriate.
-pub const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
-    match err {
-        RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
-        RequestError::NoPeers => FetchFailureKind::NoPeers,
-        RequestError::Timeout
-        | RequestError::PeerUnreachable(_)
-        | RequestError::PeerError(_)
-        | RequestError::Shutdown => FetchFailureKind::Transport,
-    }
-}
 
 /// Initial backoff for a deferred height after its first fetch failure.
 const DEFERRAL_BASE_MS: u64 = 1_000;
@@ -331,7 +315,7 @@ impl<K: SyncKey> ScopeState<K> {
     }
 }
 
-pub use crate::shard_loop::FetchFailureKind;
+use crate::event::FetchFailureKind;
 
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]

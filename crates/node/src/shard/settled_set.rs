@@ -242,7 +242,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::shard_io::sync::settled_waves_serve::serve_settled_waves_request;
+    use crate::sync::settled_waves_serve::serve_settled_waves_request;
 
     const SHARD: ShardId = ShardId::ROOT;
 

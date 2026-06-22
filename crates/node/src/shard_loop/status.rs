@@ -19,7 +19,7 @@ use hyperscale_types::{
 };
 
 use crate::host::NodeHost;
-use crate::shard_io::sync::block::BlockSyncStatus;
+use crate::sync::block::BlockSyncStatus;
 
 /// Per-shard status readout.
 #[derive(Debug, Clone)]

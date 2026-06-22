@@ -12,8 +12,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
-use crate::shard_io::fetch::FetchInput;
-use crate::shard_io::fetch::binding::{
+use crate::fetch::FetchInput;
+use crate::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };

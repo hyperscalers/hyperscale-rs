@@ -19,9 +19,10 @@ use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardId, ValidatorId};
 
-use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
-use crate::shard_io::sync::{SyncOutput, classify_fetch_error};
+use crate::event::classify_fetch_error;
 use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::sync::SyncOutput;
+use crate::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

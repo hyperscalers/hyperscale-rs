@@ -193,7 +193,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::shard_io::fetch::witness_history_serve::serve_witness_history_request;
+    use crate::fetch::witness_history_serve::serve_witness_history_request;
 
     const HEIGHT: u64 = 1;
 

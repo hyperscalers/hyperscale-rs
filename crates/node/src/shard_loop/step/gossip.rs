@@ -31,7 +31,7 @@ use hyperscale_types::{
     ValidatorId, Verifiable,
 };
 
-use crate::shard_io::CertifiedHeaderVerificationItem;
+use crate::shard::CertifiedHeaderVerificationItem;
 use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>

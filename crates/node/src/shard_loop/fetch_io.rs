@@ -8,11 +8,11 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
-use crate::shard_io::fetch::binding::{
+use crate::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::shard_io::fetch::{FetchInput, FetchOutput};
+use crate::fetch::{FetchInput, FetchOutput};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -27,7 +27,7 @@ where
     /// The shard's id is threaded through to per-binding callbacks so the
     /// response can be routed back to this shard.
     ///
-    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
+    /// [`FetchHost`]: crate::fetch::FetchHost
     pub(in crate::shard_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
