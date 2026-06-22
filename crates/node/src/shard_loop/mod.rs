@@ -41,6 +41,7 @@ pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 
 use crate::batch_accumulator::BatchAccumulator;
+use crate::beacon::BeaconBlockSync;
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
@@ -253,6 +254,12 @@ where
     pub(crate) process: Arc<ProcessIo<S, N, D>>,
     /// Per-shard I/O state shared by every vnode in `vnodes`.
     pub io: ShardIo<S>,
+    /// Beacon-block catch-up sync FSM. The beacon chain is host-global, but
+    /// each driver keeps its own instance (a lock-free per-thread
+    /// trade-off); the driving logic lives in [`crate::beacon`]. Fed
+    /// `Admitted` on every beacon commit and `StartBeaconBlockSync` when a
+    /// gossiped block sits more than one epoch ahead of the local tip.
+    pub(crate) beacon_block: BeaconBlockSync,
     /// Vnodes participating in this shard's consensus. Driven in order
     /// during each `step()` iteration; same-shard vnodes see identical
     /// inbound events and produce per-validator votes.

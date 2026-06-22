@@ -32,12 +32,9 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
-use crate::event::{FetchFailureKind, HostEvent, PoolScopedInput, classify_fetch_error};
+use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
+use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process_io::ProcessIo;
-use crate::sync::SyncOutput;
-use crate::sync::beacon_block::{
-    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, beacon_block_sync_config,
-};
 use crate::vnode::Vnode;
 
 /// Active driver for a host's shard-less, beacon-following vnodes.
@@ -135,12 +132,12 @@ where
         match input {
             PoolScopedInput::Protocol(event) => self.dispatch_protocol(*event),
             PoolScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
-                self.handle_beacon_sync_response(epoch, block);
+                beacon::on_response(self, epoch, block);
             }
             PoolScopedInput::BeaconBlockSyncFetchFailed { epoch, kind } => {
-                self.feed_beacon_sync_failed(epoch, kind);
+                beacon::on_fetch_failed(self, epoch, kind);
             }
-            PoolScopedInput::FetchTick => self.beacon_sync_tick(),
+            PoolScopedInput::FetchTick => beacon::on_tick(self),
         }
     }
 
@@ -218,11 +215,7 @@ where
                 // Advance the sync FSM's committed watermark on every commit
                 // (gossip or sync) so a serial catch-up unblocks the next
                 // epoch's fetch and a later sync starts from current+1.
-                let outputs = self.beacon_block.handle(BeaconBlockSyncInput::Admitted {
-                    scope: (),
-                    height: epoch,
-                });
-                self.process_beacon_sync_outputs(outputs);
+                beacon::on_admitted(self, epoch);
             }
             Action::TopologyChanged {
                 topology_snapshot,
@@ -243,7 +236,7 @@ where
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.
             Action::StartBeaconBlockSync { target } => {
-                self.start_beacon_block_sync(target);
+                beacon::start(self, target);
             }
             other => {
                 warn!(
@@ -254,94 +247,47 @@ where
         }
     }
 
-    /// Drive the catch-up sync FSM's periodic tick, re-dispatching any
-    /// deferred fetch whose backoff has expired.
-    fn beacon_sync_tick(&mut self) {
-        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::Tick {
-            now: std::time::Instant::now(),
-        });
-        self.process_beacon_sync_outputs(outputs);
-    }
-
     /// Whether a catch-up sync is in flight — actively fetching or holding
     /// epochs deferred behind a backoff. The driver ticks the pool while true
     /// and lets it idle otherwise.
     #[must_use]
     pub fn is_beacon_syncing(&self) -> bool {
-        self.beacon_block.is_syncing() || self.beacon_block.has_deferred()
+        beacon::has_pending(&self.beacon_block)
     }
 
-    /// Begin (or extend) a beacon-block catch-up sync toward `target`. Seeds
-    /// the FSM's committed watermark from the host's beacon tip so a serial
-    /// sync starts from `tip + 1` rather than `genesis + 1`, then dispatches
-    /// whatever fetch the FSM emits.
-    fn start_beacon_block_sync(&mut self, target: Epoch) {
-        if let Some(tip) = self.process.beacon_storage.latest_committed_epoch() {
-            let _ = self.beacon_block.handle(BeaconBlockSyncInput::Admitted {
-                scope: (),
-                height: tip,
-            });
+    /// Pick a live shard whose committee can serve the follower's beacon
+    /// fetch. Every shard member holds the beacon chain, so any live leaf
+    /// answers; spreading by the follower's own id keeps a host of followers
+    /// from all hammering one committee.
+    fn fetch_shard(&self) -> Option<ShardId> {
+        let vnode = self.vnodes.first()?;
+        let leaves: Vec<ShardId> = vnode.state.topology().shard_trie().leaves().collect();
+        if leaves.is_empty() {
+            return None;
         }
-        let outputs = self
-            .beacon_block
-            .handle(BeaconBlockSyncInput::StartSync { scope: (), target });
-        self.process_beacon_sync_outputs(outputs);
+        let idx = usize::try_from(vnode.validator_id.inner() % leaves.len() as u64)
+            .expect("modulo of leaves.len() fits usize");
+        Some(leaves[idx])
+    }
+}
+
+impl<S, N, D> BeaconSyncSink for PoolLoop<S, N, D>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    fn beacon_fsm(&mut self) -> &mut BeaconBlockSync {
+        &mut self.beacon_block
     }
 
-    /// A beacon-block sync response landed. `None` (peer didn't have the
-    /// epoch) re-queues via fetch-failed. Otherwise deliver the block to every
-    /// follower — each runs the verify/adopt/commit cascade — and tell the FSM
-    /// the epoch's bytes arrived.
-    fn handle_beacon_sync_response(
-        &mut self,
-        epoch: Epoch,
-        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
-    ) {
-        let Some(block) = block else {
-            self.feed_beacon_sync_failed(epoch, FetchFailureKind::NotFound);
-            return;
-        };
+    fn deliver_block(&mut self, block: Arc<Verifiable<CertifiedBeaconBlock>>) {
+        // Deliver to every follower inline — each runs the verify/adopt/commit
+        // cascade to quiescence within this call.
         self.dispatch_protocol(ProtocolEvent::BeaconBlockSyncReadyToApply { block });
-        let outputs = self
-            .beacon_block
-            .handle(BeaconBlockSyncInput::FetchSucceeded {
-                scope: (),
-                from: epoch,
-                count: 1,
-                delivered_heights: vec![epoch],
-                now: std::time::Instant::now(),
-            });
-        self.process_beacon_sync_outputs(outputs);
     }
 
-    /// Re-queue an epoch via `FetchFailed`, applying the FSM's deferral.
-    fn feed_beacon_sync_failed(&mut self, epoch: Epoch, kind: FetchFailureKind) {
-        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::FetchFailed {
-            scope: (),
-            from: epoch,
-            count: 1,
-            kind,
-            now: std::time::Instant::now(),
-        });
-        self.process_beacon_sync_outputs(outputs);
-    }
-
-    /// Turn the FSM's scheduling outputs into network fetches.
-    fn process_beacon_sync_outputs(&self, outputs: Vec<BeaconBlockSyncOutput>) {
-        for output in outputs {
-            match output {
-                SyncOutput::Fetch { from, .. } => self.dispatch_beacon_fetch(from),
-                SyncOutput::Complete { height, .. } => {
-                    tracing::debug!(epoch = height.inner(), "Pool beacon block sync complete");
-                }
-            }
-        }
-    }
-
-    /// Dispatch a single-epoch beacon block fetch against a live committee.
-    /// The callback routes the response — or failure — back through the host's
-    /// beacon channel as a [`PoolScopedInput`].
-    fn dispatch_beacon_fetch(&self, epoch: Epoch) {
+    fn dispatch_fetch(&self, epoch: Epoch) {
         let Some(shard) = self.fetch_shard() else {
             warn!("PoolLoop: no live shard to fetch beacon blocks from; deferring");
             return;
@@ -373,18 +319,7 @@ where
         );
     }
 
-    /// Pick a live shard whose committee can serve the follower's beacon
-    /// fetch. Every shard member holds the beacon chain, so any live leaf
-    /// answers; spreading by the follower's own id keeps a host of followers
-    /// from all hammering one committee.
-    fn fetch_shard(&self) -> Option<ShardId> {
-        let vnode = self.vnodes.first()?;
-        let leaves: Vec<ShardId> = vnode.state.topology().shard_trie().leaves().collect();
-        if leaves.is_empty() {
-            return None;
-        }
-        let idx = usize::try_from(vnode.validator_id.inner() % leaves.len() as u64)
-            .expect("modulo of leaves.len() fits usize");
-        Some(leaves[idx])
+    fn beacon_tip(&self) -> Option<Epoch> {
+        self.process.beacon_storage.latest_committed_epoch()
     }
 }

@@ -25,6 +25,7 @@ use hyperscale_types::{
 
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
+use crate::beacon::{BeaconBlockSync, beacon_block_sync_config};
 use crate::config::NodeConfig;
 use crate::fetch::FetchHost;
 use crate::pool_loop::PoolLoop;
@@ -216,6 +217,7 @@ where
                     event_tx: process.shard_sender(shard),
                     process: Arc::clone(&process),
                     io,
+                    beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
                     vnodes,
                     now: LocalTimestamp::ZERO,
                     pending_timer_ops: Vec::new(),
@@ -647,6 +649,7 @@ where
         event_tx: sender,
         process: Arc::clone(process),
         io,
+        beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
         vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
         now: LocalTimestamp::ZERO,
         pending_timer_ops: Vec::new(),

@@ -12,6 +12,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
+use crate::beacon;
 use crate::fetch::FetchInput;
 use crate::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
@@ -30,8 +31,7 @@ where
         let outputs = self.io.syncs.block_tick(now);
         self.process_block_sync_outputs(outputs);
 
-        let outputs = self.io.syncs.beacon_block_tick(now);
-        self.process_beacon_block_sync_outputs(outputs);
+        beacon::on_tick(self);
 
         let outputs = self.io.syncs.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);

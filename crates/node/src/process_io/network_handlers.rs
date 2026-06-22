@@ -739,6 +739,7 @@ pub fn register_shard_request_handlers<S, N, D>(
         GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
+    use crate::beacon::serve::serve_beacon_block_request;
     use crate::fetch::exec_cert_serve::serve_execution_certs_request;
     use crate::fetch::finalized_wave_serve::serve_finalized_waves_request;
     use crate::fetch::local_provision_serve::serve_local_provisions_request;
@@ -747,7 +748,6 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::fetch::state_range_serve::serve_state_range_request;
     use crate::fetch::transaction_serve::serve_transaction_request;
     use crate::fetch::witness_history_serve::serve_witness_history_request;
-    use crate::sync::beacon_block_serve::serve_beacon_block_request;
     use crate::sync::block_serve::serve_block_request;
     use crate::sync::remote_header_serve::serve_remote_headers_request;
     use crate::sync::settled_waves_serve::serve_settled_waves_request;

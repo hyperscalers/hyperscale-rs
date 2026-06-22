@@ -13,9 +13,6 @@ use std::time::Instant;
 
 use hyperscale_types::{BlockHeight, ShardId};
 
-use super::beacon_block::{
-    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, beacon_block_sync_config,
-};
 use super::block::{BlockSync, BlockSyncInput, BlockSyncOutput, BlockSyncStatus};
 use super::remote_header::{self, RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 use crate::config::NodeConfig;
@@ -24,10 +21,6 @@ use crate::config::NodeConfig;
 pub struct SyncHost {
     /// Block-sync state machine.
     pub block: BlockSync,
-
-    /// Beacon-block gap-fill sync state machine. Serial, one epoch at a
-    /// time (see [`beacon_block_sync_config`]).
-    pub beacon_block: BeaconBlockSync,
 
     /// Multi-shard remote-header sync state machine. Catches up missing
     /// certified header chains by batching contiguous heights into range
@@ -41,7 +34,6 @@ impl SyncHost {
     pub fn new(config: &NodeConfig) -> Self {
         Self {
             block: BlockSync::new(config.block_sync.clone()),
-            beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
             remote_header: RemoteHeaderSync::new(remote_header::default_config()),
         }
     }
@@ -54,8 +46,6 @@ impl SyncHost {
     pub fn has_any_pending(&self) -> bool {
         self.block.has_deferred()
             || self.block.is_syncing()
-            || self.beacon_block.has_deferred()
-            || self.beacon_block.is_syncing()
             || self.remote_header.has_deferred()
             || self.remote_header.is_syncing()
     }
@@ -64,12 +54,6 @@ impl SyncHost {
     /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
     pub fn block_tick(&mut self, now: Instant) -> Vec<BlockSyncOutput> {
         self.block.handle(BlockSyncInput::Tick { now })
-    }
-
-    /// Drive the beacon-block-sync FSM's periodic tick. Returns the
-    /// outputs the I/O loop should dispatch (epoch fetches, completion).
-    pub fn beacon_block_tick(&mut self, now: Instant) -> Vec<BeaconBlockSyncOutput> {
-        self.beacon_block.handle(BeaconBlockSyncInput::Tick { now })
     }
 
     /// Drive the remote-header-sync FSM's periodic tick. Returns range

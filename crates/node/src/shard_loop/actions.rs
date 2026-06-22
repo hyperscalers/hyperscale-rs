@@ -20,6 +20,7 @@ use hyperscale_types::{
 use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
+use crate::beacon;
 use crate::fetch::FetchInput;
 use crate::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
@@ -29,7 +30,6 @@ use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
     make_commit_prepared, run_qc_only_prep,
 };
-use crate::sync::beacon_block::BeaconBlockSyncInput;
 use crate::sync::block::BlockSyncInput;
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -160,15 +160,7 @@ where
                 // every commit (gossip or sync) so a later
                 // StartBeaconBlockSync fetches from current+1, and so
                 // serial sync unblocks the next epoch's fetch.
-                let outputs = self
-                    .io
-                    .syncs
-                    .beacon_block
-                    .handle(BeaconBlockSyncInput::Admitted {
-                        scope: (),
-                        height: epoch,
-                    });
-                self.process_beacon_block_sync_outputs(outputs);
+                beacon::on_admitted(self, epoch);
                 push_protocol_event(
                     self.event_sender(),
                     self.shard,

@@ -8,6 +8,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
+use crate::beacon;
 use crate::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
@@ -148,6 +149,7 @@ where
     pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self.io.fetches.has_any_pending()
             || self.io.syncs.has_any_pending()
+            || beacon::has_pending(&self.beacon_block)
             || self.io.settled_set_sync.has_pending();
         let op = if any_pending {
             TimerOp::Set {
