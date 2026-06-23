@@ -30,7 +30,7 @@ use tracing::warn;
 use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
-use crate::process_io::ProcessIo;
+use crate::process::ProcessIo;
 use crate::shard::ShardIo;
 use crate::shard::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,

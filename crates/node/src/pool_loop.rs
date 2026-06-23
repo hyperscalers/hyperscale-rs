@@ -34,7 +34,7 @@ use tracing::warn;
 
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
 use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
-use crate::process_io::ProcessIo;
+use crate::process::ProcessIo;
 use crate::vnode::Vnode;
 
 /// Active driver for a host's shard-less, beacon-following vnodes.

@@ -30,7 +30,7 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchInput;
 use crate::fetch::binding::TransactionBinding;
 use crate::host::NodeHost;
-use crate::process_io::SubmitFanout;
+use crate::process::SubmitFanout;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -341,7 +341,7 @@ where
     /// `process.shard_event_senders` so cross-thread fan-out doesn't
     /// require a `&mut NodeHost`.
     ///
-    /// [`ProcessIo::compute_submit_fanout`]: crate::process_io::ProcessIo::compute_submit_fanout
+    /// [`ProcessIo::compute_submit_fanout`]: crate::process::ProcessIo::compute_submit_fanout
     pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
         // Seed the canonical-instance cache so gossip echoes of this tx
         // arriving on other hosted shards' topics share its validation

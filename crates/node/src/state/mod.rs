@@ -59,7 +59,7 @@ pub struct NodeStateMachine {
     /// One coordinator per vnode; all vnodes on the same host share an
     /// `Arc<dyn BeaconStorage>` on the runner side via [`ProcessIo`].
     ///
-    /// [`ProcessIo`]: crate::process_io::ProcessIo
+    /// [`ProcessIo`]: crate::process::ProcessIo
     beacon_coordinator: BeaconCoordinator,
 
     /// Current time.

@@ -51,7 +51,7 @@ use crate::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
     ProvisionBinding, ShardWitnessBinding, TransactionBinding,
 };
-use crate::process_io::ProcessIo;
+use crate::process::ProcessIo;
 use crate::shard::ShardIo;
 use crate::shard::commit::PreparedCommitMap;
 use crate::vnode::Vnode;
