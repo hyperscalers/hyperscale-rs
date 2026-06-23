@@ -31,11 +31,11 @@ pub(crate) mod mempool;
 pub(crate) mod phase_times;
 pub(crate) mod verify;
 
-// The driver shell: dispatch, lifecycle, metrics, status, the generic
+// The driver shell: dispatch, lifecycle, metrics, the generic
 // fetch/timer plumbing, and the consensus/beacon-sink driver glue.
 mod actions;
 mod beacon_sink;
-mod fetch_io;
+mod fetch_dispatch;
 mod lifecycle;
 mod metrics;
 mod protocol_event;

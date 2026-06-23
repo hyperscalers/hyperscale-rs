@@ -1,9 +1,9 @@
-//! Per-shard settled-waves acquisition host.
+//! Per-shard settled-waves acquisition.
 //!
 //! When a remote shard `P` terminates at a split, a surviving counterpart
 //! must learn `S_P` — the wave-ids `P` settled at or before its terminal
 //! block — so the split-boundary fence can resolve cross-shard
-//! `FinalizedWave`s naming `P`. This host owns one acquisition per
+//! `FinalizedWave`s naming `P`. It owns one acquisition per
 //! past-terminal shard: a single verified fetch of `P`'s complete settled
 //! window list, checked against the beacon-attested `settled_waves_root`
 //! the node read from its own fold.
@@ -63,7 +63,7 @@ impl AcquisitionDriver {
     }
 }
 
-/// What the I/O glue should do after folding an input into the host.
+/// What the I/O glue should do after folding an input into [`SettledWavesAcquisition`].
 pub enum SettledWavesAcquisitionOutput {
     /// Issue the window fetch against `shard`'s terminal committee, biased
     /// to `peer`.
@@ -92,12 +92,12 @@ pub enum SettledWavesAcquisitionOutput {
 /// [`ShardIo`](crate::shard::ShardIo); shared across the shard's vnodes, so a
 /// duplicate start for an already-targeted terminal is deduplicated.
 #[derive(Default)]
-pub struct SettledWavesAcquisitionHost {
+pub struct SettledWavesAcquisition {
     drivers: HashMap<ShardId, AcquisitionDriver>,
 }
 
-impl SettledWavesAcquisitionHost {
-    /// An empty host.
+impl SettledWavesAcquisition {
+    /// An empty acquisition set.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -347,7 +347,7 @@ mod tests {
         let (storage, terminal, root) = served_chain(3);
         let pending_chain = PendingChain::new(storage);
 
-        let mut host = SettledWavesAcquisitionHost::new();
+        let mut host = SettledWavesAcquisition::new();
         let mut outputs = host.start(
             SHARD,
             BlockHeight::new(3),
@@ -392,7 +392,7 @@ mod tests {
         let (storage, terminal, _) = served_chain(3);
         let pending_chain = PendingChain::new(storage);
 
-        let mut host = SettledWavesAcquisitionHost::new();
+        let mut host = SettledWavesAcquisition::new();
         // Attest a root the served chain cannot satisfy.
         let wrong_root = settled_waves_root_from_ids([&local_wave(99)]);
         let _ = host.start(
@@ -420,7 +420,7 @@ mod tests {
     /// A driver whose retention window has passed drops on tick.
     #[test]
     fn expires_past_the_retention_horizon() {
-        let mut host = SettledWavesAcquisitionHost::new();
+        let mut host = SettledWavesAcquisition::new();
         let _ = host.start(
             SHARD,
             BlockHeight::new(2),
@@ -443,7 +443,7 @@ mod tests {
     /// is a no-op; a start for a different terminal replaces the driver.
     #[test]
     fn dedupes_by_terminal_block() {
-        let mut host = SettledWavesAcquisitionHost::new();
+        let mut host = SettledWavesAcquisition::new();
         let root = settled_waves_root_from_ids(std::iter::empty());
         let _ = host.start(
             SHARD,

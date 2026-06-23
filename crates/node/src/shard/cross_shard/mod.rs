@@ -34,7 +34,7 @@ pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::serve_remote_headers_request;
-pub use settled_set::SettledWavesAcquisitionHost;
+pub use settled_set::SettledWavesAcquisition;
 pub use settled_waves_serve::serve_settled_waves_request;
 
 use crate::config::NodeConfig;
@@ -59,7 +59,7 @@ pub struct CrossShardState {
 
     /// Settled-waves acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
-    pub settled_set_sync: SettledWavesAcquisitionHost,
+    pub settled_set_sync: SettledWavesAcquisition,
 }
 
 impl CrossShardState {
@@ -86,7 +86,7 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            settled_set_sync: SettledWavesAcquisitionHost::new(),
+            settled_set_sync: SettledWavesAcquisition::new(),
         }
     }
 
