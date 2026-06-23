@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::{
     GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
@@ -38,7 +39,7 @@ use hyperscale_types::{
 };
 
 use super::Fetch;
-use super::host::FetchHost;
+use crate::shard::ShardIo;
 use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases used across the module tree ──────────────────────────
@@ -82,7 +83,7 @@ pub trait FetchBinding: 'static {
     const PER_ID: bool = false;
 
     /// Locate the `Fetch<Id>` instance for this binding inside the host.
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id>;
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` against `shard`'s committee and
     /// route the response back through the event sender. `class` flows
@@ -166,8 +167,8 @@ impl FetchBinding for TransactionBinding {
 
     const NAME: &'static str = "transaction";
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<TxHash> {
-        &mut host.transaction
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TxHash> {
+        &mut shard.fetches.transaction
     }
 
     fn dispatch_chunk<N: Network>(
@@ -234,8 +235,8 @@ impl FetchBinding for LocalProvisionBinding {
 
     const NAME: &'static str = "local_provision";
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<ProvisionHash> {
-        &mut host.local_provision
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
+        &mut shard.fetches.local_provision
     }
 
     fn dispatch_chunk<N: Network>(
@@ -320,8 +321,8 @@ impl FetchBinding for FinalizedWaveBinding {
 
     const NAME: &'static str = "finalized_wave";
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<WaveId> {
-        &mut host.finalized_wave
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
+        &mut shard.fetches.finalized_wave
     }
 
     fn dispatch_chunk<N: Network>(
@@ -395,8 +396,8 @@ impl FetchBinding for ExecCertBinding {
 
     const NAME: &'static str = "exec_cert";
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<WaveId> {
-        &mut host.exec_cert
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
+        &mut shard.fetches.exec_cert
     }
 
     fn dispatch_chunk<N: Network>(
@@ -475,8 +476,8 @@ impl FetchBinding for ProvisionBinding {
     /// each request targets exactly one scope.
     const PER_ID: bool = true;
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id> {
-        &mut host.provision
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.fetches.provision
     }
 
     fn dispatch_chunk<N: Network>(
@@ -576,8 +577,8 @@ impl FetchBinding for ShardWitnessBinding {
     /// share `(shard, block_height, committed_block_hash)`.
     const PER_ID: bool = true;
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id> {
-        &mut host.shard_witness
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.fetches.shard_witness
     }
 
     fn dispatch_chunk<N: Network>(
@@ -657,8 +658,8 @@ impl FetchBinding for BeaconProposalBinding {
     /// a single proposal.
     const PER_ID: bool = true;
 
-    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id> {
-        &mut host.beacon_proposal
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.fetches.beacon_proposal
     }
 
     fn dispatch_chunk<N: Network>(

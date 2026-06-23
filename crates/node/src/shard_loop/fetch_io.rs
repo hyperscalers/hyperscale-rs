@@ -90,7 +90,7 @@ where
                 "Dispatching fetch request"
             );
         }
-        let outputs = B::fetch_mut(&mut self.io.fetches).handle(input);
+        let outputs = B::fetch_mut(&mut self.io).handle(input);
         self.process_fetch_outputs::<B>(outputs);
     }
 
