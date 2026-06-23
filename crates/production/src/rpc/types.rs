@@ -44,7 +44,7 @@ pub struct ReadyResponse {
 /// vnode lives in `vnodes`, sorted by `validator_id` for stable output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatusResponse {
-    /// Total number of shards in the network.
+    /// The network's current shard count, from the host's live topology.
     pub num_shards: u64,
     /// Number of connected peers.
     pub connected_peers: usize,

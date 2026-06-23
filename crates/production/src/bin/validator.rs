@@ -18,12 +18,10 @@
 //!
 //! ```toml
 //! [node]
-//! num_shards = 1
 //! data_dir = "./data"
 //!
 //! [[vnode]]
 //! validator_id = 0
-//! shard = 0
 //! key_path = "./keys/v0.key"
 //!
 //! [network]
@@ -45,7 +43,6 @@
 //! gossipsub subscriptions; different-shard vnodes share only the libp2p
 //! peer and dispatch pools.
 
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -197,10 +194,6 @@ pub struct NodeConfig {
     #[serde(default = "default_network", with = "network_serde")]
     pub network: NetworkDefinition,
 
-    /// Number of shards in the network
-    #[serde(default = "default_num_shards")]
-    pub num_shards: u64,
-
     /// Data directory for storage. Per-shard `RocksDB` instances are
     /// opened at `data_dir/shard-{N}/db`.
     #[serde(default = "default_data_dir")]
@@ -248,10 +241,6 @@ pub struct VnodeEntry {
 
     /// Path to this validator's signing key file
     pub key_path: PathBuf,
-}
-
-const fn default_num_shards() -> u64 {
-    1
 }
 
 fn default_data_dir() -> PathBuf {
@@ -545,10 +534,6 @@ pub struct ValidatorEntry {
     /// Validator ID
     pub id: u64,
 
-    /// Shard this validator belongs to
-    #[serde(default)]
-    pub shard: Option<u64>,
-
     /// Hex-encoded public key
     pub public_key: String,
 }
@@ -659,16 +644,14 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 /// parsed from the genesis hex — keeping the snapshot's view consistent with
 /// what this process actually signs with.
 ///
-/// `fallback_shard` is only consulted when no `[[genesis.validators]]` entry
-/// sets `shard` — covering both empty-genesis development mode and the legacy
-/// single-shard no-assignments path. Production multi-shard deployments must
-/// populate `shard` in `[[genesis.validators]]`.
+/// Genesis is always a single ROOT shard: the network launches at one shard
+/// and grows by splitting, so there is no operator-facing genesis-distribution
+/// knob. The network reaches its target topology by driving the real split
+/// lifecycle.
 fn build_topology(
     network: NetworkDefinition,
-    num_shards: u64,
     genesis: &GenesisConfig,
     local_keypairs: &[(ValidatorId, Arc<Bls12381G1PrivateKey>)],
-    fallback_shard: ShardId,
 ) -> Result<Arc<TopologySnapshot>> {
     let lookup_local = |id: ValidatorId| -> Option<&Arc<Bls12381G1PrivateKey>> {
         local_keypairs
@@ -716,40 +699,12 @@ fn build_topology(
 
     let validator_set = ValidatorSet::new(validators);
 
-    let has_shard_assignments = genesis.validators.iter().any(|v| v.shard.is_some());
-
-    if has_shard_assignments {
-        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
-        for v in &genesis.validators {
-            let shard = ShardId::leaf(
-                num_shards.trailing_zeros(),
-                v.shard.unwrap_or(v.id % num_shards),
-            );
-            shard_committees
-                .entry(shard)
-                .or_default()
-                .push(ValidatorId::new(v.id));
-        }
-        Ok(Arc::new(TopologySnapshot::with_shard_committees(
-            network,
-            num_shards,
-            &validator_set,
-            shard_committees,
-        )))
-    } else {
-        if num_shards > 1 {
-            warn!(
-                "Multi-shard deployment without explicit shard assignments in genesis config. \
-                 Cross-shard messages may fail. Add 'shard = N' to each [[genesis.validators]] entry."
-            );
-        }
-        Ok(Arc::new(TopologySnapshot::single_shard(
-            network,
-            fallback_shard,
-            num_shards,
-            validator_set,
-        )))
-    }
+    Ok(Arc::new(TopologySnapshot::single_shard(
+        network,
+        ShardId::ROOT,
+        1,
+        validator_set,
+    )))
 }
 
 /// Build engine genesis configuration from TOML config.
@@ -1110,7 +1065,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     info!(
         hosted_vnodes = config.vnodes.len(),
-        num_shards = config.node.num_shards,
         "Host configuration loaded"
     );
     for v in &config.vnodes {
@@ -1159,7 +1113,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             .context("Failed to initialize thread pools")?,
     );
 
-    let shard_depth = config.node.num_shards.trailing_zeros();
     // One directory convention for every open — startup seats, runtime joins,
     // and split-flip seeding. Depth qualifies the name: trie paths alone
     // collide across depths once shards split (a child `leaf(2, 0)` and
@@ -1212,17 +1165,13 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         hosted_keypairs.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
     }
 
-    // Build the host's single identity-agnostic topology snapshot. The
-    // fallback shard is consulted only for a hosted validator absent from
-    // `[[genesis.validators]]` (a degenerate config); committee placement
-    // otherwise comes from the genesis assignments.
-    let fallback_shard = ShardId::leaf(shard_depth, 0);
+    // Build the host's single identity-agnostic topology snapshot. Genesis is
+    // always a single ROOT shard; the network grows to its target topology by
+    // splitting under load.
     let topology = build_topology(
         config.node.network.clone(),
-        config.node.num_shards,
         &config.genesis,
         &hosted_keypairs,
-        fallback_shard,
     )?;
 
     // The validators this host runs. Shard participation is not named here —
@@ -1241,10 +1190,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // runner's first status tick; until then `vnodes` is empty.
     let rpc_ready = Arc::new(AtomicBool::new(false));
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
-    let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
-        num_shards: config.node.num_shards,
-        ..Default::default()
-    })));
+    // `num_shards` is published by the runner from the live topology on each
+    // status tick; it starts at the default until the first tick.
+    let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default())));
     let rpc_mempool_snapshot = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
 
     // The runner is built before the RPC server because it owns the crossbeam

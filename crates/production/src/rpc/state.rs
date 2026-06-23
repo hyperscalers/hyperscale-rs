@@ -140,8 +140,11 @@ impl Default for VnodeMempoolSnapshot {
 ///
 /// Process-level fields (`num_shards`, `connected_peers`) sit at the top;
 /// per-vnode readouts live in `vnodes`, sorted by `validator_id` for stable
-/// output. Multi-vnode hosts surface every hosted vnode; single-vnode hosts
-/// produce a one-element `vnodes` vec.
+/// output. `num_shards` is the network's current shard count, published from
+/// the host's live [`TopologySnapshot`] each tick — it tracks the topology as
+/// the network splits and merges, not a frozen genesis value. Multi-vnode
+/// hosts surface every hosted vnode; single-vnode hosts produce a one-element
+/// `vnodes` vec.
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatusState {

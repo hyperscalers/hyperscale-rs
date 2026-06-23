@@ -1217,12 +1217,14 @@ impl ProductionRunner {
         let peer_count = self.network.cached_peer_count();
         set_libp2p_peers(peer_count);
 
-        // ── Update RPC status with peer count ────────────────────────────
+        // ── Update RPC status with peer count + live shard count ─────────
         if let Some(ref rpc_status) = self.publishers.node_status {
             let current = rpc_status.load();
-            if current.connected_peers != peer_count {
+            let num_shards = self.topology_snapshot.load().num_shards();
+            if current.connected_peers != peer_count || current.num_shards != num_shards {
                 let mut updated = (**current).clone();
                 updated.connected_peers = peer_count;
+                updated.num_shards = num_shards;
                 rpc_status.store(Arc::new(updated));
             }
         }
