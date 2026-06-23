@@ -26,9 +26,9 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardId, TxHash, Verified};
 
+use super::TransactionBinding;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchInput;
-use crate::fetch::binding::TransactionBinding;
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
@@ -49,13 +49,10 @@ where
     ///
     /// [`TxStore`]: hyperscale_mempool::TxStore
     /// [`MempoolCoordinator::on_transaction_gossip`]: hyperscale_mempool::MempoolCoordinator
-    pub(in crate::shard_loop) fn handle_transaction_validated(
-        &mut self,
-        tx: Arc<Verified<RoutableTransaction>>,
-    ) {
+    pub(crate) fn handle_transaction_validated(&mut self, tx: Arc<Verified<RoutableTransaction>>) {
         let tx_hash = tx.hash();
-        self.io.pending_validation.remove(&tx_hash);
-        let submitted_locally = self.io.locally_submitted.remove(&tx_hash);
+        self.io.mempool.pending_validation.remove(&tx_hash);
+        let submitted_locally = self.io.mempool.locally_submitted.remove(&tx_hash);
         self.dispatch_event(ProtocolEvent::TransactionValidated {
             tx,
             submitted_locally,
@@ -64,13 +61,10 @@ where
 
     /// Validation failed — drop tracking entries so the tx can be
     /// re-validated if it shows up again.
-    pub(in crate::shard_loop) fn handle_transaction_validations_failed(
-        &mut self,
-        hashes: &[TxHash],
-    ) {
+    pub(crate) fn handle_transaction_validations_failed(&mut self, hashes: &[TxHash]) {
         for hash in hashes {
-            self.io.pending_validation.remove(hash);
-            self.io.locally_submitted.remove(hash);
+            self.io.mempool.pending_validation.remove(hash);
+            self.io.mempool.locally_submitted.remove(hash);
         }
     }
 
@@ -82,12 +76,12 @@ where
     /// `locally_submitted` on a single shard per node keeps the
     /// finalization metric from double-counting txs whose touched set
     /// spans multiple hosted shards.
-    pub(in crate::shard_loop) fn handle_admit_transaction(&mut self, tx: Arc<RoutableTransaction>) {
+    pub(crate) fn handle_admit_transaction(&mut self, tx: Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
-        if !self.io.pending_validation.contains(&tx_hash)
+        if !self.io.mempool.pending_validation.contains(&tx_hash)
             && !self.io.caches.tx_store.contains(&tx_hash)
         {
-            self.io.pending_validation.insert(tx_hash);
+            self.io.mempool.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
         }
     }
@@ -99,7 +93,7 @@ where
     /// submitted-locally flag. The source shard owns the
     /// `outbound_gossip_batches` map; one batch per destination shard
     /// (hosted or not) gets the tx appended.
-    pub(in crate::shard_loop) fn handle_admit_and_gossip_transaction(
+    pub(crate) fn handle_admit_and_gossip_transaction(
         &mut self,
         tx: Arc<RoutableTransaction>,
         touched_shards: &[ShardId],
@@ -108,11 +102,11 @@ where
             self.enqueue_tx_for_gossip(*dst, Arc::clone(&tx));
         }
         let tx_hash = tx.hash();
-        if !self.io.pending_validation.contains(&tx_hash)
+        if !self.io.mempool.pending_validation.contains(&tx_hash)
             && !self.io.caches.tx_store.contains(&tx_hash)
         {
-            self.io.locally_submitted.insert(tx_hash);
-            self.io.pending_validation.insert(tx_hash);
+            self.io.mempool.locally_submitted.insert(tx_hash);
+            self.io.mempool.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
         }
     }
@@ -122,7 +116,7 @@ where
     /// for every destination. No admission, no validation, no
     /// `locally_submitted` entry — this shard isn't part of the tx's
     /// touched set and won't see it in mempool.
-    pub(in crate::shard_loop) fn handle_gossip_transaction(
+    pub(crate) fn handle_gossip_transaction(
         &mut self,
         tx: &Arc<RoutableTransaction>,
         touched_shards: &[ShardId],
@@ -135,7 +129,7 @@ where
     /// Intercept a gossip-received transaction before it reaches the state
     /// machine: queue for batched async validation if we don't already
     /// have it cached and it isn't tombstoned by mempool.
-    pub(in crate::shard_loop) fn handle_gossip_received_tx_for_validation(
+    pub(crate) fn handle_gossip_received_tx_for_validation(
         &mut self,
         tx: Arc<RoutableTransaction>,
     ) {
@@ -151,7 +145,7 @@ where
                 .mempool_coordinator()
                 .is_tombstoned(&tx_hash)
         {
-            self.io.pending_validation.insert(tx_hash);
+            self.io.mempool.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
         }
     }
@@ -164,7 +158,7 @@ where
     /// `ProtocolEvent::TransactionsReceived`; invalid hashes surface as
     /// `ShardScopedInput::TransactionValidationsFailed`, mirroring the
     /// gossip-path tracking-set cleanup.
-    pub(in crate::shard_loop) fn handle_fetched_txs_for_validation(
+    pub(crate) fn handle_fetched_txs_for_validation(
         &mut self,
         batch: Vec<Arc<RoutableTransaction>>,
     ) {
@@ -233,15 +227,13 @@ where
     /// [`NodeHost::flush_expired_batches`]. The accumulator lives on the
     /// "source" `ShardLoop` (this one) — when the gossip flushes it
     /// publishes to the destination shard's topic.
-    pub(in crate::shard_loop) fn enqueue_tx_for_gossip(
-        &mut self,
-        dst: ShardId,
-        tx: Arc<RoutableTransaction>,
-    ) {
+    pub(crate) fn enqueue_tx_for_gossip(&mut self, dst: ShardId, tx: Arc<RoutableTransaction>) {
         let now = self.now;
-        let max = self.tx_gossip_max;
-        let window = self.tx_gossip_window;
+        let max = self.io.mempool.tx_gossip_max;
+        let window = self.io.mempool.tx_gossip_window;
         let batch = self
+            .io
+            .mempool
             .outbound_gossip_batches
             .entry(dst)
             .or_insert_with(|| BatchAccumulator::new(max, window));
@@ -254,7 +246,7 @@ where
     /// shard `dst` and publish it as a single `TransactionGossip` batch.
     /// No-op if empty.
     pub(crate) fn flush_tx_gossip_batch(&mut self, dst: ShardId) {
-        let Some(batch) = self.outbound_gossip_batches.get_mut(&dst) else {
+        let Some(batch) = self.io.mempool.outbound_gossip_batches.get_mut(&dst) else {
             return;
         };
         let txs = batch.take();
@@ -268,9 +260,9 @@ where
     // ─── Validation batching ────────────────────────────────────────────
 
     /// Queue a transaction for batch validation on this shard.
-    pub(in crate::shard_loop) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
+    pub(crate) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
         let now = self.now;
-        if self.io.validation_batch.push(tx, now) {
+        if self.io.mempool.validation_batch.push(tx, now) {
             self.flush_validation_batch();
         }
     }
@@ -283,7 +275,7 @@ where
     /// `TransactionValidationsFailed` so the shard can clean up
     /// `pending_validation` / `locally_submitted`.
     pub(crate) fn flush_validation_batch(&mut self) {
-        let batch = self.io.validation_batch.take();
+        let batch = self.io.mempool.validation_batch.take();
         if batch.is_empty() {
             return;
         }

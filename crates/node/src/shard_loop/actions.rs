@@ -22,7 +22,7 @@ use tracing::{debug, error, trace, warn};
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
 use crate::fetch::FetchInput;
-use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding, TransactionBinding};
+use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
     make_commit_prepared, run_qc_only_prep,
@@ -31,6 +31,7 @@ use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
 };
+use crate::shard::mempool::TransactionBinding;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

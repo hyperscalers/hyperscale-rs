@@ -7,14 +7,11 @@
 //!
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
-use super::binding::{BeaconProposalFetch, ShardWitnessFetch, TransactionFetch};
+use super::binding::{BeaconProposalFetch, ShardWitnessFetch};
 use crate::config::NodeConfig;
 
 /// Per-payload fetch state machines owned by the I/O loop.
 pub struct FetchHost {
-    /// Per-block transaction fetch (intra-shard, pinned to proposer).
-    pub transaction: TransactionFetch,
-
     /// Cross-shard beacon-witness fetch (rotates through source committee).
     pub shard_witness: ShardWitnessFetch,
 
@@ -27,7 +24,6 @@ impl FetchHost {
     #[must_use]
     pub fn new(config: &NodeConfig) -> Self {
         Self {
-            transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
             shard_witness: ShardWitnessFetch::new(
                 "shard_witness",
                 config.shard_witness_fetch.clone(),
@@ -44,15 +40,15 @@ impl FetchHost {
     /// eventually retry.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
-        self.transaction.has_pending()
-            || self.shard_witness.has_pending()
-            || self.beacon_proposal.has_pending()
+        self.shard_witness.has_pending() || self.beacon_proposal.has_pending()
     }
 }
 
 /// Cheap aggregate of per-binding fetch counts (all payloads). Built by
 /// [`ShardIo::fetch_metrics`](crate::shard::ShardIo::fetch_metrics) from the
-/// `FetchHost` payloads plus the cross-shard fetch instances on
+/// `FetchHost` payloads, the transaction fetch on
+/// [`MempoolState`](crate::shard::mempool::MempoolState), and the cross-shard
+/// fetch instances on
 /// [`CrossShardState`](crate::shard::cross_shard::CrossShardState); flattened
 /// into the broader `MetricsSnapshot` by the I/O loop.
 ///

@@ -13,6 +13,7 @@ pub mod commit;
 pub mod consensus;
 pub mod cross_shard;
 pub mod io;
+pub mod mempool;
 pub mod phase_times;
 pub mod verify;
 

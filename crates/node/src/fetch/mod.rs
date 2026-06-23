@@ -9,8 +9,8 @@
 //!   binding, in `io_loop::drive_fetch_admission`.
 //! - [`host`] bundles the per-payload `Fetch<Id>` instances owned by the
 //!   I/O loop, plus metrics readouts.
-//! - [`transaction_serve`] / [`provision_serve`] answer inbound requests
-//!   for the fetch payloads that have a dedicated wire request type.
+//! - The remaining serve modules answer inbound requests for the fetch
+//!   payloads that have a dedicated wire request type.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -26,7 +26,6 @@ pub mod binding;
 pub mod host;
 pub mod shard_witness_serve;
 pub mod state_range_serve;
-pub mod transaction_serve;
 pub mod witness_history_serve;
 
 pub use host::{FetchHost, FetchMetrics};

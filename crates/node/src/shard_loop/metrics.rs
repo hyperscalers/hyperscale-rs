@@ -350,10 +350,14 @@ where
             node_provision_cache: self.shard_io(primary_shard).caches.provision_store.len(),
             node_exec_cert_cache: self.shard_io(primary_shard).caches.exec_cert_store.len(),
             node_prepared_commits: self.shard_io(primary_shard).block_commit.prepared_len(),
-            node_pending_validation: self.shard_io(primary_shard).pending_validation.len(),
-            node_locally_submitted: self.shard_io(primary_shard).locally_submitted.len(),
+            node_pending_validation: self
+                .shard_io(primary_shard)
+                .mempool
+                .pending_validation
+                .len(),
+            node_locally_submitted: self.shard_io(primary_shard).mempool.locally_submitted.len(),
             node_pending_block_commits: self.shard_io(primary_shard).block_commit.pending_len(),
-            node_validation_batch: self.shard_io(primary_shard).validation_batch.len(),
+            node_validation_batch: self.shard_io(primary_shard).mempool.validation_batch.len(),
             node_certified_header_batch: self.shard_io(primary_shard).certified_header_batch.len(),
             node_block_sync_queued_heights: block_sync_status.queued_heights,
             node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,

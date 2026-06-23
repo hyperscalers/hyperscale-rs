@@ -7,13 +7,12 @@
 //! multi-vnode hosting captures the natural sharing structure without
 //! leaking state across `NodeHost`s.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp,
-    RoutableTransaction, TxHash, ValidatorId, Verifiable,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp, ValidatorId,
+    Verifiable,
 };
 
 use crate::batch_accumulator::BatchAccumulator;
@@ -21,6 +20,7 @@ use crate::fetch::{FetchHost, FetchMetrics};
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
 use crate::shard::cross_shard::CrossShardState;
+use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::sync::SyncHost;
 
@@ -76,30 +76,9 @@ pub struct ShardIo<S: ShardStorage> {
     /// fetch instances/stores, settled-waves acquisition).
     pub cross_shard: CrossShardState,
 
-    /// Hashes currently in the validation pipeline — either sitting in
-    /// `validation_batch` or being verified off-thread. Acts as a
-    /// dedup guard so duplicate gossip / re-submits don't enqueue
-    /// twice. Entries are removed by `TransactionValidated` /
-    /// `TransactionValidationsFailed` handlers.
-    pub pending_validation: HashSet<TxHash>,
-
-    /// Subset of `pending_validation` for which this shard is the
-    /// designated source for a locally-submitted tx — i.e. it received
-    /// `AdmitAndGossipTransaction`. Carried through validation so the
-    /// resulting `TransactionValidated` event flags
-    /// `submitted_locally = true` for mempool admission accounting.
-    ///
-    /// At most one hosted shard per node enters a given tx hash here,
-    /// so the finalization metric fires exactly once per node per
-    /// locally-submitted tx even when multiple co-hosted shards touch
-    /// it. Passive co-hosts admit via `AdmitTransaction` without
-    /// inserting; gossip-only hosts via `GossipTransaction` don't
-    /// admit at all.
-    pub locally_submitted: HashSet<TxHash>,
-
-    /// Pending transactions awaiting batched signature / format /
-    /// declared-shard verification on the `tx_validation` pool.
-    pub validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
+    /// Per-shard mempool subsystem state (transaction fetch, validation
+    /// tracking sets + batch, outbound tx-gossip accumulators).
+    pub mempool: MempoolState,
 
     /// Pending remote-certified header gossip awaiting batched BLS
     /// sender-signature verification on the crypto pool.
@@ -120,18 +99,20 @@ pub struct ShardIo<S: ShardStorage> {
 }
 
 impl<S: ShardStorage> ShardIo<S> {
-    /// Snapshot per-binding fetch counts across both the `FetchHost` payloads
-    /// (transaction, shard-witness, beacon-proposal) and the cross-shard fetch
-    /// instances on [`CrossShardState`]. The I/O loop flattens this into the
-    /// larger `MetricsSnapshot`.
+    /// Snapshot per-binding fetch counts across the `FetchHost` payloads
+    /// (shard-witness, beacon-proposal), the transaction fetch on
+    /// [`MempoolState`], and the cross-shard fetch instances on
+    /// [`CrossShardState`]. The I/O loop flattens this into the larger
+    /// `MetricsSnapshot`.
     #[must_use]
     pub fn fetch_metrics(&self) -> FetchMetrics {
         let f = &self.fetches;
         let x = &self.cross_shard;
+        let m = &self.mempool;
         FetchMetrics {
-            transaction_in_flight: f.transaction.in_flight_count(),
-            transaction_pending: f.transaction.pending_count(),
-            transaction_oldest_in_flight_age_ms: f.transaction.oldest_in_flight_age_ms(),
+            transaction_in_flight: m.transaction.in_flight_count(),
+            transaction_pending: m.transaction.pending_count(),
+            transaction_oldest_in_flight_age_ms: m.transaction.oldest_in_flight_age_ms(),
             local_provision_in_flight: x.local_provision.in_flight_count(),
             local_provision_pending: x.local_provision.pending_count(),
             local_provision_oldest_in_flight_age_ms: x.local_provision.oldest_in_flight_age_ms(),

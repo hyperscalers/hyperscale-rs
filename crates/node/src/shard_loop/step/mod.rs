@@ -8,4 +8,3 @@
 mod beacon_block_sync;
 mod protocol_event;
 mod tick;
-mod tx_validation;
