@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use hyperscale_types::BlockHeight;
 use serde::Serialize;
 
-use super::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
+use crate::sync::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Configuration alias for block-sync.
 pub type BlockSyncConfig = SyncConfig;

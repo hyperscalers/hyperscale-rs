@@ -30,7 +30,7 @@ use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
     make_commit_prepared, run_qc_only_prep,
 };
-use crate::sync::block::BlockSyncInput;
+use crate::shard::consensus::BlockSyncInput;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

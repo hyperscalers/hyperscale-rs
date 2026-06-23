@@ -10,6 +10,7 @@
 
 pub mod caches;
 pub mod commit;
+pub mod consensus;
 pub mod io;
 pub mod phase_times;
 pub mod settled_set;

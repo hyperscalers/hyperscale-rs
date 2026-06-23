@@ -51,7 +51,7 @@ use tracing::instrument;
 /// style).
 ///
 /// The block-sync state machine itself lives on `NodeHost` (in
-/// `sync::block`); when a synced block is ready to apply, `NodeHost`
+/// `shard::consensus`); when a synced block is ready to apply, `NodeHost`
 /// fires a `BlockSyncReadyToApply` event into this state machine, which routes
 /// it to shard consensus.
 pub struct NodeStateMachine {
