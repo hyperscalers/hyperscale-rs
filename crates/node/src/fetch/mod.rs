@@ -22,7 +22,6 @@ use hyperscale_metrics::{
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use tracing::{debug, trace};
 
-pub mod beacon_proposal_serve;
 pub mod binding;
 pub mod exec_cert_serve;
 pub mod finalized_wave_serve;

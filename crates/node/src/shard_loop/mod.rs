@@ -41,7 +41,7 @@ pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::BeaconBlockSync;
+use crate::beacon::{BeaconBlockSync, BeaconProposalCache};
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
@@ -51,7 +51,7 @@ use crate::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
     ProvisionBinding, ShardWitnessBinding, TransactionBinding,
 };
-use crate::process_io::{BeaconProposalCache, ProcessIo};
+use crate::process_io::ProcessIo;
 use crate::shard::ShardIo;
 use crate::shard::commit::PreparedCommitMap;
 use crate::vnode::Vnode;

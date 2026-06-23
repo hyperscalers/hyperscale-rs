@@ -25,11 +25,11 @@ use hyperscale_types::{
 
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, beacon_block_sync_config};
+use crate::beacon::{BeaconBlockSync, BeaconProposalCache, beacon_block_sync_config};
 use crate::config::NodeConfig;
 use crate::fetch::FetchHost;
 use crate::pool_loop::PoolLoop;
-use crate::process_io::{BeaconProposalCache, ProcessIo, register_shard_request_handlers};
+use crate::process_io::{ProcessIo, register_shard_request_handlers};
 use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
