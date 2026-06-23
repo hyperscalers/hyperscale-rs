@@ -43,7 +43,7 @@ where
     /// Inbound handler closure already verified sender's committee
     /// membership and resolved the public key. Queue for batched BLS
     /// verification; fires `flush_certified_header_verifications` when full.
-    pub(in crate::shard_loop) fn handle_committed_block_gossip_received(
+    pub(crate) fn handle_committed_block_gossip_received(
         &mut self,
         certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
         sender: ValidatorId,

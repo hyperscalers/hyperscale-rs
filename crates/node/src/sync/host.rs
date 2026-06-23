@@ -13,9 +13,9 @@ use std::time::Instant;
 
 use hyperscale_types::{BlockHeight, ShardId};
 
-use super::block::{BlockSync, BlockSyncInput, BlockSyncOutput, BlockSyncStatus};
 use super::remote_header::{self, RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 use crate::config::NodeConfig;
+use crate::shard::consensus::{BlockSync, BlockSyncInput, BlockSyncOutput, BlockSyncStatus};
 
 /// Sync state machines owned by the I/O loop.
 pub struct SyncHost {

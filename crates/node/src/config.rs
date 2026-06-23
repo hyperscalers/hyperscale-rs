@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::fetch::FetchConfig;
-use crate::sync::block::BlockSyncConfig;
+use crate::shard::consensus::BlockSyncConfig;
 
 /// Configuration for [`NodeHost`](crate::host::NodeHost).
 ///

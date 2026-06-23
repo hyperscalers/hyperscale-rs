@@ -33,6 +33,7 @@ use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
+use crate::shard::consensus::BlockSyncInput;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::settled_set::SettledWavesAcquisitionHost;
 use crate::shard_loop::{
@@ -40,7 +41,6 @@ use crate::shard_loop::{
     SharedTopologySnapshot, StepOutput,
 };
 use crate::sync::SyncHost;
-use crate::sync::block::BlockSyncInput;
 use crate::vnode::{Vnode, VnodeInit};
 
 /// Output of [`NodeHost::into_parts`].
