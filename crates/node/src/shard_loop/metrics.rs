@@ -156,17 +156,14 @@ where
         let s = self.shard.inner();
         let fetches = self.io.fetches.metrics();
         let syncs = &self.io.syncs;
+        let rh = &self.io.cross_shard.remote_header_sync;
 
         set_sync_blocks_behind("block", s, syncs.block.blocks_behind());
         set_sync_in_progress("block", s, syncs.block.is_syncing());
         set_sync_round_in_flight("block", s, syncs.block.in_flight_ranges());
-        set_sync_blocks_behind(
-            "remote_header",
-            s,
-            syncs.remote_header.total_blocks_behind(),
-        );
-        set_sync_in_progress("remote_header", s, syncs.remote_header.is_syncing());
-        set_sync_round_in_flight("remote_header", s, syncs.remote_header.in_flight_ranges());
+        set_sync_blocks_behind("remote_header", s, rh.total_blocks_behind());
+        set_sync_in_progress("remote_header", s, rh.is_syncing());
+        set_sync_round_in_flight("remote_header", s, rh.in_flight_ranges());
         set_fetch_in_flight("transaction", s, fetches.transaction_in_flight);
         set_fetch_in_flight("provision", s, fetches.provision_in_flight);
         set_fetch_in_flight("local_provision", s, fetches.local_provision_in_flight);
@@ -239,15 +236,16 @@ where
         for shard in self.hosted_shards() {
             let fetches = self.shard_io(shard).fetches.metrics();
             let syncs = &self.shard_io(shard).syncs;
+            let rh = &self.shard_io(shard).cross_shard.remote_header_sync;
             shards.insert(
                 shard,
                 ShardMetrics {
                     blocks_behind: syncs.block.blocks_behind(),
                     is_syncing: syncs.block.is_syncing(),
                     block_sync_round_in_flight: syncs.block.in_flight_ranges(),
-                    remote_header_blocks_behind: syncs.remote_header.total_blocks_behind(),
-                    remote_header_is_syncing: syncs.remote_header.is_syncing(),
-                    remote_header_round_in_flight: syncs.remote_header.in_flight_ranges(),
+                    remote_header_blocks_behind: rh.total_blocks_behind(),
+                    remote_header_is_syncing: rh.is_syncing(),
+                    remote_header_round_in_flight: rh.in_flight_ranges(),
                     fetch_transaction: fetches.transaction_in_flight,
                     fetch_provision: fetches.provision_in_flight,
                     fetch_local_provision: fetches.local_provision_in_flight,
@@ -366,8 +364,8 @@ where
             node_exec_cert_fetch_pending: fetches.exec_cert_pending,
             node_remote_header_fetch_pending: self
                 .shard_io(primary_shard)
-                .syncs
-                .remote_header
+                .cross_shard
+                .remote_header_sync
                 .in_flight_ranges(),
             // Storage — filled in by record_metrics off-thread.
             rocksdb_block_cache_usage_bytes: 0,

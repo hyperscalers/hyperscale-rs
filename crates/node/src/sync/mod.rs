@@ -54,8 +54,6 @@ use serde::Serialize;
 use tracing::{info, trace};
 
 pub mod host;
-pub mod remote_header;
-pub mod remote_header_serve;
 
 pub use host::SyncHost;
 

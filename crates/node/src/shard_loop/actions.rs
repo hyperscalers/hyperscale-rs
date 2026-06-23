@@ -255,7 +255,7 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
-            let outputs = self.io.syncs.on_remote_header_admitted(
+            let outputs = self.io.cross_shard.on_remote_header_admitted(
                 certified_header.shard_id(),
                 certified_header.header().height(),
             );
