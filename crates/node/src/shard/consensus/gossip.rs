@@ -31,7 +31,7 @@ use hyperscale_types::{
     ValidatorId, Verifiable,
 };
 
-use crate::shard::CertifiedHeaderVerificationItem;
+use super::CertifiedHeaderVerificationItem;
 use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -53,7 +53,7 @@ where
         let item: CertifiedHeaderVerificationItem =
             (certified_header, sender, public_key, sender_signature);
         let now = self.now;
-        if self.io.certified_header_batch.push(item, now) {
+        if self.io.consensus.certified_header_batch.push(item, now) {
             self.flush_certified_header_verifications();
         }
     }
@@ -67,7 +67,7 @@ where
     /// verification; valid ones emit as `UnverifiedRemoteHeaderReceived`,
     /// invalid ones are warn-dropped.
     pub(crate) fn flush_certified_header_verifications(&mut self) {
-        let items = self.io.certified_header_batch.take();
+        let items = self.io.consensus.certified_header_batch.take();
         if items.is_empty() {
             return;
         }

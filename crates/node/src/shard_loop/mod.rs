@@ -41,13 +41,14 @@ pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, BeaconProposalCache};
+use crate::beacon::{
+    BeaconBlockSync, BeaconProposalBinding, BeaconProposalCache, ShardWitnessBinding,
+};
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
 };
 use crate::fetch::FetchInput;
-use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::process::ProcessIo;
 use crate::shard::ShardIo;
 use crate::shard::commit::PreparedCommitMap;
@@ -230,10 +231,10 @@ pub struct StepOutput {
 /// [`Vnode`] that participates in this shard's consensus, plus per-step
 /// scratch and a shared `Arc<ProcessIo>`.
 ///
-/// Same-shard vnodes share the [`ShardIo`] (one storage, one fetch host,
-/// one mempool body store, etc.); cross-shard vnodes live in different
-/// `ShardLoop`s. [`Self::step`] dispatches one [`ShardScopedInput`] to its
-/// handler.
+/// Same-shard vnodes share the [`ShardIo`] (one storage, one set of fetch
+/// instances, one mempool body store, etc.); cross-shard vnodes live in
+/// different `ShardLoop`s. [`Self::step`] dispatches one [`ShardScopedInput`]
+/// to its handler.
 pub struct ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -595,7 +596,7 @@ where
         if self.io.mempool.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
-        if self.io.certified_header_batch.is_expired(now) {
+        if self.io.consensus.certified_header_batch.is_expired(now) {
             self.flush_certified_header_verifications();
         }
         let expired_dsts: Vec<ShardId> = self
@@ -635,7 +636,7 @@ where
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         [
             self.io.mempool.validation_batch.deadline(),
-            self.io.certified_header_batch.deadline(),
+            self.io.consensus.certified_header_batch.deadline(),
         ]
         .into_iter()
         .chain(

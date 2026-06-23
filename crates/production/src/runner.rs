@@ -1638,7 +1638,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
 
     // ── /sync: per-shard block-sync state ──────────────────────────
     if let Some(ref sync_status) = config.publishers.sync_status {
-        let block_sync = shard_loop.io.syncs.block.block_sync_status();
+        let block_sync = shard_loop.io.consensus.block_sync.block_sync_status();
         let current = sync_status.load();
         let mut updated = (**current).clone();
         updated.shards.insert(

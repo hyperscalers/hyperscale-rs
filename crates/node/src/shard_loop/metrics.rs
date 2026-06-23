@@ -155,12 +155,12 @@ where
     pub fn record_prometheus(&self) {
         let s = self.shard.inner();
         let fetches = self.io.fetch_metrics();
-        let syncs = &self.io.syncs;
+        let block_sync = &self.io.consensus.block_sync;
         let rh = &self.io.cross_shard.remote_header_sync;
 
-        set_sync_blocks_behind("block", s, syncs.block.blocks_behind());
-        set_sync_in_progress("block", s, syncs.block.is_syncing());
-        set_sync_round_in_flight("block", s, syncs.block.in_flight_ranges());
+        set_sync_blocks_behind("block", s, block_sync.blocks_behind());
+        set_sync_in_progress("block", s, block_sync.is_syncing());
+        set_sync_round_in_flight("block", s, block_sync.in_flight_ranges());
         set_sync_blocks_behind("remote_header", s, rh.total_blocks_behind());
         set_sync_in_progress("remote_header", s, rh.is_syncing());
         set_sync_round_in_flight("remote_header", s, rh.in_flight_ranges());
@@ -235,14 +235,14 @@ where
 
         for shard in self.hosted_shards() {
             let fetches = self.shard_io(shard).fetch_metrics();
-            let syncs = &self.shard_io(shard).syncs;
+            let block_sync = &self.shard_io(shard).consensus.block_sync;
             let rh = &self.shard_io(shard).cross_shard.remote_header_sync;
             shards.insert(
                 shard,
                 ShardMetrics {
-                    blocks_behind: syncs.block.blocks_behind(),
-                    is_syncing: syncs.block.is_syncing(),
-                    block_sync_round_in_flight: syncs.block.in_flight_ranges(),
+                    blocks_behind: block_sync.blocks_behind(),
+                    is_syncing: block_sync.is_syncing(),
+                    block_sync_round_in_flight: block_sync.in_flight_ranges(),
                     remote_header_blocks_behind: rh.total_blocks_behind(),
                     remote_header_is_syncing: rh.is_syncing(),
                     remote_header_round_in_flight: rh.in_flight_ranges(),
@@ -290,7 +290,11 @@ where
         let prov_mem = primary_vnode.provisions_coordinator().memory_stats();
         let rh_mem = primary_vnode.remote_headers_coordinator().memory_stats();
         let fetches = self.shard_io(primary_shard).fetch_metrics();
-        let block_sync_status = self.shard_io(primary_shard).syncs.block.block_sync_status();
+        let block_sync_status = self
+            .shard_io(primary_shard)
+            .consensus
+            .block_sync
+            .block_sync_status();
 
         let memory = MemoryMetrics {
             // Shard consensus
@@ -358,7 +362,11 @@ where
             node_locally_submitted: self.shard_io(primary_shard).mempool.locally_submitted.len(),
             node_pending_block_commits: self.shard_io(primary_shard).block_commit.pending_len(),
             node_validation_batch: self.shard_io(primary_shard).mempool.validation_batch.len(),
-            node_certified_header_batch: self.shard_io(primary_shard).certified_header_batch.len(),
+            node_certified_header_batch: self
+                .shard_io(primary_shard)
+                .consensus
+                .certified_header_batch
+                .len(),
             node_block_sync_queued_heights: block_sync_status.queued_heights,
             node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
             node_tx_fetch_blocks: fetches.transaction_pending,

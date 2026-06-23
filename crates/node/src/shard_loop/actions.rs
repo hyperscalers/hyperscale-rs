@@ -21,8 +21,8 @@ use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
+use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::FetchInput;
-use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
     make_commit_prepared, run_qc_only_prep,
@@ -478,8 +478,8 @@ where
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
                     .io
-                    .syncs
-                    .block
+                    .consensus
+                    .block_sync
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
 
@@ -508,15 +508,13 @@ where
 
     /// Dispatch a typed fetch request to the corresponding binding.
     ///
-    /// This shard's [`FetchHost`] owns the request — the shard of the
-    /// emitting vnode, not the routing target. The routing target (where
-    /// to send the request) lives on the [`FetchRequest`] variant itself
-    /// as a `shard` / `source_shard` field. `Request` never emits `Send`s
-    /// on its own — it only adds the ids to the pending set; chunks fan
-    /// out under the per-tick cap. The tick timer is refreshed once at
+    /// The fetch instance lives in this shard's `ShardIo` — keyed by the
+    /// emitting vnode's shard, not the routing target. The routing target
+    /// (where to send the request) lives on the [`FetchRequest`] variant
+    /// itself as a `shard` / `source_shard` field. `Request` never emits
+    /// `Send`s on its own — it only adds the ids to the pending set; chunks
+    /// fan out under the per-tick cap. The tick timer is refreshed once at
     /// the end of `NodeHost::step`.
-    ///
-    /// [`FetchHost`]: crate::fetch::FetchHost
     #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
@@ -624,15 +622,13 @@ where
 
     /// Dispatch a typed fetch-abandon to the corresponding binding.
     ///
-    /// This shard's [`FetchHost`] is notified — the abandoning vnode's
-    /// shard, not the routing target of the original request. Symmetric
-    /// to [`Self::process_fetch_request`] — translates the variant payload
-    /// into ids and feeds them through `FetchInput::Abandoned`, which
-    /// removes them from the binding's pending set and increments
-    /// `record_fetch_abandoned` so the cancellation is observable
-    /// separately from genuine admissions.
-    ///
-    /// [`FetchHost`]: crate::fetch::FetchHost
+    /// The fetch instance in this shard's `ShardIo` is notified — keyed by
+    /// the abandoning vnode's shard, not the routing target of the original
+    /// request. Symmetric to [`Self::process_fetch_request`] — translates the
+    /// variant payload into ids and feeds them through `FetchInput::Abandoned`,
+    /// which removes them from the binding's pending set and increments
+    /// `record_fetch_abandoned` so the cancellation is observable separately
+    /// from genuine admissions.
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
     fn process_fetch_abandon(&mut self, req: FetchAbandon) {
         match req {

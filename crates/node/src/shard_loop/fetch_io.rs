@@ -28,8 +28,6 @@ where
     ///
     /// The shard's id is threaded through to per-binding callbacks so the
     /// response can be routed back to this shard.
-    ///
-    /// [`FetchHost`]: crate::fetch::FetchHost
     pub(in crate::shard_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
@@ -143,14 +141,15 @@ where
     /// Interval for the periodic fetch tick timer.
     pub(in crate::shard_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-    /// Refresh this shard's `FetchTick` timer based on whether its own
-    /// fetch host or sync host has any pending work. Each shard manages
-    /// its own ticker — a shard with idle fetches stops paying for the
-    /// 200ms wake-up while busier shards keep ticking.
+    /// Refresh this shard's `FetchTick` timer based on whether any of its
+    /// subsystems (beacon fetches, mempool, consensus block-sync, beacon-block
+    /// sync, cross-shard) has pending work. Each shard manages its own ticker
+    /// — a shard with idle fetches stops paying for the 200ms wake-up while
+    /// busier shards keep ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
-        let any_pending = self.io.fetches.has_any_pending()
+        let any_pending = self.io.beacon_fetch.has_pending()
             || self.io.mempool.has_pending()
-            || self.io.syncs.has_any_pending()
+            || self.io.consensus.has_pending()
             || beacon::has_pending(&self.beacon_block)
             || self.io.cross_shard.has_pending();
         let op = if any_pending {

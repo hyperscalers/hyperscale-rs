@@ -676,7 +676,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     };
 
     use crate::beacon::serve::serve_beacon_block_request;
-    use crate::fetch::shard_witness_serve::serve_shard_witnesses_request;
+    use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::fetch::state_range_serve::serve_state_range_request;
     use crate::fetch::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;

@@ -6,16 +6,21 @@
 //! through. [`commit`] is the per-host beacon-commit dedup; [`proposal_cache`]
 //! and [`proposal_serve`] back the beacon-proposal pool's serve path.
 //! [`serve`] answers inbound `GetBeaconBlockRequest`s; [`gossip`] registers
-//! the beacon gossip handlers.
+//! the beacon gossip handlers. [`fetch`] holds the two per-shard beacon
+//! fetches (missing proposals, shard-witness leaves) and their bindings;
+//! [`witness_serve`] answers inbound `GetShardWitnessesRequest`s.
 
 pub mod commit;
+pub mod fetch;
 pub mod gossip;
 pub mod proposal_cache;
 pub mod proposal_serve;
 pub mod serve;
 pub mod sync;
+pub mod witness_serve;
 
 pub use commit::BeaconCommitCoordinator;
+pub use fetch::{BeaconFetchState, BeaconProposalBinding, ShardWitnessBinding};
 pub use proposal_cache::BeaconProposalCache;
 pub use sync::{
     BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config, has_pending, on_admitted,

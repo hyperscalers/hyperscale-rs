@@ -105,7 +105,11 @@ where
             shards.insert(
                 shard,
                 ShardStatus {
-                    block_sync: self.shard_io(shard).syncs.block.block_sync_status(),
+                    block_sync: self
+                        .shard_io(shard)
+                        .consensus
+                        .block_sync
+                        .block_sync_status(),
                 },
             );
 

@@ -24,16 +24,16 @@ use hyperscale_types::{
 };
 
 use crate::NodeStateMachine;
-use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, BeaconProposalCache, beacon_block_sync_config};
+use crate::beacon::{
+    BeaconBlockSync, BeaconFetchState, BeaconProposalCache, beacon_block_sync_config,
+};
 use crate::config::NodeConfig;
-use crate::fetch::FetchHost;
 use crate::pool_loop::PoolLoop;
 use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
-use crate::shard::consensus::BlockSyncInput;
+use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
@@ -41,7 +41,6 @@ use crate::shard_loop::{
     DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardLoop,
     SharedTopologySnapshot, StepOutput,
 };
-use crate::sync::SyncHost;
 use crate::vnode::{Vnode, VnodeInit};
 
 /// Output of [`NodeHost::into_parts`].
@@ -741,20 +740,15 @@ fn build_shard_io<S: ShardStorage>(
         pending_chain: Arc::clone(&pending_chain),
         prepared_commits: block_commit.prepared_commits_handle(),
     };
-    let b = &config.batch;
     let mut io = ShardIo {
         storage,
         pending_chain,
         block_commit,
         caches,
-        fetches: FetchHost::new(config),
-        syncs: SyncHost::new(config),
+        consensus: ConsensusState::new(config),
         cross_shard: CrossShardState::new(config),
         mempool: MempoolState::new(config),
-        certified_header_batch: BatchAccumulator::new(
-            b.certified_header_max,
-            b.certified_header_window,
-        ),
+        beacon_fetch: BeaconFetchState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
     };
@@ -764,7 +758,7 @@ fn build_shard_io<S: ShardStorage>(
     // re-pulling the whole chain from genesis for the coordinator to
     // filter as already committed.
     if initial_persisted_height > BlockHeight::GENESIS {
-        let outputs = io.syncs.block.handle(BlockSyncInput::Admitted {
+        let outputs = io.consensus.block_sync.handle(BlockSyncInput::Admitted {
             scope: (),
             height: initial_persisted_height,
         });
