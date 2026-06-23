@@ -25,8 +25,7 @@ use hyperscale_types::{
 };
 
 use crate::config::NodeConfig;
-use crate::fetch::Fetch;
-use crate::fetch::binding::FetchBinding;
+use crate::fetch::{Fetch, FetchBinding};
 use crate::shard::ShardIo;
 use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
 

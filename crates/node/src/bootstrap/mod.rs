@@ -23,7 +23,9 @@ pub mod merge_flip;
 pub mod observer;
 pub mod snap_sync;
 pub mod split_flip;
+pub mod state_range_serve;
 pub mod witness_history;
+pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_storage::{GenesisCommit, ImportLeaf, RecoveredState, ShardChainReader};
@@ -333,8 +335,8 @@ mod tests {
     use hyperscale_types::ShardWitnessPayload;
 
     use super::*;
-    use crate::fetch::state_range_serve::serve_state_range_request;
-    use crate::fetch::witness_history_serve::serve_witness_history_request;
+    use crate::bootstrap::state_range_serve::serve_state_range_request;
+    use crate::bootstrap::witness_history_serve::serve_witness_history_request;
 
     const ENTRIES: u8 = 12;
 
