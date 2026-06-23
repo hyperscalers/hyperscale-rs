@@ -150,7 +150,7 @@ where
         let any_pending = self.io.fetches.has_any_pending()
             || self.io.syncs.has_any_pending()
             || beacon::has_pending(&self.beacon_block)
-            || self.io.settled_set_sync.has_pending();
+            || self.io.cross_shard.settled_set_sync.has_pending();
         let op = if any_pending {
             TimerOp::Set {
                 shard: self.shard,

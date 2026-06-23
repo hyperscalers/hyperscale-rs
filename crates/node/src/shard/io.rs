@@ -20,8 +20,8 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchHost;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
+use crate::shard::cross_shard::CrossShardState;
 use crate::shard::phase_times::TxPhaseTimesCache;
-use crate::shard::settled_set::SettledWavesAcquisitionHost;
 use crate::sync::SyncHost;
 
 /// A certified header pending sender-signature verification, queued in
@@ -72,10 +72,9 @@ pub struct ShardIo<S: ShardStorage> {
     /// cross-shard data dependencies).
     pub syncs: SyncHost,
 
-    /// Settled-waves acquisition drivers — one per past-terminal remote
-    /// shard whose `S_P` this node is acquiring for the split-boundary
-    /// fence.
-    pub settled_set_sync: SettledWavesAcquisitionHost,
+    /// Per-shard cross-shard subsystem state (remote-header sync, cross-shard
+    /// fetch instances/stores, settled-waves acquisition).
+    pub cross_shard: CrossShardState,
 
     /// Hashes currently in the validation pipeline — either sitting in
     /// `validation_batch` or being verified off-thread. Acts as a

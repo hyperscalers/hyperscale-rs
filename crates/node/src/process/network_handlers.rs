@@ -685,8 +685,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::fetch::transaction_serve::serve_transaction_request;
     use crate::fetch::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
+    use crate::shard::cross_shard::serve_settled_waves_request;
     use crate::sync::remote_header_serve::serve_remote_headers_request;
-    use crate::sync::settled_waves_serve::serve_settled_waves_request;
 
     type ProvisionResponse = GetProvisionResponse;
     type ProvisionWaiter = Arc<(

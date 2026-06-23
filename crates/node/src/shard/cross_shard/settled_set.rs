@@ -8,7 +8,7 @@
 //! window list, checked against the beacon-attested `settled_waves_root`
 //! the node read from its own fold.
 //!
-//! Sans-io like the [`Sync`](super::sync) FSMs: methods fold an input and
+//! Sans-io like the [`Sync`](crate::sync) FSMs: methods fold an input and
 //! return [`SettledWavesAcquisitionOutput`]s the I/O glue turns into
 //! network requests and a `SettledWavesReconstructed` event. A correct
 //! terminal committee satisfies the root check on the first fetch; a
@@ -89,7 +89,7 @@ pub enum SettledWavesAcquisitionOutput {
 }
 
 /// Drives one settled-waves acquisition per past-terminal shard. One per
-/// [`ShardIo`](super::ShardIo); shared across the shard's vnodes, so a
+/// [`ShardIo`](crate::shard::ShardIo); shared across the shard's vnodes, so a
 /// duplicate start for an already-targeted terminal is deduplicated.
 #[derive(Default)]
 pub struct SettledWavesAcquisitionHost {
@@ -242,7 +242,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::sync::settled_waves_serve::serve_settled_waves_request;
+    use crate::shard::cross_shard::settled_waves_serve::serve_settled_waves_request;
 
     const SHARD: ShardId = ShardId::ROOT;
 

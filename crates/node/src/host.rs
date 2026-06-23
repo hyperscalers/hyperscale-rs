@@ -34,8 +34,8 @@ use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::BlockSyncInput;
+use crate::shard::cross_shard::CrossShardState;
 use crate::shard::phase_times::TxPhaseTimesCache;
-use crate::shard::settled_set::SettledWavesAcquisitionHost;
 use crate::shard_loop::{
     DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardLoop,
     SharedTopologySnapshot, StepOutput,
@@ -758,7 +758,7 @@ fn build_shard_io<S: ShardStorage>(
         caches,
         fetches: FetchHost::new(config),
         syncs: SyncHost::new(config),
-        settled_set_sync: SettledWavesAcquisitionHost::new(),
+        cross_shard: CrossShardState::new(),
         pending_validation: HashSet::new(),
         locally_submitted: HashSet::new(),
         validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
