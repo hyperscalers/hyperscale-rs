@@ -39,7 +39,6 @@ mod fetch_io;
 mod lifecycle;
 mod metrics;
 mod protocol_event;
-mod status;
 mod timer;
 
 use std::collections::HashMap;
@@ -60,7 +59,6 @@ use hyperscale_types::{
 };
 pub use io::ShardIo;
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
-pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{
