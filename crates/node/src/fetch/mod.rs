@@ -3,12 +3,11 @@
 //!
 //! - The generic [`Fetch`] state machine in this file owns scheduling
 //!   only — pending sets, chunking, in-flight caps.
-//! - [`binding`] provides per-payload glue: which `Fetch<Id>` instance on
-//!   [`FetchHost`] backs each payload and the wire shape of each request.
-//!   The `ProtocolEvent` → in-flight-drain mapping lives outside the
+//! - [`binding`] provides the per-payload [`FetchBinding`](binding::FetchBinding)
+//!   trait — which `Fetch<Id>` instance backs each payload and the wire shape
+//!   of each request. The concrete binding impls live with their subsystem
+//!   state; the `ProtocolEvent` → in-flight-drain mapping lives outside the
 //!   binding, in `io_loop::drive_fetch_admission`.
-//! - [`host`] bundles the per-payload `Fetch<Id>` instances owned by the
-//!   I/O loop, plus metrics readouts.
 //! - The remaining serve modules answer inbound requests for the fetch
 //!   payloads that have a dedicated wire request type.
 
@@ -23,12 +22,8 @@ use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use tracing::{debug, trace};
 
 pub mod binding;
-pub mod host;
-pub mod shard_witness_serve;
 pub mod state_range_serve;
 pub mod witness_history_serve;
-
-pub use host::{FetchHost, FetchMetrics};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
@@ -202,7 +197,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     }
 
     /// Age in milliseconds of the longest-running in-flight entry, or
-    /// `0` if nothing is in flight. Surfaced through `FetchHost::metrics`
+    /// `0` if nothing is in flight. Surfaced through `ShardIo::fetch_metrics`
     /// so an alert on `> N` catches admission paths that silently dropped
     /// without notifying the FSM — the symptom that motivated the
     /// provision-fetch robustness work in the first place.

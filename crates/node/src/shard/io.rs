@@ -1,43 +1,25 @@
 //! Per-shard I/O state hosted by the `NodeHost`.
 //!
 //! One [`ShardIo`] per hosted shard. Same-shard `Vnode`s share their
-//! `ShardIo`; cross-shard `Vnode`s live independently. Shard-scoped
-//! state (storage, fetch host, sync host, block-commit pipeline,
-//! request-serving caches, batch accumulators) lives here so that
-//! multi-vnode hosting captures the natural sharing structure without
+//! `ShardIo`; cross-shard `Vnode`s live independently. Shard-scoped state
+//! is grouped by subsystem — [`ConsensusState`], [`CrossShardState`],
+//! [`MempoolState`], [`BeaconFetchState`] — over genuinely-shared infra
+//! (storage, pending chain, block-commit pipeline, request-serving caches),
+//! so multi-vnode hosting captures the natural sharing structure without
 //! leaking state across `NodeHost`s.
 
 use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, ShardStorage};
-use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp, ValidatorId,
-    Verifiable,
-};
+use hyperscale_types::LocalTimestamp;
 
-use crate::batch_accumulator::BatchAccumulator;
-use crate::fetch::{FetchHost, FetchMetrics};
+use crate::beacon::BeaconFetchState;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
+use crate::shard::consensus::ConsensusState;
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
-use crate::sync::SyncHost;
-
-/// A certified header pending sender-signature verification, queued in
-/// `ShardIo::certified_header_batch` and drained on the crypto pool.
-///
-/// The wrapper carries verification state across the in-process gossip
-/// boundary — wire arrivals land as `Verifiable::Unverified` per SBOR
-/// rules, local-dispatched arrivals from a colocated proposer ride as
-/// `Verifiable::Verified` so the flush step can fast-path them past the
-/// sender-signature batch.
-pub type CertifiedHeaderVerificationItem = (
-    Arc<Verifiable<CertifiedBlockHeader>>,
-    ValidatorId,
-    Bls12381G1PublicKey,
-    Bls12381G2Signature,
-);
 
 /// Per-shard I/O state hosted by the `NodeHost`.
 pub struct ShardIo<S: ShardStorage> {
@@ -63,14 +45,9 @@ pub struct ShardIo<S: ShardStorage> {
     /// view shared with external RPC consumers.
     pub caches: SharedCaches,
 
-    /// Per-payload fetch state machines (transactions, exec certs,
-    /// provisions, finalized waves, local provisions).
-    pub fetches: FetchHost,
-
-    /// Sync state machines: block-sync (catch up the shard chain) and
-    /// remote-header sync (track other shards' certified headers for
-    /// cross-shard data dependencies).
-    pub syncs: SyncHost,
+    /// Per-shard consensus subsystem state (block-sync FSM, certified-header
+    /// verification batch).
+    pub consensus: ConsensusState,
 
     /// Per-shard cross-shard subsystem state (remote-header sync, cross-shard
     /// fetch instances/stores, settled-waves acquisition).
@@ -80,9 +57,9 @@ pub struct ShardIo<S: ShardStorage> {
     /// tracking sets + batch, outbound tx-gossip accumulators).
     pub mempool: MempoolState,
 
-    /// Pending remote-certified header gossip awaiting batched BLS
-    /// sender-signature verification on the crypto pool.
-    pub certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
+    /// Per-shard beacon fetch instances (missing proposals, shard-witness
+    /// leaves) the beacon coordinator drives for this shard.
+    pub beacon_fetch: BeaconFetchState,
 
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`
@@ -99,14 +76,14 @@ pub struct ShardIo<S: ShardStorage> {
 }
 
 impl<S: ShardStorage> ShardIo<S> {
-    /// Snapshot per-binding fetch counts across the `FetchHost` payloads
-    /// (shard-witness, beacon-proposal), the transaction fetch on
-    /// [`MempoolState`], and the cross-shard fetch instances on
-    /// [`CrossShardState`]. The I/O loop flattens this into the larger
+    /// Snapshot per-binding fetch counts across the transaction fetch on
+    /// [`MempoolState`], the cross-shard fetch instances on
+    /// [`CrossShardState`], and the beacon fetch instances on
+    /// [`BeaconFetchState`]. The I/O loop flattens this into the larger
     /// `MetricsSnapshot`.
     #[must_use]
     pub fn fetch_metrics(&self) -> FetchMetrics {
-        let f = &self.fetches;
+        let b = &self.beacon_fetch;
         let x = &self.cross_shard;
         let m = &self.mempool;
         FetchMetrics {
@@ -125,12 +102,48 @@ impl<S: ShardStorage> ShardIo<S> {
             exec_cert_in_flight: x.exec_cert.in_flight_count(),
             exec_cert_pending: x.exec_cert.pending_count(),
             exec_cert_oldest_in_flight_age_ms: x.exec_cert.oldest_in_flight_age_ms(),
-            shard_witness_in_flight: f.shard_witness.in_flight_count(),
-            shard_witness_pending: f.shard_witness.pending_count(),
-            shard_witness_oldest_in_flight_age_ms: f.shard_witness.oldest_in_flight_age_ms(),
-            beacon_proposal_in_flight: f.beacon_proposal.in_flight_count(),
-            beacon_proposal_pending: f.beacon_proposal.pending_count(),
-            beacon_proposal_oldest_in_flight_age_ms: f.beacon_proposal.oldest_in_flight_age_ms(),
+            shard_witness_in_flight: b.shard_witness.in_flight_count(),
+            shard_witness_pending: b.shard_witness.pending_count(),
+            shard_witness_oldest_in_flight_age_ms: b.shard_witness.oldest_in_flight_age_ms(),
+            beacon_proposal_in_flight: b.beacon_proposal.in_flight_count(),
+            beacon_proposal_pending: b.beacon_proposal.pending_count(),
+            beacon_proposal_oldest_in_flight_age_ms: b.beacon_proposal.oldest_in_flight_age_ms(),
         }
     }
+}
+
+/// Cheap aggregate of per-binding fetch counts (all payloads). Built by
+/// [`ShardIo::fetch_metrics`] from the transaction fetch on
+/// [`MempoolState`], the cross-shard fetch instances on [`CrossShardState`],
+/// and the beacon fetch instances on [`BeaconFetchState`]; flattened into
+/// the broader `MetricsSnapshot` by the I/O loop.
+///
+/// `_oldest_in_flight_age_ms` is `0` when nothing is in flight; otherwise
+/// the age (in milliseconds) of the longest-running in-flight entry.
+/// Alerting on this rising past tens of seconds catches admission paths
+/// that silently dropped a response without notifying the FSM — the
+/// pin scenario the rest of this work fixed for specific known sites.
+#[allow(missing_docs)] // flat readouts; field names are the documentation
+pub struct FetchMetrics {
+    pub transaction_in_flight: usize,
+    pub transaction_pending: usize,
+    pub transaction_oldest_in_flight_age_ms: u64,
+    pub local_provision_in_flight: usize,
+    pub local_provision_pending: usize,
+    pub local_provision_oldest_in_flight_age_ms: u64,
+    pub finalized_wave_in_flight: usize,
+    pub finalized_wave_pending: usize,
+    pub finalized_wave_oldest_in_flight_age_ms: u64,
+    pub provision_in_flight: usize,
+    pub provision_pending: usize,
+    pub provision_oldest_in_flight_age_ms: u64,
+    pub exec_cert_in_flight: usize,
+    pub exec_cert_pending: usize,
+    pub exec_cert_oldest_in_flight_age_ms: u64,
+    pub shard_witness_in_flight: usize,
+    pub shard_witness_pending: usize,
+    pub shard_witness_oldest_in_flight_age_ms: u64,
+    pub beacon_proposal_in_flight: usize,
+    pub beacon_proposal_pending: usize,
+    pub beacon_proposal_oldest_in_flight_age_ms: u64,
 }

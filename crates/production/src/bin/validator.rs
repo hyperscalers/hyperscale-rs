@@ -41,7 +41,7 @@
 //! ```
 //!
 //! A host can run multiple validators in one process by listing additional
-//! `[[vnode]]` blocks. Same-shard vnodes share storage, fetch host, and
+//! `[[vnode]]` blocks. Same-shard vnodes share storage, fetch state, and
 //! gossipsub subscriptions; different-shard vnodes share only the libp2p
 //! peer and dispatch pools.
 

@@ -5,7 +5,7 @@
 //! topology, surface their own seat triggers) but run no shard consensus. It is
 //! the lightweight sibling of [`ShardLoop`](crate::shard_loop::ShardLoop): a
 //! `Vec<Vnode>` plus a cloned `Arc<ProcessIo>` and per-step scratch — no
-//! `ShardIo`, no batch accumulators, no fetch host.
+//! `ShardIo`, no batch accumulators, no per-payload fetches.
 //!
 //! A follower's entire action set is handled **inline**. The delegated-dispatch
 //! path a `ShardLoop` uses is unbuildable here anyway (its `ActionContext` needs

@@ -1,10 +1,10 @@
-//! Per-payload bindings of the generic [`Fetch`] state machine.
+//! The per-payload binding trait for the generic [`Fetch`] state machine.
 //!
 //! Each fetch payload (transactions, provisions, headers, …) gets one
-//! [`FetchBinding`] impl that owns:
+//! [`FetchBinding`] impl — living with its subsystem state — that owns:
 //!
 //! - the `Id` type the fetch is keyed by;
-//! - which `Fetch<Id>` instance on [`FetchHost`] backs it;
+//! - which `Fetch<Id>` instance backs it (its `fetch_mut` navigates `ShardIo`);
 //! - the request/response shape and the per-binding rules for translating
 //!   responses back into [`NodeInput`] events.
 //!
@@ -14,40 +14,23 @@
 //! when each canonical admission event fires.
 //!
 //! `NodeHost` invokes the trait methods through generic helpers
-//! (`process_fetch_outputs`, `dispatch_fetch_request`), so adding a new
-//! payload means writing one impl block here — not editing three parallel
-//! files.
+//! (`process_fetch_outputs`, `drive_fetch`), so adding a new payload means
+//! writing one impl block beside its subsystem state — not editing three
+//! parallel files. This module holds the trait and the shared
+//! [`partition_solicited`] helper only; the concrete impls live in
+//! `shard/{consensus,cross_shard,mempool}` and `beacon`.
 
 use std::collections::HashSet;
 use std::hash::Hash;
-use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::request::beacon::{
-    GetBeaconProposalRequest, GetShardWitnessesRequest,
-};
-use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ShardWitness, ValidatorId,
-};
+use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 
 use super::Fetch;
 use crate::shard::ShardIo;
-use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
-
-// ─── Type aliases used across the module tree ──────────────────────────
-
-/// Cross-shard beacon-witness fetch keyed by
-/// `(source_shard, block_height, committed_block_hash, leaf_index)`.
-/// Each id is a single leaf in the source shard's accumulator at the
-/// named committed block.
-pub type ShardWitnessFetch = Fetch<(ShardId, BlockHeight, BlockHash, LeafIndex)>;
-/// Missing-proposal fetch keyed by `(epoch, validator)` — one entry
-/// per beacon-committee member whose proposal SPC's `OutputHigh`
-/// committed but the local pool never observed.
-pub type BeaconProposalFetch = Fetch<(Epoch, ValidatorId)>;
+use crate::shard_loop::HostEvent;
 
 // ─── Trait ─────────────────────────────────────────────────────────────
 
@@ -64,7 +47,8 @@ pub trait FetchBinding: 'static {
     /// to `true`; bag-of-hashes fetches leave it `false`.
     const PER_ID: bool = false;
 
-    /// Locate the `Fetch<Id>` instance for this binding inside the host.
+    /// Locate the `Fetch<Id>` instance for this binding inside `ShardIo` —
+    /// each impl navigates to its own subsystem's state.
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` against `shard`'s committee and
@@ -73,8 +57,8 @@ pub trait FetchBinding: 'static {
     /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
     /// single-element chunks before calling this.
     ///
-    /// `local_shard` is the hosted shard whose `FetchHost` produced this
-    /// request — it's threaded into the response callback so the resulting
+    /// `local_shard` is the hosted shard that produced this request — it's
+    /// threaded into the response callback so the resulting
     /// `ShardScopedInput::Protocol` and `*FetchFailed` events route to the right
     /// hosted shard under cross-shard hosting (distinct from `shard`,
     /// which selects the *target* committee).
@@ -145,159 +129,10 @@ where
     }
 }
 
-/// Marker type for the cross-shard beacon-witness fetch.
-pub struct ShardWitnessBinding;
-
-impl FetchBinding for ShardWitnessBinding {
-    type Id = (ShardId, BlockHeight, BlockHash, LeafIndex);
-
-    const NAME: &'static str = "shard_witness";
-
-    /// One request per leaf — keeps the dispatcher simple. The
-    /// underlying wire type can carry many leaves per request; a
-    /// future grouping optimisation can chunk-batch leaves that
-    /// share `(shard, block_height, committed_block_hash)`.
-    const PER_ID: bool = true;
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.fetches.shard_witness
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        debug_assert_eq!(ids.len(), 1, "PER_ID binding hands one id per chunk");
-        let (source_shard, block_height, committed_block_hash, leaf_index) = ids[0];
-        debug_assert_eq!(
-            shard, source_shard,
-            "ShardWitnessBinding routes to the source shard; the runner sets it from the variant",
-        );
-        let request = GetShardWitnessesRequest::new(
-            source_shard,
-            block_height,
-            committed_block_hash,
-            vec![leaf_index],
-        );
-        let es = sender.clone();
-        network.request(
-            shard,
-            preferred,
-            request,
-            class,
-            Box::new(move |result| {
-                let push_failed = || {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::ShardWitnessesFetchFailed {
-                            ids: vec![(
-                                source_shard,
-                                block_height,
-                                committed_block_hash,
-                                leaf_index,
-                            )],
-                        },
-                    );
-                };
-                let Ok(response) = result else {
-                    push_failed();
-                    return ResponseVerdict::Accept;
-                };
-                if response.witnesses.is_empty() {
-                    push_failed();
-                    return ResponseVerdict::Reject;
-                }
-                let witnesses: Vec<Arc<ShardWitness>> = response.witnesses.into_inner();
-                push_protocol_event(
-                    &es,
-                    local_shard,
-                    ProtocolEvent::ShardWitnessesReceived {
-                        shard_id: source_shard,
-                        witnesses,
-                    },
-                );
-                ResponseVerdict::Accept
-            }),
-        );
-    }
-}
-
-/// Marker type for the missing-proposal fetch.
-pub struct BeaconProposalBinding;
-
-impl FetchBinding for BeaconProposalBinding {
-    type Id = (Epoch, ValidatorId);
-
-    const NAME: &'static str = "beacon_proposal";
-
-    /// One request per `(epoch, validator)` — the wire type addresses
-    /// a single proposal.
-    const PER_ID: bool = true;
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.fetches.beacon_proposal
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        debug_assert_eq!(ids.len(), 1, "PER_ID binding hands one id per chunk");
-        let (epoch, validator) = ids[0];
-        let request = GetBeaconProposalRequest::new(epoch, validator);
-        let es = sender.clone();
-        network.request(
-            shard,
-            preferred,
-            request,
-            class,
-            Box::new(move |result| {
-                let push_failed = || {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::BeaconProposalFetchFailed {
-                            ids: vec![(epoch, validator)],
-                        },
-                    );
-                };
-                let Ok(response) = result else {
-                    push_failed();
-                    return ResponseVerdict::Accept;
-                };
-                let was_empty = response.proposal.is_none();
-                push_protocol_event(
-                    &es,
-                    local_shard,
-                    ProtocolEvent::BeaconProposalFetched {
-                        epoch,
-                        validator,
-                        proposal: response.proposal,
-                    },
-                );
-                if was_empty {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{RoutableTransaction, TxHash};
 

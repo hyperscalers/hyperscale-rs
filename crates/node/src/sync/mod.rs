@@ -1,4 +1,4 @@
-//! Sliding-window sync state machines plus inbound serve handlers.
+//! Sliding-window sync state machine — the scope-agnostic engine.
 //!
 //! The generic [`Sync`] state machine owns scheduling for one or more
 //! "scopes" (e.g. a single chain for block-sync; one per remote shard for
@@ -13,17 +13,10 @@
 //!
 //! Per-payload concerns — wire shape, response decoding, rehydration,
 //! payload-private state — live on the binding via [`SyncBinding`] and
-//! its associated `State` type.
-//!
-//! # Module map
-//!
-//! - [`block`] — block-sync binding (`Sync<BlockSyncBinding>`).
-//! - [`remote_header`] — remote-header sync binding
-//!   (`Sync<RemoteHeaderSyncBinding>`), one scope per remote shard.
-//! - [`block_serve`] / [`remote_header_serve`] — inbound responders for
-//!   the range requests the binding-side step layer dispatches.
-//! - [`host`] bundles the two sync state machines and exposes
-//!   IoLoop-side glue (tick, admission notification, metrics).
+//! its associated `State` type. The concrete bindings, their serves, and
+//! their driving glue live with their subsystem state (block-sync in
+//! [`crate::shard::consensus`], remote-header sync in
+//! [`crate::shard::cross_shard`]); this module is the engine only.
 //!
 //! # Usage
 //!
@@ -52,10 +45,6 @@ use std::time::{Duration, Instant};
 use hyperscale_types::{BlockHeight, Epoch};
 use serde::Serialize;
 use tracing::{info, trace};
-
-pub mod host;
-
-pub use host::SyncHost;
 
 /// Initial backoff for a deferred height after its first fetch failure.
 const DEFERRAL_BASE_MS: u64 = 1_000;

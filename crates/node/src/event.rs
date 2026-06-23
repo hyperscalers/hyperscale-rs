@@ -115,7 +115,7 @@ pub enum ShardScopedInput {
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
-    /// Periodic tick for this shard's fetch / sync hosts to retry
+    /// Periodic tick for this shard's fetch / sync state machines to retry
     /// pending operations. Scheduled by the shard's own
     /// `update_fetch_tick_timer` via [`TimerOp::Set`] / [`TimerOp::Cancel`]
     /// on `TimerId::FetchTick`; the runner's timer driver fires the timer
@@ -337,9 +337,9 @@ pub enum ShardScopedInput {
     },
 
     /// A provision fetch request failed (network error or peer returned None).
-    /// The envelope shard is the consumer (target) shard whose `FetchHost`
-    /// owns the in-flight tracking; `source_shard` here is the originating
-    /// shard whose provisions were being fetched.
+    /// The envelope shard is the consumer (target) shard whose cross-shard
+    /// fetch owns the in-flight tracking; `source_shard` here is the
+    /// originating shard whose provisions were being fetched.
     ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
         source_shard: ShardId,
