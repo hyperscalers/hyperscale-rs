@@ -121,8 +121,7 @@ impl<S: ShardStorage> ShardIo<S> {
 /// `_oldest_in_flight_age_ms` is `0` when nothing is in flight; otherwise
 /// the age (in milliseconds) of the longest-running in-flight entry.
 /// Alerting on this rising past tens of seconds catches admission paths
-/// that silently dropped a response without notifying the FSM — the
-/// pin scenario the rest of this work fixed for specific known sites.
+/// that silently dropped a response without notifying the FSM.
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 pub struct FetchMetrics {
     pub transaction_in_flight: usize,

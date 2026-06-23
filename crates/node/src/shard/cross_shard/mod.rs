@@ -9,17 +9,17 @@
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
 //! beside it.
 
-pub mod exec_cert_serve;
-pub mod fetch;
-pub mod finalized_wave_serve;
-pub mod local_provision_serve;
-pub mod provision_serve;
-pub mod remote_header;
-pub mod remote_header_serve;
+mod exec_cert_serve;
+mod fetch;
+mod finalized_wave_serve;
+mod local_provision_serve;
+mod provision_serve;
+mod remote_header;
+mod remote_header_serve;
 mod remote_header_sync;
-pub mod settled_set;
+mod settled_set;
 mod settled_set_sync;
-pub mod settled_waves_serve;
+mod settled_waves_serve;
 
 use std::time::Instant;
 
@@ -42,8 +42,7 @@ use crate::fetch::FetchConfig;
 
 /// Per-shard cross-shard subsystem state.
 ///
-/// Composed into [`ShardIo`](crate::shard::ShardIo). Grows as the cross-shard
-/// fetch instances/stores move in.
+/// Composed into [`ShardIo`](crate::shard::ShardIo).
 pub struct CrossShardState {
     /// Multi-shard remote-header sync: tracks other shards' certified header
     /// chains for the cross-shard data dependencies a shard provisions against.

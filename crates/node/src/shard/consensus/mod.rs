@@ -15,10 +15,7 @@ mod gossip;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use block::{
-    BlockSync, BlockSyncConfig, BlockSyncInput, BlockSyncOutput, BlockSyncStateKind,
-    BlockSyncStatus,
-};
+pub use block::{BlockSync, BlockSyncConfig, BlockSyncInput, BlockSyncOutput, BlockSyncStateKind};
 pub use block_serve::serve_block_request;
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, ValidatorId, Verifiable,
