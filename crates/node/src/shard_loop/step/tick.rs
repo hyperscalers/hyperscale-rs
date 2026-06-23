@@ -14,9 +14,9 @@ use hyperscale_storage::ShardStorage;
 
 use crate::beacon;
 use crate::fetch::FetchInput;
-use crate::fetch::binding::{
+use crate::fetch::binding::TransactionBinding;
+use crate::shard::cross_shard::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
-    TransactionBinding,
 };
 use crate::shard_loop::ShardLoop;
 
