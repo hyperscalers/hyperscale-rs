@@ -1,8 +1,8 @@
 //! Settled-waves acquisition I/O glue.
 //!
 //! Bridges
-//! [`SettledWavesAcquisitionHost`](super::settled_set::SettledWavesAcquisitionHost)'s
-//! scheduling to the network and to the state machine. The host owns the
+//! [`SettledWavesAcquisition`](super::settled_set::SettledWavesAcquisition)'s
+//! scheduling to the network and to the state machine. It owns the
 //! one-shot fetch-and-verify; this layer turns its
 //! [`SettledWavesAcquisitionOutput`]s into `GetSettledWavesRequest`
 //! fetches and the verified `Complete` into a `SettledWavesReconstructed`
