@@ -11,9 +11,9 @@
 pub mod caches;
 pub mod commit;
 pub mod consensus;
+pub mod cross_shard;
 pub mod io;
 pub mod phase_times;
-pub mod settled_set;
 pub mod verify;
 
 pub use io::{CertifiedHeaderVerificationItem, ShardIo};

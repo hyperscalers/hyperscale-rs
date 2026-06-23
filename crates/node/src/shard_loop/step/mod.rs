@@ -8,6 +8,5 @@
 mod beacon_block_sync;
 mod protocol_event;
 mod remote_header_sync;
-mod settled_set_sync;
 mod tick;
 mod tx_validation;
