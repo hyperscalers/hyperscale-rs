@@ -678,7 +678,6 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::beacon::serve::serve_beacon_block_request;
     use crate::fetch::shard_witness_serve::serve_shard_witnesses_request;
     use crate::fetch::state_range_serve::serve_state_range_request;
-    use crate::fetch::transaction_serve::serve_transaction_request;
     use crate::fetch::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
@@ -686,6 +685,7 @@ pub fn register_shard_request_handlers<S, N, D>(
         serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
         serve_settled_waves_request,
     };
+    use crate::shard::mempool::serve_transaction_request;
 
     type ProvisionResponse = GetProvisionResponse;
     type ProvisionWaiter = Arc<(

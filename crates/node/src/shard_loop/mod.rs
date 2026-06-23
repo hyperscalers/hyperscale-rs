@@ -22,7 +22,7 @@ mod metrics;
 mod status;
 mod step;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,8 +34,8 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
-    Block, CertifiedBlock, LocalTimestamp, RoutableTransaction, ShardId, TopologySnapshot,
-    TransactionStatus, TxHash, Verified,
+    Block, CertifiedBlock, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
+    Verified,
 };
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
@@ -47,13 +47,14 @@ pub use crate::event::{
     ShardScopedInput,
 };
 use crate::fetch::FetchInput;
-use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding, TransactionBinding};
+use crate::fetch::binding::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::process::ProcessIo;
 use crate::shard::ShardIo;
 use crate::shard::commit::PreparedCommitMap;
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
 };
+use crate::shard::mempool::TransactionBinding;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -284,17 +285,6 @@ where
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
     pub actions_generated: usize,
-    /// Per-destination-shard outbound `TransactionGossip` accumulators.
-    /// This shard acts as the "source" — locally-submitted or validated
-    /// transactions are appended here keyed by destination, each batch
-    /// fills until its count cap or time window expires, then flushes
-    /// as a single batched gossip message published to the destination
-    /// shard's topic.
-    pub outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<RoutableTransaction>>>,
-    /// Size cap for new tx-gossip accumulators.
-    pub tx_gossip_max: usize,
-    /// Time window for new tx-gossip accumulators.
-    pub tx_gossip_window: Duration,
 }
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -602,13 +592,15 @@ where
     /// Flush this shard's batch accumulators whose deadlines have
     /// expired at `now`.
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
-        if self.io.validation_batch.is_expired(now) {
+        if self.io.mempool.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
         if self.io.certified_header_batch.is_expired(now) {
             self.flush_certified_header_verifications();
         }
         let expired_dsts: Vec<ShardId> = self
+            .io
+            .mempool
             .outbound_gossip_batches
             .iter()
             .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
@@ -624,7 +616,13 @@ where
         self.flush_block_commits();
         self.flush_validation_batch();
         self.flush_certified_header_verifications();
-        let dsts: Vec<ShardId> = self.outbound_gossip_batches.keys().copied().collect();
+        let dsts: Vec<ShardId> = self
+            .io
+            .mempool
+            .outbound_gossip_batches
+            .keys()
+            .copied()
+            .collect();
         for dst in dsts {
             self.flush_tx_gossip_batch(dst);
         }
@@ -636,12 +634,14 @@ where
     #[must_use]
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         [
-            self.io.validation_batch.deadline(),
+            self.io.mempool.validation_batch.deadline(),
             self.io.certified_header_batch.deadline(),
         ]
         .into_iter()
         .chain(
-            self.outbound_gossip_batches
+            self.io
+                .mempool
+                .outbound_gossip_batches
                 .values()
                 .map(BatchAccumulator::deadline),
         )

@@ -9,11 +9,12 @@ use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
 use crate::beacon;
-use crate::fetch::binding::{FetchBinding, TransactionBinding};
+use crate::fetch::binding::FetchBinding;
 use crate::fetch::{FetchInput, FetchOutput};
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
 };
+use crate::shard::mempool::TransactionBinding;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -72,7 +73,7 @@ where
     /// `spawn_pending_fetches` so freed slots are filled in the same
     /// event-loop turn — this wrapper just routes the FSM-emitted Sends
     /// to the network.
-    pub(in crate::shard_loop) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
+    pub(crate) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
         if let FetchInput::Request {
             ids,
             shard,
@@ -148,6 +149,7 @@ where
     /// 200ms wake-up while busier shards keep ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self.io.fetches.has_any_pending()
+            || self.io.mempool.has_pending()
             || self.io.syncs.has_any_pending()
             || beacon::has_pending(&self.beacon_block)
             || self.io.cross_shard.has_pending();

@@ -35,6 +35,7 @@ use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::CrossShardState;
+use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard_loop::{
     DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardLoop,
@@ -140,7 +141,6 @@ where
     ) -> Self {
         assert!(!vnodes.is_empty(), "NodeHost requires at least one Vnode");
 
-        let b = &config.batch;
         let network = Arc::new(network);
 
         // First pass: build ShardIo + Vec<Vnode> for each shard, plus the
@@ -207,8 +207,6 @@ where
         ));
 
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
-        let tx_gossip_max = b.tx_gossip_max;
-        let tx_gossip_window = b.tx_gossip_window;
         let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
@@ -224,9 +222,6 @@ where
                     emitted_statuses: Vec::new(),
                     pending_reconfigurations: Vec::new(),
                     actions_generated: 0,
-                    outbound_gossip_batches: BTreeMap::new(),
-                    tx_gossip_max,
-                    tx_gossip_window,
                 };
                 (shard, shard_loop)
             })
@@ -643,7 +638,6 @@ where
         .add_hosted_shard(shard);
     process.network.subscribe_shard(shard);
 
-    let b = &config.batch;
     let shard_loop = ShardLoop {
         shard,
         event_tx: sender,
@@ -656,9 +650,6 @@ where
         emitted_statuses: Vec::new(),
         pending_reconfigurations: Vec::new(),
         actions_generated: 0,
-        outbound_gossip_batches: BTreeMap::new(),
-        tx_gossip_max: b.tx_gossip_max,
-        tx_gossip_window: b.tx_gossip_window,
     };
     register_shard_request_handlers(process, &shard_loop.io, shard);
     shard_loop
@@ -759,9 +750,7 @@ fn build_shard_io<S: ShardStorage>(
         fetches: FetchHost::new(config),
         syncs: SyncHost::new(config),
         cross_shard: CrossShardState::new(config),
-        pending_validation: HashSet::new(),
-        locally_submitted: HashSet::new(),
-        validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
+        mempool: MempoolState::new(config),
         certified_header_batch: BatchAccumulator::new(
             b.certified_header_max,
             b.certified_header_window,

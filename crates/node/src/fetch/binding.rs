@@ -26,13 +26,11 @@ use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::request::beacon::{
     GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ShardWitness, TxHash,
-    ValidatorId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ShardWitness, ValidatorId,
 };
 
 use super::Fetch;
@@ -41,8 +39,6 @@ use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_s
 
 // ─── Type aliases used across the module tree ──────────────────────────
 
-/// Per-tx fetch keyed by [`TxHash`].
-pub type TransactionFetch = Fetch<TxHash>;
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, leaf_index)`.
 /// Each id is a single leaf in the source shard's accumulator at the
@@ -146,74 +142,6 @@ where
         kept,
         missing,
         unsolicited,
-    }
-}
-
-/// Marker type for the per-block transaction fetch.
-pub struct TransactionBinding;
-
-impl FetchBinding for TransactionBinding {
-    type Id = TxHash;
-
-    const NAME: &'static str = "transaction";
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TxHash> {
-        &mut shard.fetches.transaction
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<TxHash>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        let es = sender.clone();
-        let hs = ids.clone();
-        network.request(
-            shard,
-            preferred,
-            GetTransactionsRequest::new(ids),
-            class,
-            Box::new(move |result| {
-                if let Ok(resp) = result {
-                    let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
-                    if !split.kept.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::TransactionsFetched { batch: split.kept },
-                        );
-                    }
-                    if !split.missing.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::TransactionsFetchFailed {
-                                hashes: split.missing.clone(),
-                            },
-                        );
-                    }
-                    // Reject the response if the peer shipped unsolicited
-                    // txs (injection attempt or buggy peer) OR if any
-                    // requested hash was missing from the delivery.
-                    if split.unsolicited > 0 || !split.missing.is_empty() {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::TransactionsFetchFailed { hashes: hs },
-                    );
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
     }
 }
 
@@ -370,8 +298,8 @@ impl FetchBinding for BeaconProposalBinding {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::RoutableTransaction;
     use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::{RoutableTransaction, TxHash};
 
     use super::*;
 
