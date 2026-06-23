@@ -27,7 +27,7 @@
 //! `provision.request` from `RocksDB` and the historical JMT. Reads are
 //! bounded by `jmt_history_length` (256 blocks by default).
 //!
-//! [`ProcessIo`]: crate::process_io::ProcessIo
+//! [`ProcessIo`]: crate::process::ProcessIo
 
 mod batch_accumulator;
 mod beacon;
@@ -37,7 +37,7 @@ pub mod event;
 mod fetch;
 pub mod host;
 pub mod pool_loop;
-pub mod process_io;
+pub mod process;
 mod shard;
 pub mod shard_loop;
 mod state;
@@ -48,7 +48,7 @@ pub use config::NodeConfig;
 pub use fetch::state_range_serve::serve_state_range_request;
 pub use fetch::witness_history_serve::serve_witness_history_request;
 pub use host::NodeHost;
-pub use process_io::TxStatusCache;
+pub use process::TxStatusCache;
 pub use shard::ShardIo;
 pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;

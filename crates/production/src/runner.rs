@@ -17,7 +17,7 @@
 //!
 //! [`ShardLoop`]: hyperscale_node::shard_loop::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
-//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
+//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -791,7 +791,7 @@ impl ProductionRunner {
     /// channels. Returns `true` on success, `false` only when every
     /// per-shard channel is closed (shutdown).
     ///
-    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
+    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
     /// # Panics
     ///
     /// Panics if `run()` has already consumed the host. The closure

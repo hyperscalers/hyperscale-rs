@@ -29,7 +29,7 @@ use crate::beacon::{BeaconBlockSync, BeaconProposalCache, beacon_block_sync_conf
 use crate::config::NodeConfig;
 use crate::fetch::FetchHost;
 use crate::pool_loop::PoolLoop;
-use crate::process_io::{ProcessIo, register_shard_request_handlers};
+use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
@@ -472,7 +472,7 @@ where
     /// `StepOutput::emitted_statuses`, this cache persists across steps
     /// and survives mempool eviction.
     ///
-    /// [`TxStatusCache`]: crate::process_io::TxStatusCache
+    /// [`TxStatusCache`]: crate::process::TxStatusCache
     #[must_use]
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.process.tx_status.get(hash).map(|(status, _)| status)

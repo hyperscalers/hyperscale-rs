@@ -165,7 +165,7 @@ fn skip_path_advances_past_blocked_epoch() {
 /// PC commits a value referencing proposals its pool never observed.
 ///
 /// Verifies that the wired-up `GetBeaconProposalRequest` responder
-/// (in `crates/node/src/process_io/network_handlers.rs`) doesn't
+/// (in `crates/node/src/process/network_handlers.rs`) doesn't
 /// regress: when fetch fires, it serves real proposals rather than
 /// the empty-response stub that used to live there.
 #[traced_test]

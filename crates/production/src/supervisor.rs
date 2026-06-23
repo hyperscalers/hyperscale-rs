@@ -31,7 +31,7 @@ use hyperscale_node::bootstrap::observer::observer_ready_signal;
 use hyperscale_node::bootstrap::split_flip::split_genesis_from_terminal;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::pool_loop::PoolLoop;
-use hyperscale_node::process_io::ProcessIo;
+use hyperscale_node::process::ProcessIo;
 use hyperscale_node::shard_loop::HostEvent;
 use hyperscale_node::{
     NodeConfig, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit, seat_follower, seat_vnode_group,

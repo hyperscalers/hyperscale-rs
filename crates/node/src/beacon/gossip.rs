@@ -17,7 +17,7 @@ use hyperscale_types::network::gossip::beacon::{BeaconBlockGossip, SkipRequestGo
 use tracing::warn;
 
 use crate::event::HostEvent;
-use crate::process_io::SharedShardSenders;
+use crate::process::SharedShardSenders;
 use crate::shard_loop::push_protocol_event;
 
 /// Register the beacon gossip handlers on `network`.
