@@ -33,7 +33,7 @@ where
 
         beacon::on_tick(self);
 
-        let outputs = self.io.syncs.remote_header_tick(now);
+        let outputs = self.io.cross_shard.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);
 
         self.settled_set_tick();

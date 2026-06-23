@@ -10,7 +10,7 @@
 
 use hyperscale_types::{BlockHeight, ShardId};
 
-use super::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
+use crate::sync::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Default upper bound on heights packed into a single range fetch.
 /// Matches `MAX_REMOTE_HEADERS_PER_REQUEST` so the responder never has to

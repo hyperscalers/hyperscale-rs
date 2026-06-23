@@ -11,9 +11,6 @@
 
 use std::time::Instant;
 
-use hyperscale_types::{BlockHeight, ShardId};
-
-use super::remote_header::{self, RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 use crate::config::NodeConfig;
 use crate::shard::consensus::{BlockSync, BlockSyncInput, BlockSyncOutput, BlockSyncStatus};
 
@@ -21,11 +18,6 @@ use crate::shard::consensus::{BlockSync, BlockSyncInput, BlockSyncOutput, BlockS
 pub struct SyncHost {
     /// Block-sync state machine.
     pub block: BlockSync,
-
-    /// Multi-shard remote-header sync state machine. Catches up missing
-    /// certified header chains by batching contiguous heights into range
-    /// fetches.
-    pub remote_header: RemoteHeaderSync,
 }
 
 impl SyncHost {
@@ -34,7 +26,6 @@ impl SyncHost {
     pub fn new(config: &NodeConfig) -> Self {
         Self {
             block: BlockSync::new(config.block_sync.clone()),
-            remote_header: RemoteHeaderSync::new(remote_header::default_config()),
         }
     }
 
@@ -44,37 +35,13 @@ impl SyncHost {
     /// fetches even if their consumer is slow to admit.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
-        self.block.has_deferred()
-            || self.block.is_syncing()
-            || self.remote_header.has_deferred()
-            || self.remote_header.is_syncing()
+        self.block.has_deferred() || self.block.is_syncing()
     }
 
     /// Drive the block-sync FSM's periodic tick. Returns the outputs the
     /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
     pub fn block_tick(&mut self, now: Instant) -> Vec<BlockSyncOutput> {
         self.block.handle(BlockSyncInput::Tick { now })
-    }
-
-    /// Drive the remote-header-sync FSM's periodic tick. Returns range
-    /// fetches and any newly-emitted `SyncComplete` for shards that just
-    /// caught up.
-    pub fn remote_header_tick(&mut self, now: Instant) -> Vec<RemoteHeaderSyncOutput> {
-        self.remote_header
-            .handle(RemoteHeaderSyncInput::Tick { now })
-    }
-
-    /// Notify the remote-header-sync FSM that `RemoteHeaderCoordinator`
-    /// admitted a header at `height` for `source_shard`.
-    pub fn on_remote_header_admitted(
-        &mut self,
-        source_shard: ShardId,
-        height: BlockHeight,
-    ) -> Vec<RemoteHeaderSyncOutput> {
-        self.remote_header.handle(RemoteHeaderSyncInput::Admitted {
-            scope: source_shard,
-            height,
-        })
     }
 
     /// Snapshot the cheap status readouts. The I/O loop flattens this
