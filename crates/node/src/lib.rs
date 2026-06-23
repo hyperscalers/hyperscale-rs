@@ -44,9 +44,9 @@ mod state;
 mod sync;
 mod vnode;
 
+pub use bootstrap::state_range_serve::serve_state_range_request;
+pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
-pub use fetch::state_range_serve::serve_state_range_request;
-pub use fetch::witness_history_serve::serve_witness_history_request;
 pub use host::NodeHost;
 pub use process::TxStatusCache;
 pub use shard::ShardIo;

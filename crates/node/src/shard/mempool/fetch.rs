@@ -12,8 +12,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::{MessageClass, ShardId, TxHash, ValidatorId};
 
-use crate::fetch::Fetch;
-use crate::fetch::binding::{FetchBinding, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, partition_solicited};
 use crate::shard::ShardIo;
 use crate::shard_loop::{HostEvent, ShardScopedInput, push_shard_input};
 

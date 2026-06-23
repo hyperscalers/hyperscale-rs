@@ -22,8 +22,7 @@ use hyperscale_types::{
     ValidatorId, Verifiable, WaveId,
 };
 
-use crate::fetch::Fetch;
-use crate::fetch::binding::{FetchBinding, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, partition_solicited};
 use crate::shard::ShardIo;
 use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
 
