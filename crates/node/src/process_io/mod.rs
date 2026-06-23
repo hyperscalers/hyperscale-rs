@@ -8,8 +8,6 @@
 //!
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
-mod beacon_commit;
-mod beacon_proposal_cache;
 mod canonical_txs;
 mod network_handlers;
 mod tx_status;
@@ -19,8 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-pub(crate) use beacon_commit::BeaconCommitCoordinator;
-pub(crate) use beacon_proposal_cache::BeaconProposalCache;
 pub(crate) use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
@@ -33,6 +29,7 @@ use hyperscale_types::{
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
+use crate::beacon::BeaconCommitCoordinator;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 

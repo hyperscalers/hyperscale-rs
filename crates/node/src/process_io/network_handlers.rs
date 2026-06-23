@@ -7,7 +7,6 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::gossip::beacon::{BeaconBlockGossip, SkipRequestGossip};
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
 use hyperscale_types::network::notification::beacon::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
@@ -28,7 +27,8 @@ use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, ready_signal_message};
 use tracing::warn;
 
-use crate::event::{HostEvent, ShardScopedInput};
+use crate::beacon::gossip::register_beacon_gossip_handlers;
+use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
 use crate::process_io::ProcessIo;
 use crate::shard::ShardIo;
@@ -138,80 +138,16 @@ where
                 },
             );
 
-        // ── beacon.block → ProtocolEvent::BeaconBlockReceived ───────
-        //
-        // Beacon-block gossip is `TopicScope::Global`; the framework
-        // fans it out to every hosted shard. Each shard's vnodes
-        // process the gossip independently through `handle_beacon` —
-        // the coordinator dedups verification by block hash and ignores
-        // blocks at or behind its tip.
-        let senders = self.process.shard_event_senders.clone();
-        self.process
-            .network
-            .register_gossip_handler::<BeaconBlockGossip>(
-                move |gossip: BeaconBlockGossip, target_shard: ShardId| -> GossipVerdict {
-                    let senders = senders.load();
-                    let Some(tx) = senders.get(&target_shard) else {
-                        warn!(
-                            target_shard = target_shard.inner(),
-                            "Dropping beacon block gossip: shard not hosted"
-                        );
-                        return GossipVerdict::Reject;
-                    };
-                    push_protocol_event(
-                        tx,
-                        target_shard,
-                        ProtocolEvent::BeaconBlockReceived {
-                            block: gossip.block,
-                        },
-                    );
-                    GossipVerdict::Accept
-                },
-            );
-
-        // ── beacon.block → pool follower (additive, shard-less hosts) ──
-        //
-        // The per-hosted-shard Global fan above never reaches a host with
-        // no hosted shards. Register an additive host-level handler on
-        // every host that routes the committed block to the pool's beacon
-        // channel — but only while a pool is actually draining that channel
-        // (`beacon_route_active`). Registering unconditionally lets a pool
-        // built at runtime (a validator draining off its last shard) be
-        // fed, while the gate keeps a host with no live pool from either
-        // dropping the registration or backing the channel up unbounded.
-        let beacon_sender = self.process.beacon_event_sender.clone();
+        // Beacon gossip (beacon.block per-shard + host-level pool route +
+        // beacon.skip_request) lives in `crate::beacon::gossip` — the closures
+        // capture only the senders, the pool channel, and the route gate.
         let route_active = self.process.beacon_route_active();
-        self.process
-            .network
-            .register_host_gossip_handler::<BeaconBlockGossip>(move |gossip: BeaconBlockGossip| {
-                if !route_active.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                let _ = beacon_sender.send(HostEvent::beacon(ProtocolEvent::BeaconBlockReceived {
-                    block: gossip.block,
-                }));
-            });
-
-        // ── beacon.skip_request → ProtocolEvent::UnverifiedSkipRequestReceived ──
-        let senders = self.process.shard_event_senders.clone();
-        self.process
-            .network
-            .register_gossip_handler::<SkipRequestGossip>(
-                move |gossip: SkipRequestGossip, target_shard: ShardId| -> GossipVerdict {
-                    let senders = senders.load();
-                    let Some(tx) = senders.get(&target_shard) else {
-                        return GossipVerdict::Reject;
-                    };
-                    push_protocol_event(
-                        tx,
-                        target_shard,
-                        ProtocolEvent::UnverifiedSkipRequestReceived {
-                            request: gossip.request,
-                        },
-                    );
-                    GossipVerdict::Accept
-                },
-            );
+        register_beacon_gossip_handlers(
+            &*self.process.network,
+            &self.process.shard_event_senders,
+            &self.process.beacon_event_sender,
+            &route_active,
+        );
     }
 
     /// Register notification handlers for protocol messages sent via unicast

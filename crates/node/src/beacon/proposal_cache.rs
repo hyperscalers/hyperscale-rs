@@ -18,7 +18,7 @@ use hyperscale_types::{
     ValidatorId, Verifiable, Verified, Verify,
 };
 
-use crate::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
+use super::proposal_serve::serve_beacon_proposal_request;
 
 /// Per-epoch cache of beacon proposals for inbound fetch serving.
 ///
