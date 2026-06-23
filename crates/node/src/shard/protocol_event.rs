@@ -13,7 +13,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::BlockHeight;
 
-use crate::shard_loop::ShardLoop;
+use crate::shard::ShardLoop;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -26,7 +26,7 @@ where
     /// and `pending_chain`'s pruning watermark, and the event picks up
     /// the authoritative substate byte total from storage so the state
     /// machine's count frontier reconciles even across sync commits.
-    pub(in crate::shard_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
+    pub(in crate::shard) fn handle_block_persisted(&mut self, height: BlockHeight) {
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
@@ -40,7 +40,7 @@ where
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
     /// drain hooks (so e.g. `TransactionsReceived` clears in-flight tracking)
     /// and feed the variant into the state machine.
-    pub(in crate::shard_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
+    pub(in crate::shard) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
         self.drive_fetch_admission(&event);
         self.dispatch_event(event);
     }

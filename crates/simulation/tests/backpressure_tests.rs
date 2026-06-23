@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{

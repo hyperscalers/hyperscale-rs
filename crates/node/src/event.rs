@@ -121,8 +121,8 @@ pub enum ShardScopedInput {
     /// on `TimerId::FetchTick`; the runner's timer driver fires the timer
     /// into this shard's input channel.
     ///
-    /// [`TimerOp::Set`]: crate::shard_loop::TimerOp::Set
-    /// [`TimerOp::Cancel`]: crate::shard_loop::TimerOp::Cancel
+    /// [`TimerOp::Set`]: crate::shard::TimerOp::Set
+    /// [`TimerOp::Cancel`]: crate::shard::TimerOp::Cancel
     FetchTick,
 
     /// Raw gossip-delivered transaction. `NodeHost` queues it for async

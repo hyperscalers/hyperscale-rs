@@ -2,7 +2,7 @@
 //!
 //! The beacon chain is host-global — one chain per host, `Scope = ()` — so
 //! the catch-up logic has one home here rather than a copy per driver. Both
-//! the per-shard [`ShardLoop`](crate::shard_loop::ShardLoop) and the
+//! the per-shard [`ShardLoop`](crate::shard::ShardLoop) and the
 //! shard-less [`PoolLoop`](crate::pool_loop::PoolLoop) drive the same FSM
 //! through [`BeaconSyncSink`]; only block delivery, fetch routing, and the
 //! FSM instance differ per driver. The FSM *instance* stays per-driver

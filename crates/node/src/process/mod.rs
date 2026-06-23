@@ -6,7 +6,7 @@
 //! [`ShardLoop`]'s job. Wrapped in `Arc` so off-thread closures and
 //! per-shard drivers can share the same handle.
 //!
-//! [`ShardLoop`]: crate::shard_loop::ShardLoop
+//! [`ShardLoop`]: crate::shard::ShardLoop
 
 mod canonical_txs;
 mod network_handlers;
@@ -31,7 +31,7 @@ pub use tx_status::TxStatusCache;
 
 use crate::beacon::BeaconCommitCoordinator;
 use crate::event::{HostEvent, ShardScopedInput};
-use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
+use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 
 /// Lock-free per-shard event-sender map.
 ///

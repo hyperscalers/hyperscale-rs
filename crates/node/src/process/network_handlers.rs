@@ -31,12 +31,11 @@ use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
-use crate::shard::ShardIo;
 use crate::shard::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
 };
-use crate::shard_loop::{push_protocol_event, push_shard_input};
+use crate::shard::{ShardIo, push_protocol_event, push_shard_input};
 
 impl<S, N, D> NodeHost<S, N, D>
 where

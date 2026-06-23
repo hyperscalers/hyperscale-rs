@@ -35,7 +35,7 @@ use hyperscale_types::{
 
 use crate::event::classify_fetch_error;
 use crate::shard::consensus::{BlockSyncInput, BlockSyncOutput};
-use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 use crate::sync::SyncOutput;
 
 impl<S, N, D> ShardLoop<S, N, D>

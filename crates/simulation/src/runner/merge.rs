@@ -23,7 +23,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::merge_flip::merge_genesis_from_terminals;
 use hyperscale_node::bootstrap::observer::observer_ready_signal;
 use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap, replicate_engine_bootstrap};
-use hyperscale_node::shard_loop::HostEvent;
+use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{serve_state_range_request, serve_witness_history_request};
 use hyperscale_storage::{BoundaryStore, ImportLeaf, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;

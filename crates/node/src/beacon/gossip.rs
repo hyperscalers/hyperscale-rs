@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::event::HostEvent;
 use crate::process::SharedShardSenders;
-use crate::shard_loop::push_protocol_event;
+use crate::shard::push_protocol_event;
 
 /// Register the beacon gossip handlers on `network`.
 ///

@@ -443,7 +443,7 @@ where
     /// QC-only slot and drives the next queued entry — going back
     /// through [`Self::process_qc_only`] so an `AlreadyPrepared` next
     /// head accepts inline rather than triggering another pool round-trip.
-    pub(in crate::shard_loop) fn handle_qc_only_commit_prepared(
+    pub(in crate::shard) fn handle_qc_only_commit_prepared(
         &mut self,
         certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
@@ -755,7 +755,7 @@ where
     /// and shard committees off the snapshot). Idempotent across hosted
     /// shards — every same-shard vnode's `Action::TopologyChanged` lands
     /// here, but the final stored value is identical.
-    pub(in crate::shard_loop) fn handle_topology_changed(
+    pub(in crate::shard) fn handle_topology_changed(
         &self,
         topology: &Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
@@ -782,7 +782,7 @@ where
 /// the JMT recomputation ran. The diagnostic is fully self-contained
 /// on [`QcOnlyDivergence`], so this is a free function rather than a
 /// method on `ShardLoop`.
-pub(in crate::shard_loop) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergence) {
+pub(in crate::shard) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergence) {
     error!(
         height = div.block_height.inner(),
         block_hash = ?div.block_hash,

@@ -19,7 +19,7 @@ use hyperscale_types::{
 };
 
 use super::settled_set::SettledWavesAcquisitionOutput;
-use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

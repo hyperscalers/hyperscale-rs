@@ -14,11 +14,11 @@ use hyperscale_storage::ShardStorage;
 
 use crate::beacon;
 use crate::fetch::FetchInput;
+use crate::shard::ShardLoop;
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
-use crate::shard_loop::ShardLoop;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

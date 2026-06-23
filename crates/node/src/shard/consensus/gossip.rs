@@ -32,7 +32,7 @@ use hyperscale_types::{
 };
 
 use super::CertifiedHeaderVerificationItem;
-use crate::shard_loop::{ShardLoop, push_protocol_event};
+use crate::shard::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

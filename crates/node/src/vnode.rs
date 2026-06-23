@@ -11,7 +11,7 @@
 //! and carry the emitting vnode's `(shard, idx)` via the existing
 //! action-dispatch threading.
 //!
-//! [`ShardLoop`]: crate::shard_loop::ShardLoop
+//! [`ShardLoop`]: crate::shard::ShardLoop
 
 use std::sync::Arc;
 
