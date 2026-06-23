@@ -9,11 +9,11 @@ use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
 use crate::beacon;
-use crate::fetch::binding::{
-    ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
-    TransactionBinding,
-};
+use crate::fetch::binding::{FetchBinding, TransactionBinding};
 use crate::fetch::{FetchInput, FetchOutput};
+use crate::shard::cross_shard::{
+    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
+};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

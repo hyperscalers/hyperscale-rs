@@ -10,6 +10,7 @@
 //! beside it.
 
 pub mod exec_cert_serve;
+pub mod fetch;
 pub mod finalized_wave_serve;
 pub mod local_provision_serve;
 pub mod provision_serve;
@@ -23,6 +24,10 @@ pub mod settled_waves_serve;
 use std::time::Instant;
 
 pub use exec_cert_serve::serve_execution_certs_request;
+pub use fetch::{
+    ExecCertBinding, ExecCertFetch, FinalizedWaveBinding, FinalizedWaveFetch,
+    LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
+};
 pub use finalized_wave_serve::serve_finalized_waves_request;
 use hyperscale_types::{BlockHeight, ShardId};
 pub use local_provision_serve::serve_local_provisions_request;
@@ -34,9 +39,6 @@ pub use settled_waves_serve::serve_settled_waves_request;
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
-use crate::fetch::binding::{
-    ExecCertFetch, FinalizedWaveFetch, LocalProvisionFetch, ProvisionFetch,
-};
 
 /// Per-shard cross-shard subsystem state.
 ///
