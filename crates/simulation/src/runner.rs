@@ -18,7 +18,7 @@ use hyperscale_network_memory::{
     BandwidthReport, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::shard_loop::{HostEvent, StepOutput};
+use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
     NodeConfig, NodeHost, NodeStateMachine, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit,
     seat_follower, seat_vnode_group, timer_event,

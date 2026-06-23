@@ -18,7 +18,7 @@ use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
-use hyperscale_node::shard_loop::{HostEvent, ShardScopedInput};
+use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;

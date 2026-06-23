@@ -17,7 +17,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_storage_memory::SimShardStorage;

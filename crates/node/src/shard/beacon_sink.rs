@@ -17,7 +17,7 @@ use hyperscale_types::{CertifiedBeaconBlock, Epoch, Verifiable};
 
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink};
 use crate::event::{FetchFailureKind, classify_fetch_error};
-use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> BeaconSyncSink for ShardLoop<S, N, D>
 where
@@ -85,12 +85,12 @@ where
 {
     /// Handle `Action::StartBeaconBlockSync`: feed the FSM and dispatch any
     /// fetch it emits.
-    pub(in crate::shard_loop) fn process_start_beacon_block_sync(&mut self, target: Epoch) {
+    pub(in crate::shard) fn process_start_beacon_block_sync(&mut self, target: Epoch) {
         beacon::start(self, target);
     }
 
     /// A beacon-block sync response landed.
-    pub(in crate::shard_loop) fn handle_beacon_block_sync_response_received(
+    pub(in crate::shard) fn handle_beacon_block_sync_response_received(
         &mut self,
         epoch: Epoch,
         block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
@@ -99,7 +99,7 @@ where
     }
 
     /// A beacon-block sync fetch failed at the transport layer.
-    pub(in crate::shard_loop) fn handle_beacon_block_sync_fetch_failed(
+    pub(in crate::shard) fn handle_beacon_block_sync_fetch_failed(
         &mut self,
         epoch: Epoch,
         kind: FetchFailureKind,

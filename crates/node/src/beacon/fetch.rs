@@ -26,8 +26,7 @@ use hyperscale_types::{
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding};
-use crate::shard::ShardIo;
-use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, leaf_index)`.

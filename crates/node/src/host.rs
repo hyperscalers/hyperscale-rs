@@ -30,15 +30,14 @@ use crate::beacon::{
 use crate::config::NodeConfig;
 use crate::pool_loop::PoolLoop;
 use crate::process::{ProcessIo, register_shard_request_handlers};
-use crate::shard::ShardIo;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
-use crate::shard_loop::{
-    DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardLoop,
+use crate::shard::{
+    DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardIo, ShardLoop,
     SharedTopologySnapshot, StepOutput,
 };
 use crate::vnode::{Vnode, VnodeInit};

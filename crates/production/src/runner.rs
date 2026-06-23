@@ -15,7 +15,7 @@
 //! [`ProcessIo::compute_submit_fanout`] into the relevant shards'
 //! callback channels.
 //!
-//! [`ShardLoop`]: hyperscale_node::shard_loop::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
@@ -41,7 +41,7 @@ use hyperscale_network_libp2p::{
 };
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::PoolLoop;
-use hyperscale_node::shard_loop::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
+use hyperscale_node::shard::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot, TxStatusCache,
     VnodeInit, seat_follower, seat_vnode_group,
@@ -670,7 +670,7 @@ impl ProductionRunnerBuilder {
 /// handles async I/O routing, RPC transaction submission, sync/fetch
 /// management, and the per-host metrics + GC tick.
 ///
-/// [`ShardLoop`]: hyperscale_node::shard_loop::ShardLoop
+/// [`ShardLoop`]: hyperscale_node::shard::ShardLoop
 pub struct ProductionRunner {
     /// The composed [`NodeHost`], wrapped in `Option` because it's
     /// decomposed via `into_parts()` and moved onto the per-shard

@@ -7,7 +7,7 @@
 //!   single deterministic state machine over `ProtocolEvent` inputs
 //!   and `Action` outputs.
 //! - [`host::NodeHost`] composes process-scoped resources ([`ProcessIo`])
-//!   plus one [`shard_loop::ShardLoop`] per hosted shard, wrapping the
+//!   plus one [`shard::ShardLoop`] per hosted shard, wrapping the
 //!   state machine with transport-dependent plumbing: network I/O,
 //!   thread-pool dispatch, timer scheduling, block-sync and per-payload
 //!   fetch sub-machines.
@@ -38,8 +38,7 @@ mod fetch;
 pub mod host;
 pub mod pool_loop;
 pub mod process;
-mod shard;
-pub mod shard_loop;
+pub mod shard;
 mod state;
 mod sync;
 mod vnode;
@@ -49,9 +48,8 @@ pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
 pub use host::NodeHost;
 pub use process::TxStatusCache;
-pub use shard::ShardIo;
 pub use shard::consensus::{BlockSyncStateKind, serve_block_request};
 pub use shard::cross_shard::serve_settled_waves_request;
-pub use shard_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
+pub use shard::{NodeStatusSnapshot, ShardIo, SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
 pub use vnode::{SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, seat_follower, seat_vnode_group};

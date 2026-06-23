@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_types::{
     BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NodeId, NotarizeOptions,
     ParamProposal, ParamVote, ReshapeThresholds, StakePoolId, TimestampRange, TxHash,

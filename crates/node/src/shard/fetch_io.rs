@@ -27,7 +27,7 @@ where
     ///
     /// The shard's id is threaded through to per-binding callbacks so the
     /// response can be routed back to this shard.
-    pub(in crate::shard_loop) fn process_fetch_outputs<B: FetchBinding>(
+    pub(in crate::shard) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
@@ -97,7 +97,7 @@ where
     /// through `drive_fetch` so the freed slots' `spawn_pending_fetches`
     /// outputs reach the network in the same event-loop turn instead
     /// of being silently dropped.
-    pub(in crate::shard_loop) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
+    pub(in crate::shard) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
         match event {
             ProtocolEvent::TransactionsAdmitted { txs } => {
                 let ids: Vec<_> = txs.iter().map(|tx| tx.hash()).collect();
@@ -138,7 +138,7 @@ where
     D: Dispatch,
 {
     /// Interval for the periodic fetch tick timer.
-    pub(in crate::shard_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
+    pub(in crate::shard) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
     /// Refresh this shard's `FetchTick` timer based on whether any of its
     /// subsystems (beacon fetches, mempool, consensus block-sync, beacon-block

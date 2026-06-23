@@ -31,7 +31,7 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchInput;
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
-use crate::shard_loop::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where

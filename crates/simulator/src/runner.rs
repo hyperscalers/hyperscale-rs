@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_network_memory::{BandwidthReport, NodeIndex};
-use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::validity::{ValidityClock, range_starting_at};
 use hyperscale_spammer::{

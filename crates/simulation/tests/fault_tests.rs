@@ -15,7 +15,7 @@ use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::RuleHandle;
 use hyperscale_node::NodeStateMachine;
-use hyperscale_node::shard_loop::{HostEvent, ProcessScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{

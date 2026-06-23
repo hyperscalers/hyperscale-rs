@@ -23,8 +23,7 @@ use hyperscale_types::{
 };
 
 use crate::fetch::{Fetch, FetchBinding, partition_solicited};
-use crate::shard::ShardIo;
-use crate::shard_loop::{HostEvent, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].

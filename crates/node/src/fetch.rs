@@ -25,8 +25,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use tracing::{debug, trace};
 
-use crate::shard::ShardIo;
-use crate::shard_loop::HostEvent;
+use crate::shard::{HostEvent, ShardIo};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]

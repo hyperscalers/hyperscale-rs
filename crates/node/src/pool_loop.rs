@@ -3,7 +3,7 @@
 //! A [`PoolLoop`] drives the vnodes a host runs with `shard: None` — logical
 //! nodes that follow the beacon chain (adopt committed beacon blocks, track
 //! topology, surface their own seat triggers) but run no shard consensus. It is
-//! the lightweight sibling of [`ShardLoop`](crate::shard_loop::ShardLoop): a
+//! the lightweight sibling of [`ShardLoop`](crate::shard::ShardLoop): a
 //! `Vec<Vnode>` plus a cloned `Arc<ProcessIo>` and per-step scratch — no
 //! `ShardIo`, no batch accumulators, no per-payload fetches.
 //!
@@ -117,7 +117,7 @@ where
     /// Drive one pool input through every pooled vnode and return the
     /// placement deltas they surfaced (the seat triggers the supervisor acts
     /// on). Clears per-step scratch first, mirroring
-    /// [`ShardLoop::run_step`](crate::shard_loop::ShardLoop::run_step); used by
+    /// [`ShardLoop::run_step`](crate::shard::ShardLoop::run_step); used by
     /// the production pool thread, which owns the `PoolLoop` directly rather
     /// than driving it through [`NodeHost::step`](crate::host::NodeHost::step).
     pub fn run_step(&mut self, input: PoolScopedInput) -> Vec<ParticipationChange> {

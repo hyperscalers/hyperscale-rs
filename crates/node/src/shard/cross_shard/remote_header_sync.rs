@@ -21,7 +21,7 @@ use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, Shar
 
 use super::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 use crate::event::classify_fetch_error;
-use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 use crate::sync::SyncOutput;
 
 impl<S, N, D> ShardLoop<S, N, D>
