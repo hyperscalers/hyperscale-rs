@@ -9,6 +9,10 @@
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
 //! beside it.
 
+pub mod exec_cert_serve;
+pub mod finalized_wave_serve;
+pub mod local_provision_serve;
+pub mod provision_serve;
 pub mod remote_header;
 pub mod remote_header_serve;
 mod remote_header_sync;
@@ -18,11 +22,21 @@ pub mod settled_waves_serve;
 
 use std::time::Instant;
 
+pub use exec_cert_serve::serve_execution_certs_request;
+pub use finalized_wave_serve::serve_finalized_waves_request;
 use hyperscale_types::{BlockHeight, ShardId};
+pub use local_provision_serve::serve_local_provisions_request;
+pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::serve_remote_headers_request;
 pub use settled_set::SettledWavesAcquisitionHost;
 pub use settled_waves_serve::serve_settled_waves_request;
+
+use crate::config::NodeConfig;
+use crate::fetch::FetchConfig;
+use crate::fetch::binding::{
+    ExecCertFetch, FinalizedWaveFetch, LocalProvisionFetch, ProvisionFetch,
+};
 
 /// Per-shard cross-shard subsystem state.
 ///
@@ -33,6 +47,15 @@ pub struct CrossShardState {
     /// chains for the cross-shard data dependencies a shard provisions against.
     pub remote_header_sync: RemoteHeaderSync,
 
+    /// Cross-shard provision fetch (rotates through source committee).
+    pub provision: ProvisionFetch,
+    /// Cross-shard execution-cert fetch (rotates through source committee).
+    pub exec_cert: ExecCertFetch,
+    /// Finalized-wave fetch (rotates through committee).
+    pub finalized_wave: FinalizedWaveFetch,
+    /// Local-provision fetch (pinned to proposer).
+    pub local_provision: LocalProvisionFetch,
+
     /// Settled-waves acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
     pub settled_set_sync: SettledWavesAcquisitionHost,
@@ -41,19 +64,42 @@ pub struct CrossShardState {
 impl CrossShardState {
     /// Build cross-shard state for a freshly hosted shard.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(config: &NodeConfig) -> Self {
         Self {
             remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
+            provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
+            exec_cert: ExecCertFetch::new("exec_cert", config.exec_cert_fetch.clone()),
+            finalized_wave: FinalizedWaveFetch::new(
+                "finalized_wave",
+                FetchConfig {
+                    max_in_flight: 8,
+                    max_ids_per_request: 4,
+                    parallel_chunks_per_tick: 1,
+                },
+            ),
+            local_provision: LocalProvisionFetch::new(
+                "local_provision",
+                FetchConfig {
+                    max_in_flight: 64,
+                    max_ids_per_request: 16,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
             settled_set_sync: SettledWavesAcquisitionHost::new(),
         }
     }
 
-    /// True if remote-header sync or settled-waves acquisition has pending
-    /// work — keeps this shard's `FetchTick` alive so deferred work retries.
+    /// True if any cross-shard FSM (remote-header sync, the cross-shard
+    /// fetches, or settled-waves acquisition) has pending work — keeps this
+    /// shard's `FetchTick` alive so deferred work retries.
     #[must_use]
     pub fn has_pending(&self) -> bool {
         self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
+            || self.provision.has_pending()
+            || self.exec_cert.has_pending()
+            || self.finalized_wave.has_pending()
+            || self.local_provision.has_pending()
             || self.settled_set_sync.has_pending()
     }
 
@@ -77,11 +123,5 @@ impl CrossShardState {
                 scope: source_shard,
                 height,
             })
-    }
-}
-
-impl Default for CrossShardState {
-    fn default() -> Self {
-        Self::new()
     }
 }

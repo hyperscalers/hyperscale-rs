@@ -17,7 +17,7 @@ use hyperscale_types::{
 };
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::fetch::FetchHost;
+use crate::fetch::{FetchHost, FetchMetrics};
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
 use crate::shard::cross_shard::CrossShardState;
@@ -117,4 +117,39 @@ pub struct ShardIo<S: ShardStorage> {
     /// latency spikes; per-shard so co-hosted shards don't suppress
     /// each other's warnings.
     pub last_slow_tx_warn: LocalTimestamp,
+}
+
+impl<S: ShardStorage> ShardIo<S> {
+    /// Snapshot per-binding fetch counts across both the `FetchHost` payloads
+    /// (transaction, shard-witness, beacon-proposal) and the cross-shard fetch
+    /// instances on [`CrossShardState`]. The I/O loop flattens this into the
+    /// larger `MetricsSnapshot`.
+    #[must_use]
+    pub fn fetch_metrics(&self) -> FetchMetrics {
+        let f = &self.fetches;
+        let x = &self.cross_shard;
+        FetchMetrics {
+            transaction_in_flight: f.transaction.in_flight_count(),
+            transaction_pending: f.transaction.pending_count(),
+            transaction_oldest_in_flight_age_ms: f.transaction.oldest_in_flight_age_ms(),
+            local_provision_in_flight: x.local_provision.in_flight_count(),
+            local_provision_pending: x.local_provision.pending_count(),
+            local_provision_oldest_in_flight_age_ms: x.local_provision.oldest_in_flight_age_ms(),
+            finalized_wave_in_flight: x.finalized_wave.in_flight_count(),
+            finalized_wave_pending: x.finalized_wave.pending_count(),
+            finalized_wave_oldest_in_flight_age_ms: x.finalized_wave.oldest_in_flight_age_ms(),
+            provision_in_flight: x.provision.in_flight_count(),
+            provision_pending: x.provision.pending_count(),
+            provision_oldest_in_flight_age_ms: x.provision.oldest_in_flight_age_ms(),
+            exec_cert_in_flight: x.exec_cert.in_flight_count(),
+            exec_cert_pending: x.exec_cert.pending_count(),
+            exec_cert_oldest_in_flight_age_ms: x.exec_cert.oldest_in_flight_age_ms(),
+            shard_witness_in_flight: f.shard_witness.in_flight_count(),
+            shard_witness_pending: f.shard_witness.pending_count(),
+            shard_witness_oldest_in_flight_age_ms: f.shard_witness.oldest_in_flight_age_ms(),
+            beacon_proposal_in_flight: f.beacon_proposal.in_flight_count(),
+            beacon_proposal_pending: f.beacon_proposal.pending_count(),
+            beacon_proposal_oldest_in_flight_age_ms: f.beacon_proposal.oldest_in_flight_age_ms(),
+        }
+    }
 }

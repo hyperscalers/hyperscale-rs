@@ -23,17 +23,13 @@ use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use tracing::{debug, trace};
 
 pub mod binding;
-pub mod exec_cert_serve;
-pub mod finalized_wave_serve;
 pub mod host;
-pub mod local_provision_serve;
-pub mod provision_serve;
 pub mod shard_witness_serve;
 pub mod state_range_serve;
 pub mod transaction_serve;
 pub mod witness_history_serve;
 
-pub use host::FetchHost;
+pub use host::{FetchHost, FetchMetrics};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]

@@ -758,7 +758,7 @@ fn build_shard_io<S: ShardStorage>(
         caches,
         fetches: FetchHost::new(config),
         syncs: SyncHost::new(config),
-        cross_shard: CrossShardState::new(),
+        cross_shard: CrossShardState::new(config),
         pending_validation: HashSet::new(),
         locally_submitted: HashSet::new(),
         validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),

@@ -236,7 +236,7 @@ impl FetchBinding for LocalProvisionBinding {
     const NAME: &'static str = "local_provision";
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
-        &mut shard.fetches.local_provision
+        &mut shard.cross_shard.local_provision
     }
 
     fn dispatch_chunk<N: Network>(
@@ -322,7 +322,7 @@ impl FetchBinding for FinalizedWaveBinding {
     const NAME: &'static str = "finalized_wave";
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
-        &mut shard.fetches.finalized_wave
+        &mut shard.cross_shard.finalized_wave
     }
 
     fn dispatch_chunk<N: Network>(
@@ -397,7 +397,7 @@ impl FetchBinding for ExecCertBinding {
     const NAME: &'static str = "exec_cert";
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
-        &mut shard.fetches.exec_cert
+        &mut shard.cross_shard.exec_cert
     }
 
     fn dispatch_chunk<N: Network>(
@@ -477,7 +477,7 @@ impl FetchBinding for ProvisionBinding {
     const PER_ID: bool = true;
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.fetches.provision
+        &mut shard.cross_shard.provision
     }
 
     fn dispatch_chunk<N: Network>(

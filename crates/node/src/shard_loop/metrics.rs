@@ -154,7 +154,7 @@ where
     /// by the runner after aggregating per-shard contributions.
     pub fn record_prometheus(&self) {
         let s = self.shard.inner();
-        let fetches = self.io.fetches.metrics();
+        let fetches = self.io.fetch_metrics();
         let syncs = &self.io.syncs;
         let rh = &self.io.cross_shard.remote_header_sync;
 
@@ -234,7 +234,7 @@ where
         let mut vnodes = BTreeMap::new();
 
         for shard in self.hosted_shards() {
-            let fetches = self.shard_io(shard).fetches.metrics();
+            let fetches = self.shard_io(shard).fetch_metrics();
             let syncs = &self.shard_io(shard).syncs;
             let rh = &self.shard_io(shard).cross_shard.remote_header_sync;
             shards.insert(
@@ -289,7 +289,7 @@ where
         let mempool_mem = primary_vnode.mempool_coordinator().memory_stats();
         let prov_mem = primary_vnode.provisions_coordinator().memory_stats();
         let rh_mem = primary_vnode.remote_headers_coordinator().memory_stats();
-        let fetches = self.shard_io(primary_shard).fetches.metrics();
+        let fetches = self.shard_io(primary_shard).fetch_metrics();
         let block_sync_status = self.shard_io(primary_shard).syncs.block.block_sync_status();
 
         let memory = MemoryMetrics {
