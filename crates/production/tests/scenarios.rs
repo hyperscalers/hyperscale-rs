@@ -12,9 +12,10 @@ mod prod_cluster;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline};
+use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx};
 use prod_cluster::ProdCluster;
 use serial_test::serial;
+use tracing_subscriber::fmt;
 
 /// Production epoch length: the real 5-minute deployment epoch under `ci`, a
 /// 30-second epoch otherwise — mirroring `simulation`'s `EPOCH_MS` so a budget
@@ -45,7 +46,21 @@ const fn liveness_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn liveness_baseline_prod() {
+    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&liveness_config(), EPOCH_MS);
     liveness_baseline(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn single_shard_tx_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&liveness_config(), EPOCH_MS);
+    single_shard_tx(&mut cluster);
     cluster.shutdown();
 }

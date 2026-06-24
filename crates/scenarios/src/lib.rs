@@ -19,6 +19,7 @@ mod cluster;
 mod config;
 mod liveness;
 pub mod query;
+mod transactions;
 pub mod tx;
 pub mod wait;
 
@@ -26,3 +27,4 @@ pub use budget::{Budget, epochs};
 pub use cluster::Cluster;
 pub use config::ScenarioConfig;
 pub use liveness::liveness_baseline;
+pub use transactions::single_shard_tx;

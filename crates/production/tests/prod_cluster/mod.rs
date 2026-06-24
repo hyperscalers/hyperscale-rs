@@ -7,8 +7,9 @@
 //! `await_*` helpers use. The runtime never leaks into a scenario body.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use hyperscale_engine::GenesisConfig;
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig};
 use hyperscale_test_helpers::fixtures::TestFixtures;
@@ -33,6 +34,8 @@ pub struct ProdCluster {
     runtime: Runtime,
     inner: Harness,
     epoch_ms: u64,
+    /// Wall-clock instant captured at genesis, the origin `now` measures from.
+    started: Instant,
 }
 
 impl ProdCluster {
@@ -45,11 +48,13 @@ impl ProdCluster {
             .build()
             .expect("tokio runtime");
         let spec = Self::spec(config, epoch_ms);
+        let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
         Self {
             runtime,
             inner,
             epoch_ms,
+            started,
         }
     }
 
@@ -86,7 +91,10 @@ impl ProdCluster {
                 },
                 ..BeaconChainConfig::default()
             },
-            genesis_config: None,
+            // Match the simulation's engine genesis (a funded faucet, 100B XRD)
+            // so a faucet-funded transfer behaves identically on both harnesses;
+            // the production default leaves the faucet empty.
+            genesis_config: Some(GenesisConfig::test_default()),
             simulated_outbound_latency: config.latency,
         }
     }
@@ -128,6 +136,10 @@ impl Cluster for ProdCluster {
             .await
             .is_ok()
         })
+    }
+
+    fn now(&self) -> Duration {
+        self.started.elapsed()
     }
 
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {

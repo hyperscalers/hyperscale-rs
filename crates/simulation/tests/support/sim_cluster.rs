@@ -114,6 +114,10 @@ impl Cluster for SimCluster {
         cond(self)
     }
 
+    fn now(&self) -> Duration {
+        self.runner.now()
+    }
+
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {
         (0..self.runner.num_hosts())
             .filter_map(|node| self.runner.hosts_shard(node, shard))

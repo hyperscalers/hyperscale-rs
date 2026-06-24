@@ -1,6 +1,7 @@
 //! The [`Cluster`] trait: the harness-agnostic surface a scenario drives.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_types::{
     BeaconState, BlockHeight, RoutableTransaction, ShardId, StateRoot, TransactionDecision,
@@ -34,6 +35,11 @@ pub trait Cluster {
     /// Sim drives its logical clock (and pumps reshape); production blocks on a
     /// poll loop while reshape advances organically via the supervisor.
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool;
+
+    /// Elapsed time since genesis on the cluster's own clock — for building
+    /// transaction validity windows. Sim returns its logical now; production
+    /// returns wall-clock since start.
+    fn now(&self) -> Duration;
 
     /// The highest committed block height on `shard`, if any host serves it.
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight>;
