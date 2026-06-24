@@ -7,9 +7,10 @@ mod support;
 
 use std::time::Duration;
 
+use hyperscale_scenarios::tx::split_straddler_setup;
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    single_shard_tx, split_lifecycle,
+    single_shard_tx, split_lifecycle, split_straddler_atomic,
 };
 use support::sim_cluster::SimCluster;
 
@@ -74,4 +75,26 @@ fn livelock_resolves_promptly_sim() {
 fn merge_lifecycle_sim() {
     let mut cluster = SimCluster::new(&split_config(), 11);
     merge_lifecycle(&mut cluster);
+}
+
+/// Single-shard genesis with the grow trigger armed (`split_bytes` above each
+/// child but below ROOT) and two cohorts of pool surplus — one grows ROOT to the
+/// two siblings, the other splits the heavier one after the vote.
+const fn straddler_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 8,
+        num_shards: 1,
+        split_bytes: 800_000,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+fn split_straddler_atomic_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_balances(&straddler_config(), 11, &setup.balances);
+    split_straddler_atomic(&mut cluster);
 }

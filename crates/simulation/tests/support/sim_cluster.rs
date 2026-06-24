@@ -20,6 +20,8 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
     StateRoot, TransactionDecision, TransactionStatus, TxHash,
 };
+use radix_common::math::Decimal;
+use radix_common::types::ComponentAddress;
 
 use super::reshape_driver::ReshapeDriver;
 
@@ -34,9 +36,24 @@ pub struct SimCluster {
 }
 
 impl SimCluster {
-    /// Build a genesis cluster from `config`, seeded by `seed`.
+    /// Build a genesis cluster from `config`, seeded by `seed`, funding the
+    /// shared straddler accounts (seed `31` left, `30` right) the cross-shard
+    /// scenarios spend.
     #[must_use]
     pub fn new(config: &ScenarioConfig, seed: u64) -> Self {
+        Self::with_balances(config, seed, &straddler_genesis_balances())
+    }
+
+    /// Build a genesis cluster funding `balances` instead of the default
+    /// straddler accounts — for scenarios that seat their own genesis
+    /// distribution (a byte-skewed split-straddler topology). Production
+    /// installs the identical balances.
+    #[must_use]
+    pub fn with_balances(
+        config: &ScenarioConfig,
+        seed: u64,
+        balances: &[(ComponentAddress, Decimal)],
+    ) -> Self {
         let beacon_chain_config = BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
             num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
@@ -57,12 +74,7 @@ impl SimCluster {
             ..SimConfig::default()
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
-
-        // Fund an account in each child span of the first split (seed 31 lands
-        // left, seed 30 right) from the shared scenario definition: genesis
-        // populates both subtrees, and the cross-shard scenarios spend them
-        // across the two children. Production installs the identical balances.
-        runner.initialize_genesis_with_balances(&straddler_genesis_balances());
+        runner.initialize_genesis_with_balances(balances);
 
         Self {
             runner,

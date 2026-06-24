@@ -18,7 +18,9 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
     StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
 };
+use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
+use radix_common::types::ComponentAddress;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
 
@@ -43,12 +45,26 @@ impl ProdCluster {
     /// topology; reshape scenarios are seed-sensitive.
     #[must_use]
     pub fn start(config: &ScenarioConfig, seed: u64, epoch_ms: u64) -> Self {
+        Self::start_with_balances(config, seed, epoch_ms, straddler_genesis_balances())
+    }
+
+    /// Build and start a genesis cluster funding `balances` instead of the
+    /// default straddler accounts — for scenarios that seat their own genesis
+    /// distribution (a byte-skewed split-straddler topology). The simulation
+    /// installs the identical balances.
+    #[must_use]
+    pub fn start_with_balances(
+        config: &ScenarioConfig,
+        seed: u64,
+        epoch_ms: u64,
+        balances: Vec<(ComponentAddress, Decimal)>,
+    ) -> Self {
         let runtime = Builder::new_multi_thread()
             .worker_threads(16)
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let spec = Self::spec(config, seed, epoch_ms);
+        let spec = Self::spec(config, seed, epoch_ms, balances);
         let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
         Self {
@@ -70,7 +86,12 @@ impl ProdCluster {
     /// followers (the reshape cohort), grouped one per host when
     /// `dedicated_hosts` (the reshape flip needs each seat on its own store) or
     /// `vnodes_per_host` per host otherwise.
-    fn spec(config: &ScenarioConfig, seed: u64, epoch_ms: u64) -> ClusterSpec {
+    fn spec(
+        config: &ScenarioConfig,
+        seed: u64,
+        epoch_ms: u64,
+        balances: Vec<(ComponentAddress, Decimal)>,
+    ) -> ClusterSpec {
         let fixtures = TestFixtures::with_shards_and_surplus(
             seed,
             config.validators_per_shard,
@@ -112,7 +133,7 @@ impl ProdCluster {
             // identically on both harnesses. The production default leaves the
             // faucet empty and seeds no accounts.
             genesis_config: Some(GenesisConfig {
-                xrd_balances: straddler_genesis_balances(),
+                xrd_balances: balances,
                 ..GenesisConfig::test_default()
             }),
             simulated_outbound_latency: config.latency,
