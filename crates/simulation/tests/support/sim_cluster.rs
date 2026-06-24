@@ -12,15 +12,14 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_scenarios::tx::straddler_genesis_balances;
 use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ed25519_keypair_from_seed,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash,
 };
-use radix_common::math::Decimal;
-use radix_common::types::ComponentAddress;
 
 use super::reshape_driver::ReshapeDriver;
 
@@ -59,20 +58,11 @@ impl SimCluster {
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
 
-        // Fund two accounts in opposite child spans of the first split (seed 31
-        // lands left, seed 30 right): genesis populates both subtrees, and the
-        // cross-shard scenarios spend them across the two children. The scenario
-        // bodies address these same accounts via `tx::account_from_seed(31/30)`.
-        let left_account = ComponentAddress::preallocated_account_from_public_key(
-            &ed25519_keypair_from_seed(&[31; 32]).public_key(),
-        );
-        let right_account = ComponentAddress::preallocated_account_from_public_key(
-            &ed25519_keypair_from_seed(&[30; 32]).public_key(),
-        );
-        runner.initialize_genesis_with_balances(&[
-            (left_account, Decimal::from(10_000)),
-            (right_account, Decimal::from(10_000)),
-        ]);
+        // Fund an account in each child span of the first split (seed 31 lands
+        // left, seed 30 right) from the shared scenario definition: genesis
+        // populates both subtrees, and the cross-shard scenarios spend them
+        // across the two children. Production installs the identical balances.
+        runner.initialize_genesis_with_balances(&straddler_genesis_balances());
 
         Self {
             runner,

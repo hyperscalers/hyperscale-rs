@@ -11,12 +11,14 @@ use std::time::{Duration, Instant};
 
 use hyperscale_engine::GenesisConfig;
 use hyperscale_production::LocalValidator;
+use hyperscale_scenarios::tx::straddler_genesis_balances;
 use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig};
 use hyperscale_test_helpers::fixtures::TestFixtures;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId, uniform_shard_for_node,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
 };
+use radix_common::network::NetworkDefinition;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
 
@@ -104,21 +106,35 @@ impl ProdCluster {
                 },
                 ..BeaconChainConfig::default()
             },
-            // Match the simulation's engine genesis (a funded faucet, 100B XRD)
-            // so a faucet-funded transfer behaves identically on both harnesses;
-            // the production default leaves the faucet empty.
-            genesis_config: Some(GenesisConfig::test_default()),
+            // Match the simulation's engine genesis: a funded faucet (100B XRD)
+            // plus a funded account in each child span of the first split, so
+            // both a faucet-funded transfer and the cross-shard scenarios behave
+            // identically on both harnesses. The production default leaves the
+            // faucet empty and seeds no accounts.
+            genesis_config: Some(GenesisConfig {
+                xrd_balances: straddler_genesis_balances(),
+                ..GenesisConfig::test_default()
+            }),
             simulated_outbound_latency: config.latency,
         }
     }
 
-    /// A host serving any shard `tx` touches, for submission routing. Single
-    /// shard tests resolve to the one serving host; cross-shard source
-    /// selection is refined when cross-shard scenarios land.
+    /// A host serving any shard `tx` touches, for submission routing.
+    ///
+    /// Resolves each touched node against the live partition derived from the
+    /// latest committed beacon state — post-split the genesis `num_shards` no
+    /// longer routes, since the live shards are the split children. Submitting
+    /// through a host that serves a touched shard admits the transaction
+    /// directly rather than relying on a gossip hop. The network only governs
+    /// address encoding, not shard routing, so any definition resolves the same
+    /// shards.
     fn host_for_tx(&self, tx: &RoutableTransaction) -> Option<usize> {
-        let num_shards = u64::from(self.inner.beacon_state()?.chain_config.num_shards);
+        let topology = self
+            .inner
+            .beacon_state()?
+            .derive_topology_snapshot(NetworkDefinition::simulator());
         tx.all_declared_nodes()
-            .map(|node| uniform_shard_for_node(node, num_shards))
+            .map(|node| topology.shard_for_node_id(node))
             .find_map(|shard| self.inner.host_serving(shard))
     }
 }

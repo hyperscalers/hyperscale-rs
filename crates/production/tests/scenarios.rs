@@ -12,7 +12,10 @@ mod prod_cluster;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx, split_lifecycle};
+use hyperscale_scenarios::{
+    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, single_shard_tx,
+    split_lifecycle,
+};
 use prod_cluster::ProdCluster;
 use serial_test::serial;
 use tracing_subscriber::fmt;
@@ -91,5 +94,31 @@ fn split_lifecycle_prod() {
     let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     split_lifecycle(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_tx_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cross_shard_tx(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn livelock_resolves_promptly_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    livelock_resolves_promptly(&mut cluster);
     cluster.shutdown();
 }

@@ -33,6 +33,21 @@ pub fn account_from_seed(seed: u8) -> ComponentAddress {
     ComponentAddress::preallocated_account_from_public_key(&signer_from_seed(seed).public_key())
 }
 
+/// Genesis XRD balances that seat a funded account in each child span of the
+/// first root split: seed `31` lands in the left child, seed `30` in the right.
+///
+/// Both adaptors install these at genesis from this one definition so the
+/// cross-shard scenarios spend `account_from_seed(31)` and `account_from_seed(30)`
+/// across the two children identically on either harness — the funding can't
+/// drift between sim and production.
+#[must_use]
+pub fn straddler_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
+    vec![
+        (account_from_seed(31), Decimal::from(10_000)),
+        (account_from_seed(30), Decimal::from(10_000)),
+    ]
+}
+
 /// Build a faucet-funded transfer.
 ///
 /// The faucet pays the fee and supplies free XRD, deposited to `to`. Portable —
