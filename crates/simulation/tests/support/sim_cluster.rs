@@ -70,6 +70,15 @@ impl SimCluster {
         }
     }
 
+    /// The underlying runner, for bespoke sim tests that compose a portable
+    /// scenario and then assert white-box internals the [`Cluster`] surface
+    /// doesn't expose (raw stores, committed blocks, validator placement).
+    #[allow(dead_code)] // consumed by some test binaries (reshape_grow), not every one
+    #[must_use]
+    pub const fn runner(&self) -> &SimulationRunner {
+        &self.runner
+    }
+
     /// The duration `budget` epochs span on this harness's clock.
     fn span(budget: Budget) -> Duration {
         Duration::from_millis(EPOCH_MS) * budget.0
