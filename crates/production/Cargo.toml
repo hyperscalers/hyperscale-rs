@@ -12,6 +12,12 @@ path = "src/bin/validator.rs"
 name = "hyperscale-keygen"
 path = "src/bin/keygen.rs"
 
+[features]
+# Run the portable scenario suite at the 5-minute production epoch for parity
+# with a real deployment. Off by default so the slow real-QUIC scenarios are a
+# nightly/manual job rather than part of `cargo test`.
+ci = []
+
 [dependencies]
 hyperscale-beacon.workspace = true
 hyperscale-core.workspace = true
@@ -86,6 +92,7 @@ tikv-jemallocator = { version = "0.7.0", features = ["background_threads", "unpr
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
+hyperscale-scenarios.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-test-helpers = { workspace = true, features = ["fixtures"] }

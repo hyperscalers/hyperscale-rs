@@ -32,11 +32,12 @@ use hyperscale_production::{
     StorageFactory,
 };
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader};
+use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, Epoch, PendingReshape, RoutableTransaction,
-    ShardId, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash, shard_prefix_path,
+    ShardId, StateRoot, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash,
+    shard_prefix_path,
 };
 use libp2p::Multiaddr;
 use tempfile::TempDir;
@@ -280,6 +281,14 @@ impl Cluster {
                 .find(|v| v.shard == key)
                 .map(|v| v.state_root_hash.clone())
         })
+    }
+
+    /// The raw committed JMT root for `shard`, read straight off a serving
+    /// host's live store — the byte-exact `StateRoot` that
+    /// [`Self::committed_state_root`] hex encodes, for typed comparison against
+    /// a beacon-composed anchor. `None` if no host serves `shard`.
+    pub fn committed_state_root_raw(&self, shard: ShardId) -> Option<StateRoot> {
+        self.store_for(shard).map(|store| store.state_root())
     }
 
     /// Whether any host in the cluster currently serves `shard` — the
