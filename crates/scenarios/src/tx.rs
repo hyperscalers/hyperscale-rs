@@ -13,7 +13,6 @@ use hyperscale_types::{
     ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
-use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
@@ -26,11 +25,12 @@ pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
     ed25519_keypair_from_seed(&[seed; 32])
 }
 
-/// A deterministic deposit-only account address from a one-byte seed. The
-/// public key is synthetic — the account only ever receives.
+/// The preallocated account address for the [`signer_from_seed`] of `seed` —
+/// the account that signer controls, so a genesis that funds this address can
+/// be spent by that key.
 #[must_use]
 pub fn account_from_seed(seed: u8) -> ComponentAddress {
-    ComponentAddress::preallocated_account_from_public_key(&Ed25519PublicKey([seed; 32]))
+    ComponentAddress::preallocated_account_from_public_key(&signer_from_seed(seed).public_key())
 }
 
 /// Build a faucet-funded transfer.
