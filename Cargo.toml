@@ -20,6 +20,7 @@ members = [
     "crates/production",
     "crates/provisions",
     "crates/remote-headers",
+    "crates/scenarios",
     "crates/shard",
     "crates/simulation",
     "crates/simulator",
@@ -56,6 +57,7 @@ hyperscale-node = { path = "crates/node" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-provisions = { path = "crates/provisions" }
 hyperscale-remote-headers = { path = "crates/remote-headers" }
+hyperscale-scenarios = { path = "crates/scenarios" }
 hyperscale-shard = { path = "crates/shard" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
