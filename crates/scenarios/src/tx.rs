@@ -9,10 +9,11 @@
 use std::time::Duration;
 
 use hyperscale_types::{
-    BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NotarizeOptions, ParamProposal,
-    ParamVote, ReshapeThresholds, RoutableTransaction, StakePoolId, TimestampRange,
-    WeightedTimestamp, ed25519_keypair_from_seed, encode_system_action, routable_from_notarized_v1,
-    sign_and_notarize, sign_and_notarize_with_options,
+    BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NodeId, NotarizeOptions,
+    ParamProposal, ParamVote, ReshapeThresholds, RoutableTransaction, ShardId, StakePoolId,
+    TimestampRange, WeightedTimestamp, ed25519_keypair_from_seed, encode_system_action,
+    routable_from_notarized_v1, sign_and_notarize, sign_and_notarize_with_options,
+    uniform_shard_for_node,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -34,6 +35,88 @@ pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
 #[must_use]
 pub fn account_from_seed(seed: u8) -> ComponentAddress {
     ComponentAddress::preallocated_account_from_public_key(&signer_from_seed(seed).public_key())
+}
+
+/// The splitting shard of the grown surviving-sibling shape — `leaf(1, 0)`, the
+/// heavier child the engine bootstrap concentrates substates into, which crosses
+/// the voted-down threshold and terminates.
+pub const STRADDLER_SPLITTER: ShardId = ShardId::leaf(1, 0);
+
+/// The surviving sibling — `leaf(1, 1)`, the lighter child that stays under the
+/// threshold. Straddler payers live here; their cross-shard waves name the
+/// terminating splitter.
+pub const STRADDLER_SURVIVOR: ShardId = ShardId::leaf(1, 1);
+
+/// Bulk accounts funded into the splitter to reinforce the engine bootstrap's
+/// natural low-prefix skew, so the splitter clears the voted-down threshold and
+/// the survivor stays under it.
+const STRADDLER_BULK: usize = 20;
+
+/// Straddler pairs submitted across the splitter's grow — enough to span its
+/// terminal cut: the earliest settle on it before it crosses, the latest name a
+/// splitter that has already terminated.
+pub const STRADDLER_COUNT: usize = 8;
+
+/// The genesis funding and straddler transfers for the split-straddler scenario.
+///
+/// One definition both adaptors and the scenario body derive from, so the funded
+/// accounts can't drift from the transfers spent against them.
+pub struct SplitStraddlerSetup {
+    /// Genesis XRD balances: bulk + straddler recipients in the splitter, payers
+    /// in the survivor.
+    pub balances: Vec<(ComponentAddress, Decimal)>,
+    /// Straddler transfers: `(payer key, payer account in survivor, recipient in
+    /// splitter)`.
+    pub straddlers: Vec<(Ed25519PrivateKey, ComponentAddress, ComponentAddress)>,
+}
+
+/// A deterministic seeded account routing to `shard` under the two-shard uniform
+/// trie the grow produces, skipping seeds already `taken`.
+fn account_in(shard: ShardId, taken: &mut Vec<u8>) -> (Ed25519PrivateKey, ComponentAddress) {
+    for seed in 1u8..=u8::MAX {
+        if taken.contains(&seed) {
+            continue;
+        }
+        let key = ed25519_keypair_from_seed(&[seed; 32]);
+        let address = ComponentAddress::preallocated_account_from_public_key(&key.public_key());
+        let node = NodeId(
+            address.into_node_id().0[..30]
+                .try_into()
+                .expect("account address carries a 30-byte node id"),
+        );
+        if uniform_shard_for_node(&node, 2) == shard {
+            taken.push(seed);
+            return (key, address);
+        }
+    }
+    panic!("no account seed routes to {shard:?}");
+}
+
+/// Build the split-straddler genesis funding and straddler transfers.
+///
+/// The splitter (`leaf(1, 0)`) is funded over the voted-down threshold (bulk plus
+/// straddler recipients), the survivor (`leaf(1, 1)`) under it (straddler
+/// payers), so only the splitter crosses and terminates.
+#[must_use]
+pub fn split_straddler_setup() -> SplitStraddlerSetup {
+    let mut taken = Vec::new();
+    let mut balances = Vec::new();
+    for _ in 0..STRADDLER_BULK {
+        let (_, account) = account_in(STRADDLER_SPLITTER, &mut taken);
+        balances.push((account, Decimal::from(10_000)));
+    }
+    let mut straddlers = Vec::new();
+    for _ in 0..STRADDLER_COUNT {
+        let (payer_key, payer) = account_in(STRADDLER_SURVIVOR, &mut taken);
+        let (_, recipient) = account_in(STRADDLER_SPLITTER, &mut taken);
+        balances.push((payer, Decimal::from(10_000)));
+        balances.push((recipient, Decimal::from(10_000)));
+        straddlers.push((payer_key, payer, recipient));
+    }
+    SplitStraddlerSetup {
+        balances,
+        straddlers,
+    }
 }
 
 /// Genesis XRD balances that seat a funded account in each child span of the

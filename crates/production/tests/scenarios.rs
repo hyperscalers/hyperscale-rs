@@ -12,9 +12,10 @@ mod prod_cluster;
 
 use std::time::Duration;
 
+use hyperscale_scenarios::tx::split_straddler_setup;
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    single_shard_tx, split_lifecycle,
+    single_shard_tx, split_lifecycle, split_straddler_atomic,
 };
 use prod_cluster::ProdCluster;
 use serial_test::serial;
@@ -133,5 +134,35 @@ fn merge_lifecycle_prod() {
     let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     merge_lifecycle(&mut cluster);
+    cluster.shutdown();
+}
+
+/// Two cohorts of pool surplus and a grow trigger above each child but below
+/// ROOT: one cohort grows ROOT to the two siblings, the other splits the heavier
+/// one after the vote. One validator per host (each reshape seat its own store).
+const fn straddler_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 8,
+        num_shards: 1,
+        split_bytes: 800_000,
+        latency: Duration::from_millis(60),
+        dedicated_hosts: true,
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn split_straddler_atomic_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let setup = split_straddler_setup();
+    let mut cluster =
+        ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
+    split_straddler_atomic(&mut cluster);
     cluster.shutdown();
 }
