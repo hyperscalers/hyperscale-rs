@@ -22,9 +22,6 @@ use tokio::time::{sleep, timeout};
 
 use crate::cluster::{Cluster as Harness, ClusterSpec, HostSpec};
 
-/// Seed for the production fixtures' deterministic key and topology derivation.
-const FIXTURE_SEED: u64 = 7;
-
 /// Poll cadence between predicate samples in `run_until`, matching the
 /// harness's own `await_*` interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -39,15 +36,17 @@ pub struct ProdCluster {
 }
 
 impl ProdCluster {
-    /// Build and start a genesis cluster from `config` at `epoch_ms`.
+    /// Build and start a genesis cluster from `config`, seeded by `seed`, at
+    /// `epoch_ms`. The seed drives the fixtures' deterministic keys and
+    /// topology; reshape scenarios are seed-sensitive.
     #[must_use]
-    pub fn start(config: &ScenarioConfig, epoch_ms: u64) -> Self {
+    pub fn start(config: &ScenarioConfig, seed: u64, epoch_ms: u64) -> Self {
         let runtime = Builder::new_multi_thread()
             .worker_threads(16)
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let spec = Self::spec(config, epoch_ms);
+        let spec = Self::spec(config, seed, epoch_ms);
         let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
         Self {
@@ -64,19 +63,33 @@ impl ProdCluster {
         runtime.block_on(inner.shutdown());
     }
 
-    /// Translate the portable config into a production `ClusterSpec`. Single
-    /// shard, no surplus for now; multi-shard genesis and pool surplus arrive
-    /// with the reshape scenarios.
-    fn spec(config: &ScenarioConfig, epoch_ms: u64) -> ClusterSpec {
-        let fixtures = TestFixtures::new(FIXTURE_SEED, config.validators_per_shard);
-        let validators: Vec<LocalValidator> = (0..config.validators_per_shard)
+    /// Translate the portable config into a production `ClusterSpec`: a genesis
+    /// committee of `validators_per_shard * num_shards` plus `pool_surplus`
+    /// followers (the reshape cohort), grouped one per host when
+    /// `dedicated_hosts` (the reshape flip needs each seat on its own store) or
+    /// `vnodes_per_host` per host otherwise.
+    fn spec(config: &ScenarioConfig, seed: u64, epoch_ms: u64) -> ClusterSpec {
+        let fixtures = TestFixtures::with_shards_and_surplus(
+            seed,
+            config.validators_per_shard,
+            config.num_shards,
+            config.pool_surplus,
+        );
+        let total = config.validators_per_shard * u32::try_from(config.num_shards).unwrap_or(1)
+            + config.pool_surplus;
+        let validators: Vec<LocalValidator> = (0..total)
             .map(|i| LocalValidator {
                 validator_id: ValidatorId::new(u64::from(i)),
                 signing_key: fixtures.signing_key(i),
             })
             .collect();
+        let group = if config.dedicated_hosts {
+            1
+        } else {
+            config.vnodes_per_host.max(1) as usize
+        };
         let hosts: Vec<HostSpec> = validators
-            .chunks(config.vnodes_per_host.max(1) as usize)
+            .chunks(group)
             .map(|chunk| HostSpec::new(chunk.to_vec()))
             .collect();
         ClusterSpec {

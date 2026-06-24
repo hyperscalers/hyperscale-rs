@@ -12,7 +12,7 @@ mod prod_cluster;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx};
+use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx, split_lifecycle};
 use prod_cluster::ProdCluster;
 use serial_test::serial;
 use tracing_subscriber::fmt;
@@ -47,7 +47,7 @@ const fn liveness_config() -> ScenarioConfig {
 )]
 fn liveness_baseline_prod() {
     let _ = fmt().with_test_writer().try_init();
-    let mut cluster = ProdCluster::start(&liveness_config(), EPOCH_MS);
+    let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     liveness_baseline(&mut cluster);
     cluster.shutdown();
 }
@@ -60,7 +60,36 @@ fn liveness_baseline_prod() {
 )]
 fn single_shard_tx_prod() {
     let _ = fmt().with_test_writer().try_init();
-    let mut cluster = ProdCluster::start(&liveness_config(), EPOCH_MS);
+    let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     single_shard_tx(&mut cluster);
+    cluster.shutdown();
+}
+
+/// Single-shard config with the split trigger armed (`split_bytes = 0`), one
+/// cohort of pool surplus, one validator per host (each reshape seat needs its
+/// own store), and a paced inter-host latency so the loadless committee tracks
+/// wall-clock through the multi-epoch grow.
+const fn split_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(60),
+        dedicated_hosts: true,
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn split_lifecycle_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    split_lifecycle(&mut cluster);
     cluster.shutdown();
 }
