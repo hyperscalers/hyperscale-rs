@@ -58,19 +58,22 @@ impl SimCluster {
             ..SimConfig::default()
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
-        // Fund two accounts that fall in opposite child spans of the first
-        // split, so genesis populates both subtrees with substates — a split
-        // seeds each child from a non-empty parent span.
+
+        // Fund two accounts in opposite child spans of the first split (seed 31
+        // lands left, seed 30 right): genesis populates both subtrees, and the
+        // cross-shard scenarios spend them across the two children. The scenario
+        // bodies address these same accounts via `tx::account_from_seed(31/30)`.
         let left_account = ComponentAddress::preallocated_account_from_public_key(
             &ed25519_keypair_from_seed(&[31; 32]).public_key(),
         );
         let right_account = ComponentAddress::preallocated_account_from_public_key(
-            &ed25519_keypair_from_seed(&[32; 32]).public_key(),
+            &ed25519_keypair_from_seed(&[30; 32]).public_key(),
         );
         runner.initialize_genesis_with_balances(&[
             (left_account, Decimal::from(10_000)),
             (right_account, Decimal::from(10_000)),
         ]);
+
         Self {
             runner,
             driver: ReshapeDriver::default(),

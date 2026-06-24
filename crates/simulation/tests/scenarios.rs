@@ -7,7 +7,10 @@ mod support;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx, split_lifecycle};
+use hyperscale_scenarios::{
+    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, single_shard_tx,
+    split_lifecycle,
+};
 use support::sim_cluster::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -53,4 +56,16 @@ const fn split_config() -> ScenarioConfig {
 fn split_lifecycle_sim() {
     let mut cluster = SimCluster::new(&split_config(), 11);
     split_lifecycle(&mut cluster);
+}
+
+#[test]
+fn cross_shard_tx_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cross_shard_tx(&mut cluster);
+}
+
+#[test]
+fn livelock_resolves_promptly_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    livelock_resolves_promptly(&mut cluster);
 }
