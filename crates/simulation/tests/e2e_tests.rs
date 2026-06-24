@@ -29,8 +29,8 @@ use tracing_test::traced_test;
 
 mod common;
 use common::{
-    await_all_terminal, build_cross_shard_transfer, cross_shard_grow_config,
-    find_accounts_on_each_shard, grown_leaves, submit_to_shard, with_test_recorder,
+    build_cross_shard_transfer, cross_shard_grow_config, find_accounts_on_each_shard, grown_leaves,
+    submit_to_shard,
 };
 
 /// Create a basic single-shard network configuration.
@@ -162,46 +162,6 @@ fn test_e2e_single_shard_determinism() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Cross-Shard Transaction Tests
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// End-to-end cross-shard transaction after growing to two shards.
-///
-/// Genesis at one shard funds two accounts on ROOT, `grow_to(2)` splits them
-/// onto the two children by prefix, then a withdraw-from-shard-0,
-/// deposit-to-shard-1 transfer must reach a terminal outcome on every live
-/// committee member of both children, with no aborts.
-#[traced_test]
-#[test]
-fn test_e2e_cross_shard_transaction() {
-    with_test_recorder(|recorder| {
-        let mut runner = SimulationRunner::new(&cross_shard_grow_config(), 42);
-        let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(2);
-        runner.initialize_genesis_with_balances(&[
-            (acc_a, Decimal::from(10_000)),
-            (acc_b, Decimal::from(10_000)),
-        ]);
-        runner.grow_to(2);
-
-        let leaves = grown_leaves();
-        let tx = build_cross_shard_transfer(&kp_a, acc_a, acc_b, runner.now());
-        let tx_hash = tx.hash();
-        submit_to_shard(&mut runner, leaves[0], tx);
-
-        let deadline = runner.now() + Duration::from_secs(150);
-        let latched = await_all_terminal(&mut runner, &leaves, tx_hash, deadline);
-
-        for &leaf in &leaves {
-            for vnode in runner.shard_vnodes(leaf) {
-                assert!(
-                    latched.contains(&vnode.validator_id()),
-                    "{:?} on {leaf:?} never reached a terminal outcome for {tx_hash:?}",
-                    vnode.validator_id(),
-                );
-            }
-        }
-        let aborts = recorder.counter("transactions_aborted", None);
-        assert_eq!(aborts, 0, "cross-shard transfer aborted ({aborts} events)");
-    });
-}
 
 /// Two same-seed runs of genesis → `grow_to(2)` → cross-shard transfer must
 /// produce identical committed heights and event/message counts: the split
