@@ -18,3 +18,4 @@
 pub mod merge_flip;
 pub mod observer;
 pub mod split_flip;
+pub mod view;

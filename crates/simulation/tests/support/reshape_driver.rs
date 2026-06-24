@@ -11,11 +11,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_network_memory::NodeIndex;
+use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{
-    BeaconState, BlockHash, PendingReshape, ShardAnchor, ShardId, StateRoot, ValidatorId,
-};
+use hyperscale_types::{BeaconState, PendingReshape, ShardAnchor, ShardId, StateRoot, ValidatorId};
 
 /// One splitting parent's observer duty: its pre-split committee and each
 /// cohort member's synced child store.
@@ -115,6 +114,16 @@ impl ReshapeDriver {
             }
         }
 
+        // Flip gate, read through the shared `ReshapeView` over host 0's
+        // topology projection — the same seeding predicate the production
+        // supervisor flips on. The projection drops zeroed placeholders, so
+        // `children_seeded`/`parent_composed` match the raw-boundary checks
+        // this driver used to hand-roll.
+        let Some(topology) = runner.host_topology(0) else {
+            return;
+        };
+        let view = ReshapeView::new(&topology);
+
         // Flip: a parent drained from `pending_reshapes` with both children
         // seeded and not yet flipped → follow each store to the terminal and
         // seat every member onto its child.
@@ -125,7 +134,7 @@ impl ReshapeDriver {
             .filter(|parent| {
                 !self.flipped.contains(parent)
                     && !state.pending_reshapes.contains_key(parent)
-                    && children_seeded(&state, *parent)
+                    && view.children_seeded(*parent)
             })
             .collect();
         for parent in ready {
@@ -144,7 +153,7 @@ impl ReshapeDriver {
             .filter(|parent| {
                 !self.merge_flipped.contains(parent)
                     && !state.pending_reshapes.contains_key(parent)
-                    && parent_composed(&state, *parent)
+                    && view.parent_composed(*parent)
             })
             .collect();
         for parent in merge_ready {
@@ -156,14 +165,6 @@ impl ReshapeDriver {
             self.merge_flipped.insert(parent);
         }
     }
-}
-
-/// Whether `parent`'s merge-composed beacon anchor is seeded.
-fn parent_composed(state: &BeaconState, parent: ShardId) -> bool {
-    state
-        .boundaries
-        .get(&parent)
-        .is_some_and(|boundary| boundary.block_hash != BlockHash::ZERO)
 }
 
 /// Group `keepers` by host and seat each host's set onto the reformed `parent` —
@@ -192,16 +193,4 @@ fn committee_for(runner: &SimulationRunner, shard: ShardId) -> Vec<ValidatorId> 
         .host_topology(0)
         .map(|topology| topology.committee_for_shard(shard).to_vec())
         .unwrap_or_default()
-}
-
-/// Whether both of `parent`'s children carry a seeded beacon anchor.
-fn children_seeded(state: &BeaconState, parent: ShardId) -> bool {
-    let (left, right) = parent.children();
-    let seeded = |child: ShardId| {
-        state
-            .boundaries
-            .get(&child)
-            .is_some_and(|boundary| boundary.block_hash != BlockHash::ZERO)
-    };
-    seeded(left) && seeded(right)
 }

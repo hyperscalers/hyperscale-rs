@@ -32,6 +32,7 @@ use hyperscale_node::process::ProcessIo;
 use hyperscale_node::reshape::merge_flip::merge_genesis_from_terminals;
 use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::split_flip::split_genesis_from_terminal;
+use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
     NodeConfig, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit, seat_follower, seat_vnode_group,
@@ -1333,7 +1334,7 @@ impl ShardSupervisor {
                         .network()
                         .notify(&recipients, &ReadySignalNotification::new(signal));
                 }
-                if process.topology().load().boundary(parent).is_some() {
+                if ReshapeView::new(&process.topology().load_full()).parent_composed(parent) {
                     break;
                 }
                 sleep(KEEPER_READY_REASSERT_INTERVAL).await;
