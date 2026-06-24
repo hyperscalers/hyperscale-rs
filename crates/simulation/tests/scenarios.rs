@@ -7,7 +7,7 @@ mod support;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline};
+use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx};
 use support::sim_cluster::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -27,4 +27,10 @@ const fn liveness_config() -> ScenarioConfig {
 fn liveness_baseline_sim() {
     let mut cluster = SimCluster::new(&liveness_config(), 11);
     liveness_baseline(&mut cluster);
+}
+
+#[test]
+fn single_shard_tx_sim() {
+    let mut cluster = SimCluster::new(&liveness_config(), 42);
+    single_shard_tx(&mut cluster);
 }

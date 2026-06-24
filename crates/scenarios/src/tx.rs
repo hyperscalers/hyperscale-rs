@@ -10,13 +10,54 @@ use std::time::Duration;
 
 use hyperscale_types::{
     Ed25519PrivateKey, RoutableTransaction, TimestampRange, WeightedTimestamp,
-    routable_from_notarized_v1, sign_and_notarize,
+    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
+use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
+
+/// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
+/// fee comes from the faucet, so any key notarizes it.
+#[must_use]
+pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
+    ed25519_keypair_from_seed(&[seed; 32])
+}
+
+/// A deterministic deposit-only account address from a one-byte seed. The
+/// public key is synthetic — the account only ever receives.
+#[must_use]
+pub fn account_from_seed(seed: u8) -> ComponentAddress {
+    ComponentAddress::preallocated_account_from_public_key(&Ed25519PublicKey([seed; 32]))
+}
+
+/// Build a faucet-funded transfer.
+///
+/// The faucet pays the fee and supplies free XRD, deposited to `to`. Portable —
+/// the faucet is a fixed native component on every network — so no
+/// funded-account discovery is needed.
+///
+/// # Panics
+///
+/// Panics if signing or the routability conversion fails (malformed manifest).
+#[must_use]
+pub fn build_faucet_tx(
+    to: ComponentAddress,
+    signer: &Ed25519PrivateKey,
+    network: &NetworkDefinition,
+    nonce: u32,
+    validity: TimestampRange,
+) -> RoutableTransaction {
+    let manifest = ManifestBuilder::new()
+        .lock_fee_from_faucet()
+        .get_free_xrd_from_faucet()
+        .try_deposit_entire_worktop_or_abort(to, None)
+        .build();
+    let notarized = sign_and_notarize(manifest, network, nonce, signer).expect("faucet tx signs");
+    routable_from_notarized_v1(notarized, validity).expect("faucet tx is routable")
+}
 
 /// A validity window bracketing `now`.
 ///
