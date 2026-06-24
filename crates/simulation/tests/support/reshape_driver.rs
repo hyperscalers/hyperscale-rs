@@ -7,9 +7,10 @@
 //! runner's existing reshape methods (`observe_child`, `broadcast_observer_ready`,
 //! `flip_all_for`); only *when* they fire is decided here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
@@ -29,11 +30,18 @@ struct SplitDuty {
     )>,
 }
 
-/// Drives split reshape on the simulation by reacting to committed beacon state.
+/// One merging parent's keeper duty: the keeper set drawn for the merge.
+struct MergeDuty {
+    keepers: Vec<ValidatorId>,
+}
+
+/// Drives reshape on the simulation by reacting to committed beacon state.
 #[derive(Default)]
 pub struct ReshapeDriver {
     splits: HashMap<ShardId, SplitDuty>,
     flipped: HashSet<ShardId>,
+    merges: HashMap<ShardId, MergeDuty>,
+    merge_flipped: HashSet<ShardId>,
 }
 
 impl ReshapeDriver {
@@ -75,6 +83,38 @@ impl ReshapeDriver {
             }
         }
 
+        // Keeper duty: sync each paired full keeper set's sibling half once, then
+        // re-assert ready every slice until the gate collapses the children into
+        // the parent.
+        for (parent, reshape) in &state.pending_reshapes {
+            let PendingReshape::Merge {
+                keepers,
+                admitted_at: Some(_),
+                ..
+            } = reshape
+            else {
+                continue;
+            };
+            if !self.merges.contains_key(parent) {
+                if keepers.len() != state.chain_config.shard_size as usize {
+                    continue;
+                }
+                for (validator, seat) in keepers {
+                    let sibling = seat.child.sibling().expect("a merging child has a sibling");
+                    runner.merge_keeper(*validator, seat.child, sibling);
+                }
+                self.merges.insert(
+                    *parent,
+                    MergeDuty {
+                        keepers: keepers.keys().copied().collect(),
+                    },
+                );
+            }
+            for (validator, seat) in keepers {
+                runner.broadcast_keeper_ready(*validator, seat.child);
+            }
+        }
+
         // Flip: a parent drained from `pending_reshapes` with both children
         // seeded and not yet flipped → follow each store to the terminal and
         // seat every member onto its child.
@@ -93,6 +133,50 @@ impl ReshapeDriver {
             runner.flip_all_for(parent, &duty.members, duty.synced, &state);
             self.flipped.insert(parent);
         }
+
+        // Merge flip: a parent drained from `pending_reshapes` whose composed
+        // anchor is seeded and not yet flipped → seat each host's keepers onto
+        // the reformed parent against the composed merged store.
+        let merge_ready: Vec<ShardId> = self
+            .merges
+            .keys()
+            .copied()
+            .filter(|parent| {
+                !self.merge_flipped.contains(parent)
+                    && !state.pending_reshapes.contains_key(parent)
+                    && parent_composed(&state, *parent)
+            })
+            .collect();
+        for parent in merge_ready {
+            let duty = self
+                .merges
+                .remove(&parent)
+                .expect("ready merge duty present");
+            flip_merge_by_host(runner, parent, &duty.keepers);
+            self.merge_flipped.insert(parent);
+        }
+    }
+}
+
+/// Whether `parent`'s merge-composed beacon anchor is seeded.
+fn parent_composed(state: &BeaconState, parent: ShardId) -> bool {
+    state
+        .boundaries
+        .get(&parent)
+        .is_some_and(|boundary| boundary.block_hash != BlockHash::ZERO)
+}
+
+/// Group `keepers` by host and seat each host's set onto the reformed `parent` —
+/// a merge converges every keeper onto the one parent shard, so co-hosted
+/// keepers seat against the single shared merged store together.
+fn flip_merge_by_host(runner: &mut SimulationRunner, parent: ShardId, keepers: &[ValidatorId]) {
+    let mut by_node: BTreeMap<NodeIndex, Vec<ValidatorId>> = BTreeMap::new();
+    for &validator in keepers {
+        let node = runner.network().validator_to_node(validator);
+        by_node.entry(node).or_default().push(validator);
+    }
+    for (node, validators) in &by_node {
+        runner.flip_merge_parent(*node, validators, parent);
     }
 }
 

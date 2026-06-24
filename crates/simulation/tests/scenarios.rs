@@ -8,8 +8,8 @@ mod support;
 use std::time::Duration;
 
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, single_shard_tx,
-    split_lifecycle,
+    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
+    single_shard_tx, split_lifecycle,
 };
 use support::sim_cluster::SimCluster;
 
@@ -68,4 +68,10 @@ fn cross_shard_tx_sim() {
 fn livelock_resolves_promptly_sim() {
     let mut cluster = SimCluster::new(&split_config(), 11);
     livelock_resolves_promptly(&mut cluster);
+}
+
+#[test]
+fn merge_lifecycle_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    merge_lifecycle(&mut cluster);
 }
