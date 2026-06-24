@@ -122,10 +122,7 @@ impl RequestManager {
 
                     // Backoff before retry
                     sleep(backoff).await;
-                    backoff = Duration::from_secs_f64(
-                        (backoff.as_secs_f64() * self.config.backoff_multiplier)
-                            .min(self.config.max_backoff.as_secs_f64()),
-                    );
+                    backoff = self.grow_backoff(backoff);
                 }
 
                 Err(NetworkError::NetworkShutdown) => {
@@ -153,6 +150,10 @@ impl RequestManager {
                         current_peer = next_peer;
                     }
                     current_peer_attempts = 0;
+
+                    // Backoff before retry
+                    sleep(backoff).await;
+                    backoff = self.grow_backoff(backoff);
                 }
             }
 
@@ -168,6 +169,15 @@ impl RequestManager {
                 return Err(RequestError::Exhausted { attempts });
             }
         }
+    }
+
+    /// Grow the retry backoff toward `max_backoff` by the configured
+    /// multiplier.
+    fn grow_backoff(&self, backoff: Duration) -> Duration {
+        Duration::from_secs_f64(
+            (backoff.as_secs_f64() * self.config.backoff_multiplier)
+                .min(self.config.max_backoff.as_secs_f64()),
+        )
     }
 }
 
