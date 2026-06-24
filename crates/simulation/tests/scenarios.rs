@@ -10,7 +10,7 @@ use std::time::Duration;
 use hyperscale_scenarios::tx::split_straddler_setup;
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    multi_vnode_progress, single_shard_tx, split_lifecycle, split_straddler_atomic,
 };
 use support::sim_cluster::SimCluster;
 
@@ -97,4 +97,25 @@ fn split_straddler_atomic_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_balances(&straddler_config(), 11, &setup.balances);
     split_straddler_atomic(&mut cluster);
+}
+
+/// Multi-vnode config: two vnodes per host (same-shard multi-vnode hosting), the
+/// split disarmed, no pool surplus — a single shard whose committee is hosted at
+/// two vnodes per host.
+const fn multi_vnode_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 2,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+fn multi_vnode_progress_sim() {
+    let mut cluster = SimCluster::new(&multi_vnode_config(), 11);
+    multi_vnode_progress(&mut cluster);
 }

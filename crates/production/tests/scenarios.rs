@@ -15,7 +15,7 @@ use std::time::Duration;
 use hyperscale_scenarios::tx::split_straddler_setup;
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    multi_vnode_progress, single_shard_tx, split_lifecycle, split_straddler_atomic,
 };
 use prod_cluster::ProdCluster;
 use serial_test::serial;
@@ -164,5 +164,20 @@ fn split_straddler_atomic_prod() {
     let mut cluster =
         ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
     split_straddler_atomic(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn multi_vnode_progress_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    // `liveness_config` already hosts the committee at two vnodes per host — the
+    // same-shard multi-vnode hosting under test.
+    let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
+    multi_vnode_progress(&mut cluster);
     cluster.shutdown();
 }
