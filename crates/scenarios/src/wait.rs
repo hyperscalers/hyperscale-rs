@@ -6,8 +6,15 @@
 
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 
-use crate::query::{anchor_root, split_admitted};
+use crate::query::{anchor_root, beacon_epoch, split_admitted};
 use crate::{Budget, Cluster};
+
+/// Wait until the committed beacon epoch reaches `target`.
+pub fn await_beacon_epoch<C: Cluster>(c: &mut C, target: u64, budget: Budget) -> bool {
+    c.run_until(budget, |c| {
+        beacon_epoch(c).is_some_and(|e| e.inner() >= target)
+    })
+}
 
 /// Wait until `shard`'s committed height reaches `target`.
 pub fn await_height<C: Cluster>(c: &mut C, shard: ShardId, target: u64, budget: Budget) -> bool {

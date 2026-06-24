@@ -43,6 +43,7 @@ hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true
+hyperscale-scenarios.workspace = true
 
 tracing-test.workspace = true
 
