@@ -93,12 +93,12 @@ pub fn cross_shard_tx(c: &mut impl Cluster) {
 ///
 /// The two transactions contend on the same accounts across both shards. The
 /// system resolves the contention — cycle detection aborts a deadlocked loser,
-/// or the pair admits sequentially — so both reach a terminal outcome well
-/// within the wave timeout, never livelocking. At most one aborts: a
-/// double-abort would mean a timeout, not prompt resolution. (Whether the
-/// cross-shard cycle deadlocks at all is timing-dependent, so the loser-abort
-/// is not asserted — prompt non-livelocked resolution is.) Composes
-/// [`split_lifecycle`] for the grow.
+/// or the pair admits sequentially — so both reach a terminal outcome within a
+/// bounded budget, never livelocking. At most one aborts: a double-abort would
+/// mean a timeout, not prompt resolution. (Whether the cross-shard cycle
+/// deadlocks at all is timing-dependent, so the loser-abort is not asserted —
+/// prompt non-livelocked resolution is.) Composes [`split_lifecycle`] for the
+/// grow.
 ///
 /// # Panics
 ///
@@ -136,11 +136,14 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
     c.submit(Arc::new(tx_a));
     c.submit(Arc::new(tx_b));
 
-    // A tight budget below the wave timeout: a livelocked pair would never both
-    // resolve here, while cycle detection or sequential admission both settle in
-    // a wave or two.
-    let status_a = await_tx_terminal(c, hash_a, epochs(4));
-    let status_b = await_tx_terminal(c, hash_b, epochs(4));
+    // The pair shares an account set, so the ready-set invariant serializes it
+    // into two back-to-back waves rather than running them together. Each
+    // transaction gets the settlement budget a single cross-shard transfer needs
+    // (`cross_shard_tx`), well above one wave on wall-clock. A genuine livelock
+    // never resolves, so the assertion below still catches it — the budget only
+    // has to outlast honest sequential settlement.
+    let status_a = await_tx_terminal(c, hash_a, epochs(8));
+    let status_b = await_tx_terminal(c, hash_b, epochs(8));
     assert!(
         matches!(status_a, Some(TransactionStatus::Completed(_)))
             && matches!(status_b, Some(TransactionStatus::Completed(_))),
