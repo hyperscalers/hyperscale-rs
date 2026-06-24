@@ -2,15 +2,29 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::ShardId;
+use hyperscale_types::{Epoch, ShardId};
 use radix_common::network::NetworkDefinition;
 
-use crate::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
+use crate::query::beacon_epoch;
+use crate::tx::{
+    account_from_seed, build_faucet_tx, build_reshape_threshold_vote_tx, signer_from_seed,
+    validity_around,
+};
 use crate::wait::{
-    assert_height_frozen, await_height, await_root_matches_anchor, await_serves,
-    await_split_admitted,
+    assert_height_frozen, await_height, await_merge_keeper_count, await_root_matches_anchor,
+    await_serves, await_split_admitted,
 };
 use crate::{Cluster, epochs};
+
+/// Epochs of lead before the threshold vote activates — enough for the vote
+/// transaction to commit and fold into the tally before it is read.
+const VOTE_ACTIVATE_LEAD: u64 = 4;
+
+/// Reshape `split_bytes` the vote installs after the grow. Its derived
+/// `merge_bytes = split_bytes / 8` sits far above each cold child's byte total,
+/// so both assert the merge once the change activates, while staying far above
+/// them so neither re-splits.
+const MERGE_VOTE_SPLIT_BYTES: u64 = 80_000_000;
 
 /// Arm an organic split of the root shard and drive it to completion.
 ///
@@ -59,4 +73,60 @@ pub fn split_lifecycle(c: &mut impl Cluster) {
         "split child roots did not match the beacon anchor within budget"
     );
     assert_height_frozen(c, root, epochs(2));
+}
+
+/// Grow the root into two shards, then merge the two cold children back into it.
+///
+/// Composes [`split_lifecycle`] for the grow, then votes the reshape threshold
+/// up so the children fall under the derived merge threshold — a grown topology
+/// can't merge under the frozen threshold that split it, so the vote is the
+/// honest trigger. The beacon pairs the merge and draws the keeper committee,
+/// the keepers seat the reformed parent, and its committed root reproduces the
+/// beacon-composed anchor. Requires a config with `split_bytes = 0`, one cohort
+/// of pool surplus, and a funded straddler account (`31`) to pay the vote.
+///
+/// # Panics
+///
+/// Panics if any lifecycle stage misses its budget.
+pub fn merge_lifecycle(c: &mut impl Cluster) {
+    let root = ShardId::ROOT;
+
+    split_lifecycle(c);
+
+    // Vote the reshape threshold up so the cold grown children fall under the
+    // derived merge threshold. The straddler account `31`, funded at genesis and
+    // seated on a child by the grow, pays the system-action fee.
+    let payer = signer_from_seed(31);
+    let current = beacon_epoch(c).expect("the grow committed a beacon epoch");
+    let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
+    let vote = build_reshape_threshold_vote_tx(
+        &payer,
+        MERGE_VOTE_SPLIT_BYTES,
+        activate_at,
+        &NetworkDefinition::simulator(),
+        1,
+        validity_around(c.now()),
+    );
+    c.submit(Arc::new(vote));
+
+    // The vote activates, both children assert the merge, and the beacon pairs
+    // it — drawing a quorum (2f+1 of the four-validator merged committee).
+    assert!(
+        await_merge_keeper_count(c, root, 3, epochs(20)),
+        "the merge did not pair a keeper quorum within budget"
+    );
+    // The keepers seat the reformed parent, which commits past its merged
+    // genesis at the beacon-composed anchor root.
+    assert!(
+        await_serves(c, root, epochs(28)),
+        "the merged parent was not served within budget"
+    );
+    assert!(
+        await_height(c, root, 1, epochs(8)),
+        "the merged parent did not commit past genesis within budget"
+    );
+    assert!(
+        await_root_matches_anchor(c, root, epochs(8)),
+        "the merged root did not match the beacon anchor within budget"
+    );
 }

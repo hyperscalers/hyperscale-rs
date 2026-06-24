@@ -9,14 +9,17 @@
 use std::time::Duration;
 
 use hyperscale_types::{
-    Ed25519PrivateKey, RoutableTransaction, TimestampRange, WeightedTimestamp,
-    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
+    BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NotarizeOptions, ParamProposal,
+    ParamVote, ReshapeThresholds, RoutableTransaction, StakePoolId, TimestampRange,
+    WeightedTimestamp, ed25519_keypair_from_seed, encode_system_action, routable_from_notarized_v1,
+    sign_and_notarize, sign_and_notarize_with_options,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
+use radix_transactions::model::{MessageContentsV1, MessageV1, PlaintextMessageV1};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.
@@ -111,4 +114,57 @@ pub fn build_transfer_tx(
         .build();
     let notarized = sign_and_notarize(manifest, network, nonce, payer).expect("transfer signs");
     routable_from_notarized_v1(notarized, validity).expect("transfer is routable")
+}
+
+/// Build a stake-pool parameter vote that retunes the reshape `split_bytes`,
+/// activating at `activate_at`.
+///
+/// The vote rides the system-action rail: a `lock_fee` no-op paid by `payer`
+/// carrying the `ParamVote` in its plaintext message. It routes to the shard
+/// owning `payer`'s account, witnesses to the beacon, and the beacon tallies it.
+/// The single genesis stake pool (id 0) holds all stake, so one vote is a
+/// majority. Raising `split_bytes` lifts the derived `merge_bytes` above a grown
+/// topology's children so they fall under the merge threshold.
+///
+/// # Panics
+///
+/// Panics if signing or the routability conversion fails (malformed manifest).
+#[must_use]
+pub fn build_reshape_threshold_vote_tx(
+    payer: &Ed25519PrivateKey,
+    split_bytes: u64,
+    activate_at: Epoch,
+    network: &NetworkDefinition,
+    nonce: u32,
+    validity: TimestampRange,
+) -> RoutableTransaction {
+    let vote = BeaconWitnessEvent::ParamVote(ParamVote {
+        pool: StakePoolId::new(0),
+        proposal: Some(ParamProposal {
+            params: NetworkParams {
+                reshape_thresholds: ReshapeThresholds { split_bytes },
+            },
+            activate_at,
+        }),
+    });
+    let account = ComponentAddress::preallocated_account_from_public_key(&payer.public_key());
+    let manifest = ManifestBuilder::new()
+        .lock_fee(account, Decimal::from(10))
+        .build();
+    let message = MessageV1::Plaintext(PlaintextMessageV1 {
+        mime_type: "application/octet-stream".to_string(),
+        message: MessageContentsV1::Bytes(encode_system_action(&vote)),
+    });
+    let notarized = sign_and_notarize_with_options(
+        manifest,
+        network,
+        nonce,
+        NotarizeOptions {
+            message,
+            ..Default::default()
+        },
+        payer,
+    )
+    .expect("vote transaction signs");
+    routable_from_notarized_v1(notarized, validity).expect("vote is routable")
 }

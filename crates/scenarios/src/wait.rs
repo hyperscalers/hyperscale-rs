@@ -6,7 +6,7 @@
 
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 
-use crate::query::{anchor_root, beacon_epoch, split_admitted};
+use crate::query::{anchor_root, beacon_epoch, merge_keeper_count, split_admitted};
 use crate::{Budget, Cluster};
 
 /// Wait until the committed beacon epoch reaches `target`.
@@ -32,6 +32,19 @@ pub fn await_serves<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bo
 /// Wait until the beacon admits a split for `parent`.
 pub fn await_split_admitted<C: Cluster>(c: &mut C, parent: ShardId, budget: Budget) -> bool {
     c.run_until(budget, |c| split_admitted(c, parent))
+}
+
+/// Wait until the beacon pairs a merge into `parent` with at least `min`
+/// keepers drawn.
+pub fn await_merge_keeper_count<C: Cluster>(
+    c: &mut C,
+    parent: ShardId,
+    min: usize,
+    budget: Budget,
+) -> bool {
+    c.run_until(budget, |c| {
+        merge_keeper_count(c, parent).is_some_and(|count| count >= min)
+    })
 }
 
 /// Wait until `shard`'s committed root matches the beacon-composed anchor — the

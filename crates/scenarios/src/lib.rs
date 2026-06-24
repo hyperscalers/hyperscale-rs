@@ -28,5 +28,5 @@ pub use budget::{Budget, epochs};
 pub use cluster::Cluster;
 pub use config::ScenarioConfig;
 pub use liveness::liveness_baseline;
-pub use reshape::split_lifecycle;
+pub use reshape::{merge_lifecycle, split_lifecycle};
 pub use transactions::{cross_shard_tx, livelock_resolves_promptly, single_shard_tx};
