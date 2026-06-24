@@ -60,18 +60,21 @@ pub fn await_tx_terminal<C: Cluster>(
     c.tx_status(tx)
 }
 
-/// Run `budget` epochs and assert `shard`'s committed height never changes —
-/// the "this shard stopped" signal (a terminated split parent).
+/// Run `budget` epochs and assert `shard`'s committed height never advances.
+///
+/// The "this shard stopped" signal (a terminated split parent). A terminated
+/// parent may drop to `None` as its store is dropped, so this asserts
+/// non-increase rather than strict equality (`None < Some`).
 ///
 /// # Panics
 ///
-/// Panics if the height changes over the window.
+/// Panics if the height advances over the window.
 pub fn assert_height_frozen<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) {
     let before = c.committed_height(shard);
     c.run_until(budget, |_| false);
     let after = c.committed_height(shard);
-    assert_eq!(
-        before, after,
-        "{shard:?} height changed from {before:?} to {after:?} over {budget:?}; expected frozen"
+    assert!(
+        after <= before,
+        "{shard:?} advanced from {before:?} to {after:?} over {budget:?}; expected stopped"
     );
 }

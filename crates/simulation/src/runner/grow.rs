@@ -17,12 +17,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_memory::NodeIndex;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
     BeaconState, BlockHash, BlockHeight, PendingReshape, ShardAnchor, ShardId, StateRoot,
-    TopologySnapshot, ValidatorId, ValidatorStatus,
+    TopologySnapshot, ValidatorId,
 };
 
 use super::SimulationRunner;
@@ -226,81 +225,7 @@ impl SimulationRunner {
     /// member onto its assigned child.
     fn flip_all(&mut self, splits: Vec<PendingSplit>, state: &BeaconState) {
         for split in splits {
-            let parent_halves: Vec<(ValidatorId, ShardId)> = split
-                .members
-                .iter()
-                .map(|member| {
-                    let status = state.validators[member].status;
-                    let ValidatorStatus::OnShard { shard, .. } = status else {
-                        panic!(
-                            "parent member {member:?} must land on a child of {:?}; got {status:?}",
-                            split.parent,
-                        )
-                    };
-                    (*member, shard)
-                })
-                .collect();
-            for (_, child, store, anchor, imported_root) in &split.synced {
-                self.follow_child(store, split.parent, *child, *anchor, *imported_root);
-            }
-            self.flip_split_members(split.parent, &parent_halves, split.synced);
-        }
-    }
-
-    /// Flip every member onto its assigned child: parent halves clone-and-adopt
-    /// on their own hosts; each observer reopens its synced store on a host of
-    /// its own.
-    ///
-    /// With [`NetworkConfig::dedicated_pool_hosts`] every observer seats on its
-    /// own dedicated host — kept current by the beacon follower that ran there
-    /// since construction — and that follower is dropped once the shard vnode
-    /// is seated, so the validator runs a single coordinator and every
-    /// committee member ends on a single shard (the layout the shuffle's
-    /// cross-shard relocation needs). Otherwise an observer co-hosts on a host
-    /// whose own vnode flipped to the sibling child.
-    ///
-    /// [`NetworkConfig::dedicated_pool_hosts`]: hyperscale_network_memory::NetworkConfig::dedicated_pool_hosts
-    fn flip_split_members(
-        &mut self,
-        parent: ShardId,
-        parent_halves: &[(ValidatorId, ShardId)],
-        synced: Vec<(
-            ValidatorId,
-            ShardId,
-            SimShardStorage,
-            ShardAnchor,
-            StateRoot,
-        )>,
-    ) {
-        for (member, child) in parent_halves {
-            let node = self.network.validator_to_node(*member);
-            self.flip_split_child(node, *member, parent, *child, None);
-        }
-        let dedicated = self.config.dedicated_pool_hosts;
-        let mut sibling_hosts: Vec<NodeIndex> = Vec::new();
-        for (validator, child, store, _, _) in synced {
-            let node = if dedicated {
-                self.network.validator_to_node(validator)
-            } else {
-                let node = parent_halves
-                    .iter()
-                    .map(|(member, member_child)| {
-                        (self.network.validator_to_node(*member), *member_child)
-                    })
-                    .find(|(node, member_child)| {
-                        *member_child != child && !sibling_hosts.contains(node)
-                    })
-                    .map(|(node, _)| node)
-                    .expect("a free host whose own vnode flipped to the sibling");
-                sibling_hosts.push(node);
-                node
-            };
-            self.flip_split_child(node, validator, parent, child, Some(store));
-            if dedicated {
-                // The seat rebuilt the validator's coordinator from the host's
-                // warm beacon storage; retire the now-redundant follower.
-                self.hosts[node as usize].drop_pooled_vnode(validator);
-            }
+            self.flip_all_for(split.parent, &split.members, split.synced, state);
         }
     }
 

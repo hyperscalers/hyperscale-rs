@@ -17,8 +17,12 @@ use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, ed25519_keypair_from_seed,
 };
+use radix_common::math::Decimal;
+use radix_common::types::ComponentAddress;
+
+use super::reshape_driver::ReshapeDriver;
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
 /// internal predicate loop.
@@ -27,6 +31,7 @@ const SLICE: Duration = Duration::from_secs(1);
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
 pub struct SimCluster {
     runner: SimulationRunner,
+    driver: ReshapeDriver,
 }
 
 impl SimCluster {
@@ -53,8 +58,23 @@ impl SimCluster {
             ..SimConfig::default()
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
-        runner.initialize_genesis();
-        Self { runner }
+        // Fund two accounts that fall in opposite child spans of the first
+        // split, so genesis populates both subtrees with substates — a split
+        // seeds each child from a non-empty parent span.
+        let left_account = ComponentAddress::preallocated_account_from_public_key(
+            &ed25519_keypair_from_seed(&[31; 32]).public_key(),
+        );
+        let right_account = ComponentAddress::preallocated_account_from_public_key(
+            &ed25519_keypair_from_seed(&[32; 32]).public_key(),
+        );
+        runner.initialize_genesis_with_balances(&[
+            (left_account, Decimal::from(10_000)),
+            (right_account, Decimal::from(10_000)),
+        ]);
+        Self {
+            runner,
+            driver: ReshapeDriver::default(),
+        }
     }
 
     /// The duration `budget` epochs span on this harness's clock.
@@ -105,6 +125,7 @@ impl Cluster for SimCluster {
         }
         let deadline = self.runner.now() + Self::span(budget);
         while self.runner.now() < deadline {
+            self.driver.pump(&mut self.runner);
             let next = (self.runner.now() + SLICE).min(deadline);
             self.runner.run_until(next);
             if cond(self) {

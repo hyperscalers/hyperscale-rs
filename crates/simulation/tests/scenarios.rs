@@ -7,7 +7,7 @@ mod support;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx};
+use hyperscale_scenarios::{ScenarioConfig, liveness_baseline, single_shard_tx, split_lifecycle};
 use support::sim_cluster::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -33,4 +33,24 @@ fn liveness_baseline_sim() {
 fn single_shard_tx_sim() {
     let mut cluster = SimCluster::new(&liveness_config(), 42);
     single_shard_tx(&mut cluster);
+}
+
+/// Single-shard config with the split trigger armed (`split_bytes = 0`) and one
+/// cohort of pool surplus — drives an organic root split.
+const fn split_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+fn split_lifecycle_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    split_lifecycle(&mut cluster);
 }

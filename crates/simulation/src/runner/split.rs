@@ -18,12 +18,94 @@ use hyperscale_node::shard::HostEvent;
 use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    CertifiedBlock, ShardId, StateRoot, ValidatorId, Verified, shard_prefix_path,
+    BeaconState, CertifiedBlock, ShardAnchor, ShardId, StateRoot, ValidatorId, ValidatorStatus,
+    Verified, shard_prefix_path,
 };
 
 use super::SimulationRunner;
 
+/// One cohort member's synced child store, its imported root, and the anchor
+/// the sync verified against.
+type SyncedMember = (
+    ValidatorId,
+    ShardId,
+    SimShardStorage,
+    ShardAnchor,
+    StateRoot,
+);
+
 impl SimulationRunner {
+    /// Flip every member of one split onto its assigned child: follow each
+    /// synced store to the parent's terminal root, seat each parent half
+    /// (clone-and-adopt on its own host), then seat each observer on its synced
+    /// store. The post-gate `state` says where each pre-split `member` landed.
+    ///
+    /// With [`NetworkConfig::dedicated_pool_hosts`] every observer seats on its
+    /// own dedicated host — kept current by the beacon follower that ran there
+    /// since construction — and that follower is dropped once the shard vnode is
+    /// seated, so every committee member ends on a single shard. Otherwise an
+    /// observer co-hosts on a host whose own vnode flipped to the sibling child.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member did not land `OnShard`, or if no free sibling host is
+    /// available for a co-hosted observer.
+    ///
+    /// [`NetworkConfig::dedicated_pool_hosts`]: hyperscale_network_memory::NetworkConfig::dedicated_pool_hosts
+    pub fn flip_all_for(
+        &mut self,
+        parent: ShardId,
+        members: &[ValidatorId],
+        synced: Vec<SyncedMember>,
+        state: &BeaconState,
+    ) {
+        let parent_halves: Vec<(ValidatorId, ShardId)> = members
+            .iter()
+            .map(|member| {
+                let ValidatorStatus::OnShard { shard, .. } = state.validators[member].status else {
+                    panic!(
+                        "parent member {member:?} must land on a child of {parent:?}; got {:?}",
+                        state.validators[member].status,
+                    )
+                };
+                (*member, shard)
+            })
+            .collect();
+        for (_, child, store, anchor, imported_root) in &synced {
+            self.follow_child(store, parent, *child, *anchor, *imported_root);
+        }
+        for (member, child) in &parent_halves {
+            let node = self.network.validator_to_node(*member);
+            self.flip_split_child(node, *member, parent, *child, None);
+        }
+        let dedicated = self.config.dedicated_pool_hosts;
+        let mut sibling_hosts: Vec<NodeIndex> = Vec::new();
+        for (validator, child, store, _, _) in synced {
+            let node = if dedicated {
+                self.network.validator_to_node(validator)
+            } else {
+                let node = parent_halves
+                    .iter()
+                    .map(|(member, member_child)| {
+                        (self.network.validator_to_node(*member), *member_child)
+                    })
+                    .find(|(node, member_child)| {
+                        *member_child != child && !sibling_hosts.contains(node)
+                    })
+                    .map(|(node, _)| node)
+                    .expect("a free host whose own vnode flipped to the sibling");
+                sibling_hosts.push(node);
+                node
+            };
+            self.flip_split_child(node, validator, parent, child, Some(store));
+            if dedicated {
+                // The seat rebuilt the validator's coordinator from the host's
+                // warm beacon storage; retire the now-redundant follower.
+                self.hosts[node as usize].drop_pooled_vnode(validator);
+            }
+        }
+    }
+
     /// Flip a pre-staffed member onto the freshly split `child` of
     /// `parent`, seating the vnode on `node`'s host.
     ///
