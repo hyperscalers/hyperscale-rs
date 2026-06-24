@@ -39,6 +39,7 @@ impl SimCluster {
     /// Build a genesis cluster from `config`, seeded by `seed`, funding the
     /// shared straddler accounts (seed `31` left, `30` right) the cross-shard
     /// scenarios spend.
+    #[allow(dead_code)] // some test binaries fund their own balances (reshape_sibling), not every one
     #[must_use]
     pub fn new(config: &ScenarioConfig, seed: u64) -> Self {
         Self::with_balances(config, seed, &straddler_genesis_balances())

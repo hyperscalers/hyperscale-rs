@@ -1,718 +1,142 @@
-//! A surviving sibling reconstructs a split shard's settled set.
+//! Surviving-sibling split lifecycle, composed over `split_straddler_atomic`.
 //!
-//! Reached the way mainnet would: a single-shard genesis grows into the two
-//! sibling shards `leaf(1,0)`/`leaf(1,1)` through the real split lifecycle,
-//! then a stake-pool parameter vote lowers `split_bytes` so the heavier
-//! `leaf(1,0)` (bulk-funded past the lowered threshold) splits into
-//! `leaf(2,0)`/`leaf(2,1)` while the lighter `leaf(1,1)` stays under it and
-//! keeps running — the surviving-sibling shape the split-boundary fence
-//! needs and that `reshape_straddle` (a single ROOT split, both children
-//! fresh) cannot produce.
+//! `split_straddler_atomic` grows the root into the heavier `leaf(1,0)` splitter
+//! and the lighter `leaf(1,1)` survivor, votes the reshape threshold down so only
+//! the splitter crosses, and asserts the settled-waves fence across the boundary
+//! (a straddler settles atomically with what the splitter settled by its terminal
+//! block, or aborts — never one-sided). This bespoke sim test layers the sim-only
+//! **post-lifecycle** facts on top: the second-generation split seats correctly
+//! while the sibling survives — the splitter retires, its two children each seat
+//! a full committee, and the survivor keeps its own — both children commit past
+//! their seeded genesis, and each child's chain is structurally continuous with
+//! the splitter it forked from (a committed block carries a genesis QC).
 //!
-//! This file builds the lifecycle first: the trigger fires for `leaf(1,0)`
-//! alone, its observers grow the split through the readiness gate, the
-//! children seed from its terminal contribution with subtree-root
-//! continuity, and `leaf(1,1)` commits throughout. The straddler and the
-//! fence assertions build on top.
+//! The straddler's **settled-set** machinery is not re-asserted here: the
+//! acquisition host is unit-tested in `crates/node/src/shard/cross_shard/settled_set.rs`
+//! (`acquires_against_a_served_chain`, `root_mismatch_parks_and_rotates`,
+//! `expires_past_the_retention_horizon`, `dedupes_by_terminal_block`), the
+//! counterpart abort and the lock release it triggers in `hyperscale_mempool`
+//! (`abort_in_flight_drives_committed_txs_terminal`,
+//! `abort_transactions_releases_only_the_named_txs`), and the atomic-settlement
+//! outcome is `split_straddler_atomic`'s fence.
 
-use std::fmt::Write as _;
-use std::sync::Arc;
-use std::time::Duration;
+mod support;
 
-use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
-use hyperscale_storage::{ShardChainReader, SubstateStore};
-use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHash, BlockHeight, Ed25519PrivateKey, Epoch, NodeId,
-    PendingReshape, ReshapeThresholds, RoutableTransaction, ShardAnchor, ShardId, SplitChildRoots,
-    StateRoot, TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
-    ValidatorStatus, WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1,
-    sign_and_notarize, uniform_shard_for_node,
-};
-use radix_common::constants::XRD;
-use radix_common::math::Decimal;
-use radix_common::network::NetworkDefinition;
-use radix_common::types::ComponentAddress;
-use radix_transactions::builder::ManifestBuilder;
-use tracing_test::traced_test;
+use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR, split_straddler_setup};
+use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs, split_straddler_atomic};
+use hyperscale_storage::ShardChainReader;
+use hyperscale_types::{BlockHeight, ShardId, ValidatorStatus};
+use support::sim_cluster::SimCluster;
 
+/// Committee validators per shard.
 const PER_SHARD: u32 = 4;
 
-/// Reshape threshold armed for the grow: ROOT's full genesis byte total
-/// (both halves plus the bulk accounts, ~1M) sits above it so ROOT splits
-/// once, while each child's half (`leaf(1,0)` ~627k, `leaf(1,1)` ~377k)
-/// sits below it so neither child re-splits during the grow.
-const GROW_SPLIT_BYTES: u64 = 800_000;
-
-/// The threshold the parameter vote installs after the grow: `leaf(1,0)`'s
-/// byte total (~627k — the heavier engine-bootstrap half plus 20 bulk
-/// accounts) sits above this; `leaf(1,1)`'s (~377k) sits below — so the
-/// trigger fires for `leaf(1,0)` alone. A cross-shard transfer moves no
-/// substates, so `leaf(1,1)` stays under the threshold throughout.
-const SPLIT_BYTES: u64 = 500_000;
-
-/// Epochs after the post-grow epoch at which the threshold vote activates —
-/// enough lead for the vote transaction to commit and fold into
-/// `param_votes` before the tally reads it.
-const ACTIVATE_LEAD: u64 = 4;
-
-/// Bulk accounts funded into `leaf(1,0)` to widen its margin over the
-/// threshold.
-const RIGHT_BULK: usize = 20;
-
-/// Submission offsets *before* `leaf(1,0)`'s terminal cut for the straddlers
-/// meant to *settle*: far enough ahead that the cross-shard 2PC finalizes on
-/// `leaf(1,0)` before its terminal, yet close enough that the settled wave is
-/// still in the settled set `leaf(1,0)`'s terminal attests — so the survivor
-/// reconstructs a non-empty `S_{leaf(1,0)}`. (At a five-minute epoch a settle
-/// anchored to admission would finalize epochs before the terminal and be
-/// pruned out of the attested set.)
-const SETTLE_OFFSETS_MS: [u64; 2] = [80_000, 60_000];
-
-/// Submission offsets *before* `leaf(1,0)`'s terminal cut for the
-/// straddlers meant to *straddle*. Anchored to the now-known cut so they
-/// track the boundary however long the heavier shard's grow phase runs;
-/// landing after the gate, they leave the grow phase — and thus the cut
-/// — undisturbed. They commit on `leaf(1,0)` but cross its terminal
-/// before settling, so neither side finalizes them.
-const STRADDLE_OFFSETS_MS: [u64; 3] = [700, 400, 200];
-
-const ADMISSION_BUDGET_EPOCHS: u64 = 24;
-const GATE_BUDGET_EPOCHS: u64 = 10;
-const SEED_BUDGET_EPOCHS: u64 = 6;
-const CHILD_RUN_BUDGET_EPOCHS: u64 = 6;
-const SETTLE_BUDGET_EPOCHS: u64 = 6;
-
-/// Single-shard genesis with the split trigger armed for the grow and two
-/// cohorts of pooled extras — one staffs `grow_to(2)`'s ROOT split, the
-/// other staffs `leaf(1,0)`'s split once the vote lowers the threshold.
-fn sibling_config() -> SimConfig {
-    SimConfig {
+/// Single-shard genesis with the grow trigger armed (`split_bytes` above each
+/// child but below ROOT) and two cohorts of pool surplus — one grows ROOT into
+/// the splitter and survivor siblings, the other splits the heavier splitter
+/// once the threshold vote lands.
+const fn sibling_config() -> ScenarioConfig {
+    ScenarioConfig {
         validators_per_shard: PER_SHARD,
-        jitter_fraction: 0.1,
-        beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: EPOCH_MS,
-            num_shards: 1,
-            shard_size: PER_SHARD,
-            reshape_thresholds: ReshapeThresholds {
-                split_bytes: GROW_SPLIT_BYTES,
-            },
-            ..BeaconChainConfig::default()
-        }),
-        pool_extra_validators: 2 * PER_SHARD,
-        ..Default::default()
+        vnodes_per_host: 1,
+        pool_surplus: 2 * PER_SHARD,
+        num_shards: 1,
+        split_bytes: 800_000,
+        latency: std::time::Duration::from_millis(150),
+        dedicated_hosts: false,
     }
 }
 
-fn beacon_state(runner: &SimulationRunner) -> Option<Arc<BeaconState>> {
-    let (_, state) = runner.beacon_storage(0)?.latest_committed()?;
-    Some(state)
-}
-
-/// The pending split's cohort for `parent` as `(observer, assigned child)`.
-fn pending_cohort_for(
-    runner: &SimulationRunner,
-    parent: ShardId,
-) -> Option<Vec<(ValidatorId, ShardId)>> {
-    let state = beacon_state(runner)?;
-    let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&parent) else {
-        return None;
-    };
-    Some(
-        cohort
-            .iter()
-            .map(|(validator, seat)| (*validator, seat.child))
-            .collect(),
-    )
-}
-
-fn run_until(
-    runner: &mut SimulationRunner,
-    deadline: Duration,
-    mut predicate: impl FnMut(&SimulationRunner) -> bool,
-) -> bool {
-    while runner.now() < deadline {
-        let next = runner.now() + Duration::from_secs(1);
-        runner.run_until(next);
-        if predicate(runner) {
-            return true;
-        }
-    }
-    false
-}
-
-const fn epochs(n: u64) -> Duration {
-    Duration::from_millis(EPOCH_MS * n)
-}
-
-/// A fresh keypair whose preallocated account routes to `shard` under a
-/// `num_shards`-wide uniform trie — the same routing genesis uses.
-fn account_in(
-    shard: ShardId,
-    num_shards: u64,
-    taken: &mut Vec<u8>,
-) -> (Ed25519PrivateKey, ComponentAddress) {
-    for seed in 1u8..=u8::MAX {
-        if taken.contains(&seed) {
-            continue;
-        }
-        let key = ed25519_keypair_from_seed(&[seed; 32]);
-        let address = ComponentAddress::preallocated_account_from_public_key(&key.public_key());
-        let node = NodeId(
-            address.into_node_id().0[..30]
-                .try_into()
-                .expect("account address carries a 30-byte node id"),
-        );
-        if uniform_shard_for_node(&node, num_shards) == shard {
-            taken.push(seed);
-            return (key, address);
-        }
-    }
-    panic!("no account seed routes to {shard:?}");
-}
-
-fn store_for(runner: &SimulationRunner, shard: ShardId) -> Option<&SimShardStorage> {
-    (0..runner.num_hosts()).find_map(|node| runner.hosts_shard(node, shard))
-}
-
-/// A validator currently seated on `shard`, per the committed beacon
-/// state — used to address the surviving sibling's coordinator (which
-/// validator index that is depends on the committee draw, not a fixed
-/// seat).
-fn member_of(runner: &SimulationRunner, shard: ShardId) -> ValidatorId {
-    beacon_state(runner)
-        .expect("beacon state")
-        .validators
-        .iter()
-        .find_map(|(id, record)| match record.status {
-            ValidatorStatus::OnShard { shard: seated, .. } if seated == shard => Some(*id),
-            _ => None,
-        })
-        .expect("shard has a seated member")
-}
-
-/// A payer-to-recipient XRD transfer, signed and routable, with a validity
-/// window bracketing `anchor` — the approximate weighted time it commits at.
-/// A genesis-anchored range would expire by the time the split lifecycle has
-/// run for several epochs of weighted time.
-fn transfer(
-    payer_key: &Ed25519PrivateKey,
-    payer: ComponentAddress,
-    recipient: ComponentAddress,
-    anchor: Duration,
-) -> Arc<RoutableTransaction> {
-    let manifest = ManifestBuilder::new()
-        .lock_fee(payer, Decimal::from(10))
-        .withdraw_from_account(payer, XRD, Decimal::from(500))
-        .try_deposit_entire_worktop_or_abort(recipient, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 1, payer_key)
-        .expect("transfer signs");
-    let validity = TimestampRange::new(
-        WeightedTimestamp::ZERO.plus(anchor.saturating_sub(Duration::from_secs(5))),
-        WeightedTimestamp::ZERO.plus(anchor + Duration::from_secs(150)),
-    );
-    Arc::new(routable_from_notarized_v1(notarized, validity).expect("routable"))
-}
-
-/// Walk a committed chain from `from` to its tip: the heights at which
-/// `hash` was committed (rides `transactions`) and finalized (rides a
-/// `FinalizedWave` certificate), and the finalizing block's weighted
-/// timestamp.
-fn scan_chain(
-    storage: &SimShardStorage,
-    from: BlockHeight,
-    hash: TxHash,
-) -> (
-    Option<BlockHeight>,
-    Option<BlockHeight>,
-    Option<WeightedTimestamp>,
-) {
-    let mut committed = None;
-    let mut finalized = None;
-    let mut finalized_wt = None;
-    let tip = storage.committed_height();
-    let mut height = from;
-    while height <= tip {
-        if let Some(certified) = storage.get_block(height) {
-            let block = certified.block();
-            if block.transactions().iter().any(|tx| tx.hash() == hash) {
-                committed = Some(height);
-            }
-            if block
-                .certificates()
-                .iter()
-                .any(|fw| fw.tx_hashes().any(|t| t == hash))
-            {
-                finalized = Some(height);
-                finalized_wt = Some(block.header().parent_qc().weighted_timestamp());
-            }
-        }
-        height = height.next();
-    }
-    (committed, finalized, finalized_wt)
-}
-
-#[traced_test]
 #[test]
-#[allow(clippy::too_many_lines)] // one surviving-sibling straddler lifecycle
-fn surviving_sibling_reconstructs_a_split_shards_settled_set() {
-    let mut runner = SimulationRunner::new(&sibling_config(), 11);
-    let survivor = ShardId::leaf(1, 1);
-    let splitter = ShardId::leaf(1, 0);
-    let (left_child, right_child) = splitter.children();
+fn surviving_sibling_split_seats_children_with_chains_continuous_from_the_splitter() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_balances(&sibling_config(), 11, &setup.balances);
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let (child_left, child_right) = splitter.children();
 
-    // The threshold vote is a fee-paying system transaction; fund the payer
-    // at genesis so its `lock_fee` succeeds.
-    let vote_payer = Ed25519PrivateKey::from_u64(9_999).expect("vote payer key");
-    let vote_account =
-        ComponentAddress::preallocated_account_from_public_key(&vote_payer.public_key());
+    split_straddler_atomic(&mut cluster);
 
-    // Bulk-fund the heavier half past the post-vote threshold. These accounts
-    // route to leaf(1,0) by prefix, so the grow's ROOT split partitions them
-    // there and `leaf(1,0)` lands above `SPLIT_BYTES` once the vote activates.
-    let mut taken = Vec::new();
-    let mut balances = vec![(vote_account, Decimal::from(100_000))];
-    for _ in 0..RIGHT_BULK {
-        let (_, a) = account_in(splitter, 2, &mut taken);
-        balances.push((a, Decimal::from(10_000)));
-    }
-    // Straddler pairs: payer in the surviving leaf(1,1), recipient in the
-    // splitting leaf(1,0) — a genuine cross-shard transfer between the two,
-    // so leaf(1,1)'s wave names the terminating leaf(1,0).
-    let straddlers: Vec<(Ed25519PrivateKey, ComponentAddress, ComponentAddress)> = (0
-        ..SETTLE_OFFSETS_MS.len() + STRADDLE_OFFSETS_MS.len())
-        .map(|_| {
-            let (payer_key, payer) = account_in(survivor, 2, &mut taken);
-            let (_, recipient) = account_in(splitter, 2, &mut taken);
-            (payer_key, payer, recipient)
-        })
-        .collect();
-    for (_, payer, recipient) in &straddlers {
-        balances.push((*payer, Decimal::from(10_000)));
-        balances.push((*recipient, Decimal::from(10_000)));
-    }
-    // A surviving-shard recipient for the post-abort lock-release probe.
-    let (_, lock_probe_recipient) = account_in(survivor, 2, &mut taken);
-    balances.push((lock_probe_recipient, Decimal::from(10_000)));
-    runner.initialize_genesis_with_balances(&balances);
-
-    // ── Grow the single-shard genesis into the two sibling shards through
-    // the real split lifecycle, then vote `split_bytes` down so the heavier
-    // leaf(1,0) crosses the threshold while the lighter leaf(1,1) stays under
-    // it — the surviving-sibling shape, reached the way mainnet would ──
-    runner.grow_to(2);
-    let post_grow_epoch = beacon_state(&runner)
-        .expect("post-grow beacon state")
-        .current_epoch;
-    let activate_at = Epoch::new(post_grow_epoch.inner() + ACTIVATE_LEAD);
-    runner.vote_reshape_thresholds(&vote_payer, 1, SPLIT_BYTES, activate_at);
-
-    // ── Admission: the vote activates, leaf(1,0) folds its trigger and draws
-    // a cohort; the under-threshold leaf(1,1) folds none ──
-    let admitted = run_until(&mut runner, epochs(ADMISSION_BUDGET_EPOCHS), |r| {
-        pending_cohort_for(r, splitter).is_some_and(|c| c.len() == PER_SHARD as usize)
-    });
-    assert!(
-        admitted,
-        "the vote must activate and leaf(1,0)'s trigger must fold a full cohort within \
-         {ADMISSION_BUDGET_EPOCHS} epochs",
-    );
-    assert!(
-        pending_cohort_for(&runner, survivor).is_none(),
-        "the under-threshold survivor must not split",
-    );
-    let cohort = pending_cohort_for(&runner, splitter).expect("cohort just observed");
-    for child in [left_child, right_child] {
-        assert_eq!(
-            cohort.iter().filter(|(_, c)| *c == child).count(),
-            2,
-            "the cohort halves must split evenly; got {cohort:?}",
-        );
-    }
-
-    // ── Observer duty: each cohort member syncs its child span ──
-    let mut synced_stores: Vec<(
-        ValidatorId,
-        ShardId,
-        SimShardStorage,
-        ShardAnchor,
-        StateRoot,
-    )> = Vec::new();
-    for (validator, child) in &cohort {
-        let (store, root, anchor) = runner.observe_child(*validator, splitter, *child);
-        synced_stores.push((*validator, *child, store, anchor, root));
-    }
-
-    // ── The gate fires: leaf(1,0) reshapes into the lookahead; leaf(1,1)
-    // keeps its committee. Each observer re-asserts its ready signal until
-    // then — the cohort promotes into the active reshape-observer window a
-    // window after admission (the freeze discipline), and the busy
-    // splitter's blocks anchor in that window only as their `parent_qc.wt`
-    // catches up, so a one-shot signal can land while it still classifies
-    // as a plain `Ready`. ──
-    let gate_deadline = runner.now() + epochs(GATE_BUDGET_EPOCHS);
-    let mut reshaped = false;
-    while runner.now() < gate_deadline {
-        if let Some(current) = pending_cohort_for(&runner, splitter) {
-            for (validator, _child) in &current {
-                runner.broadcast_observer_ready(*validator, splitter);
-            }
-        }
-        let next = runner.now() + Duration::from_secs(1);
-        runner.run_until(next);
-        if beacon_state(&runner).is_some_and(|s| {
-            s.pending_reshapes.is_empty() && s.next_shard_committees.contains_key(&left_child)
-        }) {
-            reshaped = true;
-            break;
-        }
-    }
-    assert!(
-        reshaped,
-        "leaf(1,0)'s re-asserted ReshapeReady signals must fire the gate"
-    );
-    let state = beacon_state(&runner).expect("post-gate state");
-    assert!(
-        state.next_shard_committees.contains_key(&survivor)
-            || state.shard_committees.contains_key(&survivor),
-        "the survivor must keep its committee across leaf(1,0)'s split",
-    );
-    assert!(
-        !state.next_shard_committees.contains_key(&splitter),
-        "the lookahead must carry leaf(1,0)'s children, not leaf(1,0)",
-    );
-    let final_epoch = state.current_epoch;
-    let cut = Duration::from_millis((final_epoch.inner() + 1) * EPOCH_MS);
-
-    // ── Submit every straddler against the now-known cut. The settle
-    // straddlers land far enough ahead (60–80s) for the 2PC to finalize on
-    // leaf(1,0) before its terminal yet close enough to stay in the attested
-    // settled set; the straddle straddlers land sub-second before the cut, so
-    // they commit on leaf(1,0) but cross its terminal before settling ──
-    let mut probes: Vec<(u64, TxHash)> = Vec::new();
-    for (offset_ms, (payer_key, payer, recipient)) in SETTLE_OFFSETS_MS
-        .iter()
-        .chain(&STRADDLE_OFFSETS_MS)
-        .zip(&straddlers)
-    {
-        let target = cut.saturating_sub(Duration::from_millis(*offset_ms));
-        let tx = transfer(payer_key, *payer, *recipient, target);
-        let hash = tx.hash();
-        let delay = target
-            .saturating_sub(runner.now())
-            .max(Duration::from_millis(10));
-        runner.schedule_initial_event(
-            0,
-            delay,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
-        probes.push((*offset_ms, hash));
-    }
-
-    // The parent halves are leaf(1,0)'s original members landing on a
-    // child — excluding the synced cohort (the pooled extras), which the
-    // observer flips handle separately.
-    let cohort_validators: Vec<ValidatorId> = cohort.iter().map(|(v, _)| *v).collect();
-    let parent_halves: Vec<(ValidatorId, ShardId)> = state
-        .validators
-        .iter()
-        .filter_map(|(id, record)| match record.status {
-            ValidatorStatus::OnShard { shard, .. }
-                if shard.parent() == Some(splitter) && !cohort_validators.contains(id) =>
-            {
-                Some((*id, shard))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        parent_halves.len(),
-        PER_SHARD as usize,
-        "leaf(1,0)'s original members must each land on a child; got {parent_halves:?}",
-    );
-
-    // ── Through the boundary: leaf(1,0) coasts to its crossing and the
-    // fold seeds both children from its terminal contribution ──
-    let seed_deadline = runner.now() + epochs(SEED_BUDGET_EPOCHS);
-    let seeded = run_until(&mut runner, seed_deadline, |r| {
-        beacon_state(r).is_some_and(|s| {
-            [left_child, right_child].iter().all(|c| {
-                s.boundaries
-                    .get(c)
-                    .is_some_and(|b| b.block_hash != BlockHash::ZERO)
+    // Placement: the splitter retired into its two children — each seats a full
+    // committee — while the survivor kept its own across the split.
+    let state = cluster
+        .beacon_state()
+        .expect("the split committed a beacon state");
+    let seated_on = |shard: ShardId| {
+        state
+            .validators
+            .values()
+            .filter(|record| {
+                matches!(record.status, ValidatorStatus::OnShard { shard: s, .. } if s == shard)
             })
-        })
-    });
-    assert!(seeded, "the fold must seed both children from the terminal");
-    let state = beacon_state(&runner).expect("post-seed state");
-    let genesis_height = state.boundaries[&left_child].height;
-
-    // Subtree-root continuity: the children's anchors compose to the
-    // parent's terminal root.
-    let parent_terminal_root = store_for(&runner, splitter)
-        .expect("a host still carries leaf(1,0)")
-        .state_root();
-    let pair = SplitChildRoots {
-        left: state.boundaries[&left_child].state_root,
-        right: state.boundaries[&right_child].state_root,
+            .count()
     };
-    assert!(
-        pair.composes_to(parent_terminal_root),
-        "the children's anchors must compose to leaf(1,0)'s terminal root",
+    assert_eq!(
+        seated_on(survivor),
+        PER_SHARD as usize,
+        "the survivor must keep a full committee across the splitter's split",
+    );
+    assert_eq!(
+        seated_on(child_left),
+        PER_SHARD as usize,
+        "the splitter's left child must seat a full committee",
+    );
+    assert_eq!(
+        seated_on(child_right),
+        PER_SHARD as usize,
+        "the splitter's right child must seat a full committee",
+    );
+    assert_eq!(
+        seated_on(splitter),
+        0,
+        "the splitter must retire once its children seat",
     );
 
-    // ── Follow + flip: observers reach the crossing, parent halves adopt,
-    // observers reopen on a sibling-flipped host ──
-    for (_, child, store, anchor, imported_root) in &synced_stores {
-        let followed = runner.follow_child(store, splitter, *child, *anchor, *imported_root);
-        assert_eq!(
-            followed, state.boundaries[child].state_root,
-            "a followed store must arrive at the beacon-seeded child anchor",
-        );
-    }
-    // After the grow the validator→host map is the split shuffle's, not the
-    // contiguous genesis layout, so resolve each member's host through the
-    // network. Parent halves adopt on their own hosts; observers reopen their
-    // synced store on a host whose own vnode flipped to the sibling child.
-    let parent_half_hosts: Vec<(NodeIndex, ShardId)> = parent_halves
-        .iter()
-        .map(|(v, c)| (runner.network().validator_to_node(*v), *c))
-        .collect();
-    for ((validator, child), (node, _)) in parent_halves.iter().zip(&parent_half_hosts) {
-        runner.flip_split_child(*node, *validator, splitter, *child, None);
-    }
-    let observer_seats: Vec<(ValidatorId, ShardId)> =
-        synced_stores.iter().map(|(v, c, ..)| (*v, *c)).collect();
-    let mut sibling_hosts: Vec<NodeIndex> = Vec::new();
-    for (validator, child) in &observer_seats {
-        let (node, _) = parent_half_hosts
-            .iter()
-            .copied()
-            .find(|(node, host_child)| host_child != child && !sibling_hosts.contains(node))
-            .expect("a free host whose own vnode flipped to the sibling");
-        sibling_hosts.push(node);
-        let store = synced_stores
-            .iter()
-            .position(|(v, ..)| v == validator)
-            .map(|i| synced_stores.swap_remove(i).2)
-            .expect("every observer synced a store");
-        runner.flip_split_child(node, *validator, splitter, *child, Some(store));
-    }
+    // Forward progress: the children reach their seeded genesis (a single block)
+    // during the scenario, so prove they keep committing past it.
+    let left_base = cluster
+        .committed_height(child_left)
+        .expect("left child commits");
+    let right_base = cluster
+        .committed_height(child_right)
+        .expect("right child commits");
+    assert!(
+        cluster.run_until(epochs(6), |c| {
+            c.committed_height(child_left)
+                .is_some_and(|h| h > left_base)
+                && c.committed_height(child_right)
+                    .is_some_and(|h| h > right_base)
+        }),
+        "both children must keep committing blocks past the split",
+    );
 
-    // ── Both children run past genesis, and the survivor keeps committing ──
-    let survivor_base = store_for(&runner, survivor)
-        .expect("survivor store")
-        .committed_height();
-    let run_deadline = runner.now() + epochs(CHILD_RUN_BUDGET_EPOCHS);
-    let progressed = run_until(&mut runner, run_deadline, |r| {
-        let children_live = [left_child, right_child].iter().all(|child| {
-            (0..r.num_hosts()).any(|node| {
-                r.hosts_shard(node, *child)
-                    .is_some_and(|s| s.committed_height() > genesis_height)
-            })
-        });
-        let survivor_live =
-            store_for(r, survivor).is_some_and(|s| s.committed_height() > survivor_base);
-        children_live && survivor_live
-    });
-    if !progressed {
-        let mut detail = String::new();
-        for shard in [survivor, left_child, right_child] {
-            for node in 0..runner.num_hosts() {
-                if let Some(s) = runner.hosts_shard(node, shard) {
-                    let _ = write!(
-                        detail,
-                        "\n  node {node} {shard:?}: committed {:?}",
-                        s.committed_height(),
-                    );
+    // Chain continuity: each child's committed chain is consensus-rooted in a
+    // structural genesis — some committed block carries a genesis QC, the fork
+    // point where the splitter's terminal root was adopted as the child's base.
+    let runner = cluster.runner();
+    for child in [child_left, child_right] {
+        for node in 0..runner.num_hosts() {
+            let Some(storage) = runner.hosts_shard(node, child) else {
+                continue;
+            };
+            let tip = storage.committed_height();
+            let mut height = BlockHeight::new(1);
+            let mut rooted = false;
+            while height <= tip {
+                if storage
+                    .get_block(height)
+                    .is_some_and(|block| block.block().header().parent_qc().is_genesis())
+                {
+                    rooted = true;
+                    break;
                 }
+                height = height.next();
             }
-        }
-        panic!(
-            "children must commit past genesis (h{}) and the survivor past h{} \
-             within {CHILD_RUN_BUDGET_EPOCHS} epochs:{detail}",
-            genesis_height.inner(),
-            survivor_base.inner(),
-        );
-    }
-
-    // ── Settlement window: the survivor reconstructs S_{leaf(1,0)} from
-    // the coast headers it sees, finalizes the straddlers it settled, and
-    // counterpart-aborts the ones it never did (releasing their locks). Run
-    // until every straddler reaches a terminal survivor outcome so the
-    // snapshot below sees the sweep fully drained, not a single early abort ──
-    let survivor_validator = member_of(&runner, survivor);
-    let survivor_host = runner.network().validator_to_node(survivor_validator);
-    let settle_deadline = runner.now() + epochs(SETTLE_BUDGET_EPOCHS);
-    let swept = run_until(&mut runner, settle_deadline, |r| {
-        probes.iter().all(|(_, hash)| {
-            matches!(
-                r.tx_status(survivor_host, hash),
-                Some(TransactionStatus::Completed(_))
-            )
-        })
-    });
-
-    // ── Scan each straddler's fate on both chains + its survivor status ──
-    let cut_wt = WeightedTimestamp::from_millis(u64::try_from(cut.as_millis()).expect("cut fits"));
-    let terminal_b = genesis_height
-        .prev()
-        .expect("leaf(1,0)'s terminal sits below the child genesis");
-    let survivor_store = store_for(&runner, survivor).expect("survivor store");
-    let splitter_store = store_for(&runner, splitter).expect("leaf(1,0) still served");
-
-    let mut report = format!(
-        "cut={}ms terminal_B=h{} child_genesis=h{}",
-        cut.as_millis(),
-        terminal_b.inner(),
-        genesis_height.inner(),
-    );
-    let mut settled = 0u32; // settled on leaf(1,0) and accepted on the survivor
-    let mut one_sided = 0u32; // accepted on the survivor but not settled on leaf(1,0)
-    let mut straddled = 0u32; // committed on leaf(1,0) but never settled there
-    let mut doomed = 0u32; // committed on the survivor but unsettled on leaf(1,0)
-    let mut doomed_aborted = 0u32; // ... and driven to Completed(Aborted) on the survivor
-    let mut wrongly_aborted = 0u32; // settled on leaf(1,0) yet aborted on the survivor
-    let mut lock_probe_idx: Option<usize> = None;
-    for (idx, (delay, hash)) in probes.iter().enumerate() {
-        let (s_committed, s_finalized, _) = scan_chain(splitter_store, BlockHeight::new(1), *hash);
-        let (v_committed, v_finalized, v_wt) =
-            scan_chain(survivor_store, BlockHeight::new(1), *hash);
-        let settled_on_splitter = s_finalized.is_some_and(|h| h <= terminal_b);
-        let post_cut = v_wt.is_some_and(|wt| wt > cut_wt);
-        let survivor_status = runner.tx_status(survivor_host, hash);
-        // The survivor *applied* the cross-shard wave only on an accept
-        // outcome; an abort finalize names the hash too but moves no state.
-        let accepted_on_survivor = matches!(
-            survivor_status,
-            Some(TransactionStatus::Completed(TransactionDecision::Accept))
-        );
-        let aborted_on_survivor = matches!(
-            survivor_status,
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
-        );
-        let _ = write!(
-            report,
-            "\n  +{delay}ms: leaf(1,0) committed={:?} finalized={:?} settled={settled_on_splitter}; \
-             leaf(1,1) committed={:?} finalized={:?} wt={:?} post_cut={post_cut} status={survivor_status:?}",
-            s_committed.map(BlockHeight::inner),
-            s_finalized.map(BlockHeight::inner),
-            v_committed.map(BlockHeight::inner),
-            v_finalized.map(BlockHeight::inner),
-            v_wt.map(WeightedTimestamp::as_millis),
-        );
-        if accepted_on_survivor && !settled_on_splitter {
-            one_sided += 1;
-        }
-        if settled_on_splitter && accepted_on_survivor {
-            settled += 1;
-        }
-        if s_committed.is_some() && !settled_on_splitter {
-            straddled += 1;
-        }
-        if settled_on_splitter && aborted_on_survivor {
-            wrongly_aborted += 1;
-        }
-        if v_committed.is_some() && !settled_on_splitter {
-            doomed += 1;
-            if aborted_on_survivor {
-                doomed_aborted += 1;
-                if lock_probe_idx.is_none() {
-                    lock_probe_idx = Some(idx);
-                }
-            }
+            assert!(
+                rooted,
+                "child {child:?} on node {node} has no structural-genesis block — \
+                 its committed chain is not rooted in the splitter fork",
+            );
         }
     }
-
-    // The driver demonstrably ran: a surviving leaf(1,1) member
-    // reconstructed leaf(1,0)'s settled-wave set from its coast tail. The
-    // committed mechanism only unit-tested this; here it runs over the real
-    // network against the draining committee.
-    let reconstructed = runner.vnode_state(survivor_validator).and_then(|node| {
-        node.shard_coordinator()
-            .settled_set(splitter)
-            .map(|set| set.waves.len())
-    });
-    assert!(
-        reconstructed.is_some_and(|n| n > 0),
-        "the survivor must reconstruct a non-empty settled set for the terminated leaf(1,0) \
-         (got {reconstructed:?}) — the io_loop driver never delivered S_P:\n{report}",
-    );
-
-    // Atomicity: the survivor finalizes a cross-shard wave with leaf(1,0)
-    // only when leaf(1,0) settled it by its terminal block — never
-    // one-sided, and never aborts one leaf(1,0) did settle.
-    assert_eq!(
-        one_sided, 0,
-        "the survivor finalized a straddler leaf(1,0) never settled — one-sided cross-shard \
-         application:\n{report}",
-    );
-    assert_eq!(
-        wrongly_aborted, 0,
-        "the survivor aborted a straddler leaf(1,0) settled by its terminal block — a settled \
-         half was discarded:\n{report}",
-    );
-    assert!(
-        settled > 0,
-        "no straddler settled cross-shard between the survivor and the splitting shard — \
-         the offsets need retuning:\n{report}",
-    );
-    assert!(
-        straddled > 0,
-        "no straddler reached leaf(1,0)'s boundary unsettled — the offsets need retuning so \
-         the test actually stresses the cut:\n{report}",
-    );
-
-    // Counterpart abort sweep: every straddler the survivor committed but
-    // leaf(1,0) never settled must reach Completed(Aborted) — it can never
-    // gain leaf(1,0)'s coverage, so its in-flight slot and node locks free.
-    assert!(
-        swept,
-        "every straddler must reach a terminal survivor outcome — the sweep that reconstructs \
-         S_{{leaf(1,0)}} and aborts the unsettled ones never drained:\n{report}",
-    );
-    assert!(
-        doomed > 0,
-        "no straddler committed on the survivor went unsettled — offsets need retuning so the \
-         counterpart sweep has something to abort:\n{report}",
-    );
-    assert_eq!(
-        doomed_aborted, doomed,
-        "the survivor must drive every doomed straddler to Completed(Aborted); \
-         {doomed_aborted}/{doomed} aborted:\n{report}",
-    );
-
-    // ── Lock-release probe: the counterpart abort released the straddler's
-    // declared-node locks, so a fresh single-shard transfer from the same
-    // payer (touching a node the straddler had locked) now completes ──
-    let probe_idx = lock_probe_idx.expect("a doomed straddler was aborted above");
-    let (probe_payer_key, probe_payer, _) = &straddlers[probe_idx];
-    let lock_probe = transfer(
-        probe_payer_key,
-        *probe_payer,
-        lock_probe_recipient,
-        runner.now(),
-    );
-    let probe_hash = lock_probe.hash();
-    runner.schedule_initial_event(
-        survivor_host,
-        Duration::from_millis(10),
-        HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: lock_probe }),
-    );
-    let probe_deadline = runner.now() + epochs(SETTLE_BUDGET_EPOCHS);
-    let probe_completed = run_until(&mut runner, probe_deadline, |r| {
-        matches!(
-            r.tx_status(survivor_host, &probe_hash),
-            Some(TransactionStatus::Completed(_))
-        )
-    });
-    assert!(
-        probe_completed,
-        "a fresh transfer from an aborted straddler's payer must complete once the counterpart \
-         abort released its locks; got status {:?}\n{report}",
-        runner.tx_status(survivor_host, &probe_hash),
-    );
 }
