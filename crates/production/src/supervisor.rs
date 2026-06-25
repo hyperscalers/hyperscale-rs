@@ -1412,6 +1412,53 @@ impl ShardSupervisor {
         }
     }
 
+    /// Reconcile hosted shards against the committed committee assignment: bring
+    /// up any shard a local validator is a committed member of that this host is
+    /// not already hosting, bootstrapping, draining, seating from a reshape
+    /// duty, or holding queued behind a drain.
+    ///
+    /// The membership-up mirror of [`Self::reconcile_teardown`]. The placement
+    /// delta still drives a join immediately (it arrives an epoch ahead, so the
+    /// bootstrap completes before the window opens); this is the committed-state
+    /// backstop for a delta that was never seen — a join that raced a teardown
+    /// and lost its queued replay, or work missed across a restart — so a
+    /// dropped delta cannot strand the host off a shard it must run. Idempotent:
+    /// the guards skip every shard already accounted for, and [`Self::join`]
+    /// rejects a double bring-up regardless. Run on the reshape tick.
+    pub(crate) fn reconcile_joins(&mut self) {
+        let topology = self.process.topology().load_full();
+        let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
+        let needed: Vec<ShardId> = topology
+            .shard_trie()
+            .leaves()
+            .filter(|&shard| {
+                host_assigned(shard, &topology, &host_ids)
+                    && !self.shards.contains_key(&shard)
+                    && !self.bootstrapping.contains_key(&shard)
+                    && !self.draining.contains(&shard)
+                    && !self.pending_joins.contains_key(&shard)
+                    && !self.reshape.is_seating(shard)
+            })
+            .collect();
+        for shard in needed {
+            let vnodes: Vec<VnodeConfig> = topology
+                .committee_for_shard(shard)
+                .iter()
+                .filter_map(|validator| {
+                    self.vnode_keys
+                        .get(validator)
+                        .map(|signing_key| VnodeConfig {
+                            validator_id: *validator,
+                            local_shard: shard,
+                            signing_key: Arc::clone(signing_key),
+                        })
+                })
+                .collect();
+            info!(shard = ?shard, "Reconciling a missed committee join from the committed view");
+            self.join(shard, &vnodes);
+        }
+    }
+
     /// Finish a teardown whose thread joined: unwire the process maps,
     /// drop the storage handle, scrub the RPC slots, and replay any
     /// join that queued behind the drain.
@@ -1551,14 +1598,23 @@ fn shard_retired(
     routing: &RoutingCommittees,
     host_ids: &HashSet<ValidatorId>,
 ) -> bool {
-    let in_active = topology
-        .committee_for_shard(shard)
-        .iter()
-        .any(|v| host_ids.contains(v));
     let in_routing = routing
         .get(&shard)
         .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
-    !in_active && !in_routing
+    !host_assigned(shard, topology, host_ids) && !in_routing
+}
+
+/// Whether `shard`'s committed committee includes a local validator — the host
+/// holds a consensus role in it and must run it.
+fn host_assigned(
+    shard: ShardId,
+    topology: &TopologySnapshot,
+    host_ids: &HashSet<ValidatorId>,
+) -> bool {
+    topology
+        .committee_for_shard(shard)
+        .iter()
+        .any(|v| host_ids.contains(v))
 }
 
 #[cfg(test)]
@@ -1570,7 +1626,7 @@ mod tests {
         ValidatorInfo, ValidatorSet, generate_bls_keypair,
     };
 
-    use super::shard_retired;
+    use super::{host_assigned, shard_retired};
 
     const HOST: ValidatorId = ValidatorId::new(1);
 
@@ -1677,5 +1733,20 @@ mod tests {
             &routing,
             &HashSet::from([HOST])
         ));
+    }
+
+    /// The join reconcile targets exactly the committed committees a local
+    /// validator belongs to.
+    #[test]
+    fn host_assigned_tracks_committed_committee_membership() {
+        let mine = ShardId::leaf(1, 0);
+        let theirs = ShardId::leaf(1, 1);
+        let topology = head(HashMap::from([
+            (mine, vec![HOST, ValidatorId::new(2)]),
+            (theirs, vec![ValidatorId::new(3)]),
+        ]));
+        let host_ids = HashSet::from([HOST]);
+        assert!(host_assigned(mine, &topology, &host_ids));
+        assert!(!host_assigned(theirs, &topology, &host_ids));
     }
 }
