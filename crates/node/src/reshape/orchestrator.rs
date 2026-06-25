@@ -863,7 +863,10 @@ fn advance_keeper_half(
         && !half.terminal_requested
         && let Some(anchor) = view.boundary(half.child)
     {
-        let terminal = anchor.height.prev().unwrap_or(anchor.height);
+        // A merging child's boundary anchors its terminal crossing directly —
+        // the block whose hash and height the beacon composed the parent from —
+        // so the certified terminal sits at the anchor height itself.
+        let terminal = anchor.height;
         out.push(ReshapeRequest::Fetch {
             duty,
             from: half.child,
