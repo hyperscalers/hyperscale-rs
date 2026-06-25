@@ -1710,7 +1710,6 @@ impl BeaconCoordinator {
             leave: current.filter(|_| moved),
             observe,
             keep,
-            split_adoption: effects.split_adoptions.get(&me).copied(),
             effective_epoch: self.state.current_epoch.next(),
         })
     }
@@ -2072,8 +2071,8 @@ mod tests {
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
         ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
         Round, ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView, SplitAdoption,
-        Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
+        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake,
+        StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
         bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, compute_merkle_root_with_proof,
         genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
         zero_bls_signature,
@@ -4343,23 +4342,7 @@ mod tests {
         assert_eq!(change.validator, me);
         assert_eq!(change.join, Some(to));
         assert_eq!(change.leave, Some(from));
-        assert_eq!(change.split_adoption, None);
         assert_eq!(change.effective_epoch, coord.state.current_epoch.next());
-
-        // The same relocation under a split execution carries the
-        // adoption marker, so the supervisor skips snap-sync.
-        let effects = SlotEffects {
-            split_adoptions: std::iter::once((me, SplitAdoption::ParentHalf { parent: from }))
-                .collect(),
-            ..SlotEffects::default()
-        };
-        let change = coord
-            .participation_delta(&effects)
-            .expect("relocation produces a delta");
-        assert_eq!(
-            change.split_adoption,
-            Some(SplitAdoption::ParentHalf { parent: from })
-        );
 
         // Promotion makes the views agree again — the delta is gone, so
         // the action fires at exactly one commit.

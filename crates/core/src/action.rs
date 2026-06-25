@@ -15,7 +15,7 @@ use hyperscale_types::{
     ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round,
     RoutableTransaction, RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates,
     SharedTransactions, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitAdoption, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
     TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
     Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
@@ -128,12 +128,6 @@ pub struct ParticipationChange {
     /// execution surfaces the keeper's move onto the parent as the
     /// ordinary join/leave pair instead.
     pub keep: Option<KeepDelta>,
-    /// Present when `join` names a freshly split child this validator
-    /// was pre-staffed for: the supervisor adopts the store along the
-    /// marked path (parent-half checkpoint hard-link or observer
-    /// reopen) instead of snap-syncing, waiting for the parent chain's
-    /// certified crossing before installing the child genesis.
-    pub split_adoption: Option<SplitAdoption>,
     /// Epoch whose window activates the new placement.
     pub effective_epoch: Epoch,
 }

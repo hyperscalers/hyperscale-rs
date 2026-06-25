@@ -1138,7 +1138,6 @@ impl ProductionRunner {
                 local_shard: shard,
                 signing_key: Arc::clone(signing_key),
             }],
-            adoption: change.split_adoption,
         });
     }
 

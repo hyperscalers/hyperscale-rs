@@ -9,8 +9,7 @@ use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
     CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
     PendingReshape, QuorumCertificate, RETENTION_HORIZON, ShardBoundary, ShardEpochContribution,
-    ShardId, SlotEffects, SplitAdoption, SplitChildRoots, TransitionCause, ValidatorId,
-    ValidatorStatus,
+    ShardId, SlotEffects, SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus,
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
@@ -229,8 +228,7 @@ pub fn apply_epoch(
     let shard_committee_transitions = diff_shard_committees(state, &pre_shard_members);
     let (observers_drawn, observers_released) = diff_observer_seats(state, &pre_seats);
     let (keepers_drawn, keepers_released) = diff_keeper_seats(state, &pre_keeper_seats);
-    let (split_adoptions, executed_parent_halves) =
-        diff_split_adoptions(state, &pre_shard_members, &pre_seats);
+    let executed_parent_halves = diff_split_parent_halves(state, &pre_shard_members, &pre_seats);
     // Retain each freshly split child's parent halves until the child commits
     // past its genesis, so the reshape orchestrator discovers and seats them
     // from the committed view.
@@ -256,29 +254,25 @@ pub fn apply_epoch(
         beacon_committee_transition: Some(beacon_committee_transition),
         observers_drawn,
         observers_released,
-        split_adoptions,
         keepers_drawn,
         keepers_released,
     }
 }
 
-/// Map each member a split execution placed on a fresh child to its
-/// store-adoption path.
+/// The parent-half cohorts a split execution placed on its fresh children,
+/// keyed by child, mapping each member to the parent it re-roots its local
+/// store from.
 ///
-/// A child is fresh when it entered the lookahead this fold while its
-/// parent left it. Each of its members either held an observer seat for
-/// exactly this child at the epoch start (the synced store reopens) or
-/// sat on the parent committee (the store hard-links from a local
-/// checkpoint) — the execution gate admits no third provenance.
-fn diff_split_adoptions(
+/// A child is fresh when it entered the lookahead this fold while its parent
+/// left it. Each of its members either held an observer seat for exactly this
+/// child at the epoch start (the synced store reopens — not a parent half) or
+/// sat on the parent committee (the store hard-links from a local checkpoint —
+/// a parent half); the execution gate admits no third provenance.
+fn diff_split_parent_halves(
     state: &BeaconState,
     pre_shard_members: &BTreeMap<ShardId, Vec<ValidatorId>>,
     pre_seats: &BTreeMap<(ValidatorId, ShardId), ShardId>,
-) -> (
-    BTreeMap<ValidatorId, SplitAdoption>,
-    BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
-) {
-    let mut adoptions = BTreeMap::new();
+) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
     let mut parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> = BTreeMap::new();
     for (child, committee) in &state.next_shard_committees {
         if pre_shard_members.contains_key(child) {
@@ -291,10 +285,7 @@ fn diff_split_adoptions(
             continue;
         };
         for member in &committee.members {
-            if pre_seats.get(&(*member, parent)) == Some(child) {
-                adoptions.insert(*member, SplitAdoption::Observer { parent });
-            } else if parent_members.contains(member) {
-                adoptions.insert(*member, SplitAdoption::ParentHalf { parent });
+            if pre_seats.get(&(*member, parent)) != Some(child) && parent_members.contains(member) {
                 parent_halves
                     .entry(*child)
                     .or_default()
@@ -302,7 +293,7 @@ fn diff_split_adoptions(
             }
         }
     }
-    (adoptions, parent_halves)
+    parent_halves
 }
 
 /// Drop the parent-half cohort of every child that has committed past its
@@ -2221,24 +2212,11 @@ mod tests {
             },
         );
 
-        let (adoptions, parent_halves) = diff_split_adoptions(&state, &pre_members, &pre_seats);
-        assert_eq!(
-            adoptions.get(&parent_members[0]),
-            Some(&SplitAdoption::ParentHalf { parent })
-        );
-        assert_eq!(
-            adoptions.get(&parent_members[3]),
-            Some(&SplitAdoption::ParentHalf { parent })
-        );
-        assert_eq!(
-            adoptions.get(&observer),
-            Some(&SplitAdoption::Observer { parent })
-        );
-        assert_eq!(adoptions.len(), 5);
+        let parent_halves = diff_split_parent_halves(&state, &pre_members, &pre_seats);
 
         // The parent halves project keyed by the child each one lands on,
-        // mapping member to the parent it re-roots from; the observer is not
-        // among them.
+        // mapping member to the parent it re-roots from; the observer reopens
+        // its own synced store, so it is not among them.
         assert_eq!(parent_halves[&left].get(&parent_members[0]), Some(&parent));
         assert_eq!(parent_halves[&left].get(&parent_members[1]), Some(&parent));
         assert_eq!(parent_halves[&right].get(&parent_members[2]), Some(&parent));

@@ -198,7 +198,6 @@ async fn test_runtime_shard_join_and_leave() {
                 local_shard: shard_b,
                 signing_key: fixtures.signing_key(vnode_b),
             }],
-            adoption: None,
         })
         .await
         .expect("supervisor accepts commands");
@@ -302,7 +301,6 @@ async fn pooled_validator_boots_as_follower_only_host() {
                 local_shard: ShardId::ROOT,
                 signing_key: fixtures.signing_key(1),
             }],
-            adoption: None,
         })
         .await
         .expect("supervisor accepts commands");

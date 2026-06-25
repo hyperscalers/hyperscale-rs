@@ -646,12 +646,6 @@ pub struct SlotEffects {
     /// deactivation. Seats a split consumed land on their child and
     /// surface through the committee transitions instead.
     pub observers_released: Vec<ObserverSeat>,
-    /// How each member placed on a freshly split child adopts its
-    /// store — keyed by validator, present exactly for the members a
-    /// split execution moved this epoch. The supervisor reads this off
-    /// the participation delta to pick the pre-staffed install path
-    /// instead of snap-sync.
-    pub split_adoptions: BTreeMap<ValidatorId, SplitAdoption>,
     /// Keeper seats drawn into pending merges this epoch — when both
     /// halves paired and the keeper committee was fixed.
     pub keepers_drawn: Vec<KeptSeat>,
@@ -660,29 +654,6 @@ pub struct SlotEffects {
     /// elapsed). Seats a merge consumed land on the parent and surface
     /// through the committee transitions instead.
     pub keepers_released: Vec<KeptSeat>,
-}
-
-/// How a member joining a freshly split child adopts its store.
-///
-/// The grow phase pre-staffed both halves, so neither path snap-syncs:
-/// the supervisor waits for the parent chain's certified crossing,
-/// installs the child's deterministic genesis, and starts consensus
-/// from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
-pub enum SplitAdoption {
-    /// Parent-committee half: holds the parent's full store and opens
-    /// the child store from a local checkpoint hard-link of it.
-    ParentHalf {
-        /// The terminating parent shard.
-        parent: ShardId,
-    },
-    /// Grow-phase observer: reopens the child-rooted store its
-    /// bootstrap duty synced to disk.
-    Observer {
-        /// The terminating parent shard, whose terminal handoff the
-        /// observer follows to stay current.
-        parent: ShardId,
-    },
 }
 
 // ─── derived queries ────────────────────────────────────────────────────────

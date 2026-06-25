@@ -48,8 +48,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::GetStateRangeRequest;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, ChainOrigin, GenesisConfigHash, NetworkDefinition,
-    RoutingCommittees, ShardAnchor, ShardId, SplitAdoption, StateRoot, StoredReceipt,
-    TopologySnapshot, ValidatorId,
+    RoutingCommittees, ShardAnchor, ShardId, StateRoot, StoredReceipt, TopologySnapshot,
+    ValidatorId,
 };
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
@@ -92,12 +92,6 @@ pub enum ShardCommand {
         /// Local vnodes participating in the shard's consensus. Every
         /// entry's `local_shard` must equal `shard`.
         vnodes: Vec<VnodeConfig>,
-        /// Present when the shard is a freshly split child this host
-        /// was pre-staffed for: the store adopts along the marked path
-        /// (parent-half checkpoint hard-link or observer store) instead
-        /// of snap-syncing, once the parent chain's certified crossing
-        /// and the beacon's child anchor are observable.
-        adoption: Option<SplitAdoption>,
     },
     /// Release one local vnode's membership in `shard`. The shard's
     /// thread, subscriptions, and storage are torn down when the last
@@ -574,20 +568,7 @@ impl ShardSupervisor {
     /// Execute one membership command.
     pub(crate) fn handle(&mut self, command: ShardCommand) {
         match command {
-            ShardCommand::Join {
-                shard,
-                vnodes,
-                adoption,
-            } => match adoption {
-                // The orchestrator discovers and seats both split adoption paths
-                // from the committed projection — an observer from its synced
-                // store, a parent half from its cloned local parent — so the
-                // placement-delta join is a no-op for either.
-                Some(SplitAdoption::ParentHalf { .. } | SplitAdoption::Observer { .. }) => {
-                    info!(shard = ?shard, "Split adoption join ignored; the orchestrator seats it");
-                }
-                None => self.join(shard, &vnodes),
-            },
+            ShardCommand::Join { shard, vnodes } => self.join(shard, &vnodes),
             ShardCommand::Leave { shard } => self.leave(shard),
         }
     }
