@@ -638,9 +638,7 @@ impl ShardSupervisor {
                 // A brand-new store (no commits, no imported JMT) gets
                 // the engine bootstrap before the snap-sync import or
                 // the from-genesis replay populates it.
-                if recovered.committed_height == BlockHeight::GENESIS
-                    && recovered.jmt_root.is_none()
-                {
+                if recovered.committed_height == BlockHeight::GENESIS {
                     engine_bootstrap.replicate_into(storage.as_ref());
                 }
                 (storage, recovered)
