@@ -551,6 +551,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                HashMap::new(),
                 pending.iter().copied().collect(),
             ))
         };
@@ -597,6 +598,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                HashMap::new(),
                 pending.iter().copied().collect(),
             ))
         };
@@ -627,6 +629,7 @@ mod tests {
                 NetworkDefinition::simulator(),
                 &ValidatorSet::new(Vec::new()),
                 leaves.iter().map(|s| (*s, Vec::new())).collect(),
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -744,6 +747,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 reshape_keepers,
+                HashMap::new(),
                 split_pending.iter().copied().collect(),
             ))
         };

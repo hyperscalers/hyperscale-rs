@@ -69,6 +69,14 @@ impl<'a> ReshapeView<'a> {
         self.topology.reshape_keeper_cohorts()
     }
 
+    /// The executed-split parent-half cohorts, keyed by the child each member
+    /// seats on — each maps a member to the parent it re-roots its local store
+    /// from. The orchestrator scans these for its host's parent-half seats.
+    #[must_use]
+    pub const fn parent_half_cohorts(&self) -> &HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
+        self.topology.reshape_parent_half_cohorts()
+    }
+
     /// Whether `shard` has seeded a beacon-attested boundary anchor. The
     /// projection drops zeroed genesis placeholders, so a projected anchor
     /// means the shard's boundary crossing committed.
@@ -134,6 +142,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         )
     }
@@ -167,6 +176,7 @@ mod tests {
             std::iter::once((parent, vec![validator])).collect(),
             std::iter::once((parent, vec![validator])).collect(),
             std::iter::once((parent, seeded_anchor())).collect(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

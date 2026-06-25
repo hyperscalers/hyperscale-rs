@@ -176,6 +176,11 @@ pub fn apply_epoch(
         WitnessOutcome::default()
     };
 
+    // The boundary fold above advanced each shard's anchor and witness
+    // watermark, so drop the parent-half cohort of any child that has now
+    // committed past its genesis.
+    release_seated_parent_halves(state);
+
     // A normal epoch folded its witnesses above, so sweep reshapes whose
     // triggers went quiet — an assertion folded this epoch is never swept.
     // A skip folds nothing, so no trigger could re-assert; carry the TTL
@@ -224,7 +229,18 @@ pub fn apply_epoch(
     let shard_committee_transitions = diff_shard_committees(state, &pre_shard_members);
     let (observers_drawn, observers_released) = diff_observer_seats(state, &pre_seats);
     let (keepers_drawn, keepers_released) = diff_keeper_seats(state, &pre_keeper_seats);
-    let split_adoptions = diff_split_adoptions(state, &pre_shard_members, &pre_seats);
+    let (split_adoptions, executed_parent_halves) =
+        diff_split_adoptions(state, &pre_shard_members, &pre_seats);
+    // Retain each freshly split child's parent halves until the child commits
+    // past its genesis, so the reshape orchestrator discovers and seats them
+    // from the committed view.
+    for (child, members) in executed_parent_halves {
+        state
+            .reshape_parent_halves
+            .entry(child)
+            .or_default()
+            .extend(members);
+    }
 
     SlotEffects {
         registered: witness.registered,
@@ -258,8 +274,12 @@ fn diff_split_adoptions(
     state: &BeaconState,
     pre_shard_members: &BTreeMap<ShardId, Vec<ValidatorId>>,
     pre_seats: &BTreeMap<(ValidatorId, ShardId), ShardId>,
-) -> BTreeMap<ValidatorId, SplitAdoption> {
+) -> (
+    BTreeMap<ValidatorId, SplitAdoption>,
+    BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+) {
     let mut adoptions = BTreeMap::new();
+    let mut parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> = BTreeMap::new();
     for (child, committee) in &state.next_shard_committees {
         if pre_shard_members.contains_key(child) {
             continue;
@@ -275,10 +295,36 @@ fn diff_split_adoptions(
                 adoptions.insert(*member, SplitAdoption::Observer { parent });
             } else if parent_members.contains(member) {
                 adoptions.insert(*member, SplitAdoption::ParentHalf { parent });
+                parent_halves
+                    .entry(*child)
+                    .or_default()
+                    .insert(*member, parent);
             }
         }
     }
-    adoptions
+    (adoptions, parent_halves)
+}
+
+/// Drop the parent-half cohort of every child that has committed past its
+/// genesis. A real anchor (non-zero `block_hash`) paired with a non-zero
+/// witness watermark means the child is live and producing — which requires
+/// its members, the parent halves among them, to have seated — so the reshape
+/// orchestrator no longer needs the cohort to discover them.
+fn release_seated_parent_halves(state: &mut BeaconState) {
+    let established: Vec<ShardId> = state
+        .reshape_parent_halves
+        .keys()
+        .filter(|child| {
+            state.boundaries.get(child).is_some_and(|b| {
+                b.block_hash != BlockHash::ZERO
+                    && b.witness_leaf_count != BeaconWitnessLeafCount::ZERO
+            })
+        })
+        .copied()
+        .collect();
+    for child in established {
+        state.reshape_parent_halves.remove(&child);
+    }
 }
 
 /// Every pending split's cohort seats, keyed `(validator, splitting
@@ -2175,7 +2221,7 @@ mod tests {
             },
         );
 
-        let adoptions = diff_split_adoptions(&state, &pre_members, &pre_seats);
+        let (adoptions, parent_halves) = diff_split_adoptions(&state, &pre_members, &pre_seats);
         assert_eq!(
             adoptions.get(&parent_members[0]),
             Some(&SplitAdoption::ParentHalf { parent })
@@ -2189,5 +2235,97 @@ mod tests {
             Some(&SplitAdoption::Observer { parent })
         );
         assert_eq!(adoptions.len(), 5);
+
+        // The parent halves project keyed by the child each one lands on,
+        // mapping member to the parent it re-roots from; the observer is not
+        // among them.
+        assert_eq!(parent_halves[&left].get(&parent_members[0]), Some(&parent));
+        assert_eq!(parent_halves[&left].get(&parent_members[1]), Some(&parent));
+        assert_eq!(parent_halves[&right].get(&parent_members[2]), Some(&parent));
+        assert_eq!(parent_halves[&right].get(&parent_members[3]), Some(&parent));
+        assert!(!parent_halves[&left].contains_key(&observer));
+        assert_eq!(parent_halves[&left].len() + parent_halves[&right].len(), 4);
+    }
+
+    /// A parent half's cohort survives until its child commits past genesis —
+    /// a real anchor whose witness watermark has advanced.
+    #[test]
+    fn parent_halves_release_once_the_child_is_established() {
+        use hyperscale_types::{BlockHeight, Hash, StateRoot, WeightedTimestamp};
+
+        fn boundary(block_hash: BlockHash, witness: BeaconWitnessLeafCount) -> ShardBoundary {
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash,
+                height: BlockHeight::GENESIS,
+                weighted_timestamp: WeightedTimestamp::ZERO,
+                witness_leaf_count: witness,
+                last_live_epoch: Epoch::GENESIS,
+                consecutive_misses: 0,
+                terminal_epoch: None,
+                terminal_qc_wt: None,
+                settled_waves_root: None,
+            }
+        }
+
+        let mut state = single_pool_state(4);
+        let parent = ShardId::leaf(1, 0);
+        let (child, _) = parent.children();
+        let member = ValidatorId::new(7);
+        state
+            .reshape_parent_halves
+            .insert(child, std::iter::once((member, parent)).collect());
+
+        // A placeholder child (zero anchor) keeps the cohort.
+        state.boundaries.insert(
+            child,
+            boundary(BlockHash::ZERO, BeaconWitnessLeafCount::ZERO),
+        );
+        release_seated_parent_halves(&mut state);
+        assert!(
+            state.reshape_parent_halves.contains_key(&child),
+            "a placeholder child keeps its parent halves",
+        );
+
+        // A seeded anchor that has not yet produced keeps it.
+        let seeded = BlockHash::from_raw(Hash::from_bytes(b"child-genesis"));
+        state
+            .boundaries
+            .insert(child, boundary(seeded, BeaconWitnessLeafCount::ZERO));
+        release_seated_parent_halves(&mut state);
+        assert!(
+            state.reshape_parent_halves.contains_key(&child),
+            "a seeded but quiet child keeps its parent halves",
+        );
+
+        // A live child that has folded a contribution drops it.
+        state
+            .boundaries
+            .insert(child, boundary(seeded, BeaconWitnessLeafCount::new(1)));
+        release_seated_parent_halves(&mut state);
+        assert!(
+            !state.reshape_parent_halves.contains_key(&child),
+            "an established child releases its parent halves",
+        );
+    }
+
+    /// The retained parent halves project onto the head snapshot keyed by
+    /// child, so the orchestrator can discover them.
+    #[test]
+    fn parent_halves_project_onto_the_head_snapshot() {
+        let mut state = single_pool_state(4);
+        let parent = ShardId::leaf(1, 0);
+        let (child, _) = parent.children();
+        let member = ValidatorId::new(7);
+        state
+            .reshape_parent_halves
+            .insert(child, std::iter::once((member, parent)).collect());
+
+        let snapshot = state.derive_topology_snapshot(net());
+        assert_eq!(
+            snapshot.reshape_parent_half_parent(child, member),
+            Some(parent),
+        );
+        assert!(snapshot.reshape_parent_half_cohorts().contains_key(&child));
     }
 }

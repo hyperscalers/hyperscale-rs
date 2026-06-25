@@ -278,6 +278,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
         split_pending_window: BTreeSet::new(),
         reshape_observers_window: BTreeMap::new(),
         reshape_keepers_window: BTreeMap::new(),
+        reshape_parent_halves: BTreeMap::new(),
         boundaries: BTreeMap::new(),
         pending_reshapes: BTreeMap::new(),
         miss_counters: BTreeMap::new(),

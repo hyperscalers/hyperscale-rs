@@ -7432,6 +7432,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         );
         TopologySchedule::single(Arc::new(snapshot))
@@ -7465,6 +7466,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

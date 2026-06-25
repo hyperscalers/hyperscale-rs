@@ -482,6 +482,16 @@ pub struct BeaconState {
     /// would diverge between the lookahead and active writes of the
     /// execution window.
     pub reshape_keepers_window: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Parent-half cohorts of executed splits, keyed by the freshly split
+    /// child each member seats on, mapping member → the parent it re-roots
+    /// its local store from. Written when a split executes (the members that
+    /// landed on a child from its parent committee, the inverse of the
+    /// child's observer cohort), and dropped once the child commits past its
+    /// genesis. Projected onto the head [`TopologySnapshot`] so the reshape
+    /// orchestrator discovers and seats parent halves from the committed view.
+    /// Not window-frozen: a parent half is seated within the window its split
+    /// executes in, so the projection carries the live map unchanged.
+    pub reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     /// Per-shard boundary record: the snap-sync anchor (`state_root` /
     /// `block_hash`), the applied witness high-water mark, and the
     /// liveness history. Seeded for every genesis shard so it is never
@@ -765,6 +775,11 @@ struct WindowProjection {
     witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
     reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// The live retained parent-half cohorts — not window-frozen like the
+    /// fields above, since a parent half is discovered and seated entirely
+    /// within the window the split executes in, so the head and lookahead
+    /// snapshots project the same map.
+    reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     split_pending: BTreeSet<ShardId>,
 }
 
@@ -911,6 +926,7 @@ impl BeaconState {
                 witness_bases: self.witness_window_bases.clone(),
                 reshape_observers: self.reshape_observers_window.clone(),
                 reshape_keepers: self.reshape_keepers_window.clone(),
+                reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.split_pending_window.clone(),
             },
             network,
@@ -933,6 +949,7 @@ impl BeaconState {
                 witness_bases: self.live_witness_bases(),
                 reshape_observers: self.live_reshape_observers(),
                 reshape_keepers: self.live_reshape_keepers(),
+                reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.live_split_pending(),
             },
             network,
@@ -1044,6 +1061,7 @@ impl BeaconState {
             witness_bases,
             reshape_observers,
             reshape_keepers,
+            reshape_parent_halves,
             split_pending,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
@@ -1098,6 +1116,8 @@ impl BeaconState {
             reshape_observers.into_iter().collect();
         let reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> =
             reshape_keepers.into_iter().collect();
+        let reshape_parent_halves: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> =
+            reshape_parent_halves.into_iter().collect();
 
         TopologySnapshot::from_explicit_committees(
             network,
@@ -1108,6 +1128,7 @@ impl BeaconState {
             witness_bases,
             reshape_observers,
             reshape_keepers,
+            reshape_parent_halves,
             split_pending,
         )
     }
@@ -1287,6 +1308,7 @@ mod tests {
             split_pending_window: BTreeSet::new(),
             reshape_observers_window: BTreeMap::new(),
             reshape_keepers_window: BTreeMap::new(),
+            reshape_parent_halves: BTreeMap::new(),
             boundaries: BTreeMap::new(),
             pending_reshapes: BTreeMap::new(),
             miss_counters: BTreeMap::new(),

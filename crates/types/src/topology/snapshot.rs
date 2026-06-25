@@ -125,6 +125,14 @@ pub struct TopologySnapshot {
     /// see them), but their ready signals classify as `ReshapeReady`
     /// witness leaves: they signal that the sibling half has synced.
     reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Per-child parent-half sets of executed splits — each freshly split
+    /// child mapped to the members that landed on it from the parent
+    /// committee and the parent each one re-roots its local store from,
+    /// projected from `BeaconState.reshape_parent_halves`. Retained from a
+    /// split's execution until the child commits past its genesis, so the
+    /// reshape orchestrator can discover and seat the parent halves from the
+    /// committed view rather than a one-shot placement delta.
+    reshape_parent_halves: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     /// Shards with an admitted, not-yet-executed split as of this
     /// window's committee freeze. Frozen with the same discipline as
     /// `witness_bases`, so both writes of a window's schedule entry
@@ -173,6 +181,7 @@ impl TopologySnapshot {
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
             reshape_keepers: HashMap::new(),
+            reshape_parent_halves: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -213,6 +222,7 @@ impl TopologySnapshot {
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
             reshape_keepers: HashMap::new(),
+            reshape_parent_halves: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -262,6 +272,7 @@ impl TopologySnapshot {
             witness_bases: HashMap::new(),
             reshape_observers: HashMap::new(),
             reshape_keepers: HashMap::new(),
+            reshape_parent_halves: HashMap::new(),
             split_pending: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -305,6 +316,7 @@ impl TopologySnapshot {
         witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
         mut reshape_observers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
         mut reshape_keepers: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+        mut reshape_parent_halves: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
         split_pending: BTreeSet<ShardId>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
@@ -337,6 +349,7 @@ impl TopologySnapshot {
 
         reshape_observers.retain(|_, cohort| !cohort.is_empty());
         reshape_keepers.retain(|_, keepers| !keepers.is_empty());
+        reshape_parent_halves.retain(|_, halves| !halves.is_empty());
         Self {
             network,
             shard_trie,
@@ -345,6 +358,7 @@ impl TopologySnapshot {
             witness_bases,
             reshape_observers,
             reshape_keepers,
+            reshape_parent_halves,
             split_pending,
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -452,6 +466,31 @@ impl TopologySnapshot {
         &self,
     ) -> &HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
         &self.reshape_keepers
+    }
+
+    /// The parent `validator` re-roots its local store from to seat on `child`
+    /// after a split execution placed it there, or `None` when the validator
+    /// holds no parent-half seat for that child.
+    #[must_use]
+    pub fn reshape_parent_half_parent(
+        &self,
+        child: ShardId,
+        validator: ValidatorId,
+    ) -> Option<ShardId> {
+        self.reshape_parent_halves
+            .get(&child)
+            .and_then(|halves| halves.get(&validator))
+            .copied()
+    }
+
+    /// The executed-split parent-half cohorts, keyed by the child each member
+    /// seats on — each maps a member to the parent it re-roots from. The reshape
+    /// orchestrator reads this to discover the parent-half duties its host holds.
+    #[must_use]
+    pub const fn reshape_parent_half_cohorts(
+        &self,
+    ) -> &HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
+        &self.reshape_parent_halves
     }
 
     /// Get the ordered committee members for a shard — full membership,
@@ -714,6 +753,7 @@ mod tests {
                 (ShardId::leaf(1, 1), BTreeMap::new()),
             ]),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::from([shard]),
         );
 
@@ -885,6 +925,7 @@ mod tests {
             witness_bases,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         );
 
@@ -923,6 +964,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -972,6 +1014,7 @@ mod tests {
             &vs,
             committees,
             consensus,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

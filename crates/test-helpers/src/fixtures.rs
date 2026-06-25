@@ -209,6 +209,7 @@ impl TestFixtures {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::new(),
         ));
 

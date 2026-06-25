@@ -383,6 +383,7 @@ mod tests {
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             HashMap::from([(shard, observers)]),
             HashMap::new(),
+            HashMap::new(),
             BTreeSet::from([shard]),
         )
     }
@@ -413,6 +414,7 @@ mod tests {
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             HashMap::new(),
             HashMap::from([(shard, keepers)]),
+            HashMap::new(),
             BTreeSet::from([shard]),
         )
     }

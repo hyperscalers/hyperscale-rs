@@ -988,6 +988,7 @@ mod tests {
             HashMap::new(),
             observer_cohorts,
             keeper_cohorts,
+            HashMap::new(),
             BTreeSet::new(),
         )
     }
