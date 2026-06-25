@@ -15,8 +15,9 @@
 //! each step (the adapter's step cadence paces it — production's 1s sleep,
 //! simulation's per-slice pump).
 //!
-//! This module covers the **split observer** and **merge keeper** duties. The
-//! supervisor wiring lands in a later phase.
+//! It covers all three reshape duties — the **split observer**, the **split
+//! parent half**, and the **merge keeper** — each discovered from its own cohort
+//! projection and sequenced to the shared adopt and seat tail.
 
 use std::collections::HashMap;
 
@@ -56,8 +57,11 @@ pub enum FetchKind {
 /// Which genesis derivation a [`ReshapeRequest::Adopt`] performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdoptKind {
-    /// A split child adopts from its parent's terminal contribution.
+    /// A split observer adopts the store it followed to the parent's terminal.
     Split,
+    /// A split parent half re-roots its cloned parent store onto the child
+    /// subtree.
+    ParentHalf,
     /// A merge parent adopts from both children's terminal contributions.
     Merge,
 }
@@ -71,6 +75,16 @@ pub enum ReshapeRequest {
     OpenStore {
         /// The duty's store shard.
         shard: ShardId,
+    },
+    /// Seed `child`'s store by cloning the host's local `parent` store onto the
+    /// child subtree, once the local parent has committed through the terminal
+    /// crossing. Answered by [`ReshapeEvent::Opened`] when the clone lands, or
+    /// [`ReshapeEvent::SeedDeferred`] while the local parent is still behind.
+    SeedFromParent {
+        /// The splitting parent whose store is cloned.
+        parent: ShardId,
+        /// The split child the clone seeds.
+        child: ShardId,
     },
     /// Fetch from `from`'s committee, on behalf of `duty`. Answered by
     /// [`ReshapeEvent::Fetched`] (or [`ReshapeEvent::FetchFailed`]). The
@@ -195,6 +209,13 @@ pub enum ReshapeEvent {
         /// The store shard.
         shard: ShardId,
     },
+    /// A [`ReshapeRequest::SeedFromParent`] could not run yet — the host's local
+    /// parent has not committed through the terminal crossing — so the seed
+    /// should be re-armed and retried.
+    SeedDeferred {
+        /// The split child whose seed is deferred.
+        child: ShardId,
+    },
 }
 
 /// One observer's progress through its split duty.
@@ -300,6 +321,49 @@ struct KeeperDuty {
     store_opened: bool,
 }
 
+/// One parent half's progress through its split duty, keyed by the child it
+/// seats.
+enum ParentHalfPhase {
+    /// Awaiting the child anchor, then seeding the child store by cloning the
+    /// host's local parent once it has committed through the terminal crossing.
+    Seeding {
+        /// Whether the seed request is already in flight.
+        requested: bool,
+    },
+    /// Store seeded; fetching the parent's certified terminal to derive the
+    /// child genesis.
+    FetchingTerminal {
+        /// The beacon-seeded child anchor the derivation verifies against.
+        anchor: ShardAnchor,
+        /// Whether the terminal fetch is already in flight.
+        requested: bool,
+    },
+    /// Terminal fetched and genesis derived; awaiting the next `advance` to emit
+    /// the adopt.
+    Adopting {
+        /// The derived chain origin.
+        origin: ChainOrigin,
+        /// The derived genesis block.
+        genesis: Box<Block>,
+    },
+    /// Adopt emitted; awaiting the verified adopted root.
+    AwaitingAdopt,
+    /// Genesis adopted; awaiting the placement that seats it.
+    Prepared,
+    /// Seated; inert until the committed projection releases the duty.
+    Seated,
+}
+
+/// One split parent-half duty, keyed by the child it seats. As with an observer
+/// duty, a host may hold more than one parent-half seat for the same child; they
+/// share the one cloned store and seat under the one placement.
+struct ParentHalfDuty {
+    parent: ShardId,
+    validators: Vec<ValidatorId>,
+    phase: ParentHalfPhase,
+    store_seeded: bool,
+}
+
 /// The keeper half `from` addresses, when it is one of the duty's children.
 fn half_for<'a>(
     left: &'a mut KeeperHalf,
@@ -326,6 +390,8 @@ pub struct ReshapeOrchestrator {
     observers: HashMap<ShardId, ObserverDuty>,
     /// In-flight keeper duties, keyed by the parent each reforms.
     keepers: HashMap<ShardId, KeeperDuty>,
+    /// In-flight parent-half duties, keyed by the child each seats.
+    parent_halves: HashMap<ShardId, ParentHalfDuty>,
 }
 
 impl ReshapeOrchestrator {
@@ -338,6 +404,7 @@ impl ReshapeOrchestrator {
             epoch_duration_ms,
             observers: HashMap::new(),
             keepers: HashMap::new(),
+            parent_halves: HashMap::new(),
         }
     }
 
@@ -348,7 +415,9 @@ impl ReshapeOrchestrator {
     /// join racing a redundant fresh snap-sync against it.
     #[must_use]
     pub fn is_seating(&self, shard: ShardId) -> bool {
-        self.keepers.contains_key(&shard) || self.observers.contains_key(&shard)
+        self.keepers.contains_key(&shard)
+            || self.observers.contains_key(&shard)
+            || self.parent_halves.contains_key(&shard)
     }
 
     /// Advance every duty one step: apply the io results in `events`, discover
@@ -359,6 +428,7 @@ impl ReshapeOrchestrator {
         }
         self.discover_observer_duties(view);
         self.discover_keeper_duties(view);
+        self.discover_parent_half_duties(view);
 
         let mut requests = Vec::new();
         let children: Vec<ShardId> = self.observers.keys().copied().collect();
@@ -369,6 +439,17 @@ impl ReshapeOrchestrator {
         for parent in parents {
             self.advance_keeper(parent, view, &mut requests);
         }
+        let halves: Vec<ShardId> = self.parent_halves.keys().copied().collect();
+        for child in halves {
+            self.advance_parent_half(child, view, &mut requests);
+        }
+        // A seated parent half lingers only to keep its child from being
+        // re-discovered; once the projection releases it (the child committed
+        // past genesis) the duty is done.
+        self.parent_halves.retain(|child, duty| {
+            !matches!(duty.phase, ParentHalfPhase::Seated)
+                || view.parent_half_cohorts().contains_key(child)
+        });
         requests
     }
 
@@ -380,6 +461,8 @@ impl ReshapeOrchestrator {
                     duty.store_opened = true;
                 } else if let Some(duty) = self.keepers.get_mut(&shard) {
                     duty.store_opened = true;
+                } else if let Some(duty) = self.parent_halves.get_mut(&shard) {
+                    duty.store_seeded = true;
                 }
             }
             ReshapeEvent::Fetched { duty, from, kind } => {
@@ -387,6 +470,8 @@ impl ReshapeOrchestrator {
                     self.apply_observer_fetched(duty, kind);
                 } else if self.keepers.contains_key(&duty) {
                     self.apply_keeper_fetched(duty, from, kind);
+                } else if self.parent_halves.contains_key(&duty) {
+                    self.apply_parent_half_fetched(duty, kind);
                 }
             }
             ReshapeEvent::FetchFailed { duty, from, kind } => {
@@ -412,6 +497,17 @@ impl ReshapeOrchestrator {
                     && matches!(duty.phase, KeeperPhase::AwaitingAdopt)
                 {
                     duty.phase = KeeperPhase::Prepared;
+                } else if let Some(duty) = self.parent_halves.get_mut(&shard)
+                    && matches!(duty.phase, ParentHalfPhase::AwaitingAdopt)
+                {
+                    duty.phase = ParentHalfPhase::Prepared;
+                }
+            }
+            ReshapeEvent::SeedDeferred { child } => {
+                if let Some(duty) = self.parent_halves.get_mut(&child)
+                    && let ParentHalfPhase::Seeding { requested } = &mut duty.phase
+                {
+                    *requested = false;
                 }
             }
         }
@@ -438,6 +534,10 @@ impl ReshapeOrchestrator {
                 }
                 FetchKind::Block { .. } => half.terminal_requested = false,
             }
+        } else if let Some(half) = self.parent_halves.get_mut(&duty)
+            && let ParentHalfPhase::FetchingTerminal { requested, .. } = &mut half.phase
+        {
+            *requested = false;
         }
     }
 
@@ -524,6 +624,32 @@ impl ReshapeOrchestrator {
                 }
             }
             _ => {}
+        }
+        if let Some(phase) = next {
+            duty.phase = phase;
+        }
+    }
+
+    /// Derive a parent half's child genesis once its terminal fetch returns.
+    fn apply_parent_half_fetched(&mut self, child: ShardId, kind: FetchedKind) {
+        let Some(duty) = self.parent_halves.get_mut(&child) else {
+            return;
+        };
+        let mut next: Option<ParentHalfPhase> = None;
+        if let ParentHalfPhase::FetchingTerminal { anchor, requested } = &mut duty.phase
+            && let FetchedKind::Block { response } = kind
+        {
+            *requested = false;
+            let anchor = *anchor;
+            if let Some(elided) = &response.certified
+                && let Ok((genesis, origin)) =
+                    split_genesis_from_terminal(child, elided.header(), elided.qc(), &anchor)
+            {
+                next = Some(ParentHalfPhase::Adopting {
+                    origin,
+                    genesis: Box::new(genesis),
+                });
+            }
         }
         if let Some(phase) = next {
             duty.phase = phase;
@@ -836,6 +962,109 @@ impl ReshapeOrchestrator {
             }
         }
     }
+
+    /// Open a parent-half duty for every cohort seat this host holds that it
+    /// isn't already running. A child already covered by an observer duty is
+    /// left to it — the observer's seat installs every homed committee member,
+    /// the parent halves among them.
+    fn discover_parent_half_duties(&mut self, view: &ReshapeView) {
+        for (&child, cohort) in view.parent_half_cohorts() {
+            if self.observers.contains_key(&child) {
+                continue;
+            }
+            for (&validator, &parent) in cohort {
+                if !self.me.contains(&validator) {
+                    continue;
+                }
+                let duty = self
+                    .parent_halves
+                    .entry(child)
+                    .or_insert_with(|| ParentHalfDuty {
+                        parent,
+                        validators: Vec::new(),
+                        phase: ParentHalfPhase::Seeding { requested: false },
+                        store_seeded: false,
+                    });
+                if !duty.validators.contains(&validator) {
+                    duty.validators.push(validator);
+                }
+            }
+        }
+    }
+
+    /// Advance one parent-half duty, emitting its current io.
+    fn advance_parent_half(
+        &mut self,
+        child: ShardId,
+        view: &ReshapeView,
+        out: &mut Vec<ReshapeRequest>,
+    ) {
+        let Some(duty) = self.parent_halves.get_mut(&child) else {
+            return;
+        };
+        let parent = duty.parent;
+        let store_seeded = duty.store_seeded;
+        let mut next: Option<ParentHalfPhase> = None;
+        match &mut duty.phase {
+            ParentHalfPhase::Seeding { requested } => {
+                // The child anchor seeds once the parent's terminal folds; it is
+                // the version the clone must reach and the derivation verifies
+                // against, so wait for it before seeding.
+                if let Some(anchor) = view.boundary(child) {
+                    if store_seeded {
+                        next = Some(ParentHalfPhase::FetchingTerminal {
+                            anchor,
+                            requested: false,
+                        });
+                    } else if !*requested {
+                        out.push(ReshapeRequest::SeedFromParent { parent, child });
+                        *requested = true;
+                    }
+                }
+            }
+            ParentHalfPhase::FetchingTerminal { anchor, requested } => {
+                // The seed gates on the local parent reaching the terminal, so
+                // the host's own retained chain serves the certified terminal.
+                if !*requested {
+                    let terminal = anchor.height.prev().unwrap_or(anchor.height);
+                    out.push(ReshapeRequest::Fetch {
+                        duty: child,
+                        from: parent,
+                        kind: FetchKind::Block {
+                            request: GetBlockRequest::new(terminal, terminal),
+                        },
+                    });
+                    *requested = true;
+                }
+            }
+            ParentHalfPhase::Adopting { .. } => {
+                if let ParentHalfPhase::Adopting { origin, genesis } =
+                    std::mem::replace(&mut duty.phase, ParentHalfPhase::AwaitingAdopt)
+                {
+                    out.push(ReshapeRequest::Adopt {
+                        shard: child,
+                        kind: AdoptKind::ParentHalf,
+                        origin,
+                        genesis,
+                    });
+                }
+            }
+            ParentHalfPhase::AwaitingAdopt | ParentHalfPhase::Seated => {}
+            ParentHalfPhase::Prepared => {
+                if duty
+                    .validators
+                    .iter()
+                    .any(|validator| view.committee(child).contains(validator))
+                {
+                    out.push(ReshapeRequest::Seat { shard: child });
+                    duty.phase = ParentHalfPhase::Seated;
+                }
+            }
+        }
+        if let Some(phase) = next {
+            duty.phase = phase;
+        }
+    }
 }
 
 /// A ready signal's recipients — `shard`'s committee minus the signer.
@@ -902,7 +1131,7 @@ mod tests {
 
     use super::{
         FetchKind, KeeperDuty, KeeperMember, KeeperPhase, ObserverDuty, ObserverPhase,
-        ReshapeOrchestrator, ReshapeRequest,
+        ParentHalfDuty, ParentHalfPhase, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
     };
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
@@ -929,7 +1158,7 @@ mod tests {
         cohort: &[(ShardId, u64, ShardId)],
         seeded: &[ShardId],
     ) -> TopologySnapshot {
-        build(committees, cohort, &[], seeded)
+        build(committees, cohort, &[], &[], seeded)
     }
 
     /// Project a snapshot with keeper cohort seats `(child, validator, parent)`.
@@ -938,20 +1167,31 @@ mod tests {
         keepers: &[(ShardId, u64, ShardId)],
         seeded: &[ShardId],
     ) -> TopologySnapshot {
-        build(committees, &[], keepers, seeded)
+        build(committees, &[], keepers, &[], seeded)
+    }
+
+    /// Project a snapshot with parent-half cohort seats `(child, validator,
+    /// parent)`.
+    fn snapshot_parent_halves(
+        committees: &[(ShardId, &[u64])],
+        parent_halves: &[(ShardId, u64, ShardId)],
+        seeded: &[ShardId],
+    ) -> TopologySnapshot {
+        build(committees, &[], &[], parent_halves, seeded)
     }
 
     fn build(
         committees: &[(ShardId, &[u64])],
         observers: &[(ShardId, u64, ShardId)],
         keepers: &[(ShardId, u64, ShardId)],
+        parent_halves: &[(ShardId, u64, ShardId)],
         seeded: &[ShardId],
     ) -> TopologySnapshot {
         let mut ids: BTreeSet<u64> = BTreeSet::new();
         for (_, members) in committees {
             ids.extend(members.iter().copied());
         }
-        for (_, v, _) in observers.iter().chain(keepers) {
+        for (_, v, _) in observers.iter().chain(keepers).chain(parent_halves) {
             ids.insert(*v);
         }
         let validators: Vec<ValidatorInfo> = ids
@@ -979,6 +1219,14 @@ mod tests {
                 .or_default()
                 .insert(vid(*v), *parent);
         }
+        let mut parent_half_cohorts: HashMap<ShardId, BTreeMap<ValidatorId, ShardId>> =
+            HashMap::new();
+        for (child, v, parent) in parent_halves {
+            parent_half_cohorts
+                .entry(*child)
+                .or_default()
+                .insert(vid(*v), *parent);
+        }
         TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &ValidatorSet::new(validators),
@@ -988,7 +1236,7 @@ mod tests {
             HashMap::new(),
             observer_cohorts,
             keeper_cohorts,
-            HashMap::new(),
+            parent_half_cohorts,
             BTreeSet::new(),
         )
     }
@@ -1252,6 +1500,118 @@ mod tests {
         assert!(
             matches!(requests.as_slice(), [ReshapeRequest::Seat { shard }] if *shard == parent),
             "a prepared keeper must seat once placed on the parent; got {requests:?}",
+        );
+    }
+
+    #[test]
+    fn detects_a_parent_half_seat_and_seeds_from_the_parent() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        // The child anchor has seeded, so the duty seeds the child store from
+        // the host's local parent.
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+
+        let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
+
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [ReshapeRequest::SeedFromParent { parent: p, child: c }]
+                    if *p == parent && *c == child
+            ),
+            "a held parent-half seat must seed from the parent; got {requests:?}",
+        );
+    }
+
+    #[test]
+    fn a_deferred_seed_re_arms_and_retries() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
+        let view = ReshapeView::new(&snap);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+
+        // The first step seeds; the seed is one-shot, so the next is quiet.
+        let _ = orch.step(&view, Vec::new());
+        assert!(orch.step(&view, Vec::new()).is_empty());
+
+        // A deferral (the local parent is still behind) re-arms the seed.
+        let requests = orch.step(&view, vec![ReshapeEvent::SeedDeferred { child }]);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child)
+            ),
+            "a deferred seed must re-arm and retry; got {requests:?}",
+        );
+    }
+
+    #[test]
+    fn a_parent_half_is_left_to_an_active_observer_duty() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        // The host holds an observer seat (validator 5, syncing the child) and a
+        // parent-half seat (validator 6) for the same child.
+        let snap = build(
+            &[(parent, &[1, 2])],
+            &[(parent, 5, child)],
+            &[],
+            &[(child, 6, parent)],
+            &[],
+        );
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)], 30_000);
+
+        let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
+
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::OpenStore { shard } if *shard == child)),
+            "the observer duty opens the child store; got {requests:?}",
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::SeedFromParent { .. })),
+            "no parent-half seed is emitted while an observer covers the child; got {requests:?}",
+        );
+    }
+
+    #[test]
+    fn a_prepared_parent_half_seats_then_releases_with_the_projection() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        orch.parent_halves.insert(
+            child,
+            ParentHalfDuty {
+                parent,
+                validators: vec![vid(5)],
+                phase: ParentHalfPhase::Prepared,
+                store_seeded: true,
+            },
+        );
+
+        // Placed on the child committee → seat, then persist while the
+        // projection still lists the cohort.
+        let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
+        assert!(
+            matches!(requests.as_slice(), [ReshapeRequest::Seat { shard }] if *shard == child),
+            "a prepared parent half seats once placed; got {requests:?}",
+        );
+        assert!(
+            orch.parent_halves.contains_key(&child),
+            "a seated parent half persists while the projection lists it",
+        );
+
+        // Once the child commits past genesis the projection releases the
+        // cohort, and the seated duty is dropped.
+        let released = snapshot_parent_halves(&[(child, &[1, 5])], &[], &[child]);
+        let _ = orch.step(&ReshapeView::new(&released), Vec::new());
+        assert!(
+            !orch.parent_halves.contains_key(&child),
+            "a released seated parent half is dropped",
         );
     }
 }

@@ -34,7 +34,6 @@ use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
 };
-use hyperscale_node::reshape::split_flip::split_genesis_from_terminal;
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
@@ -54,8 +53,6 @@ use hyperscale_types::{
 };
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
-use tokio::task::spawn_blocking;
-use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::bootstrap::bootstrap_shard_state;
@@ -118,18 +115,6 @@ pub struct CompletedBootstrap {
     shard: ShardId,
     vnodes: Vec<VnodeConfig>,
     storage: Arc<RocksDbShardStorage>,
-    recovered: RecoveredState,
-}
-
-/// A settled split-child adoption: the child store on disk is pointed
-/// at its adopted subtree with the deterministic genesis derived and
-/// verified against the beacon's child anchor; seating installs the
-/// genesis and starts consensus.
-pub struct CompletedAdoption {
-    child: ShardId,
-    vnodes: Vec<VnodeConfig>,
-    storage: Arc<RocksDbShardStorage>,
-    genesis: Block,
     recovered: RecoveredState,
 }
 
@@ -200,6 +185,12 @@ pub enum ReshapeIo {
         /// The recovered state rebuilt over the adopted genesis.
         recovered: RecoveredState,
     },
+    /// A parent-half seed could not run yet — the local parent is still behind
+    /// the terminal crossing — so the seed should be re-armed.
+    SeedDeferred {
+        /// The split child whose seed is deferred.
+        child: ShardId,
+    },
 }
 
 /// A background-work completion fed back into the supervisor by the
@@ -219,9 +210,6 @@ pub enum SupervisorEvent {
     },
     /// A snap-sync bootstrap settled (`Err` carries the failed shard).
     Bootstrapped(Result<CompletedBootstrap, ShardId>),
-    /// A split parent-half's store adoption settled (`Err` carries the
-    /// failed child).
-    SplitAdopted(Result<Box<CompletedAdoption>, ShardId>),
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeIo),
     /// A departing shard's thread joined; the unwire can finish.
@@ -404,7 +392,6 @@ impl ShardSupervisor {
                 outcome,
             } => self.on_opened(shard, vnodes, outcome),
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
-            SupervisorEvent::SplitAdopted(done) => self.finish_adoption(done),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::TornDown {
                 shard,
@@ -592,14 +579,12 @@ impl ShardSupervisor {
                 vnodes,
                 adoption,
             } => match adoption {
-                // The parent half adopts its local checkpoint and seats
-                // itself; the orchestrator seats observers from their
-                // synced stores, so an observer join is a no-op here.
-                Some(SplitAdoption::ParentHalf { parent }) => {
-                    self.join_split_child(shard, &vnodes, parent);
-                }
-                Some(SplitAdoption::Observer { .. }) => {
-                    info!(shard = ?shard, "Observer split join ignored; the orchestrator seats observers");
+                // The orchestrator discovers and seats both split adoption paths
+                // from the committed projection — an observer from its synced
+                // store, a parent half from its cloned local parent — so the
+                // placement-delta join is a no-op for either.
+                Some(SplitAdoption::ParentHalf { .. } | SplitAdoption::Observer { .. }) => {
+                    info!(shard = ?shard, "Split adoption join ignored; the orchestrator seats it");
                 }
                 None => self.join(shard, &vnodes),
             },
@@ -668,98 +653,6 @@ impl ShardSupervisor {
                 outcome,
             });
         });
-    }
-
-    /// Bring up a freshly split child this host was pre-staffed for.
-    ///
-    /// Both adoption paths first wait for the flip to become actionable:
-    /// the beacon's child anchor projecting (the fold consumed the
-    /// parent's terminal contribution) and, for a parent-half member,
-    /// the locally hosted parent chain reaching its terminal commit.
-    /// The parent half then seeds the child directory from a checkpoint
-    /// hard-link and adopts the subtree; an observer's synced store
-    /// cannot yet follow the parent to its crossing, so its stale store
-    /// is wiped and the join falls back to a snap-sync bootstrap against
-    /// the now-projected child anchor.
-    fn join_split_child(&mut self, child: ShardId, vnodes: &[VnodeConfig], parent: ShardId) {
-        if self.shards.contains_key(&child) || self.bootstrapping.contains_key(&child) {
-            warn!(shard = ?child, "Split join rejected: child already hosted or bootstrapping");
-            return;
-        }
-        if vnodes.is_empty() || vnodes.iter().any(|v| v.local_shard != child) {
-            warn!(shard = ?child, "Split join rejected: vnodes must be non-empty and target the child");
-            return;
-        }
-        self.bootstrapping.insert(child, vnodes.len());
-        let vnodes = vnodes.to_vec();
-        let process = Arc::clone(&self.process);
-        let events = self.events_tx.clone();
-        let factory = Arc::clone(&self.storage_factory);
-        let storage_dir = Arc::clone(&self.storage_dir);
-        let parent_storage = self
-            .storages
-            .lock()
-            .expect("storages lock")
-            .get(&parent)
-            .cloned();
-        let Some(parent_storage) = parent_storage else {
-            warn!(shard = ?child, ?parent, "Split join without a hosted parent store; abandoned");
-            self.bootstrapping.remove(&child);
-            return;
-        };
-        self.tokio_handle.spawn(async move {
-            let anchor = wait_for_child_anchor(&process, child).await;
-            let done = spawn_blocking(move || {
-                adopt_from_parent(&parent_storage, &factory, &storage_dir, child, &anchor).map(
-                    |(storage, genesis, recovered)| {
-                        Box::new(CompletedAdoption {
-                            child,
-                            vnodes,
-                            storage,
-                            genesis,
-                            recovered,
-                        })
-                    },
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("adoption task panicked: {e}")));
-            let done = done.map_err(|error| {
-                warn!(shard = ?child, error, "Split adoption failed; join abandoned");
-                child
-            });
-            // Send failure means the runner is shutting down.
-            let _ = events.send(SupervisorEvent::SplitAdopted(done));
-        });
-    }
-
-    /// Settle a finished split adoption: install the derived genesis on
-    /// the seated child and start consensus, or clear the bootstrapping
-    /// entry so a later placement delta can retry.
-    fn finish_adoption(&mut self, done: Result<Box<CompletedAdoption>, ShardId>) {
-        let child = match &done {
-            Ok(done) => done.child,
-            Err(child) => *child,
-        };
-        let Some(pending) = self.bootstrapping.remove(&child) else {
-            info!(shard = ?child, "Adoption finished for an abandoned join; dropped");
-            return;
-        };
-        let Ok(done) = done else {
-            // Failure already logged by the adoption task.
-            return;
-        };
-        if self.shards.contains_key(&child) {
-            warn!(shard = ?child, "Adoption completed for an already-hosted shard; dropped");
-            return;
-        }
-        self.seat_shard_with_genesis(
-            child,
-            &done.vnodes[..pending.min(done.vnodes.len())],
-            done.storage,
-            &done.recovered,
-            Some(&done.genesis),
-        );
     }
 
     /// Continue a join whose storage open finished.
@@ -879,6 +772,9 @@ impl ShardSupervisor {
     fn dispatch_reshape(&mut self, request: ReshapeRequest) {
         match request {
             ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
+            ReshapeRequest::SeedFromParent { parent, child } => {
+                self.reshape_seed_from_parent(parent, child);
+            }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
             ReshapeRequest::ImportBoundary {
                 shard,
@@ -932,6 +828,60 @@ impl ShardSupervisor {
             // Send failure means the runner is shutting down.
             let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Opened {
                 shard,
+                outcome,
+            }));
+        });
+    }
+
+    /// Seed a parent half's `child` store by checkpoint-cloning the host's own
+    /// retained `parent` store onto the child subtree, once that parent chain
+    /// has committed through the terminal crossing. Answers with
+    /// [`ReshapeIo::Opened`] when the clone lands, or [`ReshapeIo::SeedDeferred`]
+    /// while the local parent is still behind (or its store is gone). The
+    /// checkpoint hard-links, so the clone shares the engine bootstrap and the
+    /// parent's substates without copying.
+    fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId) {
+        let events = self.events_tx.clone();
+        let Some(anchor) = self.process.topology().load().boundary(child) else {
+            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
+            return;
+        };
+        let parent_storage = self
+            .storages
+            .lock()
+            .expect("storages lock")
+            .get(&parent)
+            .cloned();
+        let Some(parent_storage) = parent_storage else {
+            warn!(shard = ?child, ?parent, "Reshape seed without a hosted parent store; deferred");
+            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
+            return;
+        };
+        let factory = Arc::clone(&self.storage_factory);
+        let dir = (self.storage_dir)(child);
+        self.tokio_handle.spawn_blocking(move || {
+            // The anchor's height is the child genesis height; the parent commits
+            // one block past its terminal (the coast certifying it), so the local
+            // chain is ready for the clone once its tip reaches the anchor.
+            if parent_storage.committed_height() < anchor.height {
+                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
+                return;
+            }
+            let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| format!("stale child store wipe: {e}"))?;
+                }
+                parent_storage
+                    .checkpoint_into(&dir)
+                    .map_err(|e| format!("child checkpoint: {e}"))?;
+                let storage = factory(child)?;
+                let recovered = storage.load_recovered_state();
+                Ok((storage, recovered))
+            })();
+            // Send failure means the runner is shutting down.
+            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Opened {
+                shard: child,
                 outcome,
             }));
         });
@@ -1175,6 +1125,12 @@ impl ShardSupervisor {
                             .map_err(|e| format!("followed adoption: {e}"))?,
                         genesis.header().state_root(),
                     ),
+                    AdoptKind::ParentHalf => (
+                        storage
+                            .adopt_split_child(origin, &genesis)
+                            .map_err(|e| format!("split child adoption: {e}"))?,
+                        anchor_root.ok_or("split child anchor no longer projects")?,
+                    ),
                     AdoptKind::Merge => (
                         storage
                             .adopt_merge_parent(origin, &genesis)
@@ -1274,6 +1230,7 @@ impl ShardSupervisor {
                 }
                 ReshapeEvent::Adopted { shard }
             }
+            ReshapeIo::SeedDeferred { child } => ReshapeEvent::SeedDeferred { child },
         };
         self.reshape_step(vec![event]);
     }
@@ -1576,82 +1533,6 @@ impl ShardSupervisor {
         })
     }
 }
-
-/// Poll the process topology until the beacon's child anchor projects —
-/// the fold has consumed the parent's terminal contribution and seeded
-/// the child's genesis record. The flip cannot act sooner: the anchor
-/// carries the adopted root and the deterministic genesis hash the
-/// adoption verifies against.
-async fn wait_for_child_anchor(process: &ProdProcessIo, child: ShardId) -> ShardAnchor {
-    loop {
-        if let Some(anchor) = process.topology().load().boundary(child) {
-            return anchor;
-        }
-        sleep(ANCHOR_POLL_INTERVAL).await;
-    }
-}
-
-/// How often the flip re-checks for the child anchor and the parent's
-/// terminal commit. The wait spans the parent's coast (a couple of
-/// block intervals) plus one beacon fold.
-const ANCHOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// The parent-half adoption, blocking: wait is done; seed the child
-/// directory from a parent checkpoint, open it at the child prefix,
-/// adopt the subtree, and derive + verify the deterministic genesis
-/// from the parent chain's terminal pair.
-fn adopt_from_parent(
-    parent_storage: &RocksDbShardStorage,
-    factory: &StorageFactory,
-    storage_dir: &StorageDirResolver,
-    child: ShardId,
-    anchor: &ShardAnchor,
-) -> Result<(Arc<RocksDbShardStorage>, Block, RecoveredState), String> {
-    // The anchor's height is the child genesis height — one past the
-    // parent's terminal block — and the parent commits exactly one
-    // block past its terminal (the coast block certifying it), so the
-    // local parent chain is ready when its tip reaches the anchor.
-    let deadline = std::time::Instant::now() + PARENT_TERMINAL_WAIT;
-    while parent_storage.committed_height() < anchor.height {
-        if std::time::Instant::now() > deadline {
-            return Err("parent chain never reached its terminal commit".to_string());
-        }
-        std::thread::sleep(ANCHOR_POLL_INTERVAL);
-    }
-    let terminal_height = anchor
-        .height
-        .prev()
-        .ok_or("child anchor at the absolute height floor")?;
-    let terminal = parent_storage
-        .get_block(terminal_height)
-        .ok_or("parent chain holds no terminal block below the anchor")?;
-    let (genesis, origin) = split_genesis_from_terminal(
-        child,
-        terminal.block().header(),
-        terminal.qc_verified(),
-        anchor,
-    )?;
-
-    parent_storage
-        .checkpoint_into(&storage_dir(child))
-        .map_err(|e| format!("child checkpoint: {e}"))?;
-    let storage = factory(child)?;
-    let adopted = storage
-        .adopt_split_child(origin, &genesis)
-        .map_err(|e| format!("child adoption: {e}"))?;
-    let substate_bytes = storage
-        .substate_bytes_at_version(origin.genesis_height.inner())
-        .unwrap_or(0);
-    let recovered = verified_recovered_state(adopted, anchor.state_root, origin, substate_bytes)?;
-    Ok((storage, genesis, recovered))
-}
-
-/// Upper bound on waiting for the locally hosted parent chain to commit
-/// its crossing once the beacon anchor projects. The anchor implies the
-/// crossing is certified network-wide; a local chain further behind
-/// than this is wedged and the join should fail (a later placement
-/// delta retries).
-const PARENT_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether a hosted shard has aged out of this host's serving duty: no
 /// local validator holds a consensus role in it (absent from the active

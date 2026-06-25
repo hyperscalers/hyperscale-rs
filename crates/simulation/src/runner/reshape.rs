@@ -33,7 +33,6 @@ use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
 };
-use hyperscale_node::reshape::split_flip::split_genesis_from_terminal;
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{serve_block_request, serve_state_range_request};
@@ -67,14 +66,12 @@ pub(super) struct ReshapeStore {
 }
 
 impl SimulationRunner {
-    /// Step every host's reshape orchestrator one slice: drive its duties to a
-    /// fixpoint against the synchronous in-memory io, then flip any split
-    /// parent halves the committed view newly seeded. Idempotent — safe to
-    /// call every slice.
+    /// Step every host's reshape orchestrator one slice, driving its duties to a
+    /// fixpoint against the synchronous in-memory io. Idempotent — safe to call
+    /// every slice.
     pub fn pump_reshape(&mut self) {
         for node in 0..self.num_hosts() {
             self.pump_reshape_host(node);
-            self.flip_parent_halves(node);
         }
     }
 
@@ -130,6 +127,9 @@ impl SimulationRunner {
             }
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
+            }
+            ReshapeRequest::SeedFromParent { parent, child } => {
+                self.reshape_seed_from_parent(node, parent, child, retries)
             }
             ReshapeRequest::ImportBoundary {
                 shard,
@@ -215,6 +215,42 @@ impl SimulationRunner {
                 recovered,
             },
         );
+    }
+
+    /// Seed a parent half's child store by deep-cloning the host's own retained
+    /// parent store onto the child subtree, once that parent chain has committed
+    /// through the terminal crossing. While it still lags, carry a deferral to
+    /// the next slice so the seed re-arms.
+    fn reshape_seed_from_parent(
+        &mut self,
+        node: NodeIndex,
+        parent: ShardId,
+        child: ShardId,
+        retries: &mut Vec<ReshapeEvent>,
+    ) -> Option<ReshapeEvent> {
+        let ready = self
+            .host_topology(node)
+            .and_then(|topology| topology.boundary(child))
+            .zip(self.hosts_shard(node, parent))
+            .is_some_and(|(anchor, storage)| storage.committed_height() >= anchor.height);
+        if !ready {
+            retries.push(ReshapeEvent::SeedDeferred { child });
+            return None;
+        }
+        let storage = self.hosts[node as usize]
+            .shard_io(parent)
+            .storage
+            .clone_for_split_child(shard_prefix_path(child));
+        let recovered = storage.load_recovered_state();
+        self.reshape_stores.insert(
+            (node, child),
+            ReshapeStore {
+                storage,
+                genesis: None,
+                recovered,
+            },
+        );
+        Some(ReshapeEvent::Opened { shard: child })
     }
 
     /// Serve one reshape fetch from a committee host's store. A block fetch
@@ -342,6 +378,14 @@ impl SimulationRunner {
                     .expect("followed child adoption"),
                 genesis.header().state_root(),
             ),
+            AdoptKind::ParentHalf => (
+                storage
+                    .adopt_split_child(origin, &genesis)
+                    .expect("split child subtree adoption"),
+                view.boundary(shard)
+                    .expect("split child anchor projects")
+                    .state_root,
+            ),
             AdoptKind::Merge => (
                 storage
                     .adopt_merge_parent(origin, &genesis)
@@ -385,107 +429,6 @@ impl SimulationRunner {
             return;
         }
         self.seat_reshape_shard(node, shard, &validators, storage, &genesis, &recovered);
-    }
-
-    /// Flip every split parent half this host newly owns: a splitting
-    /// committee's own member coasting onto a freshly seeded child, which the
-    /// orchestrator leaves to the placement-delta join. Skips a child the
-    /// orchestrator is itself seating (the member rides that seat) or one
-    /// already hosted.
-    fn flip_parent_halves(&mut self, node: NodeIndex) {
-        let Some(topology) = self.host_topology(node) else {
-            return;
-        };
-        let view = ReshapeView::new(&topology);
-        let mut work: Vec<(ValidatorId, ShardId, ShardId)> = Vec::new();
-        for parent in self.hosted_shards_of(node) {
-            let (left, right) = parent.children();
-            self.gather_parent_halves(node, parent, left, &view, &mut work);
-            self.gather_parent_halves(node, parent, right, &view, &mut work);
-        }
-        for (validator, parent, child) in work {
-            self.flip_split_child(node, validator, parent, child);
-        }
-    }
-
-    /// Collect the split parent halves this host owns for one freshly seeded
-    /// `child` of `parent` — the splitting committee's own members the host runs
-    /// on the parent. Skips a child the orchestrator is itself seating (those
-    /// members ride that seat) or one already hosted.
-    fn gather_parent_halves(
-        &self,
-        node: NodeIndex,
-        parent: ShardId,
-        child: ShardId,
-        view: &ReshapeView,
-        work: &mut Vec<(ValidatorId, ShardId, ShardId)>,
-    ) {
-        if view.boundary(child).is_none()
-            || self.reshape[node as usize].is_seating(child)
-            || self.hosts_shard(node, child).is_some()
-        {
-            return;
-        }
-        for &validator in view.committee(child) {
-            if self.homes_validator(node, validator)
-                && self.hosts[node as usize].hosts_validator(validator)
-            {
-                work.push((validator, parent, child));
-            }
-        }
-    }
-
-    /// Adopt and seat one split parent half: derive the child genesis from the
-    /// terminated parent's terminal block, deep-clone the parent store onto the
-    /// child subtree, adopt, and seat.
-    fn flip_split_child(
-        &mut self,
-        node: NodeIndex,
-        validator: ValidatorId,
-        parent: ShardId,
-        child: ShardId,
-    ) {
-        let snapshot = self.host_topology(node).expect("host carries a topology");
-        let anchor = snapshot
-            .boundary(child)
-            .expect("flip requires the seeded child anchor");
-        let terminal_height = anchor
-            .height
-            .prev()
-            .expect("child anchor sits above the height floor");
-        // A terminated parent's hosts can lag each other onto its terminal, so
-        // take the chain from whichever host has the terminal block committed.
-        let parent_host = (0..self.num_hosts())
-            .find(|&n| {
-                self.hosts_shard(n, parent)
-                    .is_some_and(|s| s.get_block(terminal_height).is_some())
-            })
-            .expect("a host carries the terminated parent's terminal block");
-        let (genesis, origin, storage, adopted) = {
-            let parent_storage = &self.hosts[parent_host as usize].shard_io(parent).storage;
-            let terminal = parent_storage
-                .get_block(terminal_height)
-                .expect("parent chain holds its terminal block");
-            let (genesis, origin) = split_genesis_from_terminal(
-                child,
-                terminal.block().header(),
-                terminal.qc_verified(),
-                &anchor,
-            )
-            .expect("certified terminal derives the beacon-anchored genesis");
-            let storage = parent_storage.clone_for_split_child(shard_prefix_path(child));
-            let adopted = storage
-                .adopt_split_child(origin, &genesis)
-                .expect("child subtree adoption");
-            (genesis, origin, storage, adopted)
-        };
-        let substate_bytes = storage
-            .substate_bytes_at_version(origin.genesis_height.inner())
-            .unwrap_or(0);
-        let recovered =
-            verified_recovered_state(adopted, anchor.state_root, origin, substate_bytes)
-                .expect("adopted subtree root must match the beacon anchor");
-        self.seat_reshape_shard(node, child, &[validator], storage, &genesis, &recovered);
     }
 
     /// Install a prepared store on `node`: seat one vnode per `validator`,
