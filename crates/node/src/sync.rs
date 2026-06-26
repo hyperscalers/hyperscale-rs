@@ -1182,6 +1182,39 @@ mod tests {
     }
 
     #[test]
+    fn anchored_scope_fetches_above_the_floor_not_genesis() {
+        // A source chain that begins above genesis — a reshape child starts at
+        // its split height. Anchoring the fresh scope at that floor via
+        // `Admitted` before `StartSync` makes the first fetch land on existing
+        // heights. Without it the scope fetches from genesis, the
+        // contiguous-prefix responder returns empty for the non-existent
+        // heights below the chain start (see
+        // `empty_prefix_response_caps_target_to_committed`), and the scope
+        // stalls forever below its real chain.
+        let mut s: Sync<PrefixBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::Admitted {
+            scope: 1,
+            height: BlockHeight::new(700),
+        });
+        let outputs = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(708),
+        });
+        let first = outputs
+            .iter()
+            .find_map(|o| match o {
+                SyncOutput::Fetch { from, count, .. } => Some((*from, *count)),
+                SyncOutput::Complete { .. } => None,
+            })
+            .expect("expected a Fetch above the floor");
+        assert_eq!(
+            first.0,
+            BlockHeight::new(701),
+            "first fetch must start just above the anchored floor, not genesis",
+        );
+    }
+
+    #[test]
     fn short_response_on_non_prefix_binding_defers_as_before() {
         // Bindings without RESPONDER_SERVES_CONTIGUOUS_PREFIX (e.g.
         // block-sync) treat undelivered heights as "this peer doesn't

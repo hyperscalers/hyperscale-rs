@@ -114,7 +114,8 @@ where
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
-            } => self.process_start_remote_header_sync(source_shard, target),
+                floor,
+            } => self.process_start_remote_header_sync(source_shard, target, floor),
             Action::StartSettledWavesAcquisition {
                 shard,
                 terminal_height,

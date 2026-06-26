@@ -1004,6 +1004,12 @@ pub enum Action {
         source_shard: ShardId,
         /// Highest known target height for that shard's chain.
         target: BlockHeight,
+        /// Lowest height the source chain holds — its beacon-attested
+        /// boundary. A reshape child's chain begins at its split height,
+        /// so a fresh sync must anchor here rather than genesis, or the
+        /// contiguous-prefix responder returns empty for the non-existent
+        /// heights below it and the sync stalls.
+        floor: BlockHeight,
     },
 
     /// Acquire a terminated shard's settled-wave set `S_P` for the

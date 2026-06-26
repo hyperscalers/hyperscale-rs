@@ -517,6 +517,7 @@ impl RemoteHeaderCoordinator {
             actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
                 target,
+                floor: expected.last_verified_height,
             });
         }
 
@@ -545,11 +546,23 @@ impl RemoteHeaderCoordinator {
             if shard == self.local_shard {
                 continue;
             }
+            // Anchor a freshly tracked shard at its attested boundary, not
+            // genesis: a reshape child's chain begins at its split height, so
+            // probing from 0 requests heights below the chain start and the
+            // contiguous-prefix sync stalls there. The attested boundary is a
+            // height the shard provably holds, and it lags the tip by the
+            // witness window — far enough that no live cross-shard provision
+            // references a block below it — so it is a sound anchor.
+            // Gossip-verified headers raise it from there.
+            let anchor_height = topology
+                .head()
+                .boundary(shard)
+                .map_or(BlockHeight::new(0), |a| a.height);
             self.expected
                 .entry(shard)
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.local_committed_ts,
-                    last_verified_height: BlockHeight::new(0),
+                    last_verified_height: anchor_height,
                     last_verified_at: None,
                 });
         }
@@ -580,6 +593,7 @@ impl RemoteHeaderCoordinator {
             actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
                 target,
+                floor: expected.last_verified_height,
             });
         }
         actions
