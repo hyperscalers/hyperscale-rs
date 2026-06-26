@@ -11,13 +11,14 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_straddler_atomic, multi_vnode_progress, pool_capacity_caps_registrations,
-    re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
-    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
-    stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
-    withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+    ScenarioConfig, cross_shard_tx, grow_reaches_four_shard_topology,
+    grow_reaches_two_shard_topology, livelock_resolves_promptly, liveness_baseline,
+    merge_lifecycle, merge_straddler_atomic, multi_vnode_progress,
+    pool_capacity_caps_registrations, re_registration_of_a_live_validator_is_a_no_op,
+    register_validator_pools_a_node, register_without_capacity_is_rejected,
+    registered_validator_activates_onto_a_shard, single_shard_tx, split_lifecycle,
+    split_straddler_atomic, stake_deposit_folds_into_beacon_state,
+    stake_withdraw_drops_effective_stake, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use support::sim_cluster::SimCluster;
 
@@ -238,4 +239,32 @@ fn pool_capacity_caps_registrations_sim() {
     let mut cluster =
         SimCluster::with_balances(&witness_config(4), 0xCA9A, &witness_genesis_balances());
     pool_capacity_caps_registrations(&mut cluster);
+}
+
+/// Single-shard genesis with the split armed (`split_bytes = 0`) and exactly
+/// `(target - 1)` cohorts of pool surplus to staff the split generations the
+/// grow walks through — no surplus left over, so the partition stabilizes at
+/// `target` leaves.
+const fn grow_config(target_shards: u32) -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: (target_shards - 1) * 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+fn grow_reaches_two_shard_topology_sim() {
+    let mut cluster = SimCluster::new(&grow_config(2), 11);
+    grow_reaches_two_shard_topology(&mut cluster);
+}
+
+#[test]
+fn grow_reaches_four_shard_topology_sim() {
+    let mut cluster = SimCluster::new(&grow_config(4), 11);
+    grow_reaches_four_shard_topology(&mut cluster);
 }

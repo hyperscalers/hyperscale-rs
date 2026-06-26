@@ -3,6 +3,8 @@
 //! Each is a projection of [`Cluster::beacon_state`], kept out of the trait so
 //! both adaptors share one definition and cannot drift apart.
 
+use std::collections::BTreeSet;
+
 use hyperscale_types::{
     Bls12381G1PublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool, StakePoolId, StateRoot,
     ValidatorId, ValidatorStatus,
@@ -49,6 +51,27 @@ pub fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<usize> {
             }) => Some(keepers.len()),
             _ => None,
         })
+}
+
+/// The number of validators seated on `shard`'s current committee, or `None` if
+/// the beacon seats no committee there (the shard is unborn or terminated).
+#[must_use]
+pub fn committee_size<C: Cluster>(c: &C, shard: ShardId) -> Option<usize> {
+    c.beacon_state().and_then(|state| {
+        state
+            .shard_committees
+            .get(&shard)
+            .map(|cm| cm.members.len())
+    })
+}
+
+/// The set of shards the beacon currently seats a committee for — the live leaf
+/// partition.
+#[must_use]
+pub fn live_shards<C: Cluster>(c: &C) -> BTreeSet<ShardId> {
+    c.beacon_state()
+        .map(|state| state.shard_committees.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 /// The total stake folded into `pool`, or `None` if the beacon holds no record

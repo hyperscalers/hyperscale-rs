@@ -26,7 +26,10 @@ mod witnesses;
 
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
-pub use reshape::{merge_lifecycle, split_lifecycle};
+pub use reshape::{
+    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology, merge_lifecycle,
+    split_lifecycle,
+};
 pub use straddler::{merge_straddler_atomic, split_straddler_atomic};
 pub use support::{
     Budget, Cluster, ScenarioConfig, epochs, grow_to, query, tx, vote_reshape_threshold, wait,

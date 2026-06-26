@@ -1,22 +1,85 @@
 //! Reshape lifecycle scenarios.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::ShardId;
 use radix_common::network::NetworkDefinition;
 
+use crate::support::query::{committee_size, live_shards};
 use crate::support::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
 use crate::support::wait::{
-    assert_height_frozen, await_height, await_merge_keeper_count, await_root_matches_anchor,
-    await_serves, await_split_admitted,
+    assert_height_frozen, await_beacon_epoch, await_height, await_merge_keeper_count,
+    await_root_matches_anchor, await_serves, await_split_admitted,
 };
-use crate::support::{Cluster, epochs, vote_reshape_threshold};
+use crate::support::{Cluster, epochs, grow_to, vote_reshape_threshold};
 
 /// Reshape `split_bytes` the vote installs after the grow. Its derived
 /// `merge_bytes = split_bytes / 8` sits far above each cold child's byte total,
 /// so both assert the merge once the change activates, while staying far above
 /// them so neither re-splits.
 const MERGE_VOTE_SPLIT_BYTES: u64 = 80_000_000;
+
+/// Grow the single-shard root to a `target`-leaf partition and assert the
+/// reached topology against the beacon's committed committees.
+///
+/// Drives the portable [`grow_to`] step, then checks that the live committees are
+/// exactly the `target`-leaf partition with every leaf at the genesis committee's
+/// full strength. Committee seating is the property: a split that seats an
+/// under-strength child still commits past genesis (quorum can hold below full
+/// strength), so [`grow_to`]'s own commit check alone would miss it. Requires a
+/// config with `split_bytes = 0` and `(target - 1)` cohorts of pool surplus.
+///
+/// # Panics
+///
+/// Panics if the beacon does not fold before the grow, the grow misses its
+/// budget, or the reached topology is not the full-strength `target` partition.
+fn grow_reaches_topology(c: &mut impl Cluster, target: u32) {
+    assert!(
+        await_beacon_epoch(c, 1, epochs(6)),
+        "the beacon must fold before the grow so the genesis committee strength is known",
+    );
+    let strength = committee_size(c, ShardId::ROOT).expect("genesis seats the root committee");
+
+    grow_to(c, target);
+
+    let depth = target.trailing_zeros();
+    let leaves: Vec<ShardId> = (0..u64::from(target))
+        .map(|path| ShardId::leaf(depth, path))
+        .collect();
+    let expected: BTreeSet<ShardId> = leaves.iter().copied().collect();
+    assert!(
+        c.run_until(epochs(8), |c| {
+            live_shards(c) == expected
+                && leaves
+                    .iter()
+                    .all(|&leaf| committee_size(c, leaf) == Some(strength))
+        }),
+        "the grow must seat exactly the {target}-leaf partition, each at full committee strength ({strength})",
+    );
+}
+
+/// Grow the root into a two-leaf partition, both leaves at full committee
+/// strength.
+///
+/// # Panics
+///
+/// Panics if the grow misses its budget or the reached topology is not the
+/// full-strength two-leaf partition.
+pub fn grow_reaches_two_shard_topology(c: &mut impl Cluster) {
+    grow_reaches_topology(c, 2);
+}
+
+/// Grow the root into a four-leaf partition through two split generations, every
+/// leaf at full committee strength.
+///
+/// # Panics
+///
+/// Panics if the grow misses its budget or the reached topology is not the
+/// full-strength four-leaf partition.
+pub fn grow_reaches_four_shard_topology(c: &mut impl Cluster) {
+    grow_reaches_topology(c, 4);
+}
 
 /// Arm an organic split of the root shard and drive it to completion.
 ///
