@@ -12,11 +12,17 @@ mod prod_cluster;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::tx::{merge_straddler_setup, split_straddler_setup};
+use hyperscale_scenarios::tx::{
+    merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
+};
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_straddler_atomic, multi_vnode_progress, single_shard_tx, split_lifecycle,
-    split_straddler_atomic,
+    merge_straddler_atomic, multi_vnode_progress, pool_capacity_caps_registrations,
+    re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
+    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
+    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use prod_cluster::ProdCluster;
 use serial_test::serial;
@@ -214,5 +220,168 @@ fn multi_vnode_progress_prod() {
     // same-shard multi-vnode hosting under test.
     let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     multi_vnode_progress(&mut cluster);
+    cluster.shutdown();
+}
+
+/// Single-shard witness config: the committee equals the whole validator set
+/// (`pool_surplus = 0`, so the shuffle never fires) with resharding disarmed —
+/// the stable ground the beacon-witness scenarios fold system actions against.
+/// `validators` sizes the committee; two vnodes per host keep quorum while a
+/// member deactivates or ejects.
+const fn witness_config(validators: u32) -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: validators,
+        vnodes_per_host: 2,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::ZERO,
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn stake_deposit_folds_into_beacon_state_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0x57AC,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    stake_deposit_folds_into_beacon_state(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn register_validator_pools_a_node_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0x5EED,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    register_validator_pools_a_node(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn register_without_capacity_is_rejected_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0x0CA9,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    register_without_capacity_is_rejected(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn stake_withdraw_drops_effective_stake_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0xD7A1,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    stake_withdraw_drops_effective_stake(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn registered_validator_activates_onto_a_shard_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0xAC11,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    registered_validator_activates_onto_a_shard(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn withdrawal_ejects_a_validator_that_a_deposit_reactivates_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    // Seven validators give the committee slack to keep quorum while a couple
+    // eject.
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(7),
+        0xE1EC,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn re_registration_of_a_live_validator_is_a_no_op_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0xDEAD,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    re_registration_of_a_live_validator_is_a_no_op(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn pool_capacity_caps_registrations_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start_with_balances(
+        &witness_config(4),
+        0xCA9A,
+        EPOCH_MS,
+        witness_genesis_balances(),
+    );
+    pool_capacity_caps_registrations(&mut cluster);
     cluster.shutdown();
 }
