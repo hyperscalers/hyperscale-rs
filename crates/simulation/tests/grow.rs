@@ -5,28 +5,30 @@
 //! asserts the reached topology: every leaf the splits reshaped into stands at
 //! full committee strength and commits past its child genesis on a seated host.
 
-use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
+mod support;
+
+use std::time::Duration;
+
+use hyperscale_scenarios::{ScenarioConfig, grow_to};
+use hyperscale_simulation::SimulationRunner;
 use hyperscale_storage::ShardChainReader;
-use hyperscale_types::{BeaconChainConfig, BlockHeight, ReshapeThresholds, ShardId};
+use hyperscale_types::{BlockHeight, ShardId};
+use support::sim_cluster::SimCluster;
 use tracing_test::traced_test;
 
 const PER_SHARD: u32 = 4;
 
 /// A single-shard, paced-epoch network with the split trigger armed from
 /// genesis and one cohort of pooled extras per split.
-fn grow_config(target_shards: u32) -> SimConfig {
-    SimConfig {
+const fn grow_config(target_shards: u32) -> ScenarioConfig {
+    ScenarioConfig {
         validators_per_shard: PER_SHARD,
-        jitter_fraction: 0.1,
-        beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: EPOCH_MS,
-            num_shards: 1,
-            shard_size: PER_SHARD,
-            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
-            ..BeaconChainConfig::default()
-        }),
-        pool_extra_validators: (target_shards - 1) * PER_SHARD,
-        ..Default::default()
+        vnodes_per_host: 1,
+        pool_surplus: (target_shards - 1) * PER_SHARD,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
     }
 }
 
@@ -70,18 +72,16 @@ fn assert_grown(runner: &SimulationRunner, target_shards: u32) {
 #[test]
 fn grow_to_two_shards_reaches_topology() {
     let target = 2;
-    let mut runner = SimulationRunner::new(&grow_config(target), 11);
-    runner.initialize_genesis();
-    runner.grow_to(target);
-    assert_grown(&runner, target);
+    let mut cluster = SimCluster::new(&grow_config(target), 11);
+    grow_to(&mut cluster, target);
+    assert_grown(cluster.runner(), target);
 }
 
 #[traced_test]
 #[test]
 fn grow_to_four_shards_reaches_topology() {
     let target = 4;
-    let mut runner = SimulationRunner::new(&grow_config(target), 11);
-    runner.initialize_genesis();
-    runner.grow_to(target);
-    assert_grown(&runner, target);
+    let mut cluster = SimCluster::new(&grow_config(target), 11);
+    grow_to(&mut cluster, target);
+    assert_grown(cluster.runner(), target);
 }
