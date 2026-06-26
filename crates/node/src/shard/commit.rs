@@ -664,14 +664,6 @@ impl BlockCommitCoordinator {
         // never fires and sync_awaiting_persistence_height is never satisfied.
         commits.sort_by_key(|c| c.certified.block().height().inner());
 
-        // `commits` is non-empty (checked above) and sorted ascending by height.
-        let max_committed_height = commits
-            .last()
-            .expect("commits is non-empty after the early return")
-            .certified
-            .block()
-            .height();
-
         // Blocks committed via CommitBlock need the PreparedCommit produced
         // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
         // and defer all later blocks too to preserve height ordering. Blocks
@@ -703,9 +695,17 @@ impl BlockCommitCoordinator {
                 }
                 self.pending.push(commit);
             }
-            // Prune stale entries that outlived their blocks.
+
+            // Only entries for blocks at or below `persisted_height` are
+            // safe to drop: `accumulate` skips those heights, so their prep
+            // can never be flushed again. A prep above it may belong to a
+            // block still queued behind an earlier deferral — `VerifyStateRoot`
+            // can cache it out of order, ahead of the block that gates the
+            // flush — and `CommitBlock` never regenerates one, so evicting it
+            // early would wedge the commit pipeline at that height.
+            let persisted = self.persisted_height;
             let before = cache.len();
-            cache.retain(|_, (h, _)| *h > max_committed_height);
+            cache.retain(|_, (h, _)| *h > persisted);
             let pruned = before - cache.len();
             if pruned > 0 {
                 tracing::debug!(pruned, "Pruned stale prepared_commits entries");
