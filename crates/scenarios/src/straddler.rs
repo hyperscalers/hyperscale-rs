@@ -17,14 +17,15 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 
 use crate::reshape::split_lifecycle;
-use crate::support::query::{beacon_epoch, split_admitted};
+use crate::support::query::{beacon_epoch, committee_size, split_admitted};
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
     split_straddler_setup, validity_around,
 };
 use crate::support::wait::{
-    await_merge_keeper_count, await_serves, await_split_admitted, await_tx_terminal,
+    await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor, await_serves,
+    await_split_admitted, await_tx_terminal,
 };
 use crate::support::{Cluster, epochs};
 
@@ -137,6 +138,63 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
     }
 
     assert_fence_held(c, splitter, terminal_b, &probes);
+}
+
+/// Verify a surviving sibling's second-generation split seats correctly.
+///
+/// Composes [`split_straddler_atomic`] (grow → vote the threshold down so only
+/// the splitter crosses → settled-waves fence), then layers the seating outcome:
+/// the splitter retires into two full-strength child committees while the survivor
+/// keeps its own, each child's committed root reproduces the beacon-composed
+/// anchor, and both children commit a real block past their seeded genesis.
+/// Requires the [`split_straddler_setup`] genesis funding on a config grown from a
+/// single root.
+///
+/// # Panics
+///
+/// Panics if the lifecycle misses its budget, a committee is under strength, the
+/// splitter fails to retire, a child root diverges from the anchor, or a child
+/// stalls at its seeded genesis.
+pub fn surviving_sibling_split_seats_full_committees(c: &mut impl Cluster) {
+    assert!(
+        await_beacon_epoch(c, 1, epochs(6)),
+        "the beacon must fold before the grow so the genesis committee strength is known",
+    );
+    let strength = committee_size(c, ShardId::ROOT).expect("genesis seats the root committee");
+
+    split_straddler_atomic(c);
+
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let (child_left, child_right) = splitter.children();
+    assert!(
+        c.run_until(epochs(6), |c| committee_size(c, survivor) == Some(strength)
+            && committee_size(c, child_left) == Some(strength)
+            && committee_size(c, child_right) == Some(strength)
+            && committee_size(c, splitter).is_none()),
+        "the survivor and both splitter children must seat full committees of {strength}, and the splitter must retire",
+    );
+
+    assert!(
+        await_root_matches_anchor(c, child_left, epochs(8))
+            && await_root_matches_anchor(c, child_right, epochs(8)),
+        "both splitter children's roots must reproduce the beacon anchor",
+    );
+
+    let left_base = c
+        .committed_height(child_left)
+        .expect("the left child commits");
+    let right_base = c
+        .committed_height(child_right)
+        .expect("the right child commits");
+    assert!(
+        c.run_until(epochs(6), |c| c
+            .committed_height(child_left)
+            .is_some_and(|h| h > left_base)
+            && c.committed_height(child_right)
+                .is_some_and(|h| h > right_base)),
+        "both splitter children must keep committing past their seeded genesis",
+    );
 }
 
 /// Verify a merge straddler settles atomically across the reshape boundary.

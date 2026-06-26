@@ -18,12 +18,14 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, livelock_resolves_promptly, liveness_baseline,
-    merge_lifecycle, merge_straddler_atomic, multi_vnode_progress,
-    pool_capacity_caps_registrations, re_registration_of_a_live_validator_is_a_no_op,
-    register_validator_pools_a_node, register_without_capacity_is_rejected,
-    registered_validator_activates_onto_a_shard, single_shard_tx, split_lifecycle,
-    split_straddler_atomic, stake_deposit_folds_into_beacon_state,
-    stake_withdraw_drops_effective_stake, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
+    multi_vnode_progress, pool_capacity_caps_registrations,
+    re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
+    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
+    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
+    surviving_sibling_split_seats_full_committees,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use prod_cluster::ProdCluster;
 use serial_test::serial;
@@ -426,5 +428,33 @@ fn grow_reaches_four_shard_topology_prod() {
     let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&grow_config(4), 11, EPOCH_MS);
     grow_reaches_four_shard_topology(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn merge_seats_full_keeper_committee_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    merge_seats_full_keeper_committee(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn surviving_sibling_split_seats_full_committees_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let setup = split_straddler_setup();
+    let mut cluster =
+        ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
+    surviving_sibling_split_seats_full_committees(&mut cluster);
     cluster.shutdown();
 }
