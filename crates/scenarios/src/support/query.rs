@@ -5,7 +5,7 @@
 
 use hyperscale_types::{Epoch, PendingReshape, ShardId, StateRoot};
 
-use crate::Cluster;
+use super::Cluster;
 
 /// The latest committed beacon epoch, if the cluster has folded one.
 #[must_use]

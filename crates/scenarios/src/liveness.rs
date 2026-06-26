@@ -2,9 +2,9 @@
 
 use hyperscale_types::ShardId;
 
-use crate::query::beacon_epoch;
-use crate::wait::{await_beacon_epoch, await_height};
-use crate::{Cluster, epochs};
+use crate::support::query::beacon_epoch;
+use crate::support::wait::{await_beacon_epoch, await_height};
+use crate::support::{Cluster, epochs};
 
 /// Single shard, resharding disarmed: assert the beacon folds epochs and the
 /// root shard commits blocks. The smoke test that an assembled node makes

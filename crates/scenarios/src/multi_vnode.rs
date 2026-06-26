@@ -6,8 +6,8 @@
 
 use hyperscale_types::ShardId;
 
-use crate::wait::await_height;
-use crate::{Cluster, epochs};
+use crate::support::wait::await_height;
+use crate::support::{Cluster, epochs};
 
 /// Same-shard multi-vnode hosting makes consensus progress.
 ///

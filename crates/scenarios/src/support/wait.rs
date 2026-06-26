@@ -6,8 +6,8 @@
 
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 
-use crate::query::{anchor_root, beacon_epoch, merge_keeper_count, split_admitted};
-use crate::{Budget, Cluster};
+use super::query::{anchor_root, beacon_epoch, merge_keeper_count, split_admitted};
+use super::{Budget, Cluster};
 
 /// Wait until the committed beacon epoch reaches `target`.
 pub fn await_beacon_epoch<C: Cluster>(c: &mut C, target: u64, budget: Budget) -> bool {

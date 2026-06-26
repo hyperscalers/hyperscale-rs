@@ -5,13 +5,12 @@ use std::sync::Arc;
 use hyperscale_types::ShardId;
 use radix_common::network::NetworkDefinition;
 
-use crate::grow::vote_reshape_threshold;
-use crate::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
-use crate::wait::{
+use crate::support::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
+use crate::support::wait::{
     assert_height_frozen, await_height, await_merge_keeper_count, await_root_matches_anchor,
     await_serves, await_split_admitted,
 };
-use crate::{Cluster, epochs};
+use crate::support::{Cluster, epochs, vote_reshape_threshold};
 
 /// Reshape `split_bytes` the vote installs after the grow. Its derived
 /// `merge_bytes = split_bytes / 8` sits far above each cold child's byte total,

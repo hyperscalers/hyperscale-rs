@@ -8,7 +8,7 @@ use hyperscale_types::{
     TransactionStatus, TxHash,
 };
 
-use crate::Budget;
+use super::Budget;
 
 /// A running cluster of assembled nodes, observed and driven by a scenario.
 ///
