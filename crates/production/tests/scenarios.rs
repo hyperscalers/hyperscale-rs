@@ -16,13 +16,14 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_straddler_atomic, multi_vnode_progress, pool_capacity_caps_registrations,
-    re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
-    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
-    stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
-    withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+    ScenarioConfig, cross_shard_tx, grow_reaches_four_shard_topology,
+    grow_reaches_two_shard_topology, livelock_resolves_promptly, liveness_baseline,
+    merge_lifecycle, merge_straddler_atomic, multi_vnode_progress,
+    pool_capacity_caps_registrations, re_registration_of_a_live_validator_is_a_no_op,
+    register_validator_pools_a_node, register_without_capacity_is_rejected,
+    registered_validator_activates_onto_a_shard, single_shard_tx, split_lifecycle,
+    split_straddler_atomic, stake_deposit_folds_into_beacon_state,
+    stake_withdraw_drops_effective_stake, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use prod_cluster::ProdCluster;
 use serial_test::serial;
@@ -383,5 +384,47 @@ fn pool_capacity_caps_registrations_prod() {
         witness_genesis_balances(),
     );
     pool_capacity_caps_registrations(&mut cluster);
+    cluster.shutdown();
+}
+
+/// Single-shard genesis with the split armed and exactly `(target - 1)` cohorts
+/// of pool surplus to staff the grow's split generations. One validator per host
+/// (each reshape seat needs its own store) and a paced inter-host latency so the
+/// loadless committees track wall-clock through the multi-epoch grow.
+const fn grow_config(target_shards: u32) -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: (target_shards - 1) * 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(60),
+        dedicated_hosts: true,
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn grow_reaches_two_shard_topology_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&grow_config(2), 11, EPOCH_MS);
+    grow_reaches_two_shard_topology(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn grow_reaches_four_shard_topology_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&grow_config(4), 11, EPOCH_MS);
+    grow_reaches_four_shard_topology(&mut cluster);
     cluster.shutdown();
 }
