@@ -3,7 +3,10 @@
 //! Each is a projection of [`Cluster::beacon_state`], kept out of the trait so
 //! both adaptors share one definition and cannot drift apart.
 
-use hyperscale_types::{Epoch, PendingReshape, ShardId, StateRoot};
+use hyperscale_types::{
+    Bls12381G1PublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool, StakePoolId, StateRoot,
+    ValidatorId, ValidatorStatus,
+};
 
 use super::Cluster;
 
@@ -46,4 +49,36 @@ pub fn merge_keeper_count<C: Cluster>(c: &C, parent: ShardId) -> Option<usize> {
             }) => Some(keepers.len()),
             _ => None,
         })
+}
+
+/// The total stake folded into `pool`, or `None` if the beacon holds no record
+/// of it — counting deposits whether or not they have unbonded.
+#[must_use]
+pub fn pool_total_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
+    c.beacon_state()
+        .and_then(|state| state.pools.get(&pool).map(|p| p.total_stake))
+}
+
+/// The effective (bonded) stake of `pool` — total less any stake still inside
+/// its unbonding window. A withdrawal drops this immediately while
+/// [`pool_total_stake`] holds until the unbond matures.
+#[must_use]
+pub fn pool_effective_stake<C: Cluster>(c: &C, pool: StakePoolId) -> Option<Stake> {
+    c.beacon_state()
+        .and_then(|state| state.pools.get(&pool).map(StakePool::effective_stake))
+}
+
+/// The folded status of validator `id`, or `None` if the beacon holds no record
+/// of it.
+#[must_use]
+pub fn validator_status<C: Cluster>(c: &C, id: ValidatorId) -> Option<ValidatorStatus> {
+    c.beacon_state()
+        .and_then(|state| state.validators.get(&id).map(|r| r.status))
+}
+
+/// The registered BLS public key of validator `id`, or `None` if unregistered.
+#[must_use]
+pub fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<Bls12381G1PublicKey> {
+    c.beacon_state()
+        .and_then(|state| state.validators.get(&id).map(|r| r.pubkey))
 }

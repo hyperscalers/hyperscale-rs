@@ -22,6 +22,7 @@ mod multi_vnode;
 mod reshape;
 mod straddler;
 mod transactions;
+mod witnesses;
 
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
@@ -31,3 +32,9 @@ pub use support::{
     Budget, Cluster, ScenarioConfig, epochs, grow_to, query, tx, vote_reshape_threshold, wait,
 };
 pub use transactions::{cross_shard_tx, livelock_resolves_promptly, single_shard_tx};
+pub use witnesses::{
+    pool_capacity_caps_registrations, re_registration_of_a_live_validator_is_a_no_op,
+    register_validator_pools_a_node, register_without_capacity_is_rejected,
+    registered_validator_activates_onto_a_shard, stake_deposit_folds_into_beacon_state,
+    stake_withdraw_drops_effective_stake, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+};

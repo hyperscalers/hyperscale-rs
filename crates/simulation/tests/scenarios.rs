@@ -7,11 +7,17 @@ mod support;
 
 use std::time::Duration;
 
-use hyperscale_scenarios::tx::{merge_straddler_setup, split_straddler_setup};
+use hyperscale_scenarios::tx::{
+    merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
+};
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_tx, livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_straddler_atomic, multi_vnode_progress, single_shard_tx, split_lifecycle,
-    split_straddler_atomic,
+    merge_straddler_atomic, multi_vnode_progress, pool_capacity_caps_registrations,
+    re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
+    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
+    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use support::sim_cluster::SimCluster;
 
@@ -158,4 +164,78 @@ const fn multi_vnode_config() -> ScenarioConfig {
 fn multi_vnode_progress_sim() {
     let mut cluster = SimCluster::new(&multi_vnode_config(), 11);
     multi_vnode_progress(&mut cluster);
+}
+
+/// Single-shard witness config: the committee equals the whole validator set
+/// (`pool_surplus = 0`, so the shuffle has no stock and never fires) with
+/// resharding disarmed — the stable ground the beacon-witness scenarios fold
+/// system actions against. `validators` sizes the committee.
+const fn witness_config(validators: u32) -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: validators,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+#[test]
+fn stake_deposit_folds_into_beacon_state_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0x57AC, &witness_genesis_balances());
+    stake_deposit_folds_into_beacon_state(&mut cluster);
+}
+
+#[test]
+fn register_validator_pools_a_node_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0x5EED, &witness_genesis_balances());
+    register_validator_pools_a_node(&mut cluster);
+}
+
+#[test]
+fn register_without_capacity_is_rejected_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0x0CA9, &witness_genesis_balances());
+    register_without_capacity_is_rejected(&mut cluster);
+}
+
+#[test]
+fn stake_withdraw_drops_effective_stake_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0xD7A1, &witness_genesis_balances());
+    stake_withdraw_drops_effective_stake(&mut cluster);
+}
+
+#[test]
+fn registered_validator_activates_onto_a_shard_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0xAC11, &witness_genesis_balances());
+    registered_validator_activates_onto_a_shard(&mut cluster);
+}
+
+#[test]
+fn withdrawal_ejects_a_validator_that_a_deposit_reactivates_sim() {
+    // Seven validators give the committee slack to keep quorum while a couple
+    // eject; `pool_surplus = 0` keeps the shuffle dormant.
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(7), 0xE1EC, &witness_genesis_balances());
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates(&mut cluster);
+}
+
+#[test]
+fn re_registration_of_a_live_validator_is_a_no_op_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0xDEAD, &witness_genesis_balances());
+    re_registration_of_a_live_validator_is_a_no_op(&mut cluster);
+}
+
+#[test]
+fn pool_capacity_caps_registrations_sim() {
+    let mut cluster =
+        SimCluster::with_balances(&witness_config(4), 0xCA9A, &witness_genesis_balances());
+    pool_capacity_caps_registrations(&mut cluster);
 }
