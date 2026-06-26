@@ -1,11 +1,12 @@
-//! Fetch-fallback simulation tests.
+//! Fault-injection simulation tests.
 //!
-//! Each test installs a [`FaultRule`] suppressing a primary delivery
-//! channel, then asserts three layers of recovery:
-//! 1. The fault rule actually fired (rule misconfiguration guard).
-//! 2. The fallback fetch path engaged (`fetch_started` counter).
-//! 3. End-to-end liveness: submitted transactions reach a terminal
-//!    state on every node.
+//! Each test builds a [`SimCluster`] and installs a [`FaultRule`] — a dropped
+//! delivery channel or a network partition — via `runner_mut()`, then asserts
+//! recovery: the fault fired, any fallback fetch path engaged, and end-to-end
+//! liveness — submitted transactions reach a terminal state on every live
+//! member, and a partitioned cluster resumes committing once healed.
+
+mod support;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -16,13 +17,13 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::RuleHandle;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
+use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs};
+use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, NodeId, ReshapeThresholds,
-    RoutableTransaction, ShardId, TimestampRange, TxHash, ValidatorId, WeightedTimestamp,
-    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize,
-    uniform_shard_for_node,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TimestampRange, TxHash,
+    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1,
+    sign_and_notarize, uniform_shard_for_node,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -30,6 +31,7 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
+use support::sim_cluster::SimCluster;
 use tracing_test::traced_test;
 
 /// Run `f` against a fresh per-test `MemoryRecorder` installed as the
@@ -42,31 +44,31 @@ fn with_test_recorder<R>(f: impl FnOnce(&MemoryRecorder) -> R) -> R {
     with_scoped_recorder(arc, || f(&recorder))
 }
 
-fn single_shard_config() -> SimConfig {
-    SimConfig {
+const fn single_shard_config() -> ScenarioConfig {
+    ScenarioConfig {
         validators_per_shard: 4,
-        jitter_fraction: 0.1,
-        ..Default::default()
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
     }
 }
 
-/// Single-shard genesis with the split trigger armed, production-parity
-/// paced epochs, and one cohort of pooled extras — `grow_to(2)` drives it
-/// to two shards through the real split lifecycle, mirroring a network that
-/// launches single-shard and fans out under load.
-fn cross_shard_grow_config() -> SimConfig {
-    SimConfig {
+/// Single-shard genesis with the split trigger armed and one cohort of pooled
+/// extras — [`grow_to`] drives it to two shards through the real split
+/// lifecycle, mirroring a network that launches single-shard and fans out under
+/// load.
+const fn cross_shard_config() -> ScenarioConfig {
+    ScenarioConfig {
         validators_per_shard: 4,
-        jitter_fraction: 0.1,
-        beacon_chain_config: Some(BeaconChainConfig {
-            epoch_duration_ms: EPOCH_MS,
-            num_shards: 1,
-            shard_size: 4,
-            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
-            ..BeaconChainConfig::default()
-        }),
-        pool_extra_validators: 4,
-        ..Default::default()
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
     }
 }
 
@@ -186,13 +188,13 @@ fn await_all_terminal(
 #[test]
 fn transaction_fetch_fallback_when_gossip_dropped() {
     with_test_recorder(|recorder| {
-        let mut runner = SimulationRunner::new(&single_shard_config(), 42);
-        runner.initialize_genesis();
+        let mut cluster = SimCluster::new(&single_shard_config(), 42);
 
         // Suppress all transaction.gossip across the network. The submitting
         // node (0) still admits the tx locally, includes it in any block it
         // proposes, and serves it to followers via GetTransactionsRequest.
-        let rule = runner
+        let rule = cluster
+            .runner_mut()
             .network_mut()
             .fault()
             .drop_type("transaction.gossip")
@@ -200,13 +202,15 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
 
         let tx = build_transfer_tx(1, 2);
         let tx_hash = tx.hash();
-        runner.schedule_initial_event(
+        cluster.runner_mut().schedule_initial_event(
             0,
             Duration::ZERO,
             HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
 
-        runner.run_until(Duration::from_secs(10));
+        cluster.run_until(epochs(1), |c| {
+            (0..4u32).all(|i| tx_reached_terminal_state(c.runner(), i, tx_hash))
+        });
 
         // Layer 1: fault rule actually intercepted gossip.
         assert!(
@@ -230,7 +234,7 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
         // advanced past genesis.
         for node_idx in 0..4u32 {
             assert!(
-                tx_reached_terminal_state(&runner, node_idx, tx_hash),
+                tx_reached_terminal_state(cluster.runner(), node_idx, tx_hash),
                 "node {node_idx} did not reach terminal state for tx {tx_hash:?}; \
              gossip drops fired {} times, fetch_items_sent={fetch_items_sent}",
                 rule.fired()
@@ -239,7 +243,8 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
 
         let max_height = (0..4)
             .map(|i| {
-                runner
+                cluster
+                    .runner()
                     .node(i)
                     .unwrap()
                     .shard_coordinator()
@@ -252,6 +257,55 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
             "expected chain to advance past genesis, got max height {max_height}"
         );
     });
+}
+
+/// A 2-2 partition (nodes 0,1 vs 2,3) starves quorum, so consensus halts; once
+/// healed, the timeout pacemaker re-synchronises the lagging half and the chain
+/// resumes committing.
+#[traced_test]
+#[test]
+fn consensus_halts_under_partition_and_recovers_on_heal() {
+    let mut cluster = SimCluster::new(&single_shard_config(), 42);
+
+    // Establish consensus before partitioning.
+    cluster.run_until(epochs(1), |c| {
+        c.committed_height(ShardId::ROOT)
+            .is_some_and(|h| h >= BlockHeight::new(1))
+    });
+    let before = cluster
+        .committed_height(ShardId::ROOT)
+        .expect("consensus committed a block before the partition");
+
+    cluster
+        .runner_mut()
+        .network_mut()
+        .partition_groups(&[0, 1], &[2, 3]);
+    // Advance until the partition is visibly starving consensus, then confirm
+    // progress has halted: a 2-2 split has no quorum (needs 3 of 4).
+    cluster.run_until(epochs(1), |c| {
+        c.runner().stats().messages_dropped_partition >= 10
+    });
+    let during = cluster
+        .committed_height(ShardId::ROOT)
+        .expect("the chain still reports a height during the partition");
+    assert!(
+        during <= before + 2,
+        "a 2-2 partition has no quorum, so progress must halt: before={before}, during={during}",
+    );
+    assert!(
+        cluster.runner().stats().messages_dropped_partition > 0,
+        "the partition must drop cross-group messages",
+    );
+
+    cluster.runner_mut().network_mut().heal_all();
+    let recovered = cluster.run_until(epochs(2), |c| {
+        c.committed_height(ShardId::ROOT)
+            .is_some_and(|h| h > during + 3)
+    });
+    assert!(
+        recovered,
+        "consensus must resume committing once the partition heals (stalled at {during})",
+    );
 }
 
 /// Grow target every cross-shard fault scenario reaches before installing
@@ -296,22 +350,27 @@ where
     F: Fn(&mut SimulationRunner) -> Vec<RuleHandle>,
 {
     with_test_recorder(|recorder| {
-        let mut runner = SimulationRunner::new(&cross_shard_grow_config(), seed);
-
         // Accounts route by prefix, which equals their post-grow shard; fund
         // them on ROOT at genesis and the split partitions them across the
         // children exactly as a multi-shard genesis once placed them.
         let num_shards = u64::from(GROW_TARGET);
         let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(num_shards);
         let initial_balance = Decimal::from(10_000);
-        runner.initialize_genesis_with_balances(&[
-            (acc_a, initial_balance),
-            (acc_b, initial_balance),
-        ]);
+        let mut cluster = SimCluster::with_balances(
+            &cross_shard_config(),
+            seed,
+            &[(acc_a, initial_balance), (acc_b, initial_balance)],
+        );
 
+        // White-box grow via `runner_mut`: the cross-shard fault flow needs the
+        // full committee seated on both children before faults install, which the
+        // runner's `grow_to` settles. The portable `grow_to` exits once a leaf
+        // commits past genesis (satisfiable by an observer ahead of committee
+        // seating), and `await_all_terminal` doesn't pump to settle the rest.
+        let runner = cluster.runner_mut();
         runner.grow_to(GROW_TARGET);
 
-        let rules = install_faults(&mut runner);
+        let rules = install_faults(&mut *runner);
         assert!(
             !rules.is_empty(),
             "install_faults must return at least one rule handle"
@@ -365,7 +424,7 @@ where
         // fallback-fetch cycles, so poll until every live committee member
         // reaches a terminal outcome rather than racing a fixed window.
         let deadline = runner.now() + Duration::from_secs(150);
-        let latched = await_all_terminal(&mut runner, &live_leaves, tx_hash, deadline);
+        let latched = await_all_terminal(&mut *runner, &live_leaves, tx_hash, deadline);
 
         // Layer 1: every installed rule actually intercepted at least one
         // message. Catches misconfigured matchers that silently match nothing.
