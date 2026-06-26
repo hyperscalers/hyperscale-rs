@@ -174,3 +174,43 @@ pub fn merge_lifecycle(c: &mut impl Cluster) {
         "the merged root did not match the beacon anchor within budget"
     );
 }
+
+/// Merge two cold children back into the root and assert the reformed parent
+/// seats a full keeper committee that keeps committing past its merged genesis.
+///
+/// Composes [`merge_lifecycle`] (grow → vote → keepers paired → reformed parent
+/// served → anchor matched), then layers the seating outcome: the keeper set —
+/// half of each child's committee — seats a full committee on the parent, which
+/// then commits a real block past its merged genesis (the lifecycle's anchor
+/// match only requires the merged genesis block itself). Requires the
+/// [`merge_lifecycle`] preconditions.
+///
+/// # Panics
+///
+/// Panics if the merge misses its budget, the reformed parent is under committee
+/// strength, or it stalls at its merged genesis.
+pub fn merge_seats_full_keeper_committee(c: &mut impl Cluster) {
+    assert!(
+        await_beacon_epoch(c, 1, epochs(6)),
+        "the beacon must fold before the grow so the genesis committee strength is known",
+    );
+    let strength = committee_size(c, ShardId::ROOT).expect("genesis seats the root committee");
+
+    merge_lifecycle(c);
+
+    let root = ShardId::ROOT;
+    assert!(
+        c.run_until(epochs(6), |c| committee_size(c, root) == Some(strength)),
+        "the reformed parent must seat a full keeper committee of {strength}",
+    );
+
+    let base = c
+        .committed_height(root)
+        .expect("the reformed parent commits");
+    assert!(
+        c.run_until(epochs(6), |c| c
+            .committed_height(root)
+            .is_some_and(|h| h > base)),
+        "the reformed parent must keep committing past its merged genesis",
+    );
+}
