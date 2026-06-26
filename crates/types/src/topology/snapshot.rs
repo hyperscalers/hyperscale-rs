@@ -722,6 +722,7 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{test_node, test_transaction_with_nodes};
     use crate::{Hash, ValidatorInfo, generate_bls_keypair};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
@@ -1068,5 +1069,68 @@ mod tests {
         assert_eq!(shard1.len(), 4);
         assert!(shard1.contains(&ValidatorId::new(1)));
         assert!(shard1.contains(&ValidatorId::new(3)));
+    }
+
+    /// A two-shard topology with two validators seated on each leaf.
+    fn two_shard_topology() -> TopologySnapshot {
+        let validators: Vec<_> = (0..4).map(make_test_validator).collect();
+        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
+        shard_committees.insert(
+            ShardId::leaf(1, 0),
+            vec![ValidatorId::new(0), ValidatorId::new(1)],
+        );
+        shard_committees.insert(
+            ShardId::leaf(1, 1),
+            vec![ValidatorId::new(2), ValidatorId::new(3)],
+        );
+        TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            2,
+            &ValidatorSet::new(validators),
+            shard_committees,
+        )
+    }
+
+    /// The first `count` node seeds (scanning from 0) that route to `shard`.
+    fn first_nodes_on_shard(
+        topology: &TopologySnapshot,
+        shard: ShardId,
+        count: usize,
+    ) -> Vec<NodeId> {
+        let nodes: Vec<NodeId> = (0..=u8::MAX)
+            .map(test_node)
+            .filter(|n| topology.shard_for_node_id(n) == shard)
+            .take(count)
+            .collect();
+        assert!(
+            nodes.len() == count,
+            "fewer than {count} nodes route to {shard:?} within the seed range",
+        );
+        nodes
+    }
+
+    #[test]
+    fn single_shard_transaction_touches_one_shard() {
+        let topology = two_shard_topology();
+        let nodes = first_nodes_on_shard(&topology, ShardId::leaf(1, 0), 2);
+        let tx = test_transaction_with_nodes(b"single_shard", vec![nodes[0]], vec![nodes[1]]);
+        assert_eq!(
+            topology.all_shards_for_transaction(&tx).len(),
+            1,
+            "a transaction within one shard touches exactly that shard",
+        );
+    }
+
+    #[test]
+    fn cross_shard_transaction_touches_both_shards() {
+        let topology = two_shard_topology();
+        let left = first_nodes_on_shard(&topology, ShardId::leaf(1, 0), 1);
+        let right = first_nodes_on_shard(&topology, ShardId::leaf(1, 1), 1);
+        let tx = test_transaction_with_nodes(b"cross_shard", vec![left[0]], vec![right[0]]);
+        assert_eq!(
+            topology.all_shards_for_transaction(&tx).len(),
+            2,
+            "a transaction spanning two shards touches both",
+        );
     }
 }
