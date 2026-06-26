@@ -1,4 +1,5 @@
 # Rust
+.cargo/config.local.toml
 /target/
 /deterministic/target/
 /deterministic/Cargo.lock

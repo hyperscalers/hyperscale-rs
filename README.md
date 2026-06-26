@@ -231,6 +231,24 @@ not help — the in-repo suffix alone is ~268 characters.
    git config --global core.longpaths true
    ```
 
+Long paths are the required fix. The repository `.cargo/config.toml` stays
+platform-neutral (CMake policy only) so Linux and CI are unchanged.
+
+Optional local Cargo settings for Windows belong in `.cargo/config.local.toml`
+(gitignored). Cargo does not load that file automatically — copy its contents
+into your working copy of `.cargo/config.toml`, then run
+`git update-index --skip-worktree .cargo/config.toml` so local edits are not
+committed:
+
+```toml
+# .cargo/config.local.toml (local only, not committed)
+[net]
+git-fetch-with-cli = true
+```
+
+`git-fetch-with-cli` alone does not replace enabling long paths; checkout still
+uses libgit2 unless `LongPathsEnabled` is set.
+
 ### Windows: "Can't find clang.dll" or "libclang.dll"
 
 RocksDB (`librocksdb-sys`) uses bindgen, which needs **LLVM/libclang** and **MSVC
