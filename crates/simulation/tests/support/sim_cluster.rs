@@ -115,6 +115,14 @@ impl SimCluster {
         &self.runner
     }
 
+    /// The underlying runner for the white-box *mutations* the [`Cluster`]
+    /// surface deliberately doesn't model — network faults, vnode lifecycle,
+    /// system actions, host-targeted or delayed submission.
+    #[allow(dead_code)] // consumed by some test binaries, not every one
+    pub const fn runner_mut(&mut self) -> &mut SimulationRunner {
+        &mut self.runner
+    }
+
     /// The duration `budget` epochs span on this harness's clock.
     fn span(budget: Budget) -> Duration {
         Duration::from_millis(EPOCH_MS) * budget.0
