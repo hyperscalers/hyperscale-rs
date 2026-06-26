@@ -1,2 +1,7 @@
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Windows: radixdlt-scrypto ships generated-example fixtures with paths > MAX_PATH
+# (260). libgit2 cannot create them; use the git CLI with core.longpaths instead.
+[net]
+git-fetch-with-cli = true
