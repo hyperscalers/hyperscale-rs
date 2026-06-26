@@ -8,17 +8,31 @@
 //! replays byte-identical from the same seed across every observable surface,
 //! and a different seed produces a different chain.
 //!
-//! The two partition tests assert the full-stack liveness the mini-sim cannot
-//! model: a 2-2 split halts without quorum and resumes on heal.
+//! A companion test extends the guarantee across a reshape: a genesis → grow to
+//! two shards → cross-shard transfer run replays identically from the same seed,
+//! so the split lifecycle and the cross-shard settlement are deterministic too.
+
+mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_scenarios::tx::{
+    account_from_seed, build_transfer_tx, signer_from_seed, validity_around,
+};
+use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs, grow_to};
 use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::test_utils::test_transaction;
-use hyperscale_types::{BeaconBlockHash, BlockHeight, Round, ShardId, StateRoot};
+use hyperscale_types::{
+    BeaconBlockHash, BlockHeight, Ed25519PrivateKey, NodeId, Round, ShardId, StateRoot,
+    TransactionStatus, uniform_shard_for_node,
+};
+use radix_common::math::Decimal;
+use radix_common::network::NetworkDefinition;
+use radix_common::types::ComponentAddress;
+use support::sim_cluster::SimCluster;
 
 /// A four-validator single-shard network with light jitter; beacon options
 /// default.
@@ -142,4 +156,90 @@ fn different_seed_diverges() {
     let a = run_once(111);
     let b = run_once(222);
     assert_ne!(a, b, "different seeds must produce a different run");
+}
+
+/// Single-shard genesis with the split trigger armed and one cohort of pool
+/// surplus — the shape [`grow_to`] drives to two shards.
+const fn cross_shard_config() -> ScenarioConfig {
+    ScenarioConfig {
+        validators_per_shard: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+        dedicated_hosts: false,
+    }
+}
+
+/// The first seed whose preallocated account routes to `leaf` under a two-shard
+/// trie, with its signing key.
+fn account_on_leaf(leaf: ShardId) -> (Ed25519PrivateKey, ComponentAddress) {
+    for seed in 1u8..=u8::MAX {
+        let account = account_from_seed(seed);
+        let radix_node = account.into_node_id();
+        let node = NodeId(
+            radix_node.0[..30]
+                .try_into()
+                .expect("account address carries a 30-byte node id"),
+        );
+        if uniform_shard_for_node(&node, 2) == leaf {
+            return (signer_from_seed(seed), account);
+        }
+    }
+    panic!("no account routes to {leaf:?}");
+}
+
+/// Two same-seed runs of genesis → grow to two shards → cross-shard transfer
+/// produce identical committed heights and event/message counts: the split
+/// lifecycle and the cross-shard execution are deterministic, like the
+/// single-shard run above but across a reshape.
+#[test]
+fn cross_shard_grow_replays_byte_identical() {
+    let run = |seed: u64| -> (Vec<BlockHeight>, u64, u64) {
+        let (kp_a, acc_a) = account_on_leaf(ShardId::leaf(1, 0));
+        let (_kp_b, acc_b) = account_on_leaf(ShardId::leaf(1, 1));
+        let balances = [
+            (acc_a, Decimal::from(10_000)),
+            (acc_b, Decimal::from(10_000)),
+        ];
+        let mut cluster = SimCluster::with_balances(&cross_shard_config(), seed, &balances);
+        grow_to(&mut cluster, 2);
+
+        let tx = build_transfer_tx(
+            &kp_a,
+            acc_a,
+            acc_b,
+            Decimal::from(500),
+            &NetworkDefinition::simulator(),
+            1,
+            validity_around(cluster.now()),
+        );
+        let tx_hash = tx.hash();
+        cluster.submit(Arc::new(tx));
+        // Advance to the same deterministic point in both runs — settlement, or
+        // the budget cap if it never settles; either is identical per seed.
+        cluster.run_until(epochs(4), |c| {
+            matches!(c.tx_status(tx_hash), Some(TransactionStatus::Completed(_)))
+        });
+
+        let runner = cluster.runner();
+        let heights: Vec<BlockHeight> = [ShardId::leaf(1, 0), ShardId::leaf(1, 1)]
+            .iter()
+            .flat_map(|&leaf| {
+                runner
+                    .shard_vnodes(leaf)
+                    .into_iter()
+                    .map(|v| v.shard_coordinator().committed_height())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let stats = runner.stats();
+        (heights, stats.events_processed, stats.messages_sent)
+    };
+    assert_eq!(
+        run(54321),
+        run(54321),
+        "same-seed grow + cross-shard runs must be identical",
+    );
 }
