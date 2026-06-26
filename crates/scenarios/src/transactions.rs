@@ -7,11 +7,11 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
-use crate::tx::{
+use crate::support::tx::{
     account_from_seed, build_faucet_tx, build_transfer_tx, signer_from_seed, validity_around,
 };
-use crate::wait::{await_height, await_tx_terminal};
-use crate::{Cluster, epochs};
+use crate::support::wait::{await_height, await_tx_terminal};
+use crate::support::{Cluster, epochs};
 
 /// Submit a faucet-funded single-shard transfer and assert it accepts.
 ///

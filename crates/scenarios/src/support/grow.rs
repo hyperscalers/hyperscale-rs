@@ -12,9 +12,9 @@ use std::sync::Arc;
 use hyperscale_types::{BlockHeight, Ed25519PrivateKey, Epoch, ShardId};
 use radix_common::network::NetworkDefinition;
 
-use crate::query::beacon_epoch;
-use crate::tx::{build_reshape_threshold_vote_tx, validity_around};
-use crate::{Budget, Cluster, epochs};
+use super::query::beacon_epoch;
+use super::tx::{build_reshape_threshold_vote_tx, validity_around};
+use super::{Budget, Cluster, epochs};
 
 /// Epochs of lead before the threshold vote activates — enough for the vote
 /// transaction to commit and fold into the tally before it is read.

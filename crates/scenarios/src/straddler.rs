@@ -16,17 +16,17 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 
-use crate::query::{beacon_epoch, split_admitted};
 use crate::reshape::split_lifecycle;
-use crate::tx::{
+use crate::support::query::{beacon_epoch, split_admitted};
+use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
     split_straddler_setup, validity_around,
 };
-use crate::wait::{
+use crate::support::wait::{
     await_merge_keeper_count, await_serves, await_split_admitted, await_tx_terminal,
 };
-use crate::{Cluster, epochs};
+use crate::support::{Cluster, epochs};
 
 /// Epochs of lead before the threshold vote activates.
 const VOTE_ACTIVATE_LEAD: u64 = 4;
