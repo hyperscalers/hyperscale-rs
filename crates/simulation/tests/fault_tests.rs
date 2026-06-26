@@ -21,9 +21,9 @@ use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TimestampRange, TxHash,
-    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed, routable_from_notarized_v1,
-    sign_and_notarize, uniform_shard_for_node,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardId, TimestampRange,
+    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
+    routable_from_notarized_v1, sign_and_notarize, uniform_shard_for_node,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -306,6 +306,65 @@ fn consensus_halts_under_partition_and_recovers_on_heal() {
         recovered,
         "consensus must resume committing once the partition heals (stalled at {during})",
     );
+}
+
+/// A transaction completes when one validator is isolated.
+///
+/// With four validators and quorum three, isolating one still allows shard
+/// consensus to progress. If the isolated node is the wave leader for a wave, the
+/// vote-retry rotation recovers: non-leaders time out, re-send to a rotated
+/// leader, and the certificate is formed by the fallback. Each node is isolated in
+/// turn (four runs) so at least one run isolates the wave leader.
+#[traced_test]
+#[test]
+fn wave_leader_failure_recovers_via_rotation() {
+    for isolated_node in 0..4u32 {
+        let mut cluster = SimCluster::new(&single_shard_config(), 42 + u64::from(isolated_node));
+
+        // Let consensus commit at least one block before isolating a node.
+        cluster.run_until(epochs(1), |c| {
+            c.committed_height(ShardId::ROOT)
+                .is_some_and(|h| h >= BlockHeight::new(1))
+        });
+        cluster
+            .runner_mut()
+            .network_mut()
+            .isolate_node(isolated_node);
+
+        // Submit to a non-isolated node.
+        let submit_node = u32::from(isolated_node == 0);
+        let signer = keypair_from_seed(50 + u8::try_from(isolated_node).unwrap_or(u8::MAX));
+        let to_account = account_from_seed(100 + u8::try_from(isolated_node).unwrap_or(u8::MAX));
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .get_free_xrd_from_faucet()
+            .try_deposit_entire_worktop_or_abort(to_account, None)
+            .build();
+        let notarized = sign_and_notarize(
+            manifest,
+            &NetworkDefinition::simulator(),
+            300 + isolated_node,
+            &signer,
+        )
+        .expect("should sign");
+        let tx = routable_from_notarized_v1(notarized, test_validity_range()).expect("valid");
+        let tx_hash = tx.hash();
+        cluster.runner_mut().schedule_initial_event(
+            submit_node,
+            Duration::ZERO,
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
+        );
+
+        // The fallback rotation (vote-retry timeout ~8s) completes the wave on the
+        // non-isolated quorum, so the cluster-wide status reaches Completed.
+        let completed = cluster.run_until(epochs(3), |c| {
+            matches!(c.tx_status(tx_hash), Some(TransactionStatus::Completed(_)))
+        });
+        assert!(
+            completed,
+            "transaction should complete even with node {isolated_node} isolated",
+        );
+    }
 }
 
 /// Grow target every cross-shard fault scenario reaches before installing
