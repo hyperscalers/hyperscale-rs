@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, SHUFFLE_INTERVAL_EPOCHS, ShardId, TransitionCause,
-    ValidatorId, ValidatorStatus,
+    BeaconState, CommitteeTransition, PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardId,
+    TransitionCause, ValidatorId, ValidatorStatus,
 };
 use rand::RngExt;
 
@@ -52,6 +52,19 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     }
     let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
     for shard in shard_ids {
+        // A pending split's parent members all carry over to its children
+        // as parent halves, ready by construction — the readiness the
+        // split gate trusts. Rotating one out and refilling with a
+        // not-yet-ready pool draw would seat a child below its ready
+        // quorum, wedging it. Skip the splitting shard's rotation until it
+        // executes (next epoch), the symmetric guard to the merge-keeper
+        // skip below.
+        if matches!(
+            state.pending_reshapes.get(&shard),
+            Some(PendingReshape::Split { .. })
+        ) {
+            continue;
+        }
         // Bind the candidate set to validators whose status records
         // *this* shard. The global invariant `members ⇔ status ==
         // OnShard { shard: s, .. }` holds today; matching the shard
@@ -213,12 +226,12 @@ pub(super) fn diff_shard_committees(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::{
-        BEACON_SIGNER_COUNT, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness,
-        SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-        TransitionCause, ValidatorId, ValidatorStatus,
+        BEACON_SIGNER_COUNT, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, PendingReshape,
+        Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool,
+        StakePoolId, TransitionCause, ValidatorId, ValidatorStatus,
     };
 
     use crate::state::test_fixtures::{
@@ -472,6 +485,52 @@ mod tests {
         );
         assert!(state.pooled_validators().is_empty());
         assert!(effects.shard_committee_transitions.is_empty());
+    }
+
+    /// A shard mid-split is exempt from rotation. Its members all carry
+    /// over to the children as parent halves, ready by construction — the
+    /// readiness the split gate trusts — so rotating one out and refilling
+    /// with a not-yet-ready pool draw would seat a child below its ready
+    /// quorum and wedge it. The pool has stock, so the only thing keeping
+    /// the committee intact is the pending-split skip.
+    #[test]
+    fn shuffle_skips_a_shard_with_a_pending_split() {
+        let splitting = ShardId::leaf(1, 0);
+        // Two shards × 4 ready + 2 pool extras, so a rotation would have
+        // stock to refill with.
+        let mut state = multi_shard_state(2, 4, 2);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        // Arm a pending split with an empty cohort: the readiness gate
+        // can't pass (no cohort seats), so the split won't execute this
+        // epoch and the shard stays in the lookahead to inspect.
+        state.pending_reshapes.insert(
+            splitting,
+            PendingReshape::Split {
+                last_asserted: Epoch::new(SHUFFLE_INTERVAL_EPOCHS),
+                admitted_at: Epoch::new(SHUFFLE_INTERVAL_EPOCHS),
+                cohort: BTreeMap::new(),
+                cohort_seed: state.randomness,
+            },
+        );
+        let before = state.next_shard_committees[&splitting].members.clone();
+
+        apply_next_epoch(&mut state, &[]);
+
+        // No victim rotated out, no not-yet-ready pool draw rotated in.
+        assert_eq!(
+            state.next_shard_committees[&splitting].members, before,
+            "a shard mid-split must not rotate at the shuffle boundary",
+        );
+        for id in &state.next_shard_committees[&splitting].members {
+            assert!(
+                matches!(
+                    state.validators[id].status,
+                    ValidatorStatus::OnShard { shard, ready: true, .. } if shard == splitting
+                ),
+                "every member of a splitting shard stays a ready parent half",
+            );
+        }
     }
 
     /// On a shuffle-boundary epoch, any shard membership change is
