@@ -15,7 +15,10 @@ use hyperscale_types::{ShardId, ValidatorId};
 use tracing_test::traced_test;
 
 mod common;
+mod support;
+
 use common::rotation_config;
+use support::sim_cluster::SimCluster;
 
 /// Any seed works — the cycle is harness-driven over the deterministic grow,
 /// not dependent on a particular shuffle outcome.
@@ -24,8 +27,8 @@ const SEED: u64 = 7;
 #[traced_test]
 #[test]
 fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
-    let mut runner = SimulationRunner::new(&rotation_config(), SEED);
-    runner.initialize_genesis();
+    let mut cluster = SimCluster::with_balances(&rotation_config(), SEED, &[]);
+    let runner = cluster.runner_mut();
     // Grow to two shards; the grow draws one cohort from the pool and leaves
     // one surplus extra `Pooled` — a real shard-less beacon follower.
     runner.grow_to(2);
@@ -35,9 +38,9 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     let pool_host = (0..runner.num_hosts())
         .find(|&n| runner.pooled_len(n) > 0)
         .expect("the grow's surplus pool extra follows the beacon on its host");
-    let before = committed_beacon_epoch(&runner, pool_host);
+    let before = committed_beacon_epoch(&*runner, pool_host);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
-    let after = committed_beacon_epoch(&runner, pool_host);
+    let after = committed_beacon_epoch(&*runner, pool_host);
     assert!(
         after > before,
         "the pool follower must fold committed beacon blocks and keep its \
@@ -49,7 +52,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     // so the validator drains off its last shard only once every shard the
     // host runs is gone; the follower appears on that final leave.
     let leaf = ShardId::leaf(1, 0);
-    let (node, validator) = committee_member_host(&runner, leaf);
+    let (node, validator) = committee_member_host(&*runner, leaf);
     assert_eq!(
         runner.pooled_len(node),
         0,
@@ -79,9 +82,9 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     // shard loop is left on the host. A rising committed tip proves the
     // runtime-built pool is actually fed (the routing gap this guards against
     // left such a follower dark, never raising its own re-seat trigger).
-    let before = committed_beacon_epoch(&runner, node);
+    let before = committed_beacon_epoch(&*runner, node);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
-    let after = committed_beacon_epoch(&runner, node);
+    let after = committed_beacon_epoch(&*runner, node);
     assert!(
         after > before,
         "the drained pool follower must keep folding committed beacon blocks \
@@ -120,8 +123,8 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
 #[traced_test]
 #[test]
 fn partitioned_follower_catches_up_via_beacon_sync() {
-    let mut runner = SimulationRunner::new(&rotation_config(), SEED);
-    runner.initialize_genesis();
+    let mut cluster = SimCluster::with_balances(&rotation_config(), SEED, &[]);
+    let runner = cluster.runner_mut();
     runner.grow_to(2);
     let _ = runner.take_reconfigurations();
 
@@ -134,17 +137,17 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
 
     // Let the follower get current before isolating it.
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 2));
-    let frozen_tip = committed_beacon_epoch(&runner, pool_host);
+    let frozen_tip = committed_beacon_epoch(&*runner, pool_host);
 
     // Isolate the follower: no beacon gossip in or out.
     runner.network_mut().partition_groups(&[pool_host], &others);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
     assert_eq!(
-        committed_beacon_epoch(&runner, pool_host),
+        committed_beacon_epoch(&*runner, pool_host),
         frozen_tip,
         "the isolated follower receives no gossip, so its tip is frozen"
     );
-    let network_tip = committed_beacon_epoch(&runner, others[0]);
+    let network_tip = committed_beacon_epoch(&*runner, others[0]);
     assert!(
         network_tip > frozen_tip + 1,
         "the network must advance past the follower by more than one epoch \
@@ -155,7 +158,7 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
     // so its coordinator opens a catch-up sync to fill the gap.
     runner.network_mut().heal_all();
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
-    let caught_up = committed_beacon_epoch(&runner, pool_host);
+    let caught_up = committed_beacon_epoch(&*runner, pool_host);
     assert!(
         caught_up > frozen_tip,
         "the follower must fetch the gap epochs over beacon sync — gossip no \

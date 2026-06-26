@@ -29,7 +29,10 @@ use hyperscale_types::{
 use tracing_test::traced_test;
 
 mod common;
+mod support;
+
 use common::rotation_config;
+use support::sim_cluster::SimCluster;
 
 /// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
 /// move: one shard's rotation victim is drawn straight into the other
@@ -115,8 +118,8 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(SEED);
-    let mut runner = SimulationRunner::new(&rotation_config(), seed);
-    runner.initialize_genesis();
+    let mut cluster = SimCluster::with_balances(&rotation_config(), seed, &[]);
+    let runner = cluster.runner_mut();
     // Grow the single-shard genesis into the two shards the shuffle rotates,
     // then discard the grow's placement deltas so only the shuffle's move is
     // collected below.
@@ -127,7 +130,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     let shuffle =
         Duration::from_millis(EPOCH_MS * (SHUFFLE_INTERVAL_EPOCHS + SHUFFLE_SLACK_EPOCHS));
     let mut moves: Vec<(NodeIndex, ParticipationChange)> = Vec::new();
-    run_until_or(&mut runner, shuffle, &mut moves, |_| false);
+    run_until_or(&mut *runner, shuffle, &mut moves, |_| false);
     let (node, change) = moves
         .iter()
         .find(|(_, c)| c.join.is_some() && c.leave.is_some())
@@ -163,7 +166,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     // within a few epochs — far inside READY_TIMEOUT_EPOCHS, so the
     // flip is signal-driven, not the timeout fallback.
     let ready_deadline = runner.now() + Duration::from_millis(EPOCH_MS * READY_BUDGET_EPOCHS);
-    let became_ready = run_until_or(&mut runner, ready_deadline, &mut moves, |r| {
+    let became_ready = run_until_or(&mut *runner, ready_deadline, &mut moves, |r| {
         matches!(
             mover_status(r, node, validator),
             Some(ValidatorStatus::OnShard { shard, ready: true, .. }) if shard == to
@@ -181,9 +184,9 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .expect("joined shard is hosted")
         .shard_coordinator()
         .committed_height();
-    let peer = member_host(&runner, to, node);
+    let peer = member_host(&*runner, to, node);
     let proposed_deadline = runner.now() + Duration::from_millis(EPOCH_MS * PROPOSAL_BUDGET_EPOCHS);
-    let proposed = run_until_or(&mut runner, proposed_deadline, &mut moves, |r| {
+    let proposed = run_until_or(&mut *runner, proposed_deadline, &mut moves, |r| {
         let tip = r
             .vnode_state_in(peer, to)
             .expect("member host carries the shard")
@@ -258,20 +261,20 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     // ── Drain: the origin shard tears down and stays live without us ─
     assert!(
         !matches!(
-            mover_status(&runner, node, validator),
+            mover_status(&*runner, node, validator),
             Some(ValidatorStatus::OnShard { shard, .. }) if shard == from
         ),
         "the mover's window on the origin shard has closed"
     );
     let retained = runner.leave_shard(node, from);
-    let origin_peer = member_host(&runner, from, node);
+    let origin_peer = member_host(&*runner, from, node);
     let origin_before = runner
         .vnode_state_in(origin_peer, from)
         .expect("origin member host")
         .shard_coordinator()
         .committed_height();
     let drain_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
-    let origin_alive = run_until_or(&mut runner, drain_deadline, &mut moves, |r| {
+    let origin_alive = run_until_or(&mut *runner, drain_deadline, &mut moves, |r| {
         r.vnode_state_in(origin_peer, from)
             .expect("origin member host")
             .shard_coordinator()
