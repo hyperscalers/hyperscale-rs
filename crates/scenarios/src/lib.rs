@@ -31,7 +31,7 @@ pub mod wait;
 pub use budget::{Budget, epochs};
 pub use cluster::Cluster;
 pub use config::ScenarioConfig;
-pub use grow::grow_to;
+pub use grow::{grow_to, vote_reshape_threshold};
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
 pub use reshape::{merge_lifecycle, split_lifecycle};

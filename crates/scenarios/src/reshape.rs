@@ -2,23 +2,16 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{Epoch, ShardId};
+use hyperscale_types::ShardId;
 use radix_common::network::NetworkDefinition;
 
-use crate::query::beacon_epoch;
-use crate::tx::{
-    account_from_seed, build_faucet_tx, build_reshape_threshold_vote_tx, signer_from_seed,
-    validity_around,
-};
+use crate::grow::vote_reshape_threshold;
+use crate::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
 use crate::wait::{
     assert_height_frozen, await_height, await_merge_keeper_count, await_root_matches_anchor,
     await_serves, await_split_admitted,
 };
 use crate::{Cluster, epochs};
-
-/// Epochs of lead before the threshold vote activates — enough for the vote
-/// transaction to commit and fold into the tally before it is read.
-const VOTE_ACTIVATE_LEAD: u64 = 4;
 
 /// Reshape `split_bytes` the vote installs after the grow. Its derived
 /// `merge_bytes = split_bytes / 8` sits far above each cold child's byte total,
@@ -96,18 +89,7 @@ pub fn merge_lifecycle(c: &mut impl Cluster) {
     // Vote the reshape threshold up so the cold grown children fall under the
     // derived merge threshold. The straddler account `31`, funded at genesis and
     // seated on a child by the grow, pays the system-action fee.
-    let payer = signer_from_seed(31);
-    let current = beacon_epoch(c).expect("the grow committed a beacon epoch");
-    let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
-    let vote = build_reshape_threshold_vote_tx(
-        &payer,
-        MERGE_VOTE_SPLIT_BYTES,
-        activate_at,
-        &NetworkDefinition::simulator(),
-        1,
-        validity_around(c.now()),
-    );
-    c.submit(Arc::new(vote));
+    vote_reshape_threshold(c, &signer_from_seed(31), MERGE_VOTE_SPLIT_BYTES);
 
     // The vote activates, both children assert the merge, and the beacon pairs
     // it — drawing a quorum (2f+1 of the four-validator merged committee).

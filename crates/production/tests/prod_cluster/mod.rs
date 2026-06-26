@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use hyperscale_engine::GenesisConfig;
 use hyperscale_production::LocalValidator;
-use hyperscale_scenarios::tx::straddler_genesis_balances;
-use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig, grow_to};
+use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
+use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig, grow_to, vote_reshape_threshold};
 use hyperscale_test_helpers::fixtures::TestFixtures;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
@@ -94,11 +94,9 @@ impl ProdCluster {
             ..*config
         };
         let mut cluster = Self::start_with_balances(&grow_config, seed, epoch_ms, balances);
-        grow_to(
-            &mut cluster,
-            u32::try_from(config.num_shards).unwrap_or(u32::MAX),
-            config.split_bytes,
-        );
+        let target = u32::try_from(config.num_shards).unwrap_or(u32::MAX);
+        grow_to(&mut cluster, target);
+        vote_reshape_threshold(&mut cluster, &merge_vote_payer(), config.split_bytes);
         cluster
     }
 
