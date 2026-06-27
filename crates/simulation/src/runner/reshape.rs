@@ -444,6 +444,19 @@ impl SimulationRunner {
         genesis: &Block,
         recovered: &RecoveredState,
     ) {
+        // Don't clobber a live chain. A duplicate seat — two reshape duties for
+        // one child on a co-hosted host — would otherwise tear down the running
+        // chain and reinstall it at genesis. Skip when this host already runs
+        // `shard` past the genesis we'd install; the deliberate teardown below
+        // still fires for a stale terminated chain (a merge reforms the grow's
+        // terminated parent at a height above its pre-split terminal). Mirrors
+        // the production supervisor dropping a seat for an already-hosted shard.
+        if self
+            .hosts_shard(node, shard)
+            .is_some_and(|s| s.committed_height() > genesis.height())
+        {
+            return;
+        }
         let _ = self.hosts[node as usize].remove_shard(shard);
         let mut inits = Vec::with_capacity(validators.len());
         for &validator in validators {
