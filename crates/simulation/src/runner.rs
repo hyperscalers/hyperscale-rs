@@ -21,18 +21,17 @@ use hyperscale_network_memory::{
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
-    NodeConfig, NodeHost, NodeStateMachine, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit,
-    seat_follower, seat_vnode_group, timer_event,
+    NodeConfig, NodeHost, NodeStateMachine, SeatFollower, SeatVnodeGroup, ShardGenesis, TimerOp,
+    VnodeInit, seat_follower, seat_vnode_group, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, ChainOrigin,
-    GenesisConfigHash, GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
-    bls_keypair_from_seed, shard_prefix_path,
+    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisConfigHash,
+    GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
+    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, shard_prefix_path,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -179,9 +178,6 @@ pub struct SimulationRunner {
 
     /// Statistics.
     stats: SimulationStats,
-
-    /// Whether engine genesis has been executed on each node's storage.
-    genesis_executed: Vec<bool>,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -521,7 +517,6 @@ impl SimulationRunner {
             rng,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
-            genesis_executed: vec![false; num_hosts],
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
@@ -700,12 +695,7 @@ impl SimulationRunner {
 
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
-        self.install_engine_genesis(&GenesisConfig::test_default(), |_| true);
-        info!(
-            num_nodes = self.hosts.len(),
-            "Radix Engine genesis complete on all nodes"
-        );
-        self.finalize_genesis();
+        self.run_genesis(&GenesisConfig::test_default());
     }
 
     /// Initialize genesis with pre-funded accounts.
@@ -722,104 +712,50 @@ impl SimulationRunner {
             xrd_balances: balances.to_vec(),
             ..GenesisConfig::test_default()
         };
-        self.install_engine_genesis(&config, |_| true);
-
-        info!(
-            num_nodes = self.hosts.len(),
-            num_funded_accounts = balances.len(),
-            "Radix Engine genesis complete with funded accounts"
-        );
-
-        self.finalize_genesis();
+        self.run_genesis(&config);
     }
 
-    /// Apply a prepared engine genesis snapshot to every node selected by
-    /// `select`. Inbound handler registration happens once for all nodes in
-    /// [`Self::finalize_genesis`]. Cross-shard hosts install genesis
-    /// against every hosted shard's storage.
-    fn install_engine_genesis(
-        &mut self,
-        config: &GenesisConfig,
-        mut select: impl FnMut(usize) -> bool,
-    ) {
-        for node_idx in 0..self.hosts.len() {
-            if self.genesis_executed[node_idx] || !select(node_idx) {
-                continue;
-            }
-            let hosted: Vec<ShardId> = self.hosts[node_idx].hosted_shards().collect();
-            for shard in hosted {
-                self.hosts[node_idx].install_engine_genesis(shard, config);
-            }
-            self.genesis_executed[node_idx] = true;
-        }
-    }
-
-    /// Initialize state-machine genesis on all nodes and register inbound
-    /// network handlers. Called after engine genesis on every node.
+    /// Install and commit genesis across the cluster, then wire the hosts
+    /// into the in-memory network.
     ///
-    /// Genesis is a single ROOT shard: locate every host that serves ROOT,
-    /// initialize its genesis block on those hosts, and schedule the
-    /// `BlockCommitted` event.
-    fn finalize_genesis(&mut self) {
-        use hyperscale_storage::SubstateStore;
-        use hyperscale_types::Block;
-
+    /// Genesis is a single ROOT shard. Every ROOT-serving host runs the
+    /// shared [`NodeHost::build_shard_genesis`] ceremony — identical config
+    /// yields an identical block on each — and the certified block is
+    /// *scheduled* for commit rather than stepped inline: deferring it until
+    /// after [`NodeHost::register_inbound_handlers`] keeps genesis consensus
+    /// I/O from firing into an unwired network.
+    fn run_genesis(&mut self, config: &GenesisConfig) {
         let shard = ShardId::ROOT;
-
-        // Hosts that carry at least one vnode in ROOT.
+        let proposer = ValidatorId::new(0);
         let num_hosts = NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
         let hosts_for_shard: Vec<NodeIndex> = (0..num_hosts)
             .filter(|&h| self.hosts[h as usize].hosted_shards().any(|s| s == shard))
             .collect();
 
-        let first_host = *hosts_for_shard
-            .first()
-            .expect("the ROOT shard must have at least one host");
-        let first_node_storage = self.hosts[first_host as usize].shard_io(shard).storage();
-        let genesis_jmt_root = first_node_storage.state_root();
-
-        info!(
-            shard = ?shard,
-            genesis_jmt_root = ?genesis_jmt_root,
-            "JMT state after genesis bootstrap"
-        );
-
-        // Proposer = first validator in the ROOT committee.
-        let proposer = ValidatorId::new(0);
-        let genesis_block = Block::genesis(shard, proposer, genesis_jmt_root, ChainOrigin::ROOT);
-
-        for host_index in &hosts_for_shard {
-            let i = *host_index as usize;
-            self.hosts[i].initialize_shard_genesis(&genesis_block);
-            self.hosts[i].flush_all_batches();
-
-            // Drain outputs from genesis initialization (timer sets, etc.)
-            let output = self.hosts[i].drain_pending_output();
-            self.drain_node_io(*host_index);
-            self.process_step_output(*host_index, output);
-
-            // Sync state machine with actual JMT state after genesis bootstrap.
-            let genesis_certified = Arc::new(Verified::<CertifiedBlock>::genesis(
-                shard,
-                proposer,
-                genesis_jmt_root,
-                ChainOrigin::ROOT,
-            ));
-            let genesis_commit_event = HostEvent::protocol(
-                shard,
-                ProtocolEvent::BlockCommitted {
-                    certified: genesis_certified,
-                },
+        for &host_index in &hosts_for_shard {
+            let i = host_index as usize;
+            let ShardGenesis {
+                block,
+                certified,
+                setup_output,
+            } = self.hosts[i].build_shard_genesis(shard, proposer, config);
+            if host_index == hosts_for_shard[0] {
+                info!(
+                    shard = ?shard,
+                    genesis_jmt_root = ?block.header().state_root(),
+                    genesis_hash = ?block.hash(),
+                    hosts = hosts_for_shard.len(),
+                    "Initialized genesis for the ROOT shard"
+                );
+            }
+            self.drain_node_io(host_index);
+            self.process_step_output(host_index, setup_output);
+            self.schedule_event(
+                host_index,
+                self.now,
+                HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
             );
-            self.schedule_event(*host_index, self.now, genesis_commit_event);
         }
-
-        info!(
-            shard = ?shard,
-            genesis_hash = ?genesis_block.hash(),
-            hosts = hosts_for_shard.len(),
-            "Initialized genesis for the ROOT shard"
-        );
 
         // Wire each node into the in-memory network now that genesis is settled.
         for host in &mut self.hosts {

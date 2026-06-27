@@ -13,6 +13,8 @@
 //!   before the host starts processing events; reached by both genesis
 //!   and resume paths.
 
+use std::sync::Arc;
+
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::sharding::{
     filter_genesis_updates_for_shard, resolve_owned_nodes_from_updates,
@@ -20,9 +22,11 @@ use hyperscale_engine::sharding::{
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, ShardStorage};
-use hyperscale_types::{Block, NodeId, ShardId, StateRoot};
+use hyperscale_types::{
+    Block, CertifiedBlock, ChainOrigin, NodeId, ShardId, StateRoot, ValidatorId, Verified,
+};
 
-use crate::host::NodeHost;
+use crate::host::{NodeHost, ShardGenesis};
 
 impl<S, N, D> NodeHost<S, N, D>
 where
@@ -47,6 +51,42 @@ where
         }
         self.shard_loop_mut(shard)
             .seed_genesis_substate_frontier(genesis_block);
+    }
+
+    /// Run the deterministic part of one shard's genesis ceremony: install
+    /// engine genesis, build the genesis block under `proposer`, persist it
+    /// into the shard's vnodes, and drain the resulting setup output.
+    ///
+    /// Returns the block, its certified form, and the drained
+    /// [`StepOutput`](crate::shard::StepOutput). The caller commits the
+    /// certified block — production steps `BlockCommitted` inline, simulation
+    /// schedules it after the network is wired — so this stops short of the
+    /// commit, the one step the two runners can't share.
+    pub fn build_shard_genesis(
+        &mut self,
+        shard: ShardId,
+        proposer: ValidatorId,
+        config: &GenesisConfig,
+    ) -> ShardGenesis
+    where
+        S: GenesisCommit,
+    {
+        let genesis_jmt_root = self.install_engine_genesis(shard, config);
+        let block = Block::genesis(shard, proposer, genesis_jmt_root, ChainOrigin::ROOT);
+        self.initialize_shard_genesis(&block);
+        self.flush_all_batches();
+        let setup_output = self.drain_pending_output();
+        let certified = Arc::new(Verified::<CertifiedBlock>::genesis(
+            shard,
+            proposer,
+            genesis_jmt_root,
+            ChainOrigin::ROOT,
+        ));
+        ShardGenesis {
+            block,
+            certified,
+            setup_output,
+        }
     }
 
     /// Install engine genesis on `shard`'s storage.
