@@ -408,7 +408,11 @@ where
     ///
     /// # Panics
     /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
-    pub fn vnode_state_mut(&mut self, shard: ShardId, vnode_idx: usize) -> &mut NodeStateMachine {
+    pub(crate) fn vnode_state_mut(
+        &mut self,
+        shard: ShardId,
+        vnode_idx: usize,
+    ) -> &mut NodeStateMachine {
         &mut self.shard_loop_mut(shard).vnodes[vnode_idx].state
     }
 

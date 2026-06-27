@@ -476,7 +476,8 @@ impl BlockCommitCoordinator {
         Arc::clone(&self.prepared_commits)
     }
 
-    pub const fn persisted_height(&self) -> BlockHeight {
+    #[cfg(test)]
+    const fn persisted_height(&self) -> BlockHeight {
         self.persisted_height
     }
 
@@ -497,7 +498,8 @@ impl BlockCommitCoordinator {
     }
 
     /// Insert a prepared commit produced inline (QC-only sync path).
-    pub fn insert_prepared(
+    #[cfg(test)]
+    fn insert_prepared(
         &self,
         block_hash: BlockHash,
         height: BlockHeight,

@@ -26,11 +26,11 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
+use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock,
-    ChainOrigin, GenesisConfigHash, GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot,
+    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, ChainOrigin,
+    GenesisConfigHash, GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
     bls_keypair_from_seed, shard_prefix_path,
 };
@@ -245,26 +245,6 @@ pub struct SimulationStats {
     pub timers_set: u64,
     /// Timers cancelled.
     pub timers_cancelled: u64,
-}
-
-impl SimulationStats {
-    /// Total messages dropped (partition + packet loss).
-    #[must_use]
-    pub const fn messages_dropped(&self) -> u64 {
-        self.messages_dropped_partition + self.messages_dropped_loss
-    }
-
-    /// Message delivery rate (sent / (sent + dropped)).
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)] // headline ratio for human-readable stats
-    pub fn delivery_rate(&self) -> f64 {
-        let total = self.messages_sent + self.messages_dropped();
-        if total == 0 {
-            1.0
-        } else {
-            self.messages_sent as f64 / total as f64
-        }
-    }
 }
 
 impl SimulationRunner {
@@ -553,16 +533,6 @@ impl SimulationRunner {
         }
     }
 
-    /// Create a new simulation runner with traffic analysis enabled.
-    #[must_use]
-    pub fn with_traffic_analysis(network_config: &SimConfig, seed: u64) -> Self {
-        let mut runner = Self::new(network_config, seed);
-        let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
-        runner.network.set_traffic_analyzer(Arc::clone(&analyzer));
-        runner.traffic_analyzer = Some(analyzer);
-        runner
-    }
-
     /// Enable traffic analysis on an existing runner.
     pub fn enable_traffic_analysis(&mut self) {
         if self.traffic_analyzer.is_none() {
@@ -601,15 +571,6 @@ impl SimulationRunner {
         NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex")
     }
 
-    /// Get a reference to a node's storage. Returns the storage for the
-    /// host's first hosted shard.
-    #[must_use]
-    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimShardStorage> {
-        let host = self.hosts.get(node as usize)?;
-        let shard = host.hosted_shards().next()?;
-        Some(&host.shard_io(shard).storage)
-    }
-
     /// Get a reference to a node's storage for a specific hosted shard,
     /// or `None` when the host doesn't carry it.
     #[must_use]
@@ -617,7 +578,7 @@ impl SimulationRunner {
         let host = self.hosts.get(node as usize)?;
         host.hosted_shards()
             .any(|s| s == shard)
-            .then(|| &*host.shard_io(shard).storage)
+            .then(|| &**host.shard_io(shard).storage())
     }
 
     /// Process-shared beacon storage for a host. One handle per host,
@@ -670,31 +631,12 @@ impl SimulationRunner {
     ///
     /// With `vnodes_per_host == 1` (the default) this is the only
     /// state machine on that host. For multi-vnode hosting, use
-    /// [`Self::vnode_state`] to pick a specific validator.
+    /// [`Self::vnode_state_in`] to pick a specific host's shard vnode.
     #[must_use]
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
         let host = self.hosts.get(index as usize)?;
         let shard = host.hosted_shards().next()?;
         Some(host.vnode_state(shard, 0))
-    }
-
-    /// Get a reference to a specific validator's state machine,
-    /// regardless of which host bundles it. Works for both same-shard
-    /// and cross-shard hosting — walks every host's vnodes looking
-    /// for a matching `validator_id`.
-    #[must_use]
-    pub fn vnode_state(&self, validator_id: ValidatorId) -> Option<&NodeStateMachine> {
-        let host_index = self.network.validator_to_node(validator_id) as usize;
-        let host = self.hosts.get(host_index)?;
-        for shard in host.hosted_shards() {
-            for v in 0..host.vnodes_len(shard) {
-                let state = host.vnode_state(shard, v);
-                if state.validator_id() == validator_id {
-                    return Some(state);
-                }
-            }
-        }
-        None
     }
 
     /// Every live vnode on `shard`, across all hosts.
@@ -740,33 +682,6 @@ impl SimulationRunner {
     /// Get a mutable reference to the network for partition/loss configuration.
     pub const fn network_mut(&mut self) -> &mut SimulatedNetwork {
         &mut self.network
-    }
-
-    /// Get the number of committed blocks stored for a specific node.
-    #[must_use]
-    pub fn committed_block_count(&self, node: NodeIndex) -> usize {
-        self.hosts.get(node as usize).map_or(0, |nl| {
-            let Some(shard) = nl.hosted_shards().next() else {
-                return 0;
-            };
-            let s = &nl.shard_io(shard).storage;
-            let committed = s.committed_height();
-            if committed == BlockHeight::GENESIS {
-                usize::from(s.get_block(BlockHeight::GENESIS).is_some())
-            } else {
-                usize::try_from(committed.inner() + 1).unwrap_or(usize::MAX)
-            }
-        })
-    }
-
-    /// Check if a specific block is stored for a node.
-    #[must_use]
-    pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
-        self.hosts.get(node as usize).is_some_and(|nl| {
-            nl.hosted_shards()
-                .next()
-                .is_some_and(|shard| nl.shard_io(shard).storage.get_block(height).is_some())
-        })
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
@@ -860,7 +775,7 @@ impl SimulationRunner {
         let first_host = *hosts_for_shard
             .first()
             .expect("the ROOT shard must have at least one host");
-        let first_node_storage = &self.hosts[first_host as usize].shard_io(shard).storage;
+        let first_node_storage = self.hosts[first_host as usize].shard_io(shard).storage();
         let genesis_jmt_root = first_node_storage.state_root();
 
         info!(

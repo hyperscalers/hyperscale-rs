@@ -149,7 +149,7 @@ impl SimulationRunner {
                 .process()
                 .release_beacon_signer(validator, shard);
         }
-        let storage = (*shard_loop.io.storage).clone();
+        let storage = (**shard_loop.io.storage()).clone();
 
         // Parity with the production supervisor's `on_torn_down`: a validator
         // that drains off its last shard keeps following the beacon in the
@@ -218,12 +218,12 @@ impl SimulationRunner {
                 match request {
                     BootstrapRequest::StateRange(id, request) => {
                         let response =
-                            serve_state_range_request(&server.shard_io(shard).storage, &request);
+                            serve_state_range_request(server.shard_io(shard).storage(), &request);
                         bootstrap.on_state_range(id, &response);
                     }
                     BootstrapRequest::WitnessHistory(request) => {
                         let response = serve_witness_history_request(
-                            &server.shard_io(shard).pending_chain,
+                            server.shard_io(shard).pending_chain(),
                             &request,
                         );
                         bootstrap.on_witness_history(&response);

@@ -239,7 +239,7 @@ impl SimulationRunner {
         }
         let storage = self.hosts[node as usize]
             .shard_io(parent)
-            .storage
+            .storage()
             .clone_for_split_child(shard_prefix_path(child));
         let recovered = storage.load_recovered_state();
         self.reshape_stores.insert(
@@ -274,7 +274,7 @@ impl SimulationRunner {
                     .filter(|&node| self.hosts_shard(node, from).is_some())
                     .map(|node| {
                         serve_state_range_request(
-                            &self.hosts[node as usize].shard_io(from).storage,
+                            self.hosts[node as usize].shard_io(from).storage(),
                             &request,
                         )
                     })
@@ -349,7 +349,7 @@ impl SimulationRunner {
                 }
                 let io = self.hosts[node as usize].shard_io(shard);
                 let response =
-                    serve_block_request(&io.pending_chain, &io.caches.provision_store, request);
+                    serve_block_request(io.pending_chain(), io.provision_store(), request);
                 if response.certified.is_some() {
                     return response;
                 }

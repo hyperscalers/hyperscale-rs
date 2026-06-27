@@ -816,7 +816,7 @@ impl ProductionRunner {
         // historical default) end up running an identity filter.
         let shared_genesis_config = self.genesis_config.take();
         for shard in local_shards {
-            let height = host.shard_io(shard).storage.committed_height();
+            let height = host.shard_io(shard).storage().committed_height();
             if height > BlockHeight::GENESIS {
                 info!(
                     shard = ?shard,
@@ -1555,7 +1555,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
 
     // ── /sync: per-shard block-sync state ──────────────────────────
     if let Some(ref sync_status) = config.publishers.sync_status {
-        let block_sync = shard_loop.io.consensus.block_sync.block_sync_status();
+        let block_sync = shard_loop.io.block_sync_status();
         let current = sync_status.load();
         let mut updated = (**current).clone();
         updated.shards.insert(
