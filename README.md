@@ -212,28 +212,58 @@ Example command (adjust ports as needed):
 
 ### Windows: "Path too long" Error
 
-If you encounter "path too long" errors during `cargo build` on Windows (often due to deep dependency trees), you need to enable Long Paths in Windows.
+`hyperscale-rs` depends on the git monorepo `hyperscalers/radixdlt-scrypto`. Its
+`radix-transaction-scenarios` crate contains generated fixture paths longer than
+Windows `MAX_PATH` (~260). Cargo fetches via git but checks out with **libgit2**,
+which fails unless long paths are enabled system-wide. Shorter `CARGO_HOME` does
+not help — the in-repo suffix alone is ~268 characters.
 
-1.  Open **PowerShell** as Administrator.
-2.  Run the following command to enable long paths in the registry:
-    ```powershell
-    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
-    ```
-3.  Restart your computer (or sign out and back in).
-4.  Run this git command to ensure git uses long paths:
-    ```bash
-    git config --system core.longpaths true
-    ```
+**Enable Windows long paths:**
+
+1. Open **PowerShell** as Administrator.
+2. Run:
+   ```powershell
+   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+   ```
+3. Restart the machine (or sign out and back in).
+4. Run:
+   ```bash
+   git config --global core.longpaths true
+   ```
+
+Long paths are the required fix. The repository `.cargo/config.toml` stays
+platform-neutral (CMake policy only) so Linux and CI are unchanged.
+
+Optional local Cargo settings for Windows belong in `.cargo/config.local.toml`
+(gitignored). Cargo does not load that file automatically — copy its contents
+into your working copy of `.cargo/config.toml`, then run
+`git update-index --skip-worktree .cargo/config.toml` so local edits are not
+committed:
+
+```toml
+# .cargo/config.local.toml (local only, not committed)
+[net]
+git-fetch-with-cli = true
+```
+
+`git-fetch-with-cli` alone does not replace enabling long paths; checkout still
+uses libgit2 unless `LongPathsEnabled` is set.
 
 ### Windows: "Can't find clang.dll" or "libclang.dll"
 
-If you see errors about missing `clang.dll` or `libclang.dll` during build (usually from `rocksdb` or `bindgen`), you need to set the `LIBCLANG_PATH` environment variable.
+RocksDB (`librocksdb-sys`) uses bindgen, which needs **LLVM/libclang** and **MSVC
+headers** (`stdbool.h` from the Windows SDK). Both are required — LLVM alone is not
+enough unless you run from a Developer Command Prompt.
 
-1.  Ensure LLVM is installed (`choco install llvm`).
-2.  Ensure protobuf is installed (`choco install protobuf`).
-3.  Set the environment variable to your LLVM `bin` directory:
-    ```powershell
-    $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-    ```
-    (Or add it permanently to your System Environment Variables).
+1. Install LLVM (`choco install llvm`) and protobuf (`choco install protobuf`).
+2. Install **Visual Studio Build Tools** with the **Desktop development with C++**
+   workload (provides `vcvars64.bat` and SDK headers).
+3. Set `LIBCLANG_PATH` permanently, e.g. `C:\Program Files\LLVM\bin`.
+
+Run from **Developer PowerShell for VS** (loads `vcvars64.bat`) or set
+`LIBCLANG_PATH` manually before `cargo build`:
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+```
 
