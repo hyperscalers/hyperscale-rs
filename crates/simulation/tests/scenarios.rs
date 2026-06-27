@@ -132,16 +132,7 @@ const fn merge_straddler_config() -> ScenarioConfig {
     }
 }
 
-// The grown four-shard committees seat at full strength, but the merge fires too
-// soon for the settling waves: `with_grown_balances` arms the merge threshold in
-// setup, and the sim's reshape pump syncs the keepers in roughly one epoch where
-// production paces them over several, so `leaf(2, 2)` reaches its terminal block
-// before the cross-shard 2PC the body submits can finalize — the survivor's
-// provision lands after the merging child is gone and the straddler aborts.
-// `merge_straddler_atomic_prod` covers the invariant; the sim run is pending a
-// merge-admission pace that leaves a settling window.
 #[test]
-#[ignore = "sim merge admission outpaces the settling 2PC; see merge_straddler_atomic_prod"]
 fn merge_straddler_atomic_sim() {
     let setup = merge_straddler_setup();
     let mut cluster =

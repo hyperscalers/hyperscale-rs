@@ -118,6 +118,11 @@ pub fn apply_epoch(
     // consensus set one epoch out rather than mid-window.
     state.shard_consensus_members = state.ready_consensus_members(&state.next_shard_committees);
     state.shard_committees = state.next_shard_committees.clone();
+    // Promote the lookahead params under the same discipline: a vote
+    // tallied a prior epoch installed its change into `next_params` at
+    // `activate_at - 1`, so this epoch's blocks resolve the value every
+    // member already froze into this window's topology snapshot.
+    state.params = state.next_params;
     // Freeze each shard's beacon-witness window base under the same
     // discipline: the applied watermark as it stands before this epoch's
     // fold advances it, matching what the prior state's lookahead

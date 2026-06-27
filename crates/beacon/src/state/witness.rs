@@ -325,8 +325,12 @@ pub(super) fn apply_shard_payload(
                     state.param_votes.remove(&vote.pool);
                 }
                 Some(proposal) => {
+                    // A change is decided one epoch before it activates
+                    // (`tally_param_votes` at `activate_at - 1`), so a vote
+                    // naming this epoch or earlier can never be tallied —
+                    // drop it on arrival rather than carrying dead weight.
                     if state.pools.contains_key(&vote.pool)
-                        && proposal.activate_at >= state.current_epoch
+                        && proposal.activate_at > state.current_epoch
                         && proposal.params.validate().is_ok()
                     {
                         state.param_votes.insert(vote.pool, proposal);

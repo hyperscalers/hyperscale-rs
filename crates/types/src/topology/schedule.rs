@@ -44,14 +44,6 @@ pub struct TopologySchedule {
     /// Window length in milliseconds; `epoch = floor(wt / epoch_duration_ms)`.
     /// Zero means a single fixed committee (every timestamp maps to genesis).
     epoch_duration_ms: u64,
-    /// Substate-count thresholds for automatic shard reshaping, sourced
-    /// from the folded `BeaconState`'s live `params` — seeded at
-    /// construction and refreshed by [`set_reshape_thresholds`](Self::set_reshape_thresholds)
-    /// on each commit so a governance-activated change reaches proposers.
-    /// Consensus-critical; `DISABLED` unless the network configured
-    /// reshaping. One value, not a per-epoch entry: a change takes hold
-    /// the commit after its tally applies.
-    reshape_thresholds: ReshapeThresholds,
     /// Active committee for routing / gossip ("who is in the committee now?").
     head: Arc<TopologySnapshot>,
     /// Committee snapshots keyed by the epoch each governs.
@@ -114,34 +106,23 @@ impl TopologySchedule {
         by_epoch.insert(head_epoch, Arc::clone(&head));
         Self {
             epoch_duration_ms,
-            reshape_thresholds: ReshapeThresholds::DISABLED,
             head,
             by_epoch,
         }
     }
 
-    /// Seed the network's reshape thresholds from the folded
-    /// `BeaconState`'s live `params` at construction. The owner refreshes
-    /// them on each commit via [`set_reshape_thresholds`](Self::set_reshape_thresholds),
-    /// since a governance vote can retune them mid-chain.
+    /// Substate-count thresholds for automatic shard reshaping, read off the
+    /// head snapshot's [`params`](TopologySnapshot::params).
+    ///
+    /// A coarse "is reshaping enabled" head value for proposer-local
+    /// heuristics — not the consensus predicate input. The reshape trigger
+    /// a block commits is recomputed against the thresholds on the block's
+    /// own weighted-time-resolved snapshot ([`at`](Self::at) /
+    /// [`at_for_shard`](Self::at_for_shard)), so a governance change
+    /// resolves identically on every member regardless of fold skew.
     #[must_use]
-    pub const fn with_reshape_thresholds(mut self, thresholds: ReshapeThresholds) -> Self {
-        self.reshape_thresholds = thresholds;
-        self
-    }
-
-    /// Refresh the reshape thresholds from the folded `BeaconState`'s live
-    /// `params`. The beacon coordinator calls this on every commit so a
-    /// governance-activated change reaches the shard proposers that read
-    /// [`reshape_thresholds`](Self::reshape_thresholds) off this schedule.
-    pub const fn set_reshape_thresholds(&mut self, thresholds: ReshapeThresholds) {
-        self.reshape_thresholds = thresholds;
-    }
-
-    /// Substate-count thresholds for automatic shard reshaping.
-    #[must_use]
-    pub const fn reshape_thresholds(&self) -> ReshapeThresholds {
-        self.reshape_thresholds
+    pub fn reshape_thresholds(&self) -> ReshapeThresholds {
+        self.head.reshape_thresholds()
     }
 
     /// The chain's epoch window length in milliseconds — the constant the
@@ -172,7 +153,6 @@ impl TopologySchedule {
         by_epoch.insert(Epoch::GENESIS, Arc::clone(&snapshot));
         Self {
             epoch_duration_ms: 0,
-            reshape_thresholds: ReshapeThresholds::DISABLED,
             head: snapshot,
             by_epoch,
         }
