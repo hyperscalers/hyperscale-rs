@@ -246,6 +246,12 @@ enum ObserverPhase {
     AwaitingAdopt,
     /// Genesis adopted into the store; awaiting the placement that seats it.
     Prepared,
+    /// Seat emitted; inert until the committed projection releases the duty.
+    /// The duty stays in the map so `discover_parent_half_duties` keeps deferring
+    /// a co-hosted parent half of this child to the observer's seat — which
+    /// installs every homed committee member, parent halves included — rather
+    /// than opening a second duty that would re-seat the child from genesis.
+    Seated,
 }
 
 /// One split observer duty, keyed by the child it syncs. A host may hold more
@@ -448,6 +454,13 @@ impl ReshapeOrchestrator {
         // past genesis) the duty is done.
         self.parent_halves.retain(|child, duty| {
             !matches!(duty.phase, ParentHalfPhase::Seated)
+                || view.parent_half_cohorts().contains_key(child)
+        });
+        // A seated observer lingers through the parent-half phase so its child
+        // stays in `observers`, deferring any co-hosted parent half to the seat
+        // already issued; once the projection releases the child the duty ends.
+        self.observers.retain(|child, duty| {
+            !matches!(duty.phase, ObserverPhase::Seated)
                 || view.parent_half_cohorts().contains_key(child)
         });
         requests
@@ -809,7 +822,7 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ObserverPhase::AwaitingAdopt => {}
+            ObserverPhase::AwaitingAdopt | ObserverPhase::Seated => {}
             ObserverPhase::Prepared => {
                 if duty
                     .validators
@@ -817,7 +830,7 @@ impl ReshapeOrchestrator {
                     .any(|validator| view.committee(child).contains(validator))
                 {
                     out.push(ReshapeRequest::Seat { shard: child });
-                    self.observers.remove(&child);
+                    duty.phase = ObserverPhase::Seated;
                 }
             }
         }
