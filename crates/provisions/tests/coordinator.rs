@@ -24,8 +24,8 @@ fn fresh_coordinator() -> ProvisionCoordinator {
 }
 
 fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot) {
-    let topology = TestCommittee::new(4, 42).topology_snapshot(2);
-    (fresh_coordinator(), topology)
+    let topology_snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+    (fresh_coordinator(), topology_snapshot)
 }
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {

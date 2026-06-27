@@ -178,7 +178,7 @@ impl VoteKeeper {
     /// the untrusted wire path.
     pub fn accept_verified_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         me: ValidatorId,
         local_shard: ShardId,
         vote: Verified<BlockVote>,
@@ -186,11 +186,14 @@ impl VoteKeeper {
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash();
-        let Some(prep) = Self::preflight(topology, local_shard, &vote, committed_height) else {
+        let Some(prep) = Self::preflight(topology_snapshot, local_shard, &vote, committed_height)
+        else {
             return vec![];
         };
 
-        let committee_size = topology.consensus_committee_for_shard(local_shard).len();
+        let committee_size = topology_snapshot
+            .consensus_committee_for_shard(local_shard)
+            .len();
         let vote_set = self
             .vote_sets
             .entry(block_hash)
@@ -209,7 +212,7 @@ impl VoteKeeper {
         );
         vote_set.add_verified_vote(prep.voter_index, vote);
 
-        self.maybe_trigger_verification(topology, local_shard, block_hash)
+        self.maybe_trigger_verification(topology_snapshot, local_shard, block_hash)
     }
 
     /// Accept a wire-arrived block vote: buffer its signature into the
@@ -220,7 +223,7 @@ impl VoteKeeper {
     /// [`Self::accept_verified_vote`].
     pub fn accept_unverified_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         me: ValidatorId,
         local_shard: ShardId,
         vote: BlockVote,
@@ -228,7 +231,8 @@ impl VoteKeeper {
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash();
-        let Some(prep) = Self::preflight(topology, local_shard, &vote, committed_height) else {
+        let Some(prep) = Self::preflight(topology_snapshot, local_shard, &vote, committed_height)
+        else {
             return vec![];
         };
 
@@ -241,7 +245,9 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let committee_size = topology.consensus_committee_for_shard(local_shard).len();
+        let committee_size = topology_snapshot
+            .consensus_committee_for_shard(local_shard)
+            .len();
         let vote_set = self
             .vote_sets
             .entry(block_hash)
@@ -252,7 +258,7 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let total_power = topology.committee_votes(local_shard);
+        let total_power = topology_snapshot.committee_votes(local_shard);
         vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key);
         trace!(
             validator = ?me,
@@ -263,14 +269,14 @@ impl VoteKeeper {
             "Vote buffered"
         );
 
-        self.maybe_trigger_verification(topology, local_shard, block_hash)
+        self.maybe_trigger_verification(topology_snapshot, local_shard, block_hash)
     }
 
     /// Shared committee/power lookup for both vote-ingestion paths.
     /// Returns `None` when the vote should be dropped (committed height,
     /// non-committee voter, missing public key).
     fn preflight(
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         local_shard: ShardId,
         vote: &BlockVote,
         committed_height: BlockHeight,
@@ -305,12 +311,13 @@ impl VoteKeeper {
             return None;
         }
 
-        let Some(voter_index) = topology.committee_index_for_shard(local_shard, voter) else {
+        let Some(voter_index) = topology_snapshot.committee_index_for_shard(local_shard, voter)
+        else {
             warn!("Vote from validator {:?} not in committee", voter);
             return None;
         };
 
-        let Some(public_key) = topology.public_key(voter) else {
+        let Some(public_key) = topology_snapshot.public_key(voter) else {
             warn!("No public key for validator {:?}", voter);
             return None;
         };
@@ -338,11 +345,11 @@ impl VoteKeeper {
     /// threshold can't be met yet or no buffered signatures are waiting.
     pub fn maybe_trigger_verification(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         local_shard: ShardId,
         block_hash: BlockHash,
     ) -> Vec<Action> {
-        let total_power = topology.committee_votes(local_shard);
+        let total_power = topology_snapshot.committee_votes(local_shard);
 
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             return vec![];

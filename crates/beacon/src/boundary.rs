@@ -42,7 +42,7 @@ pub fn proposal_boundary_qcs_admissible(
     proposal: &Verified<BeaconProposal>,
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
-    topology: &TopologySchedule,
+    topology_schedule: &TopologySchedule,
     network: &NetworkDefinition,
 ) -> bool {
     proposal.boundary_qcs().iter().all(|(shard, opt)| {
@@ -59,7 +59,7 @@ pub fn proposal_boundary_qcs_admissible(
                 qc.as_unverified(),
                 state,
                 shard_source,
-                topology,
+                topology_schedule,
                 network,
             )
         })
@@ -175,13 +175,13 @@ fn boundary_qc_admissible(
     qc: &QuorumCertificate,
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
-    topology: &TopologySchedule,
+    topology_schedule: &TopologySchedule,
     network: &NetworkDefinition,
 ) -> bool {
     let Some(header) = boundary_header_for(shard_source, shard, qc.block_hash()) else {
         return false;
     };
-    boundary_qc_authentic(shard, header, qc, topology, network)
+    boundary_qc_authentic(shard, header, qc, topology_schedule, network)
         && rules::is_boundary_crossing(header, qc, state.chain_config.epoch_windows())
 }
 
@@ -213,13 +213,14 @@ fn boundary_qc_authentic(
     shard: ShardId,
     boundary_header: &BlockHeader,
     qc: &QuorumCertificate,
-    topology: &TopologySchedule,
+    topology_schedule: &TopologySchedule,
     network: &NetworkDefinition,
 ) -> bool {
     if qc.block_hash() != boundary_header.hash() {
         return false;
     }
-    let snapshot = match topology.lookup(boundary_header.parent_qc().weighted_timestamp()) {
+    let snapshot = match topology_schedule.lookup(boundary_header.parent_qc().weighted_timestamp())
+    {
         ScheduleLookup::Committee(snapshot) => snapshot,
         ScheduleLookup::NotYetCommitted => {
             debug!(

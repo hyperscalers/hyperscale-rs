@@ -133,10 +133,10 @@ impl SimCluster {
     /// pre-merge chain lingers under the same id on its old hosts; those carry
     /// no current committee seat, so this filters them out.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
-        let Some(topology) = self.runner.host_topology(0) else {
+        let Some(topology_snapshot) = self.runner.host_topology(0) else {
             return Vec::new();
         };
-        let committee: BTreeSet<ValidatorId> = topology
+        let committee: BTreeSet<ValidatorId> = topology_snapshot
             .committee_for_shard(shard)
             .iter()
             .copied()
@@ -154,10 +154,10 @@ impl SimCluster {
     /// shard tests resolve to the one serving host; cross-shard source
     /// selection is refined when cross-shard scenarios land.
     fn host_for_tx(&self, tx: &RoutableTransaction) -> Option<NodeIndex> {
-        let topology = self.runner.host_topology(0)?;
+        let topology_snapshot = self.runner.host_topology(0)?;
         let shards: BTreeSet<ShardId> = tx
             .all_declared_nodes()
-            .map(|node| topology.shard_for_node_id(node))
+            .map(|node| topology_snapshot.shard_for_node_id(node))
             .collect();
         (0..self.runner.num_hosts()).find(|&node| {
             self.runner

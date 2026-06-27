@@ -31,14 +31,14 @@ const MAX_STEPS: usize = 5_000;
 fn split_trigger_asserts_once_per_window_and_verifies() {
     let mut sim = ShardCoordinatorSim::new(4, 0x7E5A);
     let snapshot = sim
-        .topology
+        .topology_schedule
         .head()
         .as_ref()
         .clone()
         .with_params(NetworkParams {
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
         });
-    sim.topology = TopologySchedule::single(Arc::new(snapshot));
+    sim.topology_schedule = TopologySchedule::single(Arc::new(snapshot));
     sim.kick_off();
 
     let mut steps = 0;
@@ -124,7 +124,7 @@ fn observer_ready_signal_commits_as_reshape_ready_leaf() {
         BTreeMap::new(),
         BTreeSet::from([ShardId::ROOT]),
     );
-    sim.topology = TopologySchedule::single(Arc::new(snapshot));
+    sim.topology_schedule = TopologySchedule::single(Arc::new(snapshot));
 
     sim.emit_ready_signal(
         3,

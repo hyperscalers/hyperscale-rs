@@ -45,7 +45,7 @@ const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
 /// fresh to begin with; the operator decides whether to wipe and retry.
 pub async fn bootstrap_shard_state<S, N>(
     network: &Arc<N>,
-    topology: &SharedTopologySnapshot,
+    topology_snapshot: &SharedTopologySnapshot,
     storage: &Arc<S>,
     shard: ShardId,
 ) -> Result<RecoveredState, String>
@@ -54,7 +54,7 @@ where
     N: Network,
 {
     'anchor: loop {
-        let Some(anchor) = topology.load().boundary(shard) else {
+        let Some(anchor) = topology_snapshot.load().boundary(shard) else {
             return Err(format!("shard {shard:?} has no attested anchor"));
         };
         info!(
@@ -85,7 +85,7 @@ where
                     // a restart sound — nothing has been imported yet);
                     // the witness history serves from the live chain.
                     if lock(&bootstrap).is_assembling_state()
-                        && topology
+                        && topology_snapshot
                             .load()
                             .boundary(shard)
                             .is_some_and(|latest| latest != anchor)
@@ -372,10 +372,10 @@ mod tests {
         let (serving, anchor) = replica();
         let shard = ShardId::ROOT;
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 3));
-        let topology = shared_topology(anchor, shard);
+        let topology_snapshot = shared_topology(anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 
-        let recovered = bootstrap_shard_state(&network, &topology, &fresh, shard)
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
             .await
             .expect("bootstrap succeeds");
 

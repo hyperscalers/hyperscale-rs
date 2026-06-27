@@ -18,23 +18,23 @@ use hyperscale_types::{Bls12381G1PublicKey, Round, ShardId, TopologySnapshot, Va
 /// broadcasting its block, the secondary already has the votes and can form
 /// the QC on view change without re-collection.
 pub fn vote_recipients(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     shard: ShardId,
     me: ValidatorId,
     round: Round,
 ) -> Vec<ValidatorId> {
     const K: usize = 2;
-    let committee_len = topology.consensus_committee_for_shard(shard).len();
+    let committee_len = topology_snapshot.consensus_committee_for_shard(shard).len();
     let mut recipients = Vec::with_capacity(K + 1);
 
-    let block_proposer = topology.proposer_for(shard, round);
+    let block_proposer = topology_snapshot.proposer_for(shard, round);
     if block_proposer != me {
         recipients.push(block_proposer);
     }
 
     let mut next_count = 0;
     for offset in 1..=committee_len as u64 {
-        let proposer = topology.proposer_for(shard, round + offset);
+        let proposer = topology_snapshot.proposer_for(shard, round + offset);
         if proposer != me && !recipients.contains(&proposer) {
             recipients.push(proposer);
             next_count += 1;
@@ -62,19 +62,21 @@ pub fn vote_recipients(
 /// invariant violation, not a recoverable condition, and failing loud beats
 /// silently wedging the shard under a corrupt snapshot.
 pub fn committee_public_keys(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     shard: ShardId,
 ) -> Vec<Bls12381G1PublicKey> {
-    topology
+    topology_snapshot
         .consensus_committee_for_shard(shard)
         .iter()
         .map(|&validator_id| {
-            topology.public_key(validator_id).unwrap_or_else(|| {
-                panic!(
-                    "committee member {validator_id:?} absent from validator set — \
+            topology_snapshot
+                .public_key(validator_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "committee member {validator_id:?} absent from validator set — \
                      BeaconState invariant (committees subset of validators) violated"
-                )
-            })
+                    )
+                })
         })
         .collect()
 }
@@ -103,7 +105,7 @@ mod tests {
     fn vote_recipients_targets_next_proposers() {
         // 4 validators, self = V0. Proposer formula: committee[round % 4].
         let committee = TestCommittee::new(4, 42);
-        let topology = topology_for(&committee);
+        let topology_snapshot = topology_for(&committee);
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
 
@@ -111,7 +113,7 @@ mod tests {
         //   Block proposer: round 0 -> V0 (self, skipped)
         //   Next proposers: V1 (round 1), V2 (round 2)
         assert_eq!(
-            vote_recipients(&topology, shard, me, Round::new(0)),
+            vote_recipients(&topology_snapshot, shard, me, Round::new(0)),
             vec![ValidatorId::new(1), ValidatorId::new(2)]
         );
 
@@ -119,7 +121,7 @@ mod tests {
         //   Block proposer: round 1 -> V1 (included)
         //   Next proposers: V2 (round 2), V3 (round 3)
         assert_eq!(
-            vote_recipients(&topology, shard, me, Round::new(1)),
+            vote_recipients(&topology_snapshot, shard, me, Round::new(1)),
             vec![
                 ValidatorId::new(1),
                 ValidatorId::new(2),
@@ -134,11 +136,11 @@ mod tests {
         //   Block proposer: round 3 -> V3
         //   Next proposers: V0 (round 4, self, skipped), V1 (round 5), V2 (round 6)
         let committee = TestCommittee::new(4, 42);
-        let topology = topology_for(&committee);
+        let topology_snapshot = topology_for(&committee);
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
         assert_eq!(
-            vote_recipients(&topology, shard, me, Round::new(3)),
+            vote_recipients(&topology_snapshot, shard, me, Round::new(3)),
             vec![
                 ValidatorId::new(3),
                 ValidatorId::new(1),
@@ -153,11 +155,11 @@ mod tests {
         //   Block proposer: round 2 -> V2
         //   Next proposers: V3 (round 3), V0 (round 4, self, skipped), V1 (round 5)
         let committee = TestCommittee::new(4, 42);
-        let topology = topology_for(&committee);
+        let topology_snapshot = topology_for(&committee);
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
         assert_eq!(
-            vote_recipients(&topology, shard, me, Round::new(2)),
+            vote_recipients(&topology_snapshot, shard, me, Round::new(2)),
             vec![
                 ValidatorId::new(2),
                 ValidatorId::new(3),
@@ -169,10 +171,10 @@ mod tests {
     #[test]
     fn vote_recipients_empty_when_solo_validator() {
         let committee = TestCommittee::new(1, 42);
-        let topology = topology_for(&committee);
+        let topology_snapshot = topology_for(&committee);
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
-        assert!(vote_recipients(&topology, shard, me, Round::new(0)).is_empty());
+        assert!(vote_recipients(&topology_snapshot, shard, me, Round::new(0)).is_empty());
     }
 
     // ─── committee_public_keys ──────────────────────────────────────────
@@ -180,10 +182,10 @@ mod tests {
     #[test]
     fn committee_public_keys_returns_all_keys_in_order() {
         let committee = TestCommittee::new(4, 42);
-        let topology = topology_for(&committee);
+        let topology_snapshot = topology_for(&committee);
         let shard = ShardId::ROOT;
 
-        let keys = committee_public_keys(&topology, shard);
+        let keys = committee_public_keys(&topology_snapshot, shard);
         assert_eq!(keys.len(), 4);
 
         // Canonical order: committee[i] corresponds to validator i.

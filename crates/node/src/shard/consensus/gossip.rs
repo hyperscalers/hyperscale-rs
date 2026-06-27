@@ -104,11 +104,11 @@ where
         }
 
         let event_tx = self.event_sender().clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
-                let topo = topology.load();
+                let topo = topology_snapshot.load();
                 for (certified_header, sender, public_key, sender_signature) in unverified {
                     let gossip = CertifiedBlockHeaderGossip {
                         certified_header,

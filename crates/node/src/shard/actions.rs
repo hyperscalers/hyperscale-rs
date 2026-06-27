@@ -758,14 +758,15 @@ where
     /// here, but the final stored value is identical.
     pub(in crate::shard) fn handle_topology_changed(
         &self,
-        topology: &Arc<TopologySnapshot>,
+        topology_snapshot: &Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
-        self.process.apply_topology(topology, routing_committees);
+        self.process
+            .apply_topology(topology_snapshot, routing_committees);
 
         tracing::info!(
             local_shard = self.shard.inner(),
-            committee_size = topology.committee_for_shard(self.shard).len(),
+            committee_size = topology_snapshot.committee_for_shard(self.shard).len(),
             "Network topology updated"
         );
     }

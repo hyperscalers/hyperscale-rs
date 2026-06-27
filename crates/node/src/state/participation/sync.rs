@@ -16,21 +16,26 @@ impl ShardParticipation {
     /// Dispatch a sync-category `ProtocolEvent`.
     pub(in crate::state) fn handle_sync(
         &mut self,
-        sched: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         event: ProtocolEvent,
     ) -> Vec<Action> {
         match event {
-            ProtocolEvent::BlockSyncReadyToApply { certified } => self
-                .shard_coordinator
-                .on_sync_block_ready_to_apply(sched, std::sync::Arc::unwrap_or_clone(certified)),
+            ProtocolEvent::BlockSyncReadyToApply { certified } => {
+                self.shard_coordinator.on_sync_block_ready_to_apply(
+                    topology_schedule,
+                    std::sync::Arc::unwrap_or_clone(certified),
+                )
+            }
             // BlockSync finished fetching: exit shard consensus sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
-                let mut actions = self.shard_coordinator.on_block_sync_complete(sched);
+                let mut actions = self
+                    .shard_coordinator
+                    .on_block_sync_complete(topology_schedule);
                 actions.extend(
                     self.remote_headers_coordinator
-                        .flush_expected_headers(sched),
+                        .flush_expected_headers(topology_schedule),
                 );
                 actions.extend(self.provisions_coordinator.flush_expected_provisions());
                 actions
@@ -54,11 +59,12 @@ impl ShardParticipation {
                 self.execution_coordinator
                     .record_settled_waves(shard, set.clone());
                 self.shard_coordinator.record_settled_waves(shard, set);
-                let topology = sched;
-                let mut actions = self.shard_coordinator.redrive_pending_votes(topology);
+                let mut actions = self
+                    .shard_coordinator
+                    .redrive_pending_votes(topology_schedule);
                 actions.extend(
                     self.execution_coordinator
-                        .redrive_gated_finalizations(topology),
+                        .redrive_gated_finalizations(topology_schedule),
                 );
                 // Settled certificates ingested before the set was
                 // reconstructed leave the counterpart sweep immediately

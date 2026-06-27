@@ -244,7 +244,9 @@ mod tests {
         // proposer_for(r=1) = committee[1 % 4] = ValidatorId::new(1).
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
         assert!(
-            node.topology().proposer_for(node.shard_id(), Round::new(1)) == node.validator_id(),
+            node.topology_snapshot()
+                .proposer_for(node.shard_id(), Round::new(1))
+                == node.validator_id(),
             "local must be the height-1 proposer for this test",
         );
 

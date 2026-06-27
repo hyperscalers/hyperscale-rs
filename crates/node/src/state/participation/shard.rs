@@ -80,15 +80,15 @@ impl ShardParticipation {
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per shard variant
     pub(in crate::state) fn handle_shard(
         &mut self,
-        sched: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         event: ProtocolEvent,
     ) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
-                self.on_block_header_received(sched, &header, manifest)
+                self.on_block_header_received(topology_schedule, &header, manifest)
             }
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
-                self.on_qc_formed(sched, block_hash, &qc)
+                self.on_qc_formed(topology_schedule, block_hash, &qc)
             }
             ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header,
@@ -97,9 +97,8 @@ impl ShardParticipation {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = sched;
                 self.remote_headers_coordinator.on_remote_header_received(
-                    topology,
+                    topology_schedule,
                     certified_header,
                     sender,
                 )
@@ -110,36 +109,39 @@ impl ShardParticipation {
             } => self
                 .remote_headers_coordinator
                 .on_verified_remote_header_received(certified_header, sender),
-            ProtocolEvent::VerifiedBlockVoteReceived { vote } => {
-                self.shard_coordinator.on_verified_block_vote(sched, vote)
-            }
-            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => {
-                self.shard_coordinator.on_unverified_block_vote(sched, vote)
-            }
-            ProtocolEvent::VerifiedTimeoutReceived { timeout } => {
-                self.shard_coordinator.on_verified_timeout(sched, timeout)
-            }
+            ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
+                .shard_coordinator
+                .on_verified_block_vote(topology_schedule, vote),
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
+                .shard_coordinator
+                .on_unverified_block_vote(topology_schedule, vote),
+            ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
+                .shard_coordinator
+                .on_verified_timeout(topology_schedule, timeout),
             ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
                 .shard_coordinator
-                .on_unverified_timeout(sched, &timeout),
+                .on_unverified_timeout(topology_schedule, &timeout),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
-                    .on_ready_signal_received(sched, signal);
+                    .on_ready_signal_received(topology_schedule, signal);
                 Vec::new()
             }
             ProtocolEvent::BlockReadyToCommit { certified, source } => self
                 .shard_coordinator
-                .on_block_ready_to_commit(sched, certified, source),
+                .on_block_ready_to_commit(topology_schedule, certified, source),
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self
-                .shard_coordinator
-                .on_qc_result(sched, block_hash, qc, verified_votes),
+            } => self.shard_coordinator.on_qc_result(
+                topology_schedule,
+                block_hash,
+                qc,
+                verified_votes,
+            ),
             ProtocolEvent::QcSignatureVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_qc_signature_verified(sched, block_hash, result),
+                .on_qc_signature_verified(topology_schedule, block_hash, result),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -147,31 +149,31 @@ impl ShardParticipation {
                 result,
             } => self
                 .remote_headers_coordinator
-                .on_remote_header_qc_verified(sched, shard, height, sender, *result),
+                .on_remote_header_qc_verified(topology_schedule, shard, height, sender, *result),
             ProtocolEvent::TransactionRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_transaction_root_verified(sched, block_hash, result),
+                .on_transaction_root_verified(topology_schedule, block_hash, result),
             ProtocolEvent::CertificateRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_certificate_root_verified(sched, block_hash, result),
+                .on_certificate_root_verified(topology_schedule, block_hash, result),
             ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_local_receipt_root_verified(sched, block_hash, result),
+                .on_local_receipt_root_verified(topology_schedule, block_hash, result),
             ProtocolEvent::ProvisionsRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_provisions_root_verified(sched, block_hash, result),
+                .on_provisions_root_verified(topology_schedule, block_hash, result),
             ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_provision_tx_roots_verified(sched, block_hash, result),
+                .on_provision_tx_roots_verified(topology_schedule, block_hash, result),
             ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_beacon_witness_root_verified(sched, block_hash, result),
+                .on_beacon_witness_root_verified(topology_schedule, block_hash, result),
             ProtocolEvent::StateRootVerified {
                 block_hash,
                 result,
                 bytes_delta,
             } => self.shard_coordinator.on_state_root_verified(
-                sched,
+                topology_schedule,
                 block_hash,
                 result,
                 bytes_delta,
@@ -186,7 +188,7 @@ impl ShardParticipation {
                 provisions,
                 bytes_delta,
             } => self.shard_coordinator.on_proposal_built(
-                sched,
+                topology_schedule,
                 height,
                 round,
                 &block,
@@ -206,9 +208,11 @@ impl ShardParticipation {
                 height,
                 substate_bytes,
             } => {
-                let mut actions =
-                    self.shard_coordinator
-                        .on_block_persisted(sched, height, substate_bytes);
+                let mut actions = self.shard_coordinator.on_block_persisted(
+                    topology_schedule,
+                    height,
+                    substate_bytes,
+                );
                 // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {
@@ -220,7 +224,7 @@ impl ShardParticipation {
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
-                .on_finalized_waves_admitted(sched, &waves),
+                .on_finalized_waves_admitted(topology_schedule, &waves),
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }
@@ -478,7 +482,9 @@ mod tests {
         // = ValidatorId::new(1). Pick local_idx=1 to be the leader.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
         assert!(
-            node.topology().proposer_for(node.shard_id(), Round::new(1)) == node.validator_id(),
+            node.topology_snapshot()
+                .proposer_for(node.shard_id(), Round::new(1))
+                == node.validator_id(),
             "local must be the height-1 proposer for this test",
         );
 
@@ -507,7 +513,9 @@ mod tests {
         // are not the leader.
         let TestNode { mut node, .. } = TestNode::new();
         assert!(
-            node.topology().proposer_for(node.shard_id(), Round::new(1)) != node.validator_id(),
+            node.topology_snapshot()
+                .proposer_for(node.shard_id(), Round::new(1))
+                != node.validator_id(),
             "local must NOT be the height-1 proposer for this test",
         );
 

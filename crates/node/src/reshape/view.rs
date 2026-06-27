@@ -18,47 +18,49 @@ use hyperscale_types::{ShardAnchor, ShardId, TopologySnapshot, ValidatorId};
 /// Reshape gate predicates over one host's [`TopologySnapshot`] — the
 /// identity-agnostic projection of the committed `BeaconState`.
 pub struct ReshapeView<'a> {
-    topology: &'a TopologySnapshot,
+    topology_snapshot: &'a TopologySnapshot,
 }
 
 impl<'a> ReshapeView<'a> {
     /// View the reshape gate through `topology`.
     #[must_use]
-    pub const fn new(topology: &'a TopologySnapshot) -> Self {
-        Self { topology }
+    pub const fn new(topology_snapshot: &'a TopologySnapshot) -> Self {
+        Self { topology_snapshot }
     }
 
     /// The shard's beacon-attested boundary anchor, or `None` until it seeds.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
-        self.topology.boundary(shard)
+        self.topology_snapshot.boundary(shard)
     }
 
     /// The shard's full committee — the ready-signal broadcast recipients.
     #[must_use]
     pub fn committee(&self, shard: ShardId) -> &[ValidatorId] {
-        self.topology.committee_for_shard(shard)
+        self.topology_snapshot.committee_for_shard(shard)
     }
 
     /// The split child `validator` syncs as an observer of `parent`'s pending
     /// split, or `None` when it holds no observer seat there.
     #[must_use]
     pub fn observer_child(&self, parent: ShardId, validator: ValidatorId) -> Option<ShardId> {
-        self.topology.reshape_observer_child(parent, validator)
+        self.topology_snapshot
+            .reshape_observer_child(parent, validator)
     }
 
     /// The parent `validator` reforms as a keeper of `child` in a pending
     /// merge, or `None` when it holds no keeper seat there.
     #[must_use]
     pub fn keeper_parent(&self, child: ShardId, validator: ValidatorId) -> Option<ShardId> {
-        self.topology.reshape_keeper_parent(child, validator)
+        self.topology_snapshot
+            .reshape_keeper_parent(child, validator)
     }
 
     /// The pending-split observer cohorts, keyed by splitting parent — the
     /// orchestrator scans these for its host's observer seats.
     #[must_use]
     pub const fn observer_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
-        self.topology.reshape_observer_cohorts()
+        self.topology_snapshot.reshape_observer_cohorts()
     }
 
     /// The pending-merge keeper cohorts, keyed by the child each keeper runs —
@@ -66,7 +68,7 @@ impl<'a> ReshapeView<'a> {
     /// for its host's keeper seats.
     #[must_use]
     pub const fn keeper_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
-        self.topology.reshape_keeper_cohorts()
+        self.topology_snapshot.reshape_keeper_cohorts()
     }
 
     /// The executed-split parent-half cohorts, keyed by the child each member
@@ -74,7 +76,7 @@ impl<'a> ReshapeView<'a> {
     /// from. The orchestrator scans these for its host's parent-half seats.
     #[must_use]
     pub const fn parent_half_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
-        self.topology.reshape_parent_half_cohorts()
+        self.topology_snapshot.reshape_parent_half_cohorts()
     }
 
     /// Whether `shard` has seeded a beacon-attested boundary anchor. The
@@ -82,7 +84,7 @@ impl<'a> ReshapeView<'a> {
     /// means the shard's boundary crossing committed.
     #[must_use]
     pub fn seeded(&self, shard: ShardId) -> bool {
-        self.topology.boundary(shard).is_some()
+        self.topology_snapshot.boundary(shard).is_some()
     }
 
     /// Whether both of `parent`'s split children have seeded — the gate a

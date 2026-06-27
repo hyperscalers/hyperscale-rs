@@ -60,7 +60,7 @@ pub enum SettledSetVerdict {
 /// node-local callers (the finalize gate) pass their committed timestamp.
 pub fn settled_set_verdict<'a, S, I>(
     settled_sets: &HashMap<ShardId, SettledWaveSet, S>,
-    topology: &TopologySchedule,
+    topology_schedule: &TopologySchedule,
     local_shard: ShardId,
     anchored_wt: WeightedTimestamp,
     ecs: I,
@@ -76,7 +76,7 @@ where
         }
         // Evicted from every retained window — terminated so long ago its
         // waves can never resolve.
-        let Some((_, past_terminal)) = topology.at_for_shard(shard, anchored_wt) else {
+        let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
             return SettledSetVerdict::Reject;
         };
         if !past_terminal {

@@ -259,7 +259,7 @@ pub struct GenesisBoot {
     pub chain: GenesisChain,
     /// Topology projected from `chain.state`, identical in shape to the
     /// snapshot the runtime `ArcSwap` update derives on every epoch commit.
-    pub topology: TopologySnapshot,
+    pub topology_snapshot: TopologySnapshot,
 }
 
 /// Build the genesis beacon chain from `genesis` and project its topology
@@ -301,10 +301,13 @@ pub fn build_genesis(genesis: &GenesisValidators, chain_config: BeaconChainConfi
         shard_committees,
         network: &genesis.network,
     });
-    let topology = chain
+    let topology_snapshot = chain
         .state
         .derive_topology_snapshot(genesis.network.clone());
-    GenesisBoot { chain, topology }
+    GenesisBoot {
+        chain,
+        topology_snapshot,
+    }
 }
 
 /// Walk every invariant the builder relies on, panicking on the first

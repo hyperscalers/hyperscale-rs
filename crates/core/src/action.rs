@@ -787,7 +787,7 @@ pub enum Action {
         /// (`waves`, `provision_tx_roots`) keys on this, not the `ArcSwap`
         /// head, so a head-flipped proposer at a reshape boundary produces
         /// a header that resolves identically on every replica.
-        classification_topology: Arc<TopologySnapshot>,
+        classification_topology_snapshot: Arc<TopologySnapshot>,
     },
 
     /// Execute every transaction in a single-shard wave.

@@ -47,7 +47,7 @@ struct Fixture {
     genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
-    topology: Arc<TopologySnapshot>,
+    topology_snapshot: Arc<TopologySnapshot>,
 }
 
 fn fixture() -> Fixture {
@@ -100,7 +100,7 @@ fn fixture() -> Fixture {
             })
             .collect(),
     );
-    let topology = Arc::new(TopologySnapshot::with_shard_committees(
+    let topology_snapshot = Arc::new(TopologySnapshot::with_shard_committees(
         network,
         2,
         &validator_set,
@@ -113,7 +113,7 @@ fn fixture() -> Fixture {
         genesis_block,
         genesis_state,
         config_hash,
-        topology,
+        topology_snapshot,
     }
 }
 
@@ -197,7 +197,7 @@ fn add_and_remove_shard_at_runtime() {
         SyncDispatch,
         std::iter::once((SHARD_A, event_tx.clone())).collect(),
         event_tx.clone(),
-        Arc::new(ArcSwap::from(Arc::clone(&fix.topology))),
+        Arc::new(ArcSwap::from(Arc::clone(&fix.topology_snapshot))),
         NodeConfig::default(),
         Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
     );
@@ -302,7 +302,7 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
         SyncDispatch,
         BTreeMap::new(),
         event_tx,
-        Arc::new(ArcSwap::from(Arc::clone(&fix.topology))),
+        Arc::new(ArcSwap::from(Arc::clone(&fix.topology_snapshot))),
         NodeConfig::default(),
         Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
     );
@@ -364,7 +364,7 @@ fn runtime_built_pool_is_fed_beacon_blocks() {
         SyncDispatch,
         std::iter::once((SHARD_A, event_tx.clone())).collect(),
         event_tx,
-        Arc::new(ArcSwap::from(Arc::clone(&fix.topology))),
+        Arc::new(ArcSwap::from(Arc::clone(&fix.topology_snapshot))),
         NodeConfig::default(),
         Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
     );
@@ -444,7 +444,7 @@ fn remove_unknown_shard_is_none() {
         SyncDispatch,
         std::iter::once((SHARD_A, event_tx.clone())).collect(),
         event_tx,
-        Arc::new(ArcSwap::from(Arc::clone(&fix.topology))),
+        Arc::new(ArcSwap::from(Arc::clone(&fix.topology_snapshot))),
         NodeConfig::default(),
         Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
     );

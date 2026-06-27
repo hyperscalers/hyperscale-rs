@@ -220,7 +220,7 @@ impl RemoteHeaderCoordinator {
     /// `VerifyRemoteHeaderQc` for async QC verification.
     pub fn on_remote_header_received(
         &mut self,
-        topology: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         certified_header: Arc<CertifiedBlockHeader>,
         sender: ValidatorId,
     ) -> Vec<Action> {
@@ -281,7 +281,7 @@ impl RemoteHeaderCoordinator {
         // shard's terminal committee. The beacon's crossing tracker reads
         // the terminal block's canonical QC off the first coast header, so
         // dropping these would blind the fold to the crossing.
-        let committee = match topology
+        let committee = match topology_schedule
             .lookup_for_shard(
                 shard,
                 certified_header.header().parent_qc().weighted_timestamp(),
@@ -342,7 +342,7 @@ impl RemoteHeaderCoordinator {
     /// On failure: removes the failed candidate and tries the next sender's header.
     pub fn on_remote_header_qc_verified(
         &mut self,
-        topology: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         shard: ShardId,
         height: BlockHeight,
         sender: ValidatorId,
@@ -381,7 +381,7 @@ impl RemoteHeaderCoordinator {
                         return vec![];
                     };
                     let anchor = next_header.header().parent_qc().weighted_timestamp();
-                    match topology.lookup_for_shard(shard, anchor).0 {
+                    match topology_schedule.lookup_for_shard(shard, anchor).0 {
                         ScheduleLookup::Committee(committee) => {
                             return Self::emit_verify_qc(
                                 committee,
@@ -456,7 +456,7 @@ impl RemoteHeaderCoordinator {
     /// 3. Checks for timed-out remote shards and emits fallback requests
     pub fn on_block_committed(
         &mut self,
-        topology: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
         let new_ts = certified.block().header().parent_qc().weighted_timestamp();
@@ -479,7 +479,7 @@ impl RemoteHeaderCoordinator {
             }
         }
 
-        self.refresh_expected(topology);
+        self.refresh_expected(topology_schedule);
 
         // Check for timed-out remote shards.
         let mut actions = vec![];
@@ -496,7 +496,7 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            if !Self::shard_routable(topology, shard, now) {
+            if !Self::shard_routable(topology_schedule, shard, now) {
                 continue;
             }
 
@@ -539,8 +539,8 @@ impl RemoteHeaderCoordinator {
     /// the `2f+1` that admits its terminal boundary QC. The terminal clamp on
     /// the schedule retains the shard until the drain horizon, exactly long
     /// enough for its terminal to fold.
-    fn refresh_expected(&mut self, topology: &TopologySchedule) {
-        let routable = topology.routable_shards();
+    fn refresh_expected(&mut self, topology_schedule: &TopologySchedule) {
+        let routable = topology_schedule.routable_shards();
         self.expected.retain(|shard, _| routable.contains(shard));
         for shard in routable {
             if shard == self.local_shard {
@@ -554,7 +554,7 @@ impl RemoteHeaderCoordinator {
             // witness window — far enough that no live cross-shard provision
             // references a block below it — so it is a sound anchor.
             // Gossip-verified headers raise it from there.
-            let anchor_height = topology
+            let anchor_height = topology_schedule
                 .head()
                 .boundary(shard)
                 .map_or(BlockHeight::new(0), |a| a.height);
@@ -573,11 +573,11 @@ impl RemoteHeaderCoordinator {
     ///
     /// Called on sync-complete so the validator quickly discovers provision
     /// needs for blocks committed during the sync window.
-    pub fn flush_expected_headers(&mut self, topology: &TopologySchedule) -> Vec<Action> {
+    pub fn flush_expected_headers(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let mut actions = vec![];
 
         for (&shard, expected) in &self.expected {
-            if !Self::shard_routable(topology, shard, self.local_committed_ts) {
+            if !Self::shard_routable(topology_schedule, shard, self.local_committed_ts) {
                 continue;
             }
 
@@ -717,32 +717,35 @@ impl RemoteHeaderCoordinator {
     /// the buffer and replays each through [`Self::on_remote_header_received`],
     /// which re-resolves the committee and re-buffers any still beyond the
     /// schedule. Called on `ProtocolEvent::BeaconBlockPersisted`.
-    pub fn on_beacon_block_persisted(&mut self, topology: &TopologySchedule) -> Vec<Action> {
+    pub fn on_beacon_block_persisted(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         for (sender, header) in self.awaiting.drain() {
-            actions.extend(self.on_remote_header_received(topology, header, sender));
+            actions.extend(self.on_remote_header_received(topology_schedule, header, sender));
         }
         actions
     }
 
     /// Emit a `VerifyRemoteHeaderQc` action for the given header.
     fn emit_verify_qc(
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         shard: ShardId,
         height: BlockHeight,
         sender: ValidatorId,
         certified_header: Arc<CertifiedBlockHeader>,
     ) -> Vec<Action> {
-        let committee = topology.consensus_committee_for_shard(shard);
+        let committee = topology_snapshot.consensus_committee_for_shard(shard);
         let committee_public_keys: Vec<Bls12381G1PublicKey> = committee
             .iter()
             .map(|v| {
-                topology
+                topology_snapshot
                     .public_key(*v)
                     .expect("committee member must have public key")
             })
             .collect();
-        let quorum_threshold = topology.quorum_threshold_for_shard(shard);
+        let quorum_threshold = topology_snapshot.quorum_threshold_for_shard(shard);
 
         vec![Action::VerifyRemoteHeaderQc {
             certified_header,
@@ -760,9 +763,13 @@ impl RemoteHeaderCoordinator {
     /// merge child — resolves the committee that served it, so its terminal
     /// crossing keeps syncing to the beacon fold until the schedule evicts
     /// it. A fully-evicted shard resolves nothing and is skipped.
-    fn shard_routable(topology: &TopologySchedule, shard: ShardId, wt: WeightedTimestamp) -> bool {
+    fn shard_routable(
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> bool {
         matches!(
-            topology.lookup_for_shard(shard, wt).0,
+            topology_schedule.lookup_for_shard(shard, wt).0,
             ScheduleLookup::Committee(snapshot) if !snapshot.committee_for_shard(shard).is_empty()
         )
     }

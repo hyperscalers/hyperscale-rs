@@ -23,17 +23,17 @@ use crate::{
 /// validation (to verify the header's waves field).
 pub fn compute_waves(
     local_shard: ShardId,
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     block_height: BlockHeight,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
 ) -> Vec<WaveId> {
     let mut remote_shard_sets: BTreeSet<BTreeSet<ShardId>> = BTreeSet::new();
 
     for tx in transactions {
-        if topology.is_single_shard_transaction(tx) {
+        if topology_snapshot.is_single_shard_transaction(tx) {
             continue;
         }
-        let remote_shards: BTreeSet<ShardId> = topology
+        let remote_shards: BTreeSet<ShardId> = topology_snapshot
             .all_shards_for_transaction(tx)
             .into_iter()
             .filter(|&s| s != local_shard)

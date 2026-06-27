@@ -330,7 +330,7 @@ where
     /// `Action::TopologyChanged`. Long-running consumers hold the
     /// handle and re-load to observe beacon commits.
     #[must_use]
-    pub const fn topology(&self) -> &SharedTopologySnapshot {
+    pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
         &self.topology_snapshot
     }
 
@@ -379,12 +379,12 @@ where
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
     /// hosted shard, but no shard admits or takes ownership.
     pub(crate) fn compute_submit_fanout(&self, tx: &RoutableTransaction) -> SubmitFanout {
-        let topology = self.topology_snapshot.load();
+        let topology_snapshot = self.topology_snapshot.load();
         let touched_shards: Vec<ShardId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())
-            .map(|node_id| topology.shard_for_node_id(node_id))
+            .map(|node_id| topology_snapshot.shard_for_node_id(node_id))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -495,11 +495,11 @@ where
     /// — idempotent across them, the final stored value is identical.
     pub(crate) fn apply_topology(
         &self,
-        topology: &Arc<TopologySnapshot>,
+        topology_snapshot: &Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
-        self.topology_snapshot.store(Arc::clone(topology));
-        self.network.update_topology(Arc::clone(topology));
+        self.topology_snapshot.store(Arc::clone(topology_snapshot));
+        self.network.update_topology(Arc::clone(topology_snapshot));
         self.network.update_routing_committees(routing_committees);
     }
 }

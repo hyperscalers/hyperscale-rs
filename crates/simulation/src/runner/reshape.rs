@@ -78,10 +78,10 @@ impl SimulationRunner {
     /// Drive one host's orchestrator to a fixpoint: step it, perform each
     /// request, feed the results back, and repeat until a step produces no io.
     fn pump_reshape_host(&mut self, node: NodeIndex) {
-        let Some(topology) = self.host_topology(node) else {
+        let Some(topology_snapshot) = self.host_topology(node) else {
             return;
         };
-        let view = ReshapeView::new(&topology);
+        let view = ReshapeView::new(&topology_snapshot);
         let mut orch = std::mem::take(&mut self.reshape[node as usize]);
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's not-yet-committed block fetches re-arm their sequencers
@@ -230,7 +230,7 @@ impl SimulationRunner {
     ) -> Option<ReshapeEvent> {
         let ready = self
             .host_topology(node)
-            .and_then(|topology| topology.boundary(child))
+            .and_then(|topology_snapshot| topology_snapshot.boundary(child))
             .zip(self.hosts_shard(node, parent))
             .is_some_and(|(anchor, storage)| storage.committed_height() >= anchor.height);
         if !ready {
@@ -526,10 +526,10 @@ impl SimulationRunner {
     /// outcome; the pump only advances duties while `grow_to` drives it, so a
     /// member left unseated at return never catches up.
     fn grown_to(&self, target: u64) -> bool {
-        let Some(topology) = self.host_topology(0) else {
+        let Some(topology_snapshot) = self.host_topology(0) else {
             return false;
         };
-        let leaves: Vec<ShardId> = topology.shard_trie().leaves().collect();
+        let leaves: Vec<ShardId> = topology_snapshot.shard_trie().leaves().collect();
         leaves.len() as u64 >= target
             && leaves.iter().all(|&leaf| {
                 let past_genesis = (0..self.num_hosts()).any(|node| {
@@ -541,7 +541,7 @@ impl SimulationRunner {
                     .iter()
                     .map(|vnode| vnode.validator_id())
                     .collect();
-                let committee = topology.committee_for_shard(leaf);
+                let committee = topology_snapshot.committee_for_shard(leaf);
                 past_genesis
                     && !committee.is_empty()
                     && committee.iter().all(|member| seated.contains(member))

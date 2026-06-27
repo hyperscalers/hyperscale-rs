@@ -260,11 +260,11 @@ mod tests {
         }
     }
 
-    fn topology() -> TopologySnapshot {
+    fn topology_snapshot() -> TopologySnapshot {
         TestCommittee::new(4, 7).topology_snapshot(1)
     }
 
-    /// [`topology`]'s committee with `observer` holding a seat on
+    /// [`topology_snapshot`]'s committee with `observer` holding a seat on
     /// ROOT's pending left child.
     fn topology_with_observer(observer: u64) -> TopologySnapshot {
         let committee = TestCommittee::new(4, 7);
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn missed_proposals_empty_when_no_skipped_rounds() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let missed = missed_proposals_since_prev_commit(
             ShardId::ROOT,
             BlockHeight::new(5),
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn missed_proposals_emits_one_per_skipped_round() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let parent_round = Round::INITIAL;
         let committed_round = Round::new(parent_round.inner() + 3);
         let missed = missed_proposals_since_prev_commit(
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn derive_leaves_orders_sources_canonically() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let missed = missed_proposals_since_prev_commit(
             ShardId::ROOT,
             BlockHeight::new(5),
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn derive_leaves_byte_identical_across_runs() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let missed = missed_proposals_since_prev_commit(
             ShardId::ROOT,
             BlockHeight::new(9),

@@ -272,7 +272,7 @@ pub struct ShardCoordinatorSim {
     /// Identity-agnostic topology shared by every replica. A single-committee
     /// schedule — the sim runs within one epoch, so every weighted timestamp
     /// resolves to the same committee.
-    pub topology: TopologySchedule,
+    pub topology_schedule: TopologySchedule,
     /// Network definition used as the BLS signing domain.
     network: NetworkDefinition,
     /// The single shard this sim hosts.
@@ -321,7 +321,7 @@ impl ShardCoordinatorSim {
     pub fn new(n: usize, seed: u64) -> Self {
         assert!(n >= 1, "ShardCoordinatorSim n must be >= 1");
         let committee = TestCommittee::new(n, seed);
-        let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
+        let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let network = NetworkDefinition::simulator();
         let shard = ShardId::ROOT;
 
@@ -372,7 +372,7 @@ impl ShardCoordinatorSim {
             storages,
             pending_chains,
             tx_pools: (0..n).map(|_| HashMap::new()).collect(),
-            topology,
+            topology_schedule,
             network,
             shard,
             commits: (0..n).map(|_| Vec::new()).collect(),
@@ -415,8 +415,8 @@ impl ShardCoordinatorSim {
     /// protocol feeding a fetched block back into the coordinator.
     pub fn deliver_synced_block(&mut self, replica: ValidatorId, certified: &CertifiedBlock) {
         let idx = self.idx_of(replica);
-        let actions =
-            self.coordinators[idx].on_sync_block_ready_to_apply(&self.topology, certified.clone());
+        let actions = self.coordinators[idx]
+            .on_sync_block_ready_to_apply(&self.topology_schedule, certified.clone());
         self.absorb(idx, actions);
     }
 
@@ -427,7 +427,7 @@ impl ShardCoordinatorSim {
     /// of sync mode.
     pub fn deliver_block_persisted(&mut self, replica: ValidatorId, height: BlockHeight) {
         let idx = self.idx_of(replica);
-        let actions = self.coordinators[idx].on_block_persisted(&self.topology, height, 0);
+        let actions = self.coordinators[idx].on_block_persisted(&self.topology_schedule, height, 0);
         self.absorb(idx, actions);
     }
 
@@ -469,7 +469,8 @@ impl ShardCoordinatorSim {
         let hash = tx.hash();
         let tx_slice = [Arc::clone(&tx)];
         self.tx_pools[idx].insert(hash, tx);
-        let actions = self.coordinators[idx].on_transactions_admitted(&self.topology, &tx_slice);
+        let actions =
+            self.coordinators[idx].on_transactions_admitted(&self.topology_schedule, &tx_slice);
         self.absorb(idx, actions);
         // The node's tx-admission arm explicitly latches a retry
         // after `on_transactions_admitted` so the leader's
@@ -497,7 +498,8 @@ impl ShardCoordinatorSim {
         let sig = Bls12381G2Signature(sk.sign_v1(&msg).0);
         let signal = ReadySignal::new(validator, wt_window_start, wt_window_end, sig);
         for idx in 0..self.n() {
-            self.coordinators[idx].on_ready_signal_received(&self.topology, signal.clone());
+            self.coordinators[idx]
+                .on_ready_signal_received(&self.topology_schedule, signal.clone());
         }
     }
 
@@ -508,7 +510,7 @@ impl ShardCoordinatorSim {
     /// timeout not yet elapsed).
     pub fn fire_view_change_timer(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
-        if let Some(actions) = self.coordinators[idx].check_round_timeout(&self.topology) {
+        if let Some(actions) = self.coordinators[idx].check_round_timeout(&self.topology_schedule) {
             self.absorb(idx, actions);
         }
     }
@@ -541,7 +543,7 @@ impl ShardCoordinatorSim {
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
         let ready_txs: Vec<Arc<Verified<RoutableTransaction>>> =
             self.tx_pools[idx].values().cloned().collect();
-        self.coordinators[idx].try_propose(&self.topology, &ready_txs, vec![], vec![])
+        self.coordinators[idx].try_propose(&self.topology_schedule, &ready_txs, vec![], vec![])
     }
 
     /// Drain one envelope through its addressee. Network-priority
@@ -727,7 +729,7 @@ impl ShardCoordinatorSim {
                     .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
             };
             return self.coordinators[to_idx].on_block_header(
-                &self.topology,
+                &self.topology_schedule,
                 &header,
                 manifest,
                 lookup_tx,
@@ -735,16 +737,22 @@ impl ShardCoordinatorSim {
                 |_| None,
             );
         }
-        let topology = &self.topology;
+        let topology_schedule = &self.topology_schedule;
         let coord = &mut self.coordinators[to_idx];
         match env.event {
             SimEvent::BlockHeader { .. } => unreachable!("handled above"),
-            SimEvent::UnverifiedVote { vote } => coord.on_unverified_block_vote(topology, vote),
-            SimEvent::VerifiedVote { vote } => coord.on_verified_block_vote(topology, vote),
-            SimEvent::UnverifiedTimeout { timeout } => {
-                coord.on_unverified_timeout(topology, &timeout)
+            SimEvent::UnverifiedVote { vote } => {
+                coord.on_unverified_block_vote(topology_schedule, vote)
             }
-            SimEvent::VerifiedTimeout { timeout } => coord.on_verified_timeout(topology, timeout),
+            SimEvent::VerifiedVote { vote } => {
+                coord.on_verified_block_vote(topology_schedule, vote)
+            }
+            SimEvent::UnverifiedTimeout { timeout } => {
+                coord.on_unverified_timeout(topology_schedule, &timeout)
+            }
+            SimEvent::VerifiedTimeout { timeout } => {
+                coord.on_verified_timeout(topology_schedule, timeout)
+            }
             SimEvent::ProposalBuilt {
                 height,
                 round,
@@ -755,7 +763,7 @@ impl ShardCoordinatorSim {
                 provisions,
                 bytes_delta,
             } => coord.on_proposal_built(
-                topology,
+                topology_schedule,
                 height,
                 round,
                 &block,
@@ -769,38 +777,38 @@ impl ShardCoordinatorSim {
                 block_hash,
                 qc,
                 verified_votes,
-            } => coord.on_qc_result(topology, block_hash, qc, verified_votes),
+            } => coord.on_qc_result(topology_schedule, block_hash, qc, verified_votes),
             SimEvent::QcSignatureVerified { block_hash, result } => {
-                coord.on_qc_signature_verified(topology, block_hash, result)
+                coord.on_qc_signature_verified(topology_schedule, block_hash, result)
             }
             SimEvent::TransactionRootVerified { block_hash, result } => {
-                coord.on_transaction_root_verified(topology, block_hash, result)
+                coord.on_transaction_root_verified(topology_schedule, block_hash, result)
             }
             SimEvent::CertificateRootVerified { block_hash, result } => {
-                coord.on_certificate_root_verified(topology, block_hash, result)
+                coord.on_certificate_root_verified(topology_schedule, block_hash, result)
             }
             SimEvent::LocalReceiptRootVerified { block_hash, result } => {
-                coord.on_local_receipt_root_verified(topology, block_hash, result)
+                coord.on_local_receipt_root_verified(topology_schedule, block_hash, result)
             }
             SimEvent::ProvisionsRootVerified { block_hash, result } => {
-                coord.on_provisions_root_verified(topology, block_hash, result)
+                coord.on_provisions_root_verified(topology_schedule, block_hash, result)
             }
             SimEvent::ProvisionTxRootsVerified { block_hash, result } => {
-                coord.on_provision_tx_roots_verified(topology, block_hash, result)
+                coord.on_provision_tx_roots_verified(topology_schedule, block_hash, result)
             }
             SimEvent::BeaconWitnessRootVerified { block_hash, result } => {
-                coord.on_beacon_witness_root_verified(topology, block_hash, result)
+                coord.on_beacon_witness_root_verified(topology_schedule, block_hash, result)
             }
             SimEvent::StateRootVerified {
                 block_hash,
                 result,
                 bytes_delta,
-            } => coord.on_state_root_verified(topology, block_hash, result, bytes_delta),
+            } => coord.on_state_root_verified(topology_schedule, block_hash, result, bytes_delta),
             SimEvent::BlockReadyToCommit { certified, source } => {
-                coord.on_block_ready_to_commit(topology, certified, source)
+                coord.on_block_ready_to_commit(topology_schedule, certified, source)
             }
             SimEvent::QuorumCertificateFormed { block_hash, qc } => {
-                coord.on_qc_formed(topology, block_hash, &qc, &[], vec![], vec![])
+                coord.on_qc_formed(topology_schedule, block_hash, &qc, &[], vec![], vec![])
             }
         }
     }
@@ -823,7 +831,7 @@ impl ShardCoordinatorSim {
                 let header = Arc::new(*header);
                 let manifest = *manifest;
                 let committee_ids: Vec<ValidatorId> = self
-                    .topology
+                    .topology_schedule
                     .head()
                     .committee_for_shard(self.shard)
                     .to_vec();
@@ -995,7 +1003,7 @@ impl ShardCoordinatorSim {
                 beacon_witness_base,
                 carry_split_child_roots,
                 carry_settled_waves_root,
-                classification_topology,
+                classification_topology_snapshot: classification_topology,
             } => {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
@@ -1169,7 +1177,7 @@ impl ShardCoordinatorSim {
             } => {
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
-                    topology: &topology_snapshot,
+                    topology_snapshot: &topology_snapshot,
                     transactions: &transactions,
                 };
                 let result = expected.verify(&ptx_ctx);
@@ -1213,7 +1221,7 @@ impl ShardCoordinatorSim {
                     reshape_trigger,
                     substate_bytes,
                     thresholds,
-                    topology: &topology_snapshot,
+                    topology_snapshot: &topology_snapshot,
                 };
                 let result = expected_root.verify(&bw_ctx);
                 self.loopback_q.push_back(Envelope {

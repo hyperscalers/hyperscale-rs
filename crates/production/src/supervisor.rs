@@ -666,14 +666,14 @@ impl ShardSupervisor {
         vnodes.truncate(pending);
 
         let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
-        let anchor = self.process.topology().load().boundary(shard);
+        let anchor = self.process.topology_snapshot().load().boundary(shard);
         if fresh_store && anchor.is_some() {
             let process = Arc::clone(&self.process);
             let events = self.events_tx.clone();
             self.tokio_handle.spawn(async move {
                 let done = match bootstrap_shard_state(
                     process.network(),
-                    process.topology(),
+                    process.topology_snapshot(),
                     &storage,
                     shard,
                 )
@@ -736,8 +736,8 @@ impl ShardSupervisor {
     /// runner ticks it on a timer and on every placement change.
     pub(crate) fn reshape_step(&mut self, events: Vec<ReshapeEvent>) {
         let requests = {
-            let topology = self.process.topology().load_full();
-            let view = ReshapeView::new(&topology);
+            let topology_snapshot = self.process.topology_snapshot().load_full();
+            let view = ReshapeView::new(&topology_snapshot);
             self.reshape.step(&view, events)
         };
         for request in requests {
@@ -821,7 +821,7 @@ impl ShardSupervisor {
     /// parent's substates without copying.
     fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId) {
         let events = self.events_tx.clone();
-        let Some(anchor) = self.process.topology().load().boundary(child) else {
+        let Some(anchor) = self.process.topology_snapshot().load().boundary(child) else {
             let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
             return;
         };
@@ -1090,7 +1090,7 @@ impl ShardSupervisor {
         // reproduced from the parent terminal and the child anchor).
         let anchor_root = self
             .process
-            .topology()
+            .topology_snapshot()
             .load()
             .boundary(shard)
             .map(|a| a.state_root);
@@ -1154,8 +1154,8 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape seat for an already-hosted shard; dropped");
             return;
         }
-        let topology = self.process.topology().load_full();
-        let vnodes: Vec<VnodeConfig> = topology
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        let vnodes: Vec<VnodeConfig> = topology_snapshot
             .committee_for_shard(shard)
             .iter()
             .filter_map(|validator| {
@@ -1373,14 +1373,14 @@ impl ShardSupervisor {
     /// snap-sync it. Run on the reshape tick, binding serving and routing
     /// to one committed lifetime in place of a fixed drain grace.
     pub(crate) fn reconcile_teardown(&mut self) {
-        let topology = self.process.topology().load();
+        let topology_snapshot = self.process.topology_snapshot().load();
         let routing = self.process.network().routing_committees();
         let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
         let expired: Vec<ShardId> = self
             .shards
             .keys()
             .copied()
-            .filter(|&shard| shard_retired(shard, &topology, &routing, &host_ids))
+            .filter(|&shard| shard_retired(shard, &topology_snapshot, &routing, &host_ids))
             .collect();
         for shard in expired {
             info!(
@@ -1405,13 +1405,13 @@ impl ShardSupervisor {
     /// the guards skip every shard already accounted for, and [`Self::join`]
     /// rejects a double bring-up regardless. Run on the reshape tick.
     pub(crate) fn reconcile_joins(&mut self) {
-        let topology = self.process.topology().load_full();
+        let topology_snapshot = self.process.topology_snapshot().load_full();
         let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
-        let needed: Vec<ShardId> = topology
+        let needed: Vec<ShardId> = topology_snapshot
             .shard_trie()
             .leaves()
             .filter(|&shard| {
-                host_assigned(shard, &topology, &host_ids)
+                host_assigned(shard, &topology_snapshot, &host_ids)
                     && !self.shards.contains_key(&shard)
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains(&shard)
@@ -1420,7 +1420,7 @@ impl ShardSupervisor {
             })
             .collect();
         for shard in needed {
-            let vnodes: Vec<VnodeConfig> = topology
+            let vnodes: Vec<VnodeConfig> = topology_snapshot
                 .committee_for_shard(shard)
                 .iter()
                 .filter_map(|validator| {
@@ -1573,24 +1573,24 @@ impl ShardSupervisor {
 /// serving and routing share the one committed lifetime.
 fn shard_retired(
     shard: ShardId,
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     routing: &RoutingCommittees,
     host_ids: &HashSet<ValidatorId>,
 ) -> bool {
     let in_routing = routing
         .get(&shard)
         .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
-    !host_assigned(shard, topology, host_ids) && !in_routing
+    !host_assigned(shard, topology_snapshot, host_ids) && !in_routing
 }
 
 /// Whether `shard`'s committed committee includes a local validator — the host
 /// holds a consensus role in it and must run it.
 fn host_assigned(
     shard: ShardId,
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     host_ids: &HashSet<ValidatorId>,
 ) -> bool {
-    topology
+    topology_snapshot
         .committee_for_shard(shard)
         .iter()
         .any(|v| host_ids.contains(v))
@@ -1645,14 +1645,14 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let sibling = ShardId::leaf(1, 1);
         let others = vec![ValidatorId::new(2), ValidatorId::new(3)];
-        let topology = head(HashMap::from([
+        let topology_snapshot = head(HashMap::from([
             (shard, others.clone()),
             (sibling, vec![ValidatorId::new(4)]),
         ]));
         let routing = routing(&[(shard, others)]);
         assert!(shard_retired(
             shard,
-            &topology,
+            &topology_snapshot,
             &routing,
             &HashSet::from([HOST])
         ));
@@ -1664,14 +1664,14 @@ mod tests {
     #[test]
     fn keeps_a_dissolved_shard_the_host_still_routes() {
         let child = ShardId::leaf(2, 2);
-        let topology = head(HashMap::from([
+        let topology_snapshot = head(HashMap::from([
             (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
             (ShardId::leaf(1, 1), vec![HOST]),
         ]));
         let routing = routing(&[(child, vec![HOST, ValidatorId::new(2)])]);
         assert!(!shard_retired(
             child,
-            &topology,
+            &topology_snapshot,
             &routing,
             &HashSet::from([HOST])
         ));
@@ -1683,7 +1683,7 @@ mod tests {
     #[test]
     fn keeps_a_shard_with_an_active_consensus_role() {
         let shard = ShardId::leaf(1, 0);
-        let topology = head(HashMap::from([
+        let topology_snapshot = head(HashMap::from([
             (shard, vec![HOST, ValidatorId::new(2)]),
             (ShardId::leaf(1, 1), vec![ValidatorId::new(4)]),
         ]));
@@ -1691,7 +1691,7 @@ mod tests {
         let routing = routing(&[(shard, vec![ValidatorId::new(2), ValidatorId::new(3)])]);
         assert!(!shard_retired(
             shard,
-            &topology,
+            &topology_snapshot,
             &routing,
             &HashSet::from([HOST])
         ));
@@ -1701,14 +1701,14 @@ mod tests {
     #[test]
     fn retires_a_shard_evicted_from_routing() {
         let child = ShardId::leaf(2, 2);
-        let topology = head(HashMap::from([
+        let topology_snapshot = head(HashMap::from([
             (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
             (ShardId::leaf(1, 1), vec![HOST]),
         ]));
         let routing = RoutingCommittees::new();
         assert!(shard_retired(
             child,
-            &topology,
+            &topology_snapshot,
             &routing,
             &HashSet::from([HOST])
         ));
@@ -1720,12 +1720,12 @@ mod tests {
     fn host_assigned_tracks_committed_committee_membership() {
         let mine = ShardId::leaf(1, 0);
         let theirs = ShardId::leaf(1, 1);
-        let topology = head(HashMap::from([
+        let topology_snapshot = head(HashMap::from([
             (mine, vec![HOST, ValidatorId::new(2)]),
             (theirs, vec![ValidatorId::new(3)]),
         ]));
         let host_ids = HashSet::from([HOST]);
-        assert!(host_assigned(mine, &topology, &host_ids));
-        assert!(!host_assigned(theirs, &topology, &host_ids));
+        assert!(host_assigned(mine, &topology_snapshot, &host_ids));
+        assert!(!host_assigned(theirs, &topology_snapshot, &host_ids));
     }
 }

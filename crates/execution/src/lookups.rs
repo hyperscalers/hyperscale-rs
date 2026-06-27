@@ -31,11 +31,11 @@ pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
 /// for both the local shard (self is always a member, filter removes exactly
 /// one entry) and remote shards (filter is a no-op when self isn't a member).
 pub fn peers_excluding_self(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     me: ValidatorId,
     shard: ShardId,
 ) -> Vec<ValidatorId> {
-    topology
+    topology_snapshot
         .committee_for_shard(shard)
         .iter()
         .copied()
@@ -48,20 +48,23 @@ pub fn peers_excluding_self(
 /// crate) but resolves committee + voting power for the EC's own shard,
 /// since cross-shard ECs are signed by remote committees.
 #[must_use]
-pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCertificate) -> bool {
+pub fn ec_has_shard_quorum_power(
+    topology_sbapshot: &TopologySnapshot,
+    ec: &ExecutionCertificate,
+) -> bool {
     let shard = ec.shard_id();
-    let committee = topology.consensus_committee_for_shard(shard);
+    let committee = topology_sbapshot.consensus_committee_for_shard(shard);
     let signers_power: VoteCount = ec
         .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
-            topology
+            topology_sbapshot
                 .vote_of(vid)
                 .expect("committee member has voting power (TopologySnapshot invariant)")
         })
         .sum();
-    VoteCount::has_quorum(signers_power, topology.committee_votes(shard))
+    VoteCount::has_quorum(signers_power, topology_sbapshot.committee_votes(shard))
 }
 
 /// Public keys for a shard's consensus committee, in canonical order —
@@ -71,13 +74,13 @@ pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCert
 /// topology — a signal the snapshot is corrupt and verification should not
 /// proceed with a partial key set.
 pub fn committee_public_keys_for_shard(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     shard: ShardId,
 ) -> Option<Vec<Bls12381G1PublicKey>> {
-    let committee = topology.consensus_committee_for_shard(shard);
+    let committee = topology_snapshot.consensus_committee_for_shard(shard);
     let mut pubkeys = Vec::with_capacity(committee.len());
     for &vid in committee {
-        pubkeys.push(topology.public_key(vid)?);
+        pubkeys.push(topology_snapshot.public_key(vid)?);
     }
     Some(pubkeys)
 }
@@ -90,7 +93,7 @@ pub fn committee_public_keys_for_shard(
 /// Returns a map from `WaveId` to list of (tx, `participating_shards`) in
 /// block order within each wave.
 pub fn assign_waves(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     local_shard: ShardId,
     block_height: BlockHeight,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
@@ -99,7 +102,7 @@ pub fn assign_waves(
 
     for tx in transactions {
         // Compute provision dependency set = remote shards needed
-        let all_shards: BTreeSet<ShardId> = topology
+        let all_shards: BTreeSet<ShardId> = topology_snapshot
             .all_shards_for_transaction(tx)
             .into_iter()
             .collect();
@@ -125,7 +128,7 @@ pub fn assign_waves(
 ///
 /// Returns `None` if there are no cross-shard transactions needing provisions.
 pub fn build_provision_requests(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     transactions: &[Arc<Verifiable<RoutableTransaction>>],
     me: ValidatorId,
     local_shard: ShardId,
@@ -134,7 +137,7 @@ pub fn build_provision_requests(
 
     let mut provision_requests = Vec::new();
     for tx in transactions {
-        if topology.is_single_shard_transaction(tx) {
+        if topology_snapshot.is_single_shard_transaction(tx) {
             continue;
         }
         let all_nodes: Vec<NodeId> = tx
@@ -147,7 +150,7 @@ pub fn build_provision_requests(
         let mut owned_nodes: Vec<NodeId> = all_nodes
             .iter()
             .copied()
-            .filter(|n| topology.shard_for_node_id(n) == local_shard)
+            .filter(|n| topology_snapshot.shard_for_node_id(n) == local_shard)
             .collect();
         owned_nodes.sort();
         owned_nodes.dedup();
@@ -158,7 +161,7 @@ pub fn build_provision_requests(
 
         // Per-target-shard node needs for conflict detection on the remote side.
         let mut target_nodes: Vec<(ShardId, Vec<NodeId>)> = Vec::new();
-        for target_shard in topology
+        for target_shard in topology_snapshot
             .all_shards_for_transaction(tx)
             .into_iter()
             .filter(|&s| s != local_shard)
@@ -166,7 +169,7 @@ pub fn build_provision_requests(
             let mut needed: Vec<NodeId> = all_nodes
                 .iter()
                 .copied()
-                .filter(|n| topology.shard_for_node_id(n) == target_shard)
+                .filter(|n| topology_snapshot.shard_for_node_id(n) == target_shard)
                 .collect();
             // Canonicalise so gossip-emitted and fetch-served `ProvisionEntry`s
             // hash identically — `serve_provision_request` sorts and dedups too.
@@ -192,7 +195,7 @@ pub fn build_provision_requests(
     for req in &provision_requests {
         for &(target_shard, _) in &req.target_nodes {
             shard_recipients.entry(target_shard).or_insert_with(|| {
-                topology
+                topology_snapshot
                     .committee_for_shard(target_shard)
                     .iter()
                     .copied()
@@ -228,9 +231,9 @@ mod tests {
     #[test]
     fn peers_excluding_self_drops_local_validator() {
         let committee = TestCommittee::new(4, 42);
-        let topology = single_shard_topology(&committee);
+        let topology_snapshot = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::ROOT);
+        let peers = peers_excluding_self(&topology_snapshot, ValidatorId::new(0), ShardId::ROOT);
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&ValidatorId::new(0)));
         assert!(peers.contains(&ValidatorId::new(1)));
@@ -241,20 +244,24 @@ mod tests {
     #[test]
     fn peers_excluding_self_empty_for_unknown_shard() {
         let committee = TestCommittee::new(4, 42);
-        let topology = single_shard_topology(&committee);
+        let topology_snapshot = single_shard_topology(&committee);
 
         // Shard 99 has no committee — filter returns an empty vec regardless
         // of who the local validator is.
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::leaf(8, 99));
+        let peers = peers_excluding_self(
+            &topology_snapshot,
+            ValidatorId::new(0),
+            ShardId::leaf(8, 99),
+        );
         assert!(peers.is_empty());
     }
 
     #[test]
     fn peers_excluding_self_empty_when_solo_validator() {
         let committee = TestCommittee::new(1, 42);
-        let topology = single_shard_topology(&committee);
+        let topology_snapshot = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardId::ROOT);
+        let peers = peers_excluding_self(&topology_snapshot, ValidatorId::new(0), ShardId::ROOT);
         assert!(peers.is_empty());
     }
 
@@ -263,9 +270,9 @@ mod tests {
     #[test]
     fn committee_public_keys_for_shard_returns_keys_in_order() {
         let committee = TestCommittee::new(4, 42);
-        let topology = single_shard_topology(&committee);
+        let topology_snapshot = single_shard_topology(&committee);
 
-        let keys = committee_public_keys_for_shard(&topology, ShardId::ROOT)
+        let keys = committee_public_keys_for_shard(&topology_snapshot, ShardId::ROOT)
             .expect("well-formed topology resolves every key");
         assert_eq!(keys.len(), 4);
 
@@ -277,11 +284,11 @@ mod tests {
     #[test]
     fn committee_public_keys_for_shard_empty_for_unknown_shard() {
         let committee = TestCommittee::new(4, 42);
-        let topology = single_shard_topology(&committee);
+        let topology_snapshot = single_shard_topology(&committee);
 
         // An unknown shard has an empty committee, so the result is
         // `Some(vec![])` — not `None` (which is reserved for corruption).
-        let keys = committee_public_keys_for_shard(&topology, ShardId::leaf(8, 99))
+        let keys = committee_public_keys_for_shard(&topology_snapshot, ShardId::leaf(8, 99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
     }

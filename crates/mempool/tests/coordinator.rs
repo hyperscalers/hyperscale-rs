@@ -129,12 +129,16 @@ fn is_tombstoned_is_false_on_fresh_coordinator() {
 
 #[test]
 fn submit_then_ready_round_trips_a_transaction() {
-    let topology = test_topology();
+    let topology_snapshot = test_topology();
     let mut coord = coordinator_with_zero_dwell();
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
+    coord.on_submit_transaction(
+        &topology_snapshot,
+        Arc::new(verified(tx)),
+        LocalTimestamp::ZERO,
+    );
 
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
@@ -146,13 +150,13 @@ fn submit_then_ready_round_trips_a_transaction() {
 
 #[test]
 fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
-    let topology = test_topology();
+    let topology_snapshot = test_topology();
     let mut coord = MempoolCoordinator::new(ShardId::ROOT);
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
     coord.on_submit_transaction(
-        &topology,
+        &topology_snapshot,
         Arc::new(verified(tx.clone())),
         LocalTimestamp::ZERO,
     );
@@ -166,7 +170,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
         vec![Arc::new(tx)],
         vec![],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000));
+    coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
 
     assert_eq!(coord.in_flight(), 1);
     assert_eq!(
@@ -177,13 +181,13 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
 
 #[test]
 fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
-    let topology = test_topology();
+    let topology_snapshot = test_topology();
     let mut coord = MempoolCoordinator::new(ShardId::ROOT);
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
     coord.on_submit_transaction(
-        &topology,
+        &topology_snapshot,
         Arc::new(verified(tx.clone())),
         LocalTimestamp::ZERO,
     );
@@ -199,14 +203,14 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
         vec![Arc::new(tx.clone())],
         vec![Arc::new(fw.into())],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000));
+    coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
 
     // Terminal state: evicted from pool, tombstoned so gossip can't revive it.
     assert!(coord.status(&tx_hash).is_none());
     assert!(coord.is_tombstoned(&tx_hash));
 
     let actions = coord.on_transaction_gossip(
-        &topology,
+        &topology_snapshot,
         Arc::new(verified(tx)),
         false,
         LocalTimestamp::ZERO,

@@ -71,7 +71,7 @@ where
         // (each store roots its JMT at the shard's prefix) requires it, since a
         // foreign-prefix key would be mis-bucketed beneath this shard's root.
         // Drop xrd balances whose address routes to another shard.
-        let topology = self.process.topology_snapshot.load();
+        let topology_snapshot = self.process.topology_snapshot.load();
         let mut config = config.clone();
         config.xrd_balances.retain(|(address, _)| {
             let radix_node_id = address.into_node_id();
@@ -80,7 +80,7 @@ where
                     .try_into()
                     .expect("NodeId is 30 bytes"),
             );
-            topology.shard_for_node_id(&det_node_id) == shard
+            topology_snapshot.shard_for_node_id(&det_node_id) == shard
         });
         let merged = prepared_genesis(self.process.dispatch_handles.executor.network(), &config);
         // Genesis writes the full initial state in one batch, so every owned
@@ -91,8 +91,12 @@ where
         // read availability, but the prefix-rooted JMT must hold only this
         // shard's subtree, so the committed state root is the global tree's
         // node at the shard prefix.
-        let jmt_updates =
-            filter_genesis_updates_for_shard(&merged, &owner_map, shard, topology.shard_trie());
+        let jmt_updates = filter_genesis_updates_for_shard(
+            &merged,
+            &owner_map,
+            shard,
+            topology_snapshot.shard_trie(),
+        );
         self.shard_io(shard)
             .storage
             .install_genesis(&merged, &jmt_updates, &owner_map)

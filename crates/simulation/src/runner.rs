@@ -347,7 +347,7 @@ impl SimulationRunner {
         let beacon_network = genesis_validators.network.clone();
         let GenesisBoot {
             chain: genesis_chain,
-            topology: projected_topology,
+            topology_snapshot: projected_topology,
         } = build_genesis(&genesis_validators, chain_config);
         let beacon_genesis_block = genesis_chain.block;
         let beacon_genesis_state = genesis_chain.state;
@@ -726,7 +726,7 @@ impl SimulationRunner {
             self.hosts
                 .get(node as usize)?
                 .process()
-                .topology()
+                .topology_snapshot()
                 .load_full(),
         )
     }

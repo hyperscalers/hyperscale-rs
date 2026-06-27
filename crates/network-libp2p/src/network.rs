@@ -75,7 +75,7 @@ pub struct Libp2pNetwork {
     shard_gossip_types: Mutex<Vec<&'static str>>,
     /// Topology snapshot used to resolve validator identity for outbound
     /// requests. Updated lock-free via [`Self::update_topology`].
-    topology: Arc<ArcSwap<TopologySnapshot>>,
+    topology_snapshot: Arc<ArcSwap<TopologySnapshot>>,
     /// Terminal-clamped per-shard routing committees, covering live shards
     /// and split parents still draining out of the head. Fetch routing
     /// resolves `shard → committee` here so a request to a dissolved shard
@@ -108,7 +108,7 @@ impl Libp2pNetwork {
         request_manager: Arc<RequestManager>,
         tokio_handle: Handle,
         registry: Arc<HandlerRegistry>,
-        topology: Arc<ArcSwap<TopologySnapshot>>,
+        topology_snapshot: Arc<ArcSwap<TopologySnapshot>>,
         simulated_outbound_latency: Duration,
     ) -> Self {
         // Eagerly spawn the inbound router. It will dispatch incoming
@@ -128,7 +128,7 @@ impl Libp2pNetwork {
             tokio_handle,
             registry,
             shard_gossip_types: Mutex::new(Vec::new()),
-            topology,
+            topology_snapshot,
             routing_committees: Arc::new(ArcSwap::from_pointee(RoutingCommittees::new())),
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
@@ -199,7 +199,7 @@ impl Network for Libp2pNetwork {
         self.adapter.update_validator_keys(Arc::new(keys));
         // Cache the snapshot for validator identity. ArcSwap is lock-free;
         // readers in `request` use `.load()`.
-        self.topology.store(snapshot);
+        self.topology_snapshot.store(snapshot);
     }
 
     fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
@@ -406,7 +406,7 @@ impl Network for Libp2pNetwork {
             .local_shards()
             .contains(&shard)
             .then(|| Arc::clone(&self.registry));
-        let topology = Arc::clone(&self.topology);
+        let topology_snapshot = Arc::clone(&self.topology_snapshot);
         let routing_committees = Arc::clone(&self.routing_committees);
         let adapter = Arc::clone(&self.adapter);
         let rm = Arc::clone(&self.request_manager);
@@ -444,7 +444,7 @@ impl Network for Libp2pNetwork {
             // finds its draining members. Fall back to the head snapshot
             // before the first routing-committees push (cold start).
             let routing = routing_committees.load();
-            let topology_snapshot = topology.load();
+            let topology_snapshot = topology_snapshot.load();
             let committee: &[ValidatorId] = routing.get(&shard).map_or_else(
                 || topology_snapshot.committee_for_shard(shard),
                 Vec::as_slice,

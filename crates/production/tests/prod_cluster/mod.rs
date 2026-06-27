@@ -171,12 +171,12 @@ impl ProdCluster {
     /// address encoding, not shard routing, so any definition resolves the same
     /// shards.
     fn host_for_tx(&self, tx: &RoutableTransaction) -> Option<usize> {
-        let topology = self
+        let topology_snapshot = self
             .inner
             .beacon_state()?
             .derive_topology_snapshot(NetworkDefinition::simulator());
         tx.all_declared_nodes()
-            .map(|node| topology.shard_for_node_id(node))
+            .map(|node| topology_snapshot.shard_for_node_id(node))
             .find_map(|shard| self.inner.host_serving(shard))
     }
 }

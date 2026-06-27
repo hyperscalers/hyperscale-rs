@@ -25,12 +25,12 @@ pub fn verify_bls_with_metrics(
 /// Returns `None` (with a warning) if the sender is not in the shard's
 /// committee or their public key cannot be resolved.
 pub fn resolve_sender_key(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardId,
     context: &str,
 ) -> Option<Bls12381G1PublicKey> {
-    let committee = topology.committee_for_shard(shard);
+    let committee = topology_snapshot.committee_for_shard(shard);
     if !committee.contains(&sender) {
         warn!(
             sender = sender.inner(),
@@ -40,7 +40,7 @@ pub fn resolve_sender_key(
         );
         return None;
     }
-    let Some(public_key) = topology.public_key(sender) else {
+    let Some(public_key) = topology_snapshot.public_key(sender) else {
         warn!(
             sender = sender.inner(),
             "Could not resolve public key for {} sender", context
@@ -59,20 +59,20 @@ pub fn resolve_sender_key(
 /// Returns `false` (with warnings) when the proposer's key cannot be
 /// resolved or the signature fails to validate.
 pub fn verify_signed_by_proposer<T: Signed>(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     notification: &T,
     metric_label: &str,
     context: &str,
 ) -> bool {
     let signer = notification.signer();
-    let Some(public_key) = topology.public_key(signer) else {
+    let Some(public_key) = topology_snapshot.public_key(signer) else {
         warn!(signer = signer.inner(), "Unknown proposer for {}", context);
         return false;
     };
     let start = std::time::Instant::now();
     let valid = notification
         .verify_signature(&SignedContext {
-            network: topology.network(),
+            network: topology_snapshot.network(),
             public_key: &public_key,
         })
         .is_ok();
@@ -93,20 +93,20 @@ pub fn verify_signed_by_proposer<T: Signed>(
 ///
 /// Returns `false` (with warnings) on any failure.
 pub fn verify_signed_by_committee<T: Signed>(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     shard: ShardId,
     notification: &T,
     metric_label: &str,
     context: &str,
 ) -> bool {
     let signer = notification.signer();
-    let Some(public_key) = resolve_sender_key(topology, signer, shard, context) else {
+    let Some(public_key) = resolve_sender_key(topology_snapshot, signer, shard, context) else {
         return false;
     };
     let start = std::time::Instant::now();
     let valid = notification
         .verify_signature(&SignedContext {
-            network: topology.network(),
+            network: topology_snapshot.network(),
             public_key: &public_key,
         })
         .is_ok();

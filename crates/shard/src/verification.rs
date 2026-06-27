@@ -1172,7 +1172,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -1184,7 +1184,7 @@ impl VerificationPipeline {
             block_hash,
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
-            topology_snapshot: topology.clone(),
+            topology_snapshot: topology_snapshot.clone(),
         }]
     }
 
@@ -1216,7 +1216,7 @@ impl VerificationPipeline {
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
         local_shard: ShardId,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         schedule: &TopologySchedule,
         count_source: SubstateCountSource<'_>,
     ) -> Vec<Action> {
@@ -1306,7 +1306,7 @@ impl VerificationPipeline {
             substate_bytes,
             thresholds,
             finalized_waves,
-            topology_snapshot: topology.clone(),
+            topology_snapshot: topology_snapshot.clone(),
         }]
     }
 
@@ -1436,7 +1436,7 @@ impl VerificationPipeline {
     #[allow(clippy::too_many_arguments)] // single dispatch over six per-root sub-verifications
     pub(crate) fn initiate_block_verifications(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         schedule: &TopologySchedule,
         local_shard: ShardId,
         pending_blocks: &PendingBlocks,
@@ -1496,8 +1496,11 @@ impl VerificationPipeline {
             VerificationKind::ProvisionTxRoots,
             !h.provision_tx_roots().is_empty(),
         ) {
-            actions
-                .extend(self.initiate_provision_tx_root_verification(block_hash, block, topology));
+            actions.extend(self.initiate_provision_tx_root_verification(
+                block_hash,
+                block,
+                topology_snapshot,
+            ));
         }
 
         if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)
@@ -1510,7 +1513,7 @@ impl VerificationPipeline {
                 accumulator,
                 committed_hash,
                 local_shard,
-                topology,
+                topology_snapshot,
                 schedule,
                 count_source,
             ));
@@ -2180,7 +2183,7 @@ mod tests {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let topology = TestCommittee::new(4, 7).topology_snapshot(1);
+        let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
 
@@ -2196,8 +2199,8 @@ mod tests {
             &accumulator,
             BlockHash::ZERO,
             ShardId::ROOT,
-            &topology,
-            &dummy_schedule(&topology),
+            &topology_snapshot,
+            &dummy_schedule(&topology_snapshot),
             disabled_count_source(),
         );
 
@@ -2220,7 +2223,7 @@ mod tests {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let topology = TestCommittee::new(4, 7).topology_snapshot(1);
+        let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
         let parent_block_hash = bh(b"missing-parent");
@@ -2238,8 +2241,8 @@ mod tests {
                 &accumulator,
                 BlockHash::ZERO,
                 ShardId::ROOT,
-                &topology,
-                &dummy_schedule(&topology),
+                &topology_snapshot,
+                &dummy_schedule(&topology_snapshot),
                 disabled_count_source(),
             );
         }
@@ -2266,7 +2269,7 @@ mod tests {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let topology = TestCommittee::new(4, 7).topology_snapshot(1);
+        let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
         let parent_block_hash = bh(b"to-fail");
@@ -2280,8 +2283,8 @@ mod tests {
             &accumulator,
             BlockHash::ZERO,
             ShardId::ROOT,
-            &topology,
-            &dummy_schedule(&topology),
+            &topology_snapshot,
+            &dummy_schedule(&topology_snapshot),
             disabled_count_source(),
         );
         assert!(vp.is_beacon_witness_deferred(child_hash));

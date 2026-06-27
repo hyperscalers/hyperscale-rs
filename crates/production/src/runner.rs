@@ -380,14 +380,14 @@ impl ProductionRunnerBuilder {
         let beacon_network = genesis_validators.network.clone();
         let GenesisBoot {
             chain: genesis_chain,
-            topology: projected_topology,
+            topology_snapshot: projected_topology,
         } = build_genesis(&genesis_validators, chain_config);
         let beacon_genesis_block = genesis_chain.block;
         let beacon_genesis_state = genesis_chain.state;
         let beacon_config_hash = genesis_chain.config_hash;
 
         let shared_topology = Arc::new(projected_topology);
-        let topology: SharedTopologySnapshot =
+        let topology_snapshot: SharedTopologySnapshot =
             Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
         // Extract initial validator keys for network-layer bind verification.
@@ -530,7 +530,7 @@ impl ProductionRunnerBuilder {
             local_shards: local_shards.clone(),
             bind_vnodes,
             initial_validator_keys,
-            topology: topology.clone(),
+            topology_snapshot: topology_snapshot.clone(),
         })?;
 
         // The bootstrap identity replicated into every fresh store the
@@ -569,7 +569,7 @@ impl ProductionRunnerBuilder {
             (*dispatch).clone(),
             shard_event_senders,
             beacon_event_tx,
-            topology.clone(),
+            topology_snapshot.clone(),
             NodeConfig::default(),
             tx_validator,
         );
@@ -616,7 +616,7 @@ impl ProductionRunnerBuilder {
             participation_rx: Some(participation_rx),
             vnode_keys,
             network: adapter,
-            topology_snapshot: topology,
+            topology_snapshot,
             storages,
             dispatch,
             publishers: self.publishers,
@@ -808,7 +808,7 @@ impl ProductionRunner {
         // committed height, and its own genesis block.
         let mut timer_ops = Vec::new();
         let local_shards: Vec<ShardId> = host.hosted_shards().collect();
-        let topology = Arc::clone(&self.topology_snapshot);
+        let topology_snapshot = Arc::clone(&self.topology_snapshot);
         // The host's `GenesisConfig` enumerates every account across every
         // hosted shard. Each shard's storage only gets the accounts whose
         // address hashes to that shard, so genesis doesn't reapply other
@@ -829,7 +829,7 @@ impl ProductionRunner {
             let genesis_config = shared_genesis_config
                 .clone()
                 .map_or_else(GenesisConfig::production, |cfg| {
-                    filter_genesis_for_shard(cfg, shard, topology.load().shard_trie())
+                    filter_genesis_for_shard(cfg, shard, topology_snapshot.load().shard_trie())
                 });
             info!(
                 shard = ?shard,
@@ -844,7 +844,7 @@ impl ProductionRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let first_validator = topology
+            let first_validator = topology_snapshot
                 .load()
                 .committee_for_shard(shard)
                 .first()
@@ -1204,7 +1204,7 @@ struct NetworkBuildArgs {
     initial_validator_keys: Arc<ValidatorKeyMap>,
     /// Topology snapshot shared with `Libp2pNetwork` for shard-based
     /// peer resolution on outbound `Network::request` calls.
-    topology: SharedTopologySnapshot,
+    topology_snapshot: SharedTopologySnapshot,
 }
 
 struct NetworkStack {
@@ -1246,7 +1246,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         request_manager,
         TokioHandle::current(),
         registry,
-        args.topology,
+        args.topology_snapshot,
         simulated_outbound_latency,
     );
 

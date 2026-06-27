@@ -86,7 +86,7 @@ impl ConflictDetector {
         &mut self,
         tx_hash: TxHash,
         local_shard: ShardId,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         declared_reads: &[NodeId],
         declared_writes: &[NodeId],
     ) -> Vec<DetectedConflict> {
@@ -94,7 +94,7 @@ impl ConflictDetector {
         let mut owned_nodes: HashSet<NodeId> = HashSet::new();
 
         for node_id in declared_reads.iter().chain(declared_writes.iter()) {
-            let shard = topology.shard_for_node_id(node_id);
+            let shard = topology_snapshot.shard_for_node_id(node_id);
             if shard == local_shard {
                 owned_nodes.insert(*node_id);
             } else {

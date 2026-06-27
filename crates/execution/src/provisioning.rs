@@ -181,14 +181,14 @@ impl ProvisioningTracker {
         &mut self,
         tx_hash: TxHash,
         local_shard: ShardId,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         declared_reads: &[NodeId],
         declared_writes: &[NodeId],
     ) -> Vec<DetectedConflict> {
         self.conflict_detector.register_tx(
             tx_hash,
             local_shard,
-            topology,
+            topology_snapshot,
             declared_reads,
             declared_writes,
         )

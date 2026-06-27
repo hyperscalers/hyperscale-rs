@@ -68,10 +68,10 @@ mod tests {
     }
 
     /// Find a node seed that routes to `target_shard` under 2-way sharding.
-    fn node_on_shard(topology: &TopologySnapshot, target_shard: ShardId) -> NodeId {
+    fn node_on_shard(topology_snapshot: &TopologySnapshot, target_shard: ShardId) -> NodeId {
         for seed in 0u8..=255 {
             let node = NodeId([seed; 30]);
-            if topology.shard_for_node_id(&node) == target_shard {
+            if topology_snapshot.shard_for_node_id(&node) == target_shard {
                 return node;
             }
         }
@@ -132,29 +132,34 @@ mod tests {
 
     #[test]
     fn test_compute_provision_tx_roots_empty() {
-        let topology = two_shard_topology();
-        let map = Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology, &[]);
+        let topology_snapshot = two_shard_topology();
+        let map =
+            Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology_snapshot, &[]);
         assert!(map.is_empty());
     }
 
     #[test]
     fn test_compute_provision_tx_roots_single_shard_excluded() {
-        let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardId::leaf(1, 0));
+        let topology_snapshot = two_shard_topology();
+        let local_node = node_on_shard(&topology_snapshot, ShardId::leaf(1, 0));
         let tx = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![local_node],
             vec![local_node],
         )));
-        let map = Verified::<ProvisionTxRootsMap>::compute(ShardId::leaf(1, 0), &topology, &[tx]);
+        let map = Verified::<ProvisionTxRootsMap>::compute(
+            ShardId::leaf(1, 0),
+            &topology_snapshot,
+            &[tx],
+        );
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
 
     #[test]
     fn test_compute_provision_tx_roots_covers_all_touched_targets() {
-        let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardId::leaf(1, 0));
-        let remote_node = node_on_shard(&topology, ShardId::leaf(1, 1));
+        let topology_snapshot = two_shard_topology();
+        let local_node = node_on_shard(&topology_snapshot, ShardId::leaf(1, 0));
+        let remote_node = node_on_shard(&topology_snapshot, ShardId::leaf(1, 1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
         let tx_a = Arc::new(Verifiable::from(test_transaction_with_nodes(
@@ -170,7 +175,7 @@ mod tests {
 
         let roots = Verified::<ProvisionTxRootsMap>::compute(
             ShardId::leaf(1, 0),
-            &topology,
+            &topology_snapshot,
             &[tx_a.clone(), tx_b.clone()],
         );
 

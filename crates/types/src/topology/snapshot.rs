@@ -1128,13 +1128,13 @@ mod tests {
 
     /// The first `count` node seeds (scanning from 0) that route to `shard`.
     fn first_nodes_on_shard(
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         shard: ShardId,
         count: usize,
     ) -> Vec<NodeId> {
         let nodes: Vec<NodeId> = (0..=u8::MAX)
             .map(test_node)
-            .filter(|n| topology.shard_for_node_id(n) == shard)
+            .filter(|n| topology_snapshot.shard_for_node_id(n) == shard)
             .take(count)
             .collect();
         assert!(
@@ -1146,11 +1146,11 @@ mod tests {
 
     #[test]
     fn single_shard_transaction_touches_one_shard() {
-        let topology = two_shard_topology();
-        let nodes = first_nodes_on_shard(&topology, ShardId::leaf(1, 0), 2);
+        let topology_snapshot = two_shard_topology();
+        let nodes = first_nodes_on_shard(&topology_snapshot, ShardId::leaf(1, 0), 2);
         let tx = test_transaction_with_nodes(b"single_shard", vec![nodes[0]], vec![nodes[1]]);
         assert_eq!(
-            topology.all_shards_for_transaction(&tx).len(),
+            topology_snapshot.all_shards_for_transaction(&tx).len(),
             1,
             "a transaction within one shard touches exactly that shard",
         );
@@ -1158,12 +1158,12 @@ mod tests {
 
     #[test]
     fn cross_shard_transaction_touches_both_shards() {
-        let topology = two_shard_topology();
-        let left = first_nodes_on_shard(&topology, ShardId::leaf(1, 0), 1);
-        let right = first_nodes_on_shard(&topology, ShardId::leaf(1, 1), 1);
+        let topology_snapshot = two_shard_topology();
+        let left = first_nodes_on_shard(&topology_snapshot, ShardId::leaf(1, 0), 1);
+        let right = first_nodes_on_shard(&topology_snapshot, ShardId::leaf(1, 1), 1);
         let tx = test_transaction_with_nodes(b"cross_shard", vec![left[0]], vec![right[0]]);
         assert_eq!(
-            topology.all_shards_for_transaction(&tx).len(),
+            topology_snapshot.all_shards_for_transaction(&tx).len(),
             2,
             "a transaction spanning two shards touches both",
         );

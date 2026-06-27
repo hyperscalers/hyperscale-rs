@@ -170,7 +170,7 @@ impl NodeStateMachine {
 
     /// Get the current topology snapshot.
     #[must_use]
-    pub fn topology(&self) -> &TopologySnapshot {
+    pub fn topology_snapshot(&self) -> &TopologySnapshot {
         self.beacon_coordinator.current_topology_snapshot()
     }
 

@@ -201,7 +201,7 @@ pub fn build_proposal<S: ShardChainWriter>(
     transactions: Vec<Arc<Verified<RoutableTransaction>>>,
     certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
     local_shard: ShardId,
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     parent_in_flight: InFlightCount,
     finalized_tx_count: u32,
@@ -265,9 +265,9 @@ pub fn build_proposal<S: ShardChainWriter>(
     let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
-    let waves = compute_waves(local_shard, topology, height, &transactions);
+    let waves = compute_waves(local_shard, topology_snapshot, height, &transactions);
     let provision_tx_roots =
-        Verified::<ProvisionTxRootsMap>::compute(local_shard, topology, &transactions)
+        Verified::<ProvisionTxRootsMap>::compute(local_shard, topology_snapshot, &transactions)
             .into_inner()
             .0;
 
@@ -487,7 +487,7 @@ where
             let start = std::time::Instant::now();
             let ptx_ctx = ProvisionTxRootsContext {
                 local_shard: ctx.shard,
-                topology: &topology_snapshot,
+                topology_snapshot: &topology_snapshot,
                 transactions: &transactions,
             };
             let result = expected.verify(&ptx_ctx);
@@ -575,7 +575,7 @@ where
                 reshape_trigger,
                 substate_bytes,
                 thresholds,
-                topology: &topology_snapshot,
+                topology_snapshot: &topology_snapshot,
             };
             let result = expected_root.verify(&bw_ctx);
             record_signature_verification_latency(
@@ -721,7 +721,7 @@ where
             beacon_witness_base,
             carry_split_child_roots,
             carry_settled_waves_root,
-            classification_topology,
+            classification_topology_snapshot: classification_topology,
         } => {
             let view = ctx
                 .pending_chain

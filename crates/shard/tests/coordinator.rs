@@ -25,9 +25,9 @@ fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
 fn fresh_coordinator_with_topology(
     config: ShardConsensusConfig,
 ) -> (ShardCoordinator, TopologySchedule) {
-    let topology =
+    let topology_schedule =
         TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
-    (fresh_coordinator(config), topology)
+    (fresh_coordinator(config), topology_schedule)
 }
 
 #[test]
@@ -110,9 +110,9 @@ fn is_current_proposer_matches_topology() {
 
     // At round 1 the proposer rotation picks committee[1 % 4] = V1.
     // Each validator's coordinator should answer `is_current_proposer` consistently
-    // with `topology.proposer_for(shard, round) == me` for that validator.
+    // with `topology_schedule.proposer_for(shard, round) == me` for that validator.
     for local_idx in 0_u32..4 {
-        let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
+        let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let me = ValidatorId::new(u64::from(local_idx));
         let local_shard = ShardId::ROOT;
         let coordinator = ShardCoordinator::new(
@@ -123,9 +123,12 @@ fn is_current_proposer_matches_topology() {
         );
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
         // Rounds increase per block, so the fresh view is round 1.
-        let expected = topology.head().proposer_for(local_shard, Round::new(1)) == me;
+        let expected = topology_schedule
+            .head()
+            .proposer_for(local_shard, Round::new(1))
+            == me;
         assert_eq!(
-            coordinator.is_current_proposer(&topology),
+            coordinator.is_current_proposer(&topology_schedule),
             expected,
             "V{local_idx}: is_current_proposer must agree with proposer_for"
         );
@@ -140,14 +143,14 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     let committee = TestCommittee::new(4, 42);
     let mut proposers = 0usize;
     for local_idx in 0_u32..4 {
-        let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
+        let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let coordinator = ShardCoordinator::new(
             ValidatorId::new(u64::from(local_idx)),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         );
-        if coordinator.will_propose_next(&topology) {
+        if coordinator.will_propose_next(&topology_schedule) {
             proposers += 1;
         }
     }
@@ -170,22 +173,26 @@ fn proposal_parent_block_hash_falls_back_to_committed_hash_without_qc() {
 
 #[test]
 fn on_block_persisted_returns_no_actions_when_not_syncing() {
-    let (mut coordinator, topology) =
+    let (mut coordinator, topology_schedule) =
         fresh_coordinator_with_topology(ShardConsensusConfig::default());
 
-    let actions = coordinator.on_block_persisted(&topology, BlockHeight::new(1), 0);
+    let actions = coordinator.on_block_persisted(&topology_schedule, BlockHeight::new(1), 0);
     assert!(actions.is_empty());
     assert!(!coordinator.is_block_syncing());
 }
 
 #[test]
 fn check_round_timeout_does_not_fire_without_recorded_activity() {
-    let (mut coordinator, topology) =
+    let (mut coordinator, topology_schedule) =
         fresh_coordinator_with_topology(ShardConsensusConfig::default());
 
     // A fresh coordinator has no leader-activity timestamp; `check_round_timeout`
     // must not fire a view change because there's no baseline to time-out
     // against.
     coordinator.set_time(LocalTimestamp::from_millis(3_600_000));
-    assert!(coordinator.check_round_timeout(&topology).is_none());
+    assert!(
+        coordinator
+            .check_round_timeout(&topology_schedule)
+            .is_none()
+    );
 }

@@ -168,7 +168,7 @@ pub struct BeaconCoordinator {
     /// timestamp over the window from [`retention_floor`] through
     /// `current_epoch + 1`. The `+1` lookahead entry is finalized an epoch
     /// before its window opens. A node-local cache, not consensus-critical.
-    topology: TopologySchedule,
+    topology_schedule: TopologySchedule,
 
     /// Committee anchor of the local shard's committed tip — its parent QC's
     /// weighted timestamp. The oldest anchor the local chain can still key a
@@ -247,18 +247,18 @@ impl BeaconCoordinator {
         // agree on that boundary entry (one's lookahead is the next's active),
         // so the skip drops only a redundant re-derivation.
         let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
-        let mut topology =
+        let mut topology_schedule =
             TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
         for state in &history {
             if state.current_epoch != latest_epoch {
-                topology.insert(
+                topology_schedule.insert(
                     state.current_epoch,
                     Arc::new(state.derive_topology_snapshot(network.clone())),
                 );
             }
             let lookahead = state.current_epoch.next();
             if lookahead != latest_epoch {
-                topology.insert(
+                topology_schedule.insert(
                     lookahead,
                     Arc::new(state.derive_next_topology_snapshot(network.clone())),
                 );
@@ -277,7 +277,7 @@ impl BeaconCoordinator {
             evaluated_proposers: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
             local_shard,
-            topology,
+            topology_schedule,
             local_frontier,
             me,
             network,
@@ -703,7 +703,7 @@ impl BeaconCoordinator {
                 &upgraded,
                 &self.state,
                 &self.shard_source,
-                &self.topology,
+                &self.topology_schedule,
                 &self.network,
             ) {
                 trace!(
@@ -1500,17 +1500,20 @@ impl BeaconCoordinator {
         // resolve its committee a full epoch before its window opens.
         let head = Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
         let epoch = self.state.current_epoch;
-        self.topology.set_head(Arc::clone(&head));
-        self.topology.insert(epoch, head);
-        self.topology.insert(
+        self.topology_schedule.set_head(Arc::clone(&head));
+        self.topology_schedule.insert(epoch, head);
+        self.topology_schedule.insert(
             epoch.next(),
             Arc::new(
                 self.state
                     .derive_next_topology_snapshot(self.network.clone()),
             ),
         );
-        self.topology
-            .evict_below(retention_floor(&self.state, self.local_frontier, self.now));
+        self.topology_schedule.evict_below(retention_floor(
+            &self.state,
+            self.local_frontier,
+            self.now,
+        ));
 
         // Evict witnesses the boundary fold has now consumed — those below
         // each shard's advanced applied watermark
@@ -1548,8 +1551,8 @@ impl BeaconCoordinator {
                 state: Box::new(self.state.clone()),
             },
             Action::TopologyChanged {
-                topology_snapshot: Arc::clone(self.topology.head()),
-                routing_committees: Arc::new(self.topology.routing_committees()),
+                topology_snapshot: Arc::clone(self.topology_schedule.head()),
+                routing_committees: Arc::new(self.topology_schedule.routing_committees()),
             },
             // Re-arm the skip-trigger timer against the new tip. Fires
             // `skip_timeout` after the upcoming epoch's boundary if no
@@ -2017,7 +2020,7 @@ impl BeaconCoordinator {
 
     #[must_use]
     pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
-        self.topology.head()
+        self.topology_schedule.head()
     }
 
     /// The per-epoch committee schedule — the verification interface handed to
@@ -2027,7 +2030,7 @@ impl BeaconCoordinator {
     /// crosses into their verification paths.
     #[must_use]
     pub const fn topology_schedule(&self) -> &TopologySchedule {
-        &self.topology
+        &self.topology_schedule
     }
 
     /// Number of crypto verifications dispatched but not yet resulted.

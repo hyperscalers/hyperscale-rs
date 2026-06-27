@@ -100,7 +100,7 @@ where
         // header for cross-shard provisioning bookkeeping.
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
@@ -115,7 +115,7 @@ where
                     };
                     let sender = gossip.sender;
                     let header_shard = gossip.certified_header.header().shard_id();
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
 
                     let Some(public_key) =
                         resolve_sender_key(&topo, sender, header_shard, "certified header")
@@ -212,7 +212,7 @@ where
         // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<BlockHeaderNotification>(
@@ -226,7 +226,7 @@ where
                         );
                         return;
                     };
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     if !verify_signed_by_proposer(&topo, &gossip, "block_header", "block header") {
                         return;
                     }
@@ -249,7 +249,7 @@ where
         // the sender is us, and sender identity is already implicit.
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<ProvisionsNotification>(
@@ -278,7 +278,7 @@ where
                             provisions: Arc::new(verified),
                         }
                     } else {
-                        let topo = topology.load();
+                        let topo = topology_snapshot.load();
                         if !verify_signed_by_committee(
                             &topo,
                             source_shard,
@@ -300,7 +300,7 @@ where
         // ── execution.vote.batch → verify sender sig, then ProtocolEvent::UnverifiedExecutionVoteReceived ─
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<ExecutionVotesNotification>(
@@ -323,7 +323,7 @@ where
                         return;
                     };
 
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     if !verify_signed_by_committee(
                         &topo,
                         target_shard,
@@ -358,7 +358,7 @@ where
         // each receiving coordinator can decide whether the cert is for it.
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
@@ -380,7 +380,7 @@ where
                         );
                         return;
                     }
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     // Sender signed with source_shard (their local shard), not our local shard
                     if !verify_signed_by_committee(
                         &topo,
@@ -421,12 +421,12 @@ where
         // shard's committee.
 
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<ReadySignalNotification>(
                 move |notification: ReadySignalNotification| {
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     let signal = notification.signal;
                     let sender = signal.validator_id();
                     let Some(public_key) = topo.public_key(sender) else {
@@ -472,14 +472,14 @@ where
         // answered without reading any coordinator's pool.
         let senders = self.process.shard_event_senders.clone();
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
                 move |gossip: BeaconProposalNotification| {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
-                    if let Some(sender_pk) = topology.load().public_key(from) {
+                    if let Some(sender_pk) = topology_snapshot.load().public_key(from) {
                         proposal_cache.admit_wire(from, epoch, &gossip.proposal, sender_pk);
                     }
                     let event = match Arc::unwrap_or_clone(gossip.proposal).into_verified() {
@@ -560,12 +560,12 @@ where
         // BLS check fails → drop (`verify_signed_by_proposer` already
         // warns).
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
                 move |gossip: SpcNewViewNotification| {
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     if !verify_signed_by_proposer(&topo, &gossip, "spc_new_view", "SPC new view") {
                         return;
                     }
@@ -582,12 +582,12 @@ where
 
         // ── beacon.spc.new_commit → ProtocolEvent::SpcNewCommitReceived ──
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
                 move |gossip: SpcNewCommitNotification| {
-                    let topo = topology.load();
+                    let topo = topology_snapshot.load();
                     if !verify_signed_by_proposer(
                         &topo,
                         &gossip,
@@ -617,13 +617,13 @@ where
         // marker and skip the check; the expensive embedded-QC3 verify
         // still runs async in the coordinator.
         let senders = self.process.shard_event_senders.clone();
-        let topology = self.process.topology_snapshot.clone();
+        let topology_snapshot = self.process.topology_snapshot.clone();
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
                 move |gossip: SpcEmptyViewMsgNotification| {
                     if !gossip.msg.is_verified() {
-                        let topo = topology.load();
+                        let topo = topology_snapshot.load();
                         if !verify_signed_by_proposer(
                             &topo,
                             &gossip,
@@ -789,7 +789,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     // thrashing.
 
     let pending_chain = Arc::clone(&io.pending_chain);
-    let topology = process.topology_snapshot.clone();
+    let topology_snapshot = process.topology_snapshot.clone();
     let outbound_cache = Arc::clone(&io.caches.provision_store);
 
     let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
@@ -896,7 +896,7 @@ pub fn register_shard_request_handlers<S, N, D>(
                 let response = serve_provision_request(
                     &pending_chain,
                     shard,
-                    topology.load().shard_trie(),
+                    topology_snapshot.load().shard_trie(),
                     &req,
                 );
 

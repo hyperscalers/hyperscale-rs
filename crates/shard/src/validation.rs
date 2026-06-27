@@ -30,22 +30,22 @@ use crate::commit_dedup::CommitDedupIndex;
 /// the BLS-only `VerifyQcSignature` check that follows.
 #[must_use]
 pub fn qc_has_local_quorum_power(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     local_shard: ShardId,
     qc: &QuorumCertificate,
 ) -> bool {
-    let committee = topology.consensus_committee_for_shard(local_shard);
+    let committee = topology_snapshot.consensus_committee_for_shard(local_shard);
     let qc_power: VoteCount = qc
         .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
-            topology
+            topology_snapshot
                 .vote_of(vid)
                 .expect("committee member has voting power (TopologySnapshot invariant)")
         })
         .sum();
-    VoteCount::has_quorum(qc_power, topology.committee_votes(local_shard))
+    VoteCount::has_quorum(qc_power, topology_snapshot.committee_votes(local_shard))
 }
 
 /// True if `qc`'s `weighted_timestamp` is implausibly far ahead of `now`.
@@ -233,11 +233,16 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 /// its transactions. Prevents a Byzantine proposer from lying about which
 /// waves exist.
 pub fn validate_waves(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     local_shard: ShardId,
     block: &Block,
 ) -> Result<(), String> {
-    let expected = compute_waves(local_shard, topology, block.height(), block.transactions());
+    let expected = compute_waves(
+        local_shard,
+        topology_snapshot,
+        block.height(),
+        block.transactions(),
+    );
 
     if block.header().waves().0 != expected {
         return Err(format!(
@@ -355,7 +360,7 @@ pub fn validate_no_duplicate_provisions(
 /// caller can log once.
 #[allow(clippy::too_many_arguments)] // single dispatch over the pre-vote content checks
 pub fn validate_block_for_vote(
-    topology: &TopologySnapshot,
+    topology_snapshot: &TopologySnapshot,
     local_shard: ShardId,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
@@ -369,7 +374,7 @@ pub fn validate_block_for_vote(
     }
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_waves(topology, local_shard, block)?;
+    validate_waves(topology_snapshot, local_shard, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
@@ -456,7 +461,7 @@ mod tests {
 
     use super::*;
 
-    fn topology() -> TopologySnapshot {
+    fn topology_snapshot() -> TopologySnapshot {
         let committee = TestCommittee::new(4, 42);
         let validators: Vec<ValidatorInfo> = (0..committee.size())
             .map(|i| ValidatorInfo {
@@ -569,7 +574,7 @@ mod tests {
 
     #[test]
     fn validate_waves_accepts_recomputed_waves() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let height = BlockHeight::new(1);
         let expected = compute_waves(local_shard(), &topo, height, &[]);
         let block = block_with_waves(height, expected);
@@ -578,7 +583,7 @@ mod tests {
 
     #[test]
     fn validate_waves_rejects_tampered_waves() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let block = block_with_waves(
             BlockHeight::new(1),
             vec![WaveId::new(
@@ -677,7 +682,7 @@ mod tests {
 
     #[test]
     fn validate_header_rejects_runaway_round_gap() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let now = LocalTimestamp::from_millis(100_000);
         let height = BlockHeight::new(1);
         let header = header_at_round(height, Round::new(MAX_ROUND_GAP + 1), &topo);
@@ -696,7 +701,7 @@ mod tests {
 
     #[test]
     fn validate_header_accepts_round_gap_at_cap() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let now = LocalTimestamp::from_millis(100_000);
         let height = BlockHeight::new(1);
         let header = header_at_round(height, Round::new(MAX_ROUND_GAP), &topo);
@@ -742,7 +747,7 @@ mod tests {
     /// bound is the only check under test.
     fn header_extending(parent_qc: QuorumCertificate, now: LocalTimestamp) -> BlockHeader {
         let round = Round::new(1);
-        let proposer = topology().proposer_for(local_shard(), round);
+        let proposer = topology_snapshot().proposer_for(local_shard(), round);
         BlockHeader::new(
             ShardId::ROOT,
             BlockHeight::new(2),
@@ -770,7 +775,7 @@ mod tests {
 
     #[test]
     fn validate_header_rejects_far_future_parent_qc_timestamp() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let now = LocalTimestamp::from_millis(1_000_000);
 
         // Parent QC an hour ahead of our clock — far beyond the honest skew
@@ -795,7 +800,7 @@ mod tests {
 
     #[test]
     fn validate_header_accepts_recent_parent_qc_timestamp() {
-        let topo = topology();
+        let topo = topology_snapshot();
         let now = LocalTimestamp::from_millis(1_000_000);
 
         // Honest case: the parent QC was aggregated a few seconds ago, so its
@@ -963,7 +968,7 @@ mod tests {
         // the parent QC is still fully BLS-verified against the exact committee
         // before this node votes. A resolved committee runs the pre-check and
         // rejects a sub-quorum parent QC.
-        let topo = topology();
+        let topo = topology_snapshot();
         let now = LocalTimestamp::from_millis(1_000_000);
         let proposer = topo.proposer_for(local_shard(), Round::new(1));
         let header = header_with_proposer(
@@ -1283,7 +1288,7 @@ mod tests {
     fn validate_block_for_vote_rejects_unverified_before_other_checks() {
         // Out-of-order + Unverified: the verified-check fires first and
         // short-circuits before ordering is examined.
-        let topo = topology();
+        let topo = topology_snapshot();
         let mut txs = sorted_verified_txs(&[10, 20]);
         txs.reverse(); // intentionally mis-sort to prove short-circuit
         txs.push(tx(30)); // Unverified entry
@@ -1306,7 +1311,7 @@ mod tests {
     fn coast_blocks_must_be_empty() {
         // Past the terminal window a block exists only to certify the
         // crossing: any content fails the pre-vote check.
-        let topo = topology();
+        let topo = topology_snapshot();
         let with_tx = block_with_transactions(BlockHeight::new(1), sorted_verified_txs(&[10]));
         let err = validate_block_for_vote(
             &topo,

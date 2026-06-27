@@ -86,7 +86,10 @@ impl SimulationRunner {
             let committed_height = recovered.committed_height;
             (recovered, JoinKind::Retained { committed_height })
         } else {
-            let snapshot = self.hosts[node as usize].process().topology().load_full();
+            let snapshot = self.hosts[node as usize]
+                .process()
+                .topology_snapshot()
+                .load_full();
             let anchor = snapshot
                 .boundary(shard)
                 .expect("runtime join requires an attested anchor");

@@ -16,9 +16,9 @@ fn fresh_coordinator() -> ExecutionCoordinator {
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {
-    let topology =
+    let topology_schedule =
         TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
-    (fresh_coordinator(), topology)
+    (fresh_coordinator(), topology_schedule)
 }
 
 #[test]
@@ -119,8 +119,8 @@ fn fresh_is_awaiting_provisioning_is_false_for_any_tx() {
 
 #[test]
 fn fresh_emit_vote_actions_is_empty() {
-    let (mut coord, topology) = fresh_coordinator_with_topology();
-    let actions = coord.emit_vote_actions(&topology);
+    let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
+    let actions = coord.emit_vote_actions(&topology_schedule);
     assert!(actions.is_empty());
 }
 
@@ -146,9 +146,9 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
 
 #[test]
 fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shard() {
-    let (mut coord, topology) = fresh_coordinator_with_topology();
+    let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
     let local_shard = ShardId::ROOT;
-    let _ = &topology;
+    let _ = &topology_schedule;
     // A remote shard's wave that targets our local shard must register an
     // expectation. With committed_ts still ZERO the initial-deadline
     // gate is silenced, but the expectation count must reflect the header.

@@ -17,7 +17,7 @@ impl ShardParticipation {
     /// Dispatch an execution-category `ProtocolEvent`.
     pub(in crate::state) fn handle_execution(
         &mut self,
-        sched: &TopologySchedule,
+        topology_schedule: &TopologySchedule,
         event: ProtocolEvent,
     ) -> Vec<Action> {
         match event {
@@ -29,26 +29,29 @@ impl ShardParticipation {
                 // Results arriving can (a) finalize a wave whose local EC
                 // landed ahead of the engine, (b) unblock new vote emission.
                 let mut actions = self.execution_coordinator.on_execution_batch_completed(
-                    sched,
+                    topology_schedule,
                     &wave_id,
                     results,
                     tx_outcomes,
                 );
-                actions.extend(self.execution_coordinator.emit_vote_actions(sched));
+                actions.extend(
+                    self.execution_coordinator
+                        .emit_vote_actions(topology_schedule),
+                );
                 actions
             }
             ProtocolEvent::VerifiedExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_verified_execution_vote(sched, vote),
+                .on_verified_execution_vote(topology_schedule, vote),
             ProtocolEvent::UnverifiedExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_unverified_execution_vote(sched, vote),
+                .on_unverified_execution_vote(topology_schedule, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
                 verified_votes,
             } => self.execution_coordinator.on_votes_verified(
-                sched,
+                topology_schedule,
                 wave_id,
                 block_hash,
                 verified_votes,
@@ -56,28 +59,27 @@ impl ShardParticipation {
             ProtocolEvent::ExecutionCertificateAggregated {
                 wave_id,
                 certificate,
-            } => {
-                self.execution_coordinator
-                    .on_certificate_aggregated(sched, &wave_id, &certificate)
-            }
+            } => self.execution_coordinator.on_certificate_aggregated(
+                topology_schedule,
+                &wave_id,
+                &certificate,
+            ),
             ProtocolEvent::ExecutionCertificatesReceived { certificates } => {
-                let topology = sched;
                 let mut actions = Vec::new();
                 for cert in certificates {
                     actions.extend(
                         self.execution_coordinator
-                            .on_wave_certificate(topology, cert),
+                            .on_wave_certificate(topology_schedule, cert),
                     );
                 }
                 actions
             }
             ProtocolEvent::FinalizedWavesReceived { waves } => {
-                let topology = sched;
                 let mut actions = Vec::new();
                 for wave in waves {
                     actions.extend(
                         self.execution_coordinator
-                            .admit_finalized_wave(topology, wave),
+                            .admit_finalized_wave(topology_schedule, wave),
                     );
                 }
                 actions
@@ -87,7 +89,7 @@ impl ShardParticipation {
                 .on_finalized_wave_verified(result),
             ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
                 .execution_coordinator
-                .on_certificate_verified(sched, result),
+                .on_certificate_verified(topology_schedule, result),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 let local_shard = self.local_shard;
                 let mut actions = Vec::new();
@@ -103,7 +105,10 @@ impl ShardParticipation {
                     }));
                 }
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
-                actions.extend(self.execution_coordinator.emit_vote_actions(sched));
+                actions.extend(
+                    self.execution_coordinator
+                        .emit_vote_actions(topology_schedule),
+                );
                 actions
             }
             _ => unreachable!("non-execution event routed to handle_execution"),

@@ -261,7 +261,12 @@ where
     /// from all hammering one committee.
     fn fetch_shard(&self) -> Option<ShardId> {
         let vnode = self.vnodes.first()?;
-        let leaves: Vec<ShardId> = vnode.state.topology().shard_trie().leaves().collect();
+        let leaves: Vec<ShardId> = vnode
+            .state
+            .topology_snapshot()
+            .shard_trie()
+            .leaves()
+            .collect();
         if leaves.is_empty() {
             return None;
         }

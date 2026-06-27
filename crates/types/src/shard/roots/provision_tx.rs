@@ -19,7 +19,7 @@ pub struct ProvisionTxRootsContext<'a> {
     pub local_shard: ShardId,
     /// Topology snapshot anchoring shard routing — drives which target
     /// shards each cross-shard tx contributes to.
-    pub topology: &'a TopologySnapshot,
+    pub topology_snapshot: &'a TopologySnapshot,
     /// The block's transactions in block order.
     pub transactions: &'a [Arc<Verifiable<RoutableTransaction>>],
 }
@@ -73,16 +73,16 @@ impl Verified<ProvisionTxRootsMap> {
     #[must_use]
     pub fn compute(
         local_shard: ShardId,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Self {
         let mut per_target: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
 
         for tx in transactions {
-            if topology.is_single_shard_transaction(tx) {
+            if topology_snapshot.is_single_shard_transaction(tx) {
                 continue;
             }
-            for shard in topology.all_shards_for_transaction(tx) {
+            for shard in topology_snapshot.all_shards_for_transaction(tx) {
                 if shard == local_shard {
                     continue;
                 }
@@ -115,7 +115,7 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
     fn verify(&self, ctx: &ProvisionTxRootsContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let computed = Verified::<ProvisionTxRootsMap>::compute(
             ctx.local_shard,
-            ctx.topology,
+            ctx.topology_snapshot,
             ctx.transactions,
         );
         if computed.as_ref() != self {
