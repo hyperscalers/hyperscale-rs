@@ -39,9 +39,16 @@ type Key = (ShardId, BlockHeight);
 #[derive(Debug, Clone)]
 struct ExpectedProvision {
     /// Local weighted timestamp when we first expected these provisions.
-    /// Used as the liveness baseline for both fallback-fetch and orphan
-    /// eviction.
+    /// Liveness baseline for the fallback-fetch timeout — how long *we've*
+    /// been waiting. A catch-up jump in `local_committed_ts` can leave this
+    /// far behind the source block, which only makes the fetch fire sooner.
     discovered_at: WeightedTimestamp,
+    /// Authenticated weighted timestamp of the source block (its parent QC).
+    /// Orphan eviction keys on this, not `discovered_at`: a freshly-arrived
+    /// header whose source block is recent must survive the
+    /// `RETENTION_HORIZON` sweep even when our local clock was lagging at
+    /// registration (e.g. a split child still catching up).
+    source_block_ts: WeightedTimestamp,
     requested: bool,
     proposer: ValidatorId,
 }
@@ -98,16 +105,21 @@ impl ExpectedProvisionTracker {
 
     /// Register an expectation for provisions at `(source_shard, block_height)`.
     /// No-op if an expectation is already registered for the same key.
+    ///
+    /// `source_block_ts` is the source block's authenticated weighted
+    /// timestamp (its parent QC), the age anchor for orphan eviction.
     pub(crate) fn register(
         &mut self,
         source_shard: ShardId,
         block_height: BlockHeight,
         proposer: ValidatorId,
+        source_block_ts: WeightedTimestamp,
     ) {
         self.expected
             .entry((source_shard, block_height))
             .or_insert(ExpectedProvision {
                 discovered_at: self.local_committed_ts,
+                source_block_ts,
                 requested: false,
                 proposer,
             });
@@ -148,9 +160,15 @@ impl ExpectedProvisionTracker {
         }
     }
 
-    /// Drop expectations whose `discovered_at` predates `cutoff` — the
-    /// fallback fetch never resolved within `RETENTION_HORIZON`. Returns
-    /// the keys evicted so the coordinator can clean matching headers.
+    /// Drop expectations whose source block predates `cutoff` — past
+    /// `RETENTION_HORIZON` every tx in that block has terminated, so its
+    /// provisions can never be needed again. Returns the keys evicted so
+    /// the coordinator can clean matching headers.
+    ///
+    /// Keyed on the source block's authenticated `source_block_ts`, not the
+    /// local `discovered_at`: a node that registered while its committed
+    /// clock lagged (a split child catching up) would otherwise evict a
+    /// still-live expectation whose source block is recent.
     ///
     /// Under nominal operation a header is retained exactly while its
     /// provisions are outstanding; this catches entries that would
@@ -161,7 +179,7 @@ impl ExpectedProvisionTracker {
         }
         let mut dropped = Vec::new();
         self.expected.retain(|key, exp| {
-            if exp.discovered_at >= cutoff {
+            if exp.source_block_ts >= cutoff {
                 true
             } else {
                 dropped.push(*key);
@@ -250,6 +268,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
         assert_eq!(t.len(), 1);
     }
@@ -261,11 +280,13 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(7),
+            ts(1_000),
         );
         assert_eq!(t.len(), 1);
     }
@@ -277,6 +298,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
         assert!(t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
         assert!(!t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
@@ -290,6 +312,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
 
         // Before any commit, an immediate timeout sweep at a non-zero `now`
@@ -310,6 +333,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
 
         // Just under threshold: no firings.
@@ -344,6 +368,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
 
         // Verify before the timeout fires.
@@ -363,11 +388,13 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
         t.register(
             ShardId::leaf(2, 2),
             BlockHeight::new(5),
             ValidatorId::new(7),
+            ts(1_000),
         );
 
         let effects = t.flush_all();
@@ -385,6 +412,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
 
         // Advance well past RETENTION_HORIZON.
@@ -398,6 +426,45 @@ mod tests {
         assert_eq!(t.len(), 0);
     }
 
+    /// A node whose committed clock lagged at registration (a split child
+    /// catching up) stamps a stale `discovered_at`, but the source block is
+    /// recent. The orphan sweep must key on `source_block_ts` and retain it,
+    /// or the fallback fetch is evicted before it can fire and the dependent
+    /// cross-shard wave aborts.
+    #[test]
+    fn cleanup_orphans_keeps_recent_source_despite_stale_discovery() {
+        let mut t = ExpectedProvisionTracker::new();
+
+        // Register while the local clock lags far behind the source block.
+        t.record_block_committed(ts(1_000));
+        let recent_source =
+            ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
+        t.register(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+            recent_source,
+        );
+
+        // Catch up: the cutoff now predates the stale `discovered_at` (1_000)
+        // but not the recent source block.
+        let now = ts(1_000 + 3 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
+        t.record_block_committed(now);
+        let cutoff = now.minus(RETENTION_HORIZON);
+        assert!(
+            cutoff > ts(1_000),
+            "cutoff must postdate the stale discovered_at"
+        );
+        assert!(
+            recent_source >= cutoff,
+            "source block must postdate the cutoff"
+        );
+
+        let dropped = t.cleanup_orphans(cutoff);
+        assert!(dropped.is_empty());
+        assert_eq!(t.len(), 1);
+    }
+
     #[test]
     fn cleanup_orphans_no_op_when_cutoff_zero() {
         let mut t = ExpectedProvisionTracker::new();
@@ -405,6 +472,7 @@ mod tests {
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
+            ts(1_000),
         );
         let dropped = t.cleanup_orphans(WeightedTimestamp::ZERO);
         assert!(dropped.is_empty());

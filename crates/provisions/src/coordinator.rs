@@ -374,13 +374,15 @@ impl ProvisionCoordinator {
             self.headers.insert(key, Arc::clone(certified_header));
 
             let proposer = certified_header.header().proposer();
+            let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
             debug!(
                 shard = shard.inner(),
                 height = height.inner(),
                 proposer = proposer.inner(),
                 "Tracking expected provisions (verified remote block targets our shard)"
             );
-            self.expected.register(shard, height, proposer);
+            self.expected
+                .register(shard, height, proposer, source_block_ts);
         }
 
         // Join with buffered provisions waiting for this header. Drop any
@@ -1954,11 +1956,15 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&header);
 
+        // The orphan sweep keys on the source block's weighted timestamp.
+        // This synthetic header carries a genesis (zero) parent-QC timestamp,
+        // so the entry ages out the first commit whose retention cutoff goes
+        // positive — i.e. once the local clock passes RETENTION_HORIZON.
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
 
         // Walk up to (but not past) the orphan cutoff — no Abandon yet.
-        for h in 2..=orphan_cutoff_blocks + 1 {
+        for h in 2..=orphan_cutoff_blocks {
             let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             assert!(
                 !actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))),
@@ -1969,7 +1975,7 @@ mod tests {
         // One past the cutoff — orphan sweep drops the expected entry and
         // emits AbandonFetch for the dropped key.
         let actions =
-            coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 2)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 1)));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2076,18 +2082,20 @@ mod tests {
         coordinator.on_verified_remote_header(&header);
         assert_eq!(coordinator.expected.len(), 1);
 
-        // Not yet past the orphan cutoff — still retained.
-        // discovered_at was stamped at ts=500ms (the priming commit).
+        // Not yet past the orphan cutoff — still retained. The sweep keys on
+        // the source block's weighted timestamp, which for this synthetic
+        // header is the genesis (zero) parent-QC timestamp, so the entry ages
+        // out once the local clock first passes RETENTION_HORIZON.
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
-        for h in 2..=orphan_cutoff_blocks + 1 {
+        for h in 2..=orphan_cutoff_blocks {
             coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
         assert_eq!(coordinator.verified_remote_header_count(), 1);
         assert_eq!(coordinator.expected.len(), 1);
 
         // One past — orphan sweep drops header and expected entry together.
-        coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 2)));
+        coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 1)));
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.expected.len(), 0);
     }
