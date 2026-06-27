@@ -1363,10 +1363,10 @@ impl ShardCoordinator {
     /// on a missing ancestor delta.
     fn proposal_substate_bytes(
         &self,
-        topology: &TopologySchedule,
+        topology_snapshot: &TopologySnapshot,
         parent_block_hash: BlockHash,
     ) -> Result<Option<u64>, BlockHash> {
-        let thresholds = topology.reshape_thresholds();
+        let thresholds = topology_snapshot.reshape_thresholds();
         if thresholds == ReshapeThresholds::DISABLED {
             return Ok(None);
         }
@@ -1390,12 +1390,12 @@ impl ShardCoordinator {
     /// this never guesses an assertion the local walk can't justify.
     fn derive_proposal_reshape_trigger(
         &self,
-        topology: &TopologySchedule,
+        topology_snapshot: &TopologySnapshot,
         substate_bytes: Option<u64>,
         window: &[Hash],
     ) -> Option<ReshapeTrigger> {
         let count = substate_bytes?;
-        let thresholds = topology.reshape_thresholds();
+        let thresholds = topology_snapshot.reshape_thresholds();
         derive_reshape_trigger(self.local_shard, count, &thresholds, window)
     }
 
@@ -1417,7 +1417,7 @@ impl ShardCoordinator {
     fn preview_witness_commitment(
         &mut self,
         topology: &TopologySchedule,
-        committee: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         proposal_wt: WeightedTimestamp,
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
@@ -1455,7 +1455,7 @@ impl ShardCoordinator {
         // base trim off before the preview; the base never undercuts the
         // parent window's start (it is bounded by a committed ancestor's
         // count, and pruning follows commits).
-        let base = committee.witness_base(self.local_shard);
+        let base = topology_snapshot.witness_base(self.local_shard);
         let trim = usize::try_from(base.inner().saturating_sub(parent_start.inner()))
             .unwrap_or(usize::MAX)
             .min(parent_leaves.len());
@@ -1468,15 +1468,16 @@ impl ShardCoordinator {
         // same window. The re-emission that landed it here is absorbed: the
         // pool already dropped it on drain.
         ready_signals.retain(|signal| {
-            let leaf = ready_leaf_payload(self.local_shard, committee, signal.validator_id());
+            let leaf =
+                ready_leaf_payload(self.local_shard, topology_snapshot, signal.validator_id());
             !parent_leaves.contains(&leaf.leaf_hash())
         });
 
         let reshape_trigger =
-            self.derive_proposal_reshape_trigger(topology, substate_bytes, &parent_leaves);
+            self.derive_proposal_reshape_trigger(topology_snapshot, substate_bytes, &parent_leaves);
         let new_leaves = derive_leaves(
             self.local_shard,
-            committee,
+            topology_snapshot,
             receipts,
             missed,
             &ready_signals,
@@ -1552,7 +1553,7 @@ impl ShardCoordinator {
         // build — the verifier parks on the same gap — rather than emitting
         // a header whose omitted assertion every replica recomputes as
         // required and rejects.
-        let substate_bytes = match self.proposal_substate_bytes(topology, parent_block_hash) {
+        let substate_bytes = match self.proposal_substate_bytes(committee, parent_block_hash) {
             Ok(count) => count,
             Err(blocking) => {
                 trace!(
@@ -2384,7 +2385,7 @@ impl ShardCoordinator {
                 block_hash,
                 block,
                 SubstateCountSource {
-                    thresholds: topology.reshape_thresholds(),
+                    thresholds: committee.reshape_thresholds(),
                     frontier: self.substate_bytes_frontier,
                     committed_height: self.committed_height,
                     deltas: &self.pending_bytes_deltas,
@@ -2416,7 +2417,7 @@ impl ShardCoordinator {
     /// should reject the block (logs the reason).
     fn reject_invalid_block_contents(
         &self,
-        committee: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         block: &Block,
         coasting: bool,
@@ -2424,7 +2425,7 @@ impl ShardCoordinator {
         let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(block.header().parent_block_hash());
         if let Err(e) = validate_block_for_vote(
-            committee,
+            topology_snapshot,
             self.local_shard,
             block,
             &qc_chain_tx_hashes,
@@ -3118,7 +3119,7 @@ impl ShardCoordinator {
                 committee,
                 topology,
                 SubstateCountSource {
-                    thresholds: topology.reshape_thresholds(),
+                    thresholds: committee.reshape_thresholds(),
                     frontier: self.substate_bytes_frontier,
                     committed_height: self.committed_height,
                     deltas: &self.pending_bytes_deltas,
@@ -4342,13 +4343,13 @@ impl ShardCoordinator {
     /// `BeaconState` invariant violation, as in [`committee_public_keys`].
     fn committee_timeout_power(
         &self,
-        committee: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         voter: ValidatorId,
     ) -> Option<VoteCount> {
-        committee.committee_index_for_shard(self.local_shard, voter)?;
+        topology_snapshot.committee_index_for_shard(self.local_shard, voter)?;
         // Membership is confirmed above, so the power resolves; a miss is the
         // same invariant violation the committee-key lookups assert on.
-        Some(committee.vote_of(voter).unwrap_or_else(|| {
+        Some(topology_snapshot.vote_of(voter).unwrap_or_else(|| {
             panic!(
                 "committee member {voter:?} has no voting power — \
                  BeaconState invariant (committees subset of validators) violated"

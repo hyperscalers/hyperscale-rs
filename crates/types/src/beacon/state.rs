@@ -376,7 +376,20 @@ pub struct BeaconState {
     /// from `chain_config` at genesis and mutated only by the fold, so it
     /// stays a pure function of committed beacon history and every
     /// replica resolves the same value at every epoch.
+    ///
+    /// Promoted from [`Self::next_params`] at the top of each `apply_epoch`,
+    /// the same one-epoch lookahead discipline as
+    /// [`Self::shard_committees`] / [`Self::next_shard_committees`], so a
+    /// window's params are fixed an epoch before the window opens and a
+    /// block carries the params every member resolves off its
+    /// weighted-time-bound topology snapshot.
     pub params: NetworkParams,
+    /// The lookahead params governing the next epoch: what a parameter
+    /// vote folded this epoch installs at its `activate_at`, decided one
+    /// epoch early (`activate_at - 1`) so it is frozen into the next
+    /// epoch's topology snapshot before any block resolves against it.
+    /// Promoted into [`Self::params`] at the next `apply_epoch`.
+    pub next_params: NetworkParams,
     /// Each stake pool's one active parameter-change vote — the proposal
     /// `(params, activate_at)` it backs. Folded from `ParamVote`
     /// witnesses (cast/replace/clear); a pool with no entry abstains.
@@ -752,6 +765,9 @@ struct WindowProjection {
     /// snapshots project the same map.
     reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     split_pending: BTreeSet<ShardId>,
+    /// Governable params for this window: `params` (head) or `next_params`
+    /// (lookahead). Frozen one epoch ahead like the committee.
+    params: NetworkParams,
 }
 
 impl BeaconState {
@@ -899,6 +915,7 @@ impl BeaconState {
                 reshape_keepers: self.reshape_keepers_window.clone(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.split_pending_window.clone(),
+                params: self.params,
             },
             network,
         )
@@ -922,6 +939,7 @@ impl BeaconState {
                 reshape_keepers: self.live_reshape_keepers(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.live_split_pending(),
+                params: self.next_params,
             },
             network,
         )
@@ -1034,6 +1052,7 @@ impl BeaconState {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            params,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
             .validators
@@ -1095,6 +1114,7 @@ impl BeaconState {
             reshape_parent_halves,
             split_pending,
         )
+        .with_params(params)
     }
 
     /// Active-duty validator pool: every validator `OnShard { ready: true }`
@@ -1259,6 +1279,7 @@ mod tests {
         BeaconState {
             chain_config: BeaconChainConfig::default(),
             params: NetworkParams::default(),
+            next_params: NetworkParams::default(),
             param_votes: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),

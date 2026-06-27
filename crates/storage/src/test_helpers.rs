@@ -265,6 +265,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
     Arc::new(BeaconState {
         chain_config: BeaconChainConfig::default(),
         params: NetworkParams::default(),
+        next_params: NetworkParams::default(),
         param_votes: BTreeMap::new(),
         current_epoch: Epoch::new(epoch),
         validators: BTreeMap::new(),

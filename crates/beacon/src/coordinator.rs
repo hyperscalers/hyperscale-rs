@@ -248,8 +248,7 @@ impl BeaconCoordinator {
         // so the skip drops only a redundant re-derivation.
         let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
         let mut topology =
-            TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head))
-                .with_reshape_thresholds(latest.params.reshape_thresholds);
+            TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
         for state in &history {
             if state.current_epoch != latest_epoch {
                 topology.insert(
@@ -1510,11 +1509,6 @@ impl BeaconCoordinator {
                     .derive_next_topology_snapshot(self.network.clone()),
             ),
         );
-        // Carry a governance-activated reshape-threshold change into the
-        // live schedule so the shard proposers reading off it assert
-        // split/merge against the new value.
-        self.topology
-            .set_reshape_thresholds(self.state.params.reshape_thresholds);
         self.topology
             .evict_below(retention_floor(&self.state, self.local_frontier, self.now));
 

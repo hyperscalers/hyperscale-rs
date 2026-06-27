@@ -13,25 +13,34 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{BeaconState, NetworkParams};
 
-/// Tally this epoch's parameter votes and apply any proposal a strict
-/// majority of total pool stake backs at the current epoch, then prune
-/// spent votes.
+/// Decide the params governing the next epoch and stage them into
+/// [`BeaconState::next_params`], then prune spent votes.
+///
+/// Resolved one epoch ahead — the same lookahead discipline as
+/// `next_shard_committees`: at epoch E this tallies proposals naming
+/// `E + 1`, so a change a majority backs is frozen into the next epoch's
+/// topology snapshot before any block resolves against it. `apply_epoch`
+/// promotes the result into [`BeaconState::params`] at `E + 1`, so the
+/// change still takes effect at its `activate_at`; only the decision (and
+/// the vote deadline) lands an epoch earlier.
 ///
 /// Votes are bucketed by their proposed `(params, activate_at)` tuple,
-/// filtered to those naming this epoch. Because each pool backs exactly
-/// one tuple the buckets are disjoint, so at most one can exceed half of
-/// total pool stake; abstaining stake sits in the denominator, never a
-/// bucket, so a change needs an outright majority of all stake — not just
-/// of votes cast. Every vote naming this epoch or earlier is then pruned:
-/// applied or expired, it is spent, and only future proposals stay live.
+/// filtered to those naming the next epoch. Because each pool backs
+/// exactly one tuple the buckets are disjoint, so at most one can exceed
+/// half of total pool stake; abstaining stake sits in the denominator,
+/// never a bucket, so a change needs an outright majority of all stake —
+/// not just of votes cast. Absent a majority the next epoch inherits the
+/// current params. Every vote naming the next epoch or earlier is then
+/// pruned: applied or expired, it is spent, and only later proposals stay
+/// live.
 pub(super) fn tally_param_votes(state: &mut BeaconState) {
-    let current = state.current_epoch;
+    let target = state.current_epoch.next();
 
-    // Bucket the votes naming this epoch by their proposed params, summing
-    // each bucket's backing pool stake.
+    // Bucket the votes naming the next epoch by their proposed params,
+    // summing each bucket's backing pool stake.
     let mut buckets: BTreeMap<NetworkParams, u128> = BTreeMap::new();
     for (pool_id, proposal) in &state.param_votes {
-        if proposal.activate_at != current {
+        if proposal.activate_at != target {
             continue;
         }
         let weight = state
@@ -43,26 +52,23 @@ pub(super) fn tally_param_votes(state: &mut BeaconState) {
     }
 
     // Total pool stake is the denominator; a bucket wins iff it holds
-    // strictly more than the rest of the stake combined.
+    // strictly more than the rest of the stake combined. Each backing
+    // vote validated its params when recorded; a final bounds check keeps
+    // an invalid value out even if that gate ever loosens. Absent a valid
+    // winner the next epoch carries the current params forward.
     let total = state.pools.values().fold(0u128, |acc, pool| {
         acc.saturating_add(pool.total_stake.attos())
     });
     let winner = buckets
         .into_iter()
         .find(|&(_, backing)| backing > total.saturating_sub(backing))
-        .map(|(params, _)| params);
-    if let Some(params) = winner {
-        // Each backing vote validated its params when recorded; a final
-        // bounds check keeps an invalid value off `state.params` even if
-        // that gate ever loosens.
-        if params.validate().is_ok() {
-            state.params = params;
-        }
-    }
+        .map(|(params, _)| params)
+        .filter(|params| params.validate().is_ok());
+    state.next_params = winner.unwrap_or(state.params);
 
     state
         .param_votes
-        .retain(|_, proposal| proposal.activate_at > current);
+        .retain(|_, proposal| proposal.activate_at > target);
 }
 
 #[cfg(test)]
@@ -147,55 +153,60 @@ mod tests {
         cast(&mut state, 99, Some(proposal(HIGH, 5)));
         assert!(state.param_votes.is_empty());
 
-        // Activation already in the past — dead on arrival.
+        // Activation this epoch or earlier — undecidable (a change is
+        // decided at `activate_at - 1`), so dead on arrival.
         cast(&mut state, 0, Some(proposal(HIGH, 2)));
+        assert!(state.param_votes.is_empty());
+        cast(&mut state, 0, Some(proposal(HIGH, 3)));
         assert!(state.param_votes.is_empty());
 
         // Out-of-bounds params (zero split threshold) — never recorded.
         cast(&mut state, 0, Some(proposal(0, 5)));
         assert!(state.param_votes.is_empty());
 
-        // Activation at the current epoch is allowed (it tallies this epoch).
-        cast(&mut state, 0, Some(proposal(HIGH, 3)));
-        assert_eq!(state.param_votes[&StakePoolId::new(0)], proposal(HIGH, 3));
+        // Activation next epoch is the earliest decidable — recorded.
+        cast(&mut state, 0, Some(proposal(HIGH, 4)));
+        assert_eq!(state.param_votes[&StakePoolId::new(0)], proposal(HIGH, 4));
     }
 
     // ─── tally: majority, abstention, disjoint buckets ───────────────────
 
     #[test]
-    fn majority_of_total_stake_applies_the_change() {
-        // A holds 60 of 100; its lone vote is an outright majority.
-        let mut state = state_with_pools(5, &[(0, 60), (1, 40)]);
+    fn majority_of_total_stake_stages_the_change_for_next_epoch() {
+        // A holds 60 of 100; its lone vote is an outright majority. The
+        // proposal names epoch 5, so the epoch-4 tally stages it into
+        // `next_params` for promotion at epoch 5.
+        let mut state = state_with_pools(4, &[(0, 60), (1, 40)]);
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
 
         tally_param_votes(&mut state);
-        assert_eq!(state.params.reshape_thresholds.split_bytes, HIGH);
-        // Spent once tallied.
+        assert_eq!(state.next_params.reshape_thresholds.split_bytes, HIGH);
+        // Decided, so spent.
         assert!(state.param_votes.is_empty());
     }
 
     #[test]
-    fn sub_majority_does_not_change_the_param() {
-        // A holds 40 of 100; 40 is not a majority of the total.
-        let mut state = state_with_pools(5, &[(0, 40), (1, 60)]);
-        let before = state.params;
+    fn sub_majority_leaves_next_params_inheriting_current() {
+        // A holds 40 of 100; 40 is not a majority of the total, so the next
+        // epoch inherits the current params.
+        let mut state = state_with_pools(4, &[(0, 40), (1, 60)]);
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
 
         tally_param_votes(&mut state);
-        assert_eq!(state.params, before);
-        // Still spent — its activation epoch has passed.
+        assert_eq!(state.next_params, state.params);
+        // Still spent — its decision epoch has passed.
         assert!(state.param_votes.is_empty());
     }
 
     #[test]
     fn abstaining_stake_counts_in_the_denominator() {
         // Two pools back the same proposal with 60 combined; a third pool
-        // abstains with 50. 60 > 50, so the change applies.
-        let mut majority = state_with_pools(5, &[(0, 30), (1, 30), (2, 50)]);
+        // abstains with 50. 60 > 50, so the change is staged.
+        let mut majority = state_with_pools(4, &[(0, 30), (1, 30), (2, 50)]);
         majority
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
@@ -203,25 +214,23 @@ mod tests {
             .param_votes
             .insert(StakePoolId::new(1), proposal(HIGH, 5));
         tally_param_votes(&mut majority);
-        assert_eq!(majority.params.reshape_thresholds.split_bytes, HIGH);
+        assert_eq!(majority.next_params.reshape_thresholds.split_bytes, HIGH);
 
         // Same backers but the abstaining pool now holds 70: 60 is no
-        // longer an outright majority, so nothing changes.
-        let mut shy = state_with_pools(5, &[(0, 30), (1, 30), (2, 70)]);
-        let before = shy.params;
+        // longer an outright majority, so the next epoch inherits.
+        let mut shy = state_with_pools(4, &[(0, 30), (1, 30), (2, 70)]);
         shy.param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
         shy.param_votes
             .insert(StakePoolId::new(1), proposal(HIGH, 5));
         tally_param_votes(&mut shy);
-        assert_eq!(shy.params, before);
+        assert_eq!(shy.next_params, shy.params);
     }
 
     #[test]
     fn split_coalitions_in_disjoint_buckets_reach_no_majority() {
         // Two proposals each draw a plurality but neither a majority.
-        let mut state = state_with_pools(5, &[(0, 40), (1, 35), (2, 25)]);
-        let before = state.params;
+        let mut state = state_with_pools(4, &[(0, 40), (1, 35), (2, 25)]);
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
@@ -230,58 +239,57 @@ mod tests {
             .insert(StakePoolId::new(1), proposal(HIGH * 2, 5));
         // Pool 2 abstains.
         tally_param_votes(&mut state);
-        assert_eq!(state.params, before);
+        assert_eq!(state.next_params, state.params);
     }
 
     // ─── activation epoch + pruning ──────────────────────────────────────
 
     #[test]
-    fn change_flips_exactly_at_the_named_activation_epoch() {
-        let mut state = state_with_pools(4, &[(0, 100)]);
+    fn change_is_decided_exactly_one_epoch_before_activation() {
+        let mut state = state_with_pools(3, &[(0, 100)]);
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
 
-        // Epoch 4: the proposal names epoch 5, so nothing happens and the
-        // vote survives.
-        let before = state.params;
+        // Epoch 3: the proposal names epoch 5, decided at epoch 4 — too
+        // early, so nothing stages and the vote survives.
         tally_param_votes(&mut state);
-        assert_eq!(state.params, before);
+        assert_eq!(state.next_params, state.params);
         assert_eq!(state.param_votes[&StakePoolId::new(0)], proposal(HIGH, 5));
 
-        // Epoch 5: it activates and the spent vote is pruned.
-        state.current_epoch = Epoch::new(5);
+        // Epoch 4: it's staged into `next_params` and the spent vote is
+        // pruned. `apply_epoch` promotes it into `params` at epoch 5.
+        state.current_epoch = Epoch::new(4);
         tally_param_votes(&mut state);
-        assert_eq!(state.params.reshape_thresholds.split_bytes, HIGH);
+        assert_eq!(state.next_params.reshape_thresholds.split_bytes, HIGH);
         assert!(state.param_votes.is_empty());
     }
 
     #[test]
-    fn a_vote_whose_activation_epoch_passed_is_pruned_unapplied() {
-        // Folded late: the tally for epoch 6 never sees an epoch-5 proposal.
+    fn a_vote_whose_decision_epoch_passed_is_pruned_unapplied() {
+        // Folded late: the tally for epoch 6 (deciding epoch 7) never sees
+        // an epoch-5 proposal whose decision epoch (4) is long gone.
         let mut state = state_with_pools(6, &[(0, 100)]);
-        let before = state.params;
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(HIGH, 5));
 
         tally_param_votes(&mut state);
-        assert_eq!(state.params, before);
+        assert_eq!(state.next_params, state.params);
         assert!(state.param_votes.is_empty());
     }
 
     #[test]
     fn tally_defensively_rejects_out_of_bounds_winner() {
         // A majority-backed but out-of-bounds proposal (inserted directly,
-        // bypassing the fold's record-time guard) is not applied.
-        let mut state = state_with_pools(5, &[(0, 100)]);
-        let before = state.params;
+        // bypassing the fold's record-time guard) is not staged.
+        let mut state = state_with_pools(4, &[(0, 100)]);
         state
             .param_votes
             .insert(StakePoolId::new(0), proposal(0, 5));
 
         tally_param_votes(&mut state);
-        assert_eq!(state.params, before);
+        assert_eq!(state.next_params, state.params);
         assert!(state.param_votes.is_empty());
     }
 }

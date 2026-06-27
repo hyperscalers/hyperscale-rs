@@ -11,9 +11,9 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId,
-    Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardTrie, StateRoot, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition,
+    NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction, SettledWavesRoot,
+    ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -142,6 +142,12 @@ pub struct TopologySnapshot {
     ///
     /// [`TopologySchedule::split_at_next_boundary`]: crate::TopologySchedule::split_at_next_boundary
     split_pending: BTreeSet<ShardId>,
+    /// Governable network parameters in force for this window, projected
+    /// from `BeaconState.params` (head) or `next_params` (lookahead).
+    /// Frozen one epoch ahead like the committee, so every member resolves
+    /// the same `reshape_thresholds` for a block off its weighted-time-bound
+    /// snapshot rather than a live head value that skews across folds.
+    params: NetworkParams,
     validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -183,6 +189,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -224,6 +231,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -274,6 +282,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -360,9 +369,21 @@ impl TopologySnapshot {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
+    }
+
+    /// Override the window's governable params. Defaults to
+    /// [`NetworkParams::default`] (reshaping disabled); the beacon
+    /// projection sets the folded value, while tests and pre-beacon
+    /// bootstrap snapshots that don't drive the reshape predicate keep the
+    /// default.
+    #[must_use]
+    pub const fn with_params(mut self, params: NetworkParams) -> Self {
+        self.params = params;
+        self
     }
 }
 
@@ -379,6 +400,20 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn network(&self) -> &NetworkDefinition {
         &self.network
+    }
+
+    /// Governable network parameters in force for this window — frozen one
+    /// epoch ahead like the committee, so a block resolves them off the
+    /// same weighted-time-bound snapshot every member shares.
+    #[must_use]
+    pub const fn params(&self) -> NetworkParams {
+        self.params
+    }
+
+    /// Substate-byte reshape thresholds in force for this window.
+    #[must_use]
+    pub const fn reshape_thresholds(&self) -> ReshapeThresholds {
+        self.params.reshape_thresholds
     }
 
     /// Get the total number of shards (live leaves of the partition).

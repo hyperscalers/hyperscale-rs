@@ -109,6 +109,7 @@ fn initial_state() -> BeaconState {
     let mut state = BeaconState {
         chain_config: BeaconChainConfig::default(),
         params: NetworkParams::default(),
+        next_params: NetworkParams::default(),
         param_votes: BTreeMap::new(),
         current_epoch: Epoch::GENESIS,
         validators,

@@ -14,8 +14,9 @@ use std::time::Duration;
 use common::ShardCoordinatorSim;
 use hyperscale_shard::ready_signal_pool::MIN_READY_SIGNAL_DWELL;
 use hyperscale_types::{
-    NetworkDefinition, ReshapeThresholds, ShardId, ShardWitnessPayload, TopologySchedule,
-    TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
+    NetworkDefinition, NetworkParams, ReshapeThresholds, ShardId, ShardWitnessPayload,
+    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+    WeightedTimestamp,
 };
 
 const MAX_STEPS: usize = 5_000;
@@ -29,10 +30,15 @@ const MAX_STEPS: usize = 5_000;
 #[test]
 fn split_trigger_asserts_once_per_window_and_verifies() {
     let mut sim = ShardCoordinatorSim::new(4, 0x7E5A);
-    sim.topology = sim
+    let snapshot = sim
         .topology
+        .head()
+        .as_ref()
         .clone()
-        .with_reshape_thresholds(ReshapeThresholds { split_bytes: 0 });
+        .with_params(NetworkParams {
+            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+        });
+    sim.topology = TopologySchedule::single(Arc::new(snapshot));
     sim.kick_off();
 
     let mut steps = 0;
