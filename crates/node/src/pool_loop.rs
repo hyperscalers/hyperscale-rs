@@ -15,7 +15,7 @@
 //! dedup, the topology `ArcSwap`). Because a pooled vnode no-ops
 //! `BeaconBlockPersisted` (it has no shard coordinators to replay into), the
 //! whole `received → verify → adopt → commit` cascade runs to quiescence within
-//! one [`Self::dispatch_event`], with no event-channel round trip.
+//! one `PoolLoop::dispatch_event`, with no event-channel round trip.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ use tracing::warn;
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
 use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process::ProcessIo;
+use crate::shard::StepOutput;
 use crate::vnode::Vnode;
 
 /// Active driver for a host's shard-less, beacon-following vnodes.
@@ -123,7 +124,21 @@ where
     pub fn run_step(&mut self, input: PoolScopedInput) -> Vec<ParticipationChange> {
         self.clear_scratch();
         self.dispatch_event(input);
-        std::mem::take(&mut self.pending_reconfigurations)
+        self.take_output().reconfigurations
+    }
+
+    /// Drain this step's scratch into a [`StepOutput`]. A follower emits no
+    /// transaction statuses or shard timers, so those fields stay empty; the
+    /// counterpart to [`Self::clear_scratch`], used by both this loop's
+    /// [`Self::run_step`] and the whole-host
+    /// [`NodeHost::step`](crate::host::NodeHost::step) so the scratch field
+    /// set lives in one place.
+    pub(crate) fn take_output(&mut self) -> StepOutput {
+        StepOutput {
+            actions_generated: std::mem::replace(&mut self.actions_generated, 0),
+            reconfigurations: std::mem::take(&mut self.pending_reconfigurations),
+            ..StepOutput::default()
+        }
     }
 
     /// Route a [`PoolScopedInput`] to the pooled vnodes or the catch-up

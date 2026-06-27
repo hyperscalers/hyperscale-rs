@@ -228,6 +228,7 @@ pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event:
 /// counts. Sync/fetch I/O and block-commit dispatch happen internally
 /// via the `Network` and `Dispatch` traits — the runner only processes
 /// emitted transaction statuses and timer operations.
+#[derive(Default)]
 pub struct StepOutput {
     /// Transaction status notifications emitted during this step.
     pub emitted_statuses: Vec<(TxHash, TransactionStatus)>,
@@ -240,6 +241,19 @@ pub struct StepOutput {
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.
     pub reconfigurations: Vec<ParticipationChange>,
+}
+
+impl StepOutput {
+    /// Fold another step's output into this one. The whole-host driver
+    /// ([`NodeHost::step`](crate::host::NodeHost::step)) uses this to
+    /// aggregate the per-driver outputs of every shard and the pool a
+    /// single event touched.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.emitted_statuses.extend(other.emitted_statuses);
+        self.actions_generated += other.actions_generated;
+        self.timer_ops.extend(other.timer_ops);
+        self.reconfigurations.extend(other.reconfigurations);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -596,11 +610,27 @@ where
     ///
     /// [`NodeHost::step`]: crate::host::NodeHost::step
     pub fn run_step(&mut self, input: ShardScopedInput) -> StepOutput {
+        self.clear_scratch();
+        self.step(input);
+        self.take_output()
+    }
+
+    /// Clear per-step scratch so the next step's drained output reflects
+    /// only that step. Called by both this loop's [`Self::run_step`] and the
+    /// whole-host [`NodeHost::step`](crate::host::NodeHost::step) before
+    /// dispatch; centralizing it keeps the two drivers' scratch contract in
+    /// one place.
+    pub(crate) fn clear_scratch(&mut self) {
         self.pending_timer_ops.clear();
         self.emitted_statuses.clear();
         self.pending_reconfigurations.clear();
         self.actions_generated = 0;
-        self.step(input);
+    }
+
+    /// Drain this step's accumulated scratch into a [`StepOutput`]. The
+    /// counterpart to [`Self::clear_scratch`]; both drivers drain through
+    /// here so the scratch field set lives in one place.
+    pub(crate) fn take_output(&mut self) -> StepOutput {
         StepOutput {
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
