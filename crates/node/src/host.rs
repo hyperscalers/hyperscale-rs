@@ -28,7 +28,8 @@ use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidat
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, NetworkDefinition, ShardId, TransactionStatus, TxHash, ValidatorId,
+    Block, BlockHeight, CertifiedBlock, LocalTimestamp, NetworkDefinition, ShardId,
+    TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 use crate::NodeStateMachine;
@@ -60,6 +61,21 @@ pub type NodeHostParts<S, N, D> = (
     BTreeMap<ShardId, ShardLoop<S, N, D>>,
     Option<PoolLoop<S, N, D>>,
 );
+
+/// The deterministic product of one shard's genesis ceremony, returned by
+/// [`NodeHost::build_shard_genesis`].
+///
+/// The caller commits `certified` itself: production steps `BlockCommitted`
+/// inline, while simulation schedules it only after wiring the network, so
+/// the shared ceremony stops short of the commit.
+pub struct ShardGenesis {
+    /// The genesis block built and persisted into the shard's vnodes.
+    pub block: Block,
+    /// The certified genesis block to feed `ProtocolEvent::BlockCommitted`.
+    pub certified: Arc<Verified<CertifiedBlock>>,
+    /// Output drained from the genesis install (timer sets, statuses).
+    pub setup_output: StepOutput,
+}
 
 /// Top-level node composition: process-scoped resources plus one
 /// [`ShardLoop`] per hosted shard.

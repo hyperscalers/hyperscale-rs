@@ -43,17 +43,17 @@ use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::PoolLoop;
 use hyperscale_node::shard::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot, TxStatusCache,
-    VnodeInit, seat_follower, seat_vnode_group,
+    NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, ShardGenesis, SharedTopologySnapshot,
+    TxStatusCache, VnodeInit, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, ChainOrigin,
-    GenesisValidators, InFlightCount, LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId,
-    RoutableTransaction, ShardId, ShardTrie, ValidatorId, ValidatorStatus, Verified,
+    BeaconChainConfig, BlockHeight, Bls12381G1PrivateKey, GenesisValidators, InFlightCount,
+    LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, RoutableTransaction, ShardId, ShardTrie, ValidatorId,
+    ValidatorStatus,
 };
 use libp2p::identity::Keypair;
 use radix_common::types::ComponentAddress;
@@ -831,19 +831,6 @@ impl ProductionRunner {
                 .map_or_else(GenesisConfig::production, |cfg| {
                     filter_genesis_for_shard(cfg, shard, topology_snapshot.load().shard_trie())
                 });
-            info!(
-                shard = ?shard,
-                xrd_balances = genesis_config.xrd_balances.len(),
-                "Running genesis"
-            );
-            let genesis_jmt_root = host.install_engine_genesis(shard, &genesis_config);
-
-            info!(
-                shard = ?shard,
-                genesis_jmt_root = ?genesis_jmt_root,
-                "JMT state after genesis bootstrap"
-            );
-
             let first_validator = topology_snapshot
                 .load()
                 .committee_for_shard(shard)
@@ -851,45 +838,27 @@ impl ProductionRunner {
                 .copied()
                 .unwrap_or(ValidatorId::new(0));
 
-            let genesis_block =
-                Block::genesis(shard, first_validator, genesis_jmt_root, ChainOrigin::ROOT);
-
-            let genesis_hash = genesis_block.hash();
+            let ShardGenesis {
+                block,
+                certified,
+                setup_output,
+            } = host.build_shard_genesis(shard, first_validator, &genesis_config);
             info!(
                 shard = ?shard,
-                genesis_hash = ?genesis_hash,
+                genesis_jmt_root = ?block.header().state_root(),
+                genesis_hash = ?block.hash(),
+                xrd_balances = genesis_config.xrd_balances.len(),
                 proposer = ?first_validator,
-                "Created genesis block"
+                "Initialized genesis block"
             );
+            timer_ops.extend(setup_output.timer_ops);
 
-            host.initialize_shard_genesis(&genesis_block);
-            host.flush_all_batches();
-
-            let genesis_output = host.drain_pending_output();
-            timer_ops.extend(genesis_output.timer_ops);
-
-            // Sync the state machine with the JMT state genesis just
-            // installed — vnodes were created with zero state.
-            let genesis_certified = Arc::new(Verified::<CertifiedBlock>::genesis(
-                shard,
-                first_validator,
-                genesis_block.header().state_root(),
-                ChainOrigin::ROOT,
-            ));
+            // Commit genesis synchronously — production drives the shard loop
+            // on a pinned thread, so consensus may fire immediately.
             let genesis_commit_output = host.step(HostEvent::protocol(
                 shard,
-                ProtocolEvent::BlockCommitted {
-                    certified: genesis_certified,
-                },
+                ProtocolEvent::BlockCommitted { certified },
             ));
-
-            info!(
-                shard = ?shard,
-                genesis_jmt_root = ?genesis_jmt_root,
-                actions = genesis_commit_output.actions_generated,
-                "Updated state machine with genesis JMT state"
-            );
-
             timer_ops.extend(genesis_commit_output.timer_ops);
             host.flush_all_batches();
         }
