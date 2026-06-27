@@ -2,13 +2,21 @@
 //!
 //! `NodeHost` bundles `Arc<ProcessIo>` (process-scoped resources) plus
 //! one [`ShardLoop`] per hosted shard. It owns the event-routing seam:
-//! [`Self::step`] dispatches `HostEvent::Shard` to the targeted
+//! [`NodeHost::step`] dispatches `HostEvent::Shard` to the targeted
 //! `ShardLoop::step` and `HostEvent::Process` to cross-shard handlers
 //! (transaction submission fan-out, fetch tick) that need access to
 //! every hosted shard.
 //!
-//! Production and simulation runners both build a `NodeHost` via
-//! [`Self::new`] and drive it through [`Self::step`] / [`Self::set_time`].
+//! Two runners drive a `NodeHost`, each built via [`NodeHost::new`].
+//! Production decomposes it with [`NodeHost::into_parts`] and runs each
+//! [`ShardLoop`] (and the host's pool) on its own pinned thread via
+//! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
+//! single-threaded over a global event queue through [`NodeHost::step`],
+//! which fans a `HostEvent::Process` out across every hosted shard.
+//! Production also calls `step` once at startup for the genesis commit,
+//! before it decomposes the host. Both paths share `ShardLoop::step` for
+//! dispatch and the same `clear_scratch` / `take_output` scratch lifecycle,
+//! so the two drivers cannot drift.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -493,13 +501,9 @@ where
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
     ///    production receives these via its crossbeam channel receivers)
-    #[allow(clippy::too_many_lines)] // single dispatch over HostEvent; one arm per variant
     pub fn step(&mut self, event: HostEvent) -> StepOutput {
         for sl in self.shards.values_mut() {
-            sl.pending_timer_ops.clear();
-            sl.emitted_statuses.clear();
-            sl.pending_reconfigurations.clear();
-            sl.actions_generated = 0;
+            sl.clear_scratch();
         }
         if let Some(pool) = &mut self.pool {
             pool.clear_scratch();
@@ -541,23 +545,12 @@ where
     /// produces actions outside a normal step (genesis init, sync-output
     /// continuations).
     pub fn drain_pending_output(&mut self) -> StepOutput {
-        let mut out = StepOutput {
-            emitted_statuses: Vec::new(),
-            actions_generated: 0,
-            timer_ops: Vec::new(),
-            reconfigurations: Vec::new(),
-        };
+        let mut out = StepOutput::default();
         for sl in self.shards.values_mut() {
-            out.emitted_statuses.append(&mut sl.emitted_statuses);
-            out.actions_generated += std::mem::replace(&mut sl.actions_generated, 0);
-            out.timer_ops.append(&mut sl.pending_timer_ops);
-            out.reconfigurations
-                .append(&mut sl.pending_reconfigurations);
+            out.merge(sl.take_output());
         }
         if let Some(pool) = &mut self.pool {
-            out.actions_generated += std::mem::replace(&mut pool.actions_generated, 0);
-            out.reconfigurations
-                .append(&mut pool.pending_reconfigurations);
+            out.merge(pool.take_output());
         }
         out
     }
