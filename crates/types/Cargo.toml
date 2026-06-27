@@ -35,7 +35,7 @@ test-utils = []
 
 [dev-dependencies]
 proptest.workspace = true
-syn = { version = "2.0.117", features = ["full", "parsing", "visit"] }
+syn = { version = "2.0.118", features = ["full", "parsing", "visit"] }
 
 [lints]
 workspace = true
