@@ -87,15 +87,18 @@ impl NodeStateMachine {
 
         actions.extend(s.sweep_ready_counterpart_straddlers());
 
-        // The first coast commit terminates the chain: finalization is a wave
-        // certificate in a later block, and no later block will exist, so every
-        // still-in-flight transaction is permanently undecidable here. Drive them
-        // to their terminal abort and drop the execution state that was waiting
-        // on them — once. Runs after the fan-out above so a final cert-carrying
-        // block terminalizes its transactions through the normal path first.
+        // The first coast commit quiesces the chain's content: finalization is a
+        // wave certificate in a later block, and no later content block will
+        // exist, so every still-in-flight transaction is permanently undecidable
+        // here. Drive them to their terminal abort and drop the execution state
+        // that was waiting on them — once. Keyed on quiescence, not dissolution:
+        // the committee keeps coasting and serving past this point, but its
+        // terminal block is the last that can decide a transaction. Runs after
+        // the fan-out above so a final cert-carrying block terminalizes its
+        // transactions through the normal path first.
         if !s.terminal_chain_swept
             && s.shard_coordinator
-                .chain_terminated(self.beacon_coordinator.topology_schedule())
+                .quiescent(self.beacon_coordinator.topology_schedule())
         {
             s.terminal_chain_swept = true;
             actions.extend(s.mempool_coordinator.abort_in_flight());

@@ -654,17 +654,31 @@ impl ShardCoordinator {
             .is_some_and(|(_, past_terminal)| past_terminal)
     }
 
-    /// Whether this chain has terminated: the committed tip's parent QC
-    /// sits past the shard's terminal window, i.e. the first coast block
-    /// has committed and the crossing's canonical QC is readable from the
-    /// committed chain. From here the chain stops — no proposals, no new
-    /// headers, no timeouts; the post-split children take over at the
-    /// next boundary and stragglers reach this tip via block sync.
-    /// Drivers key the one-shot terminal sweep (aborting in-flight
-    /// transactions that no later block can ever decide) on this flip.
+    /// Whether this chain has gone **quiescent**: the committed tip's parent QC
+    /// sits past the shard's terminal window, i.e. the first coast block has
+    /// committed and the crossing's canonical QC is readable from the committed
+    /// chain. Content stops here — the terminal block is the last that can
+    /// decide a transaction — so the one-shot terminal sweep (aborting in-flight
+    /// transactions no later block can ever decide) keys on this flip.
+    ///
+    /// Quiescence is *not* the end of the chain's life: the committee keeps
+    /// coasting, voting, and serving past this point until its reshape
+    /// successors are live (see [`Self::dissolved`]). The two coincide today;
+    /// they part once the successor-live gate lands.
     #[must_use]
-    pub fn chain_terminated(&self, topology_schedule: &TopologySchedule) -> bool {
+    pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
         self.past_terminal_window(topology_schedule, self.committed_anchor_ts)
+    }
+
+    /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
+    /// and running its pacemaker, and let the committee tear down. From here the
+    /// post-split children (or the reformed merge parent) have taken over and
+    /// stragglers reach this tip via block sync. Equal to [`Self::quiescent`]
+    /// today; the successor-live gate that keeps the committee alive through the
+    /// handoff narrows it in a later step.
+    #[must_use]
+    pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
+        self.quiescent(topology_schedule)
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -1286,7 +1300,7 @@ impl ShardCoordinator {
     ) -> bool {
         // A terminated chain proposes nothing — the crossing is committed
         // and the post-split children carry on from it.
-        if self.chain_terminated(topology_schedule) {
+        if self.dissolved(topology_schedule) {
             return false;
         }
 
@@ -1673,7 +1687,7 @@ impl ShardCoordinator {
         // A terminated chain ingests no new headers: the crossing is
         // committed, every extension is pointless, and stragglers reach
         // the terminal tip via block sync rather than live proposals.
-        if self.chain_terminated(topology_schedule) {
+        if self.dissolved(topology_schedule) {
             debug!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
@@ -4346,7 +4360,7 @@ impl ShardCoordinator {
     ) -> Vec<Action> {
         // A terminated chain drives no view changes; the pacemaker only
         // needed to reach the crossing's commit, which has happened.
-        if self.chain_terminated(topology_schedule) {
+        if self.dissolved(topology_schedule) {
             return vec![];
         }
         // The timeout is tallied by the in-progress committee (the one that
@@ -8466,15 +8480,15 @@ mod tests {
     }
 
     #[test]
-    fn chain_terminates_once_a_coast_block_commits() {
+    fn chain_quiesces_once_a_coast_block_commits() {
         let sched = make_terminating_schedule(4);
         // Committed tip anchored inside the final window: still live.
         let live = coordinator_with_committed_anchor(500);
-        assert!(!live.chain_terminated(&sched));
+        assert!(!live.quiescent(&sched));
         // Committed tip anchored past the cut — the first coast block has
-        // committed, so the crossing's canonical QC is readable: stop.
+        // committed, so the crossing's canonical QC is readable: content stops.
         let done = coordinator_with_committed_anchor(1500);
-        assert!(done.chain_terminated(&sched));
+        assert!(done.quiescent(&sched));
     }
 
     #[test]
