@@ -20,6 +20,13 @@ use super::{Budget, Cluster, epochs};
 /// transaction to commit and fold into the tally before it is read.
 const VOTE_ACTIVATE_LEAD: u64 = 4;
 
+/// Activation windows the threshold vote retries across before giving up.
+const VOTE_ATTEMPTS: u32 = 4;
+
+/// Epochs to wait for one vote window to fold and apply — the activation lead
+/// plus slack for the witness to commit, reach the beacon, and fold.
+const VOTE_WINDOW_EPOCHS: u32 = 6;
+
 /// Grow the single-shard root into a uniform `target`-leaf partition through the
 /// organic split lifecycle.
 ///
@@ -78,23 +85,30 @@ pub fn grow_to(c: &mut impl Cluster, target: u32) {
 ///
 /// Panics if the threshold does not activate within budget.
 pub fn vote_reshape_threshold(c: &mut impl Cluster, payer: &Ed25519PrivateKey, split_bytes: u64) {
-    let current = beacon_epoch(c).expect("a beacon epoch is committed");
-    let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
-    let vote = build_reshape_threshold_vote_tx(
-        payer,
-        split_bytes,
-        activate_at,
-        &NetworkDefinition::simulator(),
-        1,
-        validity_around(c.now()),
-    );
-    c.submit(Arc::new(vote));
-    assert!(
-        c.run_until(epochs(12), |c| c.beacon_state().is_some_and(|state| state
-            .params
-            .reshape_thresholds
-            .split_bytes
-            == split_bytes)),
-        "the reshape threshold did not activate to {split_bytes} within budget",
-    );
+    // Re-submit the vote each activation window until the beacon folds and
+    // applies it. A single vote carries a fixed `VOTE_ACTIVATE_LEAD` lead and is
+    // dropped if its witness folds at or after `activate_at`; at a long epoch
+    // that lead is only a few minutes of slack, so a fold delayed by a committee
+    // hiccup can miss it. Retrying past the miss with a fresh window keeps the
+    // step robust without widening the lead (which would just defer activation).
+    for nonce in 1..=VOTE_ATTEMPTS {
+        let current = beacon_epoch(c).expect("a beacon epoch is committed");
+        let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
+        let vote = build_reshape_threshold_vote_tx(
+            payer,
+            split_bytes,
+            activate_at,
+            &NetworkDefinition::simulator(),
+            nonce,
+            validity_around(c.now()),
+        );
+        c.submit(Arc::new(vote));
+        if c.run_until(epochs(VOTE_WINDOW_EPOCHS), |c| {
+            c.beacon_state()
+                .is_some_and(|state| state.params.reshape_thresholds.split_bytes == split_bytes)
+        }) {
+            return;
+        }
+    }
+    panic!("the reshape threshold did not activate to {split_bytes} within budget");
 }
