@@ -513,6 +513,13 @@ pub struct BeaconState {
     /// which also advances `witness_leaf_count` as it applies each
     /// boundary contribution's witness chunk.
     pub boundaries: BTreeMap<ShardId, ShardBoundary>,
+    /// Shards the boundary fold has observed cross an epoch boundary past
+    /// their seeded genesis — i.e. producing on their own chain, not merely
+    /// seeded. A freshly seeded reshape successor (a split's child, a merge's
+    /// reformed parent) is absent until its first crossing folds; the reshape
+    /// handoff reads this as "successor live". GC'd alongside
+    /// [`Self::boundaries`].
+    pub advanced: BTreeSet<ShardId>,
     /// Admitted shard reshapes awaiting execution, keyed by target
     /// (the splitting shard / the merge parent). Written by the witness
     /// fold's trigger admission; pruned by the per-epoch staleness
@@ -1115,6 +1122,7 @@ impl BeaconState {
             split_pending,
         )
         .with_params(params)
+        .with_advanced(self.advanced.iter().copied().collect())
     }
 
     /// Active-duty validator pool: every validator `OnShard { ready: true }`
@@ -1295,6 +1303,7 @@ mod tests {
             reshape_keepers_window: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             boundaries: BTreeMap::new(),
+            advanced: BTreeSet::new(),
             pending_reshapes: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }

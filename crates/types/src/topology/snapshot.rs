@@ -107,6 +107,13 @@ pub struct TopologySnapshot {
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
     boundaries: HashMap<ShardId, ShardAnchor>,
+    /// Shards the beacon fold has observed cross a boundary past their seeded
+    /// genesis — projected live from `BeaconState.advanced`. A freshly seeded
+    /// reshape successor is absent until it produces; the reshape handoff
+    /// reads this (via [`Self::successors_live`]) to decide a predecessor may
+    /// dissolve. Unlike the window-frozen projections this is the live head
+    /// value, since it gates a runtime handoff, not a window's verification.
+    advanced: BTreeSet<ShardId>,
     /// Per-shard beacon-witness window base for the window this snapshot
     /// governs, projected from `BeaconState.witness_window_bases`.
     /// Absent shards read as `ZERO` (nothing consumed).
@@ -184,6 +191,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             boundaries: HashMap::new(),
+            advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -226,6 +234,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             boundaries: HashMap::new(),
+            advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -277,6 +286,7 @@ impl TopologySnapshot {
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
             boundaries: HashMap::new(),
+            advanced: BTreeSet::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -369,6 +379,7 @@ impl TopologySnapshot {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            advanced: BTreeSet::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -383,6 +394,16 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn with_params(mut self, params: NetworkParams) -> Self {
         self.params = params;
+        self
+    }
+
+    /// Set the live produced-past-genesis set (see [`Self::successors_live`]).
+    /// Defaults empty; the head derivation supplies the live `BeaconState`
+    /// value. Builder-set rather than a constructor argument so the many
+    /// committee-only constructions need not thread a runtime-liveness signal.
+    #[must_use]
+    pub fn with_advanced(mut self, advanced: BTreeSet<ShardId>) -> Self {
+        self.advanced = advanced;
         self
     }
 }
@@ -598,6 +619,46 @@ impl TopologySnapshot {
         self.boundaries.get(&shard).copied()
     }
 
+    /// Whether the beacon fold has observed `shard` cross a boundary past its
+    /// seeded genesis — it is producing on its own chain, not merely seeded.
+    /// `false` for a freshly seeded reshape successor until its first crossing
+    /// folds. The live signal behind [`Self::successors_live`].
+    #[must_use]
+    pub fn advanced_past_genesis(&self, shard: ShardId) -> bool {
+        self.advanced.contains(&shard)
+    }
+
+    /// Whether both of `parent`'s split children are live — each has produced
+    /// past its genesis. The gate a splitting parent's committee flips on to
+    /// let go: the children have demonstrably taken over, so the parent need
+    /// no longer finalize or serve its terminal for them to seed from.
+    #[must_use]
+    pub fn children_live(&self, parent: ShardId) -> bool {
+        let (left, right) = parent.children();
+        self.advanced_past_genesis(left) && self.advanced_past_genesis(right)
+    }
+
+    /// Whether `shard`'s reshape successor(s) are live in the committed view —
+    /// the make-before-break cutover signal. A split parent (its children seated
+    /// into the trie) waits on both children; a merge child (its reformed parent
+    /// seated into the trie) waits on the parent producing under a live
+    /// committee, which a lingering pre-merge terminal record never satisfies.
+    /// A shard with no successor seated yet is not clear to dissolve (`false`).
+    #[must_use]
+    pub fn successors_live(&self, shard: ShardId) -> bool {
+        let (left, right) = shard.children();
+        if self.shard_trie.contains(left) && self.shard_trie.contains(right) {
+            return self.children_live(shard);
+        }
+        if let Some(parent) = shard.parent()
+            && self.shard_trie.contains(parent)
+        {
+            return self.advanced_past_genesis(parent)
+                && !self.committee_for_shard(parent).is_empty();
+        }
+        false
+    }
+
     /// The shard's beacon-witness window base for the window this
     /// snapshot governs — the folded watermark frozen at promotion.
     /// `ZERO` for shards the projection doesn't know (nothing consumed).
@@ -807,6 +868,83 @@ mod tests {
             make_snapshot(4).reshape_observer_child(shard, observer),
             None
         );
+    }
+
+    /// Build a snapshot whose trie is `committees`' leaves, carrying `advanced`
+    /// as the produced-past-genesis set.
+    fn snapshot_with(
+        committees: HashMap<ShardId, Vec<ValidatorId>>,
+        advanced: &[ShardId],
+    ) -> TopologySnapshot {
+        let vs = ValidatorSet::new(vec![make_test_validator(0)]);
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            committees.clone(),
+            committees,
+            HashMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        )
+        .with_advanced(advanced.iter().copied().collect())
+    }
+
+    #[test]
+    fn successors_live_split_waits_for_both_children() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let v = ValidatorId::new(0);
+        // Children seated into the trie; the parent coasts off-trie.
+        let committees = HashMap::from([(left, vec![v]), (right, vec![v])]);
+        let live = |advanced: &[ShardId]| snapshot_with(committees.clone(), advanced);
+
+        assert!(!live(&[]).successors_live(parent));
+        assert!(!live(&[left]).successors_live(parent));
+        assert!(!live(&[right]).successors_live(parent));
+        assert!(live(&[left, right]).successors_live(parent));
+
+        // `children_live` is the split-named mirror.
+        assert!(!live(&[left]).children_live(parent));
+        assert!(live(&[left, right]).children_live(parent));
+        // The primitive tracks each child independently.
+        assert!(live(&[left]).advanced_past_genesis(left));
+        assert!(!live(&[left]).advanced_past_genesis(right));
+    }
+
+    #[test]
+    fn successors_live_merge_waits_for_reformed_parent() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let v = ValidatorId::new(0);
+        // The reformed parent is seated into the trie; the merging children
+        // coast off-trie. Each child waits on the parent producing.
+        let committees = HashMap::from([(parent, vec![v])]);
+        assert!(!snapshot_with(committees.clone(), &[]).successors_live(left));
+        assert!(snapshot_with(committees.clone(), &[parent]).successors_live(left));
+        assert!(snapshot_with(committees, &[parent]).successors_live(right));
+    }
+
+    #[test]
+    fn successors_live_merge_rejects_lingering_terminal_parent() {
+        // A grow-then-merge: the parent's pre-merge terminal record can still be
+        // `advanced` (it produced before terminating) yet carry no live
+        // committee. The merge cutover must not read that as the reformed parent.
+        let parent = ShardId::ROOT;
+        let (left, _) = parent.children();
+        let committees = HashMap::from([(parent, Vec::new())]);
+        assert!(!snapshot_with(committees, &[parent]).successors_live(left));
+    }
+
+    #[test]
+    fn successors_live_false_with_no_successor_seated() {
+        // A single ROOT shard, no reshape executed: neither children nor a
+        // parent are seated, so a terminating committee would not be clear to
+        // dissolve.
+        let committees = HashMap::from([(ShardId::ROOT, vec![ValidatorId::new(0)])]);
+        assert!(!snapshot_with(committees, &[]).successors_live(ShardId::ROOT));
     }
 
     fn make_snapshot(num_validators: u64) -> TopologySnapshot {

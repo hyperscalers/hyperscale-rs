@@ -107,6 +107,22 @@ impl<'a> ReshapeView<'a> {
     pub fn merge_composed(&self, parent: ShardId) -> bool {
         self.seeded(parent) && !self.committee(parent).is_empty()
     }
+
+    /// Whether both of `parent`'s split children are live — each has produced
+    /// past its genesis, not merely seeded. The make-before-break cutover: a
+    /// splitting parent's committee may dissolve only once this holds.
+    #[must_use]
+    pub fn children_live(&self, parent: ShardId) -> bool {
+        self.topology_snapshot.children_live(parent)
+    }
+
+    /// Whether `shard`'s reshape successor(s) are live — both split children, or
+    /// a merge's reformed parent producing under a live committee. The signal a
+    /// terminating committee waits on before it stops finalizing and serving.
+    #[must_use]
+    pub fn successors_live(&self, shard: ShardId) -> bool {
+        self.topology_snapshot.successors_live(shard)
+    }
 }
 
 #[cfg(test)]

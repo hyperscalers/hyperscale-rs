@@ -206,6 +206,16 @@ impl TopologySchedule {
         &self.head
     }
 
+    /// Whether `shard`'s reshape successor(s) are live in the committed head —
+    /// the make-before-break cutover a terminating committee reads off its own
+    /// beacon fold. Keys on the live head, not a weighted-time window, because
+    /// it gates a runtime handoff (dissolve when the successors have taken over)
+    /// rather than verifying an artifact against its window's committee.
+    #[must_use]
+    pub fn successors_live(&self, shard: ShardId) -> bool {
+        self.head.successors_live(shard)
+    }
+
     /// Per-shard committees for request **routing**, terminal-clamped.
     ///
     /// Every shard appearing in any retained window maps to the committee
