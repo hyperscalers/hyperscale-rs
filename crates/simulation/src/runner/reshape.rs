@@ -483,7 +483,7 @@ impl SimulationRunner {
     }
 
     /// Whether `validator`'s fixed home host is `node`.
-    fn homes_validator(&self, node: NodeIndex, validator: ValidatorId) -> bool {
+    pub(super) fn homes_validator(&self, node: NodeIndex, validator: ValidatorId) -> bool {
         self.validator_home
             .get(usize::try_from(validator.inner()).expect("id fits usize"))
             .copied()
