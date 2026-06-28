@@ -247,7 +247,7 @@ const fn grow_config(target_shards: u32) -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
+        dedicated_hosts: true,
     }
 }
 
