@@ -164,6 +164,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         reshape_keepers_window: BTreeMap::new(),
         reshape_parent_halves: BTreeMap::new(),
         boundaries,
+        advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };

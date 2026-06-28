@@ -548,6 +548,10 @@ fn record_boundaries(
             },
         );
         refreshed.insert(*shard);
+        // This shard folded a real crossing of its own — past its seeded
+        // genesis (a seed is never itself a contribution). Mark it produced;
+        // the reshape handoff reads this as "successor live".
+        state.advanced.insert(*shard);
 
         // A terminal shard's contribution crossing its final cut is the
         // chain's terminal block. A split parent seeds its pending
@@ -624,6 +628,10 @@ fn record_boundaries(
             pending_fold.contains(shard) || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
         })
     });
+    // A shard that left `boundaries` is gone; drop its produced mark too.
+    state
+        .advanced
+        .retain(|shard| state.boundaries.contains_key(shard));
 
     outcome
 }
@@ -1056,6 +1064,9 @@ mod tests {
         assert_eq!(recorded.witness_leaf_count, BeaconWitnessLeafCount::new(7));
         assert_eq!(recorded.last_live_epoch, Epoch::new(1));
         assert_eq!(recorded.consecutive_misses, 0);
+        // Folding the shard's own crossing marks it produced past genesis —
+        // the successor-liveness signal the reshape handoff reads.
+        assert!(state.advanced.contains(&shard));
     }
 
     /// The witness window base frozen at promotion is byte-identical to

@@ -125,6 +125,7 @@ fn initial_state() -> BeaconState {
         reshape_keepers_window: BTreeMap::new(),
         reshape_parent_halves: BTreeMap::new(),
         boundaries: BTreeMap::new(),
+        advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };
