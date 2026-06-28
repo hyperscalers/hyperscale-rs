@@ -28,9 +28,22 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{BlockHeight, LocalTimestamp, ShardAnchor, ShardId, ValidatorId};
+use hyperscale_types::{
+    BeaconState, BlockHeight, LocalTimestamp, ShardAnchor, ShardId, ValidatorId, ValidatorStatus,
+    shard_prefix_path,
+};
 
 use super::SimulationRunner;
+
+/// Whether `validator` is committed `OnShard(shard)` in `beacon` — the
+/// placement that should run `shard`'s consensus. Excludes `Observing`,
+/// `Keeping`, and `Pooled`, which sit in the networking `committee_for_shard`
+/// but must not be seated as consensus members.
+fn validator_on_shard(beacon: &BeaconState, validator: ValidatorId, shard: ShardId) -> bool {
+    beacon.validators.get(&validator).is_some_and(|record| {
+        matches!(record.status, ValidatorStatus::OnShard { shard: placed, .. } if placed == shard)
+    })
+}
 
 /// Drive cap for the snap-sync pump — generous over the dozens of
 /// rounds a small-state bootstrap takes, so exhaustion means a wedge.
@@ -81,6 +94,28 @@ impl SimulationRunner {
         shard: ShardId,
         storage: SimShardStorage,
     ) -> JoinKind {
+        self.seat_joined_group(node, shard, &[validator], storage)
+    }
+
+    /// Seat a group of this host's committee members onto `shard` from one
+    /// `storage`: a retained store (committed past genesis) resumes in place, a
+    /// fresh store snap-syncs against the beacon-attested anchor through the
+    /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
+    /// Every member shares the one store and one bootstrap, mirroring the
+    /// production supervisor seating a whole committee group at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a fresh store has no attested anchor or no serving host, if the
+    /// bootstrap cannot complete, or if the imported root diverges from the
+    /// anchor.
+    fn seat_joined_group(
+        &mut self,
+        node: NodeIndex,
+        shard: ShardId,
+        validators: &[ValidatorId],
+        storage: SimShardStorage,
+    ) -> JoinKind {
         let recovered = storage.load_recovered_state();
         let (recovered, kind) = if recovered.committed_height > BlockHeight::GENESIS {
             let committed_height = recovered.committed_height;
@@ -102,17 +137,107 @@ impl SimulationRunner {
             )
         };
 
-        let init = self.runtime_vnode_init(node, validator, shard, &recovered);
-        self.hosts[node as usize].add_shard(
-            vec![init],
-            storage,
-            self.event_txs[node as usize].clone(),
-        );
-        // Parity with the production supervisor's `unfollow_in_pool`: the
-        // seated validator now drives its beacon from this shard, so retire
-        // its pool follower if it had one (it drained here earlier).
-        self.hosts[node as usize].drop_pooled_vnode(validator);
+        let inits: Vec<VnodeInit> = validators
+            .iter()
+            .map(|&validator| self.runtime_vnode_init(node, validator, shard, &recovered))
+            .collect();
+        self.hosts[node as usize].add_shard(inits, storage, self.event_txs[node as usize].clone());
+        // Parity with the production supervisor's `unfollow_in_pool`: each
+        // seated validator now drives its beacon from this shard, so retire any
+        // pool follower it carried (it drained here earlier).
+        for &validator in validators {
+            self.hosts[node as usize].drop_pooled_vnode(validator);
+        }
         kind
+    }
+
+    /// Reconcile this host's physical shard membership against the committed
+    /// beacon placement — the deterministic counterpart of the production
+    /// supervisor's reconfiguration loop (`reconcile_joins` /
+    /// `reconcile_teardown`). Seats every live leaf the host holds a committed
+    /// `OnShard` placement on but isn't running, and tears down every leaf it
+    /// runs but no longer holds a placement on (a committee rotation moved its
+    /// members off). A shard a reshape duty owns (`is_seating`) is left to the
+    /// orchestrator. Idempotent; safe to call every slice.
+    ///
+    /// Placement is read from the committed `OnShard` status rather than the
+    /// networking `committee_for_shard`, which also carries split observers and
+    /// not-yet-ready joiners; an `Observing`/`Keeping`/`Pooled` validator must
+    /// not be seated as a consensus member. A terminated parent is an internal
+    /// trie node, not a leaf, so it is never torn down here — it stays retained
+    /// for serving. The placement deltas the hosted vnodes emit are drained for
+    /// parity with production's delta-driven path, but the committed projection
+    /// drives the actual join/leave: a synchronous snap-sync completes within
+    /// the slice, so joining at the activation epoch needs no lookahead.
+    pub fn pump_placement(&mut self) {
+        let _ = self.take_reconfigurations();
+        for node in 0..self.num_hosts() {
+            // Committee membership only changes at an epoch boundary, so skip the
+            // reconciliation scan until this host's committed epoch advances.
+            let Some(epoch) = self
+                .beacon_storage(node)
+                .and_then(|storage| storage.latest_committed_epoch())
+            else {
+                continue;
+            };
+            if self.placement_epoch[node as usize] == Some(epoch) {
+                continue;
+            }
+            self.placement_epoch[node as usize] = Some(epoch);
+
+            let Some(snapshot) = self.host_topology(node) else {
+                continue;
+            };
+            let Some((_, beacon)) = self.beacon_storage(node).and_then(|s| s.latest_committed())
+            else {
+                continue;
+            };
+            let leaves: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
+            let hosted: Vec<ShardId> = self.hosted_shards_of(node);
+
+            for &shard in &leaves {
+                if hosted.contains(&shard) || self.reshape[node as usize].is_seating(shard) {
+                    continue;
+                }
+                let placed: Vec<ValidatorId> = snapshot
+                    .committee_for_shard(shard)
+                    .iter()
+                    .copied()
+                    .filter(|&validator| {
+                        self.homes_validator(node, validator)
+                            && validator_on_shard(&beacon, validator, shard)
+                    })
+                    .collect();
+                if !placed.is_empty() {
+                    let storage = self
+                        .retained_storages
+                        .remove(&(node, shard))
+                        .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
+                    self.seat_joined_group(node, shard, &placed, storage);
+                }
+            }
+
+            for &shard in &hosted {
+                if self.reshape[node as usize].is_seating(shard) {
+                    continue;
+                }
+                let committee = snapshot.committee_for_shard(shard);
+                // A stalled ex-member: the host runs a live shard but the rotated
+                // committee no longer carries any of its validators. An empty
+                // committee is a terminated chain the host retains for serving,
+                // not an ex-member, so it stays. Membership is the networking
+                // committee, not the `OnShard` placement, so a freshly seated
+                // member whose status has not yet settled is never torn down.
+                let ex_member = !committee.is_empty()
+                    && !committee
+                        .iter()
+                        .any(|&validator| self.homes_validator(node, validator));
+                if ex_member {
+                    let storage = self.leave_shard(node, shard);
+                    self.retained_storages.insert((node, shard), storage);
+                }
+            }
+        }
     }
 
     /// The state machine of `node`'s vnode in `shard`, or `None` when

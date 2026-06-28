@@ -29,7 +29,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisConfigHash,
+    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, GenesisConfigHash,
     GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
     ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, shard_prefix_path,
 };
@@ -210,6 +210,16 @@ pub struct SimulationRunner {
     /// re-arms and re-requests — the in-memory stand-in for production's
     /// fetch callback firing on a later tick.
     reshape_pending: Vec<Vec<ReshapeEvent>>,
+
+    /// Storage handles stashed by a placement leave, keyed by `(host, shard)`,
+    /// so a later rejoin of the same shard takes the retained fast path —
+    /// the in-memory stand-in for the production supervisor's retained store.
+    retained_storages: HashMap<(NodeIndex, ShardId), SimShardStorage>,
+
+    /// Per-host committed beacon epoch last reconciled by `pump_placement`.
+    /// Committee membership only changes at an epoch boundary, so the
+    /// reconciliation runs once per host per epoch rather than every slice.
+    placement_epoch: Vec<Option<Epoch>>,
 
     /// Fixed home host per registered validator, by id. A validator's keys live
     /// on one host for the run, so the host whose orchestrator runs its reshape
@@ -524,6 +534,8 @@ impl SimulationRunner {
             reshape,
             reshape_stores: HashMap::new(),
             reshape_pending: vec![Vec::new(); num_hosts],
+            retained_storages: HashMap::new(),
+            placement_epoch: vec![None; num_hosts],
             validator_home,
         }
     }
