@@ -86,6 +86,21 @@ pub fn retention_floor(
                 Epoch::new(b.last_live_epoch.inner().saturating_sub(1))
             })
         })
+        // A reshape predecessor dropped from the live committees keeps a
+        // lingering terminal boundary record so straggling observers can
+        // snap-sync its anchor and the coasting predecessor can resolve its
+        // own committee. Its schedule window must outlive the record, or the
+        // floor rises the instant the successors advance — a beat before the
+        // predecessor observes successor-live and stops coasting — and evicts
+        // the window mid-handoff. Folding terminal records in holds the window
+        // exactly as long as the record lives.
+        .chain(
+            state
+                .boundaries
+                .values()
+                .filter(|b| b.terminal_epoch.is_some())
+                .map(|b| Epoch::new(b.last_live_epoch.inner().saturating_sub(1))),
+        )
         .min()
         .unwrap_or(Epoch::GENESIS);
     let horizon = windows.epoch_for(WeightedTimestamp::from_millis(
@@ -4193,6 +4208,13 @@ mod tests {
         }
     }
 
+    fn boundary_terminal_at(epoch: u64) -> ShardBoundary {
+        ShardBoundary {
+            terminal_epoch: Some(Epoch::new(epoch)),
+            ..boundary_live_at(epoch)
+        }
+    }
+
     /// Each consumer frontier can become the floor: the lagging one wins.
     #[test]
     fn retention_floor_is_the_minimum_consumer_frontier() {
@@ -4242,6 +4264,41 @@ mod tests {
         let horizon = Epoch::new(now_ms.saturating_sub(RETENTION_HORIZON.as_secs() * 1000) / ed);
         assert_eq!(floor, horizon);
         assert!(floor < Epoch::new(1000), "horizon trails the head");
+    }
+
+    /// A reshape predecessor's terminal boundary record holds the floor at its
+    /// last live epoch even after it leaves the live committees — its schedule
+    /// window must outlive the record so straggling observers can snap-sync its
+    /// anchor and the coasting predecessor can resolve its own committee through
+    /// the beacon-fold lag before it observes its successors live.
+    #[test]
+    fn retention_floor_holds_a_terminal_predecessors_window() {
+        let mut state = state_at(1000, 4);
+        state
+            .boundaries
+            .insert(ShardId::leaf(1, 0), boundary_live_at(1000));
+        let ed = state.chain_config.epoch_duration_ms;
+        let head = WeightedTimestamp::from_millis(1000 * ed);
+        let now = LocalTimestamp::from_millis(1000 * ed);
+
+        let without = retention_floor(&state, head, now);
+
+        // A dropped predecessor — not in the live committees — with a terminal
+        // record last live at epoch 100 pins the floor to 99, below the
+        // artifact horizon that would otherwise bind.
+        let predecessor = ShardId::leaf(2, 0);
+        assert!(!state.shard_committees.contains_key(&predecessor));
+        state
+            .boundaries
+            .insert(predecessor, boundary_terminal_at(100));
+        let with = retention_floor(&state, head, now);
+
+        assert!(with < without, "the terminal record lowers the floor");
+        assert_eq!(
+            with,
+            Epoch::new(99),
+            "to its last live epoch minus a window"
+        );
     }
 
     #[test]
