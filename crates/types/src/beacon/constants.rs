@@ -160,6 +160,20 @@ pub const RESHAPE_TRIGGER_TTL_EPOCHS: u64 = 4;
 /// holds.
 pub const RESHAPE_READY_TTL_EPOCHS: u64 = 8;
 
+/// How long a reshape's successors may take to go live after the reshape
+/// executes before the handoff is flagged as stalled.
+///
+/// Under make-before-break a predecessor coasts past its weighted-time cut
+/// until the beacon shows its successors live (a split's two children, or a
+/// merge's reformed parent, have produced past their seeded genesis). The
+/// terminal commits and serves reliably, so the successors should seat and
+/// produce well inside this bound. Measured from execution (the terminal
+/// boundary's `terminal_epoch`), the analogue of [`RESHAPE_READY_TTL_EPOCHS`]
+/// for the post-execution phase. Sits a touch above the readiness TTL because
+/// the window also absorbs the empty-commit lag across the reshape committee
+/// transition before the successors' first crossing can fold.
+pub const RESHAPE_HANDOFF_TTL_EPOCHS: u64 = 12;
+
 /// How long a stake-pool withdrawal request remains pending before its
 /// amount is released and any resulting auto-deactivations apply.
 ///
