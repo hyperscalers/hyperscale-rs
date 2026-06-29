@@ -1483,62 +1483,64 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
     info!(shard = ?shard, "Shard event loop exiting");
 }
 
-/// Write this shard's contribution into the shared RPC state. Each slot
-/// is keyed by `shard_id.inner()` so concurrent shard threads touching
-/// the same `ArcSwap` only race on the map metadata — losing a single
-/// 1-second cycle when two shards interleave their load-modify-store,
-/// not the values themselves.
+/// Write this shard's contribution into the shared RPC state. Each slot is
+/// keyed by `shard_id.inner()`, and the writes go through `ArcSwap::rcu` so a
+/// co-hosted sibling shard thread (or the supervisor's `scrub_rpc_state`)
+/// interleaving on the same `ArcSwap` can't drop this shard's update — the
+/// compare-and-retry re-applies it against the concurrent winner.
 fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) {
     let shard_key = shard_loop.shard.inner();
 
     // ── /status: per-vnode entries ─────────────────────────────────
     if let Some(ref rpc_status) = config.publishers.node_status {
-        let current = rpc_status.load();
-        let mut updated = (**current).clone();
-        updated.vnodes.retain(|v| v.shard != shard_key);
-        for vnode in &shard_loop.vnodes {
-            let state = &vnode.state;
-            let mempool = state.mempool_coordinator();
-            let contention = mempool.lock_contention_stats();
-            #[allow(clippy::cast_possible_truncation)] // pool sizes fit usize
-            let (pending, in_flight) = (
-                contention.pending_count as usize,
-                contention.in_flight_count as usize,
-            );
-            updated.vnodes.push(VnodeStatusEntry {
-                validator_id: vnode.validator_id.inner(),
-                shard: shard_key,
-                block_height: state.shard_coordinator().committed_height().inner(),
-                view: state.shard_coordinator().view().inner(),
-                state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
-                mempool: VnodeMempoolStats {
-                    pending_count: pending,
-                    in_flight_count: in_flight,
-                    total_count: mempool.len(),
-                },
-            });
-        }
-        updated.vnodes.sort_by_key(|v| (v.shard, v.validator_id));
-        rpc_status.store(Arc::new(updated));
+        rpc_status.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.vnodes.retain(|v| v.shard != shard_key);
+            for vnode in &shard_loop.vnodes {
+                let state = &vnode.state;
+                let mempool = state.mempool_coordinator();
+                let contention = mempool.lock_contention_stats();
+                #[allow(clippy::cast_possible_truncation)] // pool sizes fit usize
+                let (pending, in_flight) = (
+                    contention.pending_count as usize,
+                    contention.in_flight_count as usize,
+                );
+                updated.vnodes.push(VnodeStatusEntry {
+                    validator_id: vnode.validator_id.inner(),
+                    shard: shard_key,
+                    block_height: state.shard_coordinator().committed_height().inner(),
+                    view: state.shard_coordinator().view().inner(),
+                    state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
+                    mempool: VnodeMempoolStats {
+                        pending_count: pending,
+                        in_flight_count: in_flight,
+                        total_count: mempool.len(),
+                    },
+                });
+            }
+            updated.vnodes.sort_by_key(|v| (v.shard, v.validator_id));
+            Arc::new(updated)
+        });
     }
 
     // ── /sync: per-shard block-sync state ──────────────────────────
     if let Some(ref sync_status) = config.publishers.sync_status {
         let block_sync = shard_loop.io.block_sync_status();
-        let current = sync_status.load();
-        let mut updated = (**current).clone();
-        updated.shards.insert(
-            shard_key,
-            ShardSyncState {
-                state: block_sync.state.clone(),
-                current_height: block_sync.current_height,
-                target_height: block_sync.target_height,
-                blocks_behind: block_sync.blocks_behind,
-                pending_fetches: block_sync.pending_fetches,
-                queued_heights: block_sync.queued_heights,
-            },
-        );
-        sync_status.store(Arc::new(updated));
+        sync_status.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.shards.insert(
+                shard_key,
+                ShardSyncState {
+                    state: block_sync.state.clone(),
+                    current_height: block_sync.current_height,
+                    target_height: block_sync.target_height,
+                    blocks_behind: block_sync.blocks_behind,
+                    pending_fetches: block_sync.pending_fetches,
+                    queued_heights: block_sync.queued_heights,
+                },
+            );
+            Arc::new(updated)
+        });
     }
 
     // ── Mempool: per-vnode snapshots feeding RPC submission backpressure.
@@ -1549,34 +1551,35 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
         #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
         let remote_congestion_threshold = InFlightCount::new((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
-        let current = mempool_snapshot.load();
-        let mut updated = (**current).clone();
-        for vnode in &shard_loop.vnodes {
-            let state = &vnode.state;
-            let mempool = state.mempool_coordinator();
-            let contention = mempool.lock_contention_stats();
-            #[allow(clippy::cast_possible_truncation)]
-            let (pending, in_flight) = (
-                contention.pending_count as usize,
-                contention.in_flight_count as usize,
-            );
-            updated.vnodes.insert(
-                vnode.validator_id.inner(),
-                VnodeMempoolSnapshot {
-                    pending_count: pending,
-                    in_flight_count: in_flight,
-                    total_count: mempool.len(),
-                    updated_at: Some(Instant::now()),
-                    accepting_rpc_transactions: !mempool.at_in_flight_limit(),
-                    at_pending_limit: mempool.at_pending_limit(),
-                    remote_shard_in_flight: state
-                        .remote_headers_coordinator()
-                        .remote_shard_in_flight(),
-                    remote_congestion_threshold,
-                },
-            );
-        }
-        mempool_snapshot.store(Arc::new(updated));
+        mempool_snapshot.rcu(|current| {
+            let mut updated = (**current).clone();
+            for vnode in &shard_loop.vnodes {
+                let state = &vnode.state;
+                let mempool = state.mempool_coordinator();
+                let contention = mempool.lock_contention_stats();
+                #[allow(clippy::cast_possible_truncation)]
+                let (pending, in_flight) = (
+                    contention.pending_count as usize,
+                    contention.in_flight_count as usize,
+                );
+                updated.vnodes.insert(
+                    vnode.validator_id.inner(),
+                    VnodeMempoolSnapshot {
+                        pending_count: pending,
+                        in_flight_count: in_flight,
+                        total_count: mempool.len(),
+                        updated_at: Some(Instant::now()),
+                        accepting_rpc_transactions: !mempool.at_in_flight_limit(),
+                        at_pending_limit: mempool.at_pending_limit(),
+                        remote_shard_in_flight: state
+                            .remote_headers_coordinator()
+                            .remote_shard_in_flight(),
+                        remote_congestion_threshold,
+                    },
+                );
+            }
+            Arc::new(updated)
+        });
     }
 }
 

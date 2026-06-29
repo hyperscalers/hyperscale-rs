@@ -1576,21 +1576,27 @@ impl ShardSupervisor {
     fn scrub_rpc_state(&self, shard: ShardId, validator_ids: &[u64]) {
         let shard_key = shard.inner();
         if let Some(ref rpc_status) = self.publishers.node_status {
-            let mut updated = (**rpc_status.load()).clone();
-            updated.vnodes.retain(|v| v.shard != shard_key);
-            rpc_status.store(Arc::new(updated));
+            rpc_status.rcu(|current| {
+                let mut updated = (**current).clone();
+                updated.vnodes.retain(|v| v.shard != shard_key);
+                Arc::new(updated)
+            });
         }
         if let Some(ref sync_status) = self.publishers.sync_status {
-            let mut updated = (**sync_status.load()).clone();
-            updated.shards.remove(&shard_key);
-            sync_status.store(Arc::new(updated));
+            sync_status.rcu(|current| {
+                let mut updated = (**current).clone();
+                updated.shards.remove(&shard_key);
+                Arc::new(updated)
+            });
         }
         if let Some(ref mempool_snapshot) = self.publishers.mempool {
-            let mut updated = (**mempool_snapshot.load()).clone();
-            for id in validator_ids {
-                updated.vnodes.remove(id);
-            }
-            mempool_snapshot.store(Arc::new(updated));
+            mempool_snapshot.rcu(|current| {
+                let mut updated = (**current).clone();
+                for id in validator_ids {
+                    updated.vnodes.remove(id);
+                }
+                Arc::new(updated)
+            });
         }
     }
 
