@@ -659,6 +659,28 @@ impl TopologySnapshot {
         false
     }
 
+    /// Whether `shard` is a reshape predecessor still mid-handoff — its
+    /// successors are seated into the trie but not yet live. True exactly when
+    /// the reshape has executed (children or reformed parent in the trie) but
+    /// [`Self::successors_live`] is still false; a shard with no successors
+    /// seated (a rotated-off committee member, not a reshape predecessor) reads
+    /// false. The teardown path holds such a shard up — its committee keeps
+    /// serving its terminal so the successors can finish seeding — where it
+    /// would otherwise age out of the routable window.
+    #[must_use]
+    pub fn reshape_handoff_pending(&self, shard: ShardId) -> bool {
+        let (left, right) = shard.children();
+        if self.shard_trie.contains(left) && self.shard_trie.contains(right) {
+            return !self.children_live(shard);
+        }
+        if let Some(parent) = shard.parent()
+            && self.shard_trie.contains(parent)
+        {
+            return !self.successors_live(shard);
+        }
+        false
+    }
+
     /// The shard's beacon-witness window base for the window this
     /// snapshot governs — the folded watermark frozen at promotion.
     /// `ZERO` for shards the projection doesn't know (nothing consumed).
@@ -945,6 +967,29 @@ mod tests {
         // dissolve.
         let committees = HashMap::from([(ShardId::ROOT, vec![ValidatorId::new(0)])]);
         assert!(!snapshot_with(committees, &[]).successors_live(ShardId::ROOT));
+    }
+
+    #[test]
+    fn reshape_handoff_pending_holds_a_predecessor_until_successors_live() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let v = ValidatorId::new(0);
+
+        // Split predecessor: children seated, not yet live → handoff pending.
+        let split = HashMap::from([(left, vec![v]), (right, vec![v])]);
+        assert!(snapshot_with(split.clone(), &[]).reshape_handoff_pending(parent));
+        assert!(snapshot_with(split.clone(), &[left]).reshape_handoff_pending(parent));
+        // Both children live → handoff complete.
+        assert!(!snapshot_with(split, &[left, right]).reshape_handoff_pending(parent));
+
+        // Merge predecessor: the reformed parent seated, not yet live → pending.
+        let merge = HashMap::from([(parent, vec![v])]);
+        assert!(snapshot_with(merge.clone(), &[]).reshape_handoff_pending(left));
+        assert!(!snapshot_with(merge, &[parent]).reshape_handoff_pending(left));
+
+        // A rotated-off leaf with no successors seated is not a predecessor.
+        let rotated = HashMap::from([(parent, vec![v])]);
+        assert!(!snapshot_with(rotated, &[]).reshape_handoff_pending(parent));
     }
 
     fn make_snapshot(num_validators: u64) -> TopologySnapshot {

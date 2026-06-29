@@ -671,14 +671,19 @@ impl ShardCoordinator {
     }
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
-    /// and running its pacemaker, and let the committee tear down. From here the
-    /// post-split children (or the reformed merge parent) have taken over and
-    /// stragglers reach this tip via block sync. Equal to [`Self::quiescent`]
-    /// today; the successor-live gate that keeps the committee alive through the
-    /// handoff narrows it in a later step.
+    /// and running its pacemaker, and let the committee tear down. Narrower than
+    /// [`Self::quiescent`]: the chain quiesces its content at the cut, but its
+    /// committee keeps coasting (empty blocks), voting, and serving until the
+    /// beacon shows its reshape successors **live** — both split children, or a
+    /// merge's reformed parent, producing on their own chains. Holding the
+    /// committee together through the handoff is what lets the terminal block
+    /// commit (so the children can seed from it) instead of being stranded as a
+    /// certified-but-uncommitted tail when members drop out at the cut. Once the
+    /// successors are live the handoff has demonstrably succeeded, so dropping
+    /// out — even a co-located pair in lockstep — loses nothing.
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
-        self.quiescent(topology_schedule)
+        self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -8437,6 +8442,29 @@ mod tests {
         sched
     }
 
+    /// [`make_terminating_schedule`] whose head additionally shows both of
+    /// `ROOT`'s children live — seated and advanced past genesis — so a
+    /// quiescent `ROOT` reads its successors as live and may dissolve.
+    fn make_terminating_schedule_live_children(n: usize) -> TopologySchedule {
+        let mut sched = make_terminating_schedule(n);
+        let (left, right) = ShardId::ROOT.children();
+        let validators = ValidatorSet::new(
+            (0..n)
+                .map(|i| ValidatorInfo {
+                    validator_id: ValidatorId::new(i as u64),
+                    public_key: generate_bls_keypair().public_key(),
+                })
+                .collect(),
+        );
+        let mut advanced = BTreeSet::new();
+        advanced.insert(left);
+        advanced.insert(right);
+        let live_head = TopologySnapshot::new(NetworkDefinition::simulator(), 2, validators)
+            .with_advanced(advanced);
+        sched.set_head(Arc::new(live_head));
+        sched
+    }
+
     /// A schedule whose two genesis leaves merge into their parent `ROOT` at
     /// the epoch-0→1 boundary — the merge counterpart of
     /// [`make_terminating_schedule`]: the final window carries both children,
@@ -8492,25 +8520,40 @@ mod tests {
     }
 
     #[test]
-    fn terminated_chain_neither_proposes_nor_times_out() {
-        let sched = make_terminating_schedule(4);
+    fn quiescent_chain_coasts_until_its_successors_are_live() {
         // Round 4 makes this validator (id 0 of 4) the proposer.
+        // Quiescent (committed past the cut) but the children aren't live yet:
+        // the chain keeps coasting — still proposes empty blocks and runs its
+        // pacemaker — to hold the committee together so the terminal commits.
+        let coasting = make_terminating_schedule(4);
         let mut done = coordinator_with_committed_anchor(1500);
-        assert!(!done.can_propose(&sched, BlockHeight::new(1), Round::new(4)));
-        assert!(done.broadcast_timeout(&sched, Round::new(4)).is_empty());
+        assert!(done.quiescent(&coasting));
+        assert!(!done.dissolved(&coasting));
+        assert!(done.can_propose(&coasting, BlockHeight::new(1), Round::new(4)));
+        assert!(!done.broadcast_timeout(&coasting, Round::new(4)).is_empty());
 
+        // Once the beacon shows both children live, the chain dissolves: no
+        // more proposals, no timeouts.
+        let dissolved = make_terminating_schedule_live_children(4);
+        let mut done = coordinator_with_committed_anchor(1500);
+        assert!(done.dissolved(&dissolved));
+        assert!(!done.can_propose(&dissolved, BlockHeight::new(1), Round::new(4)));
+        assert!(done.broadcast_timeout(&dissolved, Round::new(4)).is_empty());
+
+        // A chain not yet past the cut proposes and times out regardless.
         let mut live = coordinator_with_committed_anchor(500);
-        assert!(live.can_propose(&sched, BlockHeight::new(1), Round::new(4)));
-        assert!(!live.broadcast_timeout(&sched, Round::new(4)).is_empty());
+        assert!(live.can_propose(&coasting, BlockHeight::new(1), Round::new(4)));
+        assert!(!live.broadcast_timeout(&coasting, Round::new(4)).is_empty());
     }
 
     #[test]
-    fn terminated_chain_ignores_new_headers() {
-        let sched = make_terminating_schedule(4);
+    fn dissolved_chain_ignores_new_headers() {
+        // A dissolved chain (quiescent and its successors live) ingests nothing.
+        let dissolved = make_terminating_schedule_live_children(4);
         let mut done = coordinator_with_committed_anchor(1500);
         let block = block_with_parent_qc_ts(BlockHeight::new(1), 500);
         let actions = done.on_block_header(
-            &sched,
+            &dissolved,
             block.header(),
             BlockManifest::default(),
             |_| None,
@@ -8518,6 +8561,12 @@ mod tests {
             |_| None,
         );
         assert!(actions.is_empty());
+
+        // A quiescent-but-coasting chain has not dissolved, so the ingest gate
+        // doesn't drop its coast-block headers — the committee keeps voting so
+        // the terminal can collect its commit votes.
+        let coasting = make_terminating_schedule(4);
+        assert!(!coordinator_with_committed_anchor(1500).dissolved(&coasting));
     }
 
     #[test]
