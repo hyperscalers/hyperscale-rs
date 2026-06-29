@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
     CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
-    PendingReshape, QuorumCertificate, RETENTION_HORIZON, ShardBoundary, ShardEpochContribution,
-    ShardId, SlotEffects, SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus,
+    PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
+    ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitChildRoots, TransitionCause,
+    ValidatorId, ValidatorStatus,
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
@@ -607,17 +608,32 @@ fn record_boundaries(
     // past genesis (`BeaconState.advanced`) covers both, and frees the record
     // for the next horizon sweep once the handoff has demonstrably completed.
     let now = windows.window_of(epoch).start;
-    let pending_fold: BTreeSet<ShardId> = state
+    let pending_fold: BTreeMap<ShardId, Epoch> = state
         .boundaries
         .iter()
-        .filter(|(shard, b)| {
-            b.terminal_epoch.is_some() && !successors_live_for_terminal(state, **shard)
+        .filter_map(|(shard, b)| {
+            let terminal = b.terminal_epoch?;
+            (!successors_live_for_terminal(state, *shard)).then_some((*shard, terminal))
         })
-        .map(|(shard, _)| *shard)
         .collect();
+    // A handoff still pending RESHAPE_HANDOFF_TTL_EPOCHS after its execution
+    // has stalled: make-before-break commits and serves the terminal reliably,
+    // so the successors should have seated and produced past genesis well
+    // inside the bound. Surface it loudly. The predecessor keeps coasting — it
+    // is the successors' only anchor, so tearing it down here would strand them
+    // — until they go live or an operator intervenes.
+    for (shard, executed_at) in stalled_handoffs(&pending_fold, epoch) {
+        tracing::error!(
+            ?shard,
+            executed_at = executed_at.inner(),
+            current = epoch.inner(),
+            "reshape handoff stalled: successors not live within the TTL after execution"
+        );
+    }
     state.boundaries.retain(|shard, b| {
         b.terminal_epoch.is_none_or(|t| {
-            pending_fold.contains(shard) || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
+            pending_fold.contains_key(shard)
+                || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
         })
     });
     // A shard that left `boundaries` is gone; drop its produced mark too.
@@ -649,6 +665,22 @@ fn successors_live_for_terminal(state: &BeaconState, shard: ShardId) -> bool {
         return state.advanced.contains(&parent);
     }
     false
+}
+
+/// The terminal shards whose handoff has stalled — their reshape successors
+/// are still not live [`RESHAPE_HANDOFF_TTL_EPOCHS`] epochs after the reshape
+/// executed. `pending` maps each terminal shard whose successors aren't yet
+/// live to the epoch its reshape executed (the boundary's `terminal_epoch`),
+/// and `epoch` is the fold's current epoch. Each result pairs the stalled
+/// shard with that execution epoch for the diagnostic.
+fn stalled_handoffs(pending: &BTreeMap<ShardId, Epoch>, epoch: Epoch) -> Vec<(ShardId, Epoch)> {
+    pending
+        .iter()
+        .filter(|(_, executed_at)| {
+            epoch.inner().saturating_sub(executed_at.inner()) >= RESHAPE_HANDOFF_TTL_EPOCHS
+        })
+        .map(|(shard, executed_at)| (*shard, *executed_at))
+        .collect()
 }
 
 /// Seed a terminated parent's pending children from its terminal header.
@@ -1815,6 +1847,30 @@ mod tests {
         assert!(
             !state.boundaries.contains_key(&parent),
             "terminal record drops past the retention horizon once its children are live",
+        );
+    }
+
+    /// The handoff stall diagnostic fires exactly at the bound: a terminal
+    /// shard whose successors are still not live `RESHAPE_HANDOFF_TTL_EPOCHS`
+    /// epochs after its reshape executed is flagged; one epoch shy it stays
+    /// quiet.
+    #[test]
+    fn stalled_handoffs_fire_at_the_ttl_not_before() {
+        let parent = ShardId::ROOT;
+        let executed_at = Epoch::new(5);
+        let pending = BTreeMap::from([(parent, executed_at)]);
+
+        let just_under = Epoch::new(executed_at.inner() + RESHAPE_HANDOFF_TTL_EPOCHS - 1);
+        assert!(
+            stalled_handoffs(&pending, just_under).is_empty(),
+            "quiet one epoch shy of the bound",
+        );
+
+        let at_bound = Epoch::new(executed_at.inner() + RESHAPE_HANDOFF_TTL_EPOCHS);
+        assert_eq!(
+            stalled_handoffs(&pending, at_bound),
+            vec![(parent, executed_at)],
+            "flagged once the bound is reached",
         );
     }
 
