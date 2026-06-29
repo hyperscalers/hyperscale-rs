@@ -15,7 +15,7 @@
 //! vnodes on one shard share storage and a thread, and a departing one
 //! must not tear the other down.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -279,6 +279,15 @@ pub struct ShardSupervisor {
     /// orchestrator's open and seat requests. Seated stores move into
     /// [`Self::storages`].
     reshape_stores: HashMap<ShardId, BootstrappingStore>,
+    /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
+    /// an ordinary placement-delta join is still opening the same shard's store
+    /// directory, keyed by that store shard. A reshape duty owns its successor's
+    /// store, but a join that slipped past the `reshape_owns` suppression (a
+    /// lagging topology snapshot) may already be mid-open; holding the prep until
+    /// that join's open lands and is abandoned keeps the two off the same
+    /// `RocksDB` directory, whose exclusive lock would otherwise fail the second
+    /// open. Re-dispatched from [`Self::reshape_step`] once the join clears.
+    pending_reshape_prep: HashMap<ShardId, ReshapeRequest>,
     /// Beacon epoch length, for the keeper's deterministic merged-genesis
     /// cut derivation. Matches the beacon's own chain config.
     epoch_duration_ms: u64,
@@ -358,6 +367,7 @@ impl ShardSupervisor {
                 epoch_duration_ms,
             ),
             reshape_stores: HashMap::new(),
+            pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,
             draining: HashSet::new(),
             pending_joins: HashMap::new(),
@@ -573,6 +583,26 @@ impl ShardSupervisor {
         }
     }
 
+    /// Whether a reshape duty on this host owns seating `shard` — one of the
+    /// host's validators holds a parent-half or observer seat for `shard` as a
+    /// split child, or a keeper seat reforming `shard` as a merge parent.
+    ///
+    /// Read straight from the committed projection (the cohorts the beacon fold
+    /// published), so it answers before the orchestrator's discovery step
+    /// populates its own duty maps — the window in which an ordinary join would
+    /// otherwise race the reshape duty for the shard's store directory.
+    fn reshape_owns(&self, shard: ShardId) -> bool {
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        let view = ReshapeView::new(&topology_snapshot);
+        host_reshape_owns(
+            view.parent_half_cohorts(),
+            view.observer_cohorts(),
+            view.keeper_cohorts(),
+            shard,
+            |validator| self.vnode_keys.contains_key(validator),
+        )
+    }
+
     /// Bring up `shard`: open its storage off this loop, then continue
     /// in [`Self::on_opened`] — seat directly for a retained store or a
     /// genesis replay, or snap-sync against the beacon-attested anchor
@@ -596,10 +626,15 @@ impl ShardSupervisor {
         }
 
         // A reshape duty owns seating this shard — a merge's keepers
-        // reforming the parent, surfaced as an ordinary join when the
-        // merge executes. The orchestrator seats them from the prepared
-        // store, so the placement-delta join is a no-op here.
-        if self.reshape.is_seating(shard) {
+        // reforming the parent, or a split's children, surfaced as an ordinary
+        // join when the reshape executes. The orchestrator seats them from the
+        // prepared store (which carries the reshape's terminal/merged state),
+        // so the placement-delta join is a no-op here. `is_seating` reads the
+        // orchestrator's post-discovery state; `reshape_owns` reads the
+        // committed projection directly, so a join that arrives before the
+        // discovery step runs is suppressed too — otherwise it would open the
+        // child's `RocksDB` directory the duty is about to wipe and clone.
+        if self.reshape.is_seating(shard) || self.reshape_owns(shard) {
             info!(shard = ?shard, "Join superseded by an active reshape duty; the orchestrator seats it");
             return;
         }
@@ -662,6 +697,18 @@ impl ShardSupervisor {
                 return;
             }
         };
+        // A reshape duty has since claimed this shard — the join slipped past
+        // the `reshape_owns` suppression against a stale snapshot and opened the
+        // store anyway. Drop it (releasing the `RocksDB` lock) and let the duty
+        // seat the shard from its terminal/merged store; any prep held behind
+        // this open can now run.
+        if self.reshape_owns(shard) {
+            self.bootstrapping.remove(&shard);
+            drop(storage);
+            info!(shard = ?shard, "Join abandoned to its reshape duty after the store opened");
+            self.resume_pending_reshape_prep();
+            return;
+        }
         // Leaves during the open released memberships from the tail.
         vnodes.truncate(pending);
 
@@ -735,6 +782,7 @@ impl ShardSupervisor {
     /// topology projection, and perform the io it returns. Idempotent; the
     /// runner ticks it on a timer and on every placement change.
     pub(crate) fn reshape_step(&mut self, events: Vec<ReshapeEvent>) {
+        self.resume_pending_reshape_prep();
         let requests = {
             let topology_snapshot = self.process.topology_snapshot().load_full();
             let view = ReshapeView::new(&topology_snapshot);
@@ -745,10 +793,50 @@ impl ShardSupervisor {
         }
     }
 
+    /// Re-dispatch any reshape store-prep held behind an ordinary join whose
+    /// open has now landed — its `bootstrapping` entry cleared — so the duty
+    /// opens the store now that nothing else holds the directory.
+    fn resume_pending_reshape_prep(&mut self) {
+        let ready: Vec<ShardId> = self
+            .pending_reshape_prep
+            .keys()
+            .copied()
+            .filter(|shard| !self.bootstrapping.contains_key(shard))
+            .collect();
+        for shard in ready {
+            // The reshape that requested this prep may have been cancelled while
+            // it was held; drop the held prep rather than opening a store no
+            // duty will seat.
+            if !self.reshape_owns(shard) {
+                self.pending_reshape_prep.remove(&shard);
+                continue;
+            }
+            if let Some(request) = self.pending_reshape_prep.remove(&shard) {
+                self.dispatch_reshape(request);
+            }
+        }
+    }
+
     /// Perform one reshape io request, answering with a
     /// [`SupervisorEvent::Reshape`] the runner loop feeds back through
     /// [`Self::on_reshape_io`].
     fn dispatch_reshape(&mut self, request: ReshapeRequest) {
+        // A store-prep for a shard an ordinary join is still opening is held
+        // until that join's open lands and is abandoned (`on_opened` ->
+        // `reshape_owns`), so the two never touch the same `RocksDB` directory
+        // at once. Resumed from `resume_pending_reshape_prep`.
+        let store_shard = match &request {
+            ReshapeRequest::OpenStore { shard } => Some(*shard),
+            ReshapeRequest::SeedFromParent { child, .. } => Some(*child),
+            _ => None,
+        };
+        if let Some(shard) = store_shard
+            && self.bootstrapping.contains_key(&shard)
+        {
+            info!(shard = ?shard, "Reshape store-prep held behind an in-flight join");
+            self.pending_reshape_prep.insert(shard, request);
+            return;
+        }
         match request {
             ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
             ReshapeRequest::SeedFromParent { parent, child } => {
@@ -1153,6 +1241,14 @@ impl ShardSupervisor {
         if self.shards.contains_key(&shard) {
             warn!(shard = ?shard, "Reshape seat for an already-hosted shard; dropped");
             return;
+        }
+        // The reshape duty owns this successor; an ordinary join racing it
+        // yields. Abandon the in-flight join — its opened store drops at
+        // `on_opened` (which finds no `bootstrapping` entry) — and seat from the
+        // prepared store, which carries the reshape's terminal/merged state the
+        // join's snap-sync would not.
+        if self.bootstrapping.remove(&shard).is_some() {
+            warn!(shard = ?shard, "Reshape seat superseding an in-flight join for the shard");
         }
         let topology_snapshot = self.process.topology_snapshot().load_full();
         let vnodes: Vec<VnodeConfig> = topology_snapshot
@@ -1560,6 +1656,39 @@ impl ShardSupervisor {
     }
 }
 
+/// Whether a reshape duty staffed by one of the host's `owned` validators owns
+/// seating `shard` — a parent-half or observer seat for a split child, or a
+/// keeper seat reforming a merge parent.
+///
+/// Keyed as the beacon projection publishes the cohorts: parent-halves by the
+/// child each member seats on, observers by the splitting parent (mapping each
+/// observer to the child it syncs), keepers by the child each runs (mapping to
+/// the parent it reforms). So `shard` is owned as a split child via the first
+/// two and as a merge parent via the third.
+fn host_reshape_owns(
+    parent_half_cohorts: &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    observer_cohorts: &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    keeper_cohorts: &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    shard: ShardId,
+    owned: impl Fn(&ValidatorId) -> bool,
+) -> bool {
+    if parent_half_cohorts
+        .get(&shard)
+        .is_some_and(|seats| seats.keys().any(&owned))
+    {
+        return true;
+    }
+    if observer_cohorts
+        .values()
+        .any(|seats| seats.iter().any(|(v, child)| *child == shard && owned(v)))
+    {
+        return true;
+    }
+    keeper_cohorts
+        .values()
+        .any(|seats| seats.iter().any(|(v, parent)| *parent == shard && owned(v)))
+}
+
 /// Whether a hosted shard has aged out of this host's serving duty: no
 /// local validator holds a consensus role in it (absent from the active
 /// committee) and none sits in its routing committee (no serve
@@ -1611,7 +1740,7 @@ mod tests {
         ValidatorInfo, ValidatorSet, generate_bls_keypair,
     };
 
-    use super::{host_assigned, shard_retired};
+    use super::{host_assigned, host_reshape_owns, shard_retired};
 
     const HOST: ValidatorId = ValidatorId::new(1);
 
@@ -1739,6 +1868,78 @@ mod tests {
             &topology_snapshot,
             &routing,
             &HashSet::from([HOST])
+        ));
+    }
+
+    /// A host whose validator holds a parent-half seat owns the split child —
+    /// so an ordinary join for the child yields to the reshape duty.
+    #[test]
+    fn host_reshape_owns_a_split_child_via_parent_half() {
+        let parent = ShardId::ROOT;
+        let child = ShardId::leaf(1, 0);
+        let parent_halves = BTreeMap::from([(child, BTreeMap::from([(HOST, parent)]))]);
+        assert!(host_reshape_owns(
+            &parent_halves,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            child,
+            |v| *v == HOST,
+        ));
+    }
+
+    /// An observer seat — keyed by the splitting parent, mapping to the child —
+    /// also makes the host own the split child.
+    #[test]
+    fn host_reshape_owns_a_split_child_via_observer() {
+        let parent = ShardId::ROOT;
+        let child = ShardId::leaf(1, 0);
+        let observers = BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]);
+        assert!(host_reshape_owns(
+            &BTreeMap::new(),
+            &observers,
+            &BTreeMap::new(),
+            child,
+            |v| *v == HOST,
+        ));
+    }
+
+    /// A keeper seat — keyed by the child it runs, mapping to the reformed
+    /// parent — makes the host own the merge parent.
+    #[test]
+    fn host_reshape_owns_a_merge_parent_via_keeper() {
+        let parent = ShardId::ROOT;
+        let child = ShardId::leaf(1, 0);
+        let keepers = BTreeMap::from([(child, BTreeMap::from([(HOST, parent)]))]);
+        assert!(host_reshape_owns(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &keepers,
+            parent,
+            |v| *v == HOST,
+        ));
+    }
+
+    /// A cohort seat held by another host's validator is not owned here, and a
+    /// shard with no cohort is not owned at all.
+    #[test]
+    fn host_reshape_owns_only_its_own_seats() {
+        let parent = ShardId::ROOT;
+        let child = ShardId::leaf(1, 0);
+        let other = ValidatorId::new(99);
+        let parent_halves = BTreeMap::from([(child, BTreeMap::from([(other, parent)]))]);
+        assert!(!host_reshape_owns(
+            &parent_halves,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            child,
+            |v| *v == HOST,
+        ));
+        assert!(!host_reshape_owns(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            child,
+            |v| *v == HOST,
         ));
     }
 

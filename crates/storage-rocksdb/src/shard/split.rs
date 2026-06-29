@@ -50,6 +50,14 @@ impl RocksDbShardStorage {
     /// Returns [`StorageError`] if checkpoint creation or the rename
     /// fails.
     pub fn checkpoint_into(&self, target: &Path) -> Result<(), StorageError> {
+        // Serialize against a co-hosted sibling vnode committing this same
+        // parent store: the checkpoint snapshots the live db, so it takes the
+        // commit lock like every other batch path rather than relying on
+        // RocksDB's internal locking alone.
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::DatabaseError("commit lock poisoned".into()))?;
         let db_path = target.join("db");
         if db_path.exists() {
             return Ok(());
