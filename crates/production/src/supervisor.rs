@@ -1580,7 +1580,13 @@ fn shard_retired(
     let in_routing = routing
         .get(&shard)
         .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
-    !host_assigned(shard, topology_snapshot, host_ids) && !in_routing
+    // A reshape predecessor mid-handoff stays up even once it ages out of the
+    // routable window: under make-before-break its committee keeps coasting and
+    // serving its terminal until the successors are live, so they can seed and
+    // finalize against it.
+    !host_assigned(shard, topology_snapshot, host_ids)
+        && !in_routing
+        && !topology_snapshot.reshape_handoff_pending(shard)
 }
 
 /// Whether `shard`'s committed committee includes a local validator — the host
@@ -1697,16 +1703,38 @@ mod tests {
         ));
     }
 
-    /// A dissolved shard aged out of routing entirely retires.
+    /// A dissolved shard aged out of routing entirely retires — once its
+    /// reshape handoff has completed. Here `leaf(2, 2)` merged into `leaf(1, 1)`,
+    /// which is now live (advanced past genesis), so the predecessor is free.
     #[test]
     fn retires_a_shard_evicted_from_routing() {
         let child = ShardId::leaf(2, 2);
         let topology_snapshot = head(HashMap::from([
             (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
             (ShardId::leaf(1, 1), vec![HOST]),
-        ]));
+        ]))
+        .with_advanced([ShardId::leaf(1, 1)].into());
         let routing = RoutingCommittees::new();
         assert!(shard_retired(
+            child,
+            &topology_snapshot,
+            &routing,
+            &HashSet::from([HOST])
+        ));
+    }
+
+    /// A reshape predecessor mid-handoff is held up even once it has aged out of
+    /// routing: its successors aren't live yet, so it keeps serving its terminal.
+    #[test]
+    fn holds_a_reshape_predecessor_until_its_successor_is_live() {
+        let child = ShardId::leaf(2, 2);
+        // `leaf(2, 2)` merged into `leaf(1, 1)`, which is seated but not yet live.
+        let topology_snapshot = head(HashMap::from([
+            (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
+            (ShardId::leaf(1, 1), vec![HOST]),
+        ]));
+        let routing = RoutingCommittees::new();
+        assert!(!shard_retired(
             child,
             &topology_snapshot,
             &routing,

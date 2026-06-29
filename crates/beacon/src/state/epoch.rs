@@ -593,33 +593,25 @@ fn record_boundaries(
     // record is dead weight. Bounded so a terminated shard can't
     // accumulate forever.
     //
-    // A split parent whose children are still placeholders is exempt: its
-    // terminal record is what `seed_split_children` folds the children from,
-    // and that fold can only happen on an epoch the beacon commits a proposal
-    // carrying the parent's terminal QC. The beacon can commit empty for
-    // several epochs across the reshape's committee transition, so the horizon
-    // alone would drop the record before any non-empty commit folds it —
-    // stranding both children on their placeholders forever. Holding it until
-    // both children carry a real anchor (seeded here, or from their own first
-    // contributions) keeps the parent sourced until it folds; the fold then
-    // marks the record so it stops being re-sourced and the next horizon sweep
-    // collects it.
-    //
-    // A merge child whose parent is still an uncomposed placeholder is exempt
-    // for the mirror reason: the parent composes only from both children's
-    // terminal folds, and a child folded in a window the beacon empty-commits
-    // through would be dropped before its sibling's fold completes the pair,
-    // stranding the parent on its placeholder forever. Holding it until the
-    // parent composes (its placeholder fills with a real anchor) keeps both
-    // children sourced; the compose then frees the records for the next sweep.
+    // A terminal record whose reshape successors aren't live yet is exempt: it
+    // is what `seed_split_children` folds the children from (or what a merge
+    // parent composes from), and that fold can only land on an epoch the beacon
+    // commits a proposal carrying the terminal QC. The beacon can commit empty
+    // for several epochs across the reshape's committee transition, so the
+    // horizon alone would drop the record first — stranding the children on
+    // their placeholders, or the merge parent uncomposed. It is also the anchor
+    // a coasting predecessor's observers snap-sync against while they finish
+    // adopting; under make-before-break the predecessor keeps coasting until its
+    // successors are live, so the record must outlive the horizon until then,
+    // not merely until they seed. Holding it until the successors have produced
+    // past genesis (`BeaconState.advanced`) covers both, and frees the record
+    // for the next horizon sweep once the handoff has demonstrably completed.
     let now = windows.window_of(epoch).start;
     let pending_fold: BTreeSet<ShardId> = state
         .boundaries
         .iter()
         .filter(|(shard, b)| {
-            b.terminal_epoch.is_some()
-                && (children_unseeded(&state.boundaries, **shard)
-                    || parent_uncomposed(&state.boundaries, **shard))
+            b.terminal_epoch.is_some() && !successors_live_for_terminal(state, **shard)
         })
         .map(|(shard, _)| *shard)
         .collect();
@@ -636,32 +628,27 @@ fn record_boundaries(
     outcome
 }
 
-/// Whether either of `parent`'s two children holds a placeholder boundary —
-/// present but still on the zero anchor a split execution seeds. A `false`
-/// here means both children carry a real anchor (a parent never split, or its
-/// children have folded), so the parent's terminal record no longer needs to
-/// outlive the retention horizon.
-fn children_unseeded(boundaries: &BTreeMap<ShardId, ShardBoundary>, parent: ShardId) -> bool {
-    let children: [ShardId; 2] = parent.children().into();
-    children.iter().any(|child| {
-        boundaries
-            .get(child)
-            .is_some_and(|b| b.block_hash == BlockHash::ZERO)
-    })
-}
-
-/// Whether `child`'s parent holds an uncomposed merge placeholder — present
-/// with a zero block hash post-genesis, the anchor a merge execution seeds and
-/// [`compose_merge_parent`] later fills from both children's terminal roots. A
-/// `true` here means a merge child's terminal record must outlive the retention
-/// horizon so the parent can still compose from it. A `false` means the parent
-/// has composed (a real anchor) or never merged, so the record is free to drop.
-fn parent_uncomposed(boundaries: &BTreeMap<ShardId, ShardBoundary>, child: ShardId) -> bool {
-    child.parent().is_some_and(|parent| {
-        boundaries
-            .get(&parent)
-            .is_some_and(|b| b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS)
-    })
+/// Whether a terminal `shard`'s reshape successors are live — both split
+/// children, or a merge's reformed parent, have produced past their genesis
+/// (`BeaconState.advanced`). The `BeaconState`-level companion of
+/// [`TopologySnapshot::successors_live`](hyperscale_types::TopologySnapshot::successors_live);
+/// both release on the same `advanced` signal, so the record outlives the
+/// coasting predecessor exactly. A split is keyed on its children's boundary
+/// records — present from the split execution, so it never mistakes a
+/// terminated grandparent for a successor — and a merge on its reformed
+/// parent's *live committee*, which a lingering pre-merge terminal record never
+/// carries. A successor not yet seated reads not-live, so the record stays.
+fn successors_live_for_terminal(state: &BeaconState, shard: ShardId) -> bool {
+    let (left, right) = shard.children();
+    if state.boundaries.contains_key(&left) && state.boundaries.contains_key(&right) {
+        return state.advanced.contains(&left) && state.advanced.contains(&right);
+    }
+    if let Some(parent) = shard.parent()
+        && state.shard_committees.contains_key(&parent)
+    {
+        return state.advanced.contains(&parent);
+    }
+    false
 }
 
 /// Seed a terminated parent's pending children from its terminal header.
@@ -1815,13 +1802,19 @@ mod tests {
             "lingers within the retention window",
         );
 
+        // The children seat and produce past their genesis — the handoff is
+        // done, so the parent's record is dead weight, free to drop on the next
+        // horizon sweep.
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            state.advanced.insert(child);
+        }
         // Advance to an epoch whose window opens past the terminal cut
         // (2000ms at epoch_duration 1000) plus `RETENTION_HORIZON`.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
         record_boundaries(&mut state, past, &[], &BTreeMap::new());
         assert!(
             !state.boundaries.contains_key(&parent),
-            "terminal record drops past the retention horizon",
+            "terminal record drops past the retention horizon once its children are live",
         );
     }
 
@@ -1851,9 +1844,7 @@ mod tests {
             );
         }
 
-        // The terminal contribution finally lands: it seeds both children,
-        // and the now-seeded parent is collected by the same fold's horizon
-        // sweep.
+        // The terminal contribution finally lands: it seeds both children.
         let (header, witnesses) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
@@ -1867,9 +1858,24 @@ mod tests {
                 "children seed from the terminal fold",
             );
         }
+        // Seeded is not yet live: the parent is held until its children produce,
+        // so a straggling observer can still snap-sync its terminal anchor while
+        // it coasts under make-before-break.
+        assert!(
+            state.boundaries.contains_key(&parent),
+            "a seeded-but-not-live parent is still held",
+        );
+
+        // The children produce past their genesis — the handoff is complete, so
+        // the parent drops on the next horizon sweep.
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            state.advanced.insert(child);
+        }
+        let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
+        record_boundaries(&mut state, even_later, &[], &BTreeMap::new());
         assert!(
             !state.boundaries.contains_key(&parent),
-            "the seeded parent drops on the next horizon sweep",
+            "the parent drops once its children are live",
         );
     }
 
@@ -1922,6 +1928,15 @@ mod tests {
             );
         }
 
+        // The reformed parent's live committee — present only once the merge
+        // actually reforms it, distinct from the placeholder record above.
+        state.shard_committees.insert(
+            parent,
+            ShardCommittee {
+                members: vec![ValidatorId::new(0)],
+            },
+        );
+
         // The beacon commits empty well past the horizon: the parent hasn't
         // composed, so both children's terminal records must be held.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
@@ -1933,8 +1948,9 @@ mod tests {
             );
         }
 
-        // The parent composes — a real anchor — so the children are now free
-        // to drop on the next horizon sweep.
+        // The parent composes — a real anchor — but composing is not yet live:
+        // the children are still held so the reformed parent can keep seeding
+        // from them while it comes up.
         state
             .boundaries
             .get_mut(&parent)
@@ -1944,8 +1960,20 @@ mod tests {
         record_boundaries(&mut state, later, &[], &BTreeMap::new());
         for child in [left, right] {
             assert!(
+                state.boundaries.contains_key(&child),
+                "a merge child is held while the reformed parent is composed but not yet live",
+            );
+        }
+
+        // The reformed parent produces past its genesis — the handoff completes,
+        // so the children drop on the next horizon sweep.
+        state.advanced.insert(parent);
+        let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
+        record_boundaries(&mut state, even_later, &[], &BTreeMap::new());
+        for child in [left, right] {
+            assert!(
                 !state.boundaries.contains_key(&child),
-                "a merge child drops once its parent has composed and the horizon passed",
+                "a merge child drops once its reformed parent is live",
             );
         }
     }
