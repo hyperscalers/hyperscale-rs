@@ -216,10 +216,11 @@ where
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
             Action::TopologyChanged {
+                epoch,
                 topology_snapshot,
                 routing_committees,
             } => {
-                self.handle_topology_changed(&topology_snapshot, routing_committees);
+                self.handle_topology_changed(epoch, &topology_snapshot, routing_committees);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_reconfigurations.push(change);
@@ -753,16 +754,18 @@ where
     /// Adopt a fresh topology snapshot: publish it through the lock-free
     /// `ArcSwap` so off-thread closures pick it up on their next `.load()`,
     /// and push it to the network adapter (which keys validator pubkeys
-    /// and shard committees off the snapshot). Idempotent across hosted
-    /// shards — every same-shard vnode's `Action::TopologyChanged` lands
-    /// here, but the final stored value is identical.
+    /// and shard committees off the snapshot). Every hosted shard's
+    /// `Action::TopologyChanged` lands here as it folds the beacon at `epoch`;
+    /// `apply_topology` gates the store monotonically so a slower shard thread
+    /// cannot regress the shared snapshot to an older epoch's view.
     pub(in crate::shard) fn handle_topology_changed(
         &self,
+        epoch: Epoch,
         topology_snapshot: &Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
         self.process
-            .apply_topology(topology_snapshot, routing_committees);
+            .apply_topology(epoch, topology_snapshot, routing_committees);
 
         tracing::info!(
             local_shard = self.shard.inner(),

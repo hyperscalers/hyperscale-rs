@@ -233,11 +233,12 @@ where
                 beacon::on_admitted(self, epoch);
             }
             Action::TopologyChanged {
+                epoch,
                 topology_snapshot,
                 routing_committees,
             } => {
                 self.process
-                    .apply_topology(&topology_snapshot, routing_committees);
+                    .apply_topology(epoch, &topology_snapshot, routing_committees);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_reconfigurations.push(change);

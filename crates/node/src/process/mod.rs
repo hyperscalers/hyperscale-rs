@@ -136,10 +136,19 @@ where
     beacon_route_active: Arc<AtomicBool>,
 
     /// Lock-free topology snapshot shared with network handler closures
-    /// and delegated dispatch jobs. The pinned thread is the sole writer
-    /// (via `Action::TopologyChanged`); all other readers `.load()` for
-    /// an atomic snapshot.
+    /// and delegated dispatch jobs. Every hosted shard (and the pool) writes
+    /// it via `Action::TopologyChanged` as it folds the beacon; readers
+    /// `.load()` for an atomic snapshot.
     pub(crate) topology_snapshot: SharedTopologySnapshot,
+
+    /// Highest beacon epoch whose `Action::TopologyChanged` has been applied to
+    /// [`Self::topology_snapshot`]. Co-hosted shard threads fold the beacon
+    /// independently and publish concurrently, so a slower thread on an older
+    /// epoch could otherwise overwrite a newer snapshot a sibling already
+    /// stored — regressing the trie / `advanced` set the reshape handoff reads.
+    /// `apply_topology` holds this lock across the epoch check and the publish,
+    /// so the highest epoch's snapshot wins and the stores never reorder.
+    apply_topology_epoch: Mutex<Epoch>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
@@ -218,6 +227,7 @@ where
             beacon_event_sender,
             beacon_route_active: Arc::new(AtomicBool::new(false)),
             topology_snapshot,
+            apply_topology_epoch: Mutex::new(Epoch::GENESIS),
             dispatch_handles,
             tx_validator,
             beacon_storage,
@@ -487,21 +497,51 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Adopt a fresh topology snapshot: publish it through the lock-free
-    /// `ArcSwap` so off-thread closures pick it up on their next `.load()`, and
-    /// push it to the network adapter (which keys validator pubkeys and shard
-    /// committees off the snapshot, and fetch routing off the terminal-clamped
-    /// committees). Shared by every driver's `Action::TopologyChanged` handling
-    /// — idempotent across them, the final stored value is identical.
+    /// Adopt a fresh topology snapshot derived at beacon `epoch`: publish it
+    /// through the lock-free `ArcSwap` so off-thread closures pick it up on
+    /// their next `.load()`, and push it to the network adapter (which keys
+    /// validator pubkeys and shard committees off the snapshot, and fetch
+    /// routing off the terminal-clamped committees).
+    ///
+    /// Every hosted shard (and the pool) calls this as it folds the beacon,
+    /// concurrently across pinned threads. The store is gated monotonically on
+    /// `epoch`: a fold for an epoch at or below the highest already applied is
+    /// dropped, so a slower thread cannot regress the shared snapshot to an
+    /// older trie / `advanced` set under another thread's newer one. A genuine
+    /// same-epoch re-apply is a no-op (the value is identical for an epoch).
     pub(crate) fn apply_topology(
         &self,
+        epoch: Epoch,
         topology_snapshot: &Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
+        let mut applied = self
+            .apply_topology_epoch
+            .lock()
+            .expect("apply topology epoch lock");
+        if !admit_topology_epoch(&mut applied, epoch) {
+            return;
+        }
+        // Publish under the lock so the highest epoch's stores never reorder
+        // behind a slower thread that admitted an earlier epoch.
         self.topology_snapshot.store(Arc::clone(topology_snapshot));
         self.network.update_topology(Arc::clone(topology_snapshot));
         self.network.update_routing_committees(routing_committees);
     }
+}
+
+/// Advance the highest-applied topology epoch to `incoming`, returning whether
+/// it supersedes what was already applied. An epoch at or below `applied` is
+/// dropped (a stale or duplicate fold); a newer one advances the watermark.
+/// The caller holds the lock guarding `applied` across this and the publish, so
+/// concurrent folds resolve to the highest epoch without the snapshot stores
+/// reordering.
+fn admit_topology_epoch(applied: &mut Epoch, incoming: Epoch) -> bool {
+    if incoming <= *applied {
+        return false;
+    }
+    *applied = incoming;
+    true
 }
 
 /// Routing decision for a locally-submitted transaction. Returned by
@@ -535,4 +575,34 @@ pub enum SubmitFanout {
     /// It runs no shard pipeline to admit or gossip through, so a
     /// locally-submitted tx is dropped.
     NoHostedShard,
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::Epoch;
+
+    use super::admit_topology_epoch;
+
+    /// The topology-epoch gate admits a strictly newer fold and drops a stale
+    /// or duplicate one — including an older fold arriving after a newer one,
+    /// which is the co-hosting reorder the gate exists to reject.
+    #[test]
+    fn topology_epoch_gate_admits_newer_drops_stale() {
+        let mut applied = Epoch::new(5);
+
+        assert!(!admit_topology_epoch(&mut applied, Epoch::new(5)), "equal");
+        assert!(!admit_topology_epoch(&mut applied, Epoch::new(4)), "older");
+        assert_eq!(applied, Epoch::new(5), "watermark unmoved by stale folds");
+
+        assert!(admit_topology_epoch(&mut applied, Epoch::new(6)), "newer");
+        assert_eq!(applied, Epoch::new(6));
+
+        // A slower thread's epoch-5 fold landing after the epoch-6 publish is
+        // dropped rather than regressing the snapshot.
+        assert!(
+            !admit_topology_epoch(&mut applied, Epoch::new(5)),
+            "reorder"
+        );
+        assert_eq!(applied, Epoch::new(6));
+    }
 }

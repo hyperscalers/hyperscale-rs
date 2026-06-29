@@ -1566,6 +1566,7 @@ impl BeaconCoordinator {
                 state: Box::new(self.state.clone()),
             },
             Action::TopologyChanged {
+                epoch: self.state.current_epoch,
                 topology_snapshot: Arc::clone(self.topology_schedule.head()),
                 routing_committees: Arc::new(self.topology_schedule.routing_committees()),
             },

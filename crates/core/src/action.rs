@@ -937,6 +937,11 @@ pub enum Action {
     /// (`ArcSwap`), rebuilds `cached_local_peers`, and updates
     /// `local_shard` / `num_shards`.
     TopologyChanged {
+        /// Beacon epoch this snapshot was derived at — the monotonic key the
+        /// `io_loop` gates the shared `ArcSwap` on, so a slower co-hosted shard
+        /// thread folding an older epoch cannot overwrite a newer snapshot a
+        /// sibling thread already published.
+        epoch: Epoch,
         /// New topology snapshot to propagate.
         topology_snapshot: Arc<TopologySnapshot>,
         /// Terminal-clamped per-shard routing committees, covering every
