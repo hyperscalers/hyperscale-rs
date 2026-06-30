@@ -8,10 +8,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{PcSim, SpcSim};
+use common::{PcSim, SpcSim, Trace};
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc3, PcValueElement, PcVector, SpcCert,
-    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, build_indirect_cert,
+    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, build_indirect_cert,
     sign_empty_view_msg, spc_context, verify_block_cert, verify_cert, verify_empty_view_msg,
     verify_proposal_object,
 };
@@ -223,6 +223,122 @@ fn sim_n7_honest_path_converges_on_high() {
     let baseline = sim.output(0).unwrap().clone();
     for i in 1..7 {
         assert_eq!(*sim.output(i).unwrap(), baseline);
+    }
+}
+
+/// Divergent view-1 inputs collapse the commit to empty — the invariant
+/// behind the coordinator feeding view-1 only at full proposal coverage.
+///
+/// When committee members feed view-1 inputs built from *different*
+/// proposal subsets — the positional `compute_view_one_input` vector
+/// with `BOTTOM` for an un-pooled proposal — and those subsets split the
+/// committee at position 0 (the lowest-id member's proposal pooled by
+/// some, absent for others), the inner PC's prefix consensus collapses to
+/// an empty committed vector. The committed value is the view-1 high; a
+/// 2-2 split at position 0 drives every round-2 QC's mcp to empty (every
+/// 3-subset mixes the two camps), so the view-1 high — and hence the
+/// commit — is empty. Later views can't recover: they shuffle the view-1
+/// highs forward as proposal objects and never re-read the pool.
+///
+/// This is the SPC behaviour the coordinator must avoid by feeding only
+/// once every committee member's proposal is pooled, so honest nodes feed
+/// the same vector (see `BeaconCoordinator::on_spc_input_dwell_timer` and
+/// the full-coverage gate in `on_beacon_proposal_received`).
+#[test]
+fn position_zero_input_split_commits_empty() {
+    let epoch = Epoch::new(16);
+    // Long timeout: this scenario converges (emptily) on the happy path
+    // with no view-change, so the timer must never fire on its own.
+    let mut sim = SpcSim::new(4, 0xB0, epoch, Duration::from_mins(10));
+
+    // Distinct per-member proposal hashes; BOTTOM marks an un-pooled
+    // proposal. Members {0,1} pooled member 0's proposal (position 0 =
+    // h0); members {2,3} did not (position 0 = BOTTOM). All four agree on
+    // positions 1-3 where present.
+    let h = |i: u8| elem(10 + i);
+    let b = PcValueElement::BOTTOM;
+    let inputs = [
+        PcVector::new([h(0), h(1), b, h(3)]), // member 0's pool
+        PcVector::new([h(0), h(1), h(2), b]), // member 1's pool
+        PcVector::new([b, h(1), h(2), h(3)]), // member 2's pool
+        PcVector::new([b, h(1), h(2), h(3)]), // member 3's pool
+    ];
+    for (i, v) in inputs.iter().enumerate() {
+        sim.input(i, v.clone());
+    }
+
+    let id = ValidatorId::new;
+    // Round-1 delivery is the lever: members {0,1} pool votes {0,1,2} and
+    // freeze QC1 over them (x = [h0,h1]); members {2,3} pool votes {1,2,3}
+    // (x = [BOTTOM,h1,h2,h3]) — inconsistent at position 0.
+    for recipient in [0u64, 1] {
+        for sender in [0u64, 1, 2] {
+            assert!(sim.deliver_vote1_from_to(id(sender), id(recipient)));
+        }
+    }
+    for recipient in [2u64, 3] {
+        for sender in [1u64, 2, 3] {
+            assert!(sim.deliver_vote1_from_to(id(sender), id(recipient)));
+        }
+    }
+
+    // Drain everything else (leftover round-1 votes, all of rounds 2/3,
+    // view-2 entry + commit). Reliable broadcast: every proposal object
+    // reaches every party, so view 2 converges — but on the empty value.
+    sim.run_until_quiescent(10_000);
+
+    // The lock-in: view 2 reaches *full* agreement on its own input (the
+    // proposal-object vector is identical at every party once the
+    // view-change certs propagate), so its QC3 low is a non-empty vector.
+    let view2_low_len = sim
+        .trace
+        .iter()
+        .find_map(|t| match t {
+            Trace::Qc3 { view, low, .. } if view.inner() == 2 => Some(low.len()),
+            _ => None,
+        })
+        .expect("view 2's inner PC decides");
+    assert_eq!(
+        view2_low_len, 4,
+        "view 2 agrees on a full proposal-object vector — the inner PC is healthy",
+    );
+
+    // …but the committed value is the *view-1 high*, which collapsed to
+    // empty, so every party commits an empty vector despite view 2's full
+    // agreement. Zero proposals fold — the beacon's frozen-boundary epoch.
+    assert!(sim.all_decided(), "parties still converge — but on empty");
+    for i in 0..4 {
+        assert!(
+            sim.output(i).unwrap().is_empty(),
+            "party {i} committed a non-empty vector: {:?}",
+            sim.output(i).unwrap(),
+        );
+    }
+}
+
+/// Control: the *same* divergent inputs, but with full proposal coverage
+/// at feed time (every member pooled all four proposals before feeding),
+/// converge on the full non-empty vector. Isolates the split — not the
+/// `BOTTOM` padding itself — as the cause of the empty commit.
+#[test]
+fn full_coverage_inputs_commit_non_empty() {
+    let epoch = Epoch::new(16);
+    let mut sim = SpcSim::new(4, 0xB1, epoch, Duration::from_mins(10));
+    let h = |i: u8| elem(10 + i);
+    // Every member fed the same complete vector — what full coverage
+    // (or a long-enough dwell) would produce.
+    let full = PcVector::new([h(0), h(1), h(2), h(3)]);
+    for i in 0..4 {
+        sim.input(i, full.clone());
+    }
+    sim.run_until_quiescent(10_000);
+    assert!(sim.all_decided());
+    for i in 0..4 {
+        assert_eq!(
+            *sim.output(i).unwrap(),
+            full,
+            "full-coverage inputs should commit the full vector",
+        );
     }
 }
 

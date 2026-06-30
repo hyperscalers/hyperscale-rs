@@ -620,18 +620,32 @@ impl CoordinatorSim {
     /// Fire the wall-clock timers on every replica: the
     /// proposal-collection dwell and the committee-start timer. The
     /// dwell is a no-op until an SPC instance is up, and wherever the
-    /// quorum fast path already fed the view-1 input — but on the
+    /// full-coverage fast path already fed the view-1 input — but on the
     /// quiescence re-kick from `run_until_committed` it is the only
     /// way forward when peers' proposals were dropped (e.g. as
-    /// unverifiable) and the pool can't reach quorum. In production
-    /// these fire as wall-clock passes the dwell and the upcoming
-    /// epoch's boundary; here the sim kicks all replicas in lockstep
-    /// so SPC instances bootstrap, feed, and `try_propose` emits the
-    /// initial `BuildAndBroadcastBeaconProposal` actions.
+    /// unverifiable) and the pool can't reach full coverage. In
+    /// production these fire as wall-clock passes the dwell and the
+    /// upcoming epoch's boundary; here the sim kicks all replicas in
+    /// lockstep so SPC instances bootstrap, feed, and `try_propose`
+    /// emits the initial `BuildAndBroadcastBeaconProposal` actions.
+    ///
+    /// The dwell re-arms while waiting for full proposal coverage; in
+    /// production the re-armed `BeaconSpcInputDwell` timer fires again
+    /// every `SPC_INPUT_DWELL` until coverage completes or the re-arm
+    /// budget runs out. At quiescence no further proposals will arrive,
+    /// so model that by firing the dwell until it stops producing work
+    /// (it no-ops once it has fed, or when there is no instance).
     pub fn kick_off(&mut self) {
         for idx in 0..self.n() {
-            let actions = self.coordinators[idx].on_spc_input_dwell_timer();
-            self.absorb(idx, actions);
+            // Bounded so a re-arm logic error can't spin forever; the
+            // budget itself is a handful of fires.
+            for _ in 0..32 {
+                let actions = self.coordinators[idx].on_spc_input_dwell_timer();
+                if actions.is_empty() {
+                    break;
+                }
+                self.absorb(idx, actions);
+            }
         }
         for idx in 0..self.n() {
             let actions = self.coordinators[idx].on_beacon_committee_start_timer();

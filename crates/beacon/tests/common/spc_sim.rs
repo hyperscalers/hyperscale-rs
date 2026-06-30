@@ -25,6 +25,38 @@ struct Envelope {
     event: SpcEvent,
 }
 
+/// An observable milestone emitted by a party's FSM, captured for tests
+/// that want to see *how* the inner PC progressed (which `v_in` a party
+/// signed, when each QC round fired, whether the empty-view path
+/// engaged) rather than just the terminal output.
+#[derive(Debug, Clone)]
+pub enum Trace {
+    /// Party `idx` signed round-1 over `v_in` at `view` — its view input.
+    Vote1 {
+        idx: usize,
+        view: SpcView,
+        v_in: PcVector,
+    },
+    /// Party `idx` formed a round-1 QC at `view` (it emitted vote-2).
+    Qc1 { idx: usize, view: SpcView },
+    /// Party `idx` formed a round-2 QC at `view` (it emitted vote-3).
+    Qc2 { idx: usize, view: SpcView },
+    /// Party `idx`'s inner PC decided at `view` (round-3 QC); carries the
+    /// committed low (`x_pp`) and high (`x_pe`) the QC3 attained.
+    Qc3 {
+        idx: usize,
+        view: SpcView,
+        low: PcVector,
+        high: PcVector,
+    },
+    /// Party `idx` broadcast a `new-view` cert entering `view`.
+    NewView { idx: usize, view: SpcView },
+    /// Party `idx` broadcast an empty-view attestation for `view`.
+    EmptyView { idx: usize, view: SpcView },
+    /// Party `idx` latched its terminal high output.
+    Output { idx: usize, value: PcVector },
+}
+
 pub struct SpcSim {
     pub instances: Vec<SpcInstance>,
     pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
@@ -37,6 +69,8 @@ pub struct SpcSim {
     /// to `outputs`. Lets a test assert the authenticator commits to the
     /// committed value (`cert.committed_value() == value`).
     output_certs: Vec<Option<Verified<SpcCert>>>,
+    /// Append-only milestone log across all parties, in processing order.
+    pub trace: Vec<Trace>,
 }
 
 impl SpcSim {
@@ -70,6 +104,7 @@ impl SpcSim {
             pending: VecDeque::new(),
             outputs,
             output_certs,
+            trace: Vec::new(),
         }
     }
 
@@ -137,12 +172,21 @@ impl SpcSim {
         for effect in effects {
             match effect {
                 SpcEffect::SignAndBroadcastPcVote1 { view, v_in } => {
+                    self.trace.push(Trace::Vote1 {
+                        idx: sender_idx,
+                        view,
+                        v_in: v_in.clone(),
+                    });
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote =
                         Verified::<PcVote1>::sign_local(&sk, sender, &self.network, &pc_ctx, v_in);
                     self.deliver_to_all(&SpcEvent::PcVote1Verified { view, vote });
                 }
                 SpcEffect::SignAndBroadcastPcVote2 { view, qc1 } => {
+                    self.trace.push(Trace::Qc1 {
+                        idx: sender_idx,
+                        view,
+                    });
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote =
                         Verified::<PcVote2>::sign_local(&sk, sender, &self.network, &pc_ctx, *qc1);
@@ -152,6 +196,10 @@ impl SpcSim {
                     });
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
+                    self.trace.push(Trace::Qc2 {
+                        idx: sender_idx,
+                        view,
+                    });
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote =
                         Verified::<PcVote3>::sign_local(&sk, sender, &self.network, &pc_ctx, *qc2);
@@ -161,6 +209,10 @@ impl SpcSim {
                     });
                 }
                 SpcEffect::BroadcastNewView { view, cert } => {
+                    self.trace.push(Trace::NewView {
+                        idx: sender_idx,
+                        view,
+                    });
                     let from = sender;
                     self.fanout(sender_idx, |_| SpcEvent::NewViewVerified {
                         from,
@@ -169,6 +221,12 @@ impl SpcSim {
                     });
                 }
                 SpcEffect::BroadcastNewCommit { view, proof } => {
+                    self.trace.push(Trace::Qc3 {
+                        idx: sender_idx,
+                        view,
+                        low: proof.x_pp().clone(),
+                        high: proof.x_pe().clone(),
+                    });
                     // The wire message is built from the proof, so the
                     // delivered value is `proof.x_pp` — same binding the
                     // production driver hands the FSM.
@@ -179,6 +237,10 @@ impl SpcSim {
                     });
                 }
                 SpcEffect::SignAndBroadcastEmptyView { view, reported } => {
+                    self.trace.push(Trace::EmptyView {
+                        idx: sender_idx,
+                        view,
+                    });
                     let spc_ctx = spc_context(self.epoch);
                     let msg = Verified::<SpcEmptyViewMsg>::sign_local(
                         &sk,
@@ -194,11 +256,43 @@ impl SpcSim {
                     // Honest path: no timer firing, no equivocation to absorb.
                 }
                 SpcEffect::OutputHigh { value, cert } => {
+                    self.trace.push(Trace::Output {
+                        idx: sender_idx,
+                        value: value.clone(),
+                    });
                     self.outputs[sender_idx] = Some(value);
                     self.output_certs[sender_idx] = Some(*cert);
                 }
             }
         }
+    }
+
+    /// Deliver the pending round-1 vote *from* `sender` *to* `recipient`,
+    /// if one is queued. Returns `true` when delivered. Gives a test
+    /// element-level control over which round-1 votes a party pools before
+    /// it crosses quorum and freezes its QC1 subset — the lever for
+    /// constructing inconsistent per-party QC1s, the asymmetry a global
+    /// FIFO can't express.
+    pub fn deliver_vote1_from_to(&mut self, sender: ValidatorId, recipient: ValidatorId) -> bool {
+        let pos = self.pending.iter().position(|e| {
+            e.to == recipient
+                && matches!(
+                    &e.event,
+                    SpcEvent::PcVote1Verified { vote, .. } if vote.validator() == sender
+                )
+        });
+        let Some(pos) = pos else {
+            return false;
+        };
+        let env = self.pending.remove(pos).expect("position just found");
+        let idx = self
+            .members
+            .iter()
+            .position(|(id, _)| *id == recipient)
+            .expect("addressed party in committee");
+        let effects = self.instances[idx].handle(env.event);
+        self.absorb(idx, effects);
+        true
     }
 
     /// Deliver `event` to every party in the committee, including the

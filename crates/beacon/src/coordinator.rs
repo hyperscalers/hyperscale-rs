@@ -36,7 +36,6 @@ use hyperscale_types::{
     SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
     SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot,
     ValidatorId, ValidatorStatus, Verifiable, Verified, Verify, WeightedTimestamp,
-    byzantine_threshold,
 };
 use tracing::{trace, warn};
 
@@ -50,6 +49,24 @@ use crate::spc_driver::SpcDriver;
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
 use crate::{boundary, rules};
+
+/// How many times the view-1 input dwell re-arms while waiting for full
+/// proposal coverage before giving up and feeding whatever is pooled.
+///
+/// The view-1 input is a positional vector — one slot per committee
+/// member, the pooled proposal's hash or `BOTTOM` if absent — and the
+/// inner PC runs prefix consensus over it. A vector that diverges across
+/// honest nodes (different members pooled different proposal subsets at
+/// feed time) collapses to a short or empty maximum-common-prefix: a
+/// disagreement at slot `k` discards every slot from `k` on, so an
+/// inconsistently-pooled low-slot proposal can drive the whole commit to
+/// empty. Feeding only at full coverage makes honest nodes feed the same
+/// vector. The cap bounds the wait: once it elapses, a still-missing
+/// proposal is from a member no node holds, so every node feeds the same
+/// partial vector and the epoch still makes progress. At
+/// [`SPC_INPUT_DWELL`] per re-arm this is a few seconds — negligible
+/// against the epoch, comfortably inside [`SPC_VIEW_TIMEOUT`].
+const MAX_INPUT_DWELL_REARMS: u32 = 6;
 
 /// Oldest epoch the topology schedule must retain — the minimum of the
 /// consumer frontiers that still verify QC-bearing artifacts:
@@ -211,6 +228,18 @@ pub struct BeaconCoordinator {
     /// fed into deterministic consensus computations — use
     /// `state.current_epoch` or weighted timestamps for that.
     now: LocalTimestamp,
+
+    /// How many times the view-1 input dwell has re-armed for the
+    /// in-flight epoch while waiting for full proposal coverage. Reset
+    /// to zero at each SPC bootstrap; capped at
+    /// [`MAX_INPUT_DWELL_REARMS`]. The dwell waits for *every* committee
+    /// member's proposal before feeding so honest nodes feed the same
+    /// view-1 vector — a partial vector diverges across nodes and the
+    /// inner PC's prefix consensus collapses it to an empty commit. The
+    /// cap bounds the wait so a genuinely-absent member (whose proposal
+    /// no node holds, so all feed the same partial vector) still lets the
+    /// epoch make progress.
+    input_dwell_rearms: u32,
 }
 
 impl BeaconCoordinator {
@@ -297,6 +326,7 @@ impl BeaconCoordinator {
             me,
             network,
             now: LocalTimestamp::ZERO,
+            input_dwell_rearms: 0,
         }
     }
 
@@ -746,9 +776,13 @@ impl BeaconCoordinator {
                 .iter()
                 .filter(|member| self.proposal_pool.contains(**member))
                 .count();
-            let n = self.state.committee.len();
-            let quorum = n - byzantine_threshold(n);
-            if pooled >= quorum && self.proposal_pool.contains(self.me) {
+            // Feed the view-1 input only once every committee member's
+            // proposal is pooled, so every honest node feeds the inner PC
+            // the same positional vector. A partial vector diverges across
+            // nodes and the prefix consensus collapses it (see
+            // [`MAX_INPUT_DWELL_REARMS`]); the dwell handles a member whose
+            // proposal never arrives.
+            if pooled == self.state.committee.len() {
                 return self.feed_view_one_input(epoch);
             }
         }
@@ -897,16 +931,19 @@ impl BeaconCoordinator {
     ///
     /// Arms the proposal-collection dwell: members bootstrap
     /// near-simultaneously at the epoch boundary, so the view-1 PC
-    /// input must wait for peers' proposals to arrive — disjoint
-    /// single-element inputs share only the empty prefix. The quorum
-    /// fast path in [`Self::on_beacon_proposal_received`] usually
-    /// feeds first; the timer covers the laggard tail.
+    /// input must wait for peers' proposals to arrive — divergent
+    /// positional inputs collapse the prefix consensus. The
+    /// full-coverage fast path in [`Self::on_beacon_proposal_received`]
+    /// feeds the instant every proposal is pooled; the dwell re-arms to
+    /// give a laggard time and only feeds a partial vector once
+    /// [`MAX_INPUT_DWELL_REARMS`] elapse.
     fn bootstrap_spc_with_committee(
         &mut self,
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Vec<Action> {
         self.spc
             .bootstrap(self.state.current_epoch.next(), committee);
+        self.input_dwell_rearms = 0;
         vec![Action::SetTimer {
             id: TimerId::BeaconSpcInputDwell,
             duration: SPC_INPUT_DWELL,
@@ -914,14 +951,31 @@ impl BeaconCoordinator {
     }
 
     /// `TimerId::BeaconSpcInputDwell` fired: the proposal-collection
-    /// dwell elapsed. Feed the view-1 input from whatever the pool
-    /// holds. A no-op when the quorum fast path already fed it, or
-    /// when no instance is up (off-committee, or the epoch already
-    /// adopted).
+    /// dwell elapsed. Feed the view-1 input once every committee
+    /// member's proposal is pooled; otherwise re-arm the dwell to give a
+    /// laggard more time, up to [`MAX_INPUT_DWELL_REARMS`] re-arms — only
+    /// then feed whatever is pooled. Waiting for full coverage keeps
+    /// honest nodes feeding the same positional vector; a partial vector
+    /// diverges and the inner PC's prefix consensus collapses it to an
+    /// empty commit. A no-op when the fast path already fed it, or when
+    /// no instance is up (off-committee, or the epoch already adopted).
     pub fn on_spc_input_dwell_timer(&mut self) -> Vec<Action> {
         let epoch = self.state.current_epoch.next();
         if !self.spc.should_feed_view_one_input(epoch) {
             return Vec::new();
+        }
+        let pooled = self
+            .state
+            .committee
+            .iter()
+            .filter(|member| self.proposal_pool.contains(**member))
+            .count();
+        if pooled < self.state.committee.len() && self.input_dwell_rearms < MAX_INPUT_DWELL_REARMS {
+            self.input_dwell_rearms += 1;
+            return vec![Action::SetTimer {
+                id: TimerId::BeaconSpcInputDwell,
+                duration: SPC_INPUT_DWELL,
+            }];
         }
         self.feed_view_one_input(epoch)
     }
@@ -3038,26 +3092,25 @@ mod tests {
         assert!(coord.equivocations.is_empty());
     }
 
-    /// The view-1 input feeds once a quorum of committee proposals is
-    /// pooled — members bootstrap near-simultaneously, so any earlier
-    /// feed would hand PC near-disjoint vectors whose only common
-    /// prefix is empty; waiting for more than a quorum would let one
-    /// faulty member push every epoch onto the dwell timer.
+    /// The view-1 input feeds only once *every* committee member's
+    /// proposal is pooled — members bootstrap near-simultaneously, so a
+    /// partial-coverage feed hands PC a positional vector that diverges
+    /// across nodes and the prefix consensus collapses it. A laggard tail
+    /// is covered by the dwell timer, not by feeding an incomplete set.
     #[test]
-    fn quorum_proposal_coverage_feeds_spc_view_one_input() {
+    fn full_proposal_coverage_feeds_spc_view_one_input() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         let me = coord.me;
         let in_flight = Epoch::GENESIS.next();
         let committee = coord.state.committee.clone();
         let n = committee.len();
-        let quorum = n - byzantine_threshold(n);
 
         let mut fed_at = None;
         let mut admitted = 0usize;
         let mut peers = committee.iter().filter(|&&v| v != me);
-        // Own proposal first, then peers until the feed triggers —
-        // with own in hand, the trigger is pure quorum coverage.
+        // Own proposal first, then peers until the feed triggers — the
+        // trigger is full coverage of the committee.
         let mut next = Some(me);
         while let Some(member) = next {
             let actions = coord.on_beacon_proposal_received(
@@ -3081,17 +3134,18 @@ mod tests {
         }
         assert_eq!(
             fed_at,
-            Some(quorum),
-            "the feed must trigger at exactly quorum coverage",
+            Some(n),
+            "the feed must trigger at exactly full committee coverage",
         );
         assert!(coord.spc.view_one_input_fed());
     }
 
-    /// The post-bootstrap dwell timer feeds the view-1 input from
-    /// whatever the pool holds, covering a committee member that never
-    /// delivers; a second fire is a no-op.
+    /// With the pool short of full coverage, the dwell timer re-arms
+    /// (giving a laggard more time) up to `MAX_INPUT_DWELL_REARMS` times,
+    /// then feeds whatever is pooled — covering a committee member that
+    /// never delivers. A second fire after feeding is a no-op.
     #[test]
-    fn input_dwell_timer_feeds_from_partial_pool() {
+    fn input_dwell_timer_rearms_then_feeds_from_partial_pool() {
         let mut coord = fresh_coord();
         let actions = coord.bootstrap_spc_for_next_epoch();
         assert!(
@@ -3110,6 +3164,23 @@ mod tests {
         assert!(actions.is_empty(), "own proposal alone doesn't kick PC");
         assert!(!coord.spc.view_one_input_fed());
 
+        // Each fire below full coverage re-arms rather than feeding.
+        for _ in 0..MAX_INPUT_DWELL_REARMS {
+            let actions = coord.on_spc_input_dwell_timer();
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::SetTimer {
+                        id: TimerId::BeaconSpcInputDwell,
+                        ..
+                    }
+                )),
+                "incomplete coverage re-arms the dwell: {actions:?}",
+            );
+            assert!(!coord.spc.view_one_input_fed());
+        }
+
+        // Re-arm budget exhausted — feed the partial pool.
         let actions = coord.on_spc_input_dwell_timer();
         assert!(
             actions

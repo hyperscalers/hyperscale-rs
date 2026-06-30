@@ -117,6 +117,55 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
 }
 
 #[test]
+fn dark_shard_does_not_stall_beacon_commits() {
+    // A shard that produces no epoch-boundary crossing (offline / not
+    // live) contributes no boundary QC to any proposal. The beacon SPC
+    // input is built from committee *proposals*, not shard headers, so a
+    // dark shard never blocks the view-1 feed: every epoch still reaches
+    // full proposal coverage and commits a Normal block. The dark shard's
+    // boundary simply stays parked at the genesis placeholder — it never
+    // advances, but it also never wedges the chain.
+    let mut sim = CoordinatorSim::new(4, 0x_DA_47);
+    sim.kick_off();
+    sim.run_until_committed(TARGET_COMMITS, MAX_STEPS);
+
+    for e in 0..TARGET_COMMITS {
+        let commit = &sim.commits[0][e];
+        assert!(
+            matches!(commit.block.cert(), BeaconCert::Normal(_)),
+            "epoch {} fell to a non-Normal cert with the shard dark",
+            commit.epoch.inner(),
+        );
+        assert_eq!(
+            commit.block.block().committed_proposals().len(),
+            sim.n(),
+            "epoch {} dropped proposals — the feed didn't reach full coverage",
+            commit.epoch.inner(),
+        );
+    }
+
+    // The chain advanced through every epoch, yet ROOT (never live) stays
+    // at the genesis placeholder — dark, not wedged.
+    let last = &sim.commits[0][TARGET_COMMITS - 1];
+    assert_eq!(last.epoch, Epoch::new(TARGET_COMMITS as u64));
+    let root = last
+        .state
+        .boundaries
+        .get(&ShardId::ROOT)
+        .expect("ROOT keeps a boundary record");
+    assert_eq!(
+        root.last_live_epoch,
+        Epoch::GENESIS,
+        "a dark shard's boundary must not advance",
+    );
+    assert_eq!(
+        root.state_root,
+        StateRoot::ZERO,
+        "a dark shard stays at the genesis placeholder",
+    );
+}
+
+#[test]
 fn observed_crossing_records_shard_boundary_through_full_commit() {
     // Drives the whole boundary chain end to end: a shard's observed
     // epoch-boundary crossing → every proposer's `boundary_qcs` → the
