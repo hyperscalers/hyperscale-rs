@@ -17,9 +17,10 @@
 use std::sync::Arc;
 
 use hyperscale_core::ParticipationChange;
+use hyperscale_engine::GenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap};
+use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap, replicate_engine_bootstrap};
 use hyperscale_node::{
     NodeStateMachine, SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
     serve_state_range_request, serve_witness_history_request,
@@ -85,8 +86,7 @@ impl SimulationRunner {
     ///
     /// Panics if the shard has no attested anchor or no serving host
     /// (the simulation models neither genesis replay nor a fully dark
-    /// committee), if the bootstrap cannot complete, or if the imported
-    /// root diverges from the anchor.
+    /// committee), or if the imported root diverges from the anchor.
     pub fn join_shard(
         &mut self,
         node: NodeIndex,
@@ -102,13 +102,14 @@ impl SimulationRunner {
     /// fresh store snap-syncs against the beacon-attested anchor through the
     /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
     /// Every member shares the one store and one bootstrap, mirroring the
-    /// production supervisor seating a whole committee group at once.
+    /// production supervisor seating a whole committee group at once. A snap-sync
+    /// whose attested anchor has gone stale leaves the group unseated; the
+    /// placement scan retries it next slice.
     ///
     /// # Panics
     ///
-    /// Panics if a fresh store has no attested anchor or no serving host, if the
-    /// bootstrap cannot complete, or if the imported root diverges from the
-    /// anchor.
+    /// Panics if a fresh store has no attested anchor or no serving host, or if
+    /// the imported root diverges from the anchor.
     fn seat_joined_group(
         &mut self,
         node: NodeIndex,
@@ -128,7 +129,24 @@ impl SimulationRunner {
             let anchor = snapshot
                 .boundary(shard)
                 .expect("runtime join requires an attested anchor");
-            let recovered = self.bootstrap_from_committee(node, shard, anchor, &storage);
+            // A fresh store needs the engine bootstrap (system packages, the
+            // intent-hash tracker) before the snap-sync import, exactly as the
+            // reshape duty and the production supervisor seed a fresh store —
+            // the authenticated span import overwrites only the prefix subtree.
+            replicate_engine_bootstrap(
+                &storage,
+                &self.beacon_network,
+                &GenesisConfig::test_default(),
+            );
+            let Some(recovered) = self.bootstrap_from_committee(node, shard, anchor, &storage)
+            else {
+                // The attested anchor's state has aged out of the serving
+                // committee — a transient fold freeze. Defer the seat; the
+                // placement scan retries next slice against the advanced anchor.
+                return JoinKind::SnapSync {
+                    anchor_height: anchor.height,
+                };
+            };
             (
                 recovered,
                 JoinKind::SnapSync {
@@ -167,8 +185,10 @@ impl SimulationRunner {
     /// trie node, not a leaf, so it is never torn down here — it stays retained
     /// for serving. The placement deltas the hosted vnodes emit are drained for
     /// parity with production's delta-driven path, but the committed projection
-    /// drives the actual join/leave: a synchronous snap-sync completes within
-    /// the slice, so joining at the activation epoch needs no lookahead.
+    /// drives the actual join/leave: the snap-sync usually completes within the
+    /// slice, and a join whose attested anchor has gone stale (a transient fold
+    /// freeze evicted its state) simply defers to a later slice, the same way
+    /// production's async bootstrap retries against the advanced anchor.
     pub fn pump_placement(&mut self) {
         let _ = self.take_reconfigurations();
         for node in 0..self.num_hosts() {
@@ -307,13 +327,23 @@ impl SimulationRunner {
     /// recovered state the joining vnode boots from. Requests rotate
     /// across the serving hosts; a rejected chunk simply re-arms and
     /// the rotation retries it elsewhere.
+    ///
+    /// Returns `None` when no serving host still pins the attested
+    /// boundary's state — a transient beacon-fold freeze at a reshape
+    /// boundary can leave a shard's attested anchor stale while its tip
+    /// runs on, so every serving member evicts the anchor's state from its
+    /// pin ring before the snap-sync can read it. The caller defers the
+    /// seat and retries next slice, when the fold has recovered and the
+    /// anchor advanced — the deterministic counterpart of production's
+    /// async `bootstrap_shard_state`, which restarts against the advanced
+    /// anchor the moment it observes the boundary move.
     fn bootstrap_from_committee(
         &self,
         node: NodeIndex,
         shard: ShardId,
         anchor: ShardAnchor,
         storage: &SimShardStorage,
-    ) -> RecoveredState {
+    ) -> Option<RecoveredState> {
         let serving: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| i != node as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
             .collect();
@@ -321,6 +351,18 @@ impl SimulationRunner {
             !serving.is_empty(),
             "no serving host for shard {shard:?} — snap-sync needs a live committee",
         );
+
+        // Defer if the attested anchor's state has aged out of every serving
+        // member's pin ring; the join retries against the advanced anchor.
+        if !serving.iter().any(|&i| {
+            self.hosts[i]
+                .shard_io(shard)
+                .storage()
+                .open_boundary(anchor.height)
+                .is_some()
+        }) {
+            return None;
+        }
 
         let mut bootstrap = ShardBootstrap::new(shard, anchor);
         let mut peer = 0usize;
@@ -358,9 +400,9 @@ impl SimulationRunner {
         }
         assert!(
             bootstrap.is_complete(),
-            "snap-sync bootstrap for shard {shard:?} did not complete",
+            "snap-sync bootstrap for shard {shard:?} did not complete against a pinned anchor",
         );
-        bootstrap.into_recovered_state()
+        Some(bootstrap.into_recovered_state())
     }
 
     /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —
