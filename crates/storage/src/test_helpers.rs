@@ -123,15 +123,30 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCe
 /// Build a minimal `Block` at the given height.
 #[must_use]
 pub fn make_test_block(height: BlockHeight) -> Block {
+    make_test_block_with_anchor_wt(height, 0)
+}
+
+/// Build a single-validator test block at `height` whose `parent_qc` carries
+/// `anchor_wt_ms` as its weighted timestamp — the canonical clock anchor a
+/// block exposes for window and floor tests.
+#[must_use]
+pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) -> Block {
     // Use the full u64 bytes for the parent hash so heights > 255 don't alias.
     let mut parent_bytes = [0u8; 32];
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
+    let parent_qc = QuorumCertificate::genesis(
+        ShardId::ROOT,
+        ChainOrigin {
+            anchor_wt: WeightedTimestamp::from_millis(anchor_wt_ms),
+            ..ChainOrigin::ROOT
+        },
+    );
     Block::Live {
         header: BlockHeader::new(
             ShardId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            parent_qc,
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(height.inner() * 1000),
             Round::INITIAL,

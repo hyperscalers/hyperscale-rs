@@ -300,7 +300,12 @@ where
         }
         // Committed tail: read by height (the committed chain is linear, so
         // height is unambiguous) until a block's weighted timestamp falls
-        // below the retention floor.
+        // below the retention floor. A block's weighted timestamp is its own
+        // `parent_qc`'s — the same canonical, hash-pinned value `anchor_wt`
+        // is, identical on every node. The served `entry.qc` is the block's
+        // certifying QC, which a coast past the crossing can re-issue at a
+        // higher round with a divergent timestamp, so it must not gate the
+        // floor: a per-node-variable cutoff would diverge the attested root.
         let floor = WeightedTimestamp::from_millis(
             anchor_wt
                 .as_millis()
@@ -311,7 +316,8 @@ where
             let Some(entry) = self.block_for_sync(h) else {
                 break;
             };
-            if entry.qc.weighted_timestamp().as_millis() < floor.as_millis() {
+            let block_wt = entry.block.header().parent_qc().weighted_timestamp();
+            if block_wt.as_millis() < floor.as_millis() {
                 break;
             }
             set.extend(local_settled_wave_ids(
@@ -1401,7 +1407,7 @@ mod tests {
 
     // ── chain reader accessors ────────────────────────────────────────
 
-    use crate::test_helpers::{make_test_block, make_test_qc};
+    use crate::test_helpers::{make_test_block, make_test_block_with_anchor_wt, make_test_qc};
 
     fn make_certified(height: BlockHeight) -> Arc<Verified<CertifiedBlock>> {
         let block = make_test_block(height);
@@ -1582,12 +1588,14 @@ mod tests {
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
     /// single finalized wave settles `settles` (a local-shard wave).
     fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &WaveId) -> BlockForSync {
+        // The block's own `parent_qc` carries `wt_ms` — the canonical clock the
+        // floor reads.
         let Block::Live {
             header,
             transactions,
             provisions,
             ..
-        } = make_test_block(height)
+        } = make_test_block_with_anchor_wt(height, wt_ms)
         else {
             unreachable!("make_test_block returns a Live block")
         };
@@ -1607,6 +1615,9 @@ mod tests {
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
         };
+        // The certifying QC carries a deliberately divergent timestamp (a
+        // higher-round re-certification past the crossing). The floor must
+        // ignore it in favour of the block's `parent_qc`.
         let qc = QuorumCertificate::new(
             block.hash(),
             ShardId::ROOT,
@@ -1615,7 +1626,7 @@ mod tests {
             Round::INITIAL,
             SignerBitfield::new(4),
             Bls12381G2Signature([0u8; 96]),
-            WeightedTimestamp::from_millis(wt_ms),
+            WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),
         );
         BlockForSync {
             block,
@@ -1669,7 +1680,10 @@ mod tests {
 
     /// The committed tail walks by height and stops at the retention floor:
     /// a block within `[anchor − RETENTION_HORIZON, anchor]` contributes,
-    /// one below it does not.
+    /// one below it does not. The floor reads each block's own `parent_qc`
+    /// timestamp, not its served certifying QC — `settled_sync_block` gives
+    /// the below-floor block a certifying QC far above the floor, so a floor
+    /// that read the served QC would wrongly include it.
     #[test]
     fn settled_waves_window_floors_the_committed_tail() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
