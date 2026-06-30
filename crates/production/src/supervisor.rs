@@ -629,12 +629,22 @@ impl ShardSupervisor {
         // reforming the parent, or a split's children, surfaced as an ordinary
         // join when the reshape executes. The orchestrator seats them from the
         // prepared store (which carries the reshape's terminal/merged state),
-        // so the placement-delta join is a no-op here. `is_seating` reads the
-        // orchestrator's post-discovery state; `reshape_owns` reads the
-        // committed projection directly, so a join that arrives before the
-        // discovery step runs is suppressed too — otherwise it would open the
-        // child's `RocksDB` directory the duty is about to wipe and clone.
-        if self.reshape.is_seating(shard) || self.reshape_owns(shard) {
+        // so the placement-delta join is a no-op here. The four conditions span
+        // the duty's whole lifetime so the join never opens a `RocksDB`
+        // directory the duty is using — `RocksDB`'s exclusive lock fails the
+        // second opener outright, so an overlap strands a co-hosted committee
+        // member's seat. `is_seating` reads the orchestrator's post-discovery
+        // state; `reshape_owns` reads the committed projection, covering the
+        // window before discovery runs and while the cohort is still published;
+        // `reshape_stores` covers the late window after the beacon marks the
+        // successor live (clearing the cohort, so `reshape_owns` lapses) while
+        // the duty still holds the opened store between its open and seat; and
+        // `pending_reshape_prep` covers a prep parked behind an earlier open.
+        if self.reshape.is_seating(shard)
+            || self.reshape_owns(shard)
+            || self.reshape_stores.contains_key(&shard)
+            || self.pending_reshape_prep.contains_key(&shard)
+        {
             info!(shard = ?shard, "Join superseded by an active reshape duty; the orchestrator seats it");
             return;
         }
@@ -1513,6 +1523,7 @@ impl ShardSupervisor {
                     && !self.draining.contains(&shard)
                     && !self.pending_joins.contains_key(&shard)
                     && !self.reshape.is_seating(shard)
+                    && !self.reshape_stores.contains_key(&shard)
             })
             .collect();
         for shard in needed {
