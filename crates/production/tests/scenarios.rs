@@ -396,12 +396,12 @@ fn pool_capacity_caps_registrations_prod() {
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
         validators_per_shard: 4,
-        vnodes_per_host: 1,
+        vnodes_per_host: 2,
         pool_surplus: (target_shards - 1) * 4,
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(60),
-        dedicated_hosts: true,
+        dedicated_hosts: false,
     }
 }
 

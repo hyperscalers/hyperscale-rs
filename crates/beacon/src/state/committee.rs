@@ -129,6 +129,47 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     }
 }
 
+/// Fill any live shard committee below `shard_size` from the pool.
+///
+/// [`run_shuffle_step`] maintains a committee's size — rotate one out, draw one
+/// in — but never grows it. A committee drawn short — a split cohort drawn
+/// against a pool the predecessors' make-before-break coast had momentarily
+/// depleted — would otherwise stay under `shard_size` for life, tightening its
+/// quorum toward all-of-N and missing the full-strength target a grow must
+/// reach. Once those predecessors dissolve and return their members to the
+/// pool, top each short committee back up; a member placed here syncs in via
+/// the normal `Ready` path like any pool refill. Skips a shard mid-reshape — a
+/// splitting parent's members carry to its children, a merge target's are its
+/// keepers — matching the shuffle's guards.
+pub(super) fn top_up_committees(state: &mut BeaconState) {
+    // Only a split can seat a committee short — its cohort drawn against a pool
+    // the make-before-break coast had depleted — and a split always leaves the
+    // topology with both children, so at least two shards. A merge draws a full
+    // keeper committee and genesis seats `shard_size`, so a lone shard is always
+    // at strength. Skipping the single-shard case keeps top-up from churning a
+    // pristine genesis committee (and the under-quorum committees small unit
+    // fixtures construct in isolation).
+    if state.next_shard_committees.len() <= 1 {
+        return;
+    }
+    let shard_size = state.chain_config.shard_size as usize;
+    let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
+    for shard in shard_ids {
+        if state.pending_reshapes.contains_key(&shard) {
+            continue;
+        }
+        while state
+            .next_shard_committees
+            .get(&shard)
+            .is_some_and(|committee| committee.members.len() < shard_size)
+        {
+            if pool_draw(state, shard).is_none() {
+                break;
+            }
+        }
+    }
+}
+
 /// Resample `state.committee` from [`beacon_eligible`] using
 /// `state.randomness`, returning the resulting handover.
 ///
@@ -331,6 +372,77 @@ mod tests {
         );
         assert_eq!(state.pooled_validators(), initial_pool);
         assert!(effects.shard_committee_transitions.is_empty());
+    }
+
+    /// `top_up_committees` fills a committee drawn below `shard_size` from the
+    /// pool — the heal a short split cohort needs once predecessors free their
+    /// members — and is a no-op once the pool is spent.
+    #[test]
+    fn top_up_fills_short_committees_from_the_pool() {
+        // Two shards at 3 of 4 ready members, two pooled spares.
+        let mut state = multi_shard_state(2, 3, 2);
+        assert_eq!(state.chain_config.shard_size, 4);
+
+        super::top_up_committees(&mut state);
+
+        for s in 0..2 {
+            assert_eq!(
+                state.next_shard_committees[&ShardId::leaf(1, s)]
+                    .members
+                    .len(),
+                4,
+                "a short committee is topped up to shard_size",
+            );
+        }
+        assert!(
+            state.pooled_validators().is_empty(),
+            "both spares were drawn into the short committees",
+        );
+
+        // Idempotent: at strength with an empty pool, a second pass changes
+        // nothing.
+        super::top_up_committees(&mut state);
+        for s in 0..2 {
+            assert_eq!(
+                state.next_shard_committees[&ShardId::leaf(1, s)]
+                    .members
+                    .len(),
+                4,
+            );
+        }
+    }
+
+    /// A shard mid-split is skipped while its sibling is topped up: a splitting
+    /// shard's members carry to its children as ready parent halves, so a
+    /// not-yet-ready pool draw must not join it.
+    #[test]
+    fn top_up_skips_a_splitting_shard() {
+        // Two short shards (so the multi-shard gate passes) and two spares.
+        let mut state = multi_shard_state(2, 3, 2);
+        let splitting = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        state.pending_reshapes.insert(
+            splitting,
+            PendingReshape::Split {
+                last_asserted: Epoch::GENESIS,
+                admitted_at: Epoch::GENESIS,
+                cohort: BTreeMap::new(),
+                cohort_seed: state.randomness,
+            },
+        );
+
+        super::top_up_committees(&mut state);
+
+        assert_eq!(
+            state.next_shard_committees[&splitting].members.len(),
+            3,
+            "a splitting shard is not topped up",
+        );
+        assert_eq!(
+            state.next_shard_committees[&sibling].members.len(),
+            4,
+            "a non-splitting sibling is still topped up from the pool",
+        );
     }
 
     /// On a `SHUFFLE_INTERVAL_EPOCHS` boundary, each shard rotates one

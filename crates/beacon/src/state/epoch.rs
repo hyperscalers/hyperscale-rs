@@ -14,7 +14,9 @@ use hyperscale_types::{
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
-use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
+use crate::state::committee::{
+    diff_shard_committees, resample_beacon_committee, run_shuffle_step, top_up_committees,
+};
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
@@ -221,6 +223,9 @@ pub fn apply_epoch(
     // Merges fold the same way, inverted: two children collapse into
     // their parent once the keeper committee is ready.
     execute_ready_merges(state);
+    // Grow any committee a short cohort draw left under `shard_size` back to
+    // full strength, now that dissolved predecessors have freed their members.
+    top_up_committees(state);
     let beacon_committee_transition =
         resample_beacon_committee(state, &BTreeSet::new(), transition_cause);
 

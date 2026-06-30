@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use hyperscale_scenarios::ScenarioConfig;
 
-/// Committee validators per shard. The shuffle retires one member at the
-/// boundary and refills it; seven keeps both committees above quorum (five)
-/// through the rotation even with an unseated replacement.
-const PER_SHARD: u32 = 7;
+/// Committee validators per shard — the production `shard_size`. The split
+/// seats each child at full strength (`2+2` parent half plus cohort), so the
+/// committee top-up never fires here: this exercises the shuffle, not top-up.
+const PER_SHARD: u32 = 4;
 
 /// `Pooled` validators left over once `grow_to(2)` has seated its cohort.
 /// Exactly one: the shuffle processes the two shards in order, so shard 0
