@@ -101,12 +101,12 @@ impl RocksDbShardStorage {
     ///
     /// # Errors
     ///
-    /// Fails closed when the checkpoint's vintage does not match the
-    /// origin (`committed version + 1 != genesis height`), when the
-    /// genesis block does not sit at the origin's height, when the
-    /// parent's root collapsed to a leaf (a ≤1-key parent cannot split),
-    /// or when the store's root path is the trie root (no parent side
-    /// to adopt from).
+    /// Fails closed when the checkpoint sits below the crossing (a stale or
+    /// foreign store), when the extracted child root does not match the
+    /// `genesis` block's attested state root, when the genesis block does not
+    /// sit at the origin's height, when the parent's root collapsed to a leaf
+    /// (a ≤1-key parent cannot split), or when the store's root path is the
+    /// trie root (no parent side to adopt from).
     pub fn adopt_split_child(
         &self,
         origin: ChainOrigin,
@@ -131,12 +131,19 @@ impl RocksDbShardStorage {
         if checkpoint_version == genesis_version && read_chain_origin(&*self.db) == origin {
             return Ok(current_root);
         }
-        // The parent chain coasts past its crossing before it stops —
-        // empty blocks whose no-op commits advance the JMT version with a
-        // frozen root — so a checkpoint taken at termination sits at the
-        // genesis height itself; one version below is the exactly-at-the-
-        // crossing case. Anything else is a stale or foreign checkpoint.
-        if checkpoint_version != genesis_version && checkpoint_version + 1 != genesis_version {
+        // The parent chain coasts past its crossing before it stops — empty
+        // blocks whose no-op commits advance the JMT version with a frozen
+        // root. Under make-before-break the parent coasts an unbounded number
+        // of such blocks past the terminal (until its successors go live), so
+        // the checkpoint sits at the crossing version (`genesis_version - 1`)
+        // or any height above it; the frozen root makes the extracted child
+        // subtree identical at every one. Reject only a checkpoint from below
+        // the crossing — a stale or foreign store that never held the
+        // terminal's child-half writes. The root-equality check below is the
+        // real guarantee that the extracted subtree is the beacon-attested one,
+        // and it rejects a non-frozen coast (a byzantine parent that changed
+        // the child's state after the crossing) however far past it lands.
+        if checkpoint_version + 1 < genesis_version {
             return Err(StorageError::DatabaseError(format!(
                 "split adoption vintage mismatch: checkpoint at version {checkpoint_version}, \
                  genesis height {genesis_version}"
@@ -207,6 +214,16 @@ impl RocksDbShardStorage {
                 StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
             }
         };
+        // The extracted subtree must be the one the beacon attested as the
+        // child's genesis — the same trust the followed-store path keys on. With
+        // the vintage check relaxed for an arbitrarily long coast, this is what
+        // rejects a checkpoint whose child state was changed past the crossing.
+        if child_root != genesis.header().state_root() {
+            return Err(StorageError::DatabaseError(format!(
+                "split adoption root {child_root:?} does not match the genesis state root {:?}",
+                genesis.header().state_root(),
+            )));
+        }
         write_jmt_metadata(&mut batch, genesis_version, child_root);
         write_chain_origin(&mut batch, origin);
         self.append_genesis_tip_to_batch(&mut batch, genesis);
@@ -535,6 +552,26 @@ mod tests {
         if side == 0 { left } else { right }
     }
 
+    /// The child subtree root the adoption extracts for `side` — the parent
+    /// root node's child slot hash at `version`. The genesis the adoption now
+    /// verifies against must carry exactly this root, so a test seeds its child
+    /// genesis with it.
+    fn child_root_from_parent(parent: &RocksDbShardStorage, version: u64, side: u8) -> StateRoot {
+        let root_key = JmtNodeKey::new(version, NibblePath::empty());
+        let node = parent
+            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&root_key))
+            .map(|v| v.into_latest().to_jmt())
+            .expect("parent root node present");
+        let JmtNode::Internal(internal) = node else {
+            panic!("parent root must be an internal node");
+        };
+        internal.children[usize::from(side)]
+            .as_ref()
+            .map_or(StateRoot::ZERO, |slot| {
+                StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
+            })
+    }
+
     /// The full parent-half flow: checkpoint the parent, open the
     /// hard-linked copy at each child's prefix, adopt. The two adopted
     /// roots compose to the parent's root, counts partition the leaf
@@ -552,8 +589,10 @@ mod tests {
             let target = child_dir.path().join("store");
             parent.checkpoint_into(&target).unwrap();
             let child = RocksDbShardStorage::open(&target, child_path(side)).unwrap();
-            let genesis = genesis_at_10(child_of(side), StateRoot::ZERO);
+            let child_root = child_root_from_parent(&parent, parent_version, side);
+            let genesis = genesis_at_10(child_of(side), child_root);
             let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+            assert_eq!(root, child_root, "adoption returns the attested child root");
             assert_ne!(root, StateRoot::ZERO);
             roots.push(root);
 
@@ -616,6 +655,57 @@ mod tests {
             WeightedTimestamp::from_millis(42_000),
         );
         assert!(child.adopt_split_child(stale, &genesis).is_err());
+    }
+
+    /// Make-before-break coasts the parent an unbounded number of empty blocks
+    /// past its terminal before the seed checkpoints it, so the checkpoint
+    /// version sits above the child's genesis height. The adoption accepts it —
+    /// the frozen coast leaves the child subtree unchanged — and still verifies
+    /// the extracted root against the attested genesis.
+    #[test]
+    fn adopts_a_child_from_a_parent_coasted_past_the_terminal() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = RocksDbShardStorage::open(parent_dir.path(), NibblePath::empty()).unwrap();
+        // The committed version (12) sits above the child genesis height (10) —
+        // the coast a make-before-break predecessor runs past its cut.
+        parent
+            .import_boundary_state(
+                BlockHeight::new(12),
+                vec![leaf(0x00), leaf(0x01), leaf(0x80)],
+            )
+            .unwrap();
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert_eq!(parent_version, 12);
+
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        let child_root = child_root_from_parent(&parent, parent_version, 0);
+        let genesis = genesis_at_10(child_of(0), child_root);
+        // checkpoint_version 12 is three past the genesis height 10 — rejected
+        // by the old at-or-one-below vintage check, accepted now.
+        let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+        assert_eq!(root, child_root);
+        assert_eq!(child.read_jmt_metadata(), (10, root));
+    }
+
+    /// A genesis claiming a child root the checkpoint does not hold fails
+    /// closed — the equality check is the safety guarantee once the vintage
+    /// check is relaxed to admit an arbitrarily long coast.
+    #[test]
+    fn adoption_rejects_a_forged_genesis_root() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = parent_store(parent_dir.path());
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        let forged = genesis_at_10(
+            child_of(0),
+            StateRoot::from_raw(Hash::from_bytes(b"forged")),
+        );
+        assert!(child.adopt_split_child(origin_at_10(), &forged).is_err());
     }
 
     /// A keeper's merged parent store, built whole-keyspace from both
