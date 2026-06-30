@@ -35,6 +35,7 @@ Rust implementation of Hyperscale consensus protocol.
 | [`production`](crates/production) | Production runner: async event loop, RPC server, telemetry |
 | [`provisions`](crates/provisions) | Centralized provision coordination for cross-shard transactions |
 | [`remote-headers`](crates/remote-headers) | Centralized remote block header coordination for cross-shard verification |
+| [`scenarios`](crates/scenarios) | Portable node-behavioral scenarios run on both the simulation and production harnesses |
 | [`shard`](crates/shard) | Shard consensus (HotStuff-2): block proposal, voting, QC formation, view changes |
 | [`simulation`](crates/simulation) | Deterministic simulation runner with event queue and multi-node orchestration |
 | [`simulator`](crates/simulator) | CLI tool for running simulations with metrics |
