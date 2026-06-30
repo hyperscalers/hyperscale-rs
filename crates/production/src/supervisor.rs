@@ -362,10 +362,7 @@ impl ShardSupervisor {
             genesis_offset_ms,
             shards: HashMap::new(),
             bootstrapping: HashMap::new(),
-            reshape: ReshapeOrchestrator::new(
-                vnode_keys.keys().copied().collect(),
-                epoch_duration_ms,
-            ),
+            reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
             reshape_stores: HashMap::new(),
             pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,

@@ -508,7 +508,7 @@ impl SimulationRunner {
                     .filter(|&v| validator_home[v as usize] == host)
                     .map(|v| ValidatorId::new(u64::from(v)))
                     .collect();
-                ReshapeOrchestrator::new(me, epoch_duration_ms)
+                ReshapeOrchestrator::new(me)
             })
             .collect();
 

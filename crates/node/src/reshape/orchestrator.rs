@@ -390,8 +390,6 @@ fn half_for<'a>(
 pub struct ReshapeOrchestrator {
     /// This host's validator ids — the seats it may hold.
     me: Vec<ValidatorId>,
-    /// The beacon epoch length, used to anchor a merge's cut.
-    epoch_duration_ms: u64,
     /// In-flight observer duties, keyed by child.
     observers: BTreeMap<ShardId, ObserverDuty>,
     /// In-flight keeper duties, keyed by the parent each reforms.
@@ -401,13 +399,11 @@ pub struct ReshapeOrchestrator {
 }
 
 impl ReshapeOrchestrator {
-    /// A fresh orchestrator for a host running `me`, with the beacon
-    /// `epoch_duration_ms` a merge's cut anchors to.
+    /// A fresh orchestrator for a host running `me`.
     #[must_use]
-    pub const fn new(me: Vec<ValidatorId>, epoch_duration_ms: u64) -> Self {
+    pub const fn new(me: Vec<ValidatorId>) -> Self {
         Self {
             me,
-            epoch_duration_ms,
             observers: BTreeMap::new(),
             keepers: BTreeMap::new(),
             parent_halves: BTreeMap::new(),
@@ -872,7 +868,6 @@ impl ReshapeOrchestrator {
         view: &ReshapeView,
         out: &mut Vec<ReshapeRequest>,
     ) {
-        let epoch_duration_ms = self.epoch_duration_ms;
         let Some(duty) = self.keepers.get_mut(&parent) else {
             return;
         };
@@ -929,7 +924,6 @@ impl ReshapeOrchestrator {
                         parent,
                         (left_h, left_qc),
                         (right_h, right_qc),
-                        epoch_duration_ms,
                         parent_anchor,
                     )
                 {
@@ -1276,7 +1270,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[], &[(parent, 5, child)], &[]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
 
@@ -1291,7 +1285,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[], &[(parent, 9, child)], &[]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         assert!(orch.step(&ReshapeView::new(&snap), Vec::new()).is_empty());
     }
@@ -1301,7 +1295,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[], &[parent]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
             observer_duty(
@@ -1328,7 +1322,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
             observer_duty(
@@ -1363,7 +1357,7 @@ mod tests {
         // the child committee.
         let snap = snapshot(&[(child, &[1, 2])], &[], &[parent, child, sibling]);
         let view = ReshapeView::new(&snap);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
             observer_duty(
@@ -1399,7 +1393,7 @@ mod tests {
         let (child, _) = parent.children();
         // The observer is now seated on the child committee.
         let snap = snapshot(&[(child, &[1, 5])], &[], &[]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
             observer_duty(parent, child, 5, ObserverPhase::Prepared),
@@ -1419,7 +1413,7 @@ mod tests {
         let (child, _) = parent.children();
         // Child committee does not yet include the observer.
         let snap = snapshot(&[(child, &[1, 2])], &[], &[]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
             observer_duty(parent, child, 5, ObserverPhase::Prepared),
@@ -1439,7 +1433,7 @@ mod tests {
             &[(own_child, 5, parent)],
             &[own_child],
         );
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
 
@@ -1465,7 +1459,7 @@ mod tests {
             &[parent, left, right],
         );
         let view = ReshapeView::new(&snap);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // First step fires the gate (ReassertingReady → Building); the second
         // opens the parent store and collects both halves.
@@ -1495,7 +1489,7 @@ mod tests {
         let (own_child, _) = parent.children();
         // The keeper is now seated on the reformed parent committee.
         let snap = snapshot_keepers(&[(parent, &[1, 5])], &[], &[]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.keepers.insert(
             parent,
             KeeperDuty {
@@ -1524,7 +1518,7 @@ mod tests {
         // The child anchor has seeded, so the duty seeds the child store from
         // the host's local parent.
         let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
 
@@ -1544,7 +1538,7 @@ mod tests {
         let (child, _) = parent.children();
         let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
         let view = ReshapeView::new(&snap);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // The first step seeds; the seed is one-shot, so the next is quiet.
         let _ = orch.step(&view, Vec::new());
@@ -1573,7 +1567,7 @@ mod tests {
             &[(child, 6, parent)],
             &[],
         );
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)]);
 
         let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
 
@@ -1596,7 +1590,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
-        let mut orch = ReshapeOrchestrator::new(vec![vid(5)], 30_000);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.parent_halves.insert(
             child,
             ParentHalfDuty {
