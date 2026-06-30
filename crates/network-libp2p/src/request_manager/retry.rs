@@ -45,6 +45,20 @@ impl RequestManager {
         let mut backoff = self.compute_initial_backoff(&current_peer, class);
 
         loop {
+            // Skip a peer whose (peer, shard) stream is in pool backoff:
+            // dispatching to it only instant-fails and re-escalates the
+            // backoff, pinning it — the lockout that wedges a freshly split
+            // child's sync when co-hosting collapses its committee onto a few
+            // peers. Re-select among peers not currently backed off; if every
+            // candidate is backed off, surface NoPeers so the caller defers on
+            // its exponential backoff instead of spinning to Exhausted.
+            if self.pool.is_backed_off(current_peer, shard) {
+                match self.health.select_peer(&self.live_peers(peers, shard)) {
+                    Some(peer) => current_peer = peer,
+                    None => return Err(RequestError::NoPeers),
+                }
+            }
+
             // Record request start
             self.health.record_request_started(&current_peer);
 
@@ -179,11 +193,22 @@ impl RequestManager {
                 .min(self.config.max_backoff.as_secs_f64()),
         )
     }
+
+    /// The candidates whose `(peer, shard)` stream is not currently in pool
+    /// backoff — the peers worth dispatching to. Empty when every candidate is
+    /// backed off, which the retry loop reads as `NoPeers`.
+    fn live_peers(&self, peers: &[PeerId], shard: ShardId) -> Vec<PeerId> {
+        peers
+            .iter()
+            .copied()
+            .filter(|peer| !self.pool.is_backed_off(*peer, shard))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -202,6 +227,7 @@ mod tests {
     struct MockState {
         responses: VecDeque<Result<Vec<u8>, NetworkError>>,
         calls: Vec<MockCall>,
+        backed_off: HashSet<PeerId>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,12 +242,17 @@ mod tests {
                 inner: Mutex::new(MockState {
                     responses: responses.into(),
                     calls: Vec::new(),
+                    backed_off: HashSet::new(),
                 }),
             })
         }
 
         fn calls(&self) -> Vec<MockCall> {
             self.inner.lock().unwrap().calls.clone()
+        }
+
+        fn mark_backed_off(&self, peers: &[PeerId]) {
+            self.inner.lock().unwrap().backed_off.extend(peers);
         }
     }
 
@@ -248,6 +279,10 @@ mod tests {
                     .unwrap_or(Err(NetworkError::Timeout))
             };
             Box::pin(async move { response })
+        }
+
+        fn is_backed_off(&self, peer: PeerId, _shard: ShardId) -> bool {
+            self.inner.lock().unwrap().backed_off.contains(&peer)
         }
     }
 
@@ -432,6 +467,44 @@ mod tests {
             "empty list must short-circuit before any send, got {result:?}"
         );
         assert!(pool.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_peers_backed_off_returns_no_peers_without_dispatch() {
+        // Every candidate's (peer, shard) stream is in pool backoff, so the
+        // retry loop must bail with NoPeers before dispatching — re-trying into
+        // a backed-off peer would only re-escalate its backoff and spin.
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let (pool, manager) = manager_with(vec![Ok(b"r".to_vec())]);
+        pool.mark_backed_off(&[peer_a, peer_b]);
+
+        let result = send(&manager, &[peer_a, peer_b], Some(peer_a)).await;
+        assert!(
+            matches!(result, Err(RequestError::NoPeers)),
+            "all-backed-off must surface NoPeers, got {result:?}"
+        );
+        assert!(
+            pool.calls().is_empty(),
+            "no request should be dispatched into a backed-off peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backed_off_peer_is_skipped_for_a_live_one() {
+        // One of two candidates is backed off; the dispatch must go to the live
+        // peer, even when the backed-off one is preferred.
+        let backed_off = PeerId::random();
+        let live = PeerId::random();
+        let (pool, manager) = manager_with(vec![Ok(b"r".to_vec())]);
+        pool.mark_backed_off(&[backed_off]);
+
+        let (responding_peer, _) = send(&manager, &[backed_off, live], Some(backed_off))
+            .await
+            .expect("succeeds against the live peer");
+        assert_eq!(responding_peer, live);
+        assert_eq!(pool.calls().len(), 1);
+        assert_eq!(pool.calls()[0].peer, live);
     }
 
     #[tokio::test]

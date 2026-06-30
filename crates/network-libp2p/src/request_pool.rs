@@ -74,6 +74,16 @@ pub trait RequestPool: Send + Sync + 'static {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>>;
+
+    /// Whether `(peer, shard)`'s stream is currently in reconnection backoff —
+    /// a recent failure whose cooldown has not elapsed. The request manager
+    /// consults this so peer selection skips a peer that would only instant-fail
+    /// (and re-escalate its backoff), and surfaces `NoPeers` when every
+    /// candidate is backed off rather than spinning. Defaults to `false` for
+    /// pools without a backoff layer (test doubles, the notify path).
+    fn is_backed_off(&self, _peer: PeerId, _shard: ShardId) -> bool {
+        false
+    }
 }
 
 impl RequestPool for RequestStreamPool {
@@ -86,6 +96,12 @@ impl RequestPool for RequestStreamPool {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>> {
         Box::pin(Self::send(self, peer, shard, type_id, data, timeout))
+    }
+
+    fn is_backed_off(&self, peer: PeerId, shard: ShardId) -> bool {
+        self.backoff
+            .get(&(peer, shard))
+            .is_some_and(|state| Instant::now() < state.next_attempt)
     }
 }
 
