@@ -10,21 +10,25 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [node]
+# Radix network this node is configured for (mainnet, stokenet, simulator, ...).
+# Bound into every BLS-signed consensus message to prevent cross-network replay.
+network = "simulator"
+
+# Directory for RocksDB storage. Per-shard instances open at data_dir/shard-{N}/db.
+data_dir = "./data"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hosted validators — one [[vnode]] block per validator identity this process
+# runs. Shard participation is a projection of beacon state, derived by the
+# runner at startup, so no shard or shard-count is configured here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[vnode]]
 # Unique validator ID (must match genesis configuration)
 validator_id = 0
 
-# Shard group this validator participates in
-shard = 0
-
-# Total number of shards in the network
-num_shards = 1
-
-# Path to the signing key file (32-byte seed)
-# If not specified, a key will be generated
+# Path to this validator's signing key file (32-byte seed)
 key_path = "./keys/validator.key"
-
-# Directory for RocksDB storage
-data_dir = "./data"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Network Configuration
