@@ -80,7 +80,9 @@ impl SimCluster {
     ) -> Self {
         let beacon_chain_config = BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
-            num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
+            // Genesis is always a single ROOT shard; `config.num_shards` is the
+            // target `with_grown_balances` pre-grows to, not a genesis width.
+            num_shards: 1,
             shard_size: config.shard_size,
             reshape_thresholds: ReshapeThresholds {
                 split_bytes: config.split_bytes,
@@ -90,7 +92,7 @@ impl SimCluster {
         let sim_config = SimConfig {
             shard_size: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
-            pool_extra_validators: config.pool_surplus,
+            pool_surplus: config.pool_surplus,
             dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
             intra_shard_latency: config.latency,
@@ -121,13 +123,11 @@ impl SimCluster {
         balances: &[(ComponentAddress, Decimal)],
     ) -> Self {
         let grow_config = ScenarioConfig {
-            num_shards: 1,
             split_bytes: 0,
             ..*config
         };
         let mut cluster = Self::with_balances(&grow_config, seed, balances);
-        let target = u32::try_from(config.num_shards).unwrap_or(u32::MAX);
-        grow_to(&mut cluster, target);
+        grow_to(&mut cluster, config.num_shards);
         vote_reshape_threshold(&mut cluster, &merge_vote_payer(), config.split_bytes);
         cluster
     }

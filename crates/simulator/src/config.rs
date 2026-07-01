@@ -104,7 +104,7 @@ impl SimulatorConfig {
         }
         SimConfig {
             shard_size: committee,
-            pool_extra_validators: (self.num_shards - 1) * committee,
+            pool_surplus: (self.num_shards - 1) * committee,
             beacon_chain_config: Some(BeaconChainConfig {
                 epoch_duration_ms: EPOCH_MS,
                 num_shards: 1,

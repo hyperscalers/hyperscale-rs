@@ -89,13 +89,11 @@ impl ProdCluster {
         balances: Vec<(ComponentAddress, Decimal)>,
     ) -> Self {
         let grow_config = ScenarioConfig {
-            num_shards: 1,
             split_bytes: 0,
             ..*config
         };
         let mut cluster = Self::start_with_balances(&grow_config, seed, epoch_ms, balances);
-        let target = u32::try_from(config.num_shards).unwrap_or(u32::MAX);
-        grow_to(&mut cluster, target);
+        grow_to(&mut cluster, config.num_shards);
         vote_reshape_threshold(&mut cluster, &merge_vote_payer(), config.split_bytes);
         cluster
     }
@@ -136,7 +134,9 @@ impl ProdCluster {
             hosts,
             beacon_chain_config: BeaconChainConfig {
                 epoch_duration_ms: epoch_ms,
-                num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
+                // Genesis is always a single ROOT shard; `config.num_shards` is
+                // the target `with_grown_balances` pre-grows to, not a width.
+                num_shards: 1,
                 shard_size: config.shard_size,
                 reshape_thresholds: ReshapeThresholds {
                     split_bytes: config.split_bytes,

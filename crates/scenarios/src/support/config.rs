@@ -24,9 +24,11 @@ pub struct ScenarioConfig {
     pub vnodes_per_host: u32,
     /// Spare validators beyond the seated committees — the observer/keeper stock.
     pub pool_surplus: u32,
-    /// Target shard count a scenario grows to (genesis is always a single ROOT
-    /// shard); the grow walks `log2(num_shards)` split generations to reach it.
-    pub num_shards: u64,
+    /// The shard count `with_grown_balances` pre-grows to before the scenario
+    /// runs, walking `log2(num_shards)` split generations to reach it (must be a
+    /// power of two). Genesis is always a single ROOT shard, so the flat-genesis
+    /// constructors (`new`/`with_balances`/`start`) ignore this field.
+    pub num_shards: u32,
     /// Substate-byte split threshold: `0` arms a split at once, `u64::MAX` never.
     pub split_bytes: u64,
     /// Base inter-host latency.
