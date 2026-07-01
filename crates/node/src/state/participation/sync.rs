@@ -167,7 +167,7 @@ mod tests {
     /// dropped from the sync-complete arm.
     #[test]
     fn block_sync_complete_flushes_expected_provisions() {
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+        let TestNode { mut node, .. } = TestNode::builder().build();
 
         // Seed provisions.expected via a verified remote header whose
         // wave depends on local.
