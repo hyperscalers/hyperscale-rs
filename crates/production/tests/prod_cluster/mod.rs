@@ -134,9 +134,6 @@ impl ProdCluster {
             hosts,
             beacon_chain_config: BeaconChainConfig {
                 epoch_duration_ms: epoch_ms,
-                // Genesis is always a single ROOT shard; `config.num_shards` is
-                // the target `with_grown_balances` pre-grows to, not a width.
-                num_shards: 1,
                 shard_size: config.shard_size,
                 reshape_thresholds: ReshapeThresholds {
                     split_bytes: config.split_bytes,

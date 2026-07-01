@@ -4,8 +4,8 @@
 //! network may retune after genesis. It is seeded from the genesis
 //! [`BeaconChainConfig`] and thereafter mutated only by the beacon fold
 //! (a committed, stake-weighted parameter-change tally). Structural and
-//! historical parameters — `num_shards`, `genesis_timestamp_ms` — stay
-//! on the immutable `chain_config` and never appear here.
+//! historical parameters — `genesis_timestamp_ms` — stay on the
+//! immutable `chain_config` and never appear here.
 //!
 //! Every runtime read of a governable parameter resolves against
 //! `BeaconState.params`, never `chain_config`: the genesis record and the

@@ -18,7 +18,6 @@ use tracing_test::traced_test;
 fn beacon_chain_config(epoch_duration_ms: u64) -> BeaconChainConfig {
     BeaconChainConfig {
         epoch_duration_ms,
-        num_shards: 1,
         shard_size: 8,
         ..BeaconChainConfig::default()
     }

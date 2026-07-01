@@ -80,9 +80,6 @@ impl SimCluster {
     ) -> Self {
         let beacon_chain_config = BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
-            // Genesis is always a single ROOT shard; `config.num_shards` is the
-            // target `with_grown_balances` pre-grows to, not a genesis width.
-            num_shards: 1,
             shard_size: config.shard_size,
             reshape_thresholds: ReshapeThresholds {
                 split_bytes: config.split_bytes,

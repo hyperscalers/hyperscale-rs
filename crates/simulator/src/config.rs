@@ -107,7 +107,6 @@ impl SimulatorConfig {
             pool_surplus: (self.num_shards - 1) * committee,
             beacon_chain_config: Some(BeaconChainConfig {
                 epoch_duration_ms: EPOCH_MS,
-                num_shards: 1,
                 shard_size: committee,
                 reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
                 ..BeaconChainConfig::default()
