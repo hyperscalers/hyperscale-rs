@@ -90,23 +90,19 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         );
     }
 
-    // ─── build shard committees ───────────────────────────────────────────
+    // ─── build the genesis shard committee ────────────────────────────────
     //
+    // A chain genesises with the single `ShardId::ROOT` shard.
     // `ShardCommittee.members` order is incidental at runtime (status
     // is what gates signing, not list position), so the input order
     // carries through verbatim.
-    let next_shard_committees: BTreeMap<ShardId, ShardCommittee> = config
-        .initial_shard_committees
-        .iter()
-        .map(|(shard, members)| {
-            (
-                *shard,
-                ShardCommittee {
-                    members: members.clone(),
-                },
-            )
-        })
-        .collect();
+    let next_shard_committees: BTreeMap<ShardId, ShardCommittee> = std::iter::once((
+        ShardId::ROOT,
+        ShardCommittee {
+            members: config.initial_shard_committee.clone(),
+        },
+    ))
+    .collect();
 
     // ─── beacon committee sorted ──────────────────────────────────────────
     //
@@ -191,9 +187,9 @@ pub struct GenesisChainInputs<'a> {
     /// runners size it differently — the sim excludes its surplus pool
     /// extras, while production seats its whole configured set.
     pub beacon_committee: Vec<ValidatorId>,
-    /// Per-shard initial committees — supplied, not derived, because genesis
-    /// has no prior randomness to sample from.
-    pub shard_committees: BTreeMap<ShardId, Vec<ValidatorId>>,
+    /// The genesis shard committee, seated on [`ShardId::ROOT`] — supplied,
+    /// not derived, because genesis has no prior randomness to sample from.
+    pub shard_committee: Vec<ValidatorId>,
     /// Radix network identity bound into the genesis config hash.
     pub network: &'a NetworkDefinition,
 }
@@ -224,7 +220,7 @@ pub fn build_genesis_chain(inputs: GenesisChainInputs<'_>) -> GenesisChain {
         chain_config,
         validators,
         beacon_committee,
-        shard_committees,
+        shard_committee,
         network,
     } = inputs;
 
@@ -240,7 +236,7 @@ pub fn build_genesis_chain(inputs: GenesisChainInputs<'_>) -> GenesisChain {
         initial_validators: validators,
         initial_pools,
         initial_beacon_committee: beacon_committee,
-        initial_shard_committees: shard_committees,
+        initial_shard_committee: shard_committee,
         initial_randomness: Randomness::new([0x42; 32]),
     };
     let state = Arc::new(build_genesis_beacon_state(&config));
@@ -293,13 +289,11 @@ pub fn build_genesis(genesis: &GenesisValidators, chain_config: BeaconChainConfi
         .min(chain_config.beacon_committee_size as usize);
     let beacon_committee: Vec<ValidatorId> = seated.into_iter().take(committee_len).collect();
 
-    let shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> =
-        std::iter::once((ShardId::ROOT, genesis.committee.clone())).collect();
     let chain = build_genesis_chain(GenesisChainInputs {
         chain_config,
         validators,
         beacon_committee,
-        shard_committees,
+        shard_committee: genesis.committee.clone(),
         network: &genesis.network,
     });
     let topology_snapshot = chain
@@ -376,25 +370,25 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardI
         "chain_config.shard_size is zero; no validator can be placed on a shard",
     );
 
-    // Shard committee members exist, each shard fits, no validator
-    // sits on two shards.
+    // The genesis committee fits the shard, its members are declared, and
+    // none is listed twice. Members seat on the sole genesis shard,
+    // `ShardId::ROOT`.
     let shard_cap = config.chain_config.shard_size as usize;
+    assert!(
+        config.initial_shard_committee.len() <= shard_cap,
+        "initial shard committee has {} members; chain_config.shard_size is {shard_cap}",
+        config.initial_shard_committee.len(),
+    );
     let mut placed: BTreeMap<ValidatorId, ShardId> = BTreeMap::new();
-    for (shard, members) in &config.initial_shard_committees {
+    for id in &config.initial_shard_committee {
         assert!(
-            members.len() <= shard_cap,
-            "initial shard committee {shard} has {} members; chain_config.shard_size is {shard_cap}",
-            members.len(),
+            validator_ids.contains(id),
+            "genesis shard committee references unknown validator {id}",
         );
-        for id in members {
-            assert!(
-                validator_ids.contains(id),
-                "shard {shard} committee references unknown validator {id}",
-            );
-            if let Some(prior) = placed.insert(*id, *shard) {
-                panic!("validator {id} appears in shard {prior} and shard {shard}");
-            }
-        }
+        assert!(
+            placed.insert(*id, ShardId::ROOT).is_none(),
+            "validator {id} appears in the genesis shard committee twice",
+        );
     }
 
     placed
@@ -462,16 +456,15 @@ mod tests {
     }
 
     /// Build a single-pool, single-shard config with `n_validators`,
-    /// the first `n_shard_members` placed on shard 0 and the first
-    /// `n_beacon_members` on the beacon committee. The pool holds
-    /// exactly enough stake for all validators at `MIN_STAKE_FLOOR`.
+    /// the first `n_shard_members` placed on the ROOT genesis shard and
+    /// the first `n_beacon_members` on the beacon committee. The pool
+    /// holds exactly enough stake for all validators at `MIN_STAKE_FLOOR`.
     fn sample_config(
         n_validators: u64,
         n_shard_members: u64,
         n_beacon_members: u64,
     ) -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardId::ROOT;
         let validators: Vec<GenesisValidator> = (0..n_validators)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -490,7 +483,7 @@ mod tests {
                 total_stake: Stake::from_attos(u128::from(n_validators) * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: beacon_members,
-            initial_shard_committees: std::iter::once((shard, shard_members)).collect(),
+            initial_shard_committee: shard_members,
             initial_randomness: Randomness::new([0xAB; 32]),
         }
     }
@@ -584,7 +577,6 @@ mod tests {
     #[test]
     fn beacon_committee_stored_sorted() {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardId::ROOT;
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -606,7 +598,7 @@ mod tests {
                 ValidatorId::new(2),
                 ValidatorId::new(1),
             ],
-            initial_shard_committees: std::iter::once((shard, vec![])).collect(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let state = build_genesis_beacon_state(&cfg);
@@ -646,7 +638,7 @@ mod tests {
                 total_stake: Stake::from_attos(2 * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: vec![],
-            initial_shard_committees: BTreeMap::new(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);
@@ -667,7 +659,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
             }],
             initial_beacon_committee: vec![],
-            initial_shard_committees: BTreeMap::new(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);
@@ -692,15 +684,15 @@ mod tests {
                 total_stake: Stake::from_attos(2 * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: vec![],
-            initial_shard_committees: BTreeMap::new(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);
     }
 
     #[test]
-    #[should_panic(expected = "shard Shard(d1p0) and shard Shard(d1p1)")]
-    fn rejects_validator_in_two_shard_committees() {
+    #[should_panic(expected = "genesis shard committee twice")]
+    fn rejects_validator_listed_twice_in_shard_committee() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
@@ -714,12 +706,7 @@ mod tests {
                 total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: vec![],
-            initial_shard_committees: [
-                (ShardId::leaf(1, 0), vec![ValidatorId::new(0)]),
-                (ShardId::leaf(1, 1), vec![ValidatorId::new(0)]),
-            ]
-            .into_iter()
-            .collect(),
+            initial_shard_committee: vec![ValidatorId::new(0), ValidatorId::new(0)],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);
@@ -761,7 +748,7 @@ mod tests {
                 total_stake: Stake::from_attos(5 * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: (0u64..5).map(ValidatorId::new).collect(),
-            initial_shard_committees: BTreeMap::new(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);
@@ -790,7 +777,7 @@ mod tests {
                 total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: vec![],
-            initial_shard_committees: BTreeMap::new(),
+            initial_shard_committee: vec![],
             initial_randomness: Randomness::ZERO,
         };
         let _ = build_genesis_beacon_state(&cfg);

@@ -183,7 +183,6 @@ impl CoordinatorSim {
         }
 
         let pool_id = StakePoolId::new(0);
-        let shard = ShardId::ROOT;
         let config = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: members
@@ -199,11 +198,7 @@ impl CoordinatorSim {
                 total_stake: Stake::from_attos((n as u128) * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: members.iter().map(|(id, _)| *id).collect(),
-            initial_shard_committees: std::iter::once((
-                shard,
-                members.iter().map(|(id, _)| *id).collect(),
-            ))
-            .collect(),
+            initial_shard_committee: members.iter().map(|(id, _)| *id).collect(),
             initial_randomness: Randomness::new([0x42; 32]),
         };
 
