@@ -10,6 +10,8 @@ description = "Simulation runner"
 ci = []
 
 [dependencies]
+arc-swap.workspace = true
+crossbeam.workspace = true
 hyperscale-beacon.workspace = true
 hyperscale-core.workspace = true
 hyperscale-shard.workspace = true
@@ -24,27 +26,17 @@ hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-types.workspace = true
 hyperscale-dispatch-sync.workspace = true
-
-# Radix dependencies for real execution
 radix-common.workspace = true
 radix-transactions.workspace = true
-
-arc-swap.workspace = true
-crossbeam.workspace = true
-tracing.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-
-# Re-import types crate with the test-utils feature so tests can share
-# `test_validity_range()` rather than redefining it per test file.
 hyperscale-types = { workspace = true, features = ["test-utils"] }
-
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true
 hyperscale-scenarios.workspace = true
-
 tracing-test.workspace = true
 
 [lints]

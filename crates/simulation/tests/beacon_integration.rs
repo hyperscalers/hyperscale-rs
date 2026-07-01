@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use hyperscale_network_memory::HostId;
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT};
 use tracing_test::traced_test;
@@ -182,7 +183,7 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
         .network_mut()
         .fault()
         .drop_type("beacon.proposal")
-        .to(0)
+        .to(HostId(0))
         .install();
 
     // Several epochs so every host — including the dropped peer catching

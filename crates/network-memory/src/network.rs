@@ -15,10 +15,10 @@
 //!
 //! # Fault injection
 //!
-//! [`FaultInjector`] (from `crate::fault`) hooks every outbound message
-//! and request, letting tests drop, delay, or rewrite messages by class,
-//! peer, or time window. Used by the `simulation` crate's fault-tests to
-//! exercise crash recovery, network partitions, and gossip outages.
+//! The fault [`Engine`](hyperscale_network::fault::Engine) hooks every outbound
+//! message and request, letting tests drop messages by class, peer, or time
+//! window. Used by the `simulation` crate's fault-tests to exercise crash
+//! recovery, network partitions, and gossip outages.
 //!
 //! # Traffic accounting
 //!
@@ -36,6 +36,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_network::fault::{Decision, Engine, FaultBuilder, HostId, MessageContext, Tier};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{ShardId, ValidatorId};
 use rand::RngExt;
@@ -43,7 +44,6 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
 
 use crate::NodeIndex;
-use crate::fault::{Decision, FaultBuilder, FaultInjector, MessageContext, Tier};
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
@@ -370,9 +370,6 @@ impl Scheduled for ScheduledResponse {
 /// - Internalized latency queues for gossip, notifications, and request-responses
 pub struct SimulatedNetwork {
     config: NetworkConfig,
-    /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
-    /// Partitions are directional - add both (a, b) and (b, a) for bidirectional partition.
-    partitions: HashSet<(NodeIndex, NodeIndex)>,
     /// Per-node handler registries, shared with each node's [`SimNetworkAdapter`].
     ///
     /// Populated when `register_gossip_handler` / `register_request_handler` /
@@ -400,8 +397,9 @@ pub struct SimulatedNetwork {
     /// Per-node gossip dedup: tracks message IDs already delivered to each node.
     /// Matches production gossipsub's content-based deduplication (hash of data + topic).
     gossip_seen: Vec<HashSet<u64>>,
-    /// Per-message-type fault rules layered on top of partition + packet loss.
-    faults: FaultInjector,
+    /// Fault-injection state: per-message-type drop rules plus the partition
+    /// block-set, layered on top of packet loss.
+    faults: Engine,
     /// Per-(requester, peer) request health, driving weighted peer selection
     /// inside the retry loop. Each requester tracks its own view of every peer
     /// it has asked, mirroring the libp2p per-node `PeerHealthTracker`.
@@ -412,7 +410,7 @@ impl std::fmt::Debug for SimulatedNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimulatedNetwork")
             .field("config", &self.config)
-            .field("partitions", &self.partitions)
+            .field("blocked", &self.faults.block_count())
             .field("registries", &self.registries.len())
             .field("pending_gossip", &self.pending_gossip.len())
             .field("pending_notifications", &self.pending_notifications.len())
@@ -428,7 +426,7 @@ impl SimulatedNetwork {
     /// from `layout.hosted` and seeds its validator→host bindings, deriving no
     /// placement of its own.
     #[must_use]
-    pub fn new(config: NetworkConfig, layout: HostLayout) -> Self {
+    pub fn new(config: NetworkConfig, layout: HostLayout, seed: u64) -> Self {
         let num_hosts = layout.hosted.len();
         let registries: Vec<Arc<HandlerRegistry>> = layout
             .hosted
@@ -437,7 +435,6 @@ impl SimulatedNetwork {
             .collect();
         Self {
             config,
-            partitions: HashSet::new(),
             registries,
             pending_gossip: BinaryHeap::new(),
             gossip_sequence: 0,
@@ -448,7 +445,7 @@ impl SimulatedNetwork {
             traffic_analyzer: None,
             validator_bindings: layout.validator_to_host,
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
-            faults: FaultInjector::default(),
+            faults: Engine::new(seed),
             peer_health: HashMap::new(),
         }
     }
@@ -482,12 +479,6 @@ impl SimulatedNetwork {
         FaultBuilder::new(&mut self.faults)
     }
 
-    /// Read-only access to the fault injector for inspection.
-    #[must_use]
-    pub const fn faults(&self) -> &FaultInjector {
-        &self.faults
-    }
-
     /// Set the traffic analyzer for bandwidth metrics recording.
     pub fn set_traffic_analyzer(&mut self, analyzer: Arc<NetworkTrafficAnalyzer>) {
         self.traffic_analyzer = Some(analyzer);
@@ -509,18 +500,18 @@ impl SimulatedNetwork {
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
     #[must_use]
     pub fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
-        self.partitions.contains(&(from, to))
+        self.faults.is_blocked(HostId(from), HostId(to))
     }
 
     /// Create a unidirectional partition: messages from `from` to `to` are dropped.
     pub fn partition_unidirectional(&mut self, from: NodeIndex, to: NodeIndex) {
-        self.partitions.insert((from, to));
+        self.faults.block(HostId(from), HostId(to));
     }
 
     /// Create a bidirectional partition between two nodes.
     pub fn partition_bidirectional(&mut self, a: NodeIndex, b: NodeIndex) {
-        self.partitions.insert((a, b));
-        self.partitions.insert((b, a));
+        self.faults.block(HostId(a), HostId(b));
+        self.faults.block(HostId(b), HostId(a));
     }
 
     /// Create a bidirectional partition between two groups of nodes.
@@ -528,8 +519,8 @@ impl SimulatedNetwork {
     pub fn partition_groups(&mut self, group_a: &[NodeIndex], group_b: &[NodeIndex]) {
         for &a in group_a {
             for &b in group_b {
-                self.partitions.insert((a, b));
-                self.partitions.insert((b, a));
+                self.faults.block(HostId(a), HostId(b));
+                self.faults.block(HostId(b), HostId(a));
             }
         }
     }
@@ -538,32 +529,32 @@ impl SimulatedNetwork {
     pub fn isolate_node(&mut self, node: NodeIndex) {
         for other in self.all_nodes() {
             if other != node {
-                self.partitions.insert((node, other));
-                self.partitions.insert((other, node));
+                self.faults.block(HostId(node), HostId(other));
+                self.faults.block(HostId(other), HostId(node));
             }
         }
     }
 
     /// Heal a unidirectional partition.
     pub fn heal_unidirectional(&mut self, from: NodeIndex, to: NodeIndex) {
-        self.partitions.remove(&(from, to));
+        self.faults.unblock(HostId(from), HostId(to));
     }
 
     /// Heal a bidirectional partition between two nodes.
     pub fn heal_bidirectional(&mut self, a: NodeIndex, b: NodeIndex) {
-        self.partitions.remove(&(a, b));
-        self.partitions.remove(&(b, a));
+        self.faults.unblock(HostId(a), HostId(b));
+        self.faults.unblock(HostId(b), HostId(a));
     }
 
     /// Heal all partitions - restore full network connectivity.
     pub fn heal_all(&mut self) {
-        self.partitions.clear();
+        self.faults.unblock_all();
     }
 
     /// Get the number of active partition pairs.
     #[must_use]
     pub fn partition_count(&self) -> usize {
-        self.partitions.len()
+        self.faults.block_count()
     }
 
     // ─── Packet Loss ───
@@ -870,48 +861,29 @@ impl SimulatedNetwork {
             return AttemptOutcome::Timeout;
         }
 
-        // Fault rules (request leg, then response leg).
-        let request_extra = match self.faults.decide(
+        // Fault rules gate the request leg only, mirroring the libp2p gate in
+        // `RequestStreamPool::send_request` — the transport has no response-leg
+        // gate. Bidirectional packet loss above already models response-direction
+        // drops; gating the response here too would let a request-typed rule fire
+        // twice per attempt, so the sim's effective drop rate would diverge from
+        // production's for the same portable rule.
+        if self.faults.decide(
             &MessageContext {
-                sender: requester,
-                recipient: peer,
+                sender: HostId(requester),
+                recipient: HostId(peer),
                 type_id,
                 tier: Tier::Request,
             },
             attempt_now,
-            rng,
-        ) {
-            Decision::Drop => {
-                stats.messages_dropped_fault += 1;
-                trace!(requester, peer, type_id, "Request dropped: fault rule");
-                return AttemptOutcome::Timeout;
-            }
-            Decision::Pass => Duration::ZERO,
-            Decision::DelayExtra(d) => d,
-        };
-        let response_extra = match self.faults.decide(
-            &MessageContext {
-                sender: peer,
-                recipient: requester,
-                type_id,
-                tier: Tier::Response,
-            },
-            attempt_now,
-            rng,
-        ) {
-            Decision::Drop => {
-                stats.messages_dropped_fault += 1;
-                trace!(requester, peer, type_id, "Response dropped: fault rule");
-                return AttemptOutcome::Timeout;
-            }
-            Decision::Pass => Duration::ZERO,
-            Decision::DelayExtra(d) => d,
-        };
+        ) == Decision::Drop
+        {
+            stats.messages_dropped_fault += 1;
+            trace!(requester, peer, type_id, "Request dropped: fault rule");
+            return AttemptOutcome::Timeout;
+        }
 
-        let rtt = self.sample_latency(requester, peer, rng)
-            + self.sample_latency(peer, requester, rng)
-            + request_extra
-            + response_extra;
+        let rtt =
+            self.sample_latency(requester, peer, rng) + self.sample_latency(peer, requester, rng);
 
         // A missing handler or empty payload is an application-level error:
         // the peer answered, but with nothing usable.
@@ -1086,23 +1058,19 @@ impl SimulatedNetwork {
                         }
                     }
                     Some(latency) => {
-                        let extra = match self.faults.decide(
+                        if self.faults.decide(
                             &MessageContext {
-                                sender,
-                                recipient: to,
+                                sender: HostId(sender),
+                                recipient: HostId(to),
                                 type_id,
                                 tier: Tier::Notification,
                             },
                             now,
-                            rng,
-                        ) {
-                            Decision::Drop => {
-                                stats.messages_dropped_fault += 1;
-                                continue;
-                            }
-                            Decision::Pass => Duration::ZERO,
-                            Decision::DelayExtra(d) => d,
-                        };
+                        ) == Decision::Drop
+                        {
+                            stats.messages_dropped_fault += 1;
+                            continue;
+                        }
                         stats.messages_sent += 1;
                         if let Some(ref analyzer) = self.traffic_analyzer {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
@@ -1110,7 +1078,7 @@ impl SimulatedNetwork {
                         self.notification_sequence += 1;
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
-                                delivery_time: now + latency + extra,
+                                delivery_time: now + latency,
                                 sequence: self.notification_sequence,
                                 target_node: to,
                                 message_type: type_id,
@@ -1198,23 +1166,19 @@ impl SimulatedNetwork {
                     }
                 }
                 Some(latency) => {
-                    let extra = match self.faults.decide(
+                    if self.faults.decide(
                         &MessageContext {
-                            sender: from,
-                            recipient: to,
+                            sender: HostId(from),
+                            recipient: HostId(to),
                             type_id: message_type,
                             tier: Tier::Gossip,
                         },
                         now,
-                        rng,
-                    ) {
-                        Decision::Drop => {
-                            stats.messages_dropped_fault += 1;
-                            continue;
-                        }
-                        Decision::Pass => Duration::ZERO,
-                        Decision::DelayExtra(d) => d,
-                    };
+                    ) == Decision::Drop
+                    {
+                        stats.messages_dropped_fault += 1;
+                        continue;
+                    }
                     stats.messages_sent += 1;
                     if let Some(ref analyzer) = self.traffic_analyzer {
                         analyzer.record_message(
@@ -1231,7 +1195,7 @@ impl SimulatedNetwork {
                         BroadcastTarget::Global => None,
                     };
                     self.pending_gossip.push(Reverse(ScheduledGossip {
-                        delivery_time: now + latency + extra,
+                        delivery_time: now + latency,
                         sequence: self.gossip_sequence,
                         target_node: to,
                         message_type,
@@ -1397,7 +1361,7 @@ mod tests {
         num_shards: u32,
         validators_per_shard: u32,
     ) -> SimulatedNetwork {
-        SimulatedNetwork::new(config, layout(num_shards, validators_per_shard))
+        SimulatedNetwork::new(config, layout(num_shards, validators_per_shard), 0)
     }
 
     /// A uniform single-vnode-per-host layout: `validators_per_shard` hosts on

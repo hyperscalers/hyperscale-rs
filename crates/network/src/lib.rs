@@ -2,21 +2,18 @@
 //!
 //! This crate contains transport utilities and the `Network` trait:
 //!
-//! - [`traits`]: `Network` trait for typed message sends and per-type handler registration
-//! - [`registry`]: `HandlerRegistry` for per-message-type handler storage/dispatch
 //! - [`compression`]: LZ4 compress/decompress helpers
+//! - [`fault`]: portable fault-injection vocabulary; the drop-rule engine behind `test-utils`
+//! - [`registry`]: `HandlerRegistry` for per-message-type handler storage/dispatch
 //! - [`topic`]: Gossipsub topic builder/parser
-//!
-//! Sync and fetch protocol state machines live in `hyperscale-node`.
-//!
-//! No async runtime dependency.
+//! - [`traits`]: `Network` trait for typed message sends and per-type handler registration
 
 pub mod compression;
+pub mod fault;
 pub mod registry;
 mod topic;
 mod traits;
 
-// Re-export key types
 pub use compression::CompressionError;
 pub use registry::{
     HandlerRegistry, RawGossipHandler, RawHostGossipHandler, RawNotificationHandler,

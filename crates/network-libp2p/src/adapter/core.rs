@@ -8,6 +8,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
+#[cfg(feature = "test-utils")]
+use hyperscale_network::fault::HostId;
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
 use hyperscale_types::{MessageClass, NetworkDefinition, ShardId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
@@ -29,6 +31,7 @@ use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, request_protocol};
 use super::command::{ClassCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
+use crate::fault_gate::FaultState;
 use crate::validator_bind::{LocalVnodeIdentity, spawn_validator_bind_service};
 
 /// libp2p-based network adapter for production use.
@@ -74,6 +77,11 @@ pub struct Libp2pAdapter {
     /// Validator BLS public keys for identity verification.
     /// Shared with the validator-bind service; updated on topology changes.
     validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
+
+    /// Fault gate consulted at the delivery seams, shared with the swarm event
+    /// loop for the inbound gossip filter. A zero-sized no-op unless the
+    /// `test-utils` feature is enabled.
+    fault_gate: Arc<FaultState>,
 }
 
 impl Libp2pAdapter {
@@ -256,12 +264,14 @@ impl Libp2pAdapter {
             cached_peer_count: cached_peer_count.clone(),
             stream_control,
             validator_keys: shared_keys,
+            fault_gate: Arc::new(FaultState::new()),
         });
 
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
         let event_loop_validator_peers = validator_peers;
         let event_loop_local_shards = Arc::clone(&adapter.local_shards);
+        let event_loop_fault_gate = Arc::clone(&adapter.fault_gate);
         let bind_trigger_tx = bind_handle.bind_tx.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         spawn(async move {
@@ -285,6 +295,7 @@ impl Libp2pAdapter {
                 validation_rx,
                 bind_trigger_tx,
                 bootstrap_peers,
+                event_loop_fault_gate,
             ))
             .catch_unwind()
             .await;
@@ -519,6 +530,25 @@ impl Libp2pAdapter {
     #[must_use]
     pub fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
         self.validator_peers.get(&validator_id).map(|r| *r)
+    }
+
+    /// The fault gate consulted at this adapter's delivery seams. A zero-sized
+    /// no-op unless `test-utils` is enabled; under it, test clusters install
+    /// drop rules and partitions through the gate.
+    #[must_use]
+    pub fn fault_gate(&self) -> &FaultState {
+        &self.fault_gate
+    }
+
+    /// Configure the fault gate: this host's id and the full `PeerId → HostId`
+    /// map. The harness calls this once before installing faults.
+    #[cfg(feature = "test-utils")]
+    pub fn fault_configure(
+        &self,
+        self_host: HostId,
+        peers: impl IntoIterator<Item = (Libp2pPeerId, HostId)>,
+    ) {
+        self.fault_gate.configure(self_host, peers);
     }
 
     /// Get a clone of the stream control handle.

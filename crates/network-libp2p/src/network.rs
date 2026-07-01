@@ -11,6 +11,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
+use hyperscale_network::fault::Tier;
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
     ResponseVerdict, Topic, ValidatorKeyMap,
@@ -366,6 +367,15 @@ impl Network for Libp2pNetwork {
         let compressed = compress(&sbor);
         let type_id = M::message_type_id();
         for peer_id in unique_peers {
+            // Fault gate: drop this unicast leg on a partition against the peer
+            // or a matching drop rule.
+            if self
+                .adapter
+                .fault_gate()
+                .drop_outbound(peer_id, type_id, Tier::Notification)
+            {
+                continue;
+            }
             self.notify_pool.send(peer_id, type_id, compressed.clone());
         }
     }
@@ -456,6 +466,15 @@ impl Network for Libp2pNetwork {
                 .filter(|v| !self_ids.contains(v))
                 .filter_map(|&v| adapter.peer_for_validator(v))
                 .collect();
+
+            // Fault gate: drop committee members this host is partitioned from,
+            // so a request never reaches the far side of a cut. An empty result
+            // falls into the `PeerUnreachable` branch below.
+            let resolved_peers: Vec<PeerId> = {
+                let mut peers = resolved_peers;
+                peers.retain(|peer| !adapter.fault_gate().blocked_outbound(*peer));
+                peers
+            };
 
             if resolved_peers.is_empty() {
                 let count = peer_unreachable_count.fetch_add(1, Ordering::Relaxed);

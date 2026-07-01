@@ -60,6 +60,7 @@ struct RunFingerprint {
     events_processed: u64,
     messages_sent: u64,
     messages_dropped_loss: u64,
+    messages_dropped_fault: u64,
     timers_set: u64,
     actions_generated: u64,
     heights: Vec<BlockHeight>,
@@ -68,12 +69,14 @@ struct RunFingerprint {
     beacon_blocks: Vec<Option<BeaconBlockHash>>,
 }
 
-/// Drive one run: genesis, three transactions submitted to node 0, then ten
-/// seconds of progress under packet loss. Returns its fingerprint.
-fn run_once(seed: u64) -> RunFingerprint {
+/// Drive one run: genesis, `install_faults` (fault rules, if any), three
+/// transactions submitted to node 0, then ten seconds of progress under packet
+/// loss. Returns its fingerprint.
+fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> RunFingerprint {
     let config = determinism_config();
     let mut runner = SimulationRunner::new(&config, seed);
     runner.initialize_genesis();
+    install_faults(&mut runner);
 
     for (i, delay_ms) in [50u64, 51, 52].into_iter().enumerate() {
         let tx = test_transaction(u8::try_from(i).unwrap() + 1);
@@ -90,6 +93,7 @@ fn run_once(seed: u64) -> RunFingerprint {
         events_processed: stats.events_processed,
         messages_sent: stats.messages_sent,
         messages_dropped_loss: stats.messages_dropped_loss,
+        messages_dropped_fault: stats.messages_dropped_fault,
         timers_set: stats.timers_set,
         actions_generated: stats.actions_generated,
         heights: (0..4u32)
@@ -129,8 +133,8 @@ fn run_once(seed: u64) -> RunFingerprint {
 /// here.
 #[test]
 fn same_seed_replays_byte_identical() {
-    let first = run_once(12345);
-    let second = run_once(12345);
+    let first = run_once(12345, |_| {});
+    let second = run_once(12345, |_| {});
 
     assert!(
         first.heights.iter().any(|h| *h > BlockHeight::GENESIS),
@@ -147,14 +151,53 @@ fn same_seed_replays_byte_identical() {
     );
 }
 
+/// Two fault rules — a deterministic `block.committed` drop and a probabilistic
+/// `transaction.gossip` drop — replay byte-identically at one seed. The plain
+/// determinism test installs no faults, so the engine's `decide` path and its
+/// own probability RNG stream (seeded `seed ^ FAULT_SALT`, disjoint from the
+/// master clock) go unchecked; this is their guard. The probabilistic rule
+/// forces a coin-flip per matching gossip; a byte-identical replay proves the
+/// fault stream is a deterministic function of the seed. The stream is seeded
+/// disjoint from the master RNG, so the coin-flips consume no master entropy —
+/// faults change the run only through the messages they drop, never by
+/// desynchronising the master draws.
+#[test]
+fn same_seed_with_faults_replays_byte_identical() {
+    let install = |runner: &mut SimulationRunner| {
+        // The handles are unused — the fault stream is observed through the
+        // aggregated `messages_dropped_fault` stat, not per-rule counters.
+        let _ = runner
+            .network_mut()
+            .fault()
+            .drop_type("block.committed")
+            .install();
+        let _ = runner
+            .network_mut()
+            .fault()
+            .drop_type_with_probability("transaction.gossip", 0.5)
+            .install();
+    };
+    let first = run_once(12345, install);
+    let second = run_once(12345, install);
+
+    assert!(
+        first.messages_dropped_fault > 0,
+        "the run must exercise the fault-decision path; none dropped by a fault rule",
+    );
+    assert_eq!(
+        first, second,
+        "same seed must replay byte-identically with fault rules installed",
+    );
+}
+
 /// A different seed produces a different run. The shared deterministic genesis
 /// means divergence shows up in the network-driven surfaces (message counts,
 /// per-node progress), so compare the whole fingerprint rather than any single
 /// field.
 #[test]
 fn different_seed_diverges() {
-    let a = run_once(111);
-    let b = run_once(222);
+    let a = run_once(111, |_| {});
+    let b = run_once(222, |_| {});
     assert_ne!(a, b, "different seeds must produce a different run");
 }
 

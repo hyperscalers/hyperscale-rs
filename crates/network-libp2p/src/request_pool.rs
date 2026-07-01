@@ -36,6 +36,7 @@ use dashmap::DashMap;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics::record_libp2p_bandwidth;
 use hyperscale_network::compression::decompress;
+use hyperscale_network::fault::Tier;
 use hyperscale_types::ShardId;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
@@ -178,6 +179,18 @@ impl RequestStreamPool {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<Vec<u8>, NetworkError> {
+        // Fault gate: drop this request leg per attempt. A dropped leg never
+        // reaches the peer, so it surfaces as a timeout — exactly what the retry
+        // loop sees on real packet loss, and it re-rolls the gate on the next
+        // attempt (the seeded probabilistic request drop).
+        if self
+            .adapter
+            .fault_gate()
+            .drop_outbound(peer, type_id, Tier::Request)
+        {
+            return Err(NetworkError::Timeout);
+        }
+
         let (resp_tx, resp_rx) = oneshot::channel();
         let req = PendingRequest {
             type_id,

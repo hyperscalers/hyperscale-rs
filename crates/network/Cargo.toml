@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "Shared network protocol logic: Network trait, compression, topics, handler registry"
 
+[features]
+# Portable fault-injection engine, shared by the sim and libp2p test harnesses.
+# Never enabled by the production binary.
+test-utils = ["dep:parking_lot", "dep:rand", "dep:rand_chacha"]
+
 [dependencies]
 arc-swap.workspace = true
 hyperscale-types.workspace = true
@@ -12,6 +17,11 @@ quick_cache.workspace = true
 sbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Optional dependencies
+parking_lot = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
 hyperscale-types = { workspace = true, features = ["test-utils"] }

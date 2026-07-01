@@ -6,36 +6,28 @@ description = "Production libp2p network transport"
 
 [features]
 default = []
+test-utils = ["hyperscale-network/test-utils", "dep:parking_lot"]
 
 [dependencies]
-hyperscale-metrics.workspace = true
-hyperscale-network.workspace = true
-hyperscale-types.workspace = true
-
 arc-swap.workspace = true
-
-# Networking - libp2p with QUIC transport
+bytes.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+hyperscale-metrics.workspace = true
 libp2p.workspace = true
 libp2p-stream.workspace = true
-futures.workspace = true
-bytes.workspace = true
-
-# Serialization
+hyperscale-network.workspace = true
+hyperscale-types.workspace = true
+rand.workspace = true
 sbor.workspace = true
 serde.workspace = true
-
-# CLI (for config enums)
-clap.workspace = true
-
-
-# Async runtime
 thiserror.workspace = true
-tracing.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
-# Lock-free concurrent data structures
-dashmap.workspace = true
-rand.workspace = true
+# Optional dependencies
+parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
 hyperscale-test-helpers = { workspace = true, features = ["fixtures"] }

@@ -24,6 +24,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hex::encode as hex_encode;
 use hyperscale_engine::GenesisConfig;
+use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_node::TxStatusCache;
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
@@ -39,7 +40,7 @@ use hyperscale_types::{
     RoutableTransaction, ShardId, StateRoot, TransactionDecision, TransactionStatus, TxHash,
     shard_prefix_path,
 };
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::{sleep, timeout};
@@ -606,6 +607,73 @@ impl Cluster {
         }
         for host in self.hosts.drain(..) {
             let _ = timeout(SHUTDOWN_TIMEOUT, host.join).await;
+        }
+    }
+}
+
+/// A `0..host_count` host index as a [`HostId`].
+fn host_id(index: usize) -> HostId {
+    HostId(u32::try_from(index).expect("host index fits a HostId"))
+}
+
+/// Fault injection: drive every host's gate. The cluster addresses hosts by
+/// index; each host's gate keys on [`HostId`].
+impl Cluster {
+    /// Configure every host's gate with its own id and the full `PeerId →
+    /// HostId` map, so partition and gossip filtering resolve peers. Call once
+    /// before installing faults.
+    pub fn fault_configure_all(&self) {
+        let map: Vec<(PeerId, HostId)> = self
+            .hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.adapter.local_peer_id(), host_id(i)))
+            .collect();
+        for (i, host) in self.hosts.iter().enumerate() {
+            host.adapter.fault_configure(host_id(i), map.clone());
+        }
+    }
+
+    /// Install `spec` as a drop rule on every host's gate; one handle per host.
+    pub fn fault_install_drop(&self, spec: &DropSpec) -> Vec<RuleHandle> {
+        self.hosts
+            .iter()
+            .map(|h| h.adapter.fault_gate().install_drop(spec.clone()))
+            .collect()
+    }
+
+    /// Partition host groups `a` and `b` — each side blocks the other, so both
+    /// outbound unicast and inbound gossip are cut in both directions.
+    pub fn fault_partition(&self, a: &[usize], b: &[usize]) {
+        for &i in a {
+            for &j in b {
+                self.hosts[i].adapter.fault_gate().block_host(host_id(j));
+                self.hosts[j].adapter.fault_gate().block_host(host_id(i));
+            }
+        }
+    }
+
+    /// Isolate one host: it blocks every other, and every other blocks it.
+    pub fn fault_isolate(&self, host: usize) {
+        self.hosts[host].adapter.fault_gate().block_all_hosts();
+        for (i, h) in self.hosts.iter().enumerate() {
+            if i != host {
+                h.adapter.fault_gate().block_host(host_id(host));
+            }
+        }
+    }
+
+    /// Heal every partition on every host.
+    pub fn fault_heal_all(&self) {
+        for h in &self.hosts {
+            h.adapter.fault_gate().heal();
+        }
+    }
+
+    /// Remove every installed drop rule on every host, leaving partitions intact.
+    pub fn fault_clear_all(&self) {
+        for h in &self.hosts {
+            h.adapter.fault_gate().clear_faults();
         }
     }
 }

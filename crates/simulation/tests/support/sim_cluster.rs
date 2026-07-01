@@ -10,10 +10,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
+use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
-use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig, grow_to, vote_reshape_threshold};
+use hyperscale_scenarios::{
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
+};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
@@ -30,6 +34,10 @@ const SLICE: Duration = Duration::from_secs(1);
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
 pub struct SimCluster {
     runner: SimulationRunner,
+    /// In-memory metrics, scoped over `run_until` so [`FaultableCluster::metric`]
+    /// can read node-emitted counters. The sim is single-threaded, so the
+    /// thread-local scoped recorder captures every emission.
+    recorder: MemoryRecorder,
 }
 
 impl SimCluster {
@@ -99,7 +107,10 @@ impl SimCluster {
         let mut runner = SimulationRunner::new(&sim_config, seed);
         runner.initialize_genesis_with_balances(balances);
 
-        Self { runner }
+        Self {
+            runner,
+            recorder: MemoryRecorder::new(),
+        }
     }
 
     /// Build a cluster grown to `config.num_shards` with `config.split_bytes` as
@@ -146,6 +157,17 @@ impl SimCluster {
         &mut self.runner
     }
 
+    /// Run a fault `scenario` with the in-memory recorder scoped, so
+    /// [`FaultableCluster::metric`] reads node-emitted counters. The sim is
+    /// single-threaded, so the thread-local scoped recorder captures every
+    /// emission. Steady-state scenarios that read no metrics call the scenario
+    /// directly instead.
+    #[allow(dead_code)] // only the fault-scenario binaries drive metrics
+    pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
+        let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
+        with_scoped_recorder(recorder, || scenario(self))
+    }
+
     /// The duration `budget` epochs span on this harness's clock.
     fn span(budget: Budget) -> Duration {
         Duration::from_millis(EPOCH_MS) * budget.0
@@ -189,6 +211,11 @@ impl SimCluster {
                 .any(|shard| shards.contains(shard))
         })
     }
+}
+
+/// A portable `0..host_count` host index as the sim's [`NodeIndex`].
+fn host_index(host: usize) -> NodeIndex {
+    NodeIndex::try_from(host).expect("host index fits a NodeIndex")
 }
 
 /// Rank a status so the cluster-wide view takes the most advanced observation.
@@ -304,5 +331,59 @@ impl Cluster for SimCluster {
             height = height.next();
         }
         (committed, finalized)
+    }
+}
+
+impl FaultableCluster for SimCluster {
+    fn host_count(&self) -> usize {
+        self.runner.num_hosts() as usize
+    }
+
+    fn drop_type(&mut self, type_id: &'static str) -> FaultHandle {
+        // The sim's global engine consults every `(sender, recipient)` edge, so
+        // one `Any`-sender rule covers every host.
+        let handle = self
+            .runner
+            .network_mut()
+            .fault()
+            .drop_type(type_id)
+            .install();
+        FaultHandle::new(move || handle.fired())
+    }
+
+    fn drop_type_with_probability(
+        &mut self,
+        type_id: &'static str,
+        probability: f64,
+    ) -> FaultHandle {
+        let handle = self
+            .runner
+            .network_mut()
+            .fault()
+            .drop_type_with_probability(type_id, probability)
+            .install();
+        FaultHandle::new(move || handle.fired())
+    }
+
+    fn partition(&mut self, group_a: &[usize], group_b: &[usize]) {
+        let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
+        let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
+        self.runner.network_mut().partition_groups(&a, &b);
+    }
+
+    fn isolate(&mut self, host: usize) {
+        self.runner.network_mut().isolate_node(host_index(host));
+    }
+
+    fn heal_all(&mut self) {
+        self.runner.network_mut().heal_all();
+    }
+
+    fn clear_drops(&mut self) {
+        self.runner.network_mut().fault().clear();
+    }
+
+    fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {
+        self.recorder.counter(name, label)
     }
 }

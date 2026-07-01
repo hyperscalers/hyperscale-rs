@@ -6,13 +6,18 @@
 //! loop on an owned multi-thread runtime, the same cadence the harness's own
 //! `await_*` helpers use. The runtime never leaks into a scenario body.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hyperscale_engine::GenesisConfig;
+use hyperscale_metrics::set_global_recorder;
+use hyperscale_metrics_memory::MemoryRecorder;
+use hyperscale_network_libp2p::fault::{DropSpec, RuleHandle};
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
-use hyperscale_scenarios::{Budget, Cluster, ScenarioConfig, grow_to, vote_reshape_threshold};
+use hyperscale_scenarios::{
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
+};
 use hyperscale_test_helpers::fixtures::TestFixtures;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
@@ -65,6 +70,11 @@ impl ProdCluster {
             .build()
             .expect("tokio runtime");
         let spec = Self::spec(config, seed, epoch_ms, balances);
+        // Claim the global recorder before the runner installs its Prometheus one
+        // (`set_global_recorder` is first-wins), so `metric()` reads node counters.
+        // Every `ProdCluster` claims it, so all prod scenario tests — fault or
+        // not — run on the in-memory recorder; only fault runs read it back.
+        let _ = global_recorder();
         let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
         Self {
@@ -236,5 +246,88 @@ impl Cluster for ProdCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         self.inner.chain_fate(shard, tx)
+    }
+}
+
+/// The process-global in-memory recorder. Prod emissions fire on async tasks and
+/// thread pools, so a thread-local scoped recorder would miss them — the global
+/// recorder captures every host's counters. Installed once (`set_global_recorder`
+/// is a `OnceLock`); each fault run `reset()`s it.
+static RECORDER: OnceLock<MemoryRecorder> = OnceLock::new();
+
+/// Install (once) and return the process-global in-memory recorder. Called
+/// before the cluster starts so it wins the `set_global_recorder` `OnceLock`
+/// ahead of the runner's Prometheus recorder — otherwise every metric read
+/// would come back zero.
+fn global_recorder() -> MemoryRecorder {
+    RECORDER
+        .get_or_init(|| {
+            let recorder = MemoryRecorder::new();
+            set_global_recorder(Box::new(recorder.clone()));
+            recorder
+        })
+        .clone()
+}
+
+impl ProdCluster {
+    /// Run a fault `scenario`: install and reset the global recorder so
+    /// [`FaultableCluster::metric`] reads this run's counters, configure every
+    /// host's fault gate, then drive the scenario. Mirrors
+    /// `SimCluster::run_faultable`.
+    ///
+    /// The recorder is process-global, so this `reset()` clears counts across
+    /// the whole process. Every fault scenario that reads metrics must run
+    /// `#[serial]` — two concurrent runs would clobber each other's counters.
+    pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
+        global_recorder().reset();
+        self.inner.fault_configure_all();
+        scenario(self)
+    }
+}
+
+impl FaultableCluster for ProdCluster {
+    fn host_count(&self) -> usize {
+        self.inner.host_count()
+    }
+
+    fn drop_type(&mut self, type_id: &'static str) -> FaultHandle {
+        let handles = self.inner.fault_install_drop(&DropSpec {
+            type_id: Some(type_id),
+            ..DropSpec::default()
+        });
+        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn drop_type_with_probability(
+        &mut self,
+        type_id: &'static str,
+        probability: f64,
+    ) -> FaultHandle {
+        let handles = self.inner.fault_install_drop(&DropSpec {
+            type_id: Some(type_id),
+            probability: Some(probability),
+            ..DropSpec::default()
+        });
+        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn partition(&mut self, group_a: &[usize], group_b: &[usize]) {
+        self.inner.fault_partition(group_a, group_b);
+    }
+
+    fn isolate(&mut self, host: usize) {
+        self.inner.fault_isolate(host);
+    }
+
+    fn heal_all(&mut self) {
+        self.inner.fault_heal_all();
+    }
+
+    fn clear_drops(&mut self) {
+        self.inner.fault_clear_all();
+    }
+
+    fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {
+        global_recorder().counter(name, label)
     }
 }

@@ -16,10 +16,15 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_tx, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, livelock_resolves_promptly, liveness_baseline,
+    ScenarioConfig, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_provisions_recovers_after_transient_outage,
+    cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
+    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
+    isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    multi_vnode_progress, pool_capacity_caps_registrations,
+    multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_shard_tx, split_lifecycle, split_straddler_atomic,
@@ -78,6 +83,59 @@ fn single_shard_tx_prod() {
     cluster.shutdown();
 }
 
+/// Fault-scenario config: four single-vnode hosts, so a `transaction.gossip`
+/// drop forces the remote hosts to fetch the transaction rather than receive it
+/// on a co-hosted mempool.
+const fn fault_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(60),
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn gossip_drop_engages_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
+    cluster.run_faultable(gossip_drop_engages_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn partition_halts_and_heals_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
+    cluster.run_faultable(partition_halts_and_heals);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn isolated_validator_still_settles_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
+    cluster.run_faultable(isolated_validator_still_settles);
+    cluster.shutdown();
+}
+
 /// Single-shard config with the split trigger armed (`split_bytes = 0`), one
 /// cohort of pool surplus, one validator per host (each reshape seat needs its
 /// own store), and a paced inter-host latency so the loadless committee tracks
@@ -116,6 +174,99 @@ fn cross_shard_tx_prod() {
     let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cross_shard_tx(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_provisions_drop_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_provisions_drop_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_exec_cert_drop_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_compound_drop_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_compound_drop_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_transaction_da_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_transaction_da_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_header_fetch_fallback_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_header_fetch_fallback);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_provisions_recovers_after_transient_outage_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
+    cluster.run_faultable(cross_shard_provisions_recovers_after_transient_outage);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn cross_shard_provisions_fetch_with_request_loss_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&split_config(), 42, EPOCH_MS);
+    // The body's liveness invariants are the prod assertion; the returned drop
+    // count (deterministic only on the sim) is not asserted here.
+    let _request_drops = cluster.run_faultable(cross_shard_provisions_fetch_with_request_loss);
     cluster.shutdown();
 }
 

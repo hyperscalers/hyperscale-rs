@@ -17,6 +17,7 @@
 
 mod support;
 
+mod faults;
 mod liveness;
 mod multi_vnode;
 mod reshape;
@@ -24,6 +25,14 @@ mod straddler;
 mod transactions;
 mod witnesses;
 
+pub use faults::{
+    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_provisions_recovers_after_transient_outage,
+    cross_shard_transaction_da_fetch_fallback, gossip_drop_engages_fetch_fallback,
+    isolated_validator_still_settles, partition_halts_and_heals,
+};
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
 pub use reshape::{
@@ -34,7 +43,8 @@ pub use straddler::{
     merge_straddler_atomic, split_straddler_atomic, surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
-    Budget, Cluster, ScenarioConfig, epochs, grow_to, query, tx, vote_reshape_threshold, wait,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs, grow_to, query, tx,
+    vote_reshape_threshold, wait,
 };
 pub use transactions::{cross_shard_tx, livelock_resolves_promptly, single_shard_tx};
 pub use witnesses::{

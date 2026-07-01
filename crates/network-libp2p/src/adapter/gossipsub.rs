@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::behaviour::BehaviourEvent;
+use crate::fault_gate::FaultState;
 
 /// Validation result sent from the gossipsub handler back to the event loop.
 ///
@@ -109,6 +110,7 @@ pub(super) fn handle_gossipsub_event(
     local_shards: &std::collections::HashSet<ShardId>,
     registry: &Arc<HandlerRegistry>,
     validation_tx: &mpsc::UnboundedSender<ValidationReport>,
+    fault_gate: &Arc<FaultState>,
 ) {
     match event {
         // Handle gossipsub messages
@@ -140,8 +142,22 @@ pub(super) fn handle_gossipsub_event(
             // Record inbound bandwidth
             record_libp2p_bandwidth(data_len as u64, 0);
 
-            // Shard-local messages must come from the local shard's topic.
             let msg_type = parsed.message_type;
+
+            // Fault gate: a matching drop rule or a partition against the origin
+            // forces `Ignore`, which suppresses both local delivery and mesh
+            // relay. Consulted before the handler spawn so a blocked message
+            // never propagates inward.
+            if fault_gate.drop_inbound_gossip(propagation_source, msg_type) {
+                let _ = validation_tx.send(ValidationReport {
+                    message_id,
+                    propagation_source,
+                    acceptance: MessageAcceptance::Ignore,
+                });
+                return;
+            }
+
+            // Shard-local messages must come from the local shard's topic.
             let is_shard_local_message =
                 matches!(msg_type, "block.header" | "block.vote" | "execution.vote");
 

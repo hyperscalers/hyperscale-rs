@@ -5,15 +5,15 @@ edition.workspace = true
 description = "Deterministic in-memory network transport for simulation"
 
 [dependencies]
-hyperscale-network.workspace = true
+hyperscale-network = { workspace = true, features = ["test-utils"] }
 hyperscale-types.workspace = true
-
-sbor.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+sbor.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

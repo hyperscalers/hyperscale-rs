@@ -11,10 +11,15 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_tx, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, livelock_resolves_promptly, liveness_baseline,
+    ScenarioConfig, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_provisions_recovers_after_transient_outage,
+    cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
+    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
+    isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    multi_vnode_progress, pool_capacity_caps_registrations,
+    multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_shard_tx, split_lifecycle, split_straddler_atomic,
@@ -48,6 +53,24 @@ fn single_shard_tx_sim() {
     single_shard_tx(&mut cluster);
 }
 
+#[test]
+fn gossip_drop_engages_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&liveness_config(), 42);
+    cluster.run_faultable(gossip_drop_engages_fetch_fallback);
+}
+
+#[test]
+fn partition_halts_and_heals_sim() {
+    let mut cluster = SimCluster::new(&liveness_config(), 42);
+    cluster.run_faultable(partition_halts_and_heals);
+}
+
+#[test]
+fn isolated_validator_still_settles_sim() {
+    let mut cluster = SimCluster::new(&liveness_config(), 42);
+    cluster.run_faultable(isolated_validator_still_settles);
+}
+
 /// Single-shard config with the split trigger armed (`split_bytes = 0`) and one
 /// cohort of pool surplus — drives an organic root split.
 const fn split_config() -> ScenarioConfig {
@@ -71,6 +94,71 @@ fn split_lifecycle_sim() {
 fn cross_shard_tx_sim() {
     let mut cluster = SimCluster::new(&split_config(), 11);
     cross_shard_tx(&mut cluster);
+}
+
+#[test]
+fn cross_shard_provisions_drop_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_provisions_drop_fetch_fallback);
+}
+
+#[test]
+fn cross_shard_exec_cert_drop_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
+}
+
+#[test]
+fn cross_shard_transaction_da_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_transaction_da_fetch_fallback);
+}
+
+#[test]
+fn cross_shard_header_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_header_fetch_fallback);
+}
+
+#[test]
+fn cross_shard_compound_drop_fetch_fallback_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_compound_drop_fetch_fallback);
+}
+
+#[test]
+fn cross_shard_provisions_recovers_after_transient_outage_sim() {
+    let mut cluster = SimCluster::new(&split_config(), 11);
+    cluster.run_faultable(cross_shard_provisions_recovers_after_transient_outage);
+}
+
+/// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's
+/// liveness invariants plus the sim-deterministic engagement — at least one
+/// `provision.request` leg drop landed at this seed. Production can't assert
+/// engagement (its async retry path is nondeterministic), so that check lives
+/// here, keyed on the exact seed.
+fn request_loss_engages_at_seed(seed: u64) {
+    let mut cluster = SimCluster::new(&split_config(), seed);
+    let request_drops = cluster.run_faultable(cross_shard_provisions_fetch_with_request_loss);
+    assert!(
+        request_drops >= 1,
+        "the 50% provision.request loss must engage at seed {seed}; drops = {request_drops}",
+    );
+}
+
+#[test]
+fn cross_shard_provisions_fetch_with_request_loss_seed_42_sim() {
+    request_loss_engages_at_seed(42);
+}
+
+#[test]
+fn cross_shard_provisions_fetch_with_request_loss_seed_1337_sim() {
+    request_loss_engages_at_seed(1337);
+}
+
+#[test]
+fn cross_shard_provisions_fetch_with_request_loss_seed_2026_sim() {
+    request_loss_engages_at_seed(2026);
 }
 
 #[test]

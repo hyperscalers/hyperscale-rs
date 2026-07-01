@@ -247,6 +247,8 @@ pub struct SimulationStats {
     pub messages_dropped_partition: u64,
     /// Messages dropped due to packet loss.
     pub messages_dropped_loss: u64,
+    /// Messages dropped by an installed fault rule.
+    pub messages_dropped_fault: u64,
     /// Messages deduplicated (same message already received by node).
     pub messages_deduplicated: u64,
     /// Timers set.
@@ -280,6 +282,7 @@ impl SimulationRunner {
         let network = SimulatedNetwork::new(
             network_config.network_config(),
             network_layout(&host_layout),
+            seed,
         );
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -908,6 +911,7 @@ impl SimulationRunner {
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
             self.stats.messages_deduplicated += stats.messages_deduplicated;
         }
 
@@ -922,6 +926,7 @@ impl SimulationRunner {
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
         }
 
         // Accept pending notifications: queued for deferred delivery with latency.
@@ -936,6 +941,7 @@ impl SimulationRunner {
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
         }
 
         // Drain buffered events (from error callbacks in accept_requests,

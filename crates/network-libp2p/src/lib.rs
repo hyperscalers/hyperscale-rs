@@ -22,3 +22,8 @@ pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use network::Libp2pNetwork;
 pub use request_manager::{RequestManager, RequestManagerConfig};
 pub use request_pool::{RequestPool, RequestStreamPool};
+
+pub mod fault_gate;
+/// Re-export the shared fault vocabulary so test clusters can drive the gate.
+#[cfg(feature = "test-utils")]
+pub use hyperscale_network::fault;

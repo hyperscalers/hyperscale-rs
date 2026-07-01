@@ -31,6 +31,7 @@ use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{MAX_COMMANDS_PER_DRAIN, SwarmCommand};
 use super::gossipsub::ValidationReport;
 use crate::config::VersionInteroperabilityMode;
+use crate::fault_gate::FaultState;
 
 /// Interval for periodic maintenance tasks in the event loop.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -69,6 +70,7 @@ pub(super) async fn run(
     mut validation_rx: mpsc::UnboundedReceiver<ValidationReport>,
     bind_trigger_tx: mpsc::UnboundedSender<Libp2pPeerId>,
     bootstrap_peers: Vec<Multiaddr>,
+    fault_gate: Arc<FaultState>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -381,6 +383,7 @@ pub(super) async fn run(
                     &local_shards.load(),
                     &registry,
                     &validation_tx,
+                    &fault_gate,
                 );
 
                 // Update cached peer count after connection changes

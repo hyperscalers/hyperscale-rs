@@ -9,6 +9,7 @@
 mod budget;
 mod cluster;
 mod config;
+pub mod faultable;
 mod grow;
 pub mod query;
 pub mod tx;
@@ -17,4 +18,5 @@ pub mod wait;
 pub use budget::{Budget, epochs};
 pub use cluster::Cluster;
 pub use config::ScenarioConfig;
+pub use faultable::{FaultHandle, FaultableCluster};
 pub use grow::{grow_to, vote_reshape_threshold};
