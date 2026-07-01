@@ -334,12 +334,11 @@ impl SimulationRunner {
         // committee size, form the genesis beacon committee.
         let beacon_network = genesis_validators.network.clone();
         let GenesisBoot {
-            chain: genesis_chain,
+            block: beacon_genesis_block,
+            state: beacon_genesis_state,
+            config_hash: beacon_config_hash,
             topology_snapshot: projected_topology,
         } = build_genesis(&genesis_validators, chain_config);
-        let beacon_genesis_block = genesis_chain.block;
-        let beacon_genesis_state = genesis_chain.state;
-        let beacon_config_hash = genesis_chain.config_hash;
         let shared_topology = Arc::new(projected_topology);
 
         // Build the host→validators layout based on the hosting mode.
