@@ -164,21 +164,36 @@ struct FaultRule {
     matcher: Matcher,
     action: FaultAction,
     window: TimeWindow,
+    matched: Arc<AtomicU64>,
     fired: Arc<AtomicU64>,
 }
 
 /// Handle returned by [`RuleBuilder::install`]. Cheaply cloneable.
 ///
-/// Holds a counter shared with the live rule; reads always reflect the
-/// current fire count. Use the handle to inspect or remove the rule.
+/// Holds counters shared with the live rule; reads always reflect the
+/// current match/fire counts. Use the handle to inspect or remove the rule.
 #[derive(Debug, Clone)]
 pub struct RuleHandle {
     id: u64,
+    matched: Arc<AtomicU64>,
     fired: Arc<AtomicU64>,
 }
 
 impl RuleHandle {
-    /// Number of times the rule has fired (matched and applied a non-Pass action).
+    /// Number of dispatches the rule's matcher matched, regardless of the
+    /// decision applied. For a probabilistic rule this counts every matching
+    /// message, including those a coin-flip chose to pass — so it's the right
+    /// signal for "did this rule intercept any traffic at all", independent of
+    /// whether the probabilistic action happened to drop.
+    #[must_use]
+    pub fn matched(&self) -> u64 {
+        self.matched.load(Ordering::Relaxed)
+    }
+
+    /// Number of times the rule fired (matched and applied a non-Pass action).
+    /// For a deterministic [`FaultAction::Drop`] this equals [`Self::matched`];
+    /// for [`FaultAction::DropWithProbability`] it counts only the draws that
+    /// actually dropped.
     #[must_use]
     pub fn fired(&self) -> u64 {
         self.fired.load(Ordering::Relaxed)
@@ -215,6 +230,10 @@ impl FaultInjector {
             if !rule.window.contains(now) || !rule.matcher.matches(ctx) {
                 continue;
             }
+            // The matcher matched this dispatch — record it before the action
+            // resolves, so a probabilistic rule that draws "pass" still counts
+            // as having intercepted the message.
+            rule.matched.fetch_add(1, Ordering::Relaxed);
             let decision = match rule.action {
                 FaultAction::Drop => Decision::Drop,
                 FaultAction::DropWithProbability(p) => {
@@ -253,15 +272,21 @@ impl FaultInjector {
     fn install(&mut self, matcher: Matcher, action: FaultAction, window: TimeWindow) -> RuleHandle {
         let id = self.next_id;
         self.next_id += 1;
-        let fired = Arc::new(AtomicU64::new(0));
+        let match_counter = Arc::new(AtomicU64::new(0));
+        let fire_counter = Arc::new(AtomicU64::new(0));
         self.rules.push(FaultRule {
             id,
             matcher,
             action,
             window,
-            fired: Arc::clone(&fired),
+            matched: Arc::clone(&match_counter),
+            fired: Arc::clone(&fire_counter),
         });
-        RuleHandle { id, fired }
+        RuleHandle {
+            id,
+            matched: match_counter,
+            fired: fire_counter,
+        }
     }
 }
 
@@ -617,5 +642,41 @@ mod tests {
         }
         assert!(h.fired() > 0);
         assert!(h.fired() < 200);
+    }
+
+    #[test]
+    fn matched_counts_passes_a_probabilistic_rule_doesnt_drop() {
+        // A zero-probability rule never drops, but every matching dispatch
+        // must still register as a match: `matched()` is how the fault-tests
+        // assert a probabilistic rule's matcher is wired without coupling the
+        // premise check to the coin-flip outcome.
+        let mut injector = FaultInjector::default();
+        let h = FaultBuilder::new(&mut injector)
+            .drop_type_with_probability("foo", 0.0)
+            .install();
+        let mut r = rng();
+        for _ in 0..8 {
+            assert_eq!(
+                injector.decide(&ctx(0, 1, "foo", Tier::Request), Duration::ZERO, &mut r),
+                Decision::Pass
+            );
+        }
+        assert_eq!(h.matched(), 8);
+        assert_eq!(h.fired(), 0);
+    }
+
+    #[test]
+    fn matched_equals_fired_for_deterministic_drop() {
+        let mut injector = FaultInjector::default();
+        let h = FaultBuilder::new(&mut injector).drop_type("foo").install();
+        let mut r = rng();
+        for _ in 0..3 {
+            assert_eq!(
+                injector.decide(&ctx(0, 1, "foo", Tier::Gossip), Duration::ZERO, &mut r),
+                Decision::Drop
+            );
+        }
+        assert_eq!(h.matched(), 3);
+        assert_eq!(h.fired(), 3);
     }
 }

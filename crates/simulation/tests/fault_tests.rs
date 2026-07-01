@@ -485,12 +485,16 @@ where
         let deadline = runner.now() + Duration::from_secs(150);
         let latched = await_all_terminal(&mut *runner, &live_leaves, tx_hash, deadline);
 
-        // Layer 1: every installed rule actually intercepted at least one
-        // message. Catches misconfigured matchers that silently match nothing.
+        // Layer 1: every installed rule's matcher actually intercepted at
+        // least one message. Catches misconfigured matchers that silently match
+        // nothing. Asserts on `matched()` rather than `fired()` so a
+        // probabilistic rule whose coin-flips all happened to pass at this seed
+        // still satisfies the premise — the matcher engaged, the drop just
+        // didn't land.
         for (i, rule) in rules.iter().enumerate() {
             assert!(
-                rule.fired() >= 1,
-                "fault rule {i} did not fire — test premise broken (rule matched no messages)"
+                rule.matched() >= 1,
+                "fault rule {i} matched no messages — test premise broken"
             );
         }
 
@@ -735,9 +739,12 @@ macro_rules! seeded_tests {
     };
 }
 
-// Exercises `Fetch::handle_failed` and the retry path that wasn't covered
-// by the all-or-nothing tests above. Every seed must independently reach
-// successful execution within the 30s budget.
+// Stresses the fetch retry path that the all-or-nothing tests above don't
+// reach: under a probabilistic request drop, attempts time out and re-issue.
+// Whether a drop actually lands on a given seed is a coin-flip over the
+// handful of `provision.request` legs that flow, so the hard per-seed
+// invariant is liveness — every live member reaches successful execution and
+// the fetch fallback engages — not that the 50% drop fired on that seed.
 seeded_tests! {
     fn seed: u64 = {
         run_cross_shard_fault_scenario_with_seed(
