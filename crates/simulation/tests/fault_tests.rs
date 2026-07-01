@@ -46,7 +46,7 @@ fn with_test_recorder<R>(f: impl FnOnce(&MemoryRecorder) -> R) -> R {
 
 const fn single_shard_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 0,
         num_shards: 1,
@@ -61,7 +61,7 @@ const fn single_shard_config() -> ScenarioConfig {
 /// load.
 const fn cross_shard_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 4,
         num_shards: 1,

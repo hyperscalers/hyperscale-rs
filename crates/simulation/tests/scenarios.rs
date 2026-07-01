@@ -27,7 +27,7 @@ use support::sim_cluster::SimCluster;
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 0,
         num_shards: 1,
@@ -52,7 +52,7 @@ fn single_shard_tx_sim() {
 /// cohort of pool surplus — drives an organic root split.
 const fn split_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 4,
         num_shards: 1,
@@ -90,7 +90,7 @@ fn merge_lifecycle_sim() {
 /// two siblings, the other splits the heavier one after the vote.
 const fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 8,
         num_shards: 1,
@@ -114,7 +114,7 @@ fn split_straddler_atomic_sim() {
 /// merge keepers then come from the merging children's own committees.
 const fn merge_straddler_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 12,
         num_shards: 4,
@@ -136,7 +136,7 @@ fn merge_straddler_atomic_sim() {
 /// two vnodes per host.
 const fn multi_vnode_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 2,
         pool_surplus: 0,
         num_shards: 1,
@@ -157,7 +157,7 @@ fn multi_vnode_progress_sim() {
 /// system actions against. `validators` sizes the committee.
 const fn witness_config(validators: u32) -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: validators,
+        shard_size: validators,
         vnodes_per_host: 1,
         pool_surplus: 0,
         num_shards: 1,
@@ -230,7 +230,7 @@ fn pool_capacity_caps_registrations_sim() {
 /// `target` leaves.
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: (target_shards - 1) * 4,
         num_shards: 1,

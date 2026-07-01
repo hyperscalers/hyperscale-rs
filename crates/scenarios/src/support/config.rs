@@ -16,8 +16,10 @@ use std::time::Duration;
 /// `u64::MAX` disarms resharding entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScenarioConfig {
-    /// Committee validators per shard.
-    pub validators_per_shard: u32,
+    /// Committee size each shard maintains — the per-shard committee count the
+    /// beacon preserves as the single ROOT genesis grows to `num_shards`, not a
+    /// genesis-only total. At genesis its lone shard has `shard_size` members.
+    pub shard_size: u32,
     /// Vnodes hosted per physical host.
     pub vnodes_per_host: u32,
     /// Spare validators beyond the seated committees — the observer/keeper stock.
