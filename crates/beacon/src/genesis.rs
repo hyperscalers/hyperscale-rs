@@ -175,9 +175,9 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 
 // ─── runner-shared genesis chain ─────────────────────────────────────────────
 
-/// The derived genesis beacon chain both runners boot from: the committed
-/// genesis block, its folded state, and the config hash bound into both.
-pub struct GenesisChain {
+/// The genesis both runners boot from: the committed beacon chain — block,
+/// folded state, config hash — plus the topology projected from that state.
+pub struct GenesisBoot {
     /// Genesis [`CertifiedBeaconBlock`], verified for each per-vnode
     /// `BeaconCoordinator` to resume from.
     pub block: Arc<Verified<CertifiedBeaconBlock>>,
@@ -186,15 +186,8 @@ pub struct GenesisChain {
     /// Genesis config hash, bound into beacon signatures alongside the
     /// network.
     pub config_hash: GenesisConfigHash,
-}
-
-/// The genesis a runner boots from: the committed beacon chain plus the
-/// topology projected from its folded state.
-pub struct GenesisBoot {
-    /// The committed genesis beacon chain — block, folded state, config hash.
-    pub chain: GenesisChain,
-    /// Topology projected from `chain.state`, identical in shape to the
-    /// snapshot the runtime `ArcSwap` update derives on every epoch commit.
+    /// Topology projected from `state`, identical in shape to the snapshot
+    /// the runtime `ArcSwap` update derives on every epoch commit.
     pub topology_snapshot: TopologySnapshot,
 }
 
@@ -246,11 +239,9 @@ pub fn build_genesis(genesis: &GenesisValidators, chain_config: BeaconChainConfi
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
     let topology_snapshot = state.derive_topology_snapshot(genesis.network.clone());
     GenesisBoot {
-        chain: GenesisChain {
-            block,
-            state,
-            config_hash,
-        },
+        block,
+        state,
+        config_hash,
         topology_snapshot,
     }
 }
@@ -503,8 +494,8 @@ mod tests {
 
     #[test]
     fn unplaced_validators_start_pooled() {
-        // 6 validators, only 4 placed on shard 0 — remaining two land
-        // in the global pool.
+        // 6 validators, only 4 placed on the ROOT shard — remaining two
+        // land in the global pool.
         let cfg = sample_config(6, 4, 4);
         let state = build_genesis_beacon_state(&cfg);
         for id in [4u64, 5].map(ValidatorId::new) {

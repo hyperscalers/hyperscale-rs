@@ -4442,8 +4442,8 @@ mod tests {
         assert_eq!(coord.participation_delta(&SlotEffects::default()), None);
     }
 
-    /// A lookahead that moves the local validator from shard 0 to
-    /// shard 1 yields exactly that join/leave pair, effective at the
+    /// A lookahead that moves the local validator from the ROOT shard to
+    /// a sibling yields exactly that join/leave pair, effective at the
     /// next epoch's window.
     #[test]
     fn participation_delta_detects_relocation() {

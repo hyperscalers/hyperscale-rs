@@ -379,12 +379,11 @@ impl ProductionRunnerBuilder {
         // supplied alongside a beacon state it has to be kept consistent with.
         let beacon_network = genesis_validators.network.clone();
         let GenesisBoot {
-            chain: genesis_chain,
+            block: beacon_genesis_block,
+            state: beacon_genesis_state,
+            config_hash: beacon_config_hash,
             topology_snapshot: projected_topology,
         } = build_genesis(&genesis_validators, chain_config);
-        let beacon_genesis_block = genesis_chain.block;
-        let beacon_genesis_state = genesis_chain.state;
-        let beacon_config_hash = genesis_chain.config_hash;
 
         let shared_topology = Arc::new(projected_topology);
         let topology_snapshot: SharedTopologySnapshot =
