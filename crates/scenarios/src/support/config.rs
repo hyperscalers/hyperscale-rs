@@ -29,6 +29,4 @@ pub struct ScenarioConfig {
     pub split_bytes: u64,
     /// Base inter-host latency.
     pub latency: Duration,
-    /// Whether each pool extra seats on its own host (shuffle/flip layouts).
-    pub dedicated_hosts: bool,
 }

@@ -52,6 +52,32 @@ impl SimCluster {
         seed: u64,
         balances: &[(ComponentAddress, Decimal)],
     ) -> Self {
+        Self::build(config, seed, balances, false)
+    }
+
+    /// Build a genesis cluster giving each pool extra its own shard-less
+    /// follower host rather than riding a committee host. This is a sim-only
+    /// layout the shuffle-relocation tests (`vnode_relocation`, `pool_reseat`)
+    /// need: a rotated vnode must move onto a host not already serving the
+    /// destination shard, so every committee host stays single-shard. Portable
+    /// scenarios never need it — they express host packing through
+    /// `vnodes_per_host` alone.
+    #[allow(dead_code)] // only the relocation binaries build a dedicated-pool layout
+    #[must_use]
+    pub fn with_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        balances: &[(ComponentAddress, Decimal)],
+    ) -> Self {
+        Self::build(config, seed, balances, true)
+    }
+
+    fn build(
+        config: &ScenarioConfig,
+        seed: u64,
+        balances: &[(ComponentAddress, Decimal)],
+        dedicated_pool_hosts: bool,
+    ) -> Self {
         let beacon_chain_config = BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
             num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
@@ -65,7 +91,7 @@ impl SimCluster {
             validators_per_shard: config.validators_per_shard,
             vnodes_per_host: config.vnodes_per_host,
             pool_extra_validators: config.pool_surplus,
-            dedicated_pool_hosts: config.dedicated_hosts,
+            dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
             intra_shard_latency: config.latency,
             cross_shard_latency: config.latency,

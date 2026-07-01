@@ -33,7 +33,6 @@ const fn liveness_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 
@@ -59,7 +58,6 @@ const fn split_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 
@@ -98,11 +96,6 @@ const fn straddler_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 800_000,
         latency: Duration::from_millis(150),
-        // Each pool observer gets its own host so a freshly split committee
-        // spreads one validator per host, as production seats it. Co-hosting a
-        // committee onto too few hosts wedges BFT when one host falls a block
-        // behind.
-        dedicated_hosts: true,
     }
 }
 
@@ -127,8 +120,6 @@ const fn merge_straddler_config() -> ScenarioConfig {
         num_shards: 4,
         split_bytes: 2_880_000,
         latency: Duration::from_millis(150),
-        // One host per pool observer; see `straddler_config`.
-        dedicated_hosts: true,
     }
 }
 
@@ -151,7 +142,6 @@ const fn multi_vnode_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 
@@ -173,7 +163,6 @@ const fn witness_config(validators: u32) -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 
@@ -247,7 +236,6 @@ const fn grow_config(target_shards: u32) -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 

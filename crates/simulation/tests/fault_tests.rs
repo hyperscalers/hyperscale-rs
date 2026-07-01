@@ -52,7 +52,6 @@ const fn single_shard_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 
@@ -68,7 +67,6 @@ const fn cross_shard_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
-        dedicated_hosts: false,
     }
 }
 

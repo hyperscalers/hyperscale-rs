@@ -27,7 +27,7 @@ const SEED: u64 = 7;
 #[traced_test]
 #[test]
 fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
-    let mut cluster = SimCluster::with_balances(&rotation_config(), SEED, &[]);
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED, &[]);
     let runner = cluster.runner_mut();
     // Grow to two shards; the grow draws one cohort from the pool and leaves
     // one surplus extra `Pooled` — a real shard-less beacon follower.
@@ -123,7 +123,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
 #[traced_test]
 #[test]
 fn partitioned_follower_catches_up_via_beacon_sync() {
-    let mut cluster = SimCluster::with_balances(&rotation_config(), SEED, &[]);
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED, &[]);
     let runner = cluster.runner_mut();
     runner.grow_to(2);
     let _ = runner.take_reconfigurations();
