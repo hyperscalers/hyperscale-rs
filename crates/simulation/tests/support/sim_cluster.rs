@@ -81,14 +81,14 @@ impl SimCluster {
         let beacon_chain_config = BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
             num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
-            shard_size: config.validators_per_shard,
+            shard_size: config.shard_size,
             reshape_thresholds: ReshapeThresholds {
                 split_bytes: config.split_bytes,
             },
             ..BeaconChainConfig::default()
         };
         let sim_config = SimConfig {
-            validators_per_shard: config.validators_per_shard,
+            validators_per_shard: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
             pool_extra_validators: config.pool_surplus,
             dedicated_pool_hosts,

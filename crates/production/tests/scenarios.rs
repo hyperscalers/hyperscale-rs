@@ -43,7 +43,7 @@ const EPOCH_MS: u64 = 30_000;
 /// two vnodes per host, zero injected latency.
 const fn liveness_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 2,
         pool_surplus: 0,
         num_shards: 1,
@@ -84,7 +84,7 @@ fn single_shard_tx_prod() {
 /// wall-clock through the multi-epoch grow.
 const fn split_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 4,
         num_shards: 1,
@@ -150,7 +150,7 @@ fn merge_lifecycle_prod() {
 /// one after the vote. One validator per host (each reshape seat its own store).
 const fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 8,
         num_shards: 1,
@@ -183,7 +183,7 @@ fn split_straddler_atomic_prod() {
 /// latency so the loadless committees track wall-clock through the merge.
 const fn merge_straddler_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 12,
         num_shards: 4,
@@ -229,7 +229,7 @@ fn multi_vnode_progress_prod() {
 /// member deactivates or ejects.
 const fn witness_config(validators: u32) -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: validators,
+        shard_size: validators,
         vnodes_per_host: 2,
         pool_surplus: 0,
         num_shards: 1,
@@ -390,7 +390,7 @@ fn pool_capacity_caps_registrations_prod() {
 /// loadless committees track wall-clock through the multi-epoch grow.
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 2,
         pool_surplus: (target_shards - 1) * 4,
         num_shards: 1,

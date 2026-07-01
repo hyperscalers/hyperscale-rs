@@ -31,7 +31,7 @@ const POOL_EXTRAS: u32 = 1;
 #[must_use]
 pub const fn rotation_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: PER_SHARD,
+        shard_size: PER_SHARD,
         vnodes_per_host: 1,
         pool_surplus: PER_SHARD + POOL_EXTRAS,
         num_shards: 1,

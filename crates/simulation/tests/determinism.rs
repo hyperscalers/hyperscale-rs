@@ -162,7 +162,7 @@ fn different_seed_diverges() {
 /// surplus — the shape [`grow_to`] drives to two shards.
 const fn cross_shard_config() -> ScenarioConfig {
     ScenarioConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 4,
         num_shards: 1,

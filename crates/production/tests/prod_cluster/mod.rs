@@ -108,7 +108,7 @@ impl ProdCluster {
 
     /// Translate the portable config into a production `ClusterSpec`. Genesis is
     /// always a single ROOT shard (a deeper partition is reached by growing): the
-    /// committee is `validators_per_shard` validators plus `pool_surplus`
+    /// committee is `shard_size` validators plus `pool_surplus`
     /// followers (the reshape cohort), chunked `vnodes_per_host` per host. At one
     /// vnode per host each validator lands on its own host, the layout the
     /// reshape flip needs (each seat its own store).
@@ -118,9 +118,8 @@ impl ProdCluster {
         epoch_ms: u64,
         balances: Vec<(ComponentAddress, Decimal)>,
     ) -> ClusterSpec {
-        let fixtures =
-            TestFixtures::with_surplus(seed, config.validators_per_shard, config.pool_surplus);
-        let total = config.validators_per_shard + config.pool_surplus;
+        let fixtures = TestFixtures::with_surplus(seed, config.shard_size, config.pool_surplus);
+        let total = config.shard_size + config.pool_surplus;
         let validators: Vec<LocalValidator> = (0..total)
             .map(|i| LocalValidator {
                 validator_id: ValidatorId::new(u64::from(i)),
@@ -138,7 +137,7 @@ impl ProdCluster {
             beacon_chain_config: BeaconChainConfig {
                 epoch_duration_ms: epoch_ms,
                 num_shards: u32::try_from(config.num_shards).unwrap_or(u32::MAX),
-                shard_size: config.validators_per_shard,
+                shard_size: config.shard_size,
                 reshape_thresholds: ReshapeThresholds {
                     split_bytes: config.split_bytes,
                 },
