@@ -36,8 +36,6 @@ pub struct BeaconChainConfig {
     /// SBOR derive in this workspace doesn't impl `Encode`/`Decode`
     /// for `Duration`.
     pub epoch_duration_ms: u64,
-    /// Number of shards.
-    pub num_shards: u32,
     /// Max validators per shard committee.
     pub shard_size: u32,
     /// Beacon committee size cap. PC requires `>= 4`.
@@ -77,12 +75,10 @@ impl BeaconChainConfig {
 }
 
 impl Default for BeaconChainConfig {
-    /// Defaults: 5-minute epochs, 2 shards, shard size 4, beacon
-    /// committee 4.
+    /// Defaults: 5-minute epochs, shard size 4, beacon committee 4.
     fn default() -> Self {
         Self {
             epoch_duration_ms: u64::try_from(EPOCH_DURATION.as_millis()).unwrap_or(u64::MAX),
-            num_shards: 2,
             shard_size: u32::try_from(SHARD_CAPACITY).unwrap_or(u32::MAX),
             beacon_committee_size: u32::try_from(BEACON_SIGNER_COUNT).unwrap_or(u32::MAX),
             reshape_thresholds: ReshapeThresholds::DISABLED,
@@ -127,7 +123,7 @@ pub struct GenesisPool {
 /// identity to operator-supplied TOML; see [`genesis_config_hash`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconGenesisConfig {
-    /// Sizing knobs (`epoch_duration_ms`, `num_shards`, `shard_size`,
+    /// Sizing knobs (`epoch_duration_ms`, `shard_size`,
     /// `beacon_committee_size`). Copied into `BeaconState.chain_config`
     /// at genesis and read from there forever after.
     pub chain_config: BeaconChainConfig,

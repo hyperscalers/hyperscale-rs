@@ -365,8 +365,8 @@ pub struct BeaconState {
     /// Sizing knobs copied from `BeaconGenesisConfig.chain_config` at
     /// genesis. Frozen for the chain's lifetime and authenticated by the
     /// genesis hash — the home for the structural and historical
-    /// parameters (`num_shards`, `genesis_timestamp_ms`) and the
-    /// not-yet-governable sizing knobs. Governable policy parameters
+    /// parameters (`genesis_timestamp_ms`) and the not-yet-governable
+    /// sizing knobs. Governable policy parameters
     /// (today `reshape_thresholds`) are seeded into [`Self::params`] at
     /// genesis and read from there; resolve a governable parameter
     /// against `params`, never here.

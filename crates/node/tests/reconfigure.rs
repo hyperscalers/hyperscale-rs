@@ -75,7 +75,6 @@ fn fixture() -> Fixture {
     .collect();
     let config = BeaconGenesisConfig {
         chain_config: BeaconChainConfig {
-            num_shards: 2,
             shard_size: 2,
             ..BeaconChainConfig::default()
         },

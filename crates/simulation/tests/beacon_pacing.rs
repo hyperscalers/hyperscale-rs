@@ -34,7 +34,6 @@ fn pacing_config() -> SimConfig {
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
-            num_shards: 1,
             shard_size: VALIDATORS,
             ..BeaconChainConfig::default()
         }),
