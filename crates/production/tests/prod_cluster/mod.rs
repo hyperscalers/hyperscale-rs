@@ -109,9 +109,9 @@ impl ProdCluster {
     /// Translate the portable config into a production `ClusterSpec`. Genesis is
     /// always a single ROOT shard (a deeper partition is reached by growing): the
     /// committee is `validators_per_shard` validators plus `pool_surplus`
-    /// followers (the reshape cohort), grouped one per host when `dedicated_hosts`
-    /// (the reshape flip needs each seat on its own store) or `vnodes_per_host`
-    /// per host otherwise.
+    /// followers (the reshape cohort), chunked `vnodes_per_host` per host. At one
+    /// vnode per host each validator lands on its own host, the layout the
+    /// reshape flip needs (each seat its own store).
     fn spec(
         config: &ScenarioConfig,
         seed: u64,
@@ -127,11 +127,7 @@ impl ProdCluster {
                 signing_key: fixtures.signing_key(i),
             })
             .collect();
-        let group = if config.dedicated_hosts {
-            1
-        } else {
-            config.vnodes_per_host.max(1) as usize
-        };
+        let group = config.vnodes_per_host.max(1) as usize;
         let hosts: Vec<HostSpec> = validators
             .chunks(group)
             .map(|chunk| HostSpec::new(chunk.to_vec()))

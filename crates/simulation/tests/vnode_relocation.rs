@@ -11,8 +11,6 @@
 //! flipping `ready: true`, and consensus participation in the new
 //! shard. The origin shard then drains, and a rejoin with the retained
 //! storage takes the fast path with no snap-sync.
-//!
-//! [`topology_rotation`]: ./topology_rotation.rs
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -118,7 +116,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(SEED);
-    let mut cluster = SimCluster::with_balances(&rotation_config(), seed, &[]);
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), seed, &[]);
     let runner = cluster.runner_mut();
     // Grow the single-shard genesis into the two shards the shuffle rotates,
     // then discard the grow's placement deltas so only the shuffle's move is

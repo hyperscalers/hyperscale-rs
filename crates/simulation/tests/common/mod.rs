@@ -24,9 +24,10 @@ const POOL_EXTRAS: u32 = 1;
 /// Single-shard, paced-epoch config both relocation tests grow to two shards
 /// (`grow_to(2)`) before exercising the committee shuffle. The split trigger is
 /// armed from genesis; the pool carries one cohort (`PER_SHARD`) for the grow
-/// plus `POOL_EXTRAS` surplus for the shuffle to refill from, each on its own
-/// dedicated beacon-follower host so every committee member ends on a single
-/// shard.
+/// plus `POOL_EXTRAS` surplus for the shuffle to refill from. The relocation
+/// tests build this through [`SimCluster::with_dedicated_pool_hosts`], seating
+/// each pool extra on its own beacon-follower host so every committee member
+/// ends on a single shard and a rotated vnode moves onto an otherwise-idle host.
 #[must_use]
 pub const fn rotation_config() -> ScenarioConfig {
     ScenarioConfig {
@@ -36,6 +37,5 @@ pub const fn rotation_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
-        dedicated_hosts: true,
     }
 }

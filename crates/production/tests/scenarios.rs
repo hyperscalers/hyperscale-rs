@@ -49,7 +49,6 @@ const fn liveness_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::ZERO,
-        dedicated_hosts: false,
     }
 }
 
@@ -91,7 +90,6 @@ const fn split_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(60),
-        dedicated_hosts: true,
     }
 }
 
@@ -158,7 +156,6 @@ const fn straddler_config() -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 800_000,
         latency: Duration::from_millis(60),
-        dedicated_hosts: true,
     }
 }
 
@@ -192,7 +189,6 @@ const fn merge_straddler_config() -> ScenarioConfig {
         num_shards: 4,
         split_bytes: 2_880_000,
         latency: Duration::from_millis(60),
-        dedicated_hosts: true,
     }
 }
 
@@ -239,7 +235,6 @@ const fn witness_config(validators: u32) -> ScenarioConfig {
         num_shards: 1,
         split_bytes: u64::MAX,
         latency: Duration::ZERO,
-        dedicated_hosts: false,
     }
 }
 
@@ -401,7 +396,6 @@ const fn grow_config(target_shards: u32) -> ScenarioConfig {
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(60),
-        dedicated_hosts: false,
     }
 }
 
