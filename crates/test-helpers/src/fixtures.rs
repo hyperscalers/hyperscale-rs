@@ -79,7 +79,7 @@ impl TestFixtures {
     /// Deterministic fixtures seating `committee_size` validators in the genesis
     /// ROOT committee, plus `surplus` validators registered in the global set
     /// (and the beacon genesis pool) but seated nowhere — the production analog
-    /// of the sim's `pool_extra_validators`, the pool a reshape draws a child
+    /// of the sim's `pool_surplus`, the pool a reshape draws a child
     /// cohort from. Validator ids `[0, committee_size)` seat the root; ids
     /// `[committee_size, committee_size + surplus)` are the surplus.
     #[must_use]

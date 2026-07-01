@@ -67,7 +67,7 @@ pub struct SimConfig {
     /// Validators registered in beacon genesis beyond the ROOT committee.
     /// They land `Pooled` and run no host, giving the shuffle refill stock
     /// and the cohorts each `grow_to` split draws.
-    pub pool_extra_validators: u32,
+    pub pool_surplus: u32,
     /// Give each pool extra its own shard-less follower host instead of
     /// leaving it host-less — the layout the shuffle's cross-shard relocation
     /// needs (a vnode can move onto a host not already serving the
@@ -91,7 +91,7 @@ impl Default for SimConfig {
         Self {
             shard_size: 4,
             vnodes_per_host: 1,
-            pool_extra_validators: 0,
+            pool_surplus: 0,
             dedicated_pool_hosts: false,
             beacon_chain_config: None,
             intra_shard_latency: Duration::from_millis(150),
@@ -287,7 +287,7 @@ impl SimulationRunner {
         // seeding. Pool extras are registered in beacon genesis (landing
         // `Pooled`, giving the shuffle refill stock) but run no host.
         let committee_size = network_config.shard_size;
-        let registered_validators = committee_size + network_config.pool_extra_validators;
+        let registered_validators = committee_size + network_config.pool_surplus;
         let keys: Vec<Bls12381G1PrivateKey> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
@@ -1071,7 +1071,7 @@ fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
         // follower. Pool-extra validator ids start past the committee
         // validators, and the `vnodes_per_host == 1` invariant the
         // dedicated layout requires puts each at its own node.
-        for k in 0..config.pool_extra_validators {
+        for k in 0..config.pool_surplus {
             plans.push(HostPlan {
                 seated: Vec::new(),
                 followers: vec![config.shard_size + k],
