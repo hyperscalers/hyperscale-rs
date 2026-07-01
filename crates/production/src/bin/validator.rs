@@ -137,7 +137,12 @@ struct Cli {
 }
 
 /// Top-level validator configuration.
+///
+/// `deny_unknown_fields` rejects stray top-level keys so a stale config —
+/// e.g. an obsolete `shard`/`num_shards` line, now derived from beacon
+/// state — fails loudly at load rather than being silently dropped.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatorConfig {
     /// Host-level identity configuration
     pub node: NodeConfig,
@@ -185,7 +190,11 @@ pub struct ValidatorConfig {
 
 /// Host-level identity configuration. Per-validator identity lives in
 /// [`VnodeEntry`].
+///
+/// `deny_unknown_fields` rejects obsolete keys — notably the dropped
+/// `shard`/`num_shards`, now projected from beacon state.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Radix network this node is configured for. Bound into every
     /// BLS-signed consensus message to prevent cross-network replay.
@@ -1360,5 +1369,14 @@ mod tests {
         let pool_config = build_thread_pool_config(&config);
         assert_eq!(pool_config.consensus_threads, 3);
         assert_eq!(pool_config.throughput_threads, 14);
+    }
+
+    /// The shipped example config must satisfy the `deny_unknown_fields`
+    /// guard: renaming or dropping a field must update the example in
+    /// lockstep, or an operator's copy of it fails to load.
+    #[test]
+    fn example_config_parses() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/validator.example.toml");
+        ValidatorConfig::load(&path).expect("shipped example config parses");
     }
 }
