@@ -38,7 +38,7 @@ use support::sim_cluster::SimCluster;
 /// default.
 fn test_network_config() -> SimConfig {
     SimConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         jitter_fraction: 0.1,
         ..Default::default()
     }

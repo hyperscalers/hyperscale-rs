@@ -98,12 +98,12 @@ impl SimulatorConfig {
         let committee = self.validators_per_shard;
         if self.num_shards <= 1 {
             return SimConfig {
-                validators_per_shard: committee,
+                shard_size: committee,
                 ..Default::default()
             };
         }
         SimConfig {
-            validators_per_shard: committee,
+            shard_size: committee,
             pool_extra_validators: (self.num_shards - 1) * committee,
             beacon_chain_config: Some(BeaconChainConfig {
                 epoch_duration_ms: EPOCH_MS,
