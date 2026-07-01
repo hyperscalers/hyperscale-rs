@@ -61,7 +61,10 @@ fn fixture() -> Fixture {
             pubkey: *committee.public_key(i),
         })
         .collect();
-    let shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = [
+    // The chain genesises as a single ROOT shard; the two-shard A/B split
+    // this test drives is a later runtime state, presented directly through
+    // the topology snapshot below rather than baked into genesis.
+    let shard_committees: HashMap<ShardId, Vec<ValidatorId>> = [
         (
             SHARD_A,
             vec![committee.validator_id(0), committee.validator_id(1)],
@@ -74,17 +77,14 @@ fn fixture() -> Fixture {
     .into_iter()
     .collect();
     let config = BeaconGenesisConfig {
-        chain_config: BeaconChainConfig {
-            shard_size: 2,
-            ..BeaconChainConfig::default()
-        },
+        chain_config: BeaconChainConfig::default(),
         initial_validators,
         initial_pools: vec![GenesisPool {
             id: pool_id,
             total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
         }],
         initial_beacon_committee: (0..4).map(|i| committee.validator_id(i)).collect(),
-        initial_shard_committees: shard_committees.clone(),
+        initial_shard_committee: (0..4).map(|i| committee.validator_id(i)).collect(),
         initial_randomness: Randomness::new([0x42; 32]),
     };
     let genesis_state = build_genesis_beacon_state(&config);
@@ -103,9 +103,7 @@ fn fixture() -> Fixture {
         network,
         2,
         &validator_set,
-        shard_committees
-            .into_iter()
-            .collect::<HashMap<ShardId, Vec<ValidatorId>>>(),
+        shard_committees,
     ));
     Fixture {
         committee,

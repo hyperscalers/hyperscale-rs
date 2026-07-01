@@ -11,7 +11,6 @@
 //! No mocks, no dispatch-table tracing — assertions ride on the same
 //! contract `NodeHost` consumes in production.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
@@ -130,22 +129,17 @@ fn test_beacon_coordinator(
     let initial_beacon_committee: Vec<_> = (0..beacon_count)
         .map(|i| committee.validator_id(i))
         .collect();
-    // Beacon-state shard committees populate shard 0 with every
-    // validator. `_num_shards` is reserved for callers that want
-    // more shards declared in the topology snapshot for tx routing;
-    // the beacon-state placement stays consolidated for test
-    // determinism.
-    let mut initial_shard_committees: BTreeMap<ShardId, Vec<_>> = BTreeMap::new();
-    initial_shard_committees.insert(
-        ShardId::ROOT,
-        (0..n).map(|i| committee.validator_id(i)).collect(),
-    );
+    // The genesis ROOT committee holds every validator. `_num_shards` is
+    // reserved for callers that want more shards declared in the topology
+    // snapshot for tx routing; the beacon-state placement stays
+    // consolidated for test determinism.
+    let initial_shard_committee: Vec<_> = (0..n).map(|i| committee.validator_id(i)).collect();
     let config = BeaconGenesisConfig {
         chain_config: BeaconChainConfig::default(),
         initial_validators,
         initial_pools,
         initial_beacon_committee,
-        initial_shard_committees,
+        initial_shard_committee,
         initial_randomness: Randomness::new([0x42; 32]),
     };
     let state = build_genesis_beacon_state(&config);

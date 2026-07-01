@@ -7,7 +7,6 @@
 //! beacon-side protocol constants (committee sizes, stake floors) and
 //! is not part of the consumer-facing type surface.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use blake3::Hasher;
@@ -15,8 +14,8 @@ use sbor::prelude::*;
 
 use crate::{
     BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash,
-    Hash, NetworkDefinition, Randomness, ReshapeThresholds, SHARD_CAPACITY, ShardId, Stake,
-    StakePoolId, ValidatorId,
+    Hash, NetworkDefinition, Randomness, ReshapeThresholds, SHARD_CAPACITY, Stake, StakePoolId,
+    ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -136,10 +135,13 @@ pub struct BeaconGenesisConfig {
     /// `BeaconState.committee`; the genesis builder sorts on the way
     /// in so the input order is incidental.
     pub initial_beacon_committee: Vec<ValidatorId>,
-    /// Explicit initial per-shard committees. Members of each shard
-    /// get `OnShard { ready: true, placed_at_epoch: GENESIS }` —
-    /// presumed synced by construction at chain bootstrap.
-    pub initial_shard_committees: BTreeMap<ShardId, Vec<ValidatorId>>,
+    /// The initial shard committee, seated on the sole genesis shard
+    /// [`ShardId::ROOT`]. A chain always genesises with one shard and
+    /// splits later, so this is a single committee rather than a
+    /// per-shard map. Members get `OnShard { ready: true,
+    /// placed_at_epoch: GENESIS }` — presumed synced by construction at
+    /// chain bootstrap.
+    pub initial_shard_committee: Vec<ValidatorId>,
     /// Seed for the very first epoch's randomness. Mixed straight into
     /// `state.randomness`; subsequent slots roll it through accepted
     /// VRF outputs.
@@ -190,7 +192,6 @@ mod tests {
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardId::ROOT;
         let validators = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -207,7 +208,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
             }],
             initial_beacon_committee: members.clone(),
-            initial_shard_committees: std::iter::once((shard, members)).collect(),
+            initial_shard_committee: members,
             initial_randomness: Randomness::new([0xAB; 32]),
         }
     }

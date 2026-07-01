@@ -2158,10 +2158,10 @@ mod tests {
         keypair(seed).public_key()
     }
 
-    /// 4 validators, all on the beacon committee, all placed on shard 0.
+    /// 4 validators, all on the beacon committee, all placed on the ROOT
+    /// genesis shard.
     fn sample_genesis() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardId::leaf(1, 0);
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -2178,7 +2178,7 @@ mod tests {
                 total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
             }],
             initial_beacon_committee: members.clone(),
-            initial_shard_committees: std::iter::once((shard, members)).collect(),
+            initial_shard_committee: members,
             initial_randomness: Randomness::new([0xAB; 32]),
         }
     }
@@ -2204,7 +2204,7 @@ mod tests {
             block,
             vec![state],
             me,
-            ShardId::leaf(1, 0),
+            ShardId::ROOT,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
@@ -2631,7 +2631,7 @@ mod tests {
             Arc::clone(&block),
             vec![state],
             ValidatorId::new(0),
-            ShardId::leaf(1, 0),
+            ShardId::ROOT,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
@@ -2650,7 +2650,7 @@ mod tests {
             block,
             vec![state],
             ValidatorId::new(0),
-            ShardId::leaf(1, 0),
+            ShardId::ROOT,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
@@ -2685,7 +2685,7 @@ mod tests {
             Arc::new(mismatched_block),
             vec![state],
             ValidatorId::new(0),
-            ShardId::leaf(1, 0),
+            ShardId::ROOT,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             GenesisConfigHash::ZERO,
@@ -4180,26 +4180,24 @@ mod tests {
     fn current_topology_snapshot_reflects_genesis_state() {
         let coord = fresh_coord();
         let snap = coord.current_topology_snapshot();
-        // 4 validators all on shard 0.
+        // 4 validators all on the ROOT genesis shard.
         assert_eq!(snap.num_shards(), 1);
-        assert_eq!(snap.committee_for_shard(ShardId::leaf(1, 0)).len(), 4);
+        assert_eq!(snap.committee_for_shard(ShardId::ROOT).len(), 4);
     }
 
     // ─── topology schedule + resolver ────────────────────────────────────
 
-    /// A state at `epoch` whose shard-0 committee (active and lookahead)
-    /// holds `size` members, so snapshots derived for different epochs
-    /// are distinguishable by committee size.
+    /// A state at `epoch` whose ROOT genesis-shard committee (active and
+    /// lookahead) holds `size` members, so snapshots derived for different
+    /// epochs are distinguishable by committee size.
     fn state_at(epoch: u64, size: u64) -> BeaconState {
         let mut s = build_genesis_beacon_state(&sample_genesis());
         s.current_epoch = Epoch::new(epoch);
         let committee = ShardCommittee {
             members: (0..size).map(ValidatorId::new).collect(),
         };
-        s.shard_committees
-            .insert(ShardId::leaf(1, 0), committee.clone());
-        s.next_shard_committees
-            .insert(ShardId::leaf(1, 0), committee);
+        s.shard_committees.insert(ShardId::ROOT, committee.clone());
+        s.next_shard_committees.insert(ShardId::ROOT, committee);
         s.shard_consensus_members = s.ready_consensus_members(&s.shard_committees);
         s
     }
@@ -4210,7 +4208,7 @@ mod tests {
             block,
             history,
             ValidatorId::new(0),
-            ShardId::leaf(1, 0),
+            ShardId::ROOT,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
@@ -4225,7 +4223,7 @@ mod tests {
     fn topology_schedule_resolves_active_lookahead_and_none_beyond() {
         let coord = coord_from_history(vec![state_at(1, 4), state_at(2, 3), state_at(3, 2)]);
         let ed = coord.current_state().chain_config.epoch_duration_ms;
-        let shard = ShardId::leaf(1, 0);
+        let shard = ShardId::ROOT;
         let len_at = |window: u64| {
             coord
                 .topology_schedule()
@@ -4290,7 +4288,7 @@ mod tests {
     /// Each consumer frontier can become the floor: the lagging one wins.
     #[test]
     fn retention_floor_is_the_minimum_consumer_frontier() {
-        let shard = ShardId::leaf(1, 0);
+        let shard = ShardId::ROOT;
         let mut state = state_at(1000, 4);
         state.boundaries.insert(shard, boundary_live_at(999));
         let ed = state.chain_config.epoch_duration_ms;
@@ -4323,7 +4321,7 @@ mod tests {
     /// (`now − RETENTION_HORIZON`) is the floor.
     #[test]
     fn retention_floor_defaults_to_the_artifact_horizon() {
-        let shard = ShardId::leaf(1, 0);
+        let shard = ShardId::ROOT;
         let mut state = state_at(1000, 4);
         state.boundaries.insert(shard, boundary_live_at(1000));
         let ed = state.chain_config.epoch_duration_ms;
@@ -4348,7 +4346,7 @@ mod tests {
         let mut state = state_at(1000, 4);
         state
             .boundaries
-            .insert(ShardId::leaf(1, 0), boundary_live_at(1000));
+            .insert(ShardId::ROOT, boundary_live_at(1000));
         let ed = state.chain_config.epoch_duration_ms;
         let head = WeightedTimestamp::from_millis(1000 * ed);
         let now = LocalTimestamp::from_millis(1000 * ed);
@@ -4450,7 +4448,7 @@ mod tests {
     #[test]
     fn participation_delta_detects_relocation() {
         let mut coord = fresh_coord();
-        let from = ShardId::leaf(1, 0);
+        let from = ShardId::ROOT;
         let to = ShardId::leaf(1, 1);
         let me = coord.me;
 
@@ -4481,7 +4479,7 @@ mod tests {
     #[test]
     fn participation_delta_ignores_other_validators() {
         let mut coord = fresh_coord();
-        let from = ShardId::leaf(1, 0);
+        let from = ShardId::ROOT;
         let to = ShardId::leaf(1, 1);
         let other = ValidatorId::new(3);
 
@@ -4520,7 +4518,7 @@ mod tests {
     fn participation_delta_reads_a_cohort_draw_as_observe_begin() {
         let mut coord = fresh_coord();
         let me = coord.me;
-        let via = ShardId::leaf(1, 0);
+        let via = ShardId::ROOT;
         let (child, _) = via.children();
 
         // Post-fold admission state: drawn from the pool into the
@@ -4570,7 +4568,7 @@ mod tests {
     fn participation_delta_reads_a_released_seat_as_abandon() {
         let mut coord = fresh_coord();
         let me = coord.me;
-        let via = ShardId::leaf(1, 0);
+        let via = ShardId::ROOT;
         let (child, _) = via.children();
 
         // Post-fold cancel state: back in the pool, out of the
@@ -4617,7 +4615,7 @@ mod tests {
     fn participation_delta_reads_execution_as_the_member_flip() {
         let mut coord = fresh_coord();
         let me = coord.me;
-        let via = ShardId::leaf(1, 0);
+        let via = ShardId::ROOT;
         let (child, _) = via.children();
 
         // Post-execution state: the lookahead replaced the parent with
@@ -4648,7 +4646,7 @@ mod tests {
     fn participation_delta_reads_a_keeper_draw_as_keep_begin() {
         let coord = fresh_coord();
         let me = coord.me;
-        let child = ShardId::leaf(1, 0); // me's shard from genesis
+        let child = ShardId::leaf(1, 0);
         let parent = ShardId::ROOT;
         let sibling = ShardId::leaf(1, 1);
 
@@ -4699,8 +4697,22 @@ mod tests {
     fn participation_delta_reads_merge_execution_as_the_member_flip() {
         let mut coord = fresh_coord();
         let me = coord.me;
-        let child = ShardId::leaf(1, 0); // me's shard from genesis
+        let child = ShardId::leaf(1, 0);
         let parent = ShardId::ROOT;
+
+        // Pre-merge state: me is a member of the child shard (the split
+        // state this merge reverses), in both windows.
+        let on_child = ShardCommittee { members: vec![me] };
+        coord.state.shard_committees = std::iter::once((child, on_child.clone())).collect();
+        coord.state.next_shard_committees = std::iter::once((child, on_child)).collect();
+        coord.state.shard_consensus_members = coord
+            .state
+            .ready_consensus_members(&coord.state.shard_committees);
+        coord.state.validators.get_mut(&me).unwrap().status = ValidatorStatus::OnShard {
+            shard: child,
+            ready: true,
+            placed_at_epoch: coord.state.current_epoch,
+        };
 
         // Post-execution lookahead: the children collapsed into the
         // parent; me landed on it as a member.
