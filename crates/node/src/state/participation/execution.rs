@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn execution_certificate_admitted_emits_outbound_ec_continuation_when_we_were_a_source() {
         // Local home shard is the root; the EC names a distinct leaf shard.
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+        let TestNode { mut node, .. } = TestNode::builder().build();
 
         let mut remote_shards = BTreeSet::new();
         remote_shards.insert(ShardId::ROOT);
@@ -213,7 +213,7 @@ mod tests {
     /// surface.
     #[test]
     fn execution_certificate_admitted_skips_continuation_when_local_not_a_source() {
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+        let TestNode { mut node, .. } = TestNode::builder().build();
 
         // EC on one leaf, dependencies on its sibling; the local root shard
         // is not in the set.

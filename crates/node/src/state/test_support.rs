@@ -50,26 +50,12 @@ impl TestNode {
     }
 }
 
+#[derive(Default)]
 pub struct TestNodeBuilder {
     local_idx: usize,
-    num_shards: u64,
-}
-
-impl Default for TestNodeBuilder {
-    fn default() -> Self {
-        Self {
-            local_idx: 0,
-            num_shards: 1,
-        }
-    }
 }
 
 impl TestNodeBuilder {
-    pub fn num_shards(mut self, n: u64) -> Self {
-        self.num_shards = n;
-        self
-    }
-
     pub fn local_idx(mut self, idx: usize) -> Self {
         self.local_idx = idx;
         self
@@ -78,11 +64,10 @@ impl TestNodeBuilder {
     pub fn build(self) -> TestNode {
         let committee = TestCommittee::new(4, 7);
         let me = committee.validator_id(self.local_idx);
-        // The beacon harness consolidates every validator onto the root shard,
-        // so the node's home shard is the root regardless of `num_shards`.
+        // The beacon harness consolidates every validator onto the root shard.
         let local_shard = ShardId::ROOT;
         let provision_store = Arc::new(ProvisionStore::new());
-        let beacon_coordinator = test_beacon_coordinator(&committee, me, self.num_shards);
+        let beacon_coordinator = test_beacon_coordinator(&committee, me);
 
         let node = NodeStateMachine::new(
             me,
@@ -104,12 +89,8 @@ impl TestNodeBuilder {
 
 /// Build a `BeaconCoordinator` for tests over the `TestCommittee` —
 /// every validator on a single pool, the first `BEACON_SIGNER_COUNT`
-/// on the beacon committee, every validator placed on shard 0.
-fn test_beacon_coordinator(
-    committee: &TestCommittee,
-    me: ValidatorId,
-    _num_shards: u64,
-) -> BeaconCoordinator {
+/// on the beacon committee, every validator placed on the ROOT shard.
+fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> BeaconCoordinator {
     let network = NetworkDefinition::simulator();
     let pool_id = StakePoolId::new(0);
     let n = committee.size();
@@ -129,10 +110,7 @@ fn test_beacon_coordinator(
     let initial_beacon_committee: Vec<_> = (0..beacon_count)
         .map(|i| committee.validator_id(i))
         .collect();
-    // The genesis ROOT committee holds every validator. `_num_shards` is
-    // reserved for callers that want more shards declared in the topology
-    // snapshot for tx routing; the beacon-state placement stays
-    // consolidated for test determinism.
+    // The genesis ROOT committee holds every validator.
     let initial_shard_committee: Vec<_> = (0..n).map(|i| committee.validator_id(i)).collect();
     let config = BeaconGenesisConfig {
         chain_config: BeaconChainConfig::default(),

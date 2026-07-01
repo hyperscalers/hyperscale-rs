@@ -396,7 +396,7 @@ mod tests {
     /// cross-shard work.
     #[test]
     fn remote_header_admitted_fans_to_execution_and_provisions() {
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+        let TestNode { mut node, .. } = TestNode::builder().build();
 
         // Wave on a remote leaf shard listing the local root shard as a dependency.
         let mut remote_shards = BTreeSet::new();
@@ -578,7 +578,7 @@ mod tests {
     /// path itself works.
     #[test]
     fn block_committed_evicts_outbound_provisions_on_weighted_timestamp_not_local_clock() {
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+        let TestNode { mut node, .. } = TestNode::builder().build();
 
         // Register an outbound batch (local root shard → remote leaf shard).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
