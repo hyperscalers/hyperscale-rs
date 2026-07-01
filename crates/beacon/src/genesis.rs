@@ -19,9 +19,9 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash,
     BlockHeight, CertifiedBeaconBlock, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
     GenesisValidators, MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE,
-    MIN_STAKE_FLOOR, NetworkDefinition, NetworkParams, Randomness, ShardBoundary, ShardCommittee,
-    ShardId, Stake, StakePool, StakePoolId, StateRoot, TopologySnapshot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, Verified, WeightedTimestamp, genesis_config_hash,
+    MIN_STAKE_FLOOR, NetworkParams, Randomness, ShardBoundary, ShardCommittee, ShardId, Stake,
+    StakePool, StakePoolId, StateRoot, TopologySnapshot, ValidatorId, ValidatorRecord,
+    ValidatorStatus, Verified, WeightedTimestamp, genesis_config_hash,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
@@ -36,8 +36,8 @@ use hyperscale_types::{
 ///
 /// Panics on any genesis-config invariant violation (duplicate ids,
 /// committee member outside the validator set, pool under-staked,
-/// shard or beacon committee oversize, validator placed on two
-/// shards). Genesis is a one-shot bootstrap whose inputs come from
+/// shard or beacon committee oversize, validator listed twice in the
+/// committee). Genesis is a one-shot bootstrap whose inputs come from
 /// operator-controlled config — any violation is a config bug to fix
 /// before launch, not a runtime condition to recover from. The
 /// TOML-loading wrapper layer can pre-validate if desired.
@@ -52,14 +52,15 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     // for the first natural pool draw.
     let mut validators: BTreeMap<ValidatorId, ValidatorRecord> = BTreeMap::new();
     for v in &config.initial_validators {
-        let status =
-            placed
-                .get(&v.id)
-                .map_or(ValidatorStatus::Pooled, |shard| ValidatorStatus::OnShard {
-                    shard: *shard,
-                    ready: true,
-                    placed_at_epoch: Epoch::GENESIS,
-                });
+        let status = if placed.contains(&v.id) {
+            ValidatorStatus::OnShard {
+                shard: ShardId::ROOT,
+                ready: true,
+                placed_at_epoch: Epoch::GENESIS,
+            }
+        } else {
+            ValidatorStatus::Pooled
+        };
         validators.insert(
             v.id,
             ValidatorRecord {
@@ -174,26 +175,6 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 
 // ─── runner-shared genesis chain ─────────────────────────────────────────────
 
-/// Caller-supplied inputs to [`build_genesis_chain`] — the parts that differ
-/// between the production and simulation runners when they stand up an
-/// otherwise identical genesis beacon chain.
-pub struct GenesisChainInputs<'a> {
-    /// Beacon chain sizing knobs (epoch duration, committee sizes, reshape
-    /// thresholds).
-    pub chain_config: BeaconChainConfig,
-    /// Every registered validator, all assigned to the single genesis pool.
-    pub validators: Vec<GenesisValidator>,
-    /// The initial beacon committee. Derived by the caller because the two
-    /// runners size it differently — the sim excludes its surplus pool
-    /// extras, while production seats its whole configured set.
-    pub beacon_committee: Vec<ValidatorId>,
-    /// The genesis shard committee, seated on [`ShardId::ROOT`] — supplied,
-    /// not derived, because genesis has no prior randomness to sample from.
-    pub shard_committee: Vec<ValidatorId>,
-    /// Radix network identity bound into the genesis config hash.
-    pub network: &'a NetworkDefinition,
-}
-
 /// The derived genesis beacon chain both runners boot from: the committed
 /// genesis block, its folded state, and the config hash bound into both.
 pub struct GenesisChain {
@@ -205,48 +186,6 @@ pub struct GenesisChain {
     /// Genesis config hash, bound into beacon signatures alongside the
     /// network.
     pub config_hash: GenesisConfigHash,
-}
-
-/// Assemble the genesis beacon chain both runners boot from.
-///
-/// Every validator lands in one genesis stake pool at the stake floor; the
-/// config carries the caller's beacon and shard committees verbatim. The
-/// block, state, and hash are pure functions of the inputs, so a production
-/// host and a sim host built from the same inputs resume from identical
-/// genesis.
-#[must_use]
-pub fn build_genesis_chain(inputs: GenesisChainInputs<'_>) -> GenesisChain {
-    let GenesisChainInputs {
-        chain_config,
-        validators,
-        beacon_committee,
-        shard_committee,
-        network,
-    } = inputs;
-
-    // One genesis pool holds every validator at the stake floor.
-    let n = validators.len() as u128;
-    let initial_pools = vec![GenesisPool {
-        id: StakePoolId::new(0),
-        total_stake: Stake::from_attos(n * MIN_STAKE_FLOOR.attos()),
-    }];
-
-    let config = BeaconGenesisConfig {
-        chain_config,
-        initial_validators: validators,
-        initial_pools,
-        initial_beacon_committee: beacon_committee,
-        initial_shard_committee: shard_committee,
-        initial_randomness: Randomness::new([0x42; 32]),
-    };
-    let state = Arc::new(build_genesis_beacon_state(&config));
-    let config_hash = genesis_config_hash(&config, network);
-    let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
-    GenesisChain {
-        block,
-        state,
-        config_hash,
-    }
 }
 
 /// The genesis a runner boots from: the committed beacon chain plus the
@@ -289,26 +228,37 @@ pub fn build_genesis(genesis: &GenesisValidators, chain_config: BeaconChainConfi
         .min(chain_config.beacon_committee_size as usize);
     let beacon_committee: Vec<ValidatorId> = seated.into_iter().take(committee_len).collect();
 
-    let chain = build_genesis_chain(GenesisChainInputs {
+    // One genesis pool holds every validator at the stake floor.
+    let total_stake = Stake::from_attos(validators.len() as u128 * MIN_STAKE_FLOOR.attos());
+    let config = BeaconGenesisConfig {
         chain_config,
-        validators,
-        beacon_committee,
-        shard_committee: genesis.committee.clone(),
-        network: &genesis.network,
-    });
-    let topology_snapshot = chain
-        .state
-        .derive_topology_snapshot(genesis.network.clone());
+        initial_validators: validators,
+        initial_pools: vec![GenesisPool {
+            id: pool_id,
+            total_stake,
+        }],
+        initial_beacon_committee: beacon_committee,
+        initial_shard_committee: genesis.committee.clone(),
+        initial_randomness: Randomness::new([0x42; 32]),
+    };
+    let state = Arc::new(build_genesis_beacon_state(&config));
+    let config_hash = genesis_config_hash(&config, &genesis.network);
+    let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let topology_snapshot = state.derive_topology_snapshot(genesis.network.clone());
     GenesisBoot {
-        chain,
+        chain: GenesisChain {
+            block,
+            state,
+            config_hash,
+        },
         topology_snapshot,
     }
 }
 
 /// Walk every invariant the builder relies on, panicking on the first
-/// violation. Returns the `validator_id → shard` placement map for the
-/// builder to read on its second pass.
-fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardId> {
+/// violation. Returns the set of genesis-seated validators (all on
+/// `ShardId::ROOT`) for the builder to read on its second pass.
+fn validate_config(config: &BeaconGenesisConfig) -> BTreeSet<ValidatorId> {
     // No duplicate validator or pool ids.
     let mut validator_ids: BTreeSet<ValidatorId> = BTreeSet::new();
     for v in &config.initial_validators {
@@ -379,14 +329,14 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardI
         "initial shard committee has {} members; chain_config.shard_size is {shard_cap}",
         config.initial_shard_committee.len(),
     );
-    let mut placed: BTreeMap<ValidatorId, ShardId> = BTreeMap::new();
+    let mut placed: BTreeSet<ValidatorId> = BTreeSet::new();
     for id in &config.initial_shard_committee {
         assert!(
             validator_ids.contains(id),
             "genesis shard committee references unknown validator {id}",
         );
         assert!(
-            placed.insert(*id, ShardId::ROOT).is_none(),
+            placed.insert(*id),
             "validator {id} appears in the genesis shard committee twice",
         );
     }
