@@ -57,10 +57,12 @@ use reshape::ReshapeStore;
 /// which the runner hands over as a [`NetworkConfig`].
 #[derive(Debug, Clone)]
 pub struct SimConfig {
-    /// Number of validators in the genesis (ROOT) committee.
-    pub validators_per_shard: u32,
+    /// Committee size each shard maintains. Genesis seats its single ROOT
+    /// shard with this many validators; each split child is drawn to the same
+    /// size from the pool.
+    pub shard_size: u32,
     /// Consecutive validators bundled into each host. Must divide
-    /// `validators_per_shard`.
+    /// `shard_size`.
     pub vnodes_per_host: u32,
     /// Validators registered in beacon genesis beyond the ROOT committee.
     /// They land `Pooled` and run no host, giving the shuffle refill stock
@@ -87,7 +89,7 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            validators_per_shard: 4,
+            shard_size: 4,
             vnodes_per_host: 1,
             pool_extra_validators: 0,
             dedicated_pool_hosts: false,
@@ -284,7 +286,7 @@ impl SimulationRunner {
         // Generate keys for all registered validators using deterministic
         // seeding. Pool extras are registered in beacon genesis (landing
         // `Pooled`, giving the shuffle refill stock) but run no host.
-        let committee_size = network_config.validators_per_shard;
+        let committee_size = network_config.shard_size;
         let registered_validators = committee_size + network_config.pool_extra_validators;
         let keys: Vec<Bls12381G1PrivateKey> = (0..registered_validators)
             .map(|i| {
@@ -464,7 +466,7 @@ impl SimulationRunner {
 
         info!(
             num_nodes = hosts.len(),
-            validators_per_shard = network_config.validators_per_shard,
+            shard_size = network_config.shard_size,
             seed,
             "Created single-shard (ROOT) simulation runner"
         );
@@ -1049,7 +1051,7 @@ fn network_layout(plans: &[HostPlan]) -> HostLayout {
 ///
 /// Genesis is a single ROOT shard, so every seated vnode is on ROOT. Returns
 /// one [`HostPlan`] per host: the committee hosts are
-/// `validators_per_shard / vnodes_per_host`, host `h` carrying
+/// `shard_size / vnodes_per_host`, host `h` carrying
 /// `vnodes_per_host` consecutive ROOT validators starting at
 /// `h * vnodes_per_host`.
 ///
@@ -1072,7 +1074,7 @@ fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
         for k in 0..config.pool_extra_validators {
             plans.push(HostPlan {
                 seated: Vec::new(),
-                followers: vec![config.validators_per_shard + k],
+                followers: vec![config.shard_size + k],
             });
         }
     }
@@ -1094,11 +1096,11 @@ struct HostPlan {
 /// are appended separately by [`build_host_layout`].
 fn build_committee_host_layout(config: &SimConfig) -> Vec<Vec<(u32, ShardId)>> {
     assert_eq!(
-        config.validators_per_shard % config.vnodes_per_host,
+        config.shard_size % config.vnodes_per_host,
         0,
-        "vnodes_per_host must divide validators_per_shard"
+        "vnodes_per_host must divide shard_size"
     );
-    let host_count = config.validators_per_shard / config.vnodes_per_host;
+    let host_count = config.shard_size / config.vnodes_per_host;
     (0..host_count)
         .map(|h| {
             let host_first_validator = h * config.vnodes_per_host;

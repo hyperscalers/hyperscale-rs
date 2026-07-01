@@ -30,7 +30,7 @@ const OUTAGE_EPOCHS: u64 = 6;
 
 fn pacing_config() -> SimConfig {
     SimConfig {
-        validators_per_shard: VALIDATORS,
+        shard_size: VALIDATORS,
         jitter_fraction: 0.1,
         beacon_chain_config: Some(BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,

@@ -88,7 +88,7 @@ impl SimCluster {
             ..BeaconChainConfig::default()
         };
         let sim_config = SimConfig {
-            validators_per_shard: config.shard_size,
+            shard_size: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
             pool_extra_validators: config.pool_surplus,
             dedicated_pool_hosts,

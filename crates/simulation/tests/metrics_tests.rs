@@ -14,7 +14,7 @@ fn metrics_recorder_collects_values_from_running_sim() {
     set_global_recorder(Box::new(recorder.clone()));
 
     let config = SimConfig {
-        validators_per_shard: 4,
+        shard_size: 4,
         jitter_fraction: 0.1,
         ..Default::default()
     };
