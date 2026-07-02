@@ -46,7 +46,8 @@ pub enum SettledSetVerdict {
     /// terminated shard's retention horizon — categorically unreachable.
     Reject,
     /// A certificate names a past-terminal shard whose settled set isn't
-    /// known yet — hold until it is reconstructed.
+    /// known yet, or a shard scheduled to terminate whose settled set can
+    /// only exist once it does — hold until the set is reconstructed.
     Defer,
 }
 
@@ -58,6 +59,12 @@ pub enum SettledSetVerdict {
 /// at `anchored_wt`, so callers that must agree across replicas (the
 /// vote fence) pass the voted block's `parent_qc` weighted timestamp;
 /// node-local callers (the finalize gate) pass their committed timestamp.
+///
+/// A shard that is not yet past-terminal but is scheduled to terminate (an
+/// admitted split/merge or a coast toward its terminal block) is fenced the
+/// same way: `Defer` until it terminates and its settled set resolves the
+/// wave. This closes the pre-boundary window in which a survivor could
+/// finalize a straddler the terminating side never settled.
 pub fn settled_set_verdict<'a, S, I>(
     settled_sets: &HashMap<ShardId, SettledWaveSet, S>,
     topology_schedule: &TopologySchedule,
@@ -80,6 +87,16 @@ where
             return SettledSetVerdict::Reject;
         };
         if !past_terminal {
+            // `shard` is live now, but if it is scheduled to terminate it may
+            // leave the trie before it settles this wave — and once it does,
+            // only its settled set is authoritative. Finalizing on
+            // EC-completeness alone would then risk applying a wave the
+            // terminating side never settled (it can produce its EC yet still
+            // fail to receive ours before its terminal block). Defer to its
+            // settled set, exactly as for an already-terminated shard.
+            if topology_schedule.termination_scheduled(shard, anchored_wt) {
+                defer = true;
+            }
             continue;
         }
         match settled_sets.get(&shard) {

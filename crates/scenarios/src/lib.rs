@@ -40,7 +40,8 @@ pub use reshape::{
     merge_seats_full_keeper_committee, split_lifecycle,
 };
 pub use straddler::{
-    merge_straddler_atomic, split_straddler_atomic, surviving_sibling_split_seats_full_committees,
+    merge_straddler_atomic, split_straddler_atomic, split_straddler_run, straddler_one_sided_count,
+    surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs, grow_to, query, tx,

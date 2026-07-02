@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
+use hyperscale_network::fault::{HostId, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
@@ -166,6 +167,58 @@ impl SimCluster {
     pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
         let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
         with_scoped_recorder(recorder, || scenario(self))
+    }
+
+    /// Cut every path by which `shard`'s committee obtains `peer_shard`'s
+    /// execution certificate, so a cross-shard wave the two share cannot
+    /// finalize on `shard`'s side.
+    ///
+    /// Fault rules gate only pushes (gossip) and request legs — never response
+    /// legs (see `network-memory`: the transport has no response gate). So EC
+    /// intake is cut on both the push and the pulls, with the correct direction
+    /// per leg:
+    /// - `execution.cert.batch` gossip, `peer_shard` → `shard` (peer pushes).
+    /// - `execution_cert.request`, `shard` → `peer_shard` (`shard` pulls the EC).
+    /// - `finalized_wave.request`, `shard` → `peer_shard` (`shard` pulls the
+    ///   finalized wave, which bundles every participant's EC).
+    ///
+    /// Provisions and headers still flow, so `shard` still executes the wave and
+    /// produces its own EC; it just never receives `peer_shard`'s.
+    ///
+    /// Snapshot-keyed on the committee hosts at call time; a caller whose
+    /// committees shift under it (a reshape in flight) must re-install. Sim-only
+    /// (`from`/`to` selectors are not on the portable `FaultableCluster` surface
+    /// yet). Returns a handle summing fires across every installed edge.
+    #[allow(dead_code)] // only the straddler probe binary isolates a shard's EC intake
+    pub fn isolate_ec_intake(&mut self, shard: ShardId, peer_shard: ShardId) -> FaultHandle {
+        let shard_hosts: Vec<NodeIndex> = self.live_committee_hosts(shard);
+        let peer_hosts: Vec<NodeIndex> = self.live_committee_hosts(peer_shard);
+        let mut handles = Vec::new();
+        for &s in &shard_hosts {
+            for &p in &peer_hosts {
+                if s == p {
+                    continue;
+                }
+                // Peer pushes its EC to `shard` by gossip.
+                // `shard` pulls the peer's EC and finalized wave.
+                for (from, to, type_id) in [
+                    (p, s, "execution.cert.batch"),
+                    (s, p, "execution_cert.request"),
+                    (s, p, "finalized_wave.request"),
+                ] {
+                    handles.push(
+                        self.runner
+                            .network_mut()
+                            .fault()
+                            .drop_type(type_id)
+                            .from(HostId(from))
+                            .to(HostId(to))
+                            .install(),
+                    );
+                }
+            }
+        }
+        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
     }
 
     /// The duration `budget` epochs span on this harness's clock.

@@ -194,6 +194,41 @@ fn split_straddler_atomic_sim() {
     split_straddler_atomic(&mut cluster);
 }
 
+/// Straddler atomicity under an asymmetric EC partition across a split boundary.
+///
+/// The terminating splitter is isolated from the survivor's execution
+/// certificate — its EC gossip is dropped inbound and the splitter's EC /
+/// finalized-wave fetch requests are dropped outbound — while provisions still
+/// flow, so the splitter executes the straddler and produces its own EC but
+/// never receives the survivor's. Dedicated per-host vnodes keep the two
+/// committees on disjoint hosts, so no in-process dispatch bridges the cut.
+///
+/// The pre-boundary settlement fence holds atomicity anyway: the survivor cannot
+/// finalize a straddler naming the splitter while the splitter has an admitted
+/// terminating reshape, so every straddler resolves the same on both sides —
+/// settled by the splitter and accepted by the survivor, or aborted on both. The
+/// seeds sweep timings that resolve finalization against the counterpart-abort
+/// sweep differently; none may resolve one-sided.
+#[test]
+fn split_straddler_asymmetric_ec_partition() {
+    use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR};
+    use hyperscale_scenarios::{split_straddler_run, straddler_one_sided_count};
+
+    for seed in [7u64, 11, 42, 2026, 1337] {
+        let setup = split_straddler_setup();
+        let mut cluster =
+            SimCluster::with_dedicated_pool_hosts(&straddler_config(), seed, &setup.balances);
+        let (probes, splitter, terminal_b) = split_straddler_run(&mut cluster, |c| {
+            c.isolate_ec_intake(STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+        });
+        let one_sided = straddler_one_sided_count(&cluster, splitter, terminal_b, &probes);
+        assert_eq!(
+            one_sided, 0,
+            "seed {seed}: survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
+        );
+    }
+}
+
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing
 /// the genesis byte skew: the survivor pair (`leaf(2,0)`/`leaf(2,1)`, the latter
 /// bulk-funded) sits above it, the light merging pair (`leaf(2,2)`/`leaf(2,3)`)
