@@ -33,7 +33,7 @@ pub struct VoteSet {
     parent_block_hash: Option<BlockHash>,
 
     /// Parent QC's `weighted_timestamp` (from the block's header). Used as
-    /// the per-vote monotonicity floor during stake-weighted aggregation:
+    /// the per-vote monotonicity floor during timestamp aggregation:
     /// any vote timestamp below this is raised to the floor before being
     /// summed, so the resulting QC's `weighted_timestamp` is guaranteed
     /// >= parent's.
@@ -380,11 +380,11 @@ mod test_helpers {
             let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
                 .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
 
-            // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
+            // Mean of the clamped vote timestamps — every vote weighs one.
             let weighted_timestamp_ms = if self.verified_power == VoteCount::ZERO {
                 0
             } else {
-                // Mean of u64 timestamps weighted by u64 powers always fits in u64.
+                // A mean of u64 timestamps always fits in u64.
                 u64::try_from(
                     self.verified_timestamp_weight_sum / u128::from(self.verified_power.inner()),
                 )
