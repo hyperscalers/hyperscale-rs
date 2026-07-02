@@ -2,15 +2,17 @@
 
 > **Warning**: Work in progress. Do not use.
 
-Rust implementation of Hyperscale consensus protocol.
+Rust implementation of the Hyperscale protocol: a sharded smart-contract network that scales **linearly** — add shards, get proportional throughput — while keeping the properties sharding usually destroys: **atomic composability** (a transaction touching state on many shards commits everywhere or nowhere) and synchronous, single-chain semantics with BFT finality. No bridges, no optimistic rollback, no user-visible intermediate states.
 
-**What's different:**
-- Pure consensus layer — no I/O, no locks, no async
-- Created with deterministic simulation testing in mind
-- Faster two-chain commit consensus based on HotStuff-2
-- Optimistic pipelining — proposers propose immediately after QC formation
-- Improved cross-shard livelock prevention
-- Real Radix Engine integration
+**What makes it distinctive:**
+
+- **Three consensus mechanisms, one clock.** Independent HotStuff-2 shard chains order transactions; execution certificates agree on their results; a slow beacon chain governs validators and topology. All three are harmonized by *weighted time* — a BFT-attested clock — which binds every artifact to exactly one governing committee.
+- **Deterministic atomic commitment.** Cross-shard transactions run a provision–execute–certify pipeline: state moves between shards as merkle-proven facts about committed blocks, every shard executes deterministically on identical inputs, and quorum certificates attest outcomes rather than vote on them. No coordinator, no blocking, and locks that structurally cannot deadlock.
+- **Dynamic sharding.** Shards split under load and merge when it recedes — live, without halting the network. State is one binary Jellyfish Merkle Tree and a shard is a prefix subtree, so resharding is a tree operation with a one-hash continuity proof; transactions straddling a reshape boundary settle atomically via attested settled sets.
+- **A self-regulating validator economy.** The minimum activation stake is a market-clearing price recomputed every epoch from topology demand — rising when validator supply is abundant, falling when splits need staffing — while vnodes let one host run many validator identities, so a seat's marginal cost is its stake, not hardware.
+- **Determinism as the spine.** The entire protocol stack is sans-io pure state machines. The same code runs under production I/O (tokio, libp2p, RocksDB) and under a deterministic simulator where whole multi-shard networks — fault injection included — replay byte-identically from a seed.
+
+**[Architecture documentation → docs/](docs/README.md)** — the whole story in a five-page overview, per-subsystem deep dives, and a consolidated invariant register intended as the starting point for formal verification.
 
 ## Crates
 
