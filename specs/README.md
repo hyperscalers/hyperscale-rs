@@ -13,6 +13,14 @@ Machine-checked models of hyperscale's protocols, written in [Quint](https://qui
 
 Models compose by abstraction, not size: each takes the earlier models' verified properties as axioms. B resolves committees through A's clock properties; C treats a shard chain as an atomic commit oracle justified by B; D adds shard termination on top of C. No model ever contains the whole system.
 
+## Analyses
+
+Statistical companions to the models — properties that are probabilistic rather than reachability claims, so the instrument is concentration bounds and Markov analysis rather than Apalache.
+
+| Analysis | Files | Scope | Status |
+|---|---|---|---|
+| **SEC-1** | [committee_security.md](committee_security.md), [committee_security.py](committee_security.py) | Prices the INV-SEC-1 premise: hypergeometric draw tails, the trickle shuffle as a birth–death chain, adaptive-corruption bounds, the seat-vs-stake wedge. Every model's `BYZ = 1..F` axiom composes with this bound | Phase 1 done; Phase 2 is Monte Carlo against the real beacon fold |
+
 ## Discipline
 
 1. **Properties come from the register.** A spec states which INV-* IDs it checks and under which abstraction. If a property isn't in the register, it goes into the register first.
