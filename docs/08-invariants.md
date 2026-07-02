@@ -45,7 +45,7 @@ The consolidated register of the system's safety and liveness properties, with s
 
 | ID | Class | Property |
 |---|---|---|
-| **INV-EXEC-1** | Safety | **Atomic commitment.** A cross-shard transaction reaches the same terminal outcome (succeeded / aborted / rejected) on every participating shard. Finalization requires ECs from all participants agreeing on one receipt root; abort paths are deterministic functions of committed state. |
+| **INV-EXEC-1** | Safety | **Atomic commitment.** A cross-shard transaction reaches the same terminal outcome (succeeded / aborted / rejected) on every participating shard. Finalization is per transaction: success requires success outcomes (identical receipt hashes, by deterministic execution) from every participant's EC; any participant's abort outcome is terminal — abort dominant, success unanimous. Abort paths are deterministic functions of committed state. |
 | **INV-EXEC-2** | Safety | **Certificate soundness.** An EC's receipt root is recomputed from its outcome vector at decode and must match; quorum power and aggregate signature verify against the WT-resolved committee. A valid-looking EC with divergent content cannot exist. |
 | **INV-EXEC-3** | Safety | **Partial coupling.** No two transactions simultaneously in flight or ready share any declared node; locks persist from commit to wave finalization. Local deadlock is structurally impossible. |
 | **INV-EXEC-4** | Determinism | **Conflict verdicts.** Cross-shard conflict detection reads only committed chain state; ties break by transaction hash; every replica on every shard derives the identical abort set. |
