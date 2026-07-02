@@ -75,6 +75,22 @@ pub struct ChainEntry {
 pub struct PendingChain<S> {
     base: Arc<S>,
     entries: RwLock<HashMap<BlockHash, ChainEntry>>,
+    settled_window_memo: RwLock<Option<SettledWindowMemo>>,
+}
+
+/// Memoized committed-tail contribution to a terminating shard's
+/// settled-waves window (see [`PendingChain::settled_waves_in_window`]).
+///
+/// Valid only under a schedule-stable floor: the committed chain is linear
+/// and immutable, so for a fixed `(shard, floor)` the accumulated set only
+/// extends at the tip. Bounded by the window's cross-shard settlements —
+/// the same set the wire cap bounds.
+struct SettledWindowMemo {
+    local_shard: ShardId,
+    floor: WeightedTimestamp,
+    /// Highest committed height folded into `set` (inclusive).
+    upto: BlockHeight,
+    set: std::collections::BTreeSet<WaveId>,
 }
 
 impl<S> PendingChain<S>
@@ -86,6 +102,7 @@ where
         Self {
             base,
             entries: RwLock::new(HashMap::new()),
+            settled_window_memo: RwLock::new(None),
         }
     }
 
@@ -308,20 +325,86 @@ where
         }
         // Committed tail: read by height (the committed chain is linear, so
         // height is unambiguous) until a block's weighted timestamp falls
-        // below the retention floor. A block's weighted timestamp is its own
-        // `parent_qc`'s — the same canonical, hash-pinned value `anchor_wt`
-        // is, identical on every node. The served `entry.qc` is the block's
-        // certifying QC, which a coast past the crossing can re-issue at a
-        // higher round with a divergent timestamp, so it must not gate the
-        // floor: a per-node-variable cutoff would diverge the attested root.
+        // below the retention floor. A schedule-supplied floor is fixed for
+        // the whole scheduled window, so its walk is memoized; the anchor
+        // floor moves with every block and spans only the horizon, so it
+        // walks plainly.
         let anchor_floor = anchor_wt
             .as_millis()
             .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
-        let floor = WeightedTimestamp::from_millis(
-            window_floor.map_or(anchor_floor, |f| anchor_floor.min(f.as_millis())),
-        );
-        let mut h = height;
-        loop {
+        if let Some(floor) = window_floor.filter(|f| f.as_millis() <= anchor_floor) {
+            set.extend(self.committed_settled_window(local_shard, floor, height));
+        } else {
+            let floor = WeightedTimestamp::from_millis(anchor_floor);
+            self.walk_committed_settled(local_shard, floor, height, None, &mut set);
+        }
+        set
+    }
+
+    /// The committed-tail contribution to a settled-waves window under a
+    /// schedule-stable floor: every wave `local_shard` settled in a
+    /// committed block with weighted timestamp at or above `floor`, at
+    /// heights up to `upto` (inclusive).
+    ///
+    /// Memoized: the committed chain is linear and immutable, so for a
+    /// fixed floor the set only extends at the tip. A terminating shard's
+    /// window reaches back to its reshape's admission — several epochs of
+    /// blocks — and is recomputed on every coast proposal and every
+    /// verification of one; without the memo each call re-walks the whole
+    /// span. A call the memo doesn't cover (a lower height than already
+    /// folded, or a different floor) walks in full and leaves it alone.
+    fn committed_settled_window(
+        &self,
+        local_shard: ShardId,
+        floor: WeightedTimestamp,
+        upto: BlockHeight,
+    ) -> std::collections::BTreeSet<WaveId> {
+        let covered: Option<(BlockHeight, std::collections::BTreeSet<WaveId>)> =
+            read_or_recover(&self.settled_window_memo)
+                .as_ref()
+                .filter(|m| m.local_shard == local_shard && m.floor == floor && m.upto <= upto)
+                .map(|m| (m.upto, m.set.clone()));
+        let (covered_upto, mut set) = match covered {
+            Some((u, s)) => (Some(u), s),
+            None => (None, std::collections::BTreeSet::new()),
+        };
+        self.walk_committed_settled(local_shard, floor, upto, covered_upto, &mut set);
+
+        let mut memo = write_or_recover(&self.settled_window_memo);
+        if memo
+            .as_ref()
+            .is_none_or(|m| m.local_shard != local_shard || m.floor != floor || m.upto < upto)
+        {
+            *memo = Some(SettledWindowMemo {
+                local_shard,
+                floor,
+                upto,
+                set: set.clone(),
+            });
+        }
+        set
+    }
+
+    /// Walk the committed chain downward from `upto`, folding
+    /// `local_shard`'s settled wave-ids into `set`, stopping below `floor`
+    /// or at `covered_upto` (heights at or below it are already folded).
+    ///
+    /// The floor reads each block's own `parent_qc` weighted timestamp —
+    /// the same canonical, hash-pinned value the window anchor is,
+    /// identical on every node. The served certifying QC must not gate the
+    /// floor: a coast past the crossing can re-issue it at a higher round
+    /// with a divergent timestamp, and a per-node-variable cutoff would
+    /// diverge the attested root.
+    fn walk_committed_settled(
+        &self,
+        local_shard: ShardId,
+        floor: WeightedTimestamp,
+        upto: BlockHeight,
+        covered_upto: Option<BlockHeight>,
+        set: &mut std::collections::BTreeSet<WaveId>,
+    ) {
+        let mut h = upto;
+        while covered_upto != Some(h) {
             let Some(entry) = self.block_for_sync(h) else {
                 break;
             };
@@ -336,7 +419,6 @@ where
             let Some(prev) = h.prev() else { break };
             h = prev;
         }
-        set
     }
 
     /// Most recent QC observed by this chain. Pending entries shadow the
@@ -1761,5 +1843,45 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(set, BTreeSet::from([in_window, early_settled]));
+    }
+
+    /// The memoized window walk extends at the tip and never leaks later
+    /// settlements into an earlier block's window: a second call at a
+    /// higher height folds only the new blocks onto the memo, and a call
+    /// back below the memo's coverage recomputes in full.
+    #[test]
+    fn settled_window_memo_extends_at_the_tip_only() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let floor = Some(WeightedTimestamp::from_millis(500));
+        let (w2, w3, w4) = (wave(400), wave(401), wave(402));
+        let stub = StubStore::default()
+            .with_sync_block(
+                BlockHeight::new(2),
+                settled_sync_block(BlockHeight::new(2), 1_000, &w2),
+            )
+            .with_sync_block(
+                BlockHeight::new(3),
+                settled_sync_block(BlockHeight::new(3), 2_000, &w3),
+            )
+            .with_sync_block(
+                BlockHeight::new(4),
+                settled_sync_block(BlockHeight::new(4), 3_000, &w4),
+            );
+        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let at = |h: u64| {
+            chain.settled_waves_in_window(
+                ShardId::ROOT,
+                BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
+                BlockHeight::new(h),
+                WeightedTimestamp::from_millis(rh_ms + 10_000),
+                floor,
+                Vec::new(),
+            )
+        };
+        assert_eq!(at(3), BTreeSet::from([w2.clone(), w3.clone()]));
+        // The higher call folds only block 4 onto the memo.
+        assert_eq!(at(4), BTreeSet::from([w2.clone(), w3.clone(), w4]));
+        // Back below the memo's coverage: full recompute, no leak of block 4.
+        assert_eq!(at(3), BTreeSet::from([w2, w3]));
     }
 }
