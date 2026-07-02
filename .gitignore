@@ -52,6 +52,7 @@ docker-cluster-data/
 
 # Modelling
 tla/
+_apalache-out/
 
 # Docker compose and monitoring (dynamically generated)
 scripts/monitoring/prometheus.yml
