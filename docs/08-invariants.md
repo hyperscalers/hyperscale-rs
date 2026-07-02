@@ -34,7 +34,7 @@ The consolidated register of the system's safety and liveness properties, with s
 |---|---|---|
 | **INV-BEACON-1** | Safety | **One block per epoch.** SPC/PC (plus the skip path) commit at most one beacon block per epoch; honest replicas agree on the block sequence. |
 | **INV-BEACON-2** | Determinism | **Pure fold.** `BeaconState` is a pure function of the committed block sequence; all honest replicas hold byte-identical state at every epoch. |
-| **INV-BEACON-3** | Safety | **Lookahead freeze.** The committees governing epoch e+1 are computed and frozen during epoch e's fold — before any artifact in e+1's window can exist. |
+| **INV-BEACON-3** | Safety | **Lookahead freeze.** The committees governing epoch e+1 are computed and frozen during epoch e's fold. Artifacts can still outrun the frozen head (admission-bounded timestamp skew, or a lagging local fold); INV-BEACON-4 defers those lookups rather than mis-resolving. |
 | **INV-BEACON-4** | Safety | **Schedule coverage.** Every weighted timestamp a verifier can legitimately encounter resolves in the topology schedule; lookups below the retention floor are rejected permanently, above the head deferred — never silently mis-resolved. |
 | **INV-BEACON-5** | Determinism | **Canonical boundary.** Per epoch and shard, all replicas derive the same single canonical boundary QC (max by `(WT, hash)` over committed proposals). |
 | **INV-BEACON-6** | Safety | **Witness integrity.** Witness chunks are contiguous, merkle-proven against the QC-attested boundary header, and applied exactly once against a per-shard watermark. |
