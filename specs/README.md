@@ -7,7 +7,7 @@ Machine-checked models of hyperscale's protocols, written in [Quint](https://qui
 | Model | File | Scope | Properties | Status |
 |---|---|---|---|---|
 | **A** | [wt_clock.qnt](wt_clock.qnt) | The weighted-time clock: per-vote clamp, quorum mean, admission plausibility, epoch resolution | INV-SHARD-6, INV-BEACON-3/4 | Verified |
-| **B** | — | Shard consensus (the HotStuff-2 variant): safe-vote rule, round-contiguous commit, crash-recovery register re-init. Opens with a substrate pilot: the vote rule written plain vs. on [Choreo](https://github.com/quint-co/choreo), both under `quint verify`; the tractable one wins | INV-SHARD-1..4 | Next |
+| **B** | [shard_consensus.qnt](shard_consensus.qnt) | Shard consensus (the HotStuff-2 variant): safe-vote rule, round-contiguous commit, crash-recovery register re-init. The broken twin is the register-persistence gap, not artificial constants: one crash + F Byzantine forks the commit (scripted witness + Apalache search) | INV-SHARD-1..4 | Verified (depth 8) |
 | **C** | — | Atomic commitment with shard consensus abstracted to a commit oracle: provision → execute → certify, deterministic aborts, wave deadlines | INV-EXEC-1/4/5 | Planned |
 | **D** | — | Straddler settlement layered on C: settled set, fence, sweeps, late-EC materialization | INV-RESHAPE-5/6 | Planned |
 
@@ -25,5 +25,6 @@ Models compose by abstraction, not size: each takes the earlier models' verified
 ## Apalache notes
 
 - Symbolic mode requires **constant integer ranges**: encode state-relative quantities as offsets in a constant band (never `a.to(b)` with a state- or nondet-dependent bound), and pick subsets via `powerset()` with a size guard rather than an index range.
+- **[Choreo](https://github.com/quint-co/choreo) is `quint run`-only.** Its row-polymorphic core fails Apalache's type recovery on Choreo's own examples (2PC: Snowcat error on `choreo::s`; MonadBFT: JVM crash), and its test suite never invokes `verify`. Models here are plain Quint; Choreo's file organization (types/protocol/instance split, explicit local-state records) is still worth imitating.
 - `quint verify` downloads Apalache automatically on first use; a JDK must be on the PATH.
 - Counterexamples land in `_apalache-out/` (gitignored), including ITF JSON traces — the format a future model-based-testing bridge can replay against the Rust state machines.
