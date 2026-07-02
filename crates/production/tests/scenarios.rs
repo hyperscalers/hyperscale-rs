@@ -27,7 +27,7 @@ use hyperscale_scenarios::{
     multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    single_shard_tx, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
@@ -322,6 +322,21 @@ fn split_straddler_atomic_prod() {
     let mut cluster =
         ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
     split_straddler_atomic(&mut cluster);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn split_straddler_ec_partition_atomic_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let setup = split_straddler_setup();
+    let mut cluster =
+        ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
+    split_straddler_ec_partition_atomic(&mut cluster);
     cluster.shutdown();
 }
 

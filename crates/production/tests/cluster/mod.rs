@@ -520,6 +520,17 @@ impl Cluster {
             .position(|h| h.adapter.local_shards().contains(&shard))
     }
 
+    /// Every host index serving `shard` — its committee members, before a
+    /// terminating reshape relocates them.
+    pub fn hosts_serving(&self, shard: ShardId) -> Vec<usize> {
+        self.hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.adapter.local_shards().contains(&shard))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// A live handle to any host's `RocksDbShardStorage` for `shard`. Every
     /// committee member commits the same chain, so the first match suffices.
     fn store_for(&self, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {

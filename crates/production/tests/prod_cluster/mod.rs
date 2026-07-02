@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use hyperscale_engine::GenesisConfig;
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_libp2p::fault::{DropSpec, RuleHandle};
+use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
 use hyperscale_scenarios::{
@@ -325,6 +325,35 @@ impl FaultableCluster for ProdCluster {
 
     fn clear_drops(&mut self) {
         self.inner.fault_clear_all();
+    }
+
+    fn drop_type_between(
+        &mut self,
+        from: &[usize],
+        to: &[usize],
+        type_id: &'static str,
+    ) -> FaultHandle {
+        let mut handles = Vec::new();
+        for &src in from {
+            for &dst in to {
+                if src == dst {
+                    continue;
+                }
+                let from = u32::try_from(src).expect("host index fits u32");
+                let to = u32::try_from(dst).expect("host index fits u32");
+                handles.extend(self.inner.fault_install_drop(&DropSpec {
+                    type_id: Some(type_id),
+                    from: Some(HostId(from)),
+                    to: Some(HostId(to)),
+                    ..DropSpec::default()
+                }));
+            }
+        }
+        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
+        self.inner.hosts_serving(shard)
     }
 
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {

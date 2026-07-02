@@ -27,7 +27,38 @@ use crate::support::wait::{
     await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor, await_serves,
     await_split_admitted, await_tx_terminal,
 };
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
+
+/// Cut every path by which `shard`'s committee obtains `peer_shard`'s execution
+/// certificate, so a cross-shard wave the two share cannot finalize on `shard`'s
+/// side.
+///
+/// Fault rules gate pushes (gossip) and request legs, never response legs, so EC
+/// intake is cut on the push and on the pulls, with the correct direction per
+/// leg: `peer_shard` pushes its EC by gossip (`execution.cert.batch`), and
+/// `shard` pulls the EC and the finalized wave that bundles it
+/// (`execution_cert.request`, `finalized_wave.request`). Provisions and headers
+/// still flow, so `shard` still executes the wave and produces its own EC; it
+/// just never receives `peer_shard`'s.
+///
+/// Faithful only with disjoint committees — if the two shards share a host, its
+/// co-hosted vnodes hand the EC across in-process, which no network rule
+/// intercepts.
+#[must_use]
+pub fn isolate_ec_intake(
+    c: &mut impl FaultableCluster,
+    shard: ShardId,
+    peer_shard: ShardId,
+) -> FaultHandle {
+    let shard_hosts = c.committee_hosts(shard);
+    let peer_hosts = c.committee_hosts(peer_shard);
+    let handles = [
+        c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
+        c.drop_type_between(&shard_hosts, &peer_hosts, "execution_cert.request"),
+        c.drop_type_between(&shard_hosts, &peer_hosts, "finalized_wave.request"),
+    ];
+    FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
 
 /// Epochs of lead before the threshold vote activates.
 const VOTE_ACTIVATE_LEAD: u64 = 4;
@@ -56,6 +87,36 @@ const STRADDLER_SPLIT_BYTES: u64 = 500_000;
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
     let (probes, splitter, terminal_b) = split_straddler_run(c, |_| {});
     assert_fence_held(c, splitter, terminal_b, &probes);
+}
+
+/// Verify a split straddler settles atomically when the terminating splitter is
+/// isolated from the survivor's execution certificate.
+///
+/// The same choreography as [`split_straddler_atomic`], but with the splitter's
+/// EC intake cut ([`isolate_ec_intake`]) once committees stabilize: provisions
+/// still flow, so the splitter executes each straddler and produces its own EC,
+/// but never receives the survivor's and so settles none. The pre-boundary
+/// settlement fence must hold atomicity anyway — the survivor cannot finalize a
+/// straddler naming the splitter while the splitter has an admitted terminating
+/// reshape, so no straddler resolves one-sided.
+///
+/// Requires disjoint splitter/survivor committees (no shared host), or a
+/// co-hosted vnode bridges the EC across in-process, which no network rule
+/// intercepts. The simulation seats these via dedicated pool hosts.
+///
+/// # Panics
+///
+/// Panics if the choreography misses its budget or any straddler resolves
+/// one-sided (the survivor applies one the splitter never settled).
+pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
+    let (probes, splitter, terminal_b) = split_straddler_run(c, |c| {
+        let _ = isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    });
+    let one_sided = straddler_one_sided_count(c, splitter, terminal_b, &probes);
+    assert_eq!(
+        one_sided, 0,
+        "the survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
+    );
 }
 
 /// The split-straddler choreography, minus the terminal assertion.

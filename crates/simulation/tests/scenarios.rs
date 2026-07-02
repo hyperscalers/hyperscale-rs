@@ -22,7 +22,7 @@ use hyperscale_scenarios::{
     multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    single_shard_tx, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
@@ -196,36 +196,18 @@ fn split_straddler_atomic_sim() {
 
 /// Straddler atomicity under an asymmetric EC partition across a split boundary.
 ///
-/// The terminating splitter is isolated from the survivor's execution
-/// certificate — its EC gossip is dropped inbound and the splitter's EC /
-/// finalized-wave fetch requests are dropped outbound — while provisions still
-/// flow, so the splitter executes the straddler and produces its own EC but
-/// never receives the survivor's. Dedicated per-host vnodes keep the two
-/// committees on disjoint hosts, so no in-process dispatch bridges the cut.
-///
-/// The pre-boundary settlement fence holds atomicity anyway: the survivor cannot
-/// finalize a straddler naming the splitter while the splitter has an admitted
-/// terminating reshape, so every straddler resolves the same on both sides —
-/// settled by the splitter and accepted by the survivor, or aborted on both. The
-/// seeds sweep timings that resolve finalization against the counterpart-abort
-/// sweep differently; none may resolve one-sided.
+/// Drives the portable [`split_straddler_ec_partition_atomic`] scenario across a
+/// seed sweep, seating disjoint splitter/survivor committees via dedicated pool
+/// hosts so no co-hosted vnode bridges the EC cut in-process. The seeds vary how
+/// the survivor's finalization races its own counterpart-abort sweep; none may
+/// resolve one-sided.
 #[test]
 fn split_straddler_asymmetric_ec_partition() {
-    use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR};
-    use hyperscale_scenarios::{split_straddler_run, straddler_one_sided_count};
-
     for seed in [7u64, 11, 42, 2026, 1337] {
         let setup = split_straddler_setup();
         let mut cluster =
             SimCluster::with_dedicated_pool_hosts(&straddler_config(), seed, &setup.balances);
-        let (probes, splitter, terminal_b) = split_straddler_run(&mut cluster, |c| {
-            c.isolate_ec_intake(STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
-        });
-        let one_sided = straddler_one_sided_count(&cluster, splitter, terminal_b, &probes);
-        assert_eq!(
-            one_sided, 0,
-            "seed {seed}: survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
-        );
+        split_straddler_ec_partition_atomic(&mut cluster);
     }
 }
 
