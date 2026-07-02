@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
+use hyperscale_network::fault::{HostId, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
@@ -381,6 +382,39 @@ impl FaultableCluster for SimCluster {
 
     fn clear_drops(&mut self) {
         self.runner.network_mut().fault().clear();
+    }
+
+    fn drop_type_between(
+        &mut self,
+        from: &[usize],
+        to: &[usize],
+        type_id: &'static str,
+    ) -> FaultHandle {
+        let mut handles = Vec::new();
+        for &src in from {
+            for &dst in to {
+                if src == dst {
+                    continue;
+                }
+                handles.push(
+                    self.runner
+                        .network_mut()
+                        .fault()
+                        .drop_type(type_id)
+                        .from(HostId(host_index(src)))
+                        .to(HostId(host_index(dst)))
+                        .install(),
+                );
+            }
+        }
+        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
+        self.live_committee_hosts(shard)
+            .into_iter()
+            .map(|node| node as usize)
+            .collect()
     }
 
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {

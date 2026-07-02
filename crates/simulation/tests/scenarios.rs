@@ -22,7 +22,7 @@ use hyperscale_scenarios::{
     multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
-    single_shard_tx, split_lifecycle, split_straddler_atomic,
+    single_shard_tx, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     stake_deposit_folds_into_beacon_state, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
@@ -192,6 +192,23 @@ fn split_straddler_atomic_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_balances(&straddler_config(), 11, &setup.balances);
     split_straddler_atomic(&mut cluster);
+}
+
+/// Straddler atomicity under an asymmetric EC partition across a split boundary.
+///
+/// Drives the portable [`split_straddler_ec_partition_atomic`] scenario across a
+/// seed sweep, seating disjoint splitter/survivor committees via dedicated pool
+/// hosts so no co-hosted vnode bridges the EC cut in-process. The seeds vary how
+/// the survivor's finalization races its own counterpart-abort sweep; none may
+/// resolve one-sided.
+#[test]
+fn split_straddler_asymmetric_ec_partition() {
+    for seed in [7u64, 11, 42, 2026, 1337] {
+        let setup = split_straddler_setup();
+        let mut cluster =
+            SimCluster::with_dedicated_pool_hosts(&straddler_config(), seed, &setup.balances);
+        split_straddler_ec_partition_atomic(&mut cluster);
+    }
 }
 
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing

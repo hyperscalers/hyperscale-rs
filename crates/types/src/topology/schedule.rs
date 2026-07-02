@@ -409,6 +409,37 @@ impl TopologySchedule {
         }
     }
 
+    /// Whether `shard` is scheduled to terminate — leave the trie via a split
+    /// or merge — at or after `wt`, as far as the schedule can see.
+    ///
+    /// Covers the whole terminating lifecycle: an admitted-but-unexecuted
+    /// reshape shows in the active window's [`split_pending`] /
+    /// [`merge_pending`] one epoch after admission, and in the lookahead
+    /// window immediately (its projection is frozen from the live pending
+    /// reshapes), so both are consulted; once the reshape executes the record
+    /// clears but the shard coasts to its terminal block with its successors
+    /// already in the lookahead, which [`terminates_at_next_boundary`] reads.
+    /// A shard with no reshape returns `false` in every window, so a plain
+    /// epoch crossing never trips this.
+    ///
+    /// Deterministic in `(schedule, wt)`, so the vote fence and the finalize
+    /// gate agree. Used to fence a straddler naming a shard whose settled set
+    /// cannot exist yet because it has not terminated.
+    ///
+    /// [`split_pending`]: TopologySnapshot::split_pending
+    /// [`merge_pending`]: TopologySnapshot::merge_pending
+    /// [`terminates_at_next_boundary`]: Self::terminates_at_next_boundary
+    #[must_use]
+    pub fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        let epoch = self.epoch_for(wt);
+        let pending = [epoch, epoch.next()].iter().any(|e| {
+            self.by_epoch
+                .get(e)
+                .is_some_and(|s| s.split_pending(shard) || s.merge_pending(shard))
+        });
+        pending || self.terminates_at_next_boundary(shard, wt) == Some(true)
+    }
+
     /// Record the committee governing `epoch`. The beacon coordinator inserts
     /// the just-applied epoch's active committee and the next epoch's
     /// lookahead on every commit.

@@ -27,7 +27,38 @@ use crate::support::wait::{
     await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor, await_serves,
     await_split_admitted, await_tx_terminal,
 };
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
+
+/// Cut every path by which `shard`'s committee obtains `peer_shard`'s execution
+/// certificate, so a cross-shard wave the two share cannot finalize on `shard`'s
+/// side.
+///
+/// Fault rules gate pushes (gossip) and request legs, never response legs, so EC
+/// intake is cut on the push and on the pulls, with the correct direction per
+/// leg: `peer_shard` pushes its EC by gossip (`execution.cert.batch`), and
+/// `shard` pulls the EC and the finalized wave that bundles it
+/// (`execution_cert.request`, `finalized_wave.request`). Provisions and headers
+/// still flow, so `shard` still executes the wave and produces its own EC; it
+/// just never receives `peer_shard`'s.
+///
+/// Faithful only with disjoint committees — if the two shards share a host, its
+/// co-hosted vnodes hand the EC across in-process, which no network rule
+/// intercepts.
+#[must_use]
+pub fn isolate_ec_intake(
+    c: &mut impl FaultableCluster,
+    shard: ShardId,
+    peer_shard: ShardId,
+) -> FaultHandle {
+    let shard_hosts = c.committee_hosts(shard);
+    let peer_hosts = c.committee_hosts(peer_shard);
+    let handles = [
+        c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
+        c.drop_type_between(&shard_hosts, &peer_hosts, "execution_cert.request"),
+        c.drop_type_between(&shard_hosts, &peer_hosts, "finalized_wave.request"),
+    ];
+    FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
 
 /// Epochs of lead before the threshold vote activates.
 const VOTE_ACTIVATE_LEAD: u64 = 4;
@@ -54,6 +85,58 @@ const STRADDLER_SPLIT_BYTES: u64 = 500_000;
 /// Panics if the grow or split misses its budget, or the settled-waves fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler).
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
+    let (probes, splitter, terminal_b) = split_straddler_run(c, |_| {});
+    assert_fence_held(c, splitter, terminal_b, &probes);
+}
+
+/// Verify a split straddler settles atomically when the terminating splitter is
+/// isolated from the survivor's execution certificate.
+///
+/// The same choreography as [`split_straddler_atomic`], but with the splitter's
+/// EC intake cut ([`isolate_ec_intake`]) once committees stabilize: provisions
+/// still flow, so the splitter executes each straddler and produces its own EC,
+/// but never receives the survivor's and so settles none. The pre-boundary
+/// settlement fence must hold atomicity anyway — the survivor cannot finalize a
+/// straddler naming the splitter while the splitter has an admitted terminating
+/// reshape, so no straddler resolves one-sided.
+///
+/// Requires disjoint splitter/survivor committees (no shared host), or a
+/// co-hosted vnode bridges the EC across in-process, which no network rule
+/// intercepts. The simulation seats these via dedicated pool hosts.
+///
+/// # Panics
+///
+/// Panics if the choreography misses its budget or any straddler resolves
+/// one-sided (the survivor applies one the splitter never settled).
+pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
+    let (probes, splitter, terminal_b) = split_straddler_run(c, |c| {
+        let _ = isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    });
+    let one_sided = straddler_one_sided_count(c, splitter, terminal_b, &probes);
+    assert_eq!(
+        one_sided, 0,
+        "the survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
+    );
+}
+
+/// The split-straddler choreography, minus the terminal assertion.
+///
+/// Grows, votes the threshold down, submits settling then straddling waves,
+/// drives the split, and waits for every straddler to reach a terminal verdict.
+/// Returns the probe hashes, the splitter shard, and its terminal block height
+/// for the caller to judge. `before_settling` runs once after the split is
+/// admitted (committees stable, splitter still live) and before the settling
+/// waves are submitted — the seam a fault probe uses to install a rule keyed on
+/// the live committees.
+///
+/// # Panics
+///
+/// Panics if the grow or split misses its budget, or a straddler never reaches
+/// a terminal verdict.
+pub fn split_straddler_run<C: Cluster>(
+    c: &mut C,
+    mut before_settling: impl FnMut(&mut C),
+) -> (Vec<TxHash>, ShardId, BlockHeight) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let (child_left, child_right) = splitter.children();
@@ -90,6 +173,11 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
     );
 
     let mut probes: Vec<TxHash> = Vec::new();
+
+    // Fault-injection seam: committees are stable and the splitter is still
+    // live, so a probe can key a rule on the live splitter/survivor committees
+    // before any straddler EC crosses.
+    before_settling(c);
 
     // Settling waves: submitted while the splitter still commits real blocks, so
     // it finalizes them before its terminal cut — they settle atomically.
@@ -137,7 +225,7 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
         );
     }
 
-    assert_fence_held(c, splitter, terminal_b, &probes);
+    (probes, splitter, terminal_b)
 }
 
 /// Verify a surviving sibling's second-generation split seats correctly.
@@ -381,11 +469,53 @@ fn assert_fence_held<C: Cluster>(
     terminal_b: BlockHeight,
     probes: &[TxHash],
 ) {
-    let mut consistent = 0u32;
-    let mut doomed = 0u32;
-    let mut one_sided = 0u32;
-    let mut mismatch = 0u32;
-    let mut report = String::new();
+    let tally = straddler_tally(c, splitter, terminal_b, probes);
+
+    assert_eq!(
+        tally.one_sided, 0,
+        "the survivor applied a straddler the splitter never settled — one-sided:{}",
+        tally.report,
+    );
+    assert_eq!(
+        tally.mismatch, 0,
+        "the survivor's verdict contradicted the splitter's settlement:{}",
+        tally.report,
+    );
+    assert!(
+        tally.consistent > 0,
+        "no straddler settled atomically — submission timing needs retuning:{}",
+        tally.report,
+    );
+}
+
+/// How each straddler resolved on the survivor versus what the splitter settled
+/// by its terminal block.
+struct StraddlerTally {
+    /// Survivor verdict matched the splitter's settlement.
+    consistent: u32,
+    /// Splitter never settled it; survivor correctly aborted.
+    doomed: u32,
+    /// Survivor applied a decision the splitter never settled — a broken fence.
+    one_sided: u32,
+    /// Survivor's verdict contradicted the splitter's settlement.
+    mismatch: u32,
+    /// Per-probe detail for assertion messages.
+    report: String,
+}
+
+fn straddler_tally<C: Cluster>(
+    c: &C,
+    splitter: ShardId,
+    terminal_b: BlockHeight,
+    probes: &[TxHash],
+) -> StraddlerTally {
+    let mut tally = StraddlerTally {
+        consistent: 0,
+        doomed: 0,
+        one_sided: 0,
+        mismatch: 0,
+        report: String::new(),
+    };
 
     for (idx, hash) in probes.iter().enumerate() {
         let (_, splitter_final) = c.chain_fate(splitter, *hash);
@@ -398,29 +528,37 @@ fn assert_fence_held<C: Cluster>(
             _ => None,
         };
         let _ = write!(
-            report,
+            tally.report,
             "\n  #{idx}: splitter settled={settled:?}; survivor verdict={verdict:?}",
         );
         match (settled, verdict) {
-            (Some(t), Some(v)) if t == v => consistent += 1,
-            (Some(_), Some(_)) => mismatch += 1,
-            (None, Some(TransactionDecision::Aborted)) => doomed += 1, // correctly aborted
-            (None, Some(_)) => one_sided += 1,
+            (Some(t), Some(v)) if t == v => tally.consistent += 1,
+            (Some(_), Some(_)) => tally.mismatch += 1,
+            (None, Some(TransactionDecision::Aborted)) => tally.doomed += 1, // correctly aborted
+            (None, Some(_)) => tally.one_sided += 1,
             (_, None) => {} // unresolved — the terminal-verdict gate caught it
         }
     }
-    let _ = write!(report, "\n  consistent={consistent} doomed={doomed}");
+    let _ = write!(
+        tally.report,
+        "\n  consistent={} doomed={}",
+        tally.consistent, tally.doomed,
+    );
+    tally
+}
 
-    assert_eq!(
-        one_sided, 0,
-        "the survivor applied a straddler the splitter never settled — one-sided:{report}",
-    );
-    assert_eq!(
-        mismatch, 0,
-        "the survivor's verdict contradicted the splitter's settlement:{report}",
-    );
-    assert!(
-        consistent > 0,
-        "no straddler settled atomically — submission timing needs retuning:{report}",
-    );
+/// The number of straddlers the survivor applied one-sided.
+///
+/// A one-sided straddler is one the survivor finalized on a decision the
+/// splitter never settled by its terminal block. Zero when the fence holds; a
+/// probe that cuts the survivor→splitter EC channel across the boundary watches
+/// whether it goes positive.
+#[must_use]
+pub fn straddler_one_sided_count<C: Cluster>(
+    c: &C,
+    splitter: ShardId,
+    terminal_b: BlockHeight,
+    probes: &[TxHash],
+) -> u32 {
+    straddler_tally(c, splitter, terminal_b, probes).one_sided
 }
