@@ -238,9 +238,11 @@ pub struct ExecutionCoordinator {
     settled_sets: HashMap<ShardId, SettledWaveSet>,
 
     /// Finalized waves built but withheld because a contained EC names a
-    /// past-terminal shard whose settled set isn't known yet (the gate's
-    /// `Defer`). Re-checked when that set is recorded, then emitted if
-    /// settled or dropped if not. Keyed by `WaveId`.
+    /// shard that is scheduled to terminate, or past-terminal with its
+    /// settled set not yet known (the gate's `Defer`). Re-checked on every
+    /// commit and when a set is recorded; a wave leaves only on evidence —
+    /// settled-set membership, the scheduled termination clearing, or the
+    /// schedule evicting the shard — never on a clock. Keyed by `WaveId`.
     gated_finalized: HashMap<WaveId, Arc<Verifiable<FinalizedWave>>>,
 
     /// Past-terminal partner shards whose settled set is recorded but whose
@@ -1588,11 +1590,12 @@ impl ExecutionCoordinator {
         self.early.gc_stale_ecs(self.committed_ts);
         self.provisioning.gc_stale_provisions(self.committed_ts);
 
-        // Re-check gate-held finalized waves against the advanced clock:
-        // emit any the schedule now resolves, and drop any held past their
-        // retention horizon. Runs every block so a settled set that never
-        // reconstructs can't pin the buffer; rejected straddlers ride
-        // `gate_rejected_aborts` into the commit's counterpart sweep.
+        // Re-check gate-held finalized waves against the advanced schedule:
+        // emit any it now resolves, and drop any whose partner it has
+        // evicted from every retained window. Runs every block so a settled
+        // set that never reconstructs can't pin the buffer; rejected
+        // straddlers ride `gate_rejected_aborts` into the commit's
+        // counterpart sweep.
         actions.extend(self.redrive_gated_finalizations(topology_schedule));
 
         // Re-broadcast outbound ECs that haven't been ACKed via wave
@@ -1887,9 +1890,9 @@ impl ExecutionCoordinator {
     ///
     /// `Pass` records the wave and emits the admission event (one event
     /// covers both the shard consensus subscriber and the `io_loop`
-    /// serving cache). `Defer` buffers it until the past-terminal shard's
-    /// settled
-    /// set is reconstructed ([`Self::redrive_gated_finalizations`]).
+    /// serving cache). `Defer` buffers it until the terminating shard's
+    /// settled set resolves it or its scheduled termination clears
+    /// ([`Self::redrive_gated_finalizations`]).
     /// `Reject` drops it — the wave names a past-terminal shard that
     /// didn't settle it, so it must never be produced; the counterpart
     /// abort sweep terminates the underlying transaction.
@@ -1922,23 +1925,13 @@ impl ExecutionCoordinator {
                 )]
             }
             SettledSetVerdict::Defer => {
-                // Hold until the past-terminal partner's settled set
-                // reconstructs — unless the wave has been held past
-                // `RETENTION_HORIZON` of its own execution anchor, at which
-                // point the set is categorically irrelevant everywhere and
-                // can never resolve it. Then it rides the reject path so its
-                // straddlers abort rather than the buffer growing unbounded.
-                let anchor = finalized_arc
-                    .execution_certificates()
-                    .iter()
-                    .map(|ec| ec.vote_anchor_ts())
-                    .max()
-                    .unwrap_or(self.committed_ts);
-                if self.committed_ts > anchor.plus(RETENTION_HORIZON) {
-                    self.gate_rejected_aborts.extend(finalized_arc.tx_hashes());
-                } else {
-                    self.gated_finalized.insert(wave_id, finalized_arc);
-                }
+                // Hold until evidence resolves the wave: the partner's
+                // settled set reconstructs (pass or reject on membership),
+                // its scheduled termination clears (pass), or the schedule
+                // evicts it from every retained window (reject). Never
+                // dropped on a clock — a deadline verdict here can
+                // contradict a settlement the partner already committed.
+                self.gated_finalized.insert(wave_id, finalized_arc);
                 vec![]
             }
             SettledSetVerdict::Reject => {
@@ -2074,10 +2067,9 @@ impl ExecutionCoordinator {
         aborted
     }
 
-    /// Re-check every gate-held finalized wave now that a settled set was
-    /// recorded: emit the ones now settled, drop the ones now known
-    /// unsettled, and re-hold any still naming an unknown past-terminal
-    /// shard.
+    /// Re-check every gate-held finalized wave against the current settled
+    /// sets and schedule: emit the ones now resolvable, drop the ones now
+    /// known unsettled or schedule-evicted, and re-hold the rest.
     pub fn redrive_gated_finalizations(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -4312,41 +4304,85 @@ mod tests {
         );
     }
 
-    /// A gate-held wave whose partner's settled set never reconstructs
-    /// can't defer forever: once the commit clock passes the wave's own
-    /// execution anchor by `RETENTION_HORIZON`, the redrive drops it like a
-    /// reject so its straddler aborts rather than the buffer growing
-    /// unbounded.
+    /// A gate-held wave is never dropped on a clock: held past its own
+    /// execution anchor by `RETENTION_HORIZON` while its partner's
+    /// scheduled termination still stands, it stays held — the partner may
+    /// yet prove it settled the wave, and a deadline abort would contradict
+    /// that settlement. Only the schedule evicting the partner from every
+    /// retained window rejects it, so its straddler aborts rather than the
+    /// buffer pinning forever.
     #[test]
-    fn gate_held_wave_evicts_past_its_retention_horizon() {
+    fn gate_held_wave_survives_the_horizon_until_schedule_eviction() {
+        // Windows long enough that the commit clock can pass the wave's
+        // anchor plus the horizon while the pre-terminal window still
+        // governs — the shape a terminating shard's multi-epoch coast has
+        // at production epoch length.
+        let epoch_ms = 2 * RETENTION_HORIZON.as_secs() * 1000;
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let final_window = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators.clone()),
+        ));
+        let post_split = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        ));
+        let mut sched = TopologySchedule::new(epoch_ms, Epoch::new(0), final_window);
+        sched.insert(Epoch::new(1), Arc::clone(&post_split));
+
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
-        // Past ROOT's terminal window so the gate defers while the settled
-        // set is unknown.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        let sched = terminating_schedule();
         let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let wave_id = wave.wave_id().clone();
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
 
+        // ROOT is live in epoch 0 but leaves the trie at its boundary: the
+        // gate defers on the scheduled termination.
         let deferred = state.emit_or_gate_finalized(&sched, wave);
-        assert!(deferred.is_empty(), "held while the settled set is unknown");
+        assert!(
+            deferred.is_empty(),
+            "held while the partner is scheduled to terminate",
+        );
         assert!(state.gated_finalized.contains_key(&wave_id));
 
-        // The set never reconstructs; the commit clock advances past the
-        // wave's anchor (1ms) plus the horizon. The next redrive evicts it.
+        // The settled set doesn't exist yet; the commit clock sails past
+        // the wave's anchor (1ms) plus the horizon with epoch 0 still
+        // governing. The hold must survive the clock.
         state.committed_ts = WeightedTimestamp::from_millis(2).plus(RETENTION_HORIZON);
         let released = state.redrive_gated_finalizations(&sched);
         assert!(released.is_empty(), "an unresolved wave is never finalized");
         assert!(
-            state.gated_finalized.is_empty(),
-            "the buffer no longer pins the held wave",
+            state.gated_finalized.contains_key(&wave_id),
+            "a gate-held wave is never dropped on a clock",
         );
+        assert!(
+            state.take_ready_counterpart_aborts().is_empty(),
+            "no abort while the wave can still resolve",
+        );
+
+        // ROOT falls out of every retained window: no honest artifact can
+        // resolve the wave anymore, so the redrive rejects it and its
+        // straddler aborts.
+        let evicted = TopologySchedule::new(epoch_ms, Epoch::new(0), post_split);
+        let released = state.redrive_gated_finalizations(&evicted);
+        assert!(released.is_empty(), "an unresolved wave is never finalized");
+        assert!(state.gated_finalized.is_empty());
         assert!(!state.finalized.contains(&wave_id));
 
         let aborted = state.take_ready_counterpart_aborts();
         assert_eq!(
             aborted, tx_hashes,
-            "the held wave's straddler aborts rather than wedging in flight",
+            "the held wave's straddler aborts once the partner is evicted",
         );
     }
 
