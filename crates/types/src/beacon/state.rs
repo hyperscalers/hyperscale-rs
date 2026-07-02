@@ -40,8 +40,9 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, Randomness,
-    SettledWavesRoot, ShardId, Stake, StakePoolId, StateRoot, ValidatorId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, RETENTION_HORIZON,
+    Randomness, SettledWavesRoot, ShardId, Stake, StakePoolId, StateRoot, ValidatorId,
+    WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -269,6 +270,14 @@ pub struct ShardBoundary {
     /// [`ShardAnchor`](crate::ShardAnchor) and resolves split-straddling
     /// waves against it. `None` for a live shard.
     pub settled_waves_root: Option<SettledWavesRoot>,
+    /// Epoch the reshape that terminates this shard was admitted (split)
+    /// or paired (merge), stamped at the reshape's execution alongside
+    /// [`terminal_epoch`](Self::terminal_epoch). Floors the shard's
+    /// attested settled-waves window: counterpart fences hold straddlers
+    /// from the moment the reshape projects, so the window must reach back
+    /// to that point, not a fixed span behind the terminal. `None` for a
+    /// live shard.
+    pub reshape_admitted_epoch: Option<Epoch>,
 }
 
 /// One observer drawn into a pending split's cohort.
@@ -476,6 +485,13 @@ pub struct BeaconState {
     /// predicate reads it to answer "no split lands at this window's
     /// end" without the next window's entry.
     pub split_pending_window: BTreeSet<ShardId>,
+    /// Each terminating leaf's settled-waves window floor as of this
+    /// epoch's promotion, frozen under the [`Self::split_pending_window`]
+    /// discipline: pending split targets and paired merge children from
+    /// the live records, plus shards already coasting to their terminal
+    /// (their boundary carries the stamp once the record is gone). The
+    /// schedule's settled-window floor reads it.
+    pub settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Each pending split's observer cohort (keyed by parent, mapping
     /// observer → child sub-shard) as of this epoch's promotion, frozen
     /// under the [`Self::split_pending_window`] discipline. A window's
@@ -772,6 +788,7 @@ struct WindowProjection {
     /// snapshots project the same map.
     reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     split_pending: BTreeSet<ShardId>,
+    settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Governable params for this window: `params` (head) or `next_params`
     /// (lookahead). Frozen one epoch ahead like the committee.
     params: NetworkParams,
@@ -922,6 +939,7 @@ impl BeaconState {
                 reshape_keepers: self.reshape_keepers_window.clone(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.split_pending_window.clone(),
+                settled_window_floors: self.settled_window_floors.clone(),
                 params: self.params,
             },
             network,
@@ -946,6 +964,7 @@ impl BeaconState {
                 reshape_keepers: self.live_reshape_keepers(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.live_split_pending(),
+                settled_window_floors: self.live_settled_window_floors(),
                 params: self.next_params,
             },
             network,
@@ -1007,6 +1026,49 @@ impl BeaconState {
             .collect()
     }
 
+    /// Each terminating leaf's settled-waves window floor as state stands
+    /// right now: the start of the epoch its reshape was admitted (split)
+    /// or paired (merge), backed off by [`RETENTION_HORIZON`] to cover a
+    /// wave that finalized against the fence just after it armed but
+    /// executed up to a full wave lifetime earlier. Sourced from
+    /// `pending_reshapes` while the record lives and from the boundary
+    /// stamp once the reshape executes (the coast). The value the next
+    /// promotion freezes into [`Self::settled_window_floors`], and what
+    /// the lookahead snapshot projects.
+    #[must_use]
+    pub fn live_settled_window_floors(&self) -> BTreeMap<ShardId, WeightedTimestamp> {
+        let floor = |admitted: Epoch| {
+            WeightedTimestamp::from_millis(
+                admitted
+                    .inner()
+                    .saturating_mul(self.chain_config.epoch_duration_ms)
+                    .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
+            )
+        };
+        let mut floors: BTreeMap<ShardId, WeightedTimestamp> = self
+            .boundaries
+            .iter()
+            .filter_map(|(shard, b)| b.reshape_admitted_epoch.map(|at| (*shard, floor(at))))
+            .collect();
+        for (target, reshape) in &self.pending_reshapes {
+            match reshape {
+                PendingReshape::Split { admitted_at, .. } => {
+                    floors.insert(*target, floor(*admitted_at));
+                }
+                PendingReshape::Merge {
+                    admitted_at: Some(at),
+                    ..
+                } => {
+                    let (left, right) = target.children();
+                    floors.insert(left, floor(*at));
+                    floors.insert(right, floor(*at));
+                }
+                PendingReshape::Merge { .. } => {}
+            }
+        }
+        floors
+    }
+
     /// Each pending split's observer cohort (parent → observer → child
     /// sub-shard) as `pending_reshapes` stand right now — the value the
     /// next promotion freezes into [`Self::reshape_observers_window`], and
@@ -1059,6 +1121,7 @@ impl BeaconState {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            settled_window_floors,
             params,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
@@ -1122,6 +1185,7 @@ impl BeaconState {
             split_pending,
         )
         .with_params(params)
+        .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
     }
 
@@ -1299,6 +1363,7 @@ mod tests {
             shard_consensus_members: BTreeMap::new(),
             witness_window_bases: BTreeMap::new(),
             split_pending_window: BTreeSet::new(),
+            settled_window_floors: BTreeMap::new(),
             reshape_observers_window: BTreeMap::new(),
             reshape_keepers_window: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
@@ -1376,6 +1441,7 @@ mod tests {
             terminal_epoch: None,
             terminal_qc_wt: None,
             settled_waves_root: None,
+            reshape_admitted_epoch: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
         state
@@ -1637,6 +1703,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);
 

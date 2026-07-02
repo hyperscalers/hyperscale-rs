@@ -434,6 +434,7 @@ impl StateMachine for NodeStateMachine {
                     settled_waves_root_required: ready.settled_waves_root_required,
                     claimed_settled_waves_root: ready.claimed_settled_waves_root,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
+                    settled_waves_window_floor: ready.settled_waves_window_floor,
                 });
             }
 

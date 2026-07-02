@@ -599,6 +599,7 @@ where
             settled_waves_root_required,
             claimed_settled_waves_root,
             parent_weighted_timestamp,
+            settled_waves_window_floor,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -656,6 +657,7 @@ where
                     parent_block_hash,
                     parent_block_height,
                     parent_weighted_timestamp,
+                    settled_waves_window_floor,
                     &finalized_waves,
                 )
             });
@@ -721,6 +723,7 @@ where
             beacon_witness_base,
             carry_split_child_roots,
             carry_settled_waves_root,
+            settled_waves_window_floor,
             classification_topology_snapshot: classification_topology,
         } => {
             let view = ctx
@@ -737,6 +740,7 @@ where
                     parent_block_hash,
                     parent_block_height,
                     parent_qc.weighted_timestamp(),
+                    settled_waves_window_floor,
                     &finalized_waves,
                 )
             });

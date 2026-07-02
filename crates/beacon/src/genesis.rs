@@ -133,6 +133,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     terminal_epoch: None,
                     terminal_qc_wt: None,
                     settled_waves_root: None,
+                    reshape_admitted_epoch: None,
                 },
             )
         })
@@ -157,6 +158,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         shard_consensus_members: BTreeMap::new(),
         witness_window_bases: BTreeMap::new(),
         split_pending_window: BTreeSet::new(),
+        settled_window_floors: BTreeMap::new(),
         reshape_observers_window: BTreeMap::new(),
         reshape_keepers_window: BTreeMap::new(),
         reshape_parent_halves: BTreeMap::new(),

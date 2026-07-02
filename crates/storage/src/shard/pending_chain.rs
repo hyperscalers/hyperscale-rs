@@ -236,18 +236,13 @@ where
         self.base.get_block_for_sync(height)
     }
 
-    /// The wave-ids `local_shard` settled across `[anchor_wt −
-    /// RETENTION_HORIZON, parent]`, unioned with `own` (the block being
-    /// built or verified). Walks the parent's pending prefix by hash
-    /// (each entry carries its settled wave-ids from insert, so a
-    /// not-yet-attached ancestor still contributes), then the committed
-    /// tail by height until a block falls below the retention floor.
-    ///
-    /// A terminating shard's settled-waves root over `[anchor_wt −
-    /// RETENTION_HORIZON, parent]`, including `own_certificates` (the block
-    /// being built or verified). `anchor_wt` is the block's parent-QC
-    /// weighted timestamp — the same value on the proposer and every
-    /// verifier — so the floored window, and thus the root, agree.
+    /// A terminating shard's settled-waves root over `[min(anchor_wt,
+    /// window_floor) − RETENTION_HORIZON, parent]`, including
+    /// `own_certificates` (the block being built or verified). `anchor_wt`
+    /// is the block's parent-QC weighted timestamp and `window_floor` the
+    /// schedule's settled-window floor — both the same value on the
+    /// proposer and every verifier — so the floored window, and thus the
+    /// root, agree.
     #[must_use]
     pub fn settled_waves_root_in_window(
         &self,
@@ -255,6 +250,7 @@ where
         parent_block_hash: BlockHash,
         parent_block_height: BlockHeight,
         anchor_wt: WeightedTimestamp,
+        window_floor: Option<WeightedTimestamp>,
         own_certificates: &[Arc<Verifiable<FinalizedWave>>],
     ) -> SettledWavesRoot {
         let set = self.settled_waves_in_window(
@@ -262,11 +258,22 @@ where
             parent_block_hash,
             parent_block_height,
             anchor_wt,
+            window_floor,
             local_settled_wave_ids(own_certificates, local_shard),
         );
         settled_waves_root_from_ids(set.iter())
     }
 
+    /// The wave-ids `local_shard` settled across the window, unioned with
+    /// `own` (the block being built or verified). Walks the parent's
+    /// pending prefix by hash (each entry carries its settled wave-ids
+    /// from insert, so a not-yet-attached ancestor still contributes),
+    /// then the committed tail by height until a block falls below the
+    /// floor: `RETENTION_HORIZON` behind `anchor_wt`, extended down to
+    /// `window_floor` when the schedule supplies one — the reach back to
+    /// the reshape's admission that covers every settlement a counterpart
+    /// fence can still be holding a straddler against.
+    ///
     /// Pure over the parent chain: the proposer (parent still pending) and
     /// every verifier (parent committed) walk the same ancestors and
     /// produce the same set, so the settled-waves root they derive agrees.
@@ -280,6 +287,7 @@ where
         parent_block_hash: BlockHash,
         parent_block_height: BlockHeight,
         anchor_wt: WeightedTimestamp,
+        window_floor: Option<WeightedTimestamp>,
         own: Vec<WaveId>,
     ) -> std::collections::BTreeSet<WaveId> {
         let mut set: std::collections::BTreeSet<WaveId> = own.into_iter().collect();
@@ -306,10 +314,11 @@ where
         // certifying QC, which a coast past the crossing can re-issue at a
         // higher round with a divergent timestamp, so it must not gate the
         // floor: a per-node-variable cutoff would diverge the attested root.
+        let anchor_floor = anchor_wt
+            .as_millis()
+            .saturating_sub(RETENTION_HORIZON.as_secs() * 1000);
         let floor = WeightedTimestamp::from_millis(
-            anchor_wt
-                .as_millis()
-                .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
+            window_floor.map_or(anchor_floor, |f| anchor_floor.min(f.as_millis())),
         );
         let mut h = height;
         loop {
@@ -1673,6 +1682,7 @@ mod tests {
             parent,
             BlockHeight::new(5),
             WeightedTimestamp::from_millis(10_000),
+            None,
             vec![own.clone()],
         );
         assert_eq!(set, BTreeSet::from([wa, wb, own]));
@@ -1716,8 +1726,40 @@ mod tests {
             parent,
             BlockHeight::new(4),
             anchor,
+            None,
             Vec::new(),
         );
         assert_eq!(set, BTreeSet::from([parent_wave, in_window]));
+    }
+
+    /// A schedule-supplied window floor extends the committed walk below
+    /// `anchor − RETENTION_HORIZON`: a wave settled early in a terminating
+    /// shard's scheduled window — outside the anchor-relative span — still
+    /// enters the set, so the attested root covers every settlement a
+    /// counterpart fence can be holding a straddler against.
+    #[test]
+    fn window_floor_extends_the_committed_tail_below_the_horizon() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // anchor floor = 10_000
+        let (in_window, early_settled) = (wave(300), wave(301));
+        let stub = StubStore::default()
+            .with_sync_block(
+                BlockHeight::new(3),
+                settled_sync_block(BlockHeight::new(3), anchor.as_millis(), &in_window),
+            )
+            .with_sync_block(
+                BlockHeight::new(2),
+                settled_sync_block(BlockHeight::new(2), 9_999, &early_settled),
+            );
+        let chain = Arc::new(PendingChain::new(Arc::new(stub)));
+        let set = chain.settled_waves_in_window(
+            ShardId::ROOT,
+            BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
+            BlockHeight::new(3),
+            anchor,
+            Some(WeightedTimestamp::from_millis(9_000)),
+            Vec::new(),
+        );
+        assert_eq!(set, BTreeSet::from([in_window, early_settled]));
     }
 }

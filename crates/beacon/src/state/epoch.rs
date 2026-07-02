@@ -10,7 +10,7 @@ use hyperscale_types::{
     CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
     PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
     ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitChildRoots, TransitionCause,
-    ValidatorId, ValidatorStatus,
+    ValidatorId, ValidatorStatus, WeightedTimestamp,
 };
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
@@ -137,6 +137,7 @@ pub fn apply_epoch(
     // resolved from the lookahead schedule entry or the re-derived
     // active one.
     state.split_pending_window = state.live_split_pending();
+    state.settled_window_floors = state.live_settled_window_floors();
     // Freeze the reshape-seat projections under the same discipline.
     // The execution fold flips a split's observer cohort to `OnShard`
     // and consumes a merge's keepers mid-fold, so a live projection
@@ -465,6 +466,48 @@ fn diff_keeper_seats(
 /// record forward and bumps `consecutive_misses`. A forged QC or malformed
 /// chunk simply reads as missed — identically on every node. Returns the
 /// validator-status events the applied chunks produced.
+/// Terminal marks a crossing refresh carries onto a shard's rebuilt
+/// boundary record; a refresh must never clear them.
+struct TerminalMarks {
+    terminal_epoch: Option<Epoch>,
+    reshape_admitted_epoch: Option<Epoch>,
+    terminal_qc_wt: Option<WeightedTimestamp>,
+}
+
+/// The marks for a shard's rebuilt boundary record, plus whether this
+/// contribution is the chain's terminal block (its crossing lands in an
+/// epoch past the scheduled terminal). The scheduled-terminal marks come
+/// from the prior record. The certifying QC's timestamp is recorded on
+/// the terminal contribution: a merge parent floors it to the cut, and
+/// persisting it lets the parent compose even when its two children's
+/// terminals fold in separate epochs. A split parent seeds in-fold and
+/// never composes, so only merge children (no `split_child_roots`)
+/// carry it.
+fn carried_terminal_marks(
+    state: &BeaconState,
+    shard: ShardId,
+    header: &BlockHeader,
+    qc: &QuorumCertificate,
+    windows: EpochWindows,
+) -> (TerminalMarks, bool) {
+    let (terminal_epoch, reshape_admitted_epoch) =
+        state.boundaries.get(&shard).map_or((None, None), |b| {
+            (b.terminal_epoch, b.reshape_admitted_epoch)
+        });
+    let is_terminal =
+        terminal_epoch.is_some_and(|t| windows.epoch_for(qc.weighted_timestamp()) > t);
+    let terminal_qc_wt =
+        (is_terminal && header.split_child_roots().is_none()).then(|| qc.weighted_timestamp());
+    (
+        TerminalMarks {
+            terminal_epoch,
+            reshape_admitted_epoch,
+            terminal_qc_wt,
+        },
+        is_terminal,
+    )
+}
+
 fn record_boundaries(
     state: &mut BeaconState,
     epoch: Epoch,
@@ -526,18 +569,8 @@ fn record_boundaries(
         ) {
             continue;
         }
-        let terminal_epoch = state.boundaries.get(shard).and_then(|b| b.terminal_epoch);
-        // Once this contribution is the chain's terminal block — its crossing
-        // lands in an epoch past the scheduled terminal — record the
-        // certifying QC's timestamp. A merge parent floors it to the cut, and
-        // persisting it lets the parent compose even when its two children's
-        // terminals fold in separate epochs. A split parent seeds in-fold and
-        // never composes, so only merge children (no `split_child_roots`)
-        // carry it.
-        let is_terminal_contribution =
-            terminal_epoch.is_some_and(|t| windows.epoch_for(qc.weighted_timestamp()) > t);
-        let terminal_qc_wt = (is_terminal_contribution && header.split_child_roots().is_none())
-            .then(|| qc.weighted_timestamp());
+        let (marks, is_terminal_contribution) =
+            carried_terminal_marks(state, *shard, header, qc, windows);
         state.boundaries.insert(
             *shard,
             ShardBoundary {
@@ -548,9 +581,10 @@ fn record_boundaries(
                 witness_leaf_count: BeaconWitnessLeafCount::new(chunk_end),
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
-                terminal_epoch,
-                terminal_qc_wt,
+                terminal_epoch: marks.terminal_epoch,
+                terminal_qc_wt: marks.terminal_qc_wt,
                 settled_waves_root: header.settled_waves_root(),
+                reshape_admitted_epoch: marks.reshape_admitted_epoch,
             },
         );
         refreshed.insert(*shard);
@@ -748,6 +782,7 @@ fn seed_split_children(
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
     }
@@ -847,6 +882,7 @@ fn compose_merge_parent(
             terminal_epoch: None,
             terminal_qc_wt: None,
             settled_waves_root: None,
+            reshape_admitted_epoch: None,
         },
     );
     tracing::info!(
@@ -1117,6 +1153,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
         state.witness_window_bases = state.live_witness_bases();
@@ -1193,6 +1230,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
         assert_eq!(
@@ -1253,6 +1291,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
 
@@ -1624,6 +1663,7 @@ mod tests {
                 terminal_epoch: Some(Epoch::new(1)),
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
         for child in <[ShardId; 2]>::from(parent.children()) {
@@ -1640,6 +1680,7 @@ mod tests {
                     terminal_epoch: None,
                     terminal_qc_wt: None,
                     settled_waves_root: None,
+                    reshape_admitted_epoch: None,
                 },
             );
         }
@@ -1967,6 +2008,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
         // Both children have folded their terminal contribution (a real
@@ -1985,6 +2027,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_qc_wt: Some(WeightedTimestamp::from_millis(1_900)),
                     settled_waves_root: None,
+                    reshape_admitted_epoch: None,
                 },
             );
         }
@@ -2096,6 +2139,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_qc_wt: None,
                     settled_waves_root: None,
+                    reshape_admitted_epoch: None,
                 },
             );
         }
@@ -2112,6 +2156,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             },
         );
         (state, parent, left_root, right_root)
@@ -2348,6 +2393,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_qc_wt: None,
                 settled_waves_root: None,
+                reshape_admitted_epoch: None,
             }
         }
 

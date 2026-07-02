@@ -3,9 +3,10 @@
 //! Serves a terminated shard's complete settled-wave window list to a
 //! surviving counterpart resolving cross-shard waves across a split
 //! boundary. The request names the terminal block `B`; the server
-//! reconstructs `S_P` over `[B − RETENTION_HORIZON, B]` off its committed
-//! chain — the same set `B`'s `settled_waves_root` commits — so the
-//! requester accepts the list against the beacon-attested root. No
+//! reconstructs `S_P` off its committed chain over the window reaching
+//! back to the terminating reshape's admission — the same set `B`'s
+//! `settled_waves_root` commits — so the requester accepts the list
+//! against the beacon-attested root. No
 //! per-block QC: completeness is the merkle root, not block-by-block
 //! verification.
 
@@ -13,7 +14,9 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetSettledWavesRequest;
 use hyperscale_types::network::response::GetSettledWavesResponse;
-use hyperscale_types::{BoundedVec, MAX_FINALIZED_TX_PER_BLOCK, local_settled_wave_ids};
+use hyperscale_types::{
+    BoundedVec, MAX_FINALIZED_TX_PER_BLOCK, WeightedTimestamp, local_settled_wave_ids,
+};
 
 /// Serve an inbound settled-waves window request from the local chain.
 ///
@@ -22,6 +25,12 @@ use hyperscale_types::{BoundedVec, MAX_FINALIZED_TX_PER_BLOCK, local_settled_wav
 /// [`local_settled_wave_ids`]) — so it stays proportional to cross-shard
 /// traffic, not total throughput.
 ///
+/// `window_floor` is the shard's settled-window floor read off the serving
+/// node's topology projection — the same value the terminal's proposer
+/// floored the attested root at, so the recomputed list matches it. A
+/// projection that no longer carries the floor serves a narrower window;
+/// the requester's root check catches the mismatch and rotates peers.
+///
 /// Returns `not_found` when the terminal block isn't held or the stored
 /// block's hash doesn't match the requested terminal — the requester
 /// rotates peers. Returns `not_found` too when the window set exceeds the
@@ -29,6 +38,7 @@ use hyperscale_types::{BoundedVec, MAX_FINALIZED_TX_PER_BLOCK, local_settled_wav
 #[must_use]
 pub fn serve_settled_waves_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
+    window_floor: Option<WeightedTimestamp>,
     req: &GetSettledWavesRequest,
 ) -> GetSettledWavesResponse {
     let Some(BlockForSync { block, .. }) = pending_chain.block_for_sync(req.terminal_height) else {
@@ -52,6 +62,7 @@ pub fn serve_settled_waves_request<S: ShardStorage>(
         block.header().parent_block_hash(),
         parent_height,
         block.header().parent_qc().weighted_timestamp(),
+        window_floor,
         own,
     );
 
@@ -98,9 +109,9 @@ mod tests {
         BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-        TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate,
-        WaveId, WeightedTimestamp, settled_waves_root_from_ids,
+        ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
+        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+        WaveCertificate, WaveId, WeightedTimestamp, settled_waves_root_from_ids,
     };
 
     use super::*;
@@ -204,7 +215,7 @@ mod tests {
         let pending_chain = PendingChain::new(Arc::new(storage));
 
         let req = GetSettledWavesRequest::new(BlockHeight::new(3), terminal);
-        let response = serve_settled_waves_request(&pending_chain, &req);
+        let response = serve_settled_waves_request(&pending_chain, None, &req);
         let waves = response.waves.expect("terminal block is held");
 
         let expected: BTreeSet<WaveId> = (1..=3)
@@ -224,6 +235,37 @@ mod tests {
         );
     }
 
+    /// A schedule-supplied floor reaches settlements older than the
+    /// anchor-relative horizon: a wave settled early in the terminating
+    /// shard's scheduled window — below `terminal − RETENTION_HORIZON` —
+    /// is served only when the floor covers it.
+    #[test]
+    fn window_floor_serves_early_settlements() {
+        let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
+        let storage = SimShardStorage::default();
+        let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalized_wave(1)]);
+        parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalized_wave(2)]);
+        let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalized_wave(3)]);
+        let pending_chain = PendingChain::new(Arc::new(storage));
+        let req = GetSettledWavesRequest::new(BlockHeight::new(3), terminal);
+
+        // Anchor-only floor: the early settlement falls outside the window.
+        let narrow = serve_settled_waves_request(&pending_chain, None, &req)
+            .waves
+            .expect("terminal block is held");
+        assert_eq!(narrow.len(), 2);
+
+        // The floor reaches back past the early settlement.
+        let wide = serve_settled_waves_request(
+            &pending_chain,
+            Some(WeightedTimestamp::from_millis(500)),
+            &req,
+        )
+        .waves
+        .expect("terminal block is held");
+        assert_eq!(wide.len(), 3);
+    }
+
     /// A hash mismatch against the stored block serves `not_found`.
     #[test]
     fn wrong_terminal_hash_serves_not_found() {
@@ -235,7 +277,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
         );
         assert!(
-            serve_settled_waves_request(&pending_chain, &req)
+            serve_settled_waves_request(&pending_chain, None, &req)
                 .waves
                 .is_none()
         );
@@ -248,7 +290,7 @@ mod tests {
         let pending_chain = PendingChain::new(storage);
         let req = GetSettledWavesRequest::new(BlockHeight::new(7), BlockHash::ZERO);
         assert!(
-            serve_settled_waves_request(&pending_chain, &req)
+            serve_settled_waves_request(&pending_chain, None, &req)
                 .waves
                 .is_none()
         );

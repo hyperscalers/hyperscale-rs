@@ -709,6 +709,7 @@ impl ShardCoordinatorSim {
                 settled_waves_root_required: ready.settled_waves_root_required,
                 claimed_settled_waves_root: ready.claimed_settled_waves_root,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
+                settled_waves_window_floor: ready.settled_waves_window_floor,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1003,6 +1004,7 @@ impl ShardCoordinatorSim {
                 beacon_witness_base,
                 carry_split_child_roots,
                 carry_settled_waves_root,
+                settled_waves_window_floor,
                 classification_topology_snapshot: classification_topology,
             } => {
                 let view = self.pending_chains[emitter_idx]
@@ -1014,6 +1016,7 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         parent_block_height,
                         parent_qc.weighted_timestamp(),
+                        settled_waves_window_floor,
                         &finalized_waves,
                     )
                 });
@@ -1243,6 +1246,7 @@ impl ShardCoordinatorSim {
                 settled_waves_root_required,
                 claimed_settled_waves_root,
                 parent_weighted_timestamp,
+                settled_waves_window_floor,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1271,6 +1275,7 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         parent_block_height,
                         parent_weighted_timestamp,
+                        settled_waves_window_floor,
                         &finalized_waves,
                     )
                 });
