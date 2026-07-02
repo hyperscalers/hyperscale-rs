@@ -974,12 +974,16 @@ pub fn register_shard_request_handlers<S, N, D>(
     // A counterpart resolving this shard's settled set across a split
     // boundary names its terminal block; we serve the complete settled-wave
     // window list, which the counterpart accepts against the beacon-attested
-    // settled-waves root.
+    // settled-waves root. The window floor comes off the live topology
+    // projection so the served window matches the one the terminal's
+    // proposer attested.
     let pending_chain = Arc::clone(&io.pending_chain);
+    let topology_snapshot = process.topology_snapshot().clone();
     process
         .network
         .register_request_handler::<GetSettledWavesRequest>(shard, move |req| {
-            serve_settled_waves_request(&pending_chain, &req)
+            let window_floor = topology_snapshot.load().settled_window_floor(shard);
+            serve_settled_waves_request(&pending_chain, window_floor, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

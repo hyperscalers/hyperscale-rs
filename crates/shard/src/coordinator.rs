@@ -1532,6 +1532,7 @@ impl ShardCoordinator {
     /// and dispatches via the `proposal` tracker — or defers (the parent
     /// JMT, the split-at-boundary bit, or the reshape substate byte total not
     /// yet resolved) and retries on the next tick.
+    #[allow(clippy::too_many_lines)]
     fn build_and_dispatch_proposal(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1637,6 +1638,8 @@ impl ShardCoordinator {
             preview.base,
             carry_split_child_roots,
             carry_settled_waves_root,
+            topology_schedule
+                .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
         );
 

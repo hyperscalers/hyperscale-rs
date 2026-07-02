@@ -362,7 +362,7 @@ mod tests {
             match output {
                 SettledWavesAcquisitionOutput::Fetch { shard, request, .. } => {
                     assert_eq!(shard, SHARD);
-                    let response = serve_settled_waves_request(&pending_chain, &request);
+                    let response = serve_settled_waves_request(&pending_chain, None, &request);
                     outputs.extend(host.on_response(SHARD, &response));
                 }
                 SettledWavesAcquisitionOutput::Complete {
@@ -404,7 +404,7 @@ mod tests {
             vec![ValidatorId::new(0), ValidatorId::new(1)],
         );
         let request = GetSettledWavesRequest::new(BlockHeight::new(3), terminal);
-        let response = serve_settled_waves_request(&pending_chain, &request);
+        let response = serve_settled_waves_request(&pending_chain, None, &request);
         let parked = host.on_response(SHARD, &response);
         assert!(parked.is_empty(), "a mismatch parks rather than completes");
         assert!(host.has_pending());

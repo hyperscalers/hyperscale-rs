@@ -122,6 +122,9 @@ pub struct ReadyStateRootVerification {
     /// The block's parent-QC weighted timestamp — the settled-waves window
     /// anchor.
     pub parent_weighted_timestamp: WeightedTimestamp,
+    /// The schedule's settled-window floor at the anchor — extends the
+    /// window back to the reshape's admission.
+    pub settled_waves_window_floor: Option<WeightedTimestamp>,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -151,6 +154,7 @@ pub struct PendingStateRootVerification {
     pub settled_waves_root_required: bool,
     pub claimed_settled_waves_root: Option<SettledWavesRoot>,
     pub parent_weighted_timestamp: WeightedTimestamp,
+    pub settled_waves_window_floor: Option<WeightedTimestamp>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -969,6 +973,7 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
         settled_waves_root_required: bool,
+        settled_waves_window_floor: Option<WeightedTimestamp>,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -983,6 +988,7 @@ impl VerificationPipeline {
             settled_waves_root_required,
             claimed_settled_waves_root: block.header().settled_waves_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
+            settled_waves_window_floor,
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1453,12 +1459,15 @@ impl VerificationPipeline {
 
         if self.needs_state_root_verification(block) {
             let parent_block_height = h.parent_qc().height();
+            let settled_waves_window_floor =
+                schedule.settled_window_floor(local_shard, h.parent_qc().weighted_timestamp());
             self.initiate_state_root_verification(
                 block_hash,
                 block,
                 parent_block_height,
                 split_child_roots_required,
                 settled_waves_root_required,
+                settled_waves_window_floor,
             );
         }
 
@@ -1661,6 +1670,7 @@ impl VerificationPipeline {
                     settled_waves_root_required: pending.settled_waves_root_required,
                     claimed_settled_waves_root: pending.claimed_settled_waves_root,
                     parent_weighted_timestamp: pending.parent_weighted_timestamp,
+                    settled_waves_window_floor: pending.settled_waves_window_floor,
                 })
             })
             .collect()
@@ -2116,7 +2126,14 @@ mod tests {
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
 
-        vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS, false, false);
+        vp.initiate_state_root_verification(
+            block_hash,
+            &block,
+            BlockHeight::GENESIS,
+            false,
+            false,
+            None,
+        );
 
         let mut pb = PendingBlock::from_complete_block(
             &block,
@@ -2159,7 +2176,14 @@ mod tests {
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
 
-        vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS, false, false);
+        vp.initiate_state_root_verification(
+            block_hash,
+            &block,
+            BlockHeight::GENESIS,
+            false,
+            false,
+            None,
+        );
 
         let empty_pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);

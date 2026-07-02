@@ -440,6 +440,42 @@ impl TopologySchedule {
         pending || self.terminates_at_next_boundary(shard, wt) == Some(true)
     }
 
+    /// The floor of `shard`'s attested settled-waves window at `wt`: the
+    /// start of the epoch its terminating reshape was admitted, backed off
+    /// by [`RETENTION_HORIZON`] to cover a wave that finalized against the
+    /// fence just after it armed but executed up to a full wave lifetime
+    /// earlier. Counterpart fences hold straddlers from admission, so the
+    /// window a terminal's `settled_waves_root` commits must reach back to
+    /// it — a fixed span behind the terminal misses settlements the fence
+    /// is still holding against.
+    ///
+    /// Reads the floor off `wt`'s window or its lookahead (the same
+    /// entries [`termination_scheduled`] consults, so any wave the fence
+    /// can hold has a floor at or before its settlement). `None` when
+    /// neither retained window records a floor for `shard` — callers then
+    /// floor on the block anchor alone. Deterministic in `(schedule,
+    /// wt)`: the proposer committing a coast block's root, every verifier
+    /// recomputing it, and a former member serving the window list all
+    /// derive the same floor.
+    ///
+    /// [`termination_scheduled`]: Self::termination_scheduled
+    #[must_use]
+    pub fn settled_window_floor(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Option<WeightedTimestamp> {
+        if self.epoch_duration_ms == 0 {
+            return None;
+        }
+        let epoch = self.epoch_for(wt);
+        [epoch, epoch.next()].iter().find_map(|e| {
+            self.by_epoch
+                .get(e)
+                .and_then(|s| s.settled_window_floor(shard))
+        })
+    }
+
     /// Record the committee governing `epoch`. The beacon coordinator inserts
     /// the just-applied epoch's active committee and the next epoch's
     /// lookahead on every commit.
@@ -473,6 +509,49 @@ mod tests {
             1,
             ValidatorSet::new(Vec::new()),
         ))
+    }
+
+    #[test]
+    fn settled_window_floor_reads_the_window_and_its_lookahead() {
+        use std::collections::BTreeMap;
+
+        let floor = WeightedTimestamp::from_millis(4_000);
+        let terminating = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(Vec::new()),
+            )
+            .with_settled_window_floors(BTreeMap::from([(ShardId::ROOT, floor)])),
+        );
+        let mut sched = TopologySchedule::new(1000, Epoch::new(3), snapshot());
+        sched.insert(Epoch::new(5), terminating);
+
+        // The floor answers from the governing window and from the epoch
+        // before it (the lookahead consult), and nowhere else.
+        assert_eq!(
+            sched.settled_window_floor(ShardId::ROOT, WeightedTimestamp::from_millis(5_500)),
+            Some(floor),
+        );
+        assert_eq!(
+            sched.settled_window_floor(ShardId::ROOT, WeightedTimestamp::from_millis(4_500)),
+            Some(floor),
+        );
+        assert_eq!(
+            sched.settled_window_floor(ShardId::ROOT, WeightedTimestamp::from_millis(3_500)),
+            None,
+        );
+        assert_eq!(
+            sched.settled_window_floor(ShardId::leaf(1, 1), WeightedTimestamp::from_millis(5_500)),
+            None,
+        );
+
+        // A single-committee schedule has no epoch boundaries to floor at.
+        assert_eq!(
+            TopologySchedule::single(snapshot())
+                .settled_window_floor(ShardId::ROOT, WeightedTimestamp::from_millis(5_500)),
+            None,
+        );
     }
 
     #[test]

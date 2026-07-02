@@ -4275,6 +4275,7 @@ mod tests {
             terminal_epoch: None,
             terminal_qc_wt: None,
             settled_waves_root: None,
+            reshape_admitted_epoch: None,
         }
     }
 

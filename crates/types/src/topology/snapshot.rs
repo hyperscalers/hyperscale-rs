@@ -149,6 +149,15 @@ pub struct TopologySnapshot {
     ///
     /// [`TopologySchedule::split_at_next_boundary`]: crate::TopologySchedule::split_at_next_boundary
     split_pending: BTreeSet<ShardId>,
+    /// Each terminating leaf's settled-waves window floor as of this
+    /// window's committee freeze — pending split targets, paired merge
+    /// children, and shards coasting to their terminal block, each mapped
+    /// to the start of its reshape's admission epoch backed off by the
+    /// retention horizon. Frozen with the same discipline as
+    /// `split_pending`; the schedule's settled-window floor reads it to
+    /// reach the attested settled-waves window back to the point
+    /// counterpart fences began holding straddlers.
+    settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Governable network parameters in force for this window, projected
     /// from `BeaconState.params` (head) or `next_params` (lookahead).
     /// Frozen one epoch ahead like the committee, so every member resolves
@@ -197,6 +206,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            settled_window_floors: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -240,6 +250,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            settled_window_floors: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -292,6 +303,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            settled_window_floors: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -379,6 +391,7 @@ impl TopologySnapshot {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
@@ -404,6 +417,21 @@ impl TopologySnapshot {
     #[must_use]
     pub fn with_advanced(mut self, advanced: BTreeSet<ShardId>) -> Self {
         self.advanced = advanced;
+        self
+    }
+
+    /// Set each terminating leaf's settled-waves window floor (see
+    /// [`Self::settled_window_floor`]). Defaults empty; the beacon
+    /// projection supplies the frozen (active) or live (lookahead) value.
+    /// Builder-set rather than a constructor argument so the many
+    /// committee-only constructions need not thread reshape lifecycle
+    /// state.
+    #[must_use]
+    pub fn with_settled_window_floors(
+        mut self,
+        settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
+    ) -> Self {
+        self.settled_window_floors = settled_window_floors;
         self
     }
 }
@@ -502,6 +530,16 @@ impl TopologySnapshot {
     #[must_use]
     pub fn merge_pending(&self, shard: ShardId) -> bool {
         self.reshape_keepers.contains_key(&shard)
+    }
+
+    /// The floor of `shard`'s attested settled-waves window, as of this
+    /// window's committee freeze — present while `shard`'s terminating
+    /// reshape pends and through its coast to its terminal block: the
+    /// start of the reshape's admission epoch, backed off by the
+    /// retention horizon.
+    #[must_use]
+    pub fn settled_window_floor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+        self.settled_window_floors.get(&shard).copied()
     }
 
     /// The pending-split observer cohorts, keyed by splitting parent — each

@@ -577,6 +577,12 @@ pub enum Action {
         /// settled-waves window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
+        /// The schedule's settled-window floor for the shard at the block's
+        /// anchor — extends the settled-waves window back to the reshape's
+        /// admission, covering every settlement a counterpart fence can
+        /// still hold a straddler against. `None` when no retained window
+        /// records one.
+        settled_waves_window_floor: Option<WeightedTimestamp>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.
@@ -781,6 +787,10 @@ pub enum Action {
         /// handler computes the `settled_waves_root` over the committed
         /// retention window and stamps it into the header.
         carry_settled_waves_root: bool,
+        /// The schedule's settled-window floor for the shard at the block's
+        /// anchor, paired with `carry_settled_waves_root` — extends the
+        /// committed window walk back to the reshape's admission.
+        settled_waves_window_floor: Option<WeightedTimestamp>,
         /// The block's **anchored** committee snapshot, resolved by the
         /// coordinator as `at_for_shard(local_shard, parent_qc.wt)` — the
         /// same one the verifier recomputes against. Classification

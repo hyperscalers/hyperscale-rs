@@ -236,6 +236,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
         terminal_epoch: None,
         terminal_qc_wt: None,
         settled_waves_root: None,
+        reshape_admitted_epoch: None,
     }
 }
 
@@ -287,7 +288,12 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
     tracing::info!(shard = ?target, "Shard split readiness gate met; reshaping the trie");
 
     let halves = [(left, left_half.to_vec()), (right, right_half.to_vec())];
-    let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.remove(&target) else {
+    let Some(PendingReshape::Split {
+        cohort,
+        admitted_at,
+        ..
+    }) = state.pending_reshapes.remove(&target)
+    else {
         unreachable!("pending split read above");
     };
     state.next_shard_committees.remove(&target);
@@ -299,6 +305,7 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
     // witness drain) without counting the dead chain as missing.
     if let Some(boundary) = state.boundaries.get_mut(&target) {
         boundary.terminal_epoch = Some(state.current_epoch);
+        boundary.reshape_admitted_epoch = Some(admitted_at);
     } else {
         tracing::warn!(
             shard = ?target,
@@ -399,7 +406,12 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
         "Shard merge readiness gate met; reshaping the trie"
     );
 
-    let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.remove(&parent) else {
+    let Some(PendingReshape::Merge {
+        keepers,
+        admitted_at,
+        ..
+    }) = state.pending_reshapes.remove(&parent)
+    else {
         unreachable!("pending merge read above");
     };
 
@@ -425,6 +437,7 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
         }
         if let Some(boundary) = state.boundaries.get_mut(&child) {
             boundary.terminal_epoch = Some(state.current_epoch);
+            boundary.reshape_admitted_epoch = admitted_at;
         } else {
             tracing::warn!(
                 shard = ?child,
@@ -652,6 +665,69 @@ mod tests {
     /// A not-yet-ready parent member counts toward the gate (ready by
     /// construction — committee-liveness trust) but carries its real
     /// flag onto the child, completing sync via the normal Ready path.
+    /// The execution stamps the reshape's admission epoch onto the
+    /// terminating parent's boundary record, and the live settled-window
+    /// floor projection carries the parent across the whole lifecycle:
+    /// from the pending record at admission, then from the boundary stamp
+    /// once the record is consumed (the coast).
+    #[test]
+    fn execution_stamps_the_admission_epoch_on_the_terminal_boundary() {
+        use hyperscale_types::RETENTION_HORIZON;
+
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(4);
+        state.chain_config.epoch_duration_ms = 400_000;
+        state.boundaries.insert(
+            p,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(10),
+                weighted_timestamp: WeightedTimestamp::ZERO,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::new(5),
+                consecutive_misses: 0,
+                terminal_epoch: None,
+                terminal_qc_wt: None,
+                settled_waves_root: None,
+                reshape_admitted_epoch: None,
+            },
+        );
+        apply_shard_payload(
+            &mut state,
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        let admitted = state.current_epoch;
+        let floor = WeightedTimestamp::from_millis(
+            admitted.inner() * 400_000 - RETENTION_HORIZON.as_secs() * 1000,
+        );
+        assert_eq!(
+            state.live_settled_window_floors().get(&p),
+            Some(&floor),
+            "the pending record projects the floor from admission",
+        );
+
+        let left_observer = observer_for(&state, p, left);
+        mark_ready(&mut state, p, left_observer);
+        let right_observer = observer_for(&state, p, right);
+        mark_ready(&mut state, p, right_observer);
+        execute_ready_splits(&mut state);
+
+        assert!(state.pending_reshapes.is_empty());
+        assert_eq!(
+            state.boundaries[&p].reshape_admitted_epoch,
+            Some(admitted),
+            "the execution stamps the admission onto the terminal boundary",
+        );
+        assert_eq!(
+            state.live_settled_window_floors().get(&p),
+            Some(&floor),
+            "the boundary stamp keeps projecting the floor through the coast",
+        );
+    }
+
     #[test]
     fn unready_parent_member_counts_toward_gate_but_keeps_its_flag() {
         let p = ShardId::leaf(1, 0);
@@ -947,6 +1023,7 @@ mod tests {
                     terminal_epoch: None,
                     terminal_qc_wt: None,
                     settled_waves_root: None,
+                    reshape_admitted_epoch: None,
                 },
             );
         }
