@@ -9,6 +9,8 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
+use hyperscale_types::ShardId;
+
 use super::Cluster;
 
 /// Handle to an installed drop rule.
@@ -58,6 +60,27 @@ pub trait FaultableCluster: Cluster {
         type_id: &'static str,
         probability: f64,
     ) -> FaultHandle;
+
+    /// Drop deliveries of `type_id` sent by a host in `from` to a host in `to`,
+    /// that direction only. The reverse direction and every other host pair
+    /// flow untouched. Fault rules gate pushes (gossip) and request legs, never
+    /// response legs — so isolating a fetched payload cuts the *requester's*
+    /// outbound request, not the response.
+    ///
+    /// Gossip caveat as [`partition`](Self::partition): production attributes a
+    /// gossip message to its immediate relay hop, so keep `from` and `to`
+    /// bridged by no third host. Returns a handle summing fires across every
+    /// installed edge.
+    fn drop_type_between(
+        &mut self,
+        from: &[usize],
+        to: &[usize],
+        type_id: &'static str,
+    ) -> FaultHandle;
+
+    /// The hosts whose vnode sits in `shard`'s live committee — the copy
+    /// currently seated, not a terminated chain lingering on old hosts.
+    fn committee_hosts(&self, shard: ShardId) -> Vec<usize>;
 
     /// Remove every installed drop rule, on every host — lifting any transient
     /// outage so the suppressed channel flows again. Leaves partitions intact
