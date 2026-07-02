@@ -12,7 +12,9 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 - **A self-regulating validator economy.** The minimum activation stake is a market-clearing price recomputed every epoch from topology demand — rising when validator supply is abundant, falling when splits need staffing — while vnodes let one host run many validator identities, so a seat's marginal cost is its stake, not hardware.
 - **Determinism as the spine.** The entire protocol stack is sans-io pure state machines. The same code runs under production I/O (tokio, libp2p, RocksDB) and under a deterministic simulator where whole multi-shard networks — fault injection included — replay byte-identically from a seed.
 
-**[Architecture documentation → docs/](docs/README.md)** — the whole story in a five-page overview, per-subsystem deep dives, and a consolidated invariant register intended as the starting point for formal verification.
+**[Architecture documentation → docs/](docs/)** — the whole story in a five-page overview, per-subsystem deep dives, and a consolidated invariant register intended as the starting point for formal verification.
+
+**[Formal models → specs/](specs/)** — an in-progress track of machine-checked [Quint](https://quint-lang.org/) models (verified with Apalache) of the critical safety properties. Each is transcribed from the implementation it models and cross-checked against it by the deterministic scenario suite.
 
 ## Crates
 
