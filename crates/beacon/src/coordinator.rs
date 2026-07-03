@@ -85,6 +85,16 @@ const MAX_INPUT_DWELL_REARMS: u32 = 6;
 /// Anything attested below the floor is provably bogus or provably
 /// terminal, so a schedule miss below it is rejectable, never deferrable.
 ///
+/// Human-readable discriminator for a block's authenticating cert,
+/// for diagnostics.
+const fn cert_kind(cert: &BeaconCert) -> &'static str {
+    match cert {
+        BeaconCert::Genesis(_) => "genesis",
+        BeaconCert::Normal(_) => "SPC",
+        BeaconCert::Skip(_) => "skip",
+    }
+}
+
 /// **Not consensus-critical**: the floor bounds a node-local cache; nodes
 /// with different frontiers produce the same chain.
 #[must_use]
@@ -144,6 +154,19 @@ pub struct BeaconCoordinator {
     /// cert. Carried so SPC instance bootstrap and skip-cert anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
     latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+
+    /// Beacon committee that governed the tip epoch, captured before
+    /// its fold advanced the state. A competing block for the adopted
+    /// epoch verifies against the sets that governed it, not the sets
+    /// the fold derived from it — the current state's committee may
+    /// have rotated. On a restart the constructor recovers this from
+    /// the penultimate history state when one is loaded; otherwise the
+    /// live state stands in until the next commit.
+    tip_epoch_committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    /// Active pool that governed the tip epoch — the signer base for a
+    /// competing skip cert. Same capture discipline as
+    /// `tip_epoch_committee`.
+    tip_epoch_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
 
     /// SPC consensus-plane driver: the optional current-epoch instance
     /// plus the PC-vote and SPC-message verification slot pools. Bare
@@ -240,6 +263,22 @@ pub struct BeaconCoordinator {
     /// no node holds, so all feed the same partial vector) still lets the
     /// epoch make progress.
     input_dwell_rearms: u32,
+
+    /// Whether the local validator has committed to signing a round-3
+    /// PC vote for the pending epoch. While set, the skip trigger emits
+    /// no [`SkipRequest`]: a skip certificate's honest signers must be
+    /// validators that never contribute a vote-3 toward the epoch's SPC
+    /// certificate, so the two certificates cannot both assemble out of
+    /// one honest signer's signatures. Vote-1/2 signatures are exempt —
+    /// they cannot complete a QC3 without 2f+1 vote-3s. Reset on every
+    /// commit (new pending epoch, new anchor).
+    vote3_signed: bool,
+    /// Whether the local validator has committed to broadcasting a
+    /// [`SkipRequest`] for the pending epoch. While set, round-3 PC
+    /// sign intents for the epoch are dropped at the lift — the other
+    /// half of the vote-3 / skip-request exclusion. Reset on every
+    /// commit.
+    skip_signed: bool,
 }
 
 impl BeaconCoordinator {
@@ -308,10 +347,22 @@ impl BeaconCoordinator {
                 );
             }
         }
+        // The tip epoch's signer sets come from the state *before* its
+        // fold when the loaded history carries one; the live state
+        // stands in otherwise (see the field docs).
+        let tip_epoch_source = if history.len() >= 2 {
+            &history[history.len() - 2]
+        } else {
+            latest
+        };
+        let tip_epoch_committee = tip_epoch_source.derive_beacon_committee();
+        let tip_epoch_pool = tip_epoch_source.derive_active_pool();
         let state = history.into_iter().next_back().expect(LATEST_STATE_EXPECT);
         Self {
             state,
             latest_block,
+            tip_epoch_committee,
+            tip_epoch_pool,
             spc: SpcDriver::new(me),
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
@@ -327,6 +378,8 @@ impl BeaconCoordinator {
             network,
             now: LocalTimestamp::ZERO,
             input_dwell_rearms: 0,
+            vote3_signed: false,
+            skip_signed: false,
         }
     }
 
@@ -461,9 +514,17 @@ impl BeaconCoordinator {
     ///
     /// The action handler signs the request (the coordinator has no
     /// key) and emits the loopback into `on_verified_skip_request_received`.
-    pub fn on_beacon_skip_timer(&self) -> Vec<Action> {
+    pub fn on_beacon_skip_timer(&mut self) -> Vec<Action> {
         if !self.skip_trigger_due(self.next_epoch_boundary()) {
             trace!("BeaconSkipTrigger fired before the next epoch's skip deadline");
+            return Vec::new();
+        }
+        // Vote-3 / skip-request exclusion: a validator whose vote-3 may
+        // sit inside the epoch's SPC certificate must not also lend its
+        // signature to the skip certificate — an honest signature backs
+        // at most one of the two commit paths.
+        if self.vote3_signed {
+            trace!("BeaconSkipTrigger fired but local vote-3 already signed for the epoch");
             return Vec::new();
         }
         let local_on_active_pool = self
@@ -475,6 +536,7 @@ impl BeaconCoordinator {
             trace!("BeaconSkipTrigger fired but local validator not on active pool");
             return Vec::new();
         }
+        self.skip_signed = true;
         vec![Action::BroadcastSkipRequest {
             epoch_to_skip: self.state.current_epoch.next(),
             anchor: self.latest_block.block_hash(),
@@ -1013,6 +1075,9 @@ impl BeaconCoordinator {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
         if epoch <= tip_epoch {
+            if let Some(actions) = self.tip_competitor_verification(&block) {
+                return actions;
+            }
             trace!(
                 epoch = epoch.inner(),
                 "BeaconBlockReceived for past/current epoch — dropping",
@@ -1062,6 +1127,50 @@ impl BeaconCoordinator {
         };
         let equivocation_signers = self.equivocation_signers_for(&block);
         self.dispatch_block_verification(block, signers, equivocation_signers)
+    }
+
+    /// Dispatch verification for a block that competes with the adopted
+    /// tip: same epoch, same parent, different hash. A validly certified
+    /// competitor is self-proving evidence that both commit paths (SPC
+    /// cert and pool skip cert) assembled for one epoch, and
+    /// [`Self::on_beacon_block_verified`] halts on it — the divergence
+    /// is detected loudly rather than carried silently. Returns `None`
+    /// when `block` is not a tip competitor (the caller's ordinary
+    /// drop/sync handling applies).
+    ///
+    /// Verification runs against the signer sets that governed the tip
+    /// epoch (`tip_epoch_committee` / `tip_epoch_pool`), captured at
+    /// adoption — the live state's sets are post-fold.
+    fn tip_competitor_verification(
+        &mut self,
+        block: &Arc<Verifiable<CertifiedBeaconBlock>>,
+    ) -> Option<Vec<Action>> {
+        if block.epoch() != self.latest_block.epoch()
+            || block.epoch() == Epoch::GENESIS
+            || block.prev_block_hash() != self.latest_block.prev_block_hash()
+            || block.block_hash() == self.latest_block.block_hash()
+        {
+            return None;
+        }
+        if let BeaconCert::Skip(skip_cert) = block.cert()
+            && (skip_cert.anchor_hash() != self.latest_block.prev_block_hash()
+                || skip_cert.epoch_to_skip() != block.epoch())
+        {
+            return None;
+        }
+        let signers = match block.cert() {
+            BeaconCert::Normal(_) => self.tip_epoch_committee.clone(),
+            BeaconCert::Skip(_) => self.tip_epoch_pool.clone(),
+            BeaconCert::Genesis(_) => return None,
+        };
+        warn!(
+            epoch = block.epoch().inner(),
+            competitor = ?block.block_hash(),
+            adopted = ?self.latest_block.block_hash(),
+            "BeaconBlock competes with the adopted tip — dispatching cert verification",
+        );
+        let equivocation_signers = self.equivocation_signers_for(block);
+        Some(self.dispatch_block_verification(Arc::clone(block), signers, equivocation_signers))
     }
 
     /// Apply a beacon block delivered by the runner's gap-fill sync.
@@ -1239,6 +1348,15 @@ impl BeaconCoordinator {
     ///
     /// Stale or duplicate results (slot wasn't in flight) are
     /// tolerated.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the verified block competes with the adopted tip —
+    /// same epoch, same parent, different hash. Two validly certified
+    /// blocks for one epoch mean both commit paths (SPC cert and pool
+    /// skip cert) assembled; there is no reconciliation between them,
+    /// so the replica halts with the evidence rather than continuing
+    /// on a forked beacon chain.
     pub fn on_beacon_block_verified(
         &mut self,
         result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
@@ -1251,6 +1369,29 @@ impl BeaconCoordinator {
             }
         };
         let block_hash = block.block_hash();
+        // A validly certified block for the adopted epoch, extending the
+        // same parent, with a different hash: both commit paths assembled
+        // certificates for one epoch. There is no reconciliation between
+        // them — every fact the fold derives (committees, schedule,
+        // pricing) diverges from here — so halt with the evidence rather
+        // than keep operating on a forked beacon chain.
+        if block.epoch() == self.latest_block.epoch()
+            && block.epoch() > Epoch::GENESIS
+            && block.prev_block_hash() == self.latest_block.prev_block_hash()
+            && block_hash != self.latest_block.block_hash()
+        {
+            panic!(
+                "beacon dual commit detected: epoch {} carries two validly certified blocks — \
+                 adopted {:?} ({} cert) and competitor {:?} ({} cert) both extend {:?}; \
+                 halting rather than continuing on a forked beacon chain",
+                block.epoch().inner(),
+                self.latest_block.block_hash(),
+                cert_kind(self.latest_block.cert()),
+                block_hash,
+                cert_kind(block.cert()),
+                block.prev_block_hash(),
+            );
+        }
         // Idempotency: another path (local skip-quorum assembly, an
         // earlier peer-broadcast adoption) may have already advanced
         // the tip at or past this block's epoch. Re-entering
@@ -1543,6 +1684,15 @@ impl BeaconCoordinator {
         // here.
         let prior_tip = self.latest_block.block_hash();
         let was_on_committee = self.is_on_committee();
+        // The pending epoch is settled: the vote-3 / skip-request
+        // exclusion re-arms for the next one.
+        self.vote3_signed = false;
+        self.skip_signed = false;
+        // The sets governing the epoch being adopted, captured before
+        // its fold advances them — a competing block for this epoch
+        // verifies against these.
+        self.tip_epoch_committee = self.state.derive_beacon_committee();
+        self.tip_epoch_pool = self.state.derive_active_pool();
         let input = apply_input_for(&block);
         let effects = apply_epoch(&mut self.state, &self.network, block.epoch(), input);
         self.latest_block = Arc::clone(&block);
@@ -2006,6 +2156,19 @@ impl BeaconCoordinator {
                     });
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
+                    // Vote-3 / skip-request exclusion, the other
+                    // direction: once the local skip request is out,
+                    // no further vote-3 may feed the epoch's SPC
+                    // certificate. Vote-1/2 intents still lift — they
+                    // cannot complete a QC3 without 2f+1 vote-3s.
+                    if self.skip_signed {
+                        trace!(
+                            view = view.inner(),
+                            "Dropping vote-3 sign intent — local skip request already broadcast",
+                        );
+                        continue;
+                    }
+                    self.vote3_signed = true;
                     actions.push(Action::SignAndBroadcastPcVote3 {
                         epoch,
                         view,
@@ -2136,13 +2299,13 @@ mod tests {
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, KeptSeat, LeafIndex,
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
-        ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
-        Round, ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, compute_merkle_root_with_proof,
-        genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
-        zero_bls_signature,
+        ObserverSeat, PcQc2, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
+        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
+        build_qc3, compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_vote1,
+        sign_vote2, sign_vote3, spc_context, zero_bls_signature,
     };
 
     use super::*;
@@ -3201,11 +3364,11 @@ mod tests {
         keys: &[Bls12381G1PrivateKey],
         committee: &[(ValidatorId, Bls12381G1PublicKey)],
         signer_positions: &[usize],
+        v_in: &PcVector,
     ) -> SpcCert {
         let net = NetworkDefinition::simulator();
         let spc_ctx = spc_context(epoch);
         let pc_ctx = pc_context(&spc_ctx, prev_view);
-        let v_in = PcVector::empty();
         let v1s: Vec<_> = signer_positions
             .iter()
             .map(|&i| sign_vote1(&keys[i], committee[i].0, &net, &pc_ctx, v_in.clone()))
@@ -3253,8 +3416,60 @@ mod tests {
             .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
-        let cert = build_direct_cert(SpcView::new(1), epoch, &keys, &committee, &signer_positions);
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            epoch,
+            &keys,
+            &committee,
+            &signer_positions,
+            &PcVector::empty(),
+        );
         let block = BeaconBlock::new(epoch, prev_hash, Vec::new());
+        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Normal(Box::new(cert)),
+        )))
+    }
+
+    /// Like `valid_block_at`, but carrying one committed proposal (a
+    /// bare abstention from the position-0 proposer), with the cert
+    /// built over the matching element vector. A proposal-less block is
+    /// bit-identical to the epoch's skip block — the cert discriminator
+    /// rides outside the block hash — so a *diverging* SPC block needs
+    /// content.
+    fn valid_nonempty_block_at(
+        coord: &BeaconCoordinator,
+        epoch: Epoch,
+        prev_hash: BeaconBlockHash,
+    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+        let n = coord.state.committee.len();
+        let f = n.saturating_sub(1) / 3;
+        let q = n - f;
+        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
+        let committee: Vec<_> = coord
+            .state
+            .committee
+            .iter()
+            .copied()
+            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .collect();
+        let signer_positions: Vec<usize> = (0..q).collect();
+        let proposal = BeaconProposal::new(
+            std::iter::once((ShardId::ROOT, None)).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let mut elements = vec![PcValueElement::BOTTOM; n];
+        elements[0] = proposal.pc_element_hash(epoch);
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            epoch,
+            &keys,
+            &committee,
+            &signer_positions,
+            &PcVector::new(elements),
+        );
+        let block = BeaconBlock::new(epoch, prev_hash, vec![(committee[0].0, proposal)]);
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal(Box::new(cert)),
@@ -3298,6 +3513,101 @@ mod tests {
         let block = valid_block_at(&coord, Epoch::new(1), BeaconBlockHash::ZERO);
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
+    }
+
+    /// Drive `coord` through its own skip path for the pending epoch:
+    /// deadline passed, one verified request per pool member, quorum
+    /// assembly, adoption. Returns the broadcast skip block.
+    fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Arc<Verified<CertifiedBeaconBlock>> {
+        pass_skip_deadline(coord);
+        let anchor = coord.latest_block.block_hash();
+        let epoch_to_skip = coord.state.current_epoch.next();
+        let mut adopted = None;
+        for i in 0..4u64 {
+            let req = Verified::<SkipRequest>::sign_local(
+                &keypair(i),
+                ValidatorId::new(i),
+                &NetworkDefinition::simulator(),
+                anchor,
+                epoch_to_skip,
+            );
+            let actions = coord.on_verified_skip_request_received(Arc::new(req));
+            for action in actions {
+                if let Action::BroadcastBeaconBlock { block } = action {
+                    adopted = Some(block);
+                }
+            }
+        }
+        adopted.expect("pool quorum assembles and adopts the skip block")
+    }
+
+    /// Both commit paths assemble for one epoch from honest inputs
+    /// alone under asymmetric delivery: one replica adopts the SPC
+    /// block, another the skip block, and their chains diverge. On
+    /// first contact — the skip block verifying against the SPC
+    /// adopter's tip — the replica halts instead of carrying the fork.
+    #[test]
+    #[should_panic(expected = "beacon dual commit detected")]
+    fn normal_and_skip_paths_diverge_then_halt_on_contact() {
+        // Replica A commits epoch 1 via the SPC path.
+        let mut coord_a = new_coord(ValidatorId::new(0));
+        let ed = coord_a.state.chain_config.epoch_duration_ms;
+        coord_a.set_now(LocalTimestamp::from_millis(2 * ed));
+        let genesis_tip = coord_a.latest_block.block_hash();
+        let normal = valid_nonempty_block_at(&coord_a, Epoch::new(1), genesis_tip);
+        let dispatched = coord_a.on_beacon_block_received(Arc::clone(&normal));
+        let _ = complete_verifications(&mut coord_a, dispatched);
+        assert_eq!(coord_a.current_epoch(), Epoch::new(1));
+
+        // Replica B, cut off from the block, skips epoch 1 with the
+        // pool quorum.
+        let mut coord_b = new_coord(ValidatorId::new(1));
+        let skip_block = adopt_skip_block(&mut coord_b);
+        assert_eq!(coord_b.current_epoch(), Epoch::new(1));
+
+        // The fork: same epoch, same parent, different blocks.
+        assert_ne!(
+            coord_a.latest_block.block_hash(),
+            coord_b.latest_block.block_hash(),
+        );
+
+        // Contact: the skip block reaches A. Its cert is dispatched for
+        // verification against the pool that governed epoch 1, and the
+        // verified competitor halts the replica.
+        let competitor = Arc::new(Verifiable::from(
+            Arc::unwrap_or_clone(skip_block).into_inner(),
+        ));
+        let dispatched = coord_a.on_beacon_block_received(competitor);
+        assert!(
+            dispatched
+                .iter()
+                .any(|a| matches!(a, Action::VerifyBeaconBlock { .. })),
+            "a tip competitor must be verified, not silently dropped",
+        );
+        let _ = complete_verifications(&mut coord_a, dispatched);
+    }
+
+    /// The reverse contact direction: a replica on the skip branch
+    /// verifies the SPC block for the epoch it skipped and halts.
+    #[test]
+    #[should_panic(expected = "beacon dual commit detected")]
+    fn verified_normal_competitor_on_skip_tip_halts() {
+        let mut coord = fresh_coord();
+        let genesis_tip = coord.latest_block.block_hash();
+        // Built against the genesis-time committee — the set the tip
+        // epoch's competitor verification uses.
+        let normal = valid_nonempty_block_at(&coord, Epoch::new(1), genesis_tip);
+
+        let _ = adopt_skip_block(&mut coord);
+        assert_eq!(coord.current_epoch(), Epoch::new(1));
+
+        let dispatched = coord.on_beacon_block_received(normal);
+        assert!(
+            dispatched
+                .iter()
+                .any(|a| matches!(a, Action::VerifyBeaconBlock { .. })),
+        );
+        let _ = complete_verifications(&mut coord, dispatched);
     }
 
     /// Committing an epoch *normally* forgets the prior tip's
@@ -3599,6 +3909,7 @@ mod tests {
             &keys,
             &cert_committee,
             &signer_positions,
+            &PcVector::empty(),
         );
 
         let recipients = coord.spc_recipients();
@@ -3668,6 +3979,7 @@ mod tests {
             &keys,
             &cert_committee,
             &signer_positions,
+            &PcVector::empty(),
         );
 
         let recipients = coord.spc_recipients();
@@ -3760,6 +4072,75 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::VerifySkipRequest { .. })),
             "a due request must be delegated for verification",
+        );
+    }
+
+    /// A round-3 sign intent lifted for the pending epoch.
+    fn vote3_effect() -> SpcEffect {
+        let qc2 = Verified::<PcQc2>::new_unchecked_for_test(PcQc2::new(
+            PcVector::empty(),
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            PcXpProof::Full,
+        ));
+        SpcEffect::SignAndBroadcastPcVote3 {
+            view: SpcView::new(1),
+            qc2: Box::new(qc2),
+        }
+    }
+
+    /// An honest signature backs at most one of the epoch's two commit
+    /// paths: once a vote-3 sign intent lifts, the skip trigger emits
+    /// no request for the epoch.
+    #[test]
+    fn vote3_sign_intent_blocks_local_skip_request() {
+        let mut coord = fresh_coord();
+        pass_skip_deadline(&mut coord);
+
+        let lifted = coord.lift_spc_effects(Epoch::new(1), &[], vec![vote3_effect()]);
+        assert!(
+            lifted
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastPcVote3 { .. })),
+        );
+
+        let actions = coord.on_beacon_skip_timer();
+        assert!(actions.is_empty(), "a vote-3 signer must not skip-sign");
+    }
+
+    /// The other direction: once the local skip request is out, vote-3
+    /// sign intents drop at the lift. Vote-1 intents still lift — they
+    /// cannot complete a QC3.
+    #[test]
+    fn local_skip_request_mutes_vote3_sign_intents() {
+        let mut coord = fresh_coord();
+        pass_skip_deadline(&mut coord);
+
+        let actions = coord.on_beacon_skip_timer();
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastSkipRequest { .. })),
+        );
+
+        let lifted = coord.lift_spc_effects(Epoch::new(1), &[], vec![vote3_effect()]);
+        assert!(
+            lifted.is_empty(),
+            "post-skip vote-3 intents drop at the lift"
+        );
+
+        let lifted = coord.lift_spc_effects(
+            Epoch::new(1),
+            &[],
+            vec![SpcEffect::SignAndBroadcastPcVote1 {
+                view: SpcView::new(1),
+                v_in: PcVector::empty(),
+            }],
+        );
+        assert!(
+            lifted
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. })),
         );
     }
 
@@ -4406,6 +4787,7 @@ mod tests {
             &keys,
             &cert_committee,
             &signer_positions,
+            &PcVector::empty(),
         );
 
         let recipients = coord.spc_recipients();
