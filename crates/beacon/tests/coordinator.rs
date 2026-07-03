@@ -754,3 +754,106 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
         "replica 1's committed block omits validator 0's proposal — fetch path didn't admit it",
     );
 }
+
+/// Both commit paths assemble for one epoch across a block-layer
+/// partition, from honest signatures alone, with the vote-3 /
+/// skip-request exclusion active. The committee majority commits the
+/// SPC block; the other side — nine non-committee pool validators plus
+/// the one committee member that never signed a round-3 vote — reaches
+/// the ⌈2·13/3⌉+1 = 10 skip quorum and commits the skip block. The
+/// chains diverge at the same parent; on first cross-partition contact
+/// the replica verifies the competitor and halts.
+#[test]
+#[should_panic(expected = "beacon dual commit detected")]
+fn dual_commit_paths_diverge_across_partition_then_halt() {
+    const COMMITTEE: usize = 4;
+    const POOL: usize = 13;
+    let mut sim = CoordinatorSim::new_with_pool(COMMITTEE, POOL, 0xF0_12);
+    let ids: Vec<ValidatorId> = (0..POOL as u64).map(ValidatorId::new).collect();
+
+    // Member 3 is cut from all inbound traffic for the SPC phase: it
+    // proposes and casts its round-1 vote, but never sees a QC2, so it
+    // never signs a round-3 vote and stays skip-eligible.
+    sim.drop_counters[3] = usize::MAX / 2;
+    // Blocks never cross between the committee majority and the rest.
+    sim.partition_blocks_between(&ids[..3], &ids[3..]);
+
+    // The beacon paces to wall-clock and goes quiescent between
+    // timer fires; re-kick until the committee side commits (the
+    // `run_until_committed` quiescence pattern, scoped to the
+    // committee — the partitioned replicas never commit here).
+    sim.kick_off();
+    for _ in 0..8 {
+        sim.run_for_at_most(50_000);
+        if (0..3).all(|i| !sim.commits[i].is_empty()) {
+            break;
+        }
+        // The view timer is what carries a view whose proposal-object
+        // coverage is incomplete (member 3 relays nothing); the sim
+        // models its wall-clock expiry explicitly.
+        sim.fire_spc_view_timer_all();
+        sim.kick_off();
+    }
+
+    // The committee majority committed the SPC block for epoch 1 —
+    // proposal-carrying, so its hash diverges from the skip block's
+    // (a proposal-less SPC block would be bit-identical to it).
+    let normal = sim.commits[0]
+        .last()
+        .expect("committee replica commits epoch 1")
+        .clone();
+    assert_eq!(normal.epoch, Epoch::new(1));
+    assert!(matches!(normal.block.cert(), BeaconCert::Normal(_)));
+    assert!(!normal.block.block().committed_proposals().is_empty());
+    for i in 1..3 {
+        assert!(!sim.commits[i].is_empty(), "replica {i} missed the commit");
+    }
+    for i in 3..POOL {
+        assert!(
+            sim.commits[i].is_empty(),
+            "replica {i} saw the block through the partition",
+        );
+    }
+
+    // The partitioned side reaches its skip deadline and every replica
+    // there fires the real wall-clock trigger — the exclusion admits
+    // exactly the validators that never signed a round-3 vote.
+    sim.drop_counters[3] = 0;
+    sim.pass_skip_deadline();
+    for idx in 3..POOL {
+        sim.fire_beacon_skip_timer(idx);
+    }
+    sim.run_for_at_most(50_000);
+
+    let skip = sim.commits[4]
+        .last()
+        .expect("pool side commits the skip block")
+        .clone();
+    assert_eq!(skip.epoch, Epoch::new(1));
+    let BeaconCert::Skip(cert) = skip.block.cert() else {
+        panic!("expected a skip cert on the partitioned side");
+    };
+    assert!(
+        cert.signer_count() >= 10,
+        "skip quorum is 10 of the 13-member active pool",
+    );
+    for i in 3..POOL {
+        assert!(
+            matches!(
+                sim.commits[i].last().map(|c| c.block.cert()),
+                Some(BeaconCert::Skip(_)),
+            ),
+            "replica {i} did not adopt the skip block",
+        );
+    }
+
+    // The fork: same epoch, same parent, different blocks — reached
+    // with zero Byzantine signatures.
+    assert_eq!(normal.block.prev_block_hash(), skip.block.prev_block_hash(),);
+    assert_ne!(normal.block.block_hash(), skip.block.block_hash());
+
+    // Contact: heal the partition and hand the skip block to a
+    // committee replica. The verified competitor halts it.
+    sim.clear_block_partition();
+    let _ = sim.deliver_block_to(0, &skip.block);
+}

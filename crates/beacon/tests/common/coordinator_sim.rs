@@ -149,6 +149,12 @@ pub struct CoordinatorSim {
     /// and the entry is removed. Used to simulate a missed proposal
     /// gossip from `sender` to `receiver`.
     blocked_proposal_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
+    /// Persistent per-pair filter on `BroadcastBeaconBlock` deliveries:
+    /// while `(sender, receiver)` is present, block gossip from
+    /// `sender` never reaches `receiver`. Models a partition at the
+    /// block-dissemination layer; cleared by
+    /// [`Self::clear_block_partition`].
+    blocked_block_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
 }
 
 impl CoordinatorSim {
@@ -164,15 +170,31 @@ impl CoordinatorSim {
     /// rejects oversized committees.
     #[must_use]
     pub fn new(n: usize, seed: u64) -> Self {
+        Self::new_with_pool(n, n, seed)
+    }
+
+    /// Like [`Self::new`], but with `pool_n` validators of which only
+    /// the first `committee_n` sit on the beacon committee. Every
+    /// validator is seated ready on the single ROOT shard (the chain
+    /// config's shard size is raised to fit), so all `pool_n` are in
+    /// the active pool — the signer base for skip certificates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `committee_n > BEACON_SIGNER_COUNT` or
+    /// `committee_n > pool_n`.
+    #[must_use]
+    pub fn new_with_pool(committee_n: usize, pool_n: usize, seed: u64) -> Self {
         assert!(
-            n <= BEACON_SIGNER_COUNT,
-            "CoordinatorSim n={n} exceeds BEACON_SIGNER_COUNT={BEACON_SIGNER_COUNT}",
+            committee_n <= BEACON_SIGNER_COUNT,
+            "CoordinatorSim committee_n={committee_n} exceeds BEACON_SIGNER_COUNT={BEACON_SIGNER_COUNT}",
         );
+        assert!(committee_n <= pool_n);
         let network = NetworkDefinition::simulator();
 
-        let mut sks = Vec::with_capacity(n);
-        let mut members = Vec::with_capacity(n);
-        for i in 0..n {
+        let mut sks = Vec::with_capacity(pool_n);
+        let mut members = Vec::with_capacity(pool_n);
+        for i in 0..pool_n {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
@@ -183,8 +205,12 @@ impl CoordinatorSim {
         }
 
         let pool_id = StakePoolId::new(0);
+        let chain_config = BeaconChainConfig {
+            shard_size: u32::try_from(pool_n).expect("pool_n fits in u32"),
+            ..BeaconChainConfig::default()
+        };
         let config = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config,
             initial_validators: members
                 .iter()
                 .map(|(id, pk)| GenesisValidator {
@@ -195,9 +221,13 @@ impl CoordinatorSim {
                 .collect(),
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos((n as u128) * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_attos((pool_n as u128) * MIN_STAKE_FLOOR.attos()),
             }],
-            initial_beacon_committee: members.iter().map(|(id, _)| *id).collect(),
+            initial_beacon_committee: members
+                .iter()
+                .take(committee_n)
+                .map(|(id, _)| *id)
+                .collect(),
             initial_shard_committee: members.iter().map(|(id, _)| *id).collect(),
             initial_randomness: Randomness::new([0x42; 32]),
         };
@@ -206,7 +236,7 @@ impl CoordinatorSim {
         let config_hash = genesis_config_hash(&config, &network);
         let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
 
-        let coordinators: Vec<BeaconCoordinator> = (0..n)
+        let coordinators: Vec<BeaconCoordinator> = (0..pool_n)
             .map(|i| {
                 BeaconCoordinator::new(
                     Arc::clone(&genesis_block),
@@ -225,15 +255,43 @@ impl CoordinatorSim {
             members,
             sks,
             network,
-            commits: (0..n).map(|_| Vec::new()).collect(),
+            commits: (0..pool_n).map(|_| Vec::new()).collect(),
             network_q: VecDeque::new(),
             loopback_q: VecDeque::new(),
-            drop_counters: vec![0; n],
-            byzantine: vec![None; n],
-            byzantine_fires: vec![0; n],
+            drop_counters: vec![0; pool_n],
+            byzantine: vec![None; pool_n],
+            byzantine_fires: vec![0; pool_n],
             pending_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
+            blocked_block_pairs: BTreeSet::new(),
         }
+    }
+
+    /// Partition the block-dissemination layer between `a` and `b`:
+    /// `BroadcastBeaconBlock` deliveries never cross between the two
+    /// groups, in either direction, until
+    /// [`Self::clear_block_partition`]. Other traffic is unaffected.
+    pub fn partition_blocks_between(&mut self, a: &[ValidatorId], b: &[ValidatorId]) {
+        for &x in a {
+            for &y in b {
+                self.blocked_block_pairs.insert((x, y));
+                self.blocked_block_pairs.insert((y, x));
+            }
+        }
+    }
+
+    /// Heal the block-dissemination partition.
+    pub fn clear_block_partition(&mut self) {
+        self.blocked_block_pairs.clear();
+    }
+
+    /// Fire the wall-clock skip trigger on `idx` — the real coordinator
+    /// path, including the vote-3 / skip-request exclusion — and absorb
+    /// whatever it emits (the signed request loops back locally and
+    /// queues for every peer).
+    pub fn fire_beacon_skip_timer(&mut self, idx: usize) {
+        let actions = self.coordinators[idx].on_beacon_skip_timer();
+        self.absorb(idx, actions);
     }
 
     /// Block the next `BuildAndBroadcastBeaconProposal` from `sender`
@@ -997,6 +1055,10 @@ impl CoordinatorSim {
             Action::BroadcastBeaconBlock { block } => {
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
+                        continue;
+                    }
+                    let rcpt = self.members[to_idx].0;
+                    if self.blocked_block_pairs.contains(&(me, rcpt)) {
                         continue;
                     }
                     self.network_q.push_back(Envelope {
