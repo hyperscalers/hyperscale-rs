@@ -27,7 +27,12 @@
 //   INV-BEACON-1 across the paths: no two honest replicas adopt different
 //   blocks at the same epoch. The SPC cert is quorum-signed by the
 //   committee; the skip cert by > 2/3 of the wider pool; adoption is
-//   first-verified-wins at tip + 1 with no cross-path arbitration.
+//   first-verified-wins at tip + 1 with no cross-path reconciliation
+//   (a replica that verifies a competing block for its adopted epoch
+//   halts — the implementation detects the fork loudly, which this
+//   model treats identically to reaching the invariant violation). The
+//   shipped honest rule is the EXCLUSIVE instance's: a round-3 vote and
+//   a skip request are mutually exclusive per validator per epoch.
 //
 // Code anchors:
 //   - Prefix algebra: crates/types/src/beacon/prefix_ops.rs — `mcp`,
@@ -444,11 +449,10 @@ module beacon_epoch {
   // non-committee members.
   const F: int
   const POOL_EXTRA: int
-  // Candidate hardening, not shipped behavior: an honest validator
-  // signs at most one of the two paths (SPC participation excludes
-  // skip-signing and vice versa). The shipped coordinator gates SPC
-  // ingress on an observed skip *quorum*, not on the local signature —
-  // between signing and quorum both paths stay open.
+  // The shipped honest rule (coordinator vote-3 / skip-request
+  // exclusion): an honest validator signs at most one of the two paths
+  // per epoch. Instances with EXCLUSIVE = false are the twin without
+  // it.
   const EXCLUSIVE: bool
 
   pure val N = 3 * F + 1
@@ -591,23 +595,24 @@ module beacon_epoch {
   }
 }
 
-// The shipped arbitration (none): both certificates can form and
+// The twin without the sign-path exclusion: both certificates form and
 // adoption is first-verified-wins — honest replicas fork the beacon
 // chain at the epoch without a single Byzantine signature.
 module beacon_epoch_dual {
   import beacon_epoch(F = 1, POOL_EXTRA = 0, EXCLUSIVE = false).*
 }
 
-// Candidate hardening probed: with pool == committee, mutual exclusion
-// between the sign paths makes the two quorums intersect in an honest
-// signer, so both certificates cannot form.
+// The shipped rule at pool == committee: mutual exclusion between the
+// sign paths makes the two quorums intersect in an honest signer, so
+// both certificates cannot form.
 module beacon_epoch_exclusive {
   import beacon_epoch(F = 1, POOL_EXTRA = 0, EXCLUSIVE = true).*
 }
 
-// The same hardening with a pool of 12 over a committee of 4: the skip
+// The shipped rule with a pool of 12 over a committee of 4: the skip
 // quorum (9) forms without touching the SPC quorum, and the fork
-// returns — exclusion is not a fix, only a shrink of the window.
+// returns — the exclusion shrinks the window, it does not close it;
+// the open finding, detected at contact by the halt.
 module beacon_epoch_exclusive_pool {
   import beacon_epoch(F = 1, POOL_EXTRA = 8, EXCLUSIVE = true).*
 }
