@@ -70,15 +70,13 @@
 //     vector; the prefix algebra is length-generic.
 //   - One PC instance. SPC view sequencing, indirect certificates
 //     (paper Lemmas A.3-A.5), and the commit-walk parent resolution are
-//     deferred to a revision, as is PC liveness. The walk deviation the
-//     revision probes: the paper's Parent (Algorithm 3 line 1) resolves
-//     a value's FIRST non-bottom entry, fetching the preimage if needed,
-//     so Parent is a function of the value; the implementation's
-//     `parent_of` (crates/beacon/src/spc.rs) skips a non-bottom entry
-//     whose preimage is absent from the local proposal table and
-//     resolves the next one, making resolution depend on table coverage
-//     — outside the premise of the paper's unique-chain Agreement
-//     argument (Lemma A.7).
+//     deferred to a revision, as is PC liveness. The implementation's
+//     walk (`resolve_parent`, crates/beacon/src/spc.rs) carries the
+//     paper's Parent semantics (Algorithm 3 line 1): only a value's
+//     FIRST non-bottom entry resolves, and a missing preimage defers
+//     the walk until the proposal object arrives — resolution is a
+//     function of the value, which is the unique-chain premise of the
+//     paper's Agreement argument (Lemma A.7) the revision mechanizes.
 //
 // Run:
 //   quint typecheck specs/beacon_spc.qnt
