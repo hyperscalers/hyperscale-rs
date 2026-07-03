@@ -70,50 +70,50 @@ fn hash_proposal_object(po: &SpcProposalObject) -> PcValueElement {
     PcValueElement::from_digest(raw, COLLISION_DOMAIN)
 }
 
-/// `Parent(view, value)` — walk a value vector's first non-bottom
-/// element to its proposal-object preimage, returning the cert's
-/// parent `(view, value)` alongside the verified cert that proves it.
-/// Used by [`commit`] to chain back to view 1; on reaching view 1 the
-/// returned cert is what authenticates the committed beacon block.
-///
-/// `view = 1` has no parent (returns `None`).
-fn parent_of(
-    view: SpcView,
-    value: &PcVector,
-    proposals: &BTreeMap<PcValueElement, Verified<SpcProposalObject>>,
-) -> Option<(SpcView, PcVector, Verified<SpcCert>)> {
-    if view.inner() == 1 {
-        return None;
-    }
-    for el in value.iter() {
-        if *el != PcValueElement::BOTTOM
-            && let Some(po) = proposals.get(el)
-        {
-            let (parent_view, parent_value) = match &po.cert {
-                SpcCert::Direct {
-                    prev_view, value, ..
-                } => (*prev_view, value.clone()),
-                SpcCert::Indirect {
-                    target_view,
-                    target_value,
-                    ..
-                } => (*target_view, target_value.clone()),
-            };
-            return Some((parent_view, parent_value, po.verified_cert()));
-        }
-    }
-    None
+/// Outcome of resolving a value vector's parent pin against the local
+/// proposal-object table.
+enum ParentResolution {
+    /// The first non-bottom element's proposal object is held; its
+    /// cert pins the parent `(view, value)`, and the verified cert is
+    /// what proves it — on reaching view 1 it authenticates the
+    /// committed beacon block. Boxed to keep the variants close in
+    /// size — `SpcCert` embeds a full `PcQc3`.
+    Resolved(SpcView, PcVector, Box<Verified<SpcCert>>),
+    /// The first non-bottom element's preimage is not in the table.
+    /// The walk is blocked, not ended: callers defer and re-resolve
+    /// once the proposal object arrives.
+    Missing,
+    /// No non-bottom element — the value pins no parent.
+    Parentless,
 }
 
-/// `HasParent(view, value)`: view 1 always has a parent (the genesis
-/// boundary); view ≥ 2 needs the first non-bottom hash in `value` to
-/// reference a known proposal object.
-fn has_parent(
-    view: SpcView,
+/// `Parent(value)` — read the value vector's FIRST non-bottom element
+/// only, so resolution is a function of the value itself: two replicas
+/// holding the same value can never resolve different parents,
+/// whatever their tables hold. A missing preimage defers rather than
+/// falling through to a later element. View 1 anchors on the genesis
+/// boundary; callers gate on `view == 1` before resolving.
+fn resolve_parent(
     value: &PcVector,
     proposals: &BTreeMap<PcValueElement, Verified<SpcProposalObject>>,
-) -> bool {
-    view.inner() == 1 || parent_of(view, value, proposals).is_some()
+) -> ParentResolution {
+    let Some(el) = value.iter().find(|el| **el != PcValueElement::BOTTOM) else {
+        return ParentResolution::Parentless;
+    };
+    let Some(po) = proposals.get(el) else {
+        return ParentResolution::Missing;
+    };
+    let (parent_view, parent_value) = match &po.cert {
+        SpcCert::Direct {
+            prev_view, value, ..
+        } => (*prev_view, value.clone()),
+        SpcCert::Indirect {
+            target_view,
+            target_value,
+            ..
+        } => (*target_view, target_value.clone()),
+    };
+    ParentResolution::Resolved(parent_view, parent_value, Box::new(po.verified_cert()))
 }
 
 // ─── FSM ───────────────────────────────────────────────────────────────────
@@ -325,6 +325,12 @@ impl ViewState {
 /// wouldn't act on, so it's dropped before the BLS dispatch.
 pub(crate) const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
 
+/// Bound on `pending_commits`. Distinct blocked walks are
+/// re-aggregation variants of real QC3s inside the admission window,
+/// so the honest population is small; past the cap new entries drop —
+/// beacon block sync delivers the committed epoch regardless.
+const MAX_PENDING_COMMITS: usize = 64;
+
 /// One SPC FSM instance, scoped to a single epoch.
 ///
 /// Owns one inner PC instance per view it enters. The
@@ -345,12 +351,30 @@ pub struct SpcInstance {
     max_high: Option<Verified<SpcHighTriple>>,
 
     /// Empty-view messages we've sig-/Qc3-validated but couldn't admit
-    /// yet because `has_parent` failed at receipt. Keyed by `msg.view`
-    /// then sender. Re-scanned after every `enter_view` so a missing-
-    /// parent message that arrives ahead of its parent proposal-object
-    /// still counts toward the `f + 1` indirect-cert threshold once
-    /// the gap closes.
+    /// yet because the reported triple's parent didn't resolve at
+    /// receipt. Keyed by `msg.view` then sender. Re-scanned after every
+    /// `enter_view` so a missing-parent message that arrives ahead of
+    /// its parent proposal-object still counts toward the `f + 1`
+    /// indirect-cert threshold once the gap closes.
     pending_empty_views: BTreeMap<SpcView, BTreeMap<ValidatorId, Verified<SpcEmptyViewMsg>>>,
+
+    /// `NewView`s whose cert's parent claim didn't resolve at receipt,
+    /// keyed by the proposal-object slot they fill once admitted
+    /// (last-write-wins per `(view, relay)`, like the slot itself).
+    /// Dropping them instead would lose the relay's proposal object
+    /// and skew this replica's table against its peers'.
+    pending_new_views: BTreeMap<(SpcView, ValidatorId), Verified<SpcCert>>,
+
+    /// Own decided highs whose parent didn't resolve at decision time.
+    /// The direct advance is re-attempted once the preimage arrives;
+    /// attesting an empty view instead would claim "no parented high
+    /// at this view" for a view that has one — exactly the claim the
+    /// indirect-cert skip must be able to trust.
+    pending_highs: BTreeMap<SpcView, Verified<PcQc3>>,
+
+    /// Commit walks blocked on a missing proposal-object preimage,
+    /// re-attempted after every `proposals_by_hash` insert.
+    pending_commits: Vec<(SpcView, PcVector)>,
 
     high_output: Option<PcVector>,
 }
@@ -404,6 +428,9 @@ impl SpcInstance {
             new_commit_broadcast: BTreeSet::new(),
             max_high: None,
             pending_empty_views: BTreeMap::new(),
+            pending_new_views: BTreeMap::new(),
+            pending_highs: BTreeMap::new(),
+            pending_commits: Vec::new(),
             high_output: None,
         }
     }
@@ -580,8 +607,23 @@ impl SpcInstance {
         if self.high_output.is_some() {
             return vec![];
         }
+        let parented = view.inner() == 1
+            || match resolve_parent(high, &self.proposals_by_hash) {
+                ParentResolution::Resolved(..) => true,
+                ParentResolution::Missing => {
+                    // The high pins a parent the local table can't
+                    // resolve yet. Defer the advance and retry when
+                    // the preimage lands; an empty-view here would
+                    // attest a parentless view to the indirect-cert
+                    // skip, which may only bypass views whose lows
+                    // are genuinely parentless.
+                    self.pending_highs.insert(view, proof);
+                    return vec![];
+                }
+                ParentResolution::Parentless => false,
+            };
         let mut out = vec![];
-        if has_parent(view, high, &self.proposals_by_hash) {
+        if parented {
             let triple = Verified::<SpcHighTriple>::from_verified_proof(view, proof.clone());
             self.update_max_high(triple);
             let Some(next_raw) = view.inner().checked_add(1) else {
@@ -649,8 +691,17 @@ impl SpcInstance {
                 ..
             } => (*target_view, target_value.clone()),
         };
-        if !has_parent(prev_view, &parent_value, &self.proposals_by_hash) {
-            return vec![];
+        if prev_view.inner() > 1 {
+            match resolve_parent(&parent_value, &self.proposals_by_hash) {
+                ParentResolution::Resolved(..) => {}
+                ParentResolution::Missing => {
+                    self.buffer_pending_new_view(from, view, cert);
+                    return vec![];
+                }
+                // A cert whose parent claim pins nothing can never
+                // validate — drop it.
+                ParentResolution::Parentless => return vec![],
+            }
         }
         self.enter_view(from, view, cert)
     }
@@ -744,8 +795,9 @@ impl SpcInstance {
             out.extend(self.translate_pc_effects(view, pc_effects));
         }
         // `proposals_by_hash` just gained an entry, so previously-
-        // buffered empty-views may now pass their `has_parent` check.
-        out.extend(self.rescan_pending_empty_views());
+        // buffered empty-views, new-views, deferred highs, and blocked
+        // commit walks may now resolve.
+        out.extend(self.rescan_pending());
         out
     }
 
@@ -789,12 +841,20 @@ impl SpcInstance {
         if view.inner() <= reported_view.inner() {
             return vec![];
         }
-        if !has_parent(reported_view, &reported_value, &self.proposals_by_hash) {
-            // Parent ProposalObject hasn't arrived yet. Buffer the
-            // empty-view; `rescan_pending_empty_views` retries it
-            // after every `enter_view`.
-            self.buffer_pending_empty_view(msg);
-            return vec![];
+        if reported_view.inner() > 1 {
+            match resolve_parent(&reported_value, &self.proposals_by_hash) {
+                ParentResolution::Resolved(..) => {}
+                ParentResolution::Missing => {
+                    // Parent ProposalObject hasn't arrived yet. Buffer
+                    // the empty-view; the pending rescan retries it
+                    // after every `enter_view`.
+                    self.buffer_pending_empty_view(msg);
+                    return vec![];
+                }
+                // A reported high that pins no parent is invalid
+                // evidence — drop it.
+                ParentResolution::Parentless => return vec![],
+            }
         }
 
         self.update_max_high(Verified::<SpcHighTriple>::from_verified_empty_view(&msg));
@@ -851,11 +911,48 @@ impl SpcInstance {
         bucket.entry(msg.signer).or_insert(msg);
     }
 
-    /// Drain `pending_empty_views` and re-attempt each entry. Every
-    /// `proposals_by_hash` insert must follow with a call here —
-    /// `has_parent` flips from false to true when the value's first
-    /// non-bottom hash gains a preimage, and entries waiting on that
-    /// would otherwise stall.
+    fn buffer_pending_new_view(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        cert: Verified<SpcCert>,
+    ) {
+        let current = self.current_view.inner();
+        let v = view.inner();
+        if v < current || v > current + MAX_PENDING_EMPTY_VIEW_AHEAD {
+            return;
+        }
+        // Last-write-wins per (view, relay), matching the proposal-
+        // object slot the entry fills once admitted.
+        self.pending_new_views.insert((view, from), cert);
+    }
+
+    fn buffer_pending_commit(&mut self, view: SpcView, value: PcVector) {
+        if self.high_output.is_some() {
+            return;
+        }
+        let entry = (view, value);
+        if self.pending_commits.contains(&entry)
+            || self.pending_commits.len() >= MAX_PENDING_COMMITS
+        {
+            return;
+        }
+        self.pending_commits.push(entry);
+    }
+
+    /// Drain every deferred-work buffer and re-attempt each entry.
+    /// Every `proposals_by_hash` insert must follow with a call here —
+    /// parent resolution flips from `Missing` to `Resolved` when the
+    /// value's first non-bottom hash gains a preimage, and entries
+    /// waiting on that would otherwise stall.
+    fn rescan_pending(&mut self) -> Vec<SpcEffect> {
+        let mut out = self.rescan_pending_empty_views();
+        out.extend(self.rescan_pending_new_views());
+        out.extend(self.rescan_pending_highs());
+        out.extend(self.rescan_pending_commits());
+        out
+    }
+
     fn rescan_pending_empty_views(&mut self) -> Vec<SpcEffect> {
         let current = self.current_view;
         self.pending_empty_views
@@ -870,6 +967,42 @@ impl SpcInstance {
         out
     }
 
+    fn rescan_pending_new_views(&mut self) -> Vec<SpcEffect> {
+        let current = self.current_view;
+        self.pending_new_views
+            .retain(|(v, _), _| v.inner() >= current.inner());
+        let pending = std::mem::take(&mut self.pending_new_views);
+        let mut out = vec![];
+        for ((view, from), cert) in pending {
+            out.extend(self.on_new_view_verified(from, view, cert));
+        }
+        out
+    }
+
+    fn rescan_pending_highs(&mut self) -> Vec<SpcEffect> {
+        let current = self.current_view;
+        // A deferred high at view v advances to v + 1; entries the
+        // view sequence has already passed are stale.
+        self.pending_highs
+            .retain(|v, _| v.inner() + 1 >= current.inner());
+        let pending = std::mem::take(&mut self.pending_highs);
+        let mut out = vec![];
+        for (view, proof) in pending {
+            let high = proof.x_pe().clone();
+            out.extend(self.on_vpc_output_high(view, &high, proof));
+        }
+        out
+    }
+
+    fn rescan_pending_commits(&mut self) -> Vec<SpcEffect> {
+        let pending = std::mem::take(&mut self.pending_commits);
+        let mut out = vec![];
+        for (view, value) in pending {
+            out.extend(self.commit(view, &value));
+        }
+        out
+    }
+
     fn commit(&mut self, view: SpcView, value: &PcVector) -> Vec<SpcEffect> {
         let mut out = vec![];
         // View-1 commit is a no-op locally: `v_low` is computed by PC
@@ -878,28 +1011,36 @@ impl SpcInstance {
         if view.inner() == 1 {
             return out;
         }
-        if let Some((parent_view, parent_value, parent_cert)) =
-            parent_of(view, value, &self.proposals_by_hash)
-        {
-            if parent_view.inner() == 1 {
-                if self.high_output.is_none() {
-                    self.high_output = Some(parent_value.clone());
-                    // The authenticating cert is the one the walk just
-                    // resolved to `(1, parent_value)` — so
-                    // `cert.committed_value() == parent_value == value`
-                    // holds by construction, which is what lets a remote
-                    // verifier bind a block's committed proposals to its
-                    // cert.
-                    out.push(SpcEffect::OutputHigh {
-                        value: parent_value,
-                        cert: Box::new(parent_cert),
-                    });
-                    // Instance is done: free the proposal table.
-                    self.proposals_by_hash.clear();
+        match resolve_parent(value, &self.proposals_by_hash) {
+            ParentResolution::Resolved(parent_view, parent_value, parent_cert) => {
+                if parent_view.inner() == 1 {
+                    if self.high_output.is_none() {
+                        self.high_output = Some(parent_value.clone());
+                        // The authenticating cert is the one the walk just
+                        // resolved to `(1, parent_value)` — so
+                        // `cert.committed_value() == parent_value == value`
+                        // holds by construction, which is what lets a remote
+                        // verifier bind a block's committed proposals to its
+                        // cert.
+                        out.push(SpcEffect::OutputHigh {
+                            value: parent_value,
+                            cert: parent_cert,
+                        });
+                        // Instance is done: free the proposal table and
+                        // the deferred work.
+                        self.proposals_by_hash.clear();
+                        self.pending_new_views.clear();
+                        self.pending_highs.clear();
+                        self.pending_commits.clear();
+                    }
+                } else if parent_view.inner() > 1 {
+                    out.extend(self.commit(parent_view, &parent_value));
                 }
-            } else if parent_view.inner() > 1 {
-                out.extend(self.commit(parent_view, &parent_value));
             }
+            ParentResolution::Missing => {
+                self.buffer_pending_commit(view, value.clone());
+            }
+            ParentResolution::Parentless => {}
         }
         out
     }
@@ -1061,20 +1202,32 @@ mod tests {
         assert!(effects.is_empty());
     }
 
-    /// `parent_of(view 1, _)` returns `None` — view 1 has no parent.
-    /// `has_parent(view 1, _)` returns `true` — the genesis boundary.
-    #[test]
-    fn parent_helpers_at_view_one() {
-        let proposals = BTreeMap::new();
-        assert!(parent_of(SpcView::new(1), &PcVector::empty(), &proposals).is_none());
-        assert!(has_parent(SpcView::new(1), &PcVector::empty(), &proposals));
+    /// A [`PcQc3`] whose committed low and high both equal `value` —
+    /// the shape the FSM's `proof.x_pp() == value` binding expects.
+    fn pc_qc3_with(value: PcVector) -> PcQc3 {
+        let qc2 = PcQc2::new(
+            value.clone(),
+            SignerBitfield::new(4),
+            generate_bls_keypair().sign_v1(b"unused"),
+            PcXpProof::Full,
+        );
+        PcQc3::new(
+            value,
+            qc2,
+            None,
+            None,
+            SignerBitfield::new(4),
+            PcSignerLengths::Uniform(0),
+            generate_bls_keypair().sign_v1(b"unused"),
+        )
     }
 
-    /// `parent_of(view N, _)` returns the cert's parent triple when
-    /// the value's first non-bottom hash resolves to a proposal
-    /// object in the table.
+    /// Parent resolution reads only the value's first non-bottom
+    /// entry: BOTTOMs are skipped, a missing preimage is `Missing`
+    /// (never a fall-through to a later entry the table happens to
+    /// hold), and an all-bottom value is `Parentless`.
     #[test]
-    fn parent_of_resolves_first_non_bottom_hash() {
+    fn parent_resolution_reads_only_first_non_bottom_entry() {
         let parent_value = PcVector::new(std::iter::once(PcValueElement::new([0xAB; 32])));
         let cert = SpcCert::Direct {
             prev_view: SpcView::new(2),
@@ -1085,19 +1238,213 @@ mod tests {
             view: SpcView::new(3),
             cert,
         };
-        let h = hash_proposal_object(&po);
+        let h_known = hash_proposal_object(&po);
+        let h_unknown = PcValueElement::new([0x77; 32]);
         let mut proposals = BTreeMap::new();
-        proposals.insert(h, Verified::<SpcProposalObject>::new_unchecked_for_test(po));
+        proposals.insert(
+            h_known,
+            Verified::<SpcProposalObject>::new_unchecked_for_test(po),
+        );
 
-        // Search vector: [BOTTOM, h] — second element resolves.
-        let search = PcVector::new([PcValueElement::BOTTOM, h]);
-        let (parent_view, resolved_value, resolved_cert) =
-            parent_of(SpcView::new(3), &search, &proposals).expect("resolves");
+        let ParentResolution::Resolved(parent_view, resolved_value, resolved_cert) = resolve_parent(
+            &PcVector::new([PcValueElement::BOTTOM, h_known]),
+            &proposals,
+        ) else {
+            panic!("[BOTTOM, known] resolves via the first non-bottom entry");
+        };
         assert_eq!(parent_view, SpcView::new(2));
         assert_eq!(resolved_value, parent_value);
         // The lifted cert is exactly the proposal object's cert, so its
         // committed value matches the resolved parent value.
         assert_eq!(resolved_cert.committed_value(), &parent_value);
+
+        assert!(matches!(
+            resolve_parent(&PcVector::new([h_unknown, h_known]), &proposals),
+            ParentResolution::Missing
+        ));
+        assert!(matches!(
+            resolve_parent(
+                &PcVector::new([PcValueElement::BOTTOM, PcValueElement::BOTTOM]),
+                &proposals
+            ),
+            ParentResolution::Parentless
+        ));
+        assert!(matches!(
+            resolve_parent(&PcVector::empty(), &proposals),
+            ParentResolution::Parentless
+        ));
+    }
+
+    /// The commit walk is a function of the committed value: a replica
+    /// missing the first entry's preimage defers instead of resolving
+    /// a later entry, so two replicas walking the same value latch the
+    /// same view-1 high once their tables catch up.
+    #[test]
+    fn commit_walk_defers_on_missing_first_preimage_and_converges() {
+        let (_, members) = fsm_committee(4);
+        let mk = |idx: usize| {
+            SpcInstance::new(
+                Epoch::new(1),
+                members.clone(),
+                members[idx].0,
+                Duration::from_millis(100),
+            )
+        };
+        let mut x = mk(0);
+        let mut y = mk(1);
+
+        // Two view-2 entry certs pinning different (consistent,
+        // different-length) view-1 highs.
+        let v_short = PcVector::new([PcValueElement::new([0xA1; 32])]);
+        let v_long = PcVector::new([
+            PcValueElement::new([0xA1; 32]),
+            PcValueElement::new([0xA2; 32]),
+        ]);
+        let cert_a = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: v_short.clone(),
+            proof: dummy_pc_qc3().into(),
+        };
+        let cert_b = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: v_long,
+            proof: pc_qc3_with(PcVector::new([PcValueElement::new([0xA2; 32])])).into(),
+        };
+        let h_a = hash_proposal_object(&SpcProposalObject {
+            view: SpcView::new(2),
+            cert: cert_a.clone(),
+        });
+        let h_b = hash_proposal_object(&SpcProposalObject {
+            view: SpcView::new(2),
+            cert: cert_b.clone(),
+        });
+
+        let nv = |from: usize, cert: &SpcCert| SpcEvent::NewViewVerified {
+            from: members[from].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert.clone())),
+        };
+        // X holds both proposal objects; Y holds only the second.
+        let _ = x.handle(nv(2, &cert_a));
+        let _ = x.handle(nv(3, &cert_b));
+        let _ = y.handle(nv(3, &cert_b));
+
+        // View 2 commits a low naming both objects, first the one Y
+        // lacks.
+        let low = PcVector::new([h_a, h_b]);
+        let proof = pc_qc3_with(low.clone());
+        let nc = || SpcEvent::NewCommitVerified {
+            view: SpcView::new(2),
+            value: low.clone(),
+            proof: Box::new(Verified::<PcQc3>::new_unchecked_for_test(proof.clone())),
+        };
+
+        let _ = x.handle(nc());
+        assert_eq!(x.high_output(), Some(&v_short));
+
+        let _ = y.handle(nc());
+        assert!(
+            y.high_output().is_none(),
+            "the walk defers on the missing first preimage",
+        );
+
+        // The missing proposal object arrives; the deferred walk
+        // resolves to the same parent X took.
+        let _ = y.handle(nv(2, &cert_a));
+        assert_eq!(y.high_output(), Some(&v_short));
+    }
+
+    /// A decided high whose parent pin can't be resolved locally
+    /// defers the advance: no empty-view is attested (the view HAS a
+    /// parented high) and no direct advance fires until the preimage
+    /// lands — then the advance proceeds.
+    #[test]
+    fn unresolved_high_defers_the_advance_without_attesting_empty() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = SpcInstance::new(
+            Epoch::new(1),
+            members.clone(),
+            members[0].0,
+            Duration::from_millis(100),
+        );
+
+        let cert_a = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xB1; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let h_a = hash_proposal_object(&SpcProposalObject {
+            view: SpcView::new(2),
+            cert: cert_a.clone(),
+        });
+
+        let high = PcVector::new([h_a]);
+        let effects = fsm.on_vpc_output_high(
+            SpcView::new(2),
+            &high,
+            Verified::<PcQc3>::new_unchecked_for_test(pc_qc3_with(high.clone())),
+        );
+        assert!(effects.is_empty(), "deferred: no empty-view, no advance");
+
+        // The preimage arrives via a NewView relay; the direct advance
+        // to view 3 fires from the rescan.
+        let effects = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert_a)),
+        });
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            SpcEffect::BroadcastNewView { view, .. } if view.inner() == 3
+        )));
+    }
+
+    /// A `NewView` whose cert's parent claim has no local preimage is
+    /// buffered and admitted once the claimed object arrives, instead
+    /// of being dropped and losing the relay's proposal object.
+    #[test]
+    fn new_view_with_unresolved_parent_claim_is_buffered() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = SpcInstance::new(
+            Epoch::new(1),
+            members.clone(),
+            members[0].0,
+            Duration::from_millis(100),
+        );
+
+        let cert_a = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xC1; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let h_a = hash_proposal_object(&SpcProposalObject {
+            view: SpcView::new(2),
+            cert: cert_a.clone(),
+        });
+        let cert_c = SpcCert::Direct {
+            prev_view: SpcView::new(2),
+            value: PcVector::new([h_a]),
+            proof: dummy_pc_qc3().into(),
+        };
+
+        // A view-3 entry claiming a view-2 parent we can't resolve:
+        // buffered, not dropped.
+        let effects = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(3),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert_c)),
+        });
+        assert!(effects.is_empty());
+        assert_eq!(fsm.current_view(), SpcView::new(1));
+
+        // The claimed object arrives; the buffered entry admits and
+        // the view advances past it.
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[2].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert_a)),
+        });
+        assert_eq!(fsm.current_view(), SpcView::new(3));
     }
 
     /// `hash_proposal_object` is deterministic + never returns
