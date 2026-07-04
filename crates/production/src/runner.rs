@@ -52,11 +52,9 @@ use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Bls12381G1PrivateKey, GenesisValidators, InFlightCount,
-    LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, RoutableTransaction, ShardId, ShardTrie, ValidatorId,
-    ValidatorStatus,
+    LocalTimestamp, MAX_TX_IN_FLIGHT, RoutableTransaction, ShardId, ValidatorId, ValidatorStatus,
 };
 use libp2p::identity::Keypair;
-use radix_common::types::ComponentAddress;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot};
@@ -459,20 +457,9 @@ impl ProductionRunnerBuilder {
         let mut shard_channels: HashMap<ShardId, ShardChannels> = HashMap::new();
         let mut shard_callback_txs: HashMap<ShardId, Sender<HostEvent>> = HashMap::new();
         for shard in &local_shards {
-            let (timer_tx, timer_rx) = unbounded();
-            let (callback_tx, callback_rx) = unbounded();
-            let (shutdown_tx, shutdown_rx) = unbounded();
-            shard_callback_txs.insert(*shard, callback_tx.clone());
-            shard_channels.insert(
-                *shard,
-                ShardChannels {
-                    timer_tx,
-                    timer_rx,
-                    callback_rx,
-                    shutdown_tx,
-                    shutdown_rx,
-                },
-            );
+            let (channels, callback_tx) = ShardChannels::new();
+            shard_callback_txs.insert(*shard, callback_tx);
+            shard_channels.insert(*shard, channels);
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -808,12 +795,12 @@ impl ProductionRunner {
         let mut timer_ops = Vec::new();
         let local_shards: Vec<ShardId> = host.hosted_shards().collect();
         let topology_snapshot = Arc::clone(&self.topology_snapshot);
-        // The host's `GenesisConfig` enumerates every account across every
-        // hosted shard. Each shard's storage only gets the accounts whose
-        // address hashes to that shard, so genesis doesn't reapply other
-        // shards' state into the wrong store. Single-shard hosts (the
-        // historical default) end up running an identity filter.
-        let shared_genesis_config = self.genesis_config.take();
+        // Shared across every hosted shard; `install_engine_genesis` retains
+        // only the accounts whose address hashes to the shard it installs.
+        let genesis_config = self
+            .genesis_config
+            .take()
+            .unwrap_or_else(GenesisConfig::production);
         for shard in local_shards {
             let height = host.shard_io(shard).storage().committed_height();
             if height > BlockHeight::GENESIS {
@@ -825,11 +812,6 @@ impl ProductionRunner {
             }
             info!(shard = ?shard, "No committed blocks - initializing genesis for shard");
 
-            let genesis_config = shared_genesis_config
-                .clone()
-                .map_or_else(GenesisConfig::production, |cfg| {
-                    filter_genesis_for_shard(cfg, shard, topology_snapshot.load().shard_trie())
-                });
             let first_validator = topology_snapshot
                 .load()
                 .committee_for_shard(shard)
@@ -1241,6 +1223,28 @@ pub struct ShardChannels {
     pub(crate) shutdown_rx: Receiver<()>,
 }
 
+impl ShardChannels {
+    /// Allocate one shard's channel triple. Returns the callback sender
+    /// alongside — it goes into the process-scoped event-sender maps so
+    /// callbacks, network handlers, and RPC fanout land on the shard's
+    /// thread.
+    pub(crate) fn new() -> (Self, Sender<HostEvent>) {
+        let (timer_tx, timer_rx) = unbounded();
+        let (callback_tx, callback_rx) = unbounded();
+        let (shutdown_tx, shutdown_rx) = unbounded();
+        (
+            Self {
+                timer_tx,
+                timer_rx,
+                callback_rx,
+                shutdown_tx,
+                shutdown_rx,
+            },
+            callback_tx,
+        )
+    }
+}
+
 /// Manages tokio-based timers for one shard's pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
@@ -1299,33 +1303,6 @@ impl Drop for ProdTimerManager {
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Drop `xrd_balance` entries whose address doesn't hash to `shard`. The
-/// network-wide [`GenesisConfig`] enumerates accounts across every shard;
-/// installing it verbatim into one shard's storage would create accounts
-/// that consensus on that shard never owns.
-fn filter_genesis_for_shard(
-    mut config: GenesisConfig,
-    shard: ShardId,
-    shard_trie: &ShardTrie,
-) -> GenesisConfig {
-    config
-        .xrd_balances
-        .retain(|(address, _)| shard_for_address(address, shard_trie) == shard);
-    config
-}
-
-/// Compute the shard a [`ComponentAddress`] belongs to, by longest-prefix
-/// match against the active partition.
-fn shard_for_address(address: &ComponentAddress, shard_trie: &ShardTrie) -> ShardId {
-    let radix_node_id = address.into_node_id();
-    let det_node_id = NodeId(
-        radix_node_id.0[..30]
-            .try_into()
-            .expect("NodeId is 30 bytes"),
-    );
-    shard_trie.shard_for(&det_node_id)
-}
 
 /// Mint the `host`'s monotonic local clock as a `LocalTimestamp` (ms since
 /// UNIX epoch). Used to set the state machine's clock before each step.
