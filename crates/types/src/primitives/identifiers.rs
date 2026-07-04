@@ -604,6 +604,52 @@ impl Display for SpcView {
     }
 }
 
+/// Beacon epoch-ratification round counter.
+///
+/// The active pool ratifies one block per epoch across a sequence of
+/// rounds; each round admits one prevote and one precommit per member.
+/// A `(anchor, epoch, round, phase)` tuple scopes every ratify vote's
+/// signing bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct RatifyRound(u32);
+
+impl RatifyRound {
+    /// Initial round.
+    pub const INITIAL: Self = Self(1);
+
+    /// Construct a ratify round from a raw `u32`.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u32`. Use sparingly — at boundaries (display, BLS
+    /// signing-bytes construction, structured log fields) only.
+    #[must_use]
+    pub const fn inner(self) -> u32 {
+        self.0
+    }
+
+    /// Get the next round.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl Display for RatifyRound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RatifyRound({})", self.0)
+    }
+}
+
 /// shard round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
