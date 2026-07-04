@@ -701,6 +701,14 @@ impl Verified<CandidateBeaconBlock> {
     /// value, so a candidate cannot be built from unverified proposals
     /// or an unverified cert — verification is a type-level
     /// precondition, not a convention.
+    ///
+    /// # Panics
+    ///
+    /// Panics at the genesis epoch: candidates exist only past genesis
+    /// (the verify predicate rejects them with
+    /// [`CandidateBeaconBlockVerifyError::CandidateAtGenesis`]), so
+    /// assembling one would mint a `Verified` value the predicate
+    /// refutes.
     #[must_use]
     pub fn assemble(
         epoch: Epoch,
@@ -709,6 +717,7 @@ impl Verified<CandidateBeaconBlock> {
         shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
         cert: Verified<SpcCert>,
     ) -> Self {
+        assert_ne!(epoch, Epoch::GENESIS, "candidates exist only past genesis");
         let proposals: Vec<(ValidatorId, BeaconProposal)> = committed
             .into_iter()
             .map(|(id, proposal)| (id, proposal.into_inner()))

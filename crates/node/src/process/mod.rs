@@ -96,6 +96,11 @@ impl BeaconSignerSeat {
     /// — cross-vnode equivocation is impossible by construction — and
     /// never a fenced-out epoch: a successor's first fresh position
     /// passes.
+    ///
+    /// The ordering also drops the fast-forward re-prevote a
+    /// future-round polka schedules behind its precommit (same round,
+    /// lower phase). Benign: the polka is itself a prevote quorum for
+    /// the value, and the lock re-prevotes at the next round.
     fn allow_ratify(&mut self, position: (Epoch, RatifyRound, RatifyPhase)) -> bool {
         if Some(position) > self.max_ratify {
             self.max_ratify = Some(position);
