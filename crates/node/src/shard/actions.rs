@@ -93,8 +93,12 @@ where
             | Action::BuildAndBroadcastBeaconProposal { .. }
             | Action::BroadcastBeaconBlock { .. }
             | Action::BroadcastSkipRequest { .. }
+            | Action::SignAndBroadcastRatifyVote { .. }
+            | Action::BroadcastBeaconCandidate { .. }
             | Action::VerifyBeaconBlock { .. }
             | Action::VerifySkipRequest { .. }
+            | Action::VerifyRatifyVote { .. }
+            | Action::VerifyBeaconCandidate { .. }
             | Action::VerifyPcVote1 { .. }
             | Action::VerifyPcVote2 { .. }
             | Action::VerifyPcVote3 { .. }

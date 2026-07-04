@@ -12,7 +12,11 @@
 //! validators fetch witness contents on demand via request/response.
 
 mod beacon_block;
+mod candidate;
+mod ratify_vote;
 mod skip_request;
 
 pub use beacon_block::BeaconBlockGossip;
+pub use candidate::BeaconCandidateGossip;
+pub use ratify_vote::RatifyVoteGossip;
 pub use skip_request::SkipRequestGossip;

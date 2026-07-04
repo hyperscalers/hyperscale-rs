@@ -8,16 +8,17 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount,
-    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round,
-    RoutableTransaction, RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates,
-    SharedTransactions, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
+    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    CertifiedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector,
+    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
+    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
+    RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates, SharedTransactions,
+    SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView,
+    SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
+    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -1246,6 +1247,69 @@ pub enum Action {
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
+    /// Sign and broadcast a [`RatifyVote`] globally. The action handler
+    /// signs the vote using the runner-held BLS key (the coordinator
+    /// has no signing material), broadcasts the result over the global
+    /// beacon-ratify topic, and loops the verified vote back to the
+    /// state machine so the local ratification tracker pools its own
+    /// contribution. Quorum aggregation happens off-chain inside the
+    /// tracker.
+    SignAndBroadcastRatifyVote {
+        /// Anchor block hash the vote rides against (the latest
+        /// committed beacon block at the dispatching coordinator).
+        anchor: BeaconBlockHash,
+        /// Epoch whose block the vote ratifies. Must be
+        /// `current_epoch.next()` at the local tip — older or further
+        /// epochs are rejected at admission.
+        epoch: Epoch,
+        /// Ratification round the vote is cast in.
+        round: RatifyRound,
+        /// Prevote or precommit.
+        phase: RatifyPhase,
+        /// Hash of the block the vote names — the verified candidate's
+        /// or the canonical skip block's.
+        block_hash: BeaconBlockHash,
+    },
+
+    /// Verify a single-signer [`RatifyVote`] BLS signature. The result
+    /// returns to the state machine carrying the typed verified handle
+    /// on success.
+    VerifyRatifyVote {
+        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits dispatch.
+        vote: Box<Verifiable<RatifyVote>>,
+        /// Active validator pool used to look up the signer's pubkey.
+        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Broadcast an SPC-certified [`CandidateBeaconBlock`] over the
+    /// beacon gossip topic for pool ratification. The candidate is
+    /// self-authenticating (its SPC cert rides along); no signing
+    /// needed.
+    BroadcastBeaconCandidate {
+        /// Candidate to broadcast.
+        candidate: Arc<Verified<CandidateBeaconBlock>>,
+    },
+
+    /// Verify a [`CandidateBeaconBlock`]: its SPC proposal cert against
+    /// the epoch's committee, every `PcVoteEquivocation` carried in its
+    /// committed proposals, and the proposal-to-cert content binding.
+    /// The result returns to the state machine carrying the candidate
+    /// back.
+    VerifyBeaconCandidate {
+        /// Candidate whose cert + embedded equivocation witnesses are
+        /// being verified. A [`Verifiable::Verified`] wrapper
+        /// short-circuits dispatch.
+        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        /// Beacon committee for the candidate's epoch, in positional
+        /// order matching the SPC cert's signer bitfields.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        /// Pubkeys for the validators referenced by embedded
+        /// `PcVoteEquivocation` evidence. Empty when the candidate
+        /// carries no equivocations.
+        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
     /// Verify a round-1 PC vote against its `(epoch, view)` committee.
     /// Result returns via [`ProtocolEvent::PcVote1Verified`] carrying the
     /// typed verified handle on success.
@@ -1388,8 +1452,12 @@ impl Action {
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastSkipRequest { .. }
+            | Self::SignAndBroadcastRatifyVote { .. }
+            | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
+            | Self::VerifyRatifyVote { .. }
+            | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }
             | Self::VerifyPcVote2 { .. }
             | Self::VerifyPcVote3 { .. }
@@ -1435,7 +1503,8 @@ impl Action {
             | Self::SignAndBroadcastEmptyView { epoch, .. }
             | Self::BroadcastSpcNewView { epoch, .. }
             | Self::BroadcastSpcNewCommit { epoch, .. }
-            | Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some(*epoch),
+            | Self::BuildAndBroadcastBeaconProposal { epoch, .. }
+            | Self::SignAndBroadcastRatifyVote { epoch, .. } => Some(*epoch),
             Self::BroadcastSkipRequest { epoch_to_skip, .. } => Some(*epoch_to_skip),
             Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
@@ -1480,8 +1549,11 @@ impl Action {
             | Self::Fetch(_)
             | Self::AbandonFetch(_)
             | Self::BroadcastBeaconBlock { .. }
+            | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
+            | Self::VerifyRatifyVote { .. }
+            | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }
             | Self::VerifyPcVote2 { .. }
             | Self::VerifyPcVote3 { .. }
@@ -1535,8 +1607,12 @@ impl Action {
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastSkipRequest { .. }
+            | Self::SignAndBroadcastRatifyVote { .. }
+            | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
+            | Self::VerifyRatifyVote { .. }
+            | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }
             | Self::VerifyPcVote2 { .. }
             | Self::VerifyPcVote3 { .. }
