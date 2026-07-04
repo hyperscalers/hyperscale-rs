@@ -259,7 +259,8 @@ fn forged_boundary_qc_records_no_shard_boundary() {
     // assembler can back it, and the fold's hash binding accepts it — so a
     // forged QC would write `state_root = anchor`. The 2f+1 admission check
     // makes every honest verifier drop the proposal carrying it, so it
-    // can't reach the committed set, and the shard reads as a miss.
+    // can't reach the committed set; the epoch commits empty — skip-shaped —
+    // and the boundary carries forward untouched.
     let mut sim = CoordinatorSim::new(4, 0xF0_4D);
     let anchor = StateRoot::from_raw(Hash::from_bytes(b"forged-anchor"));
     sim.deliver_forged_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
@@ -543,16 +544,16 @@ fn forged_equivocation_witness_cannot_jail_or_fork() {
 
 // ─── Skip-path integration ─────────────────────────────────────────────
 
-/// Pool-quorum skip drives the chain past an abandoned epoch on every
+/// Pool ratification drives the chain past an abandoned epoch on every
 /// replica.
 ///
 /// All four replicas (which form both the active pool and the beacon
-/// committee at n=4) fire the skip trigger at the genesis tip. With
-/// quorum = ⌈8/3⌉+1 = 4, the third request hits quorum at every honest
-/// node within a network hop of being dispatched; each replica then
-/// assembles, broadcasts, and adopts the skip block — converging on a
-/// single block hash regardless of which signer subset the local
-/// cert holds.
+/// committee at n=4) fire the ratify timer at the genesis tip, making
+/// the canonical skip hash prevotable. With quorum = 4 − ⌊3/3⌋ = 3, the
+/// third prevote polkas at every honest node within a network hop;
+/// precommits follow, and each replica assembles a `RatifyCert` and
+/// adopts the skip block — converging on a single block hash regardless
+/// of which signer subset the local cert holds.
 #[test]
 fn skip_quorum_drives_chain_past_abandoned_epoch() {
     let mut sim = CoordinatorSim::new(4, 0);
@@ -562,15 +563,15 @@ fn skip_quorum_drives_chain_past_abandoned_epoch() {
     let pre_epoch = sim.coordinators[0].current_state().current_epoch;
     let skipped_epoch = pre_epoch.next();
 
-    // All n replicas dispatch a SkipRequest at the genesis anchor for
-    // the same `epoch_to_skip = pre_epoch.next()`. The sim's
-    // `fire_skip_trigger` mirrors what the production runner does on
-    // the skip-trigger timer firing: sign, admit locally, fan out.
-    // Requests only count once the epoch's deadline passes on each
-    // tracker's clock, so advance them first.
+    // All n replicas prevote the skip hash at the genesis anchor for
+    // the same epoch = `pre_epoch.next()`. The sim's `fire_ratify_timer`
+    // mirrors what the production runner does on the ratify timer
+    // firing: sign, admit locally, fan out. The skip hash only becomes
+    // prevotable once the epoch's deadline passes on each tracker's
+    // clock, so advance the clocks first.
     sim.pass_skip_deadline();
     for idx in 0..n {
-        sim.fire_skip_trigger(idx);
+        sim.fire_ratify_timer(idx);
     }
     // Bound by target_commits=1 — once every replica has committed
     // the skip block, stop. Letting the sim run further would push
@@ -609,7 +610,7 @@ fn skip_quorum_drives_chain_past_abandoned_epoch() {
         );
     }
 
-    // Skip-cert convergence isn't required to be byte-identical; the
+    // Ratify-cert convergence isn't required to be byte-identical; the
     // adoption rule only insists on block-hash agreement. So this test
     // pins the load-bearing invariant (block hash) but doesn't require
     // cert equality.
@@ -633,7 +634,7 @@ fn consecutive_skips_advance_chain() {
     // First skip: at the genesis tip, abandon epoch 1.
     sim.pass_skip_deadline();
     for idx in 0..n {
-        sim.fire_skip_trigger(idx);
+        sim.fire_ratify_timer(idx);
     }
     let _ = sim.run_until_committed(1, MAX_STEPS);
     for r in 0..n {
@@ -659,7 +660,7 @@ fn consecutive_skips_advance_chain() {
     // Second skip: from the post-skip-1 tip, abandon epoch 2.
     sim.pass_skip_deadline();
     for idx in 0..n {
-        sim.fire_skip_trigger(idx);
+        sim.fire_ratify_timer(idx);
     }
     let _ = sim.run_until_committed(2, MAX_STEPS);
     for r in 0..n {
@@ -756,7 +757,7 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
     );
 }
 
-/// The partition that used to fork the beacon now stalls it: with the
+/// A partition stalls the beacon instead of forking it: with the
 /// pool as the single commit quorum, the committee majority's SPC
 /// candidate cannot ratify on its side of a partition (four of
 /// thirteen), while the far side — nine non-committee pool validators
@@ -815,7 +816,7 @@ fn partition_stalls_committee_side_then_skip_settles() {
     sim.drop_counters[3] = 0;
     sim.pass_skip_deadline();
     for idx in 3..POOL {
-        sim.fire_beacon_skip_timer(idx);
+        sim.fire_ratify_timer(idx);
     }
     sim.run_for_at_most(50_000);
 
@@ -921,8 +922,8 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
 
     // Replicas 2 and 3 hit the deadline first and prevote skip.
     sim.pass_skip_deadline();
-    sim.fire_beacon_skip_timer(2);
-    sim.fire_beacon_skip_timer(3);
+    sim.fire_ratify_timer(2);
+    sim.fire_ratify_timer(3);
     sim.run_for_at_most(10_000);
 
     // Round 1 split 2–2 below the quorum of 3: no polka, no lock, no
@@ -939,13 +940,13 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     // ...and the rounds advance. The first fire on replicas 0 and 1 is
     // their deadline edge — registers already spent, no vote — which
     // arms round-timeout semantics for the next fire.
-    sim.fire_beacon_skip_timer(0);
-    sim.fire_beacon_skip_timer(1);
+    sim.fire_ratify_timer(0);
+    sim.fire_ratify_timer(1);
     // Round timeout on all four: everyone enters round 2 unlocked with
     // the candidate held, re-prevotes it, and the polka, precommits,
     // and commit certificate follow.
     for i in 0..4 {
-        sim.fire_beacon_skip_timer(i);
+        sim.fire_ratify_timer(i);
     }
     sim.run_for_at_most(10_000);
 

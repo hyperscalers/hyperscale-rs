@@ -185,7 +185,7 @@ pub(super) fn top_up_committees(state: &mut BeaconState) {
 ///
 /// `excluded` is the validator set the sampler must skip on top of the
 /// natural [`beacon_eligible`] filter — empty under both the natural
-/// resample and the Skip-cert path; carried so future schedulers that
+/// resample and the skip path; carried so future schedulers that
 /// want to exclude additional validators (e.g. operator-driven
 /// quarantine) have a single seam to plumb through. `cause` tags the
 /// resulting transition.
