@@ -1258,19 +1258,7 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape seat superseding an in-flight join for the shard");
         }
         let topology_snapshot = self.process.topology_snapshot().load_full();
-        let vnodes: Vec<VnodeConfig> = topology_snapshot
-            .committee_for_shard(shard)
-            .iter()
-            .filter_map(|validator| {
-                self.vnode_keys
-                    .get(validator)
-                    .map(|signing_key| VnodeConfig {
-                        validator_id: *validator,
-                        local_shard: shard,
-                        signing_key: Arc::clone(signing_key),
-                    })
-            })
-            .collect();
+        let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
         if vnodes.is_empty() {
             warn!(shard = ?shard, "Reshape seat with no local committee members; dropped");
             return;
@@ -1350,9 +1338,7 @@ impl ShardSupervisor {
             self.process.assign_beacon_signer(cfg.validator_id, shard);
         }
 
-        let (timer_tx, timer_rx) = unbounded();
-        let (callback_tx, callback_rx) = unbounded();
-        let (shutdown_tx, shutdown_rx) = unbounded();
+        let (channels, callback_tx) = ShardChannels::new();
         let mut shard_loop = attach_shard(
             &self.process,
             &self.node_config,
@@ -1371,13 +1357,7 @@ impl ShardSupervisor {
             .expect("storages lock")
             .insert(shard, storage);
 
-        let channels = ShardChannels {
-            timer_tx,
-            timer_rx,
-            callback_rx,
-            shutdown_tx: shutdown_tx.clone(),
-            shutdown_rx,
-        };
+        let shutdown_tx = channels.shutdown_tx.clone();
         let validator_ids = vnodes.iter().map(|v| v.validator_id.inner()).collect();
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
@@ -1524,19 +1504,7 @@ impl ShardSupervisor {
             })
             .collect();
         for shard in needed {
-            let vnodes: Vec<VnodeConfig> = topology_snapshot
-                .committee_for_shard(shard)
-                .iter()
-                .filter_map(|validator| {
-                    self.vnode_keys
-                        .get(validator)
-                        .map(|signing_key| VnodeConfig {
-                            validator_id: *validator,
-                            local_shard: shard,
-                            signing_key: Arc::clone(signing_key),
-                        })
-                })
-                .collect();
+            let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
             info!(shard = ?shard, "Reconciling a missed committee join from the committed view");
             self.join(shard, &vnodes);
         }
@@ -1641,6 +1609,29 @@ impl ShardSupervisor {
             publishers: self.publishers.clone(),
             genesis_offset_ms: self.genesis_offset_ms,
         }
+    }
+
+    /// One [`VnodeConfig`] per member of `shard`'s committee whose signing
+    /// key this host holds — the local vnodes a seat or reconciled join
+    /// brings up.
+    fn local_committee_vnodes(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        shard: ShardId,
+    ) -> Vec<VnodeConfig> {
+        topology_snapshot
+            .committee_for_shard(shard)
+            .iter()
+            .filter_map(|validator| {
+                self.vnode_keys
+                    .get(validator)
+                    .map(|signing_key| VnodeConfig {
+                        validator_id: *validator,
+                        local_shard: shard,
+                        signing_key: Arc::clone(signing_key),
+                    })
+            })
+            .collect()
     }
 
     /// Build one `VnodeInit` per joining vnode via [`seat_vnode_group`],
