@@ -70,9 +70,9 @@ fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u
 }
 
 /// Drop every PC and SPC notification so no beacon committee member can
-/// reach quorum on the first epoch. Active-pool members watch the skip
-/// timer fire `SKIP_TIMEOUT` past the first epoch boundary, broadcast
-/// signed `SkipRequest`s, and the chain advances past the abandoned
+/// reach quorum on the first epoch. Active-pool members watch the ratify
+/// timer fire `SKIP_TIMEOUT` past the first epoch boundary, prevote the
+/// canonical skip hash, and the chain advances past the abandoned
 /// epoch with a `BeaconCert::Skip` cert.
 #[traced_test]
 #[test]
@@ -86,7 +86,7 @@ fn skip_path_advances_past_blocked_epoch() {
     // epoch's SPC stalls. The active shard members off the beacon
     // committee (validators 4..8) still have working network — their
     // `BeaconRatifyTrigger` timer fires at `EPOCH_DURATION + SKIP_TIMEOUT`
-    // and they sign a `SkipRequest` for epoch 1 at the genesis tip.
+    // and they prevote the skip hash for epoch 1 at the genesis tip.
     let _rules = [
         runner
             .network_mut()
@@ -127,7 +127,7 @@ fn skip_path_advances_past_blocked_epoch() {
 
     // Cross the epoch-1 boundary (`EPOCH_MS`) plus the skip timeout (the
     // epoch length clamped into `[SPC_VIEW_TIMEOUT, SKIP_TIMEOUT]`), then
-    // leave slack for the skip cert to assemble and the skip block to
+    // leave slack for the ratify cert to assemble and the skip block to
     // broadcast.
     let skip_timeout = Duration::from_millis(EPOCH_MS).clamp(SPC_VIEW_TIMEOUT, SKIP_TIMEOUT);
     runner.run_until(Duration::from_millis(EPOCH_MS) + skip_timeout + Duration::from_secs(30));

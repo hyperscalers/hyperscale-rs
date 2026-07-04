@@ -1036,11 +1036,12 @@ pub enum ProtocolEvent {
     /// wall-clock boundary has been reached.
     BeaconCommitteeStartTimer,
 
-    /// Beacon skip-trigger timer fired — the local vnode hasn't
-    /// observed the expected commit within `SKIP_TIMEOUT` of its
-    /// expected block time. If the local node is in the active pool,
-    /// the coordinator emits a [`Action::BroadcastSkipRequest`]
-    /// proposing to abandon the next epoch.
+    /// Beacon ratify timer fired. The first fire past the pending
+    /// epoch's deadline makes the canonical skip hash prevotable;
+    /// each subsequent fire is a ratify round timeout. If the local
+    /// node is in the active pool, the coordinator drives its
+    /// prevote/precommit effects and re-arms the timer at
+    /// `RATIFY_ROUND_TIMEOUT` while the epoch is undecided.
     BeaconRatifyTimer,
 
     /// Beacon SPC view-timeout timer fired. The coordinator routes

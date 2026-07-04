@@ -69,8 +69,8 @@ impl RatifyPhase {
 /// One active validator's signed ratification vote for `block_hash` at
 /// `(anchor_hash, epoch, round, phase)`.
 ///
-/// Gossiped all-to-all across the active validator pool. a quorum of
-/// precommit-phase signers over the same tuple assemble into a
+/// Gossiped all-to-all across the active validator pool. A quorum of
+/// precommit-phase signers over the same tuple assembles into a
 /// [`RatifyCert`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct RatifyVote {

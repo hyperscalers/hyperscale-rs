@@ -1631,7 +1631,7 @@ pub enum ActionOwner {
     /// outbound provision fetch + broadcast.
     Provisions,
     /// Beacon-coordinator actions: PC/SPC sign-and-broadcast,
-    /// beacon-block / skip-request / skip-cert gossip, shard-witness
+    /// beacon-block / candidate / ratify-vote gossip, shard-witness
     /// fetch dispatch, beacon-side crypto verification.
     Beacon,
     /// I/O-loop-internal effects (timers, commits, status emission,

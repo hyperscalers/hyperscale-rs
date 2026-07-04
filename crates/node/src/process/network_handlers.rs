@@ -138,8 +138,9 @@ where
             );
 
         // Beacon gossip (beacon.block per-shard + host-level pool route +
-        // beacon.skip_request) lives in `crate::beacon::gossip` — the closures
-        // capture only the senders, the pool channel, and the route gate.
+        // beacon.candidate + beacon.ratify_vote) lives in `crate::beacon::gossip`
+        // — the closures capture only the senders, the pool channel, and the
+        // route gate.
         let route_active = self.process.beacon_route_active();
         register_beacon_gossip_handlers(
             &*self.process.network,

@@ -17,10 +17,11 @@ pub enum TimerId {
     /// wall-clock boundary if the local vnode is on the next
     /// committee and that block isn't committed yet. Process-scoped.
     BeaconCommitteeStart,
-    /// Beacon skip-trigger timer. Fires `SKIP_TIMEOUT` past
-    /// the expected block time when the local vnode hasn't observed
-    /// the expected commit; the coordinator's `skip_trigger_due` check
-    /// reads against this. Process-scoped.
+    /// Beacon ratify timer. First fires `SKIP_TIMEOUT` past the
+    /// expected block time when the local vnode hasn't observed the
+    /// expected commit (the coordinator's `skip_trigger_due` check
+    /// reads against this), then re-arms as the ratify round timeout
+    /// while the epoch is undecided. Process-scoped.
     BeaconRatifyTrigger,
     /// Beacon SPC view-timeout timer. Set by the SPC FSM when
     /// entering a view; on fire, the coordinator drives the inner

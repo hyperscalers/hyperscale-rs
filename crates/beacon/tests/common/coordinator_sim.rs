@@ -33,8 +33,7 @@ use hyperscale_types::{
     SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
     TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
     compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_empty_view_msg,
-    sign_vote1, sign_vote2, sign_vote3, spc_context, verify_ratify_cert, verify_vote1,
-    verify_vote2, verify_vote3, vrf_sign, zero_bls_signature,
+    sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign, zero_bls_signature,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -153,11 +152,12 @@ pub struct CoordinatorSim {
     /// and the entry is removed. Used to simulate a missed proposal
     /// gossip from `sender` to `receiver`.
     blocked_proposal_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
-    /// Persistent per-pair filter on `BroadcastBeaconBlock` deliveries:
-    /// while `(sender, receiver)` is present, block gossip from
-    /// `sender` never reaches `receiver`. Models a partition at the
-    /// block-dissemination layer; cleared by
-    /// [`Self::clear_block_partition`].
+    /// Persistent per-pair filter on beacon commit-layer deliveries:
+    /// while `(sender, receiver)` is present, `BroadcastBeaconBlock`,
+    /// `BroadcastBeaconCandidate`, and `SignAndBroadcastRatifyVote`
+    /// traffic from `sender` never reaches `receiver`. Models a
+    /// partition — candidates, votes, and blocks all stop crossing;
+    /// cleared by [`Self::clear_block_partition`].
     blocked_block_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
 }
 
@@ -181,7 +181,7 @@ impl CoordinatorSim {
     /// the first `committee_n` sit on the beacon committee. Every
     /// validator is seated ready on the single ROOT shard (the chain
     /// config's shard size is raised to fit), so all `pool_n` are in
-    /// the active pool — the signer base for skip certificates.
+    /// the active pool — the ratify signer base.
     ///
     /// # Panics
     ///
@@ -287,15 +287,6 @@ impl CoordinatorSim {
     /// Heal the block-dissemination partition.
     pub fn clear_block_partition(&mut self) {
         self.blocked_block_pairs.clear();
-    }
-
-    /// Fire the wall-clock skip trigger on `idx` — the real coordinator
-    /// path, including the vote-3 / skip-request exclusion — and absorb
-    /// whatever it emits (the signed request loops back locally and
-    /// queues for every peer).
-    pub fn fire_beacon_skip_timer(&mut self, idx: usize) {
-        let actions = self.coordinators[idx].on_beacon_ratify_timer();
-        self.absorb(idx, actions);
     }
 
     /// Block the next `BuildAndBroadcastBeaconProposal` from `sender`
@@ -661,12 +652,13 @@ impl CoordinatorSim {
         }
     }
 
-    /// Fire the skip path on `signer_idx` via the real timer entry:
+    /// Fire the ratify timer on `signer_idx` via the real timer entry:
     /// `on_beacon_ratify_timer` past the deadline prevotes the skip
-    /// hash, and `absorb` signs the vote, loops it back, and queues it
-    /// for every peer. Mirrors what the production runner does on
+    /// hash (subsequent fires are round timeouts), and `absorb` signs
+    /// the vote, loops it back, and queues it for every peer. Mirrors
+    /// what the production runner does on
     /// `skip_trigger_due() && !is_committed && is_on_active_pool`.
-    pub fn fire_skip_trigger(&mut self, signer_idx: usize) {
+    pub fn fire_ratify_timer(&mut self, signer_idx: usize) {
         let actions = self.coordinators[signer_idx].on_beacon_ratify_timer();
         self.absorb(signer_idx, actions);
     }

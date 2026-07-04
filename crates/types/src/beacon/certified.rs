@@ -5,8 +5,8 @@
 //! `prev_block_hash` references on the next block); the cert is
 //! side-data that authenticates it. Two nodes holding byte-different
 //! `CertifiedBeaconBlock`s of the same logical block (different valid
-//! Skip-cert signer subsets, for example) agree on the block hash used
-//! for chain linkage — the wrapper is never hashed.
+//! ratify-cert signer subsets, for example) agree on the block hash
+//! used for chain linkage — the wrapper is never hashed.
 //!
 //! Pairing invariant — `cert` shape must match `block` shape:
 //!

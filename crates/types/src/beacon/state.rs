@@ -562,11 +562,12 @@ pub enum TransitionCause {
     /// per-shard committees, the epoch-rotation step for the beacon
     /// committee.
     NaturalShuffle,
-    /// Committee resampled because the pool-quorum
-    /// [`SkipEpochCert`](crate::SkipEpochCert) abandoned the prior
-    /// epoch. Same pipeline as `NaturalShuffle` over an empty proposal
-    /// set, distinguished only for observability so operators can tell
-    /// "scheduled rotation" apart from "the chain just skipped."
+    /// Committee resampled because the pool ratified the epoch's
+    /// canonical skip block — the epoch closed with no committed
+    /// proposals. Same pipeline as `NaturalShuffle` over an empty
+    /// proposal set, distinguished only for observability so operators
+    /// can tell "scheduled rotation" apart from "the chain just
+    /// skipped."
     Skip,
     /// A mid-epoch jail, deactivation, or withdrawal-driven
     /// auto-deactivation changed a shard's `members` list without a
@@ -578,8 +579,8 @@ pub enum TransitionCause {
 ///
 /// Surfaced by natural epoch boundaries (in
 /// [`SlotEffects::beacon_committee_transition`] and
-/// [`SlotEffects::shard_committee_transitions`]) and by skip-cert
-/// application, so the runner has a unified signal for "tear down the
+/// [`SlotEffects::shard_committee_transitions`]) and by skip-block
+/// commits, so the runner has a unified signal for "tear down the
 /// SPC instance you were running for `from` and bootstrap a fresh one
 /// with `to`."
 ///

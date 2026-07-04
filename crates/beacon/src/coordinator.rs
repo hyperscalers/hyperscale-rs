@@ -153,7 +153,7 @@ pub struct BeaconCoordinator {
     state: BeaconState,
 
     /// Latest committed beacon block paired with its authenticating
-    /// cert. Carried so SPC instance bootstrap and skip-cert anchor
+    /// cert. Carried so SPC instance bootstrap and ratify anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
     latest_block: Arc<Verified<CertifiedBeaconBlock>>,
 
@@ -166,7 +166,7 @@ pub struct BeaconCoordinator {
     /// live state stands in until the next commit.
     tip_epoch_committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     /// Active pool that governed the tip epoch — the signer base for a
-    /// competing skip cert. Same capture discipline as
+    /// competing block's ratify cert. Same capture discipline as
     /// `tip_epoch_committee`.
     tip_epoch_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
 
@@ -474,8 +474,8 @@ impl BeaconCoordinator {
         self.now.as_millis() >= epoch_boundary.as_millis()
     }
 
-    /// How long the committee waits past an epoch's expected block time before
-    /// a member broadcasts a [`SkipRequest`](hyperscale_types::SkipRequest).
+    /// How long the pool waits past an epoch's expected block time before
+    /// a member prevotes the canonical skip hash.
     ///
     /// [`SKIP_TIMEOUT`] is sized for the 5-minute production epoch (a small
     /// fraction of it). Clamped into `[SPC_VIEW_TIMEOUT, SKIP_TIMEOUT]` against
@@ -502,7 +502,7 @@ impl BeaconCoordinator {
     /// has reached `expected_block_time + skip_timeout`. The
     /// runner combines this with its own "expected block hasn't
     /// arrived" + "local on active pool" checks before actually
-    /// broadcasting a [`SkipRequest`](hyperscale_types::SkipRequest).
+    /// prevoting the skip hash.
     #[must_use]
     pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
         self.now.as_millis() >= expected_block_time.plus(self.skip_timeout()).as_millis()
@@ -1401,11 +1401,11 @@ impl BeaconCoordinator {
     /// # Panics
     ///
     /// Panics when the verified block competes with the adopted tip —
-    /// same epoch, same parent, different hash. Two validly certified
-    /// blocks for one epoch mean both commit paths (SPC cert and pool
-    /// skip cert) assembled; there is no reconciliation between them,
-    /// so the replica halts with the evidence rather than continuing
-    /// on a forked beacon chain.
+    /// same epoch, same parent, different hash. Every block carries a
+    /// pool ratify cert, so two validly certified blocks for one epoch
+    /// mean intersecting pool signers equivocated; there is no
+    /// reconciliation between the blocks, so the replica halts with
+    /// the evidence rather than continuing on a forked beacon chain.
     pub fn on_beacon_block_verified(
         &mut self,
         result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
@@ -1419,11 +1419,12 @@ impl BeaconCoordinator {
         };
         let block_hash = block.block_hash();
         // A validly certified block for the adopted epoch, extending the
-        // same parent, with a different hash: both commit paths assembled
-        // certificates for one epoch. There is no reconciliation between
-        // them — every fact the fold derives (committees, schedule,
-        // pricing) diverges from here — so halt with the evidence rather
-        // than keep operating on a forked beacon chain.
+        // same parent, with a different hash: the ratify quorums behind
+        // the two certs intersect, so some pool signers equivocated.
+        // There is no reconciliation — every fact the fold derives
+        // (committees, schedule, pricing) diverges from here — so halt
+        // with the evidence rather than keep operating on a forked
+        // beacon chain.
         if block.epoch() == self.latest_block.epoch()
             && block.epoch() > Epoch::GENESIS
             && block.prev_block_hash() == self.latest_block.prev_block_hash()
@@ -1441,7 +1442,7 @@ impl BeaconCoordinator {
                 block.prev_block_hash(),
             );
         }
-        // Idempotency: another path (local skip-quorum assembly, an
+        // Idempotency: another path (local ratify cert assembly, an
         // earlier peer-broadcast adoption) may have already advanced
         // the tip at or past this block's epoch. Re-entering
         // `adopt_block` would trip `apply_epoch`'s regression guard.
