@@ -291,7 +291,7 @@ impl SimulationRunner {
         // `Pooled`, giving the shuffle refill stock) but run no host.
         let committee_size = network_config.shard_size;
         let registered_validators = committee_size + network_config.pool_surplus;
-        let keys: Vec<Bls12381G1PrivateKey> = (0..registered_validators)
+        let signing_keys: Vec<Arc<Bls12381G1PrivateKey>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed
@@ -299,11 +299,11 @@ impl SimulationRunner {
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-                bls_keypair_from_seed(&seed_bytes)
+                Arc::new(bls_keypair_from_seed(&seed_bytes))
             })
             .collect();
         let public_keys: Vec<Bls12381G1PublicKey> =
-            keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+            signing_keys.iter().map(|key| key.public_key()).collect();
 
         // Build global validator set (pool extras included — fold-derived
         // snapshots carry every registered validator, so genesis matches)
@@ -378,13 +378,9 @@ impl SimulationRunner {
                 let vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = validator_idxs
                     .iter()
                     .map(|&idx| {
-                        let key_bytes = keys[idx as usize].to_bytes();
                         (
                             ValidatorId::new(u64::from(idx)),
-                            Arc::new(
-                                Bls12381G1PrivateKey::from_bytes(&key_bytes)
-                                    .expect("valid key bytes"),
-                            ),
+                            Arc::clone(&signing_keys[idx as usize]),
                         )
                     })
                     .collect();
@@ -402,10 +398,7 @@ impl SimulationRunner {
                 }));
             }
             for &validator_idx in &plan.followers {
-                let key_bytes = keys[validator_idx as usize].to_bytes();
-                let signing_key = Arc::new(
-                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
-                );
+                let signing_key = Arc::clone(&signing_keys[validator_idx as usize]);
                 vnode_inits.push(seat_follower(SeatFollower {
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
@@ -472,15 +465,6 @@ impl SimulationRunner {
             seed,
             "Created single-shard (ROOT) simulation runner"
         );
-
-        let signing_keys: Vec<Arc<Bls12381G1PrivateKey>> = keys
-            .iter()
-            .map(|key| {
-                Arc::new(
-                    Bls12381G1PrivateKey::from_bytes(&key.to_bytes()).expect("valid key bytes"),
-                )
-            })
-            .collect();
 
         // Fixed home host per registered validator: committee validators home
         // to their genesis host, pool extras to their dedicated host or — when
@@ -669,6 +653,19 @@ impl SimulationRunner {
             }
         }
         vnodes
+    }
+
+    /// The state machine of `node`'s vnode in `shard`, or `None` when
+    /// the host doesn't carry that shard. Relocation puts two vnodes
+    /// with one validator id on a host (the draining shard's and the
+    /// joined shard's), so lookups here are shard-scoped where a
+    /// validator-id walk would be ambiguous.
+    #[must_use]
+    pub fn vnode_state_in(&self, node: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
+        let host = self.hosts.get(node as usize)?;
+        host.hosted_shards()
+            .any(|s| s == shard)
+            .then(|| host.vnode_state(shard, 0))
     }
 
     /// Host `node`'s current topology snapshot, or `None` if `node` is out of
@@ -864,9 +861,8 @@ impl SimulationRunner {
                 // refresh can re-arm the next one if the sync is still running.
                 let fired_pool_tick = event.is_pool_fetch_tick();
 
-                self.hosts[node_index as usize].set_time(LocalTimestamp::from_millis(
-                    u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),
-                ));
+                let now = self.local_now();
+                self.hosts[node_index as usize].set_time(now);
                 let output = self.hosts[node_index as usize].step(event);
                 self.hosts[node_index as usize].flush_all_batches();
 
@@ -1025,6 +1021,11 @@ impl SimulationRunner {
         let key = EventKey::new(time, &event, node, self.sequence);
         self.event_queue.insert(key, event);
         key
+    }
+
+    /// The current simulation time as the [`LocalTimestamp`] fed to hosts.
+    fn local_now(&self) -> LocalTimestamp {
+        LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX))
     }
 }
 

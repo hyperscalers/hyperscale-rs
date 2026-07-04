@@ -22,7 +22,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap, replicate_engine_bootstrap};
 use hyperscale_node::{
-    NodeStateMachine, SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
+    SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
     serve_state_range_request, serve_witness_history_request,
 };
 use hyperscale_provisions::ProvisionConfig;
@@ -30,8 +30,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BeaconState, BlockHeight, LocalTimestamp, ShardAnchor, ShardId, ValidatorId, ValidatorStatus,
-    shard_prefix_path,
+    BeaconState, BlockHeight, ShardAnchor, ShardId, ValidatorId, ValidatorStatus, shard_prefix_path,
 };
 
 use super::SimulationRunner;
@@ -260,19 +259,6 @@ impl SimulationRunner {
         }
     }
 
-    /// The state machine of `node`'s vnode in `shard`, or `None` when
-    /// the host doesn't carry that shard. Relocation puts two vnodes
-    /// with one validator id on a host (the draining shard's and the
-    /// joined shard's), so lookups here are shard-scoped where
-    /// `Self::vnode_state`'s validator-id walk would be ambiguous.
-    #[must_use]
-    pub fn vnode_state_in(&self, node: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
-        let host = self.hosts.get(node as usize)?;
-        host.hosted_shards()
-            .any(|s| s == shard)
-            .then(|| host.vnode_state(shard, 0))
-    }
-
     /// Stop hosting `shard` on `node`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.
@@ -301,7 +287,7 @@ impl SimulationRunner {
         // pool (its storage stays warm and it raises its own re-seat trigger)
         // rather than going dark. One still on another shard keeps that
         // coordinator and needs no follower.
-        let now = LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(0));
+        let now = self.local_now();
         for validator in departed {
             if self.hosts[node as usize].hosts_validator(validator) {
                 continue;
@@ -419,7 +405,7 @@ impl SimulationRunner {
     ) -> VnodeInit {
         let host = &self.hosts[node as usize];
         host.process().assign_beacon_signer(validator, shard);
-        let now = LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(0));
+        let now = self.local_now();
         let signing_key = Arc::clone(
             &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
         );
