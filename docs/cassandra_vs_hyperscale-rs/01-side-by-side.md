@@ -156,6 +156,9 @@ Cassandra and hyperscale-rs agree on the BFT skeleton because they inherited it 
 place; they diverge because Cassandra spent its innovation budget on **keeping one committee live
 through a partition**, while hyperscale-rs spent its budget on **scaling across committees with
 atomic composability, an attested clock, live resharding, and deterministic assurance**. The
-partition-liveness axis is precisely where hyperscale-rs is most conservative — which is why
-Cassandra's core mechanism is the one part genuinely worth a close look. That assessment is
-[doc 02](02-secret-sauce-and-recommendations.md).
+partition-liveness axis is precisely where hyperscale-rs is most conservative — so Cassandra's core
+mechanism is the natural thing to test against it. That test is [doc 02](02-secret-sauce-and-recommendations.md),
+and it concludes the mechanism **does not fit** a system built for cross-shard atomic commitment:
+partial progress is safe only because nothing outside a committee acts on its non-final results,
+which is exactly what cross-shard commitment must do. Two smaller, quorum-independent ideas survive;
+the partial-progress core does not.
