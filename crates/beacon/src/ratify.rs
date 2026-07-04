@@ -12,10 +12,10 @@
 //!   a value whose prevote quorum (polka) formed at a round strictly
 //!   newer than the lock — following the pool, never leading it.
 //! - **Precommit** a value exactly when its polka is observed, at
-//!   rounds no older than the current one. A polka of ⌈2M/3⌉ + 1
-//!   prevotes carries an honest majority that verified the value, so
-//!   the precommit needs no local copy of the block.
-//! - **Commit** when ⌈2M/3⌉ + 1 precommits for one hash land in one
+//!   rounds no older than the current one. A polka carries honest
+//!   voters that verified the value, so the precommit needs no local
+//!   copy of the block.
+//! - **Commit** when a quorum of precommits for one hash land in one
 //!   round — at any round, however stale: a certificate's validity
 //!   doesn't age.
 //!
@@ -152,6 +152,20 @@ impl RatifyTracker {
     #[must_use]
     pub const fn is_completed(&self) -> bool {
         self.completed
+    }
+
+    /// Whether the epoch's skip deadline (or a round timeout) has
+    /// passed — the coordinator's timer distinguishes its first fire
+    /// (the deadline) from re-fires (round timeouts) by this.
+    #[must_use]
+    pub const fn deadline_passed(&self) -> bool {
+        self.deadline_passed
+    }
+
+    /// Whether `validator` sits in the epoch's active pool.
+    #[must_use]
+    pub fn pool_contains(&self, validator: ValidatorId) -> bool {
+        self.pool.iter().any(|(id, _)| *id == validator)
     }
 
     /// A verified SPC candidate for the epoch arrived; its hash
@@ -481,16 +495,16 @@ mod tests {
     /// quorum.
     #[test]
     fn polka_triggers_a_single_precommit() {
-        // Pool 7, quorum 6.
+        // Pool 7, quorum 5.
         let (mut t, keys) = tracker(7);
-        for i in 0..5 {
+        for i in 0..4 {
             let effects = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
             assert!(effects.is_empty(), "sub-quorum prevotes precommit nothing");
         }
-        let effects = t.observe(vote(&keys, 5, 1, RatifyPhase::Prevote, candidate_hash()));
+        let effects = t.observe(vote(&keys, 4, 1, RatifyPhase::Prevote, candidate_hash()));
         assert_eq!(sign_precommit_round(&effects), Some((1, candidate_hash())),);
 
-        let effects = t.observe(vote(&keys, 6, 1, RatifyPhase::Prevote, candidate_hash()));
+        let effects = t.observe(vote(&keys, 5, 1, RatifyPhase::Prevote, candidate_hash()));
         assert!(effects.is_empty(), "precommit register blocks a repeat");
     }
 
@@ -499,14 +513,14 @@ mod tests {
     #[test]
     fn equivocating_signer_spends_its_slot() {
         let (mut t, keys) = tracker(7);
-        for i in 0..5 {
+        for i in 0..4 {
             let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
         }
         // Signer 0 votes again — for skip this time. Dropped: the slot
-        // is spent, and the candidate polka must not complete either.
+        // is spent, and neither hash reaches a polka.
         let effects = t.observe(vote(&keys, 0, 1, RatifyPhase::Prevote, t.skip_block_hash()));
         assert!(effects.is_empty());
-        assert_eq!(t.vote_count(RatifyRound::new(1), RatifyPhase::Prevote), 5);
+        assert_eq!(t.vote_count(RatifyRound::new(1), RatifyPhase::Prevote), 4);
     }
 
     /// Votes for a foreign anchor, foreign epoch, or a round past the
@@ -554,7 +568,7 @@ mod tests {
         let (mut t, keys) = tracker(7);
         let (active, _) = pool(7);
         let mut cert = None;
-        for i in 0..6 {
+        for i in 0..5 {
             let effects = t.observe(vote(&keys, i, 1, RatifyPhase::Precommit, candidate_hash()));
             for e in effects {
                 if let RatifyEffect::CertAssembled { cert: c } = e {
@@ -564,7 +578,7 @@ mod tests {
         }
         let cert = cert.expect("quorum of precommits assembles");
         assert_eq!(cert.block_hash(), candidate_hash());
-        assert_eq!(cert.signer_count(), 6);
+        assert_eq!(cert.signer_count(), 5);
         assert!(verify_ratify_cert(&cert, &net(), &active).is_ok());
         assert!(t.is_completed());
     }
@@ -618,8 +632,8 @@ mod tests {
     fn future_polka_fast_forwards_the_round() {
         let (mut t, keys) = tracker(7);
         let mut effects = vec![];
-        for i in 0..6 {
-            effects = t.observe(vote(&keys, i, 3, RatifyPhase::Prevote, candidate_hash()));
+        for i in 0..5 {
+            effects.extend(t.observe(vote(&keys, i, 3, RatifyPhase::Prevote, candidate_hash())));
         }
         assert_eq!(t.round(), RatifyRound::new(3));
         assert_eq!(sign_precommit_round(&effects), Some((3, candidate_hash())),);
@@ -632,10 +646,10 @@ mod tests {
     fn lock_holds_across_rounds() {
         let (mut t, keys) = tracker(7);
         let _ = t.on_candidate(candidate_hash());
-        for i in 1..=5 {
-            // Five peers + the own round-1 prevote... the own prevote
-            // is not pooled until its loopback arrives; pool it
-            // explicitly as signer 0's vote.
+        for i in 1..=4 {
+            // Four peers + the own round-1 prevote below reach the
+            // quorum of 5; the own prevote is not pooled until its
+            // loopback arrives, so pool it explicitly as signer 0's.
             let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
         }
         let effects = t.observe(vote(&keys, 0, 1, RatifyPhase::Prevote, candidate_hash()));
@@ -710,7 +724,7 @@ mod tests {
         let skip = t.skip_block_hash();
         let mut effects = vec![];
         for i in 1..=6 {
-            effects = t.observe(vote(&keys, i, 2, RatifyPhase::Prevote, skip));
+            effects.extend(t.observe(vote(&keys, i, 2, RatifyPhase::Prevote, skip)));
         }
         assert_eq!(sign_precommit_round(&effects), Some((2, skip)));
 

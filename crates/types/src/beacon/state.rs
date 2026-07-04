@@ -32,8 +32,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use radix_common::network::NetworkDefinition;
 use sbor::prelude::*;
 
-use crate::beacon::cert::BeaconCert;
-use crate::beacon::certified::CertifiedBeaconBlock;
 use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
@@ -1193,9 +1191,9 @@ impl BeaconState {
     /// on any shard, paired with their pubkey. Returned in `BTreeMap`
     /// iteration order over `self.validators` (sorted by `ValidatorId`).
     ///
-    /// This is the quorum substrate for skip:
-    /// [`SkipRequest`](crate::SkipRequest)s are signed by members of this
-    /// pool and assembled into a [`SkipEpochCert`](crate::SkipEpochCert)
+    /// This is the quorum substrate for epoch ratification:
+    /// [`RatifyVote`](crate::RatifyVote)s are signed by members of this
+    /// pool and assembled into a [`RatifyCert`](crate::RatifyCert)
     /// whose `signers` bitfield is positionally indexed against the same
     /// ordering.
     #[must_use]
@@ -1205,23 +1203,6 @@ impl BeaconState {
             .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
             .map(|(id, r)| (*id, r.pubkey))
             .collect()
-    }
-
-    /// Pick the signer pool a certified block's cert verifies against.
-    ///
-    /// Beacon committee for a Normal cert, active pool for a Skip cert.
-    /// Returns `None` for `BeaconCert::Genesis` — past-tip genesis blocks
-    /// have no signer pool to verify against.
-    #[must_use]
-    pub fn signer_pool_for(
-        &self,
-        block: &CertifiedBeaconBlock,
-    ) -> Option<Vec<(ValidatorId, Bls12381G1PublicKey)>> {
-        match block.cert() {
-            BeaconCert::Normal(_) => Some(self.derive_beacon_committee()),
-            BeaconCert::Skip(_) => Some(self.derive_active_pool()),
-            BeaconCert::Genesis(_) => None,
-        }
     }
 
     /// Dynamic per-validator minimum stake.

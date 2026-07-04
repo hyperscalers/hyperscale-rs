@@ -23,7 +23,6 @@
 //! | `HYPERSCALE_PC_VOTE2_LENGTH_v1` | Length attestation rider on PC round-2 |
 //! | `HYPERSCALE_PC_EMPTY_VIEW_v1` | SPC empty-view skip statement |
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-epoch randomness contribution) |
-//! | `HYPERSCALE_SKIP_REQUEST_v1` | Skip request + aggregated skip cert sig |
 //! | `HYPERSCALE_RATIFY_VOTE_v1` | Epoch ratification vote + aggregated ratify cert sig |
 //!
 //! # Usage
@@ -34,7 +33,6 @@
 
 mod beacon_pc;
 mod beacon_ratify;
-mod beacon_skip;
 mod beacon_vrf;
 mod execution;
 mod provisions;
@@ -48,7 +46,6 @@ pub use beacon_pc::{
     pc_vote_signing_message, spc_context, spc_relay_signing_message,
 };
 pub use beacon_ratify::{DOMAIN_RATIFY_VOTE, ratify_vote_message};
-pub use beacon_skip::{DOMAIN_SKIP_REQUEST, skip_request_message};
 pub use beacon_vrf::{
     DOMAIN_PC_VRF, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };

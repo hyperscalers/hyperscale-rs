@@ -26,10 +26,9 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, Bls12381G1PublicKey, Epoch,
-    GenesisConfigHash, NetworkDefinition, PcValueElement, ShardEpochContribution, ShardId, SpcCert,
-    ValidatorId, Verified, Verify, spc_context, verify_block_cert, verify_skip_cert,
-    verify_vote_equivocation,
+    BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CandidateBeaconBlock, Epoch,
+    GenesisConfigHash, NetworkDefinition, PcValueElement, RatifyCert, SpcCert, ValidatorId,
+    Verified, Verify, spc_context, verify_block_cert, verify_ratify_cert, verify_vote_equivocation,
 };
 
 /// A beacon block paired with the cert that authenticates it.
@@ -52,6 +51,12 @@ pub enum CertifiedBeaconBlockPairingError {
     SkipCertAtGenesis,
     /// `Skip` cert with non-empty committed proposals.
     SkipCertWithProposals,
+    /// The ratify cert names a different block hash.
+    RatifyCertBlockHashMismatch,
+    /// The ratify cert names a different epoch.
+    RatifyCertEpochMismatch,
+    /// The ratify cert's anchor isn't the block's parent.
+    RatifyCertAnchorMismatch,
 }
 
 impl CertifiedBeaconBlock {
@@ -155,19 +160,42 @@ impl CertifiedBeaconBlock {
                     return Err(E::GenesisCertWithProposals);
                 }
             }
-            BeaconCert::Normal(_) => {
+            BeaconCert::Normal { ratify, .. } => {
                 if is_genesis_epoch {
                     return Err(E::NormalCertAtGenesis);
                 }
+                Self::check_ratify_binding(block, ratify)?;
             }
-            BeaconCert::Skip(_) => {
+            BeaconCert::Skip(ratify) => {
                 if is_genesis_epoch {
                     return Err(E::SkipCertAtGenesis);
                 }
                 if has_proposals {
                     return Err(E::SkipCertWithProposals);
                 }
+                Self::check_ratify_binding(block, ratify)?;
             }
+        }
+        Ok(())
+    }
+
+    /// The ratify cert must name exactly this block: its hash, its
+    /// epoch, and its parent as the anchor. Structural — the cert's
+    /// signatures cover its own fields, so tying those fields to the
+    /// block is the pairing's job, not the verifier's.
+    fn check_ratify_binding(
+        block: &BeaconBlock,
+        ratify: &RatifyCert,
+    ) -> Result<(), CertifiedBeaconBlockPairingError> {
+        use CertifiedBeaconBlockPairingError as E;
+        if ratify.block_hash() != block.block_hash() {
+            return Err(E::RatifyCertBlockHashMismatch);
+        }
+        if ratify.epoch() != block.epoch() {
+            return Err(E::RatifyCertEpochMismatch);
+        }
+        if ratify.anchor_hash() != block.prev_block_hash() {
+            return Err(E::RatifyCertAnchorMismatch);
         }
         Ok(())
     }
@@ -175,23 +203,27 @@ impl CertifiedBeaconBlock {
 
 // ─── Verifiers ─────────────────────────────────────────────────────────────
 
-/// Verify a [`CertifiedBeaconBlock`] under the cert variant's required
-/// signer pool.
+/// Verify a [`CertifiedBeaconBlock`]'s certificates under their signer
+/// pools.
 ///
-/// Dispatches: SPC cert against the beacon committee, Skip cert against
-/// the active pool. `Genesis` certs reject — past-tip genesis blocks
-/// have no replayable verification.
+/// Every non-genesis block carries a pool ratification cert, checked
+/// against `active_pool`; a `Normal` block additionally carries the
+/// committee's SPC proposal cert, checked against `committee`.
+/// `Genesis` certs reject — past-tip genesis blocks have no replayable
+/// verification.
 #[must_use]
 pub fn verify_certified(
     block: &CertifiedBeaconBlock,
     network: &NetworkDefinition,
-    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     match block.cert() {
-        BeaconCert::Normal(cert) => {
-            verify_block_cert(cert, network, &spc_context(block.epoch()), signers).is_ok()
+        BeaconCert::Normal { spc, ratify } => {
+            verify_block_cert(spc, network, &spc_context(block.epoch()), committee).is_ok()
+                && verify_ratify_cert(ratify, network, active_pool).is_ok()
         }
-        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers).is_ok(),
+        BeaconCert::Skip(ratify) => verify_ratify_cert(ratify, network, active_pool).is_ok(),
         BeaconCert::Genesis(_) => false,
     }
 }
@@ -225,20 +257,21 @@ pub fn verify_block_equivocations(
 
 /// Verification context for [`CertifiedBeaconBlock`].
 ///
-/// The cert variant determines which signer pool the BLS aggregate
-/// verifies under: SPC certs against the beacon committee for the
-/// block's epoch, Skip certs against the active validator pool at the
-/// anchor's epoch. Equivocation witnesses bring their own per-validator
-/// pubkey lookup since the equivocating validator need not be on the
-/// current signer pool.
+/// The ratify cert verifies against the active validator pool at the
+/// anchor's epoch; a `Normal` block's SPC cert additionally verifies
+/// against the beacon committee. Equivocation witnesses bring their
+/// own per-validator pubkey lookup since the equivocating validator
+/// need not be on the current signer pool.
 #[derive(Debug, Clone, Copy)]
 pub struct CertifiedBeaconBlockVerifyContext<'a> {
-    /// Network the cert and equivocation evidence were bound to.
+    /// Network the certs and equivocation evidence were bound to.
     pub network: &'a NetworkDefinition,
-    /// Signer pool the cert verifies against (committee for Normal,
-    /// active pool for Skip). Positional ordering matches the cert's
-    /// signer bitfield.
-    pub signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    /// Beacon committee for the block's epoch — the SPC cert's signer
+    /// base. Positional ordering matches the SPC cert's bitfields.
+    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    /// Active validator pool at the anchor's epoch — the ratify cert's
+    /// signer base. Positional ordering matches the cert's bitfield.
+    pub active_pool: &'a [(ValidatorId, Bls12381G1PublicKey)],
     /// Pubkeys for the validators referenced by embedded
     /// `PcVoteEquivocation` evidence. The coordinator filters
     /// `state.validators` down to the referenced subset; an evidence
@@ -308,15 +341,15 @@ pub enum CertifiedBeaconBlockVerifyError {
 impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
     type Error = CertifiedBeaconBlockVerifyError;
 
-    /// Composite predicate: the cert verifies under the variant's
-    /// required signer pool (via [`verify_certified`]) and every
-    /// embedded `PcVoteEquivocation` verifies against
-    /// `equivocation_signers` (via [`verify_block_equivocations`]).
+    /// Composite predicate: both certs verify under their signer pools
+    /// (via [`verify_certified`]) and every embedded
+    /// `PcVoteEquivocation` verifies against `equivocation_signers`
+    /// (via [`verify_block_equivocations`]).
     fn verify(
         &self,
         ctx: &CertifiedBeaconBlockVerifyContext<'_>,
     ) -> Result<Verified<Self>, Self::Error> {
-        if !verify_certified(self, ctx.network, ctx.signers) {
+        if !verify_certified(self, ctx.network, ctx.committee, ctx.active_pool) {
             return Err(CertifiedBeaconBlockVerifyError::BadCert);
         }
         if !verify_block_equivocations(self, ctx.network, ctx.equivocation_signers) {
@@ -324,8 +357,8 @@ impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
         }
         // `Skip`/`Genesis` carry no proposals (pairing invariant) and
         // bind trivially.
-        if let BeaconCert::Normal(cert) = self.cert()
-            && !verify_committed_proposal_binding(self.block(), cert, ctx.signers)
+        if let BeaconCert::Normal { spc, .. } = self.cert()
+            && !verify_committed_proposal_binding(self.block(), spc, ctx.committee)
         {
             return Err(CertifiedBeaconBlockVerifyError::ProposalCertMismatch);
         }
@@ -359,39 +392,29 @@ impl Verified<CertifiedBeaconBlock> {
         CertifiedBeaconBlock::new_checked(block, cert).map(Self::new_unchecked)
     }
 
-    /// Assemble a `Normal` beacon block from the SPC-committed proposals
-    /// and the cert that authenticates them. Consumes the typed
-    /// `Verified<BeaconProposal>` set and the `Verified<SpcCert>` by
-    /// value, so a `Normal` `CertifiedBeaconBlock` cannot be built from
-    /// unverified proposals or an unverified cert — verification is a
+    /// Pair a ratified candidate with the pool certificate that
+    /// commits it. Consumes typed verified inputs, so a `Normal`
+    /// `CertifiedBeaconBlock` cannot be built from an unverified
+    /// candidate or an unverified ratify cert — verification is a
     /// type-level precondition, not a convention.
-    ///
-    /// Mirror of the shard [`Verified::<CertifiedBlock>::assemble`].
     ///
     /// # Errors
     ///
-    /// Returns [`CertifiedBeaconBlockPairingError`] if the resulting
-    /// block/cert shapes don't pair (e.g. a `Normal` cert at the genesis
-    /// epoch).
-    pub fn assemble(
-        epoch: Epoch,
-        prev_block_hash: BeaconBlockHash,
-        committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
-        shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
-        cert: Verified<SpcCert>,
+    /// Returns [`CertifiedBeaconBlockPairingError`] if the ratify cert
+    /// doesn't name the candidate's block (hash, epoch, anchor).
+    pub fn from_ratified_candidate(
+        candidate: Verified<CandidateBeaconBlock>,
+        ratify: Verified<RatifyCert>,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {
-        let proposals: Vec<(ValidatorId, BeaconProposal)> = committed
-            .into_iter()
-            .map(|(id, proposal)| (id, proposal.into_inner()))
-            .collect();
-        let block = BeaconBlock::new_with_contributions(
-            epoch,
-            prev_block_hash,
-            proposals,
-            shard_contributions,
-        );
-        CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(cert.into_inner())))
-            .map(Self::new_unchecked)
+        let (block, spc) = candidate.into_inner().into_parts();
+        CertifiedBeaconBlock::new_checked(
+            block,
+            BeaconCert::Normal {
+                spc,
+                ratify: ratify.into_inner(),
+            },
+        )
+        .map(Self::new_unchecked)
     }
 
     /// Genesis bootstrap pair, verified by construction — the genesis
@@ -470,7 +493,7 @@ mod tests {
     use super::*;
     use crate::{
         BeaconBlockHash, BeaconProposal, Bls12381G2Signature, Hash, PcQc2, PcQc3, PcSignerLengths,
-        PcVector, PcXpProof, SignerBitfield, SkipEpochCert, SpcCert, SpcView, VRF_PROOF_BYTES,
+        PcVector, PcXpProof, RatifyRound, SignerBitfield, SpcCert, SpcView, VRF_PROOF_BYTES,
         ValidatorId, VrfProof, bls_keypair_from_seed,
     };
 
@@ -518,11 +541,30 @@ mod tests {
             .collect()
     }
 
-    /// A `Normal` cert whose committed value is `value`. The binding
-    /// check only reads `committed_value()`, so the embedded proof is a
-    /// placeholder — this exercises `verify_committed_proposal_binding`
-    /// in isolation, not the cert's BLS verification.
-    fn normal_cert_with_value(value: PcVector) -> BeaconCert {
+    /// A structurally-bound ratify cert for `block`: names the block's
+    /// hash, epoch, and parent, with a placeholder aggregate — pairing
+    /// checks are structural, not cryptographic.
+    fn ratify_cert_for(block: &BeaconBlock) -> RatifyCert {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        RatifyCert::new(
+            block.prev_block_hash(),
+            block.epoch(),
+            RatifyRound::INITIAL,
+            block.block_hash(),
+            signers,
+            Bls12381G2Signature([0x22; 96]),
+        )
+    }
+
+    /// A `Normal` cert for `block` whose SPC committed value is
+    /// `value`. The binding check only reads `committed_value()`, so
+    /// the embedded proof is a placeholder — this exercises
+    /// `verify_committed_proposal_binding` in isolation, not the
+    /// cert's BLS verification.
+    fn normal_cert_with_value(value: PcVector, block: &BeaconBlock) -> BeaconCert {
         let qc2 = PcQc2::new(
             value.clone(),
             SignerBitfield::new(4),
@@ -538,24 +580,22 @@ mod tests {
             PcSignerLengths::Uniform(0),
             Bls12381G2Signature([0x33; 96]),
         );
-        BeaconCert::Normal(Box::new(SpcCert::Direct {
-            prev_view: SpcView::new(1),
-            value,
-            proof: proof.into(),
-        }))
+        BeaconCert::Normal {
+            spc: Box::new(SpcCert::Direct {
+                prev_view: SpcView::new(1),
+                value,
+                proof: proof.into(),
+            }),
+            ratify: ratify_cert_for(block),
+        }
     }
 
-    fn skip_cert() -> SkipEpochCert {
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        signers.set(1);
-        signers.set(2);
-        SkipEpochCert::new(
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
-            Epoch::new(5),
-            signers,
-            Bls12381G2Signature([0x22; 96]),
-        )
+    /// A `Normal` cert for `block` with placeholder SPC content.
+    fn normal_cert_for(block: &BeaconBlock) -> BeaconCert {
+        BeaconCert::Normal {
+            spc: Box::new(direct_cert()),
+            ratify: ratify_cert_for(block),
+        }
     }
 
     #[test]
@@ -575,9 +615,8 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             vec![(ValidatorId::new(0), proposal(0))],
         );
-        let pair =
-            CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(direct_cert())))
-                .unwrap();
+        let cert = normal_cert_for(&block);
+        let pair = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
         let bytes = basic_encode(&pair).unwrap();
         let decoded: CertifiedBeaconBlock = basic_decode(&bytes).unwrap();
         assert_eq!(pair, decoded);
@@ -589,7 +628,8 @@ mod tests {
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
         );
-        let pair = CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert())).unwrap();
+        let cert = BeaconCert::Skip(ratify_cert_for(&block));
+        let pair = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
         let bytes = basic_encode(&pair).unwrap();
         let decoded: CertifiedBeaconBlock = basic_decode(&bytes).unwrap();
         assert_eq!(pair, decoded);
@@ -618,13 +658,12 @@ mod tests {
 
         let bind = |proposals: Vec<(ValidatorId, BeaconProposal)>| {
             let block = BeaconBlock::new(epoch, prev, proposals);
-            let certified =
-                CertifiedBeaconBlock::new_checked(block, normal_cert_with_value(value.clone()))
-                    .unwrap();
-            let BeaconCert::Normal(cert) = certified.cert() else {
+            let cert = normal_cert_with_value(value.clone(), &block);
+            let certified = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
+            let BeaconCert::Normal { spc, .. } = certified.cert() else {
                 unreachable!("normal_cert_with_value builds a Normal cert");
             };
-            verify_committed_proposal_binding(certified.block(), cert, &committee)
+            verify_committed_proposal_binding(certified.block(), spc, &committee)
         };
 
         // Faithful block binds.
@@ -639,11 +678,11 @@ mod tests {
         assert!(!bind(vec![(ValidatorId::new(9), good)]));
     }
 
-    /// Two different `SkipEpochCert`s (different signer subsets) paired
-    /// with byte-identical `BeaconBlock`s produce identical block
-    /// hashes — adoption convergence property.
+    /// Two different `RatifyCert`s (different signer subsets, different
+    /// rounds) paired with byte-identical `BeaconBlock`s produce
+    /// identical block hashes — adoption convergence property.
     #[test]
-    fn skip_certs_with_different_signers_share_block_hash() {
+    fn ratify_certs_with_different_signers_share_block_hash() {
         let epoch = Epoch::new(5);
         let prev = BeaconBlockHash::from_raw(Hash::from_bytes(b"prev"));
         let block_a = BeaconBlock::skip(epoch, prev);
@@ -653,9 +692,11 @@ mod tests {
         signers_a.set(0);
         signers_a.set(1);
         signers_a.set(2);
-        let cert_a = SkipEpochCert::new(
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
+        let cert_a = RatifyCert::new(
+            prev,
             epoch,
+            RatifyRound::INITIAL,
+            block_a.block_hash(),
             signers_a,
             Bls12381G2Signature([0x22; 96]),
         );
@@ -664,9 +705,11 @@ mod tests {
         signers_b.set(0);
         signers_b.set(2);
         signers_b.set(3);
-        let cert_b = SkipEpochCert::new(
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
+        let cert_b = RatifyCert::new(
+            prev,
             epoch,
+            RatifyRound::new(2),
+            block_b.block_hash(),
             signers_b,
             Bls12381G2Signature([0x44; 96]),
         );
@@ -695,9 +738,8 @@ mod tests {
     #[test]
     fn rejects_normal_cert_at_genesis() {
         let block = BeaconBlock::genesis();
-        let err =
-            CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(direct_cert())))
-                .unwrap_err();
+        let cert = normal_cert_for(&block);
+        let err = CertifiedBeaconBlock::new_checked(block, cert).unwrap_err();
         assert_eq!(err, CertifiedBeaconBlockPairingError::NormalCertAtGenesis);
     }
 
@@ -708,9 +750,60 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             vec![(ValidatorId::new(0), proposal(0))],
         );
-        let err =
-            CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert())).unwrap_err();
+        let cert = BeaconCert::Skip(ratify_cert_for(&block));
+        let err = CertifiedBeaconBlock::new_checked(block, cert).unwrap_err();
         assert_eq!(err, CertifiedBeaconBlockPairingError::SkipCertWithProposals);
+    }
+
+    /// The ratify cert must name exactly the paired block: a foreign
+    /// hash, epoch, or anchor rejects at pairing — a relay can't move
+    /// a genuine commit certificate onto different block bytes.
+    #[test]
+    fn rejects_ratify_cert_naming_a_different_block() {
+        let prev = BeaconBlockHash::from_raw(Hash::from_bytes(b"prev"));
+        let block = BeaconBlock::skip(Epoch::new(5), prev);
+        let good = ratify_cert_for(&block);
+
+        let wrong_hash = RatifyCert::new(
+            good.anchor_hash(),
+            good.epoch(),
+            good.round(),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"other")),
+            good.signers().clone(),
+            good.aggregate_sig(),
+        );
+        assert_eq!(
+            CertifiedBeaconBlock::new_checked(block.clone(), BeaconCert::Skip(wrong_hash))
+                .unwrap_err(),
+            CertifiedBeaconBlockPairingError::RatifyCertBlockHashMismatch,
+        );
+
+        let wrong_epoch = RatifyCert::new(
+            good.anchor_hash(),
+            good.epoch().next(),
+            good.round(),
+            good.block_hash(),
+            good.signers().clone(),
+            good.aggregate_sig(),
+        );
+        assert_eq!(
+            CertifiedBeaconBlock::new_checked(block.clone(), BeaconCert::Skip(wrong_epoch))
+                .unwrap_err(),
+            CertifiedBeaconBlockPairingError::RatifyCertEpochMismatch,
+        );
+
+        let wrong_anchor = RatifyCert::new(
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"other-anchor")),
+            good.epoch(),
+            good.round(),
+            good.block_hash(),
+            good.signers().clone(),
+            good.aggregate_sig(),
+        );
+        assert_eq!(
+            CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(wrong_anchor)).unwrap_err(),
+            CertifiedBeaconBlockPairingError::RatifyCertAnchorMismatch,
+        );
     }
 
     /// Forge a wire-byte stream carrying a `Skip` cert paired with a
@@ -724,11 +817,8 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             vec![(ValidatorId::new(0), proposal(0))],
         );
-        let bytes = basic_encode(&CertifiedBeaconBlockWire {
-            block,
-            cert: BeaconCert::Skip(skip_cert()),
-        })
-        .unwrap();
+        let cert = BeaconCert::Skip(ratify_cert_for(&block));
+        let bytes = basic_encode(&CertifiedBeaconBlockWire { block, cert }).unwrap();
         let err = basic_decode::<CertifiedBeaconBlock>(&bytes).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidCustomValue));
     }
@@ -752,11 +842,8 @@ mod tests {
     #[test]
     fn decode_rejects_normal_cert_at_genesis() {
         let block = BeaconBlock::genesis();
-        let bytes = basic_encode(&CertifiedBeaconBlockWire {
-            block,
-            cert: BeaconCert::Normal(Box::new(direct_cert())),
-        })
-        .unwrap();
+        let cert = normal_cert_for(&block);
+        let bytes = basic_encode(&CertifiedBeaconBlockWire { block, cert }).unwrap();
         let err = basic_decode::<CertifiedBeaconBlock>(&bytes).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidCustomValue));
     }

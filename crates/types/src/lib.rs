@@ -54,19 +54,17 @@ pub use beacon::{
     RatifyCertVerifyError, RatifyPhase, RatifyVerifyContext, RatifyVote, RatifyVoteVerifyError,
     ReadySignal, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG, SHUFFLE_INTERVAL_EPOCHS,
     SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardBoundary, ShardCommittee, ShardEpochContribution,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, ShardWitnessVerifyError, SkipEpochCert,
-    SkipEpochCertVerifyError, SkipReport, SkipRequest, SkipRequestVerifyError, SkipVerifyContext,
+    ShardWitness, ShardWitnessPayload, ShardWitnessProof, ShardWitnessVerifyError, SkipReport,
     SlotEffects, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
     SpcHighTriple, SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
     SpcProposalObject, SpcProposalObjectVerifyError, SpcVerifyContext, StakePool,
     TOKENS_PER_YEAR_TARGET, TransitionCause, UNBONDING_WINDOW_EPOCHS, ValidatorRecord,
     ValidatorStatus, build_indirect_cert, build_qc1, build_qc2, build_qc3, build_ratify_cert,
-    build_skip_cert, byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp,
-    qc1_certify, ratify_quorum, ready_signal_window, sign_empty_view_msg, sign_ratify_vote,
-    sign_skip_request, sign_vote1, sign_vote2, sign_vote3, skip_target, verify_block_cert,
-    verify_block_equivocations, verify_cert, verify_certified, verify_empty_view_msg,
-    verify_proposal_object, verify_qc1, verify_qc2, verify_qc3, verify_ratify_cert,
-    verify_ratify_vote, verify_skip_cert, verify_skip_request, verify_vote_equivocation,
+    byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp, qc1_certify,
+    ratify_quorum, ready_signal_window, sign_empty_view_msg, sign_ratify_vote, sign_vote1,
+    sign_vote2, sign_vote3, skip_target, verify_block_cert, verify_block_equivocations,
+    verify_cert, verify_certified, verify_empty_view_msg, verify_proposal_object, verify_qc1,
+    verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
     verify_vote1, verify_vote2, verify_vote3,
 };
 pub use crypto::batch_verify::{
@@ -156,22 +154,22 @@ pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_RATIFY_VOTE,
-    DOMAIN_READY_SIGNAL, DOMAIN_SKIP_REQUEST, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW,
-    DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_BIND, PcContext, SpcContext,
-    VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
-    certified_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
-    exec_vote_message, pc_context, pc_vote_signing_message, ratify_vote_message,
-    ready_signal_message, skip_request_message, spc_context, spc_relay_signing_message,
-    state_provisions_message, timeout_message, validator_bind_message, vrf_output_from_proof,
-    vrf_reveal_message, vrf_sign, vrf_verify,
+    DOMAIN_READY_SIGNAL, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, DOMAIN_STATE_PROVISION_BATCH,
+    DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_BIND, PcContext, SpcContext, VALIDATOR_BIND_NONCE_LEN,
+    block_header_message, block_vote_message, certified_block_header_message,
+    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, pc_context,
+    pc_vote_signing_message, ratify_vote_message, ready_signal_message, spc_context,
+    spc_relay_signing_message, state_provisions_message, timeout_message, validator_bind_message,
+    vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
 pub use state_key::{MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN};
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::timeouts::{
-    EPOCH_DURATION, MAX_PROGRESS_WAIT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT,
-    VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX, WAVE_TIMEOUT,
+    EPOCH_DURATION, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION,
+    RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,
+    VIEW_CHANGE_TIMEOUT_MAX, WAVE_TIMEOUT,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;

@@ -4,7 +4,7 @@
 //! signing `(anchor_hash, epoch, round, phase, block_hash)` under
 //! [`DOMAIN_RATIFY_VOTE`]. A prevote and a precommit at the same round
 //! sign different bytes, so neither can stand in for the other;
-//! ⌈2M/3⌉ + 1 precommits over the same tuple aggregate into a
+//! a quorum of precommits over the same tuple aggregates into a
 //! [`RatifyCert`](crate::RatifyCert) committing the block.
 //!
 //! Domain separation here keeps a ratify sig from being confused with
@@ -48,7 +48,7 @@ pub fn ratify_vote_message(
 mod tests {
     use super::*;
     use crate::Hash;
-    use crate::signing::DOMAIN_SKIP_REQUEST;
+    use crate::signing::DOMAIN_PC_VRF;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -160,8 +160,8 @@ mod tests {
         );
     }
 
-    /// Domain separation: a ratify sig must not collide with a skip
-    /// request (or any other beacon BLS message reusing the same key
+    /// Domain separation: a ratify sig must not collide with a VRF
+    /// reveal (or any other beacon BLS message reusing the same key
     /// material) — distinct domain tags guarantee the prefixes diverge.
     #[test]
     fn ratify_vote_message_differs_from_other_beacon_domains() {
@@ -173,6 +173,6 @@ mod tests {
             RatifyPhase::Prevote,
             &block(),
         );
-        assert_ne!(&bytes[..DOMAIN_SKIP_REQUEST.len()], DOMAIN_SKIP_REQUEST);
+        assert_ne!(&bytes[..DOMAIN_PC_VRF.len()], DOMAIN_PC_VRF);
     }
 }

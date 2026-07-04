@@ -21,7 +21,7 @@ pub enum TimerId {
     /// the expected block time when the local vnode hasn't observed
     /// the expected commit; the coordinator's `skip_trigger_due` check
     /// reads against this. Process-scoped.
-    BeaconSkipTrigger,
+    BeaconRatifyTrigger,
     /// Beacon SPC view-timeout timer. Set by the SPC FSM when
     /// entering a view; on fire, the coordinator drives the inner
     /// PC instance with the current view's input even if the view's

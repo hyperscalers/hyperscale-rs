@@ -10,17 +10,18 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlock,
-    CertifiedBlockHeader, CertifiedHeaderVerifyError, Epoch, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave, FinalizedWaveVerifyError,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2,
-    PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId, ShardWitness, SkipRequest,
-    SkipRequestVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    StateRoot, StateRootVerifyError, StoredReceipt, Timeout, TransactionRoot, TxOutcome,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, LocalReceiptRoot,
+    LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
+    RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
+    RoutableTransaction, ShardId, ShardWitness, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout, TransactionRoot, TxOutcome,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, WaveId, WeightedTimestamp,
 };
 
@@ -846,26 +847,46 @@ pub enum ProtocolEvent {
         proposal: Arc<Verified<BeaconProposal>>,
     },
 
-    /// A `SkipRequest` arrived over the wire. Wire decode lands the
+    /// A [`RatifyVote`] arrived over the wire. Wire decode lands the
     /// wrapper as `Unverified`; locally-relayed broadcasts preserve
     /// the marker.
-    UnverifiedSkipRequestReceived {
-        /// Received request.
-        request: Arc<Verifiable<SkipRequest>>,
+    UnverifiedRatifyVoteReceived {
+        /// Received vote.
+        vote: Arc<Verifiable<RatifyVote>>,
     },
 
-    /// A locally-signed [`SkipRequest`] arrived via the
-    /// [`Action::BroadcastSkipRequest`] self-loopback path. The signing
-    /// validator produced the BLS sig, so the request is verified by
-    /// construction — coordinator skips
-    /// [`Action::VerifySkipRequest`] and admits directly.
+    /// A locally-signed [`RatifyVote`] arrived via the
+    /// [`Action::SignAndBroadcastRatifyVote`] self-loopback path. The
+    /// signing validator produced the BLS sig, so the vote is verified
+    /// by construction — coordinator skips
+    /// [`Action::VerifyRatifyVote`] and pools it directly.
     ///
-    /// [`Action::BroadcastSkipRequest`]: crate::Action::BroadcastSkipRequest
-    /// [`Action::VerifySkipRequest`]: crate::Action::VerifySkipRequest
-    VerifiedSkipRequestReceived {
-        /// Verified request, sealed via
-        /// [`Verified::<SkipRequest>::sign_local`].
-        request: Arc<Verified<SkipRequest>>,
+    /// [`Action::SignAndBroadcastRatifyVote`]: crate::Action::SignAndBroadcastRatifyVote
+    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    VerifiedRatifyVoteReceived {
+        /// Verified vote, sealed via
+        /// [`Verified::<RatifyVote>::sign_local`].
+        vote: Arc<Verified<RatifyVote>>,
+    },
+
+    /// A [`CandidateBeaconBlock`] arrived over the wire — an SPC output
+    /// awaiting ratification. Wire decode lands the wrapper as
+    /// `Unverified`; the locally-assembled candidate reaches the
+    /// tracker directly and never takes this path.
+    BeaconCandidateReceived {
+        /// Received candidate.
+        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+    },
+
+    /// Result of an [`Action::VerifyBeaconCandidate`] dispatch. The
+    /// verified handle rides back on success so the coordinator can
+    /// route it into the ratification tracker without stashing during
+    /// the verify round-trip.
+    ///
+    /// [`Action::VerifyBeaconCandidate`]: crate::Action::VerifyBeaconCandidate
+    BeaconCandidateVerified {
+        /// Verified candidate on success; the typed error otherwise.
+        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     },
 
     /// A shard-witness fetch response landed. `BeaconCoordinator`
@@ -903,21 +924,26 @@ pub enum ProtocolEvent {
         result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySkipRequest`] dispatch.
-    SkipRequestVerified {
-        /// Request anchor, extracted from the unverified payload at
-        /// dispatch time. Carried with `epoch_to_skip` and `signer` in
-        /// both result arms so the coordinator can clear the
-        /// per-`(anchor, epoch_to_skip, signer)` pipeline slot regardless
-        /// of the verify outcome.
+    /// Result of an [`Action::VerifyRatifyVote`] dispatch.
+    ///
+    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    RatifyVoteVerified {
+        /// Vote anchor, extracted from the unverified payload at
+        /// dispatch time. Carried with the epoch, round, phase, and
+        /// signer in both result arms so the coordinator can clear the
+        /// per-signer pipeline slot regardless of the verify outcome.
         anchor: BeaconBlockHash,
-        /// Epoch the request asks to skip.
-        epoch_to_skip: Epoch,
+        /// Epoch the vote ratifies.
+        epoch: Epoch,
+        /// Round the vote was cast in.
+        round: RatifyRound,
+        /// Prevote or precommit.
+        phase: RatifyPhase,
         /// Claimed signer; keys the verification slot alongside the
         /// anchor and epoch.
         signer: ValidatorId,
-        /// Verified request on success; the typed error otherwise.
-        result: Result<Verified<SkipRequest>, SkipRequestVerifyError>,
+        /// Verified vote on success; the typed error otherwise.
+        result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
     },
 
     /// Result of an [`Action::VerifyPcVote1`] dispatch. The verified
@@ -1015,7 +1041,7 @@ pub enum ProtocolEvent {
     /// expected block time. If the local node is in the active pool,
     /// the coordinator emits a [`Action::BroadcastSkipRequest`]
     /// proposing to abandon the next epoch.
-    BeaconSkipTimer,
+    BeaconRatifyTimer,
 
     /// Beacon SPC view-timeout timer fired. The coordinator routes
     /// `SpcEvent::TimerExpired { view: spc.current_view() }` into

@@ -15,10 +15,9 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
     RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates, SharedTransactions,
-    SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView,
-    SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp,
+    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
+    StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -1194,57 +1193,33 @@ pub enum Action {
         block: Arc<Verified<CertifiedBeaconBlock>>,
     },
 
-    /// Sign and broadcast a [`SkipRequest`] globally. The action
-    /// handler signs the request using the runner-held BLS key (the
-    /// coordinator has no signing material), broadcasts the result over
-    /// the global beacon-skip topic, and feeds a
-    /// [`ProtocolEvent::VerifiedSkipRequestReceived`] loopback so the
-    /// local `SkipTracker` accumulates its own contribution. Quorum
-    /// aggregation happens off-chain inside `SkipTracker`.
-    BroadcastSkipRequest {
-        /// Epoch the request asks the active pool to abandon. Must be
-        /// `current_epoch.next()` at the local tip — older or further
-        /// epochs are rejected by the verifier.
-        epoch_to_skip: Epoch,
-        /// Anchor block hash the request rides against (the latest
-        /// committed beacon block at the dispatching coordinator).
-        anchor: BeaconBlockHash,
-    },
-
-    /// Verify the cert authenticating a beacon block (SPC cert on a
-    /// Normal block, pool-quorum cert on a Skip block — the handler
-    /// reads `block.cert()` to branch) **and** every
-    /// `PcVoteEquivocation` carried in the block's committed
-    /// proposals. Result returns via [`ProtocolEvent::BeaconBlockVerified`]
-    /// carrying the block back; `valid` is the AND-reduction over the
-    /// cert check and every equivocation check.
+    /// Verify the certs authenticating a beacon block — the pool
+    /// ratify cert on every non-genesis block, plus the SPC proposal
+    /// cert on a Normal block — **and** every `PcVoteEquivocation`
+    /// carried in the block's committed proposals. Result returns via
+    /// [`ProtocolEvent::BeaconBlockVerified`] carrying the block back;
+    /// `valid` is the AND-reduction over every cert check and every
+    /// equivocation check.
     VerifyBeaconBlock {
-        /// Block whose cert + embedded equivocation witnesses are
+        /// Block whose certs + embedded equivocation witnesses are
         /// being verified. A [`Verifiable::Verified`] wrapper
         /// short-circuits dispatch. Carried back through the result
         /// event so the coordinator doesn't have to stash it
         /// separately.
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
-        /// Signers paired with their pubkeys — committee for a Normal
-        /// block, active pool for a Skip block. Positional ordering
-        /// matches the cert's signer bitfield.
-        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        /// Beacon committee for the block's epoch — the SPC cert's
+        /// signer base. Positional ordering matches the cert's
+        /// bitfields.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        /// Active validator pool at the anchor's epoch — the ratify
+        /// cert's signer base. Positional ordering matches the cert's
+        /// bitfield.
+        active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         /// Pubkeys for the validators referenced by embedded
         /// `PcVoteEquivocation` evidence. Empty when the block
         /// carries no equivocations. Lookup-shape, order doesn't
         /// matter.
         equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
-    },
-
-    /// Verify a single-signer [`SkipRequest`] BLS signature. Result
-    /// returns via [`ProtocolEvent::SkipRequestVerified`] carrying the
-    /// typed verified handle on success.
-    VerifySkipRequest {
-        /// Request to verify. A [`Verifiable::Verified`] wrapper
-        /// short-circuits dispatch.
-        request: Box<Verifiable<SkipRequest>>,
-        /// Active validator pool used to look up the signer's pubkey.
-        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
     /// Sign and broadcast a [`RatifyVote`] globally. The action handler
@@ -1451,11 +1426,9 @@ impl Action {
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
-            | Self::BroadcastSkipRequest { .. }
             | Self::SignAndBroadcastRatifyVote { .. }
             | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
-            | Self::VerifySkipRequest { .. }
             | Self::VerifyRatifyVote { .. }
             | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }
@@ -1505,7 +1478,6 @@ impl Action {
             | Self::BroadcastSpcNewCommit { epoch, .. }
             | Self::BuildAndBroadcastBeaconProposal { epoch, .. }
             | Self::SignAndBroadcastRatifyVote { epoch, .. } => Some(*epoch),
-            Self::BroadcastSkipRequest { epoch_to_skip, .. } => Some(*epoch_to_skip),
             Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
@@ -1551,7 +1523,6 @@ impl Action {
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
-            | Self::VerifySkipRequest { .. }
             | Self::VerifyRatifyVote { .. }
             | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }
@@ -1606,11 +1577,9 @@ impl Action {
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
-            | Self::BroadcastSkipRequest { .. }
             | Self::SignAndBroadcastRatifyVote { .. }
             | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
-            | Self::VerifySkipRequest { .. }
             | Self::VerifyRatifyVote { .. }
             | Self::VerifyBeaconCandidate { .. }
             | Self::VerifyPcVote1 { .. }

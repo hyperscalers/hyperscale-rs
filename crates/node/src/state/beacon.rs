@@ -74,12 +74,18 @@ impl NodeStateMachine {
             } => self
                 .beacon_coordinator
                 .on_beacon_proposal_received(from, epoch, proposal),
-            ProtocolEvent::UnverifiedSkipRequestReceived { request } => self
+            ProtocolEvent::UnverifiedRatifyVoteReceived { vote } => self
                 .beacon_coordinator
-                .on_unverified_skip_request_received(request),
-            ProtocolEvent::VerifiedSkipRequestReceived { request } => self
+                .on_unverified_ratify_vote_received(vote),
+            ProtocolEvent::VerifiedRatifyVoteReceived { vote } => self
                 .beacon_coordinator
-                .on_verified_skip_request_received(request),
+                .on_verified_ratify_vote_received(vote),
+            ProtocolEvent::BeaconCandidateReceived { candidate } => self
+                .beacon_coordinator
+                .on_beacon_candidate_received(candidate),
+            ProtocolEvent::BeaconCandidateVerified { result } => {
+                self.beacon_coordinator.on_beacon_candidate_verified(result)
+            }
             ProtocolEvent::ShardWitnessesReceived {
                 shard_id,
                 witnesses,
@@ -96,17 +102,16 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconBlockVerified { result } => {
                 self.beacon_coordinator.on_beacon_block_verified(result)
             }
-            ProtocolEvent::SkipRequestVerified {
+            ProtocolEvent::RatifyVoteVerified {
                 anchor,
-                epoch_to_skip,
+                epoch,
+                round,
+                phase,
                 signer,
                 result,
-            } => self.beacon_coordinator.on_skip_request_verified(
-                anchor,
-                epoch_to_skip,
-                signer,
-                result,
-            ),
+            } => self
+                .beacon_coordinator
+                .on_ratify_vote_verified(anchor, epoch, round, phase, signer, result),
             ProtocolEvent::PcVote1Verified {
                 epoch,
                 view,
@@ -158,7 +163,7 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconCommitteeStartTimer => {
                 self.beacon_coordinator.on_beacon_committee_start_timer()
             }
-            ProtocolEvent::BeaconSkipTimer => self.beacon_coordinator.on_beacon_skip_timer(),
+            ProtocolEvent::BeaconRatifyTimer => self.beacon_coordinator.on_beacon_ratify_timer(),
             ProtocolEvent::BeaconSpcViewTimer => self.beacon_coordinator.on_beacon_spc_view_timer(),
             ProtocolEvent::BeaconSpcInputDwellTimer => {
                 self.beacon_coordinator.on_spc_input_dwell_timer()

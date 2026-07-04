@@ -391,12 +391,14 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BeaconBlockReceived { .. }
             | ProtocolEvent::UnverifiedBeaconProposalReceived { .. }
             | ProtocolEvent::VerifiedBeaconProposalReceived { .. }
-            | ProtocolEvent::UnverifiedSkipRequestReceived { .. }
-            | ProtocolEvent::VerifiedSkipRequestReceived { .. }
+            | ProtocolEvent::UnverifiedRatifyVoteReceived { .. }
+            | ProtocolEvent::VerifiedRatifyVoteReceived { .. }
+            | ProtocolEvent::BeaconCandidateReceived { .. }
+            | ProtocolEvent::BeaconCandidateVerified { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }
             | ProtocolEvent::BeaconProposalFetched { .. }
             | ProtocolEvent::BeaconBlockVerified { .. }
-            | ProtocolEvent::SkipRequestVerified { .. }
+            | ProtocolEvent::RatifyVoteVerified { .. }
             | ProtocolEvent::PcVote1Verified { .. }
             | ProtocolEvent::PcVote2Verified { .. }
             | ProtocolEvent::PcVote3Verified { .. }
@@ -404,7 +406,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::SpcNewCommitVerified { .. }
             | ProtocolEvent::SpcEmptyViewVerified { .. }
             | ProtocolEvent::BeaconCommitteeStartTimer
-            | ProtocolEvent::BeaconSkipTimer
+            | ProtocolEvent::BeaconRatifyTimer
             | ProtocolEvent::BeaconSpcViewTimer
             | ProtocolEvent::BeaconSpcInputDwellTimer
             | ProtocolEvent::BeaconBlockPersisted { .. }

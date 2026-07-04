@@ -26,24 +26,26 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
-    BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, Epoch, GenesisConfigHash, JailReason,
-    LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH,
-    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
-    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
-    RETENTION_HORIZON, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee, ShardId,
-    ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SlotEffects, SpcCert,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot,
-    ValidatorId, ValidatorStatus, Verifiable, Verified, Verify, WeightedTimestamp,
+    BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CandidateBeaconBlock,
+    CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
+    CertifiedBlockHeader, Epoch, GenesisConfigHash, JailReason, LeafIndex, LocalTimestamp,
+    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement,
+    PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
+    RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError,
+    SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee, ShardId, ShardWitness,
+    SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verify,
+    WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
 use crate::commit_assembly::{AssemblyDecision, CommitAssembler};
 use crate::equivocations::EquivocationObservations;
 use crate::proposal_pool::BeaconProposalPool;
+use crate::ratify::{RatifyEffect, RatifyTracker};
 use crate::shard_source::ShardSourceTracker;
-use crate::skip_tracker::SkipTracker;
 use crate::spc::SpcEffect;
 use crate::spc_driver::SpcDriver;
 use crate::state::{apply_epoch, apply_input_for};
@@ -90,7 +92,7 @@ const MAX_INPUT_DWELL_REARMS: u32 = 6;
 const fn cert_kind(cert: &BeaconCert) -> &'static str {
     match cert {
         BeaconCert::Genesis(_) => "genesis",
-        BeaconCert::Normal(_) => "SPC",
+        BeaconCert::Normal { .. } => "normal",
         BeaconCert::Skip(_) => "skip",
     }
 }
@@ -185,10 +187,18 @@ pub struct BeaconCoordinator {
     /// witness drain.
     shard_source: ShardSourceTracker,
 
-    /// Buckets observed [`SkipRequest`]s and aggregates them into a
-    /// [`SkipEpochCert`](hyperscale_types::SkipEpochCert) once
-    /// ⌈2M/3⌉ + 1 active-pool quorum lands.
-    skip_tracker: SkipTracker,
+    /// Ratification state for the pending epoch at the current tip:
+    /// rounds, own-vote registers, locks, pooled votes, and
+    /// commit-cert assembly. Rebuilt on every adoption for the new
+    /// `(anchor, epoch)`.
+    ratify: RatifyTracker,
+
+    /// The verified SPC candidate awaiting ratification, held so the
+    /// commit certificate can pair with the block it names. First
+    /// verified candidate wins; reset on every adoption. A replica
+    /// whose cert names a hash it never held adopts from the
+    /// assembler's certified-block broadcast instead.
+    pending_candidate: Option<Arc<Verified<CandidateBeaconBlock>>>,
 
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
@@ -263,22 +273,6 @@ pub struct BeaconCoordinator {
     /// no node holds, so all feed the same partial vector) still lets the
     /// epoch make progress.
     input_dwell_rearms: u32,
-
-    /// Whether the local validator has committed to signing a round-3
-    /// PC vote for the pending epoch. While set, the skip trigger emits
-    /// no [`SkipRequest`]: a skip certificate's honest signers must be
-    /// validators that never contribute a vote-3 toward the epoch's SPC
-    /// certificate, so the two certificates cannot both assemble out of
-    /// one honest signer's signatures. Vote-1/2 signatures are exempt —
-    /// they cannot complete a QC3 without 2f+1 vote-3s. Reset on every
-    /// commit (new pending epoch, new anchor).
-    vote3_signed: bool,
-    /// Whether the local validator has committed to broadcasting a
-    /// [`SkipRequest`] for the pending epoch. While set, round-3 PC
-    /// sign intents for the epoch are dropped at the lift — the other
-    /// half of the vote-3 / skip-request exclusion. Reset on every
-    /// commit.
-    skip_signed: bool,
 }
 
 impl BeaconCoordinator {
@@ -358,6 +352,14 @@ impl BeaconCoordinator {
         let tip_epoch_committee = tip_epoch_source.derive_beacon_committee();
         let tip_epoch_pool = tip_epoch_source.derive_active_pool();
         let state = history.into_iter().next_back().expect(LATEST_STATE_EXPECT);
+        // The pending epoch's ratification runs over the pool the live
+        // (post-fold) state derives — the signer base every candidate
+        // outcome at this tip shares.
+        let ratify = RatifyTracker::new(
+            latest_block.block_hash(),
+            state.current_epoch.next(),
+            state.derive_active_pool(),
+        );
         Self {
             state,
             latest_block,
@@ -366,7 +368,8 @@ impl BeaconCoordinator {
             spc: SpcDriver::new(me),
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
-            skip_tracker: SkipTracker::new(),
+            ratify,
+            pending_candidate: None,
             equivocations: EquivocationObservations::new(),
             proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
@@ -378,8 +381,6 @@ impl BeaconCoordinator {
             network,
             now: LocalTimestamp::ZERO,
             input_dwell_rearms: 0,
-            vote3_signed: false,
-            skip_signed: false,
         }
     }
 
@@ -395,6 +396,13 @@ impl BeaconCoordinator {
     /// so every handler in the batch reads a consistent `now`.
     pub const fn set_now(&mut self, now: LocalTimestamp) {
         self.now = now;
+    }
+
+    /// Hash of the verified candidate held for the pending epoch, if
+    /// any.
+    #[must_use]
+    pub fn pending_candidate_hash(&self) -> Option<BeaconBlockHash> {
+        self.pending_candidate.as_ref().map(|c| c.block_hash())
     }
 
     /// Local shard block committed — advance the chain's committee anchor to
@@ -422,7 +430,7 @@ impl BeaconCoordinator {
                 duration: self.duration_until_next_epoch_boundary(),
             },
             Action::SetTimer {
-                id: TimerId::BeaconSkipTrigger,
+                id: TimerId::BeaconRatifyTrigger,
                 duration: self
                     .duration_until_next_epoch_boundary()
                     .saturating_add(self.skip_timeout()),
@@ -500,66 +508,105 @@ impl BeaconCoordinator {
         self.now.as_millis() >= expected_block_time.plus(self.skip_timeout()).as_millis()
     }
 
-    /// `TimerId::BeaconSkipTrigger` fired — the next epoch's expected
-    /// block hasn't committed within `SKIP_TIMEOUT` of its boundary.
-    /// If the deadline has truly passed and the local validator sits on
-    /// the active pool, sign and broadcast a [`SkipRequest`] for the
-    /// next epoch at the current tip; otherwise no-op.
+    /// `TimerId::BeaconRatifyTrigger` fired. The first fire past the
+    /// pending epoch's deadline makes the skip hash prevotable (the
+    /// expected block didn't commit in time); each subsequent fire is a
+    /// round timeout that re-prevotes per the tracker's lock rule. The
+    /// timer re-arms at [`RATIFY_ROUND_TIMEOUT`] while the epoch is
+    /// undecided.
     ///
-    /// The deadline is re-validated at fire time because the request is
+    /// The deadline is re-validated at fire time because votes are
     /// built from the *current* tip and epoch: a fire armed against an
-    /// older tip looks fresh once the chain advances, and broadcasting
-    /// it would ask to skip an epoch whose window may not even have
-    /// opened. Re-checking makes any stale or early fire harmless.
-    ///
-    /// The action handler signs the request (the coordinator has no
-    /// key) and emits the loopback into `on_verified_skip_request_received`.
-    pub fn on_beacon_skip_timer(&mut self) -> Vec<Action> {
+    /// older tip looks fresh once the chain advances, and voting on it
+    /// would target an epoch whose window may not even have opened.
+    /// Re-checking makes any stale or early fire harmless.
+    pub fn on_beacon_ratify_timer(&mut self) -> Vec<Action> {
         if !self.skip_trigger_due(self.next_epoch_boundary()) {
-            trace!("BeaconSkipTrigger fired before the next epoch's skip deadline");
+            trace!("BeaconRatifyTrigger fired before the next epoch's skip deadline");
             return Vec::new();
         }
-        // Vote-3 / skip-request exclusion: a validator whose vote-3 may
-        // sit inside the epoch's SPC certificate must not also lend its
-        // signature to the skip certificate — an honest signature backs
-        // at most one of the two commit paths.
-        if self.vote3_signed {
-            trace!("BeaconSkipTrigger fired but local vote-3 already signed for the epoch");
+        if self.ratify.is_completed() {
             return Vec::new();
         }
-        let local_on_active_pool = self
-            .state
-            .derive_active_pool()
-            .iter()
-            .any(|(id, _)| *id == self.me);
-        if !local_on_active_pool {
-            trace!("BeaconSkipTrigger fired but local validator not on active pool");
-            return Vec::new();
+        let effects = if self.ratify.deadline_passed() {
+            self.ratify.on_round_timeout()
+        } else {
+            self.ratify.on_deadline()
+        };
+        let mut actions = self.lift_ratify_effects(effects);
+        actions.push(Action::SetTimer {
+            id: TimerId::BeaconRatifyTrigger,
+            duration: RATIFY_ROUND_TIMEOUT,
+        });
+        actions
+    }
+
+    /// Lift the tracker's typed effects into actions: sign intents
+    /// become signing dispatches (pool members only — the tracker
+    /// tracks votes on every node, but only pool members contribute
+    /// signatures), and an assembled commit certificate becomes the
+    /// epoch's block.
+    fn lift_ratify_effects(&mut self, effects: Vec<RatifyEffect>) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for effect in effects {
+            match effect {
+                RatifyEffect::SignPrevote { round, block_hash } => {
+                    actions.extend(self.ratify_sign_action(
+                        round,
+                        RatifyPhase::Prevote,
+                        block_hash,
+                    ));
+                }
+                RatifyEffect::SignPrecommit { round, block_hash } => {
+                    actions.extend(self.ratify_sign_action(
+                        round,
+                        RatifyPhase::Precommit,
+                        block_hash,
+                    ));
+                }
+                RatifyEffect::CertAssembled { cert } => {
+                    actions.extend(self.commit_ratified_block(*cert));
+                }
+            }
         }
-        self.skip_signed = true;
-        vec![Action::BroadcastSkipRequest {
-            epoch_to_skip: self.state.current_epoch.next(),
+        actions
+    }
+
+    fn ratify_sign_action(
+        &self,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        block_hash: BeaconBlockHash,
+    ) -> Option<Action> {
+        if !self.ratify.pool_contains(self.me) {
+            return None;
+        }
+        Some(Action::SignAndBroadcastRatifyVote {
             anchor: self.latest_block.block_hash(),
-        }]
+            epoch: self.state.current_epoch.next(),
+            round,
+            phase,
+            block_hash,
+        })
     }
 
     /// A peer's round-1 PC vote arrived. Gate, dedup, and dispatch the
     /// BLS check via the [`SpcDriver`]. Admission happens in
     /// [`Self::on_pc_vote1_verified`] when the result lands.
     pub fn on_pc_vote1_received(&mut self, view: SpcView, vote: PcVote1) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_pc_vote1_received(view, vote, skip)
     }
 
     /// A peer's round-2 PC vote arrived.
     pub fn on_pc_vote2_received(&mut self, view: SpcView, vote: Box<PcVote2>) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_pc_vote2_received(view, vote, skip)
     }
 
     /// A peer's round-3 PC vote arrived.
     pub fn on_pc_vote3_received(&mut self, view: SpcView, vote: Box<PcVote3>) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_pc_vote3_received(view, vote, skip)
     }
 
@@ -572,7 +619,7 @@ impl BeaconCoordinator {
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_spc_new_view_received(from, proposal, skip)
     }
 
@@ -582,7 +629,7 @@ impl BeaconCoordinator {
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_spc_new_commit_received(from, msg, skip)
     }
 
@@ -591,7 +638,7 @@ impl BeaconCoordinator {
         &mut self,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         self.spc.on_unverified_spc_empty_view_received(msg, skip)
     }
 
@@ -602,7 +649,7 @@ impl BeaconCoordinator {
         &mut self,
         msg: Box<Verified<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self.spc.on_verified_spc_empty_view_received(msg, skip);
         self.lift_from_spc(effects)
     }
@@ -615,7 +662,7 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_spc_new_view_verified(epoch, from, view, result, skip);
@@ -630,7 +677,7 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_spc_new_commit_verified(epoch, from, view, result, skip);
@@ -645,7 +692,7 @@ impl BeaconCoordinator {
         view: SpcView,
         result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_spc_empty_view_verified(epoch, from, view, result, skip);
@@ -660,7 +707,7 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_pc_vote1_verified(epoch, view, signer, result, skip);
@@ -675,7 +722,7 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_pc_vote2_verified(epoch, view, signer, result, skip);
@@ -690,7 +737,7 @@ impl BeaconCoordinator {
         signer: ValidatorId,
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self
             .spc
             .on_pc_vote3_verified(epoch, view, signer, result, skip);
@@ -704,7 +751,7 @@ impl BeaconCoordinator {
         view: SpcView,
         vote: Verified<PcVote1>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self.spc.on_verified_pc_vote1_received(view, vote, skip);
         self.lift_from_spc(effects)
     }
@@ -715,7 +762,7 @@ impl BeaconCoordinator {
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self.spc.on_verified_pc_vote2_received(view, vote, skip);
         self.lift_from_spc(effects)
     }
@@ -726,7 +773,7 @@ impl BeaconCoordinator {
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
     ) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self.spc.on_verified_pc_vote3_received(view, vote, skip);
         self.lift_from_spc(effects)
     }
@@ -734,7 +781,7 @@ impl BeaconCoordinator {
     /// `TimerId::BeaconSpcView` fired. Route a synthesized `TimerExpired`
     /// into the SPC instance against its current view.
     pub fn on_beacon_spc_view_timer(&mut self) -> Vec<Action> {
-        let skip = self.skip_quorum_at_tip();
+        let skip = self.ratify_settled_at_tip();
         let effects = self.spc.on_beacon_spc_view_timer(skip);
         self.lift_from_spc(effects)
     }
@@ -1042,15 +1089,11 @@ impl BeaconCoordinator {
         self.feed_view_one_input(epoch)
     }
 
-    /// Whether the skip tracker has accumulated quorum to abandon
-    /// `current_epoch.next()` at the local tip's anchor.
-    fn skip_quorum_at_tip(&self) -> bool {
-        let active_pool_size = self.state.derive_active_pool().len();
-        self.skip_tracker.quorum_reached(
-            self.latest_block.block_hash(),
-            self.state.current_epoch.next(),
-            active_pool_size,
-        )
+    /// Whether the pending epoch is already decided — a ratification
+    /// commit certificate assembled at the local tip. Further PC/SPC
+    /// crypto for the epoch is moot.
+    const fn ratify_settled_at_tip(&self) -> bool {
+        self.ratify.is_completed()
     }
 
     /// A peer-aggregated [`BeaconBlock`] arrived via the beacon gossip
@@ -1106,37 +1149,30 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        // Structural checks pass. Skip blocks carry an extra anchor +
-        // epoch gate beyond the cert-type → signer-pool dispatch.
-        if let BeaconCert::Skip(skip_cert) = block.cert()
-            && (skip_cert.anchor_hash() != self.latest_block.block_hash()
-                || skip_cert.epoch_to_skip() != epoch)
-        {
-            warn!(
-                epoch = epoch.inner(),
-                "BeaconBlockReceived Skip cert anchor/epoch mismatch — dropping",
-            );
-            return Vec::new();
-        }
-        let Some(signers) = self.state.signer_pool_for(&block) else {
+        // Structural checks pass. The ratify cert's own anchor/epoch
+        // binding to the block is the pairing invariant, enforced at
+        // wire decode.
+        if matches!(block.cert(), BeaconCert::Genesis(_)) {
             warn!(
                 epoch = epoch.inner(),
                 "BeaconBlockReceived with Genesis cert past tip — dropping",
             );
             return Vec::new();
-        };
-        let equivocation_signers = self.equivocation_signers_for(&block);
-        self.dispatch_block_verification(block, signers, equivocation_signers)
+        }
+        let committee = self.state.derive_beacon_committee();
+        let active_pool = self.state.derive_active_pool();
+        let equivocation_signers = self.equivocation_signers_for(block.block());
+        self.dispatch_block_verification(block, committee, active_pool, equivocation_signers)
     }
 
     /// Dispatch verification for a block that competes with the adopted
     /// tip: same epoch, same parent, different hash. A validly certified
-    /// competitor is self-proving evidence that both commit paths (SPC
-    /// cert and pool skip cert) assembled for one epoch, and
-    /// [`Self::on_beacon_block_verified`] halts on it — the divergence
-    /// is detected loudly rather than carried silently. Returns `None`
-    /// when `block` is not a tip competitor (the caller's ordinary
-    /// drop/sync handling applies).
+    /// competitor is self-proving evidence of two ratification commit
+    /// certificates for one epoch — more than a third of the pool
+    /// double-signed — and [`Self::on_beacon_block_verified`] halts on
+    /// it: the divergence is detected loudly rather than carried
+    /// silently. Returns `None` when `block` is not a tip competitor
+    /// (the caller's ordinary drop/sync handling applies).
     ///
     /// Verification runs against the signer sets that governed the tip
     /// epoch (`tip_epoch_committee` / `tip_epoch_pool`), captured at
@@ -1149,28 +1185,23 @@ impl BeaconCoordinator {
             || block.epoch() == Epoch::GENESIS
             || block.prev_block_hash() != self.latest_block.prev_block_hash()
             || block.block_hash() == self.latest_block.block_hash()
+            || matches!(block.cert(), BeaconCert::Genesis(_))
         {
             return None;
         }
-        if let BeaconCert::Skip(skip_cert) = block.cert()
-            && (skip_cert.anchor_hash() != self.latest_block.prev_block_hash()
-                || skip_cert.epoch_to_skip() != block.epoch())
-        {
-            return None;
-        }
-        let signers = match block.cert() {
-            BeaconCert::Normal(_) => self.tip_epoch_committee.clone(),
-            BeaconCert::Skip(_) => self.tip_epoch_pool.clone(),
-            BeaconCert::Genesis(_) => return None,
-        };
         warn!(
             epoch = block.epoch().inner(),
             competitor = ?block.block_hash(),
             adopted = ?self.latest_block.block_hash(),
             "BeaconBlock competes with the adopted tip — dispatching cert verification",
         );
-        let equivocation_signers = self.equivocation_signers_for(block);
-        Some(self.dispatch_block_verification(Arc::clone(block), signers, equivocation_signers))
+        let equivocation_signers = self.equivocation_signers_for(block.block());
+        Some(self.dispatch_block_verification(
+            Arc::clone(block),
+            self.tip_epoch_committee.clone(),
+            self.tip_epoch_pool.clone(),
+            equivocation_signers,
+        ))
     }
 
     /// Apply a beacon block delivered by the runner's gap-fill sync.
@@ -1196,11 +1227,11 @@ impl BeaconCoordinator {
     /// such evidence at admission via the pubkey-lookup miss.
     fn equivocation_signers_for(
         &self,
-        block: &CertifiedBeaconBlock,
+        block: &BeaconBlock,
     ) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
         let mut signers: Vec<(ValidatorId, Bls12381G1PublicKey)> = Vec::new();
         let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
-        for (_, proposal) in block.block().committed_proposals() {
+        for (_, proposal) in block.committed_proposals() {
             for ev in proposal.equivocations().iter() {
                 if seen.insert(ev.validator)
                     && let Some(rec) = self.state.validators.get(&ev.validator)
@@ -1219,7 +1250,8 @@ impl BeaconCoordinator {
     fn dispatch_block_verification(
         &mut self,
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
-        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Vec<Action> {
         if !self.verification.mark_block_in_flight(block.block_hash()) {
@@ -1227,113 +1259,130 @@ impl BeaconCoordinator {
         }
         vec![Action::VerifyBeaconBlock {
             block,
-            signers,
+            committee,
+            active_pool,
             equivocation_signers,
         }]
     }
 
-    /// A peer's [`SkipRequest`] arrived via gossip. Validate the
+    /// A peer's [`RatifyVote`] arrived via gossip. Validate the
     /// non-crypto fields and dispatch BLS verification to the crypto
-    /// pool. Admission to the [`SkipTracker`] happens in
-    /// [`Self::on_skip_request_verified`] once the result lands;
-    /// quorum assembly + adoption follow from there.
+    /// pool. Admission to the [`RatifyTracker`] happens in
+    /// [`Self::on_ratify_vote_verified`] once the result lands; polka
+    /// reactions, cert assembly, and adoption follow from there.
     ///
     /// Synchronous validation (before dispatch):
-    /// - Anchor must equal `latest_block.block_hash()`. Requests
-    ///   pinning a different anchor are stale or for a chain head we
-    ///   haven't seen.
-    /// - `epoch_to_skip` must equal `current_epoch.next()` — the
-    ///   in-flight epoch.
+    /// - Anchor must equal `latest_block.block_hash()`. Votes pinning
+    ///   a different anchor are stale or for a chain head we haven't
+    ///   seen.
+    /// - `epoch` must equal `current_epoch.next()` — the in-flight
+    ///   epoch.
     /// - Signer must sit in the active-duty pool
-    ///   ([`derive_active_pool`]); off-pool requests can't contribute
-    ///   to quorum so the BLS check is pointless.
+    ///   ([`derive_active_pool`]); off-pool votes can't contribute to
+    ///   quorum so the BLS check is pointless.
+    ///
+    /// No deadline gate: prevotes for the candidate are the happy path
+    /// *before* the deadline. A premature skip-hash vote is harmless —
+    /// the local tracker pools it, but the local validator's own votes
+    /// (and the polkas they enable) still pace to the local clock.
     ///
     /// Async (on the crypto pool):
     /// - BLS sig verifies against the canonical
-    ///   [`skip_request_message`](hyperscale_types::skip_request_message)
+    ///   [`ratify_vote_message`](hyperscale_types::ratify_vote_message)
     ///   under the signer's pubkey.
-    pub fn on_unverified_skip_request_received(
+    pub fn on_unverified_ratify_vote_received(
         &mut self,
-        request: Arc<Verifiable<SkipRequest>>,
+        vote: Arc<Verifiable<RatifyVote>>,
     ) -> Vec<Action> {
-        if request.anchor_hash() != self.latest_block.block_hash() {
+        if vote.anchor_hash() != self.latest_block.block_hash() {
             trace!(
-                signer = ?request.signer(),
-                "SkipRequest at unknown anchor — dropping",
+                signer = ?vote.signer(),
+                "RatifyVote at unknown anchor — dropping",
             );
             return Vec::new();
         }
         let expected_epoch = self.state.current_epoch.next();
-        if request.epoch_to_skip() != expected_epoch {
+        if vote.epoch() != expected_epoch {
             trace!(
-                signer = ?request.signer(),
-                epoch_to_skip = request.epoch_to_skip().inner(),
+                signer = ?vote.signer(),
+                epoch = vote.epoch().inner(),
                 expected = expected_epoch.inner(),
-                "SkipRequest at unexpected epoch — dropping",
+                "RatifyVote at unexpected epoch — dropping",
             );
             return Vec::new();
         }
-
-        // Honest trackers count a skip request only once the epoch's
-        // deadline has passed on their own clock. Without this, a peer's
-        // stale timer — or a Byzantine pool member — can march the chain
-        // past wall-clock one premature skip at a time; with it, an early
-        // skip needs a quorum of dishonest clocks. Screened here before
-        // the BLS dispatch and re-checked at admission.
-        if !self.skip_trigger_due(self.next_epoch_boundary()) {
+        if !self.ratify.pool_contains(vote.signer()) {
             trace!(
-                signer = ?request.signer(),
-                "SkipRequest before the epoch's skip deadline — dropping",
-            );
-            return Vec::new();
-        }
-
-        let active_pool = self.state.derive_active_pool();
-        if !active_pool.iter().any(|(id, _)| *id == request.signer()) {
-            trace!(
-                signer = ?request.signer(),
-                "SkipRequest signer absent from active pool — dropping",
+                signer = ?vote.signer(),
+                "RatifyVote signer absent from active pool — dropping",
             );
             return Vec::new();
         }
 
         let key = (
-            request.anchor_hash(),
-            request.epoch_to_skip(),
-            request.signer(),
+            vote.anchor_hash(),
+            vote.epoch(),
+            vote.round(),
+            vote.phase(),
+            vote.signer(),
         );
-        if !self.verification.mark_skip_request_in_flight(key) {
+        if !self.verification.mark_ratify_vote_in_flight(key) {
             return Vec::new();
         }
-        vec![Action::VerifySkipRequest {
-            request: Box::new(Arc::unwrap_or_clone(request)),
-            signers: active_pool,
+        vec![Action::VerifyRatifyVote {
+            vote: Box::new(Arc::unwrap_or_clone(vote)),
+            signers: self.state.derive_active_pool(),
         }]
     }
 
-    /// A locally-signed [`SkipRequest`] arrived via the
-    /// `Action::BroadcastSkipRequest` self-loopback path. The signing
-    /// validator produced the BLS sig, so the request is verified by
-    /// construction — skip the verify dispatch and admit directly.
-    pub fn on_verified_skip_request_received(
+    /// A locally-signed [`RatifyVote`] arrived via the
+    /// `Action::SignAndBroadcastRatifyVote` self-loopback path. The
+    /// signing validator produced the BLS sig, so the vote is verified
+    /// by construction — skip the verify dispatch and pool directly.
+    pub fn on_verified_ratify_vote_received(
         &mut self,
-        request: Arc<Verified<SkipRequest>>,
+        vote: Arc<Verified<RatifyVote>>,
     ) -> Vec<Action> {
-        self.admit_verified_skip_request(Arc::unwrap_or_clone(request))
+        self.admit_verified_ratify_vote(Arc::unwrap_or_clone(vote))
     }
 
-    /// Build the skip block paired with `cert`, adopt it via the
+    /// Build the block the commit certificate names, adopt it via the
     /// shared adoption path, and emit a broadcast so peers converge.
-    fn commit_skip_block(&mut self, cert: Verified<SkipEpochCert>) -> Vec<Action> {
-        let anchor = self.latest_block.block_hash();
-        let raw_cert = cert.into_inner();
-        let epoch_to_skip = raw_cert.epoch_to_skip();
-        let block = BeaconBlock::skip(epoch_to_skip, anchor);
-        let certified = Verified::<CertifiedBeaconBlock>::from_committed_assembly(
-            block,
-            BeaconCert::Skip(raw_cert),
-        )
-        .expect("skip block pairs with skip cert by construction");
+    ///
+    /// The skip hash rebuilds the canonical skip block from the cert's
+    /// own fields; the candidate hash pairs the held verified
+    /// candidate with the cert. A cert naming a hash this replica
+    /// never held commits nothing locally — the assembling peers
+    /// broadcast the certified block and adoption follows from its
+    /// receipt.
+    fn commit_ratified_block(&mut self, cert: Verified<RatifyCert>) -> Vec<Action> {
+        let block_hash = cert.block_hash();
+        let certified = if block_hash == self.ratify.skip_block_hash() {
+            let block = BeaconBlock::skip(cert.epoch(), cert.anchor_hash());
+            Verified::<CertifiedBeaconBlock>::from_committed_assembly(
+                block,
+                BeaconCert::Skip(cert.into_inner()),
+            )
+            .expect("skip block pairs with its ratify cert by construction")
+        } else if self
+            .pending_candidate
+            .as_ref()
+            .is_some_and(|c| c.block_hash() == block_hash)
+        {
+            let candidate = self.pending_candidate.take().expect("checked above");
+            Verified::<CertifiedBeaconBlock>::from_ratified_candidate(
+                Arc::unwrap_or_clone(candidate),
+                cert,
+            )
+            .expect("candidate pairs with its ratify cert by construction")
+        } else {
+            warn!(
+                block_hash = ?block_hash,
+                "Ratify cert names a candidate this replica never held — awaiting \
+                 the assembler's certified block broadcast",
+            );
+            return Vec::new();
+        };
         let block_arc = Arc::new(certified);
 
         let mut actions = self.adopt_block(Arc::clone(&block_arc));
@@ -1424,77 +1473,52 @@ impl BeaconCoordinator {
         self.adopt_block(block)
     }
 
-    /// A previously-dispatched [`Action::VerifySkipRequest`] has
-    /// returned. Clears the `(anchor, epoch_to_skip, signer)` pipeline
-    /// slot on both arms — the key fields ride back in the result event
-    /// so a verification failure can't pin a signer's slot in-flight and
-    /// block their later honest request — and on success admits the
-    /// request to the [`SkipTracker`].
-    pub fn on_skip_request_verified(
+    /// A previously-dispatched [`Action::VerifyRatifyVote`] has
+    /// returned. Clears the `(anchor, epoch, round, phase, signer)`
+    /// pipeline slot on both arms — the key fields ride back in the
+    /// result event so a verification failure can't pin a signer's
+    /// slot in-flight and block their later honest vote — and on
+    /// success pools the vote in the [`RatifyTracker`].
+    pub fn on_ratify_vote_verified(
         &mut self,
         anchor: BeaconBlockHash,
-        epoch_to_skip: Epoch,
+        epoch: Epoch,
+        round: RatifyRound,
+        phase: RatifyPhase,
         signer: ValidatorId,
-        result: Result<Verified<SkipRequest>, SkipRequestVerifyError>,
+        result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
     ) -> Vec<Action> {
-        let key = (anchor, epoch_to_skip, signer);
-        let request = match result {
-            Ok(r) => r,
+        let key = (anchor, epoch, round, phase, signer);
+        let vote = match result {
+            Ok(v) => v,
             Err(err) => {
-                self.verification.forget_skip_request(key);
-                warn!(%err, "SkipRequest BLS verification failed — dropping");
+                self.verification.forget_ratify_vote(key);
+                warn!(%err, "RatifyVote BLS verification failed — dropping");
                 return Vec::new();
             }
         };
-        self.verification.forget_skip_request(key);
-        self.admit_verified_skip_request(request)
+        self.verification.forget_ratify_vote(key);
+        self.admit_verified_ratify_vote(vote)
     }
 
-    /// A [`SkipRequest`] has passed BLS verification: admit it to the
-    /// tracker, and if the local tip now sits at a skip-quorum, assemble
-    /// the cert, build the skip block, adopt locally, and broadcast.
-    fn admit_verified_skip_request(&mut self, request: Verified<SkipRequest>) -> Vec<Action> {
+    /// A [`RatifyVote`] has passed BLS verification: pool it and lift
+    /// whatever it completes — a polka into the local precommit, a
+    /// precommit quorum into the epoch's commit certificate.
+    fn admit_verified_ratify_vote(&mut self, vote: Verified<RatifyVote>) -> Vec<Action> {
         // Tip may have advanced since dispatch; re-check the anchor +
-        // epoch before admission so a stale verified request can't push
-        // into the wrong bucket.
-        let anchor = self.latest_block.block_hash();
-        let expected_epoch = self.state.current_epoch.next();
-        if request.anchor_hash() != anchor || request.epoch_to_skip() != expected_epoch {
-            trace!(
-                signer = ?request.signer(),
-                "Verified SkipRequest no longer matches tip — dropping",
-            );
-            return Vec::new();
-        }
-        // Admission is the authoritative deadline gate: the unverified
-        // intake screens wire requests before spending a pairing, but the
-        // local loopback enters here directly and the clock is re-read
-        // after the BLS round trip.
-        if !self.skip_trigger_due(self.next_epoch_boundary()) {
-            trace!(
-                signer = ?request.signer(),
-                "Verified SkipRequest before the epoch's skip deadline — dropping",
-            );
-            return Vec::new();
-        }
-        if !self.skip_tracker.observe(request) {
-            return Vec::new();
-        }
-        let active_pool = self.state.derive_active_pool();
-        if !self
-            .skip_tracker
-            .quorum_reached(anchor, expected_epoch, active_pool.len())
+        // epoch before admission so a stale verified vote can't pool
+        // against the wrong instance.
+        if vote.anchor_hash() != self.latest_block.block_hash()
+            || vote.epoch() != self.state.current_epoch.next()
         {
+            trace!(
+                signer = ?vote.signer(),
+                "Verified RatifyVote no longer matches tip — dropping",
+            );
             return Vec::new();
         }
-        let Some(cert) = self
-            .skip_tracker
-            .try_assemble(anchor, expected_epoch, &active_pool)
-        else {
-            warn!("SkipTracker quorum reached but try_assemble returned None");
-            return Vec::new();
-        };
-        self.commit_skip_block(cert)
+        let effects = self.ratify.observe(vote);
+        self.lift_ratify_effects(effects)
     }
 
     /// A shard-witness fetch response arrived. For each witness:
@@ -1678,16 +1702,19 @@ impl BeaconCoordinator {
     /// the new committee. Emits `CommitBeaconBlock` only — no
     /// broadcast (caller decides whether the local node is the
     /// originator).
+    /// The pending epoch is settled: ratification restarts for the
+    /// next one at the new tip, over the post-fold pool.
+    fn restart_ratification(&mut self) {
+        self.ratify = RatifyTracker::new(
+            self.latest_block.block_hash(),
+            self.state.current_epoch.next(),
+            self.state.derive_active_pool(),
+        );
+        self.pending_candidate = None;
+    }
+
     fn adopt_block(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Vec<Action> {
-        // The anchor we're committing past. Its skip-request buckets are
-        // stale on any commit path once the tip advances, so drop them
-        // here.
-        let prior_tip = self.latest_block.block_hash();
         let was_on_committee = self.is_on_committee();
-        // The pending epoch is settled: the vote-3 / skip-request
-        // exclusion re-arms for the next one.
-        self.vote3_signed = false;
-        self.skip_signed = false;
         // The sets governing the epoch being adopted, captured before
         // its fold advances them — a competing block for this epoch
         // verifies against these.
@@ -1697,7 +1724,7 @@ impl BeaconCoordinator {
         let effects = apply_epoch(&mut self.state, &self.network, block.epoch(), input);
         self.latest_block = Arc::clone(&block);
         self.spc.clear();
-        self.skip_tracker.forget_anchor(prior_tip);
+        self.restart_ratification();
 
         // Evidence for a validator the fold now holds permanently jailed
         // is dead weight in future proposals — the jail can't be upgraded
@@ -1778,7 +1805,7 @@ impl BeaconCoordinator {
             // `skip_timeout` after the upcoming epoch's boundary if no
             // commit lands by then.
             Action::SetTimer {
-                id: TimerId::BeaconSkipTrigger,
+                id: TimerId::BeaconRatifyTrigger,
                 duration: self
                     .duration_until_next_epoch_boundary()
                     .saturating_add(self.skip_timeout()),
@@ -1956,7 +1983,7 @@ impl BeaconCoordinator {
         ) {
             AssemblyDecision::Assemble {
                 committed, cert, ..
-            } => self.assemble_and_adopt(epoch, committed, *cert),
+            } => self.assemble_and_broadcast_candidate(epoch, committed, *cert),
             AssemblyDecision::AwaitFetch { missing, .. } => {
                 self.fetch_missing_proposals(epoch, &missing)
             }
@@ -1988,15 +2015,16 @@ impl BeaconCoordinator {
             .collect()
     }
 
-    /// Build the certified block from `committed` + SPC `cert`, route
-    /// it through the shared adoption path, and emit the gossip
-    /// broadcast.
+    /// Build the candidate block from `committed` + SPC `cert`, feed
+    /// its hash to the ratification tracker as the prevotable value,
+    /// and broadcast it to the pool. The SPC cert authenticates the
+    /// content; commitment waits for the pool's ratify cert.
     ///
     /// Defers (emitting nothing) when a committed boundary's source
     /// header isn't synced locally: assembling an incomplete contribution
-    /// set would diverge from a fully-synced peer's block, so the local
-    /// node waits for that peer's gossiped block instead.
-    fn assemble_and_adopt(
+    /// set would diverge from a fully-synced peer's candidate, so the
+    /// local node waits for that peer's gossiped candidate instead.
+    fn assemble_and_broadcast_candidate(
         &mut self,
         epoch: Epoch,
         committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
@@ -2007,25 +2035,97 @@ impl BeaconCoordinator {
         else {
             trace!(
                 epoch = epoch.inner(),
-                "Deferring beacon assembly — a committed boundary's source header isn't synced \
-                 locally; awaiting a fully-synced peer's gossiped block",
+                "Deferring candidate assembly — a committed boundary's source header isn't \
+                 synced locally; awaiting a fully-synced peer's gossiped candidate",
             );
             return Vec::new();
         };
         let prev_block_hash = self.latest_block.block_hash();
-        let certified = Verified::<CertifiedBeaconBlock>::assemble(
+        let candidate = Arc::new(Verified::<CandidateBeaconBlock>::assemble(
             epoch,
             prev_block_hash,
             committed,
             shard_contributions,
             cert,
-        )
-        .expect("Normal beacon block pairs with SPC cert by construction");
-        let block_arc = Arc::new(certified);
-
-        let mut actions = self.adopt_block(Arc::clone(&block_arc));
-        actions.push(Action::BroadcastBeaconBlock { block: block_arc });
+        ));
+        if self.pending_candidate.is_none() {
+            self.pending_candidate = Some(Arc::clone(&candidate));
+        }
+        let effects = self.ratify.on_candidate(candidate.block_hash());
+        let mut actions = self.lift_ratify_effects(effects);
+        actions.push(Action::BroadcastBeaconCandidate { candidate });
         actions
+    }
+
+    /// A peer's [`CandidateBeaconBlock`] arrived via gossip. Gate the
+    /// non-crypto fields and dispatch SPC-cert + equivocation
+    /// verification; [`Self::on_beacon_candidate_verified`] feeds the
+    /// tracker when the result lands. First verified candidate wins —
+    /// a second distinct candidate (an equivocating committee) is
+    /// ignored, and the pool cert arbitrates.
+    pub fn on_beacon_candidate_received(
+        &mut self,
+        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+    ) -> Vec<Action> {
+        if candidate.prev_block_hash() != self.latest_block.block_hash()
+            || candidate.epoch() != self.state.current_epoch.next()
+        {
+            trace!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate doesn't extend the local tip — dropping",
+            );
+            return Vec::new();
+        }
+        if self.pending_candidate.is_some() || self.ratify.candidate().is_some() {
+            return Vec::new();
+        }
+        if !self
+            .verification
+            .mark_candidate_in_flight(candidate.block_hash())
+        {
+            return Vec::new();
+        }
+        let committee = self.state.derive_beacon_committee();
+        let equivocation_signers = self.equivocation_signers_for(candidate.block());
+        vec![Action::VerifyBeaconCandidate {
+            candidate,
+            committee,
+            equivocation_signers,
+        }]
+    }
+
+    /// A previously-dispatched [`Action::VerifyBeaconCandidate`] has
+    /// returned. Clear the pipeline slot, and on the `Ok` arm hold the
+    /// candidate for cert pairing and feed its hash to the tracker as
+    /// the prevotable value. Drops silently on the `Err` arm.
+    pub fn on_beacon_candidate_verified(
+        &mut self,
+        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
+    ) -> Vec<Action> {
+        let candidate = match result {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(%err, "BeaconCandidate verification failed — dropping");
+                return Vec::new();
+            }
+        };
+        self.verification.forget_candidate(candidate.block_hash());
+        // Tip may have advanced since dispatch; a stale candidate no
+        // longer names a prevotable value.
+        if candidate.prev_block_hash() != self.latest_block.block_hash()
+            || candidate.epoch() != self.state.current_epoch.next()
+        {
+            trace!(
+                epoch = candidate.epoch().inner(),
+                "Verified BeaconCandidate no longer extends the tip — dropping",
+            );
+            return Vec::new();
+        }
+        if self.pending_candidate.is_none() {
+            self.pending_candidate = Some(Arc::clone(&candidate));
+        }
+        let effects = self.ratify.on_candidate(candidate.block_hash());
+        self.lift_ratify_effects(effects)
     }
 
     /// Handle a [`ProtocolEvent::BeaconProposalFetched`] dispatch:
@@ -2090,7 +2190,7 @@ impl BeaconCoordinator {
         ) {
             AssemblyDecision::Assemble {
                 committed, cert, ..
-            } => self.assemble_and_adopt(epoch, committed, *cert),
+            } => self.assemble_and_broadcast_candidate(epoch, committed, *cert),
             AssemblyDecision::AwaitFetch { .. } | AssemblyDecision::Idle => Vec::new(),
         }
     }
@@ -2156,19 +2256,6 @@ impl BeaconCoordinator {
                     });
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
-                    // Vote-3 / skip-request exclusion, the other
-                    // direction: once the local skip request is out,
-                    // no further vote-3 may feed the epoch's SPC
-                    // certificate. Vote-1/2 intents still lift — they
-                    // cannot complete a QC3 without 2f+1 vote-3s.
-                    if self.skip_signed {
-                        trace!(
-                            view = view.inner(),
-                            "Dropping vote-3 sign intent — local skip request already broadcast",
-                        );
-                        continue;
-                    }
-                    self.vote3_signed = true;
                     actions.push(Action::SignAndBroadcastPcVote3 {
                         epoch,
                         view,
@@ -2283,7 +2370,7 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("spc_active", &self.spc.is_bootstrapped())
             .field("verifications_in_flight", &self.verifications_in_flight())
             .field("witness_chunks", &self.shard_source.total_chunk_len())
-            .field("skip_buckets", &self.skip_tracker.bucket_count())
+            .field("ratify_round", &self.ratify.round())
             .field("equivocations", &self.equivocations.len())
             .finish_non_exhaustive()
     }
@@ -2299,13 +2386,13 @@ mod tests {
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, KeptSeat, LeafIndex,
         LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
-        ObserverSeat, PcQc2, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
-        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
-        build_qc3, compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_vote1,
-        sign_vote2, sign_vote3, spc_context, zero_bls_signature,
+        ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
+        Round, ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
+        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake,
+        StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
+        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, build_ratify_cert,
+        compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_ratify_vote,
+        sign_vote1, sign_vote2, sign_vote3, spc_context, zero_bls_signature,
     };
 
     use super::*;
@@ -2736,7 +2823,9 @@ mod tests {
     /// synchronous-equivalent outcome without manually threading
     /// results back to the coordinator.
     fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
-        use hyperscale_types::{CertifiedBeaconBlockVerifyContext, SkipVerifyContext};
+        use hyperscale_types::{
+            CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, RatifyVerifyContext,
+        };
 
         let net = NetworkDefinition::simulator();
         let mut out = Vec::new();
@@ -2744,13 +2833,15 @@ mod tests {
             match action {
                 Action::VerifyBeaconBlock {
                     block,
-                    signers,
+                    committee,
+                    active_pool,
                     equivocation_signers,
                 } => {
                     let result = Arc::unwrap_or_clone(block)
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             network: &net,
-                            signers: &signers,
+                            committee: &committee,
+                            active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
                         .map(Arc::new)
@@ -2758,18 +2849,36 @@ mod tests {
                     let post = coord.on_beacon_block_verified(result);
                     out.extend(complete_verifications(coord, post));
                 }
-                Action::VerifySkipRequest { request, signers } => {
-                    let anchor = request.anchor_hash();
-                    let epoch_to_skip = request.epoch_to_skip();
-                    let signer = request.signer();
-                    let result = (*request)
-                        .upgrade(&SkipVerifyContext {
+                Action::VerifyBeaconCandidate {
+                    candidate,
+                    committee,
+                    equivocation_signers,
+                } => {
+                    let result = Arc::unwrap_or_clone(candidate)
+                        .upgrade(&CandidateVerifyContext {
+                            network: &net,
+                            committee: &committee,
+                            equivocation_signers: &equivocation_signers,
+                        })
+                        .map(Arc::new)
+                        .map_err(|(_, e)| e);
+                    let post = coord.on_beacon_candidate_verified(result);
+                    out.extend(complete_verifications(coord, post));
+                }
+                Action::VerifyRatifyVote { vote, signers } => {
+                    let anchor = vote.anchor_hash();
+                    let epoch = vote.epoch();
+                    let round = vote.round();
+                    let phase = vote.phase();
+                    let signer = vote.signer();
+                    let result = (*vote)
+                        .upgrade(&RatifyVerifyContext {
                             network: &net,
                             active_pool: &signers,
                         })
                         .map_err(|(_, e)| e);
                     let post =
-                        coord.on_skip_request_verified(anchor, epoch_to_skip, signer, result);
+                        coord.on_ratify_vote_verified(anchor, epoch, round, phase, signer, result);
                     out.extend(complete_verifications(coord, post));
                 }
                 other => out.push(other),
@@ -2882,34 +2991,63 @@ mod tests {
         assert!(coord.skip_trigger_due(expected));
     }
 
-    /// The skip-trigger fire re-validates the deadline against the
+    /// The ratify-timer fire re-validates the deadline against the
     /// *current* next epoch. A fire before that deadline — a re-armed
-    /// timer racing an adoption — must not broadcast: the request it
-    /// would build anchors at the current tip and names the current next
-    /// epoch, so nothing downstream could tell it was stale.
+    /// timer racing an adoption — must vote nothing: the vote it would
+    /// sign anchors at the current tip and names the current next
+    /// epoch, so nothing downstream could tell it was stale. Past the
+    /// deadline, the fire prevotes the skip hash and re-arms for the
+    /// next round; a second fire advances the round and re-prevotes
+    /// per the lock rule.
     #[test]
-    fn skip_timer_fire_before_the_deadline_broadcasts_nothing() {
+    fn ratify_timer_paces_to_the_deadline_then_rounds() {
         let mut coord = fresh_coord();
         let boundary = coord.current_state().chain_config.epoch_duration_ms;
         let timeout_ms: u64 = SKIP_TIMEOUT
             .as_millis()
             .try_into()
             .expect("SKIP_TIMEOUT fits in u64 millis");
+        let skip_hash = coord.ratify.skip_block_hash();
 
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms - 1));
         assert!(
-            coord.on_beacon_skip_timer().is_empty(),
-            "an early fire must not broadcast a skip request",
+            coord.on_beacon_ratify_timer().is_empty(),
+            "an early fire must not vote",
         );
 
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
-        let actions = coord.on_beacon_skip_timer();
+        let actions = coord.on_beacon_ratify_timer();
         assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::BroadcastSkipRequest { epoch_to_skip, .. }
-                    if epoch_to_skip.inner() == 1)
-            ),
-            "a fire past the deadline must broadcast for the next epoch; got {actions:?}",
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SignAndBroadcastRatifyVote { epoch, phase: RatifyPhase::Prevote, block_hash, .. }
+                    if epoch.inner() == 1 && *block_hash == skip_hash
+            )),
+            "a fire past the deadline must prevote the skip hash; got {actions:?}",
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::BeaconRatifyTrigger,
+                    ..
+                }
+            )),
+            "the timer must re-arm for the next round; got {actions:?}",
+        );
+        assert_eq!(coord.ratify.round(), RatifyRound::INITIAL);
+
+        // A second fire is a round timeout: the round advances, and the
+        // unlocked tracker re-prevotes skip (still no candidate).
+        let actions = coord.on_beacon_ratify_timer();
+        assert_eq!(coord.ratify.round(), RatifyRound::new(2));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SignAndBroadcastRatifyVote { round, phase: RatifyPhase::Prevote, block_hash, .. }
+                    if *round == RatifyRound::new(2) && *block_hash == skip_hash
+            )),
+            "a round timeout must re-prevote in the new round; got {actions:?}",
         );
     }
 
@@ -3038,77 +3176,85 @@ mod tests {
 
     /// Two skip requests from the same signer at the same anchor/epoch
     /// but with different signature bytes collapse to one verification
-    /// slot: the slot key is `(anchor, epoch_to_skip, signer)`, not the
-    /// encoded-request hash, so a forged-sig flood can't mint extra
-    /// in-flight BLS checks.
+    /// slot: the slot key is `(anchor, epoch, round, phase, signer)`,
+    /// not the encoded-vote hash, so a forged-sig flood can't mint
+    /// extra in-flight BLS checks.
     #[test]
-    fn skip_request_verification_keys_on_signer_not_signature() {
-        use hyperscale_types::{Bls12381G2Signature, SkipRequest};
+    fn ratify_vote_verification_keys_on_signer_not_signature() {
+        use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
         let anchor = coord.latest_block().block_hash();
         let epoch = coord.current_epoch().next();
         let signer = ValidatorId::new(1); // a peer on the active pool
+        let skip_hash = coord.ratify.skip_block_hash();
 
-        let req = |sig_byte: u8| {
-            Arc::new(Verifiable::from(SkipRequest::new(
+        let vote = |sig_byte: u8| {
+            Arc::new(Verifiable::from(RatifyVote::new(
                 anchor,
                 epoch,
+                RatifyRound::INITIAL,
+                RatifyPhase::Prevote,
+                skip_hash,
                 signer,
                 Bls12381G2Signature([sig_byte; 96]),
             )))
         };
 
-        // First request dispatches one verification.
-        let first = coord.on_unverified_skip_request_received(req(0));
+        // First vote dispatches one verification.
+        let first = coord.on_unverified_ratify_vote_received(vote(0));
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifySkipRequest { .. }));
+        assert!(matches!(first[0], Action::VerifyRatifyVote { .. }));
         assert_eq!(coord.verifications_in_flight(), 1);
 
-        // Same triple, different signature — deduped before dispatch.
-        let second = coord.on_unverified_skip_request_received(req(1));
+        // Same tuple, different signature — deduped before dispatch.
+        let second = coord.on_unverified_ratify_vote_received(vote(1));
         assert!(second.is_empty());
         assert_eq!(coord.verifications_in_flight(), 1);
     }
 
-    /// A skip request that fails BLS verification releases its slot, so
-    /// a later request for the same `(anchor, epoch, signer)` triple
-    /// re-dispatches. Without clearing on the failure arm, a forged
-    /// request could pin a signer's slot in-flight and block their
-    /// honest request from ever being verified.
+    /// A ratify vote that fails BLS verification releases its slot, so
+    /// a later vote for the same tuple re-dispatches. Without clearing
+    /// on the failure arm, a forged vote could pin a signer's slot
+    /// in-flight and block their honest vote from ever being verified.
     #[test]
-    fn failed_skip_request_verification_releases_slot() {
-        use hyperscale_types::{Bls12381G2Signature, SkipRequest};
+    fn failed_ratify_vote_verification_releases_slot() {
+        use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
         let anchor = coord.latest_block().block_hash();
         let epoch = coord.current_epoch().next();
         let signer = ValidatorId::new(1);
+        let skip_hash = coord.ratify.skip_block_hash();
 
-        let forged = Arc::new(Verifiable::from(SkipRequest::new(
+        let forged = Arc::new(Verifiable::from(RatifyVote::new(
             anchor,
             epoch,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
             signer,
             Bls12381G2Signature([0u8; 96]), // garbage sig — fails BLS verify
         )));
-        let dispatched = coord.on_unverified_skip_request_received(forged);
+        let dispatched = coord.on_unverified_ratify_vote_received(forged);
         assert_eq!(coord.verifications_in_flight(), 1);
 
         // Drive the (failing) verification to completion — the slot clears.
         let _ = complete_verifications(&mut coord, dispatched);
         assert_eq!(coord.verifications_in_flight(), 0);
 
-        // A fresh request for the same triple re-dispatches rather than
+        // A fresh vote for the same tuple re-dispatches rather than
         // being deduped against a pinned slot.
-        let retry = Arc::new(Verifiable::from(SkipRequest::new(
+        let retry = Arc::new(Verifiable::from(RatifyVote::new(
             anchor,
             epoch,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
             signer,
             Bls12381G2Signature([2u8; 96]),
         )));
-        let redispatched = coord.on_unverified_skip_request_received(retry);
+        let redispatched = coord.on_unverified_ratify_vote_received(retry);
         assert_eq!(redispatched.len(), 1);
-        assert!(matches!(redispatched[0], Action::VerifySkipRequest { .. }));
+        assert!(matches!(redispatched[0], Action::VerifyRatifyVote { .. }));
     }
 
     #[test]
@@ -3395,10 +3541,33 @@ mod tests {
         }
     }
 
+    /// Pool-signed commit certificate for `block`: a precommit quorum
+    /// over its hash at round 1, signed by every active-pool member's
+    /// fixture key.
+    fn ratify_cert_for_block(coord: &BeaconCoordinator, block: &BeaconBlock) -> RatifyCert {
+        let pool = coord.state.derive_active_pool();
+        let net = NetworkDefinition::simulator();
+        let votes: Vec<RatifyVote> = pool
+            .iter()
+            .map(|(id, _)| {
+                sign_ratify_vote(
+                    &keypair(id.inner()),
+                    *id,
+                    &net,
+                    block.prev_block_hash(),
+                    block.epoch(),
+                    RatifyRound::INITIAL,
+                    RatifyPhase::Precommit,
+                    block.block_hash(),
+                )
+            })
+            .collect();
+        build_ratify_cert(&votes, &pool).expect("full pool meets quorum")
+    }
+
     /// Build a peer `BeaconBlock` at `epoch` that verifies under
-    /// `coord`'s state. `signer_positions` selects which committee
-    /// members contribute to the cert (default `n - f` for honest
-    /// quorum).
+    /// `coord`'s state: an SPC proposal cert from the committee quorum
+    /// plus a pool-signed ratify cert over the block's hash.
     fn valid_block_at(
         coord: &BeaconCoordinator,
         epoch: Epoch,
@@ -3425,9 +3594,13 @@ mod tests {
             &PcVector::empty(),
         );
         let block = BeaconBlock::new(epoch, prev_hash, Vec::new());
+        let ratify = ratify_cert_for_block(coord, &block);
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
-            BeaconCert::Normal(Box::new(cert)),
+            BeaconCert::Normal {
+                spc: Box::new(cert),
+                ratify,
+            },
         )))
     }
 
@@ -3470,9 +3643,13 @@ mod tests {
             &PcVector::new(elements),
         );
         let block = BeaconBlock::new(epoch, prev_hash, vec![(committee[0].0, proposal)]);
+        let ratify = ratify_cert_for_block(coord, &block);
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
-            BeaconCert::Normal(Box::new(cert)),
+            BeaconCert::Normal {
+                spc: Box::new(cert),
+                ratify,
+            },
         )))
     }
 
@@ -3515,30 +3692,51 @@ mod tests {
         assert!(actions.is_empty());
     }
 
-    /// Drive `coord` through its own skip path for the pending epoch:
-    /// deadline passed, one verified request per pool member, quorum
-    /// assembly, adoption. Returns the broadcast skip block.
+    /// Sign one pool member's ratify vote for the pending epoch at
+    /// `coord`'s tip.
+    fn signed_ratify_vote(
+        coord: &BeaconCoordinator,
+        signer: u64,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        block_hash: BeaconBlockHash,
+    ) -> Arc<Verified<RatifyVote>> {
+        Arc::new(Verified::<RatifyVote>::sign_local(
+            &keypair(signer),
+            ValidatorId::new(signer),
+            &NetworkDefinition::simulator(),
+            coord.latest_block.block_hash(),
+            coord.state.current_epoch.next(),
+            round,
+            phase,
+            block_hash,
+        ))
+    }
+
+    /// Drive `coord` through the skip outcome for the pending epoch:
+    /// deadline passed, one verified precommit for the skip hash per
+    /// pool member, cert assembly, adoption. Returns the broadcast
+    /// skip block.
     fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Arc<Verified<CertifiedBeaconBlock>> {
         pass_skip_deadline(coord);
-        let anchor = coord.latest_block.block_hash();
-        let epoch_to_skip = coord.state.current_epoch.next();
+        let skip_hash = coord.ratify.skip_block_hash();
         let mut adopted = None;
         for i in 0..4u64 {
-            let req = Verified::<SkipRequest>::sign_local(
-                &keypair(i),
-                ValidatorId::new(i),
-                &NetworkDefinition::simulator(),
-                anchor,
-                epoch_to_skip,
+            let vote = signed_ratify_vote(
+                coord,
+                i,
+                RatifyRound::INITIAL,
+                RatifyPhase::Precommit,
+                skip_hash,
             );
-            let actions = coord.on_verified_skip_request_received(Arc::new(req));
+            let actions = coord.on_verified_ratify_vote_received(vote);
             for action in actions {
                 if let Action::BroadcastBeaconBlock { block } = action {
                     adopted = Some(block);
                 }
             }
         }
-        adopted.expect("pool quorum assembles and adopts the skip block")
+        adopted.expect("pool precommit quorum assembles and adopts the skip block")
     }
 
     /// Both commit paths assemble for one epoch from honest inputs
@@ -3610,26 +3808,30 @@ mod tests {
         let _ = complete_verifications(&mut coord, dispatched);
     }
 
-    /// Committing an epoch *normally* forgets the prior tip's
-    /// skip-request buckets, not just the skip-commit path — otherwise a
-    /// bucket leaks for every epoch that saw a skip request before
-    /// committing normally.
+    /// Committing an epoch resets ratification for the next one:
+    /// pooled votes at the prior tip don't survive into the new
+    /// instance — otherwise every epoch that saw votes before
+    /// committing would leak them into the next epoch's counting.
     #[test]
-    fn normal_commit_forgets_prior_tip_skip_buckets() {
-        use hyperscale_types::SkipRequest;
+    fn commit_resets_ratification_for_the_new_epoch() {
         let mut coord = fresh_coord();
         let genesis_tip = coord.latest_block.block_hash();
-        // A skip request observed at the genesis tip for the in-flight
-        // epoch.
-        let req = Verified::<SkipRequest>::sign_local(
-            &keypair(0),
-            ValidatorId::new(0),
-            &NetworkDefinition::simulator(),
-            genesis_tip,
-            Epoch::new(1),
+        // A vote pooled at the genesis tip for the in-flight epoch.
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = signed_ratify_vote(
+            &coord,
+            0,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
         );
-        assert!(coord.skip_tracker.observe(req));
-        assert_eq!(coord.skip_tracker.bucket_count(), 1);
+        let _ = coord.on_verified_ratify_vote_received(vote);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            1
+        );
 
         // Commit epoch 1 normally (a valid peer block chaining off genesis).
         let block = valid_block_at(&coord, Epoch::new(1), genesis_tip);
@@ -3637,7 +3839,13 @@ mod tests {
         let _ = complete_verifications(&mut coord, dispatched);
 
         assert_eq!(coord.current_epoch(), Epoch::new(1));
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0,
+            "the new epoch's tracker starts empty",
+        );
     }
 
     #[test]
@@ -3942,11 +4150,12 @@ mod tests {
         );
     }
 
-    /// `on_spc_output_high` commits and broadcasts directly: the SPC cert
-    /// authenticates the block, so the decision yields `CommitBeaconBlock`
-    /// then `BroadcastBeaconBlock` with no header-signature round in between.
+    /// `on_spc_output_high` broadcasts a candidate and prevotes its
+    /// hash: the SPC cert authenticates the content, but nothing
+    /// commits until the pool's ratify cert assembles — no
+    /// `CommitBeaconBlock`, no epoch advance.
     #[test]
-    fn output_high_emits_commit_and_broadcast_directly() {
+    fn output_high_broadcasts_candidate_and_prevotes() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         let in_flight = Epoch::GENESIS.next();
@@ -3990,243 +4199,277 @@ mod tests {
             &recipients,
         );
 
-        // The SPC cert authenticates the block, so OutputHigh produces
-        // Commit + TopologyChanged + Broadcast directly. (The next-epoch
-        // BuildAndBroadcastBeaconProposal also tails on since the genesis
-        // committee doesn't rotate.)
+        // The SPC cert authenticates the content only: OutputHigh
+        // produces the candidate broadcast plus the local prevote for
+        // its hash — commitment waits for the pool.
         let kinds: Vec<&str> = actions.iter().map(Action::type_name).collect();
         assert!(
-            kinds.starts_with(&["CommitBeaconBlock", "TopologyChanged"]),
-            "expected commit-then-topology prefix, got {kinds:?}",
+            !kinds.contains(&"CommitBeaconBlock"),
+            "nothing commits before the ratify cert, got {kinds:?}",
         );
         assert!(
-            kinds.contains(&"BroadcastBeaconBlock"),
-            "expected BroadcastBeaconBlock in {kinds:?}",
+            kinds.contains(&"BroadcastBeaconCandidate"),
+            "expected BroadcastBeaconCandidate in {kinds:?}",
         );
+        let candidate_hash = coord
+            .ratify
+            .candidate()
+            .expect("the assembled candidate's hash feeds the tracker");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SignAndBroadcastRatifyVote { phase: RatifyPhase::Prevote, block_hash, .. }
+                    if *block_hash == candidate_hash
+            )),
+            "expected a prevote for the candidate's hash in {actions:?}",
+        );
+        assert_eq!(coord.state.current_epoch, Epoch::GENESIS, "no adoption");
+    }
+
+    /// Ratifying the candidate commits it: once a precommit quorum for
+    /// the candidate's hash pools, the coordinator pairs the held
+    /// candidate with the cert, adopts, and broadcasts the certified
+    /// block.
+    #[test]
+    fn precommit_quorum_over_candidate_commits_the_normal_block() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let in_flight = Epoch::GENESIS.next();
+        let committee = coord.state.committee.clone();
+        let n = committee.len();
+        let mut elements = Vec::with_capacity(n);
+        for id in &committee {
+            let p = sample_proposal(u8::try_from(id.inner()).unwrap_or(0));
+            elements.push(p.pc_element_hash(in_flight));
+            coord.proposal_pool.admit(*id, in_flight, p);
+        }
+        let output = PcVector::new(elements);
+        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
+        let cert_committee: Vec<_> = coord
+            .state
+            .committee
+            .iter()
+            .copied()
+            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .collect();
+        let f = n.saturating_sub(1) / 3;
+        let q = n - f;
+        let signer_positions: Vec<usize> = (0..q).collect();
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            in_flight,
+            &keys,
+            &cert_committee,
+            &signer_positions,
+            &PcVector::empty(),
+        );
+        let recipients = coord.spc_recipients();
+        let _ = coord.on_spc_output_high(
+            in_flight,
+            &output,
+            Verified::new_unchecked_for_test(cert),
+            &recipients,
+        );
+        let candidate_hash = coord.ratify.candidate().expect("candidate held");
+
+        let mut emitted: Vec<Action> = Vec::new();
+        for i in 0..u64::try_from(n).unwrap() {
+            let vote = signed_ratify_vote(
+                &coord,
+                i,
+                RatifyRound::INITIAL,
+                RatifyPhase::Precommit,
+                candidate_hash,
+            );
+            emitted.extend(coord.on_verified_ratify_vote_received(vote));
+        }
+
         assert_eq!(coord.state.current_epoch, in_flight);
         assert_eq!(coord.latest_block.epoch(), in_flight);
+        assert!(matches!(
+            coord.latest_block.cert(),
+            BeaconCert::Normal { .. }
+        ));
+        let kinds: Vec<&str> = emitted.iter().map(Action::type_name).collect();
+        assert!(
+            kinds.contains(&"CommitBeaconBlock") && kinds.contains(&"BroadcastBeaconBlock"),
+            "expected commit + broadcast after ratification, got {kinds:?}",
+        );
     }
 
-    /// Build a real skip request signed by validator `seed`'s key,
-    /// wrapped for the `on_unverified_skip_request_received` receive
-    /// shape.
-    fn signed_skip_request(
-        seed: u64,
-        validator: ValidatorId,
-        anchor_hash: BeaconBlockHash,
-        epoch_to_skip: Epoch,
-    ) -> Arc<Verifiable<SkipRequest>> {
-        use hyperscale_types::sign_skip_request;
-        let sk = keypair(seed);
-        let net = NetworkDefinition::simulator();
-        let raw = sign_skip_request(&sk, validator, &net, anchor_hash, epoch_to_skip);
-        Arc::new(Verifiable::from(raw))
+    /// Wrap a signed ratify vote for the wire receive shape.
+    fn wire_ratify_vote(
+        coord: &BeaconCoordinator,
+        signer: u64,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        block_hash: BeaconBlockHash,
+    ) -> Arc<Verifiable<RatifyVote>> {
+        let vote = signed_ratify_vote(coord, signer, round, phase, block_hash);
+        Arc::new(Verifiable::from(Arc::unwrap_or_clone(vote).into_inner()))
     }
 
-    /// A skip request for an epoch whose deadline hasn't passed on the
-    /// local clock is dropped on both receive paths — the wire intake
-    /// (before spending a BLS pairing) and the verified admission (the
-    /// loopback's entry). Otherwise a peer's stale timer, or a Byzantine
-    /// pool member, marches the chain past wall-clock one premature skip
-    /// at a time.
+    /// Ratify votes carry no deadline gate: a candidate prevote before
+    /// the epoch's skip deadline is the happy path, so the wire intake
+    /// dispatches its verification straight away. The clock discipline
+    /// lives in the local validator's own votes, not in what it pools.
     #[test]
-    fn early_skip_request_dropped_on_both_receive_paths() {
-        use hyperscale_types::SkipRequest;
+    fn pre_deadline_prevotes_dispatch_verification() {
         let mut coord = fresh_coord();
-        let anchor = coord.latest_block.block_hash();
-        let epoch_to_skip = coord.state.current_epoch.next();
-
+        let skip_hash = coord.ratify.skip_block_hash();
         // Clock at genesis: the deadline (boundary + SKIP_TIMEOUT) is
         // far in the future.
-        let wire = signed_skip_request(1, ValidatorId::new(1), anchor, epoch_to_skip);
-        assert!(
-            coord.on_unverified_skip_request_received(wire).is_empty(),
-            "early wire request must drop before the BLS dispatch",
-        );
-
-        let verified = Verified::<SkipRequest>::sign_local(
-            &keypair(0),
-            ValidatorId::new(0),
-            &NetworkDefinition::simulator(),
-            anchor,
-            epoch_to_skip,
+        let wire = wire_ratify_vote(
+            &coord,
+            1,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
         );
         assert!(
             coord
-                .on_verified_skip_request_received(Arc::new(verified))
-                .is_empty(),
-            "early loopback request must drop at admission",
+                .on_unverified_ratify_vote_received(wire)
+                .iter()
+                .any(|a| matches!(a, Action::VerifyRatifyVote { .. })),
+            "a pre-deadline vote must still be delegated for verification",
         );
-        assert_eq!(
-            coord.skip_tracker.signer_count(anchor, epoch_to_skip),
+    }
+
+    #[test]
+    fn on_ratify_vote_drops_at_wrong_anchor() {
+        let mut coord = fresh_coord();
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = signed_ratify_vote(
+            &coord,
             0,
-            "no early request may reach the tracker",
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
         );
-
-        // Past the deadline the same wire request dispatches its verify.
-        pass_skip_deadline(&mut coord);
-        let wire = signed_skip_request(1, ValidatorId::new(1), anchor, epoch_to_skip);
-        assert!(
-            coord
-                .on_unverified_skip_request_received(wire)
-                .iter()
-                .any(|a| matches!(a, Action::VerifySkipRequest { .. })),
-            "a due request must be delegated for verification",
-        );
-    }
-
-    /// A round-3 sign intent lifted for the pending epoch.
-    fn vote3_effect() -> SpcEffect {
-        let qc2 = Verified::<PcQc2>::new_unchecked_for_test(PcQc2::new(
-            PcVector::empty(),
-            SignerBitfield::new(4),
-            zero_bls_signature(),
-            PcXpProof::Full,
-        ));
-        SpcEffect::SignAndBroadcastPcVote3 {
-            view: SpcView::new(1),
-            qc2: Box::new(qc2),
-        }
-    }
-
-    /// An honest signature backs at most one of the epoch's two commit
-    /// paths: once a vote-3 sign intent lifts, the skip trigger emits
-    /// no request for the epoch.
-    #[test]
-    fn vote3_sign_intent_blocks_local_skip_request() {
-        let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
-
-        let lifted = coord.lift_spc_effects(Epoch::new(1), &[], vec![vote3_effect()]);
-        assert!(
-            lifted
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastPcVote3 { .. })),
-        );
-
-        let actions = coord.on_beacon_skip_timer();
-        assert!(actions.is_empty(), "a vote-3 signer must not skip-sign");
-    }
-
-    /// The other direction: once the local skip request is out, vote-3
-    /// sign intents drop at the lift. Vote-1 intents still lift — they
-    /// cannot complete a QC3.
-    #[test]
-    fn local_skip_request_mutes_vote3_sign_intents() {
-        let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
-
-        let actions = coord.on_beacon_skip_timer();
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastSkipRequest { .. })),
-        );
-
-        let lifted = coord.lift_spc_effects(Epoch::new(1), &[], vec![vote3_effect()]);
-        assert!(
-            lifted.is_empty(),
-            "post-skip vote-3 intents drop at the lift"
-        );
-
-        let lifted = coord.lift_spc_effects(
-            Epoch::new(1),
-            &[],
-            vec![SpcEffect::SignAndBroadcastPcVote1 {
-                view: SpcView::new(1),
-                v_in: PcVector::empty(),
-            }],
-        );
-        assert!(
-            lifted
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. })),
-        );
-    }
-
-    #[test]
-    fn on_skip_request_drops_at_wrong_anchor() {
-        let mut coord = fresh_coord();
-        // Wrong anchor: zero hash isn't the local tip.
-        let req = signed_skip_request(
-            0,
-            ValidatorId::new(0),
+        // Re-sign against a foreign anchor: zero hash isn't the tip.
+        let foreign = Arc::new(Verifiable::from(RatifyVote::new(
             BeaconBlockHash::ZERO,
-            coord.state.current_epoch.next(),
-        );
-        let actions = coord.on_unverified_skip_request_received(req);
+            vote.epoch(),
+            vote.round(),
+            vote.phase(),
+            vote.block_hash(),
+            vote.signer(),
+            vote.sig(),
+        )));
+        let actions = coord.on_unverified_ratify_vote_received(foreign);
         assert!(actions.is_empty());
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0
+        );
     }
 
     #[test]
-    fn on_skip_request_drops_at_wrong_epoch() {
+    fn on_ratify_vote_drops_at_wrong_epoch() {
         let mut coord = fresh_coord();
-        // Right anchor, wrong epoch_to_skip (we expect current.next()).
-        let req = signed_skip_request(
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = signed_ratify_vote(
+            &coord,
             0,
-            ValidatorId::new(0),
-            coord.latest_block.block_hash(),
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
+        );
+        let wrong_epoch = Arc::new(Verifiable::from(RatifyVote::new(
+            vote.anchor_hash(),
             Epoch::new(99),
-        );
-        let actions = coord.on_unverified_skip_request_received(req);
+            vote.round(),
+            vote.phase(),
+            vote.block_hash(),
+            vote.signer(),
+            vote.sig(),
+        )));
+        let actions = coord.on_unverified_ratify_vote_received(wrong_epoch);
         assert!(actions.is_empty());
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0
+        );
     }
 
     #[test]
-    fn on_skip_request_drops_non_pool_signer() {
+    fn on_ratify_vote_drops_non_pool_signer() {
         let mut coord = fresh_coord();
-        let req = signed_skip_request(
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = wire_ratify_vote(
+            &coord,
             99,
-            ValidatorId::new(99),
-            coord.latest_block.block_hash(),
-            coord.state.current_epoch.next(),
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
         );
-        let actions = coord.on_unverified_skip_request_received(req);
+        let actions = coord.on_unverified_ratify_vote_received(vote);
         assert!(actions.is_empty());
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0
+        );
     }
 
     #[test]
-    fn on_skip_request_drops_invalid_sig_via_async_result() {
+    fn on_ratify_vote_drops_invalid_sig_via_async_result() {
         use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
+        let skip_hash = coord.ratify.skip_block_hash();
         // Signer 0 is in the pool, but sig is all-zeros — verification
         // returns false on the result path.
-        let req = Arc::new(Verifiable::from(SkipRequest::new(
+        let vote = Arc::new(Verifiable::from(RatifyVote::new(
             coord.latest_block.block_hash(),
             coord.state.current_epoch.next(),
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
             ValidatorId::new(0),
             Bls12381G2Signature([0u8; 96]),
         )));
-        let dispatched = coord.on_unverified_skip_request_received(req);
+        let dispatched = coord.on_unverified_ratify_vote_received(vote);
         // Synchronous validation passes (signer in pool, anchor + epoch
         // match) — so a verify action is dispatched.
-        let [Action::VerifySkipRequest { .. }] = dispatched.as_slice() else {
-            panic!("expected single VerifySkipRequest, got {dispatched:?}");
+        let [Action::VerifyRatifyVote { .. }] = dispatched.as_slice() else {
+            panic!("expected single VerifyRatifyVote, got {dispatched:?}");
         };
         let actions = complete_verifications(&mut coord, dispatched);
         assert!(actions.is_empty(), "invalid sig should drop on result");
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0
+        );
     }
 
     #[test]
-    fn on_skip_request_admits_valid_request_below_quorum() {
+    fn on_ratify_vote_admits_valid_vote_below_quorum() {
         let mut coord = fresh_coord();
-        pass_skip_deadline(&mut coord);
         coord.bootstrap_spc_for_next_epoch();
-        let anchor = coord.latest_block.block_hash();
-        let epoch_to_skip = coord.state.current_epoch.next();
-        let req = signed_skip_request(0, ValidatorId::new(0), anchor, epoch_to_skip);
-        let dispatched = coord.on_unverified_skip_request_received(req);
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = wire_ratify_vote(
+            &coord,
+            0,
+            RatifyRound::INITIAL,
+            RatifyPhase::Precommit,
+            skip_hash,
+        );
+        let dispatched = coord.on_unverified_ratify_vote_received(vote);
         let actions = complete_verifications(&mut coord, dispatched);
         assert!(actions.is_empty());
         assert_eq!(
-            coord.skip_tracker.signer_count(anchor, epoch_to_skip),
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Precommit),
             1,
-            "request must land in the tracker after verification",
+            "vote must land in the tracker after verification",
         );
         // n=4 → quorum is ⌈8/3⌉+1 = 4. One sig is below.
         assert!(
@@ -4235,36 +4478,48 @@ mod tests {
         );
     }
 
-    /// Reaching skip-quorum at the local tip builds + adopts the skip
-    /// block, broadcasts it, advances the epoch counter, and clears
-    /// the SPC instance for the abandoned epoch (the next epoch's SPC
-    /// bootstraps on adoption since the local node remains on the
-    /// committee).
+    /// A precommit quorum for the skip hash at the local tip builds +
+    /// adopts the skip block, broadcasts it, advances the epoch
+    /// counter, and clears the SPC instance for the abandoned epoch
+    /// (the next epoch's SPC bootstraps on adoption since the local
+    /// node remains on the committee).
     #[test]
-    fn on_skip_request_assembles_cert_and_adopts_skip_block_on_quorum() {
+    fn precommit_quorum_assembles_cert_and_adopts_skip_block() {
         let mut coord = fresh_coord();
         pass_skip_deadline(&mut coord);
         coord.bootstrap_spc_for_next_epoch();
         let anchor = coord.latest_block.block_hash();
         let epoch_to_skip = coord.state.current_epoch.next();
+        let skip_hash = coord.ratify.skip_block_hash();
         let n = coord.state.committee.len();
 
+        let votes: Vec<_> = (0..u64::try_from(n).unwrap())
+            .map(|i| {
+                wire_ratify_vote(
+                    &coord,
+                    i,
+                    RatifyRound::INITIAL,
+                    RatifyPhase::Precommit,
+                    skip_hash,
+                )
+            })
+            .collect();
         let mut emitted: Vec<Action> = Vec::new();
-        for i in 0..u64::try_from(n).unwrap() {
-            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
-            let dispatched = coord.on_unverified_skip_request_received(req);
+        for vote in votes {
+            let dispatched = coord.on_unverified_ratify_vote_received(vote);
             emitted.extend(complete_verifications(&mut coord, dispatched));
         }
 
         // Adoption happened: epoch advanced past the skipped one.
         assert_eq!(coord.state.current_epoch, epoch_to_skip);
-        // Tip now points at the Skip block.
-        assert!(matches!(coord.latest_block.cert(), BeaconCert::Skip(_)));
-        // Skip cert anchored at the previous tip's hash.
-        if let BeaconCert::Skip(cert) = coord.latest_block.cert() {
-            assert_eq!(cert.anchor_hash(), anchor);
-            assert_eq!(cert.epoch_to_skip(), epoch_to_skip);
-        }
+        // Tip now points at the Skip block, committed by a ratify cert
+        // naming the previous tip as anchor.
+        let BeaconCert::Skip(cert) = coord.latest_block.cert() else {
+            panic!("expected a Skip cert at the tip");
+        };
+        assert_eq!(cert.anchor_hash(), anchor);
+        assert_eq!(cert.epoch(), epoch_to_skip);
+        assert_eq!(cert.block_hash(), skip_hash);
         // Broadcast emitted for peers.
         assert!(
             emitted
@@ -4279,69 +4534,80 @@ mod tests {
                 .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
             "expected CommitBeaconBlock in {emitted:?}",
         );
-        // Tracker bucket cleared after adoption.
-        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+        // Ratification restarted for the new pending epoch.
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Precommit),
+            0
+        );
     }
 
-    /// Two assemblies at the same quorum — e.g. a duplicate
-    /// re-observation that re-hits quorum — must be idempotent: the
-    /// adoption path's `apply_epoch` regression check would panic if
-    /// the coordinator tried to re-adopt the skip block.
+    /// A late duplicate vote against the pre-adoption anchor is
+    /// dropped by the anchor-mismatch check — the adoption path's
+    /// `apply_epoch` regression check would panic if the coordinator
+    /// tried to re-adopt.
     #[test]
-    fn on_skip_request_duplicate_after_adoption_is_noop() {
-        let mut coord = fresh_coord();
-        coord.bootstrap_spc_for_next_epoch();
-        let anchor = coord.latest_block.block_hash();
-        let epoch_to_skip = coord.state.current_epoch.next();
-        let n = coord.state.committee.len();
-
-        for i in 0..u64::try_from(n).unwrap() {
-            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
-            let dispatched = coord.on_unverified_skip_request_received(req);
-            let _ = complete_verifications(&mut coord, dispatched);
-        }
-        // The tip's anchor has moved on. A late duplicate against the
-        // old anchor is dropped by the anchor-mismatch check.
-        let stale = signed_skip_request(0, ValidatorId::new(0), anchor, epoch_to_skip);
-        let actions = coord.on_unverified_skip_request_received(stale);
-        assert!(actions.is_empty(), "stale anchor must be a no-op");
-    }
-
-    /// Once the skip-quorum is reached at the local tip, the SPC
-    /// dispatch gate drops further SPC events for the abandoned
-    /// epoch.
-    #[test]
-    fn dispatch_spc_event_gated_by_skip_quorum() {
+    fn duplicate_vote_after_adoption_is_noop() {
         let mut coord = fresh_coord();
         pass_skip_deadline(&mut coord);
         coord.bootstrap_spc_for_next_epoch();
-        let anchor = coord.latest_block.block_hash();
-        let epoch_to_skip = coord.state.current_epoch.next();
+        let skip_hash = coord.ratify.skip_block_hash();
         let n = coord.state.committee.len();
-        // Observe quorum-1 requests so the tracker holds quorum-many
-        // entries but we observe them without triggering the adoption
-        // path. To do that, observe one fewer than required, then
-        // separately bump the tracker via `observe` to cross quorum
-        // without re-driving adoption — this is what the gate is for.
-        for i in 0..u64::try_from(n - 1).unwrap() {
-            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
-            let dispatched = coord.on_unverified_skip_request_received(req);
+
+        let stale = wire_ratify_vote(
+            &coord,
+            0,
+            RatifyRound::INITIAL,
+            RatifyPhase::Precommit,
+            skip_hash,
+        );
+        for i in 0..u64::try_from(n).unwrap() {
+            let vote = wire_ratify_vote(
+                &coord,
+                i,
+                RatifyRound::INITIAL,
+                RatifyPhase::Precommit,
+                skip_hash,
+            );
+            let dispatched = coord.on_unverified_ratify_vote_received(vote);
             let _ = complete_verifications(&mut coord, dispatched);
         }
-        // Push the last request directly into the tracker, bypassing
-        // the adoption-on-quorum branch — simulates the gate firing
-        // between observation and the next dispatch.
-        let last_idx = u64::try_from(n - 1).unwrap();
-        let last_sk = keypair(last_idx);
-        let last_req = Verified::<SkipRequest>::sign_local(
-            &last_sk,
-            ValidatorId::new(last_idx),
-            &NetworkDefinition::simulator(),
-            anchor,
-            epoch_to_skip,
+        // The tip's anchor has moved on.
+        let actions = coord.on_unverified_ratify_vote_received(stale);
+        assert!(actions.is_empty(), "stale anchor must be a no-op");
+    }
+
+    /// A commit certificate for a candidate this replica never held
+    /// settles the epoch without adopting (the assembler's broadcast
+    /// delivers the block); until it arrives, the SPC dispatch gate
+    /// drops further SPC events for the already-decided epoch.
+    #[test]
+    fn dispatch_spc_event_gated_once_epoch_settles() {
+        use hyperscale_types::Hash;
+        let mut coord = fresh_coord();
+        pass_skip_deadline(&mut coord);
+        coord.bootstrap_spc_for_next_epoch();
+        let n = coord.state.committee.len();
+        // A candidate hash the local replica never verified.
+        let unheld = BeaconBlockHash::from_raw(Hash::from_bytes(b"unheld-candidate"));
+
+        for i in 0..u64::try_from(n).unwrap() {
+            let vote = signed_ratify_vote(
+                &coord,
+                i,
+                RatifyRound::INITIAL,
+                RatifyPhase::Precommit,
+                unheld,
+            );
+            let _ = coord.on_verified_ratify_vote_received(vote);
+        }
+        assert!(coord.ratify.is_completed(), "the epoch is decided");
+        assert_eq!(
+            coord.state.current_epoch,
+            Epoch::GENESIS,
+            "nothing adopted without the block",
         );
-        coord.skip_tracker.observe(last_req);
-        assert!(coord.skip_quorum_at_tip());
 
         // SPC dispatch is now gated — the view timer drops without
         // dispatching into the FSM (no broadcast actions).
@@ -4791,12 +5057,26 @@ mod tests {
         );
 
         let recipients = coord.spc_recipients();
-        let actions = coord.on_spc_output_high(
+        let _ = coord.on_spc_output_high(
             in_flight,
             &output,
             Verified::new_unchecked_for_test(cert),
             &recipients,
         );
+        // Ratify the candidate: adoption (and the topology refresh)
+        // happens at the pool's commit certificate.
+        let candidate_hash = coord.ratify.candidate().expect("candidate held");
+        let mut actions: Vec<Action> = Vec::new();
+        for i in 0..u64::try_from(n).unwrap() {
+            let vote = signed_ratify_vote(
+                &coord,
+                i,
+                RatifyRound::INITIAL,
+                RatifyPhase::Precommit,
+                candidate_hash,
+            );
+            actions.extend(coord.on_verified_ratify_vote_received(vote));
+        }
 
         let topology_changed: Vec<&Action> = actions
             .iter()

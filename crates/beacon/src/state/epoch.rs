@@ -56,19 +56,31 @@ pub enum ApplyEpochInput<'a> {
 
 /// Pick the [`ApplyEpochInput`] for a certified block.
 ///
+/// The discriminator is the block's *content*, never its cert variant:
+/// a proposal-less block folds as a skip whichever certificate commits
+/// it. A proposal-less Normal block is byte-identical to the epoch's
+/// skip block, and the fold is a pure function of the committed block
+/// sequence — if the cert variant picked the pipeline, an assembler
+/// pairing the same commit certificate with the other variant would
+/// fork byte-identical chains into different states.
+///
 /// # Panics
 ///
 /// Panics on `BeaconCert::Genesis` — callers must filter genesis blocks
 /// before adoption.
 #[must_use]
 pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
-    match block.cert() {
-        BeaconCert::Normal(_) => ApplyEpochInput::Normal {
+    assert!(
+        !matches!(block.cert(), BeaconCert::Genesis(_)),
+        "apply_input_for called on Genesis block",
+    );
+    if block.block().committed_proposals().is_empty() {
+        ApplyEpochInput::Skip
+    } else {
+        ApplyEpochInput::Normal {
             committed: block.block().committed_proposals(),
             shard_contributions: block.block().shard_contributions(),
-        },
-        BeaconCert::Skip(_) => ApplyEpochInput::Skip,
-        BeaconCert::Genesis(_) => panic!("apply_input_for called on Genesis block"),
+        }
     }
 }
 

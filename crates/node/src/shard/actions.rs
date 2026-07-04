@@ -92,11 +92,9 @@ where
             | Action::BroadcastSpcNewCommit { .. }
             | Action::BuildAndBroadcastBeaconProposal { .. }
             | Action::BroadcastBeaconBlock { .. }
-            | Action::BroadcastSkipRequest { .. }
             | Action::SignAndBroadcastRatifyVote { .. }
             | Action::BroadcastBeaconCandidate { .. }
             | Action::VerifyBeaconBlock { .. }
-            | Action::VerifySkipRequest { .. }
             | Action::VerifyRatifyVote { .. }
             | Action::VerifyBeaconCandidate { .. }
             | Action::VerifyPcVote1 { .. }

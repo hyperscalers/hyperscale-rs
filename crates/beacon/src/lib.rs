@@ -3,7 +3,7 @@
 //! Hosts the [`BeaconCoordinator`] state machine and its sub-machines:
 //! PC / SPC consensus (one SPC instance per epoch), `BeaconState`
 //! application via `apply_epoch`, pending-block tracking, verification
-//! dispatch, witness fetching, skip-quorum assembly, and equivocation
+//! dispatch, witness fetching, epoch ratification, and equivocation
 //! observation.
 //!
 //! `BeaconCoordinator` is also the topology source — after each
@@ -23,7 +23,6 @@ pub mod ratify;
 pub mod rules;
 pub mod sampling;
 pub mod shard_source;
-pub mod skip_tracker;
 pub mod spc;
 pub mod spc_driver;
 pub mod state;

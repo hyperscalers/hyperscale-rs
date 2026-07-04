@@ -85,7 +85,7 @@ fn skip_path_advances_past_blocked_epoch() {
     // committee can't reach the n-f vote threshold and the first
     // epoch's SPC stalls. The active shard members off the beacon
     // committee (validators 4..8) still have working network — their
-    // `BeaconSkipTrigger` timer fires at `EPOCH_DURATION + SKIP_TIMEOUT`
+    // `BeaconRatifyTrigger` timer fires at `EPOCH_DURATION + SKIP_TIMEOUT`
     // and they sign a `SkipRequest` for epoch 1 at the genesis tip.
     let _rules = [
         runner

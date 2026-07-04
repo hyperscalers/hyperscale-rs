@@ -22,18 +22,19 @@ use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
     BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
     BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-    BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
+    BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CandidateBeaconBlock,
+    CandidateVerifyContext, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
     Hash, InFlightCount, LeafIndex, LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR,
     NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round,
-    SKIP_TIMEOUT, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
-    SkipEpochCert, SkipRequest, SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
+    PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
+    RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote, Round, SKIP_TIMEOUT, ShardId,
+    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcEmptyViewMsg,
+    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
+    TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
     compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_empty_view_msg,
-    sign_vote1, sign_vote2, sign_vote3, spc_context, verify_skip_cert, verify_vote1, verify_vote2,
-    verify_vote3, vrf_sign, zero_bls_signature,
+    sign_vote1, sign_vote2, sign_vote3, spc_context, verify_ratify_cert, verify_vote1,
+    verify_vote2, verify_vote3, vrf_sign, zero_bls_signature,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -103,8 +104,11 @@ enum SimEvent {
     BeaconBlock {
         block: Arc<Verified<CertifiedBeaconBlock>>,
     },
-    SkipRequest {
-        request: Arc<Verifiable<SkipRequest>>,
+    BeaconCandidate {
+        candidate: Arc<Verified<CandidateBeaconBlock>>,
+    },
+    RatifyVote {
+        vote: Arc<Verifiable<RatifyVote>>,
     },
     BeaconProposalFetched {
         epoch: Epoch,
@@ -290,7 +294,7 @@ impl CoordinatorSim {
     /// whatever it emits (the signed request loops back locally and
     /// queues for every peer).
     pub fn fire_beacon_skip_timer(&mut self, idx: usize) {
-        let actions = self.coordinators[idx].on_beacon_skip_timer();
+        let actions = self.coordinators[idx].on_beacon_ratify_timer();
         self.absorb(idx, actions);
     }
 
@@ -572,13 +576,15 @@ impl CoordinatorSim {
             match action {
                 Action::VerifyBeaconBlock {
                     block,
-                    signers,
+                    committee,
+                    active_pool,
                     equivocation_signers,
                 } => {
                     let result = Arc::unwrap_or_clone(block)
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             network: &self.network,
-                            signers: &signers,
+                            committee: &committee,
+                            active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
                         .map(Arc::new)
@@ -586,22 +592,36 @@ impl CoordinatorSim {
                     let post = self.coordinators[replica_idx].on_beacon_block_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                Action::VerifySkipRequest { request, signers } => {
-                    let anchor = request.anchor_hash();
-                    let epoch_to_skip = request.epoch_to_skip();
-                    let signer = request.signer();
-                    let result = (*request)
-                        .upgrade(&SkipVerifyContext {
+                Action::VerifyBeaconCandidate {
+                    candidate,
+                    committee,
+                    equivocation_signers,
+                } => {
+                    let result = Arc::unwrap_or_clone(candidate)
+                        .upgrade(&CandidateVerifyContext {
+                            network: &self.network,
+                            committee: &committee,
+                            equivocation_signers: &equivocation_signers,
+                        })
+                        .map(Arc::new)
+                        .map_err(|(_, e)| e);
+                    let post = self.coordinators[replica_idx].on_beacon_candidate_verified(result);
+                    out.extend(self.resolve_verifications(replica_idx, post));
+                }
+                Action::VerifyRatifyVote { vote, signers } => {
+                    let anchor = vote.anchor_hash();
+                    let epoch = vote.epoch();
+                    let round = vote.round();
+                    let phase = vote.phase();
+                    let signer = vote.signer();
+                    let result = (*vote)
+                        .upgrade(&RatifyVerifyContext {
                             network: &self.network,
                             active_pool: &signers,
                         })
                         .map_err(|(_, e)| e);
-                    let post = self.coordinators[replica_idx].on_skip_request_verified(
-                        anchor,
-                        epoch_to_skip,
-                        signer,
-                        result,
-                    );
+                    let post = self.coordinators[replica_idx]
+                        .on_ratify_vote_verified(anchor, epoch, round, phase, signer, result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
                 other => out.push(other),
@@ -626,42 +646,14 @@ impl CoordinatorSim {
         }
     }
 
-    /// Fire the skip-trigger path on `signer_idx`: build and sign a
-    /// `SkipRequest` against the replica's current tip + next epoch,
-    /// then admit it locally and queue it for delivery to every peer.
-    /// Mirrors what the production runner does on
+    /// Fire the skip path on `signer_idx` via the real timer entry:
+    /// `on_beacon_ratify_timer` past the deadline prevotes the skip
+    /// hash, and `absorb` signs the vote, loops it back, and queues it
+    /// for every peer. Mirrors what the production runner does on
     /// `skip_trigger_due() && !is_committed && is_on_active_pool`.
     pub fn fire_skip_trigger(&mut self, signer_idx: usize) {
-        let signer = self.members[signer_idx].0;
-        let sk = &self.sks[signer_idx];
-        let anchor = self.coordinators[signer_idx].latest_block().block_hash();
-        let epoch_to_skip = self.coordinators[signer_idx]
-            .current_state()
-            .current_epoch
-            .next();
-        let verified =
-            Verified::<SkipRequest>::sign_local(sk, signer, &self.network, anchor, epoch_to_skip);
-        let verified_arc = Arc::new(verified);
-        // Admit locally first — the production runner feeds the
-        // request back into the local coordinator via the action
-        // handler's loopback. The local arm goes through the verified
-        // receive entry.
-        let actions = self.coordinators[signer_idx]
-            .on_verified_skip_request_received(Arc::clone(&verified_arc));
+        let actions = self.coordinators[signer_idx].on_beacon_ratify_timer();
         self.absorb(signer_idx, actions);
-        // Queue for every peer as an unverified wire arrival.
-        let wire = Arc::new(Verifiable::from((*verified_arc).clone()));
-        for to_idx in 0..self.coordinators.len() {
-            if to_idx == signer_idx {
-                continue;
-            }
-            self.network_q.push_back(Envelope {
-                to_idx,
-                event: SimEvent::SkipRequest {
-                    request: Arc::clone(&wire),
-                },
-            });
-        }
     }
 
     /// Number of replicas.
@@ -825,8 +817,12 @@ impl CoordinatorSim {
                 let wrapped = Arc::new(Verifiable::from((**block).clone()));
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
-            SimEvent::SkipRequest { request } => {
-                self.coordinators[env.to_idx].on_unverified_skip_request_received(request)
+            SimEvent::BeaconCandidate { candidate } => {
+                let wrapped = Arc::new(Verifiable::from((**candidate).clone()));
+                self.coordinators[env.to_idx].on_beacon_candidate_received(wrapped)
+            }
+            SimEvent::RatifyVote { vote } => {
+                self.coordinators[env.to_idx].on_unverified_ratify_vote_received(vote)
             }
             SimEvent::BeaconProposalFetched {
                 epoch,
@@ -1069,34 +1065,61 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastSkipRequest {
-                epoch_to_skip,
-                anchor,
-            } => {
-                let sk = &self.sks[emitter_idx];
-                let signer = self.members[emitter_idx].0;
-                let verified = Verified::<SkipRequest>::sign_local(
-                    sk,
-                    signer,
-                    &self.network,
-                    anchor,
-                    epoch_to_skip,
-                );
-                let request = Arc::new(verified);
-                // Local loopback: the FSM expects to see its own
-                // verified contribution to the skip pool.
-                let actions = self.coordinators[emitter_idx]
-                    .on_verified_skip_request_received(Arc::clone(&request));
-                self.absorb(emitter_idx, actions);
-                let wire = Arc::new(Verifiable::from((*request).clone()));
+            Action::BroadcastBeaconCandidate { candidate } => {
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
                     }
+                    let rcpt = self.members[to_idx].0;
+                    if self.blocked_block_pairs.contains(&(me, rcpt)) {
+                        continue;
+                    }
                     self.network_q.push_back(Envelope {
                         to_idx,
-                        event: SimEvent::SkipRequest {
-                            request: Arc::clone(&wire),
+                        event: SimEvent::BeaconCandidate {
+                            candidate: Arc::clone(&candidate),
+                        },
+                    });
+                }
+            }
+            Action::SignAndBroadcastRatifyVote {
+                anchor,
+                epoch,
+                round,
+                phase,
+                block_hash,
+            } => {
+                let sk = &self.sks[emitter_idx];
+                let signer = self.members[emitter_idx].0;
+                let verified = Verified::<RatifyVote>::sign_local(
+                    sk,
+                    signer,
+                    &self.network,
+                    anchor,
+                    epoch,
+                    round,
+                    phase,
+                    block_hash,
+                );
+                let vote = Arc::new(verified);
+                // Local loopback: the tracker expects to see its own
+                // verified contribution to the vote pool.
+                let actions = self.coordinators[emitter_idx]
+                    .on_verified_ratify_vote_received(Arc::clone(&vote));
+                self.absorb(emitter_idx, actions);
+                let wire = Arc::new(Verifiable::from((*vote).clone()));
+                for to_idx in 0..self.coordinators.len() {
+                    if to_idx == emitter_idx {
+                        continue;
+                    }
+                    let rcpt = self.members[to_idx].0;
+                    if self.blocked_block_pairs.contains(&(me, rcpt)) {
+                        continue;
+                    }
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::RatifyVote {
+                            vote: Arc::clone(&wire),
                         },
                     });
                 }
@@ -1110,7 +1133,8 @@ impl CoordinatorSim {
             }
             Action::VerifyBeaconBlock {
                 block,
-                signers,
+                committee,
+                active_pool,
                 equivocation_signers,
             } => {
                 // Production runs this on the consensus crypto pool; the
@@ -1120,7 +1144,8 @@ impl CoordinatorSim {
                 let result = Arc::unwrap_or_clone(block)
                     .upgrade(&CertifiedBeaconBlockVerifyContext {
                         network: &self.network,
-                        signers: &signers,
+                        committee: &committee,
+                        active_pool: &active_pool,
                         equivocation_signers: &equivocation_signers,
                     })
                     .map(Arc::new)
@@ -1128,22 +1153,36 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifySkipRequest { request, signers } => {
-                let anchor = request.anchor_hash();
-                let epoch_to_skip = request.epoch_to_skip();
-                let signer = request.signer();
-                let result = (*request)
-                    .upgrade(&SkipVerifyContext {
+            Action::VerifyBeaconCandidate {
+                candidate,
+                committee,
+                equivocation_signers,
+            } => {
+                let result = Arc::unwrap_or_clone(candidate)
+                    .upgrade(&CandidateVerifyContext {
+                        network: &self.network,
+                        committee: &committee,
+                        equivocation_signers: &equivocation_signers,
+                    })
+                    .map(Arc::new)
+                    .map_err(|(_, e)| e);
+                let post = self.coordinators[emitter_idx].on_beacon_candidate_verified(result);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifyRatifyVote { vote, signers } => {
+                let anchor = vote.anchor_hash();
+                let epoch = vote.epoch();
+                let round = vote.round();
+                let phase = vote.phase();
+                let signer = vote.signer();
+                let result = (*vote)
+                    .upgrade(&RatifyVerifyContext {
                         network: &self.network,
                         active_pool: &signers,
                     })
                     .map_err(|(_, e)| e);
-                let post = self.coordinators[emitter_idx].on_skip_request_verified(
-                    anchor,
-                    epoch_to_skip,
-                    signer,
-                    result,
-                );
+                let post = self.coordinators[emitter_idx]
+                    .on_ratify_vote_verified(anchor, epoch, round, phase, signer, result);
                 self.absorb(emitter_idx, post);
             }
             Action::VerifyPcVote1 {

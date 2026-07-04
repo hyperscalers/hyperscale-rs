@@ -96,7 +96,7 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
 
     let first_commit = &sim.commits[0][0];
     assert!(
-        matches!(first_commit.block.cert(), BeaconCert::Normal(_)),
+        matches!(first_commit.block.cert(), BeaconCert::Normal { .. }),
         "honest-path commit unexpectedly carries a non-Normal cert",
     );
     assert_eq!(
@@ -132,7 +132,7 @@ fn dark_shard_does_not_stall_beacon_commits() {
     for e in 0..TARGET_COMMITS {
         let commit = &sim.commits[0][e];
         assert!(
-            matches!(commit.block.cert(), BeaconCert::Normal(_)),
+            matches!(commit.block.cert(), BeaconCert::Normal { .. }),
             "epoch {} fell to a non-Normal cert with the shard dark",
             commit.epoch.inner(),
         );
@@ -187,7 +187,7 @@ fn observed_crossing_records_shard_boundary_through_full_commit() {
 
     let commit = &sim.commits[0][0];
     assert!(
-        matches!(commit.block.cert(), BeaconCert::Normal(_)),
+        matches!(commit.block.cert(), BeaconCert::Normal { .. }),
         "honest-path commit unexpectedly carries a non-Normal cert",
     );
     assert!(
@@ -276,9 +276,9 @@ fn forged_boundary_qc_records_no_shard_boundary() {
         StateRoot::ZERO,
         "a forged boundary QC must not advance the anchor",
     );
-    assert!(
-        boundary.consecutive_misses >= 1,
-        "a shard with no admissible crossing reads as a miss",
+    assert_eq!(
+        boundary.consecutive_misses, 0,
+        "an empty commit is skip-shaped: the boundary carries forward untouched",
     );
     assert!(
         !commit
@@ -755,37 +755,35 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
     );
 }
 
-/// Both commit paths assemble for one epoch across a block-layer
-/// partition, from honest signatures alone, with the vote-3 /
-/// skip-request exclusion active. The committee majority commits the
-/// SPC block; the other side — nine non-committee pool validators plus
-/// the one committee member that never signed a round-3 vote — reaches
-/// the ⌈2·13/3⌉+1 = 10 skip quorum and commits the skip block. The
-/// chains diverge at the same parent; on first cross-partition contact
-/// the replica verifies the competitor and halts.
+/// The partition that used to fork the beacon now stalls it: with the
+/// pool as the single commit quorum, the committee majority's SPC
+/// candidate cannot ratify on its side of a partition (four of
+/// thirteen), while the far side — nine non-committee pool validators
+/// plus the silenced committee member — reaches the quorum of nine and
+/// commits the skip block. On heal, the committee side adopts the
+/// certified skip block at tip + 1; nothing halts, no epoch carries
+/// two blocks.
 #[test]
-#[should_panic(expected = "beacon dual commit detected")]
-fn dual_commit_paths_diverge_across_partition_then_halt() {
+fn partition_stalls_committee_side_then_skip_settles() {
     const COMMITTEE: usize = 4;
     const POOL: usize = 13;
     let mut sim = CoordinatorSim::new_with_pool(COMMITTEE, POOL, 0xF0_12);
     let ids: Vec<ValidatorId> = (0..POOL as u64).map(ValidatorId::new).collect();
 
     // Member 3 is cut from all inbound traffic for the SPC phase: it
-    // proposes and casts its round-1 vote, but never sees a QC2, so it
-    // never signs a round-3 vote and stays skip-eligible.
+    // proposes and casts its round-1 vote, but never sees a QC2 — the
+    // committee quorum {0,1,2} still certifies a candidate.
     sim.drop_counters[3] = usize::MAX / 2;
-    // Blocks never cross between the committee majority and the rest.
+    // Candidates, votes, and blocks never cross between the committee
+    // majority and the rest.
     sim.partition_blocks_between(&ids[..3], &ids[3..]);
 
-    // The beacon paces to wall-clock and goes quiescent between
-    // timer fires; re-kick until the committee side commits (the
-    // `run_until_committed` quiescence pattern, scoped to the
-    // committee — the partitioned replicas never commit here).
+    // The beacon paces to wall-clock and goes quiescent between timer
+    // fires; re-kick until the committee side certifies its candidate.
     sim.kick_off();
     for _ in 0..8 {
         sim.run_for_at_most(50_000);
-        if (0..3).all(|i| !sim.commits[i].is_empty()) {
+        if (0..3).all(|i| sim.coordinators[i].pending_candidate_hash().is_some()) {
             break;
         }
         // The view timer is what carries a view whose proposal-object
@@ -795,29 +793,24 @@ fn dual_commit_paths_diverge_across_partition_then_halt() {
         sim.kick_off();
     }
 
-    // The committee majority committed the SPC block for epoch 1 —
-    // proposal-carrying, so its hash diverges from the skip block's
-    // (a proposal-less SPC block would be bit-identical to it).
-    let normal = sim.commits[0]
-        .last()
-        .expect("committee replica commits epoch 1")
-        .clone();
-    assert_eq!(normal.epoch, Epoch::new(1));
-    assert!(matches!(normal.block.cert(), BeaconCert::Normal(_)));
-    assert!(!normal.block.block().committed_proposals().is_empty());
-    for i in 1..3 {
-        assert!(!sim.commits[i].is_empty(), "replica {i} missed the commit");
-    }
-    for i in 3..POOL {
+    // The committee side holds an SPC-certified candidate but cannot
+    // commit it: its side of the partition musters three prevotes
+    // against the pool quorum of nine.
+    for i in 0..3 {
+        assert!(
+            sim.coordinators[i].pending_candidate_hash().is_some(),
+            "replica {i} never certified the candidate",
+        );
         assert!(
             sim.commits[i].is_empty(),
-            "replica {i} saw the block through the partition",
+            "replica {i} committed without a pool quorum",
         );
     }
 
     // The partitioned side reaches its skip deadline and every replica
-    // there fires the real wall-clock trigger — the exclusion admits
-    // exactly the validators that never signed a round-3 vote.
+    // there fires the real wall-clock trigger: prevotes for the skip
+    // hash, the polka, precommits, and the commit certificate all
+    // assemble within the nine-plus-one members of that side.
     sim.drop_counters[3] = 0;
     sim.pass_skip_deadline();
     for idx in 3..POOL {
@@ -831,11 +824,11 @@ fn dual_commit_paths_diverge_across_partition_then_halt() {
         .clone();
     assert_eq!(skip.epoch, Epoch::new(1));
     let BeaconCert::Skip(cert) = skip.block.cert() else {
-        panic!("expected a skip cert on the partitioned side");
+        panic!("expected a Skip cert on the partitioned side");
     };
     assert!(
-        cert.signer_count() >= 10,
-        "skip quorum is 10 of the 13-member active pool",
+        cert.signer_count() >= 9,
+        "commit quorum is 9 of the 13-member active pool",
     );
     for i in 3..POOL {
         assert!(
@@ -846,14 +839,25 @@ fn dual_commit_paths_diverge_across_partition_then_halt() {
             "replica {i} did not adopt the skip block",
         );
     }
+    // The committee side is still stalled — consistency chosen over
+    // availability for the partition minority.
+    for i in 0..3 {
+        assert!(sim.commits[i].is_empty(), "replica {i} forked");
+    }
 
-    // The fork: same epoch, same parent, different blocks — reached
-    // with zero Byzantine signatures.
-    assert_eq!(normal.block.prev_block_hash(), skip.block.prev_block_hash(),);
-    assert_ne!(normal.block.block_hash(), skip.block.block_hash());
-
-    // Contact: heal the partition and hand the skip block to a
-    // committee replica. The verified competitor halts it.
+    // Heal: the certified skip block reaches a committee replica, which
+    // adopts it at tip + 1 — convergence, not a halt.
     sim.clear_block_partition();
-    let _ = sim.deliver_block_to(0, &skip.block);
+    let actions = sim.deliver_block_to(0, &skip.block);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+        "the healed replica must adopt the skip block; got {actions:?}",
+    );
+    assert_eq!(
+        sim.coordinators[0].latest_block().block_hash(),
+        skip.block.block_hash(),
+        "both sides converge on the skip block",
+    );
 }
