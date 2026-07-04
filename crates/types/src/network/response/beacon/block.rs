@@ -56,8 +56,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G2Signature, Epoch, Hash, SignerBitfield,
-        SkipEpochCert,
+        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G2Signature, Epoch, Hash, RatifyCert,
+        RatifyRound, SignerBitfield,
     };
 
     fn sample_block() -> Arc<Verifiable<CertifiedBeaconBlock>> {
@@ -65,9 +65,11 @@ mod tests {
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
         );
-        let cert = SkipEpochCert::new(
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
-            Epoch::new(5),
+        let cert = RatifyCert::new(
+            block.prev_block_hash(),
+            block.epoch(),
+            RatifyRound::INITIAL,
+            block.block_hash(),
             SignerBitfield::new(4),
             Bls12381G2Signature([0u8; 96]),
         );

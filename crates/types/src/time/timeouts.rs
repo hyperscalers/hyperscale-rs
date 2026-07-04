@@ -104,13 +104,24 @@ pub const MAX_PROGRESS_WAIT: Duration = Duration::from_secs(9);
 pub const EPOCH_DURATION: Duration = Duration::from_mins(5);
 
 /// Wall-clock interval an active validator waits past an epoch's
-/// expected block time before broadcasting a
-/// [`SkipRequest`](crate::SkipRequest).
+/// expected block time before prevoting the skip block in
+/// ratification round 1.
 ///
-/// Consensus-critical: every validator must derive the same trigger
-/// instant or the cert-assembly quorum splits. Sized so a normal SPC
-/// commit (well under 10 s on a healthy network) never trips the
-/// timer, while a genuine stall doesn't burn an entire epoch waiting.
-/// Starting value picked mid-range against the 30–60 s envelope; tune
-/// from operational data.
+/// Loosely synchronized clocks suffice: a validator that prevoted the
+/// candidate before its deadline and one that prevoted skip after it
+/// split round 1 below both quorums at worst, and round 2 converges.
+/// Sized so a normal SPC commit (well under 10 s on a healthy network)
+/// never trips the timer, while a genuine stall doesn't burn an entire
+/// epoch waiting. Starting value picked mid-range against the 30–60 s
+/// envelope; tune from operational data.
 pub const SKIP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Wall-clock length of one ratification round past the first: a
+/// round with neither a commit certificate nor a polka worth waiting
+/// on re-prevotes in the next round after this long.
+///
+/// Long enough for a pool-wide vote broadcast plus aggregation
+/// (seconds), short enough that a split round-1 vote converges well
+/// within the epoch. A spuriously short value costs an extra benign
+/// round; a long one only delays skipping a genuinely dead committee.
+pub const RATIFY_ROUND_TIMEOUT: Duration = Duration::from_secs(15);

@@ -3,7 +3,7 @@
 //! into.
 //!
 //! A beacon block — Normal or Skip — commits only through a
-//! [`RatifyCert`]: ⌈2M/3⌉ + 1 of the active pool precommitting the same
+//! [`RatifyCert`]: a quorum of the active pool precommitting the same
 //! `(anchor_hash, epoch, round, block_hash)`. Votes are over block
 //! hashes, not path tags: `BeaconBlock::skip(epoch, anchor)` is
 //! deterministic, so ratifying the skip block and ratifying an
@@ -33,8 +33,9 @@ use thiserror::Error;
 
 use super::certified::verify_committed_proposal_binding;
 use crate::{
-    BeaconBlock, BeaconBlockHash, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    Epoch, NetworkDefinition, RatifyRound, SignerBitfield, SpcCert, ValidatorId, Verified, Verify,
+    BeaconBlock, BeaconBlockHash, BeaconProposal, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, Epoch, NetworkDefinition, RatifyRound, ShardEpochContribution, ShardId,
+    SignerBitfield, SpcCert, ValidatorId, Verified, Verify,
     aggregate_verify_bls_different_messages, ratify_vote_message, spc_context, verify_block_cert,
     verify_bls12381_v1, verify_vote_equivocation,
 };
@@ -68,7 +69,7 @@ impl RatifyPhase {
 /// One active validator's signed ratification vote for `block_hash` at
 /// `(anchor_hash, epoch, round, phase)`.
 ///
-/// Gossiped all-to-all across the active validator pool. ⌈2M/3⌉ + 1
+/// Gossiped all-to-all across the active validator pool. a quorum of
 /// precommit-phase signers over the same tuple assemble into a
 /// [`RatifyCert`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -149,7 +150,7 @@ impl RatifyVote {
     }
 }
 
-/// Pool-quorum commit certificate: ⌈2M/3⌉ + 1 active signers
+/// Pool-quorum commit certificate: a quorum of active signers
 /// precommitted `block_hash` at `(anchor_hash, epoch, round)`.
 ///
 /// Carried as side-data on a
@@ -239,13 +240,16 @@ impl RatifyCert {
     }
 }
 
-/// Ratification quorum over a pool of `pool_size` members: `⌈2M/3⌉ + 1`.
+/// Ratification quorum over a pool of `pool_size` members:
+/// `M − ⌊(M−1)/3⌋` — the standard BFT quorum (`2f+1` at `M = 3f+1`).
 ///
-/// Any two quorums intersect in more than a third of the pool — the
-/// intersection argument every commit-safety property here reduces to.
+/// Any two quorums intersect in at least `f + 1` members, at least one
+/// of them honest — the intersection argument every commit-safety
+/// property here reduces to — while tolerating `f` unresponsive
+/// members, which the commit path's liveness rides on.
 #[must_use]
 pub const fn ratify_quorum(pool_size: usize) -> usize {
-    (2 * pool_size).div_ceil(3) + 1
+    pool_size - (pool_size - 1) / 3
 }
 
 // ─── Verifiers ─────────────────────────────────────────────────────────────
@@ -690,6 +694,38 @@ impl Verified<RatifyCert> {
     }
 }
 
+impl Verified<CandidateBeaconBlock> {
+    /// Assemble a candidate from the SPC-committed proposals and the
+    /// cert that authenticates them. Consumes the typed
+    /// `Verified<BeaconProposal>` set and the `Verified<SpcCert>` by
+    /// value, so a candidate cannot be built from unverified proposals
+    /// or an unverified cert — verification is a type-level
+    /// precondition, not a convention.
+    #[must_use]
+    pub fn assemble(
+        epoch: Epoch,
+        prev_block_hash: BeaconBlockHash,
+        committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
+        shard_contributions: BTreeMap<ShardId, ShardEpochContribution>,
+        cert: Verified<SpcCert>,
+    ) -> Self {
+        let proposals: Vec<(ValidatorId, BeaconProposal)> = committed
+            .into_iter()
+            .map(|(id, proposal)| (id, proposal.into_inner()))
+            .collect();
+        let block = BeaconBlock::new_with_contributions(
+            epoch,
+            prev_block_hash,
+            proposals,
+            shard_contributions,
+        );
+        Self::new_unchecked(CandidateBeaconBlock::new(
+            block,
+            Box::new(cert.into_inner()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,12 +826,14 @@ mod tests {
         assert_eq!(sample_cert().signer_count(), 3);
     }
 
+    /// The standard BFT quorum: `2f+1` at `M = 3f+1`, tolerating `f`
+    /// unresponsive members while any two quorums share an honest one.
     #[test]
-    fn quorum_formula_matches_skip_path() {
-        assert_eq!(ratify_quorum(4), 4);
-        assert_eq!(ratify_quorum(7), 6);
-        assert_eq!(ratify_quorum(10), 8);
-        assert_eq!(ratify_quorum(13), 10);
+    fn quorum_is_the_standard_bft_threshold() {
+        assert_eq!(ratify_quorum(4), 3);
+        assert_eq!(ratify_quorum(7), 5);
+        assert_eq!(ratify_quorum(10), 7);
+        assert_eq!(ratify_quorum(13), 9);
     }
 
     // ─── Verifier / builder tests ──────────────────────────────────────
@@ -846,7 +884,7 @@ mod tests {
     /// a quorum-meeting set of precommits.
     #[test]
     fn build_then_verify_ratify_cert_round_trips() {
-        // Pool of 7, quorum = ⌈14/3⌉ + 1 = 6.
+        // Pool of 7, quorum = 7 − 2 = 5.
         let (active, keys) = pool(7);
         let votes: Vec<RatifyVote> = (0..6)
             .map(|i| precommit(&keys, i, RatifyRound::INITIAL))
@@ -860,7 +898,7 @@ mod tests {
     #[test]
     fn build_ratify_cert_rejects_below_quorum() {
         let (active, keys) = pool(7);
-        let votes: Vec<RatifyVote> = (0..5)
+        let votes: Vec<RatifyVote> = (0..4)
             .map(|i| precommit(&keys, i, RatifyRound::INITIAL))
             .collect();
         assert!(build_ratify_cert(&votes, &active).is_none());
@@ -962,8 +1000,8 @@ mod tests {
     #[test]
     fn build_ratify_cert_dedupes_repeated_signer() {
         let (active, keys) = pool(7);
-        // 6 distinct signers + one duplicate of signer 0 — quorum met
-        // exactly when dedup is enforced.
+        // 6 distinct signers + one duplicate of signer 0 — the signer
+        // count must reflect dedup, not raw vote count.
         let mut votes: Vec<RatifyVote> = (0..6)
             .map(|i| precommit(&keys, i, RatifyRound::INITIAL))
             .collect();
@@ -1012,7 +1050,7 @@ mod tests {
     /// on the unique block hash however the certs were assembled.
     #[test]
     fn two_distinct_quorum_subsets_both_verify() {
-        // Pool of 10, quorum = ⌈20/3⌉ + 1 = 8.
+        // Pool of 10, quorum = 10 − 3 = 7.
         let (active, keys) = pool(10);
         let make_subset = |range: std::ops::Range<u64>| -> Vec<RatifyVote> {
             range

@@ -6,16 +6,16 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_types::{BeaconBlockHash, Epoch, ValidatorId};
+use hyperscale_types::{BeaconBlockHash, Epoch, RatifyPhase, RatifyRound, ValidatorId};
 
 /// In-flight verification slots over an arbitrary key.
 ///
 /// A slot is marked when the verification action is dispatched and
 /// cleared when the result lands (or the slot is otherwise no longer
 /// needed). A marked slot suppresses redundant redispatch of the same
-/// check. Reused by [`BeaconVerificationPipeline`] (block + skip-request
-/// slots) and by [`SpcDriver`](crate::spc_driver::SpcDriver) (PC-vote +
-/// SPC-message slots).
+/// check. Reused by [`BeaconVerificationPipeline`] (block + candidate +
+/// ratify-vote slots) and by [`SpcDriver`](crate::spc_driver::SpcDriver)
+/// (PC-vote + SPC-message slots).
 #[derive(Debug)]
 pub(crate) struct VerificationSlots<K> {
     in_flight: BTreeSet<K>,
@@ -52,36 +52,44 @@ impl<K: Ord> VerificationSlots<K> {
     }
 }
 
-/// Slot key for a pending skip-request sig verification.
+/// Slot key for a pending ratify-vote sig verification.
 ///
-/// Per-`(anchor, epoch_to_skip, signer)` — the canonical identity of a
-/// skip request, independent of its signature bytes. Keying on identity
-/// rather than the encoded-request hash bounds a Byzantine peer to one
-/// in-flight slot per claimed signer: replaying the same triple with
-/// forged signatures can't mint additional verification slots. The slot
-/// clears on both verify arms (the key rides back in the result event),
-/// so a failed forgery can't pin a signer's slot and block their later
-/// honest request.
-pub type SkipRequestSlotKey = (BeaconBlockHash, Epoch, ValidatorId);
+/// Per-`(anchor, epoch, round, phase, signer)` — the canonical identity
+/// of a ratify vote, independent of its signature bytes and named hash.
+/// Keying on identity rather than the encoded-vote hash bounds a
+/// Byzantine peer to one in-flight slot per claimed signer per round
+/// and phase: replaying the tuple with forged signatures can't mint
+/// additional verification slots. The slot clears on both verify arms
+/// (the key rides back in the result event), so a failed forgery can't
+/// pin a signer's slot and block their later honest vote.
+pub type RatifyVoteSlotKey = (
+    BeaconBlockHash,
+    Epoch,
+    RatifyRound,
+    RatifyPhase,
+    ValidatorId,
+);
 
-/// Tracks the asynchronous block-cert and skip-request verifications the
-/// coordinator dispatches to the crypto pool.
+/// Tracks the asynchronous block-cert, candidate, and ratify-vote
+/// verifications the coordinator dispatches to the crypto pool.
 ///
 /// Suppresses redundant redispatch while a check is outstanding. The
 /// PC-vote and SPC-message slot pools live on
 /// [`SpcDriver`](crate::spc_driver::SpcDriver).
 ///
-/// Two domains, each an independent in-flight slot pool:
+/// Three domains, each an independent in-flight slot pool:
 /// - Block-cert verifications, keyed on [`BeaconBlockHash`].
-/// - Skip-request sig verifications, keyed on
-///   `(anchor, epoch_to_skip, signer)`.
-///
-/// Domains never share keys by construction — different `K` types per
-/// slot pool.
+/// - Candidate verifications, keyed on [`BeaconBlockHash`]. Separate
+///   from the block pool: after ratification the certified block
+///   carries the same hash the candidate did, and sharing a pool would
+///   let a stale candidate slot suppress the block's verification.
+/// - Ratify-vote sig verifications, keyed on
+///   `(anchor, epoch, round, phase, signer)`.
 #[derive(Debug, Default)]
 pub struct BeaconVerificationPipeline {
     blocks: VerificationSlots<BeaconBlockHash>,
-    skip_requests: VerificationSlots<SkipRequestSlotKey>,
+    candidates: VerificationSlots<BeaconBlockHash>,
+    ratify_votes: VerificationSlots<RatifyVoteSlotKey>,
 }
 
 impl BeaconVerificationPipeline {
@@ -104,15 +112,26 @@ impl BeaconVerificationPipeline {
         self.blocks.clear(&block_hash);
     }
 
-    /// Mark a skip-request sig verification in flight. Same semantics as
+    /// Mark a candidate verification in flight. Same semantics as
     /// [`Self::mark_block_in_flight`].
-    pub fn mark_skip_request_in_flight(&mut self, key: SkipRequestSlotKey) -> bool {
-        self.skip_requests.mark_in_flight(key)
+    pub fn mark_candidate_in_flight(&mut self, block_hash: BeaconBlockHash) -> bool {
+        self.candidates.mark_in_flight(block_hash)
     }
 
-    /// Clear the skip-request slot once its result lands.
-    pub fn forget_skip_request(&mut self, key: SkipRequestSlotKey) {
-        self.skip_requests.clear(&key);
+    /// Clear the candidate slot once its result lands.
+    pub fn forget_candidate(&mut self, block_hash: BeaconBlockHash) {
+        self.candidates.clear(&block_hash);
+    }
+
+    /// Mark a ratify-vote sig verification in flight. Same semantics as
+    /// [`Self::mark_block_in_flight`].
+    pub fn mark_ratify_vote_in_flight(&mut self, key: RatifyVoteSlotKey) -> bool {
+        self.ratify_votes.mark_in_flight(key)
+    }
+
+    /// Clear the ratify-vote slot once its result lands.
+    pub fn forget_ratify_vote(&mut self, key: RatifyVoteSlotKey) {
+        self.ratify_votes.clear(&key);
     }
 }
 
@@ -126,7 +145,7 @@ impl BeaconVerificationPipeline {
 
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.blocks.len() + self.skip_requests.len()
+        self.blocks.len() + self.candidates.len() + self.ratify_votes.len()
     }
 }
 
@@ -140,10 +159,12 @@ mod tests {
         BeaconBlockHash::from_raw(Hash::from_bytes(&[seed]))
     }
 
-    fn skip_key(seed: u8) -> SkipRequestSlotKey {
+    fn vote_key(seed: u8) -> RatifyVoteSlotKey {
         (
             BeaconBlockHash::from_raw(Hash::from_bytes(&[seed])),
             Epoch::new(u64::from(seed)),
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
             ValidatorId::new(u64::from(seed)),
         )
     }
@@ -193,9 +214,22 @@ mod tests {
     fn domains_are_independent() {
         let mut p = BeaconVerificationPipeline::new();
         p.mark_block_in_flight(block_hash(5));
-        p.mark_skip_request_in_flight(skip_key(5));
+        p.mark_ratify_vote_in_flight(vote_key(5));
         assert_eq!(p.in_flight_count(), 2);
         p.forget_block(block_hash(5));
         assert_eq!(p.in_flight_count(), 1);
+    }
+
+    /// The candidate pool is independent of the block pool: a candidate
+    /// slot at some hash never suppresses the certified block's
+    /// verification at the same hash.
+    #[test]
+    fn candidate_and_block_pools_share_no_keys() {
+        let mut p = BeaconVerificationPipeline::new();
+        assert!(p.mark_candidate_in_flight(block_hash(7)));
+        assert!(p.mark_block_in_flight(block_hash(7)));
+        assert_eq!(p.in_flight_count(), 2);
+        p.forget_candidate(block_hash(7));
+        assert!(p.is_block_in_flight(block_hash(7)));
     }
 }

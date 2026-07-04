@@ -9,7 +9,7 @@ use crate::{MessageClass, NetworkMessage, RatifyVote, Verifiable};
 
 /// Broadcasts one active validator's signed epoch-ratification vote.
 ///
-/// Gossiped across the full active validator pool; ⌈2M/3⌉ + 1 active
+/// Gossiped across the full active validator pool; a quorum of active
 /// signers precommitting the same
 /// `(anchor_hash, epoch, round, block_hash)` assemble into a
 /// [`RatifyCert`](crate::RatifyCert) committing the epoch's block.

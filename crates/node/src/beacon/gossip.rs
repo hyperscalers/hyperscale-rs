@@ -13,7 +13,9 @@ use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{GossipVerdict, Network};
 use hyperscale_types::ShardId;
-use hyperscale_types::network::gossip::beacon::{BeaconBlockGossip, SkipRequestGossip};
+use hyperscale_types::network::gossip::beacon::{
+    BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
+};
 use tracing::warn;
 
 use crate::event::HostEvent;
@@ -28,7 +30,8 @@ use crate::shard::push_protocol_event;
 ///   to the follower pool's beacon channel, but only while a pool is draining
 ///   it (`route_active`) — so a host with no live pool neither drops the
 ///   registration nor backs the channel up.
-/// - `beacon.skip_request` routes to the named shard's consensus.
+/// - `beacon.candidate` and `beacon.ratify_vote` route to the named
+///   shard's consensus.
 pub fn register_beacon_gossip_handlers<N: Network>(
     network: &N,
     senders: &SharedShardSenders,
@@ -78,10 +81,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         }));
     });
 
-    // ── beacon.skip_request → ProtocolEvent::UnverifiedSkipRequestReceived ──
+    // ── beacon.candidate → ProtocolEvent::BeaconCandidateReceived ──
     let s = senders.clone();
-    network.register_gossip_handler::<SkipRequestGossip>(
-        move |gossip: SkipRequestGossip, target_shard: ShardId| -> GossipVerdict {
+    network.register_gossip_handler::<BeaconCandidateGossip>(
+        move |gossip: BeaconCandidateGossip, target_shard: ShardId| -> GossipVerdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
                 return GossipVerdict::Reject;
@@ -89,9 +92,26 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             push_protocol_event(
                 tx,
                 target_shard,
-                ProtocolEvent::UnverifiedSkipRequestReceived {
-                    request: gossip.request,
+                ProtocolEvent::BeaconCandidateReceived {
+                    candidate: gossip.candidate,
                 },
+            );
+            GossipVerdict::Accept
+        },
+    );
+
+    // ── beacon.ratify_vote → ProtocolEvent::UnverifiedRatifyVoteReceived ──
+    let s = senders.clone();
+    network.register_gossip_handler::<RatifyVoteGossip>(
+        move |gossip: RatifyVoteGossip, target_shard: ShardId| -> GossipVerdict {
+            let senders = s.load();
+            let Some(tx) = senders.get(&target_shard) else {
+                return GossipVerdict::Reject;
+            };
+            push_protocol_event(
+                tx,
+                target_shard,
+                ProtocolEvent::UnverifiedRatifyVoteReceived { vote: gossip.vote },
             );
             GossipVerdict::Accept
         },

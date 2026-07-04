@@ -12,16 +12,18 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::gossip::beacon::{BeaconBlockGossip, SkipRequestGossip};
+use hyperscale_types::network::gossip::beacon::{
+    BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
+};
 use hyperscale_types::network::notification::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, CertifiedBeaconBlockVerifyContext, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW,
-    PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SkipRequest, SkipVerifyContext,
-    SpcEmptyViewMsg, SpcVerifyContext, Verifiable, Verified, pc_context, spc_context,
-    spc_relay_signing_message,
+    BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext,
+    DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
+    RatifyVerifyContext, RatifyVote, SpcEmptyViewMsg, SpcVerifyContext, Verifiable, Verified,
+    pc_context, spc_context, spc_relay_signing_message,
 };
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
@@ -185,55 +187,88 @@ where
                     Arc::unwrap_or_clone(block),
                 ))));
         }
-        Action::BroadcastSkipRequest {
-            epoch_to_skip,
+        Action::SignAndBroadcastRatifyVote {
             anchor,
+            epoch,
+            round,
+            phase,
+            block_hash,
         } => {
-            let verified = Verified::<SkipRequest>::sign_local(
+            let verified = Verified::<RatifyVote>::sign_local(
                 ctx.signing_key,
                 me,
                 network,
                 anchor,
-                epoch_to_skip,
+                epoch,
+                round,
+                phase,
+                block_hash,
             );
-            let request = Arc::new(verified);
+            let vote = Arc::new(verified);
             ctx.network
-                .broadcast_global(&SkipRequestGossip::new(Arc::new(Verifiable::from(
-                    (*request).clone(),
+                .broadcast_global(&RatifyVoteGossip::new(Arc::new(Verifiable::from(
+                    (*vote).clone(),
                 ))));
-            ctx.notify_protocol(ProtocolEvent::VerifiedSkipRequestReceived { request });
+            ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
+        }
+        Action::BroadcastBeaconCandidate { candidate } => {
+            ctx.network
+                .broadcast_global(&BeaconCandidateGossip::new(Arc::new(Verifiable::from(
+                    Arc::unwrap_or_clone(candidate),
+                ))));
         }
         Action::VerifyBeaconBlock {
             block,
-            signers,
+            committee,
+            active_pool,
             equivocation_signers,
         } => {
             let result = Arc::unwrap_or_clone(block)
                 .upgrade(&CertifiedBeaconBlockVerifyContext {
                     network,
-                    signers: &signers,
+                    committee: &committee,
+                    active_pool: &active_pool,
                     equivocation_signers: &equivocation_signers,
                 })
                 .map(Arc::new)
                 .map_err(|(_, e)| e);
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { result });
         }
-        Action::VerifySkipRequest { request, signers } => {
-            let anchor = request.anchor_hash();
-            let epoch_to_skip = request.epoch_to_skip();
-            let signer = request.signer();
-            let result = (*request)
-                .upgrade(&SkipVerifyContext {
+        Action::VerifyRatifyVote { vote, signers } => {
+            let anchor = vote.anchor_hash();
+            let epoch = vote.epoch();
+            let round = vote.round();
+            let phase = vote.phase();
+            let signer = vote.signer();
+            let result = (*vote)
+                .upgrade(&RatifyVerifyContext {
                     network,
                     active_pool: &signers,
                 })
                 .map_err(|(_, e)| e);
-            ctx.notify_protocol(ProtocolEvent::SkipRequestVerified {
+            ctx.notify_protocol(ProtocolEvent::RatifyVoteVerified {
                 anchor,
-                epoch_to_skip,
+                epoch,
+                round,
+                phase,
                 signer,
                 result,
             });
+        }
+        Action::VerifyBeaconCandidate {
+            candidate,
+            committee,
+            equivocation_signers,
+        } => {
+            let result = Arc::unwrap_or_clone(candidate)
+                .upgrade(&CandidateVerifyContext {
+                    network,
+                    committee: &committee,
+                    equivocation_signers: &equivocation_signers,
+                })
+                .map(Arc::new)
+                .map_err(|(_, e)| e);
+            ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { result });
         }
         Action::VerifyPcVote1 {
             epoch,

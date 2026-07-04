@@ -17,10 +17,11 @@ use hyperscale_types::{
     ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash,
     GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NetworkParams, NodeId,
     PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Randomness, Round, ShardAnchor, ShardId, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, compute_global_receipt_root, compute_merkle_root, zero_bls_signature,
+    QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, compute_merkle_root,
+    zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -256,10 +257,21 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
         Vec::new(),
     );
+    let ratify = RatifyCert::new(
+        block.prev_block_hash(),
+        block.epoch(),
+        RatifyRound::INITIAL,
+        block.block_hash(),
+        SignerBitfield::new(4),
+        Bls12381G2Signature([0x22; 96]),
+    );
     Arc::new(Verified::new_unchecked_for_test(
         CertifiedBeaconBlock::new_unchecked(
             block,
-            BeaconCert::Normal(Box::new(placeholder_cert())),
+            BeaconCert::Normal {
+                spc: Box::new(placeholder_cert()),
+                ratify,
+            },
         ),
     ))
 }

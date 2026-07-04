@@ -186,7 +186,9 @@ pub fn timer_event(id: &TimerId, shard: ShardId) -> HostEvent {
         TimerId::BeaconCommitteeStart => {
             HostEvent::protocol(shard, ProtocolEvent::BeaconCommitteeStartTimer)
         }
-        TimerId::BeaconSkipTrigger => HostEvent::protocol(shard, ProtocolEvent::BeaconSkipTimer),
+        TimerId::BeaconRatifyTrigger => {
+            HostEvent::protocol(shard, ProtocolEvent::BeaconRatifyTimer)
+        }
         TimerId::BeaconSpcView => HostEvent::protocol(shard, ProtocolEvent::BeaconSpcViewTimer),
         TimerId::BeaconSpcInputDwell => {
             HostEvent::protocol(shard, ProtocolEvent::BeaconSpcInputDwellTimer)

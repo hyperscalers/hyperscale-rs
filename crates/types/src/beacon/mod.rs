@@ -18,8 +18,9 @@
 //!   the PC build path consumes.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
 //!   submission: per-shard boundary QCs, equivocations, and a VRF reveal).
-//! - [`skip`]: [`SkipRequest`] and [`SkipEpochCert`] (pool-quorum
-//!   abandonment of a stalled epoch).
+//! - [`ratify`]: [`RatifyVote`] / [`RatifyCert`] (the pool-quorum
+//!   commit path for every non-genesis block) and
+//!   [`CandidateBeaconBlock`] (the SPC output awaiting ratification).
 //! - [`spc`]: Strong Prefix Consensus wire types, verify / sign /
 //!   build helpers.
 //! - [`ready_signal`]: [`ReadySignal`] validator-emitted "ready on shard"
@@ -44,7 +45,6 @@ pub mod prefix_ops;
 pub mod proposal;
 pub mod ratify;
 pub mod ready_signal;
-pub mod skip;
 pub mod spc;
 pub mod state;
 pub mod witness;
@@ -91,10 +91,6 @@ pub use ratify::{
     build_ratify_cert, ratify_quorum, sign_ratify_vote, verify_ratify_cert, verify_ratify_vote,
 };
 pub use ready_signal::{ReadySignal, ready_signal_window};
-pub use skip::{
-    SkipEpochCert, SkipEpochCertVerifyError, SkipRequest, SkipRequestVerifyError,
-    SkipVerifyContext, build_skip_cert, sign_skip_request, verify_skip_cert, verify_skip_request,
-};
 pub use spc::{
     SkipReport, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
     SpcHighTriple, SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,

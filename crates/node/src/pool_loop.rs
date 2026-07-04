@@ -199,11 +199,12 @@ where
         match action {
             Action::VerifyBeaconBlock {
                 block,
-                signers,
+                committee,
+                active_pool,
                 equivocation_signers,
             } => {
-                // Inline BLS verify of the SPC cert against the committee — no
-                // off-thread dispatch. The result re-enters the same vnode as a
+                // Inline BLS verify of the block's certs — no off-thread
+                // dispatch. The result re-enters the same vnode as a
                 // continuation so adoption runs within this cascade.
                 let network = self.vnodes[vnode_idx]
                     .state
@@ -212,7 +213,8 @@ where
                 let result = Arc::unwrap_or_clone(block)
                     .upgrade(&CertifiedBeaconBlockVerifyContext {
                         network,
-                        signers: &signers,
+                        committee: &committee,
+                        active_pool: &active_pool,
                         equivocation_signers: &equivocation_signers,
                     })
                     .map(Arc::new)
