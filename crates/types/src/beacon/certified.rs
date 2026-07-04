@@ -246,34 +246,33 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
     pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
 }
 
-/// Bind a block's committed proposals to the value its cert
+/// Bind a block's committed proposals to the value its SPC cert
 /// authenticates.
 ///
-/// A `Normal` cert's [`committed_value`](crate::SpcCert::committed_value)
+/// The cert's [`committed_value`](crate::SpcCert::committed_value)
 /// is the committee-agreed `PcVector`: one
 /// [`pc_element_hash`](crate::BeaconProposal::pc_element_hash) per
 /// committee position, `ZERO` where no proposal was committed. A
 /// well-formed block carries exactly those proposals — each at its
 /// proposer's committee position. This recomputes the vector from the
 /// block's proposals and requires byte equality, so a relay can't pair
-/// a genuine cert with substituted proposal bytes. `Skip`/`Genesis`
-/// carry no proposals (enforced by the pairing invariant) and bind
-/// trivially.
+/// a genuine cert with substituted proposal bytes.
 ///
-/// `committee` is the cert's signer pool in positional order (committee
-/// for `Normal`) — the same slice the cert itself verifies against.
+/// `committee` is the cert's signer pool in positional order — the
+/// same slice the cert itself verifies against. Shared by the
+/// `Normal`-cert arm here and the candidate verifier
+/// ([`CandidateBeaconBlock`](crate::CandidateBeaconBlock)), which check
+/// the same block-content binding on either side of ratification.
 #[must_use]
-fn verify_committed_proposal_binding(
-    block: &CertifiedBeaconBlock,
+pub fn verify_committed_proposal_binding(
+    block: &BeaconBlock,
+    cert: &SpcCert,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
-    let BeaconCert::Normal(cert) = block.cert() else {
-        return true;
-    };
     let certified: Vec<PcValueElement> = cert.committed_value().iter().copied().collect();
     let epoch = block.epoch();
     let mut canonical = vec![PcValueElement::BOTTOM; certified.len()];
-    for (validator, proposal) in block.block().committed_proposals() {
+    for (validator, proposal) in block.committed_proposals() {
         let Some(pos) = committee.iter().position(|(id, _)| id == validator) else {
             return false;
         };
@@ -323,7 +322,11 @@ impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
         if !verify_block_equivocations(self, ctx.network, ctx.equivocation_signers) {
             return Err(CertifiedBeaconBlockVerifyError::BadEquivocationWitness);
         }
-        if !verify_committed_proposal_binding(self, ctx.signers) {
+        // `Skip`/`Genesis` carry no proposals (pairing invariant) and
+        // bind trivially.
+        if let BeaconCert::Normal(cert) = self.cert()
+            && !verify_committed_proposal_binding(self.block(), cert, ctx.signers)
+        {
             return Err(CertifiedBeaconBlockVerifyError::ProposalCertMismatch);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -618,7 +621,10 @@ mod tests {
             let certified =
                 CertifiedBeaconBlock::new_checked(block, normal_cert_with_value(value.clone()))
                     .unwrap();
-            verify_committed_proposal_binding(&certified, &committee)
+            let BeaconCert::Normal(cert) = certified.cert() else {
+                unreachable!("normal_cert_with_value builds a Normal cert");
+            };
+            verify_committed_proposal_binding(certified.block(), cert, &committee)
         };
 
         // Faithful block binds.

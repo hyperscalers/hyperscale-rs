@@ -42,6 +42,7 @@ pub mod params;
 pub mod pc;
 pub mod prefix_ops;
 pub mod proposal;
+pub mod ratify;
 pub mod ready_signal;
 pub mod skip;
 pub mod spc;
@@ -83,6 +84,11 @@ pub use prefix_ops::{mce, mcp, qc1_certify};
 pub use proposal::{
     BeaconProposal, BeaconProposalEquivocationMismatch, BeaconProposalVerifyContext,
     BeaconProposalVerifyError,
+};
+pub use ratify::{
+    CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext, RatifyCert,
+    RatifyCertVerifyError, RatifyPhase, RatifyVerifyContext, RatifyVote, RatifyVoteVerifyError,
+    build_ratify_cert, ratify_quorum, sign_ratify_vote, verify_ratify_cert, verify_ratify_vote,
 };
 pub use ready_signal::{ReadySignal, ready_signal_window};
 pub use skip::{
