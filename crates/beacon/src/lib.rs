@@ -19,6 +19,7 @@ pub mod equivocations;
 pub mod genesis;
 pub mod pc;
 pub mod proposal_pool;
+pub mod ratify;
 pub mod rules;
 pub mod sampling;
 pub mod shard_source;
