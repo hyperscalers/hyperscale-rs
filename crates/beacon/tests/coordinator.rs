@@ -13,9 +13,10 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconCert, BeaconWitnessLeafCount, Epoch, Hash, PcValueElement, PcVector, PcVoteEquivocation,
-    PcVoteRound, ShardId, SpcView, StakePoolId, StateRoot, ValidatorId, ValidatorStatus,
-    zero_bls_signature,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, Bls12381G2Signature,
+    CandidateBeaconBlock, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
+    PcVoteEquivocation, PcVoteRound, PcXpProof, ShardId, SignerBitfield, SpcCert, SpcView,
+    StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verified, VrfProof, zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -860,4 +861,100 @@ fn partition_stalls_committee_side_then_skip_settles() {
         skip.block.block_hash(),
         "both sides converge on the skip block",
     );
+}
+
+/// A candidate landing at the skip deadline splits round 1: half the
+/// pool prevotes the candidate, half prevotes skip, and neither
+/// reaches the quorum of three — the wedge a strict one-vote register
+/// could never leave. Nobody precommitted, so nobody is locked, and
+/// the round-2 re-prevote converges on the candidate every replica
+/// now holds.
+#[test]
+fn split_round_one_converges_on_the_candidate_in_round_two() {
+    let mut sim = CoordinatorSim::new(4, 0x5D_17);
+    let genesis_tip = sim.coordinators[0].latest_block().block_hash();
+
+    // An SPC-certified candidate for epoch 1. The cert is a structural
+    // placeholder — delivery below bypasses wire verification, and
+    // ratification itself never re-checks it; the pool cert is what
+    // commits.
+    let qc2 = PcQc2::new(
+        PcVector::empty(),
+        SignerBitfield::new(4),
+        Bls12381G2Signature([0x11; 96]),
+        PcXpProof::Full,
+    );
+    let qc3 = PcQc3::new(
+        PcVector::empty(),
+        qc2,
+        None,
+        None,
+        SignerBitfield::new(4),
+        PcSignerLengths::Uniform(0),
+        Bls12381G2Signature([0x11; 96]),
+    );
+    let proposal = BeaconProposal::new(
+        std::iter::once((ShardId::ROOT, None)).collect(),
+        Vec::new(),
+        VrfProof::ZERO,
+    );
+    let candidate = Arc::new(Verified::<CandidateBeaconBlock>::new_unchecked_for_test(
+        CandidateBeaconBlock::new(
+            BeaconBlock::new(
+                Epoch::new(1),
+                genesis_tip,
+                vec![(ValidatorId::new(0), proposal)],
+            ),
+            Box::new(SpcCert::Direct {
+                prev_view: SpcView::new(1),
+                value: PcVector::empty(),
+                proof: qc3.into(),
+            }),
+        ),
+    ));
+    let candidate_hash = candidate.block_hash();
+
+    // Replicas 0 and 1 see the candidate before their deadline and
+    // prevote it in round 1.
+    sim.deliver_candidate_to(0, &candidate);
+    sim.deliver_candidate_to(1, &candidate);
+
+    // Replicas 2 and 3 hit the deadline first and prevote skip.
+    sim.pass_skip_deadline();
+    sim.fire_beacon_skip_timer(2);
+    sim.fire_beacon_skip_timer(3);
+    sim.run_for_at_most(10_000);
+
+    // Round 1 split 2–2 below the quorum of 3: no polka, no lock, no
+    // commit anywhere.
+    for i in 0..4 {
+        assert!(sim.commits[i].is_empty(), "replica {i} committed early");
+    }
+
+    // The candidate reaches the late half (its round-1 register is
+    // spent, so holding it changes only what round 2 prevotes)...
+    sim.deliver_candidate_to(2, &candidate);
+    sim.deliver_candidate_to(3, &candidate);
+
+    // ...and the rounds advance. The first fire on replicas 0 and 1 is
+    // their deadline edge — registers already spent, no vote — which
+    // arms round-timeout semantics for the next fire.
+    sim.fire_beacon_skip_timer(0);
+    sim.fire_beacon_skip_timer(1);
+    // Round timeout on all four: everyone enters round 2 unlocked with
+    // the candidate held, re-prevotes it, and the polka, precommits,
+    // and commit certificate follow.
+    for i in 0..4 {
+        sim.fire_beacon_skip_timer(i);
+    }
+    sim.run_for_at_most(10_000);
+
+    for i in 0..4 {
+        let commit = sim.commits[i]
+            .last()
+            .unwrap_or_else(|| panic!("replica {i} never committed"));
+        assert_eq!(commit.epoch, Epoch::new(1));
+        assert_eq!(commit.block.block_hash(), candidate_hash);
+        assert!(matches!(commit.block.cert(), BeaconCert::Normal { .. }));
+    }
 }

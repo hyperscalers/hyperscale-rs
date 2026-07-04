@@ -1,7 +1,7 @@
-// Model E (register: specs/README.md) — beacon consensus: the inner
-// prefix-consensus (PC) value algebra, the epoch's two commit paths
-// (SPC certificate vs pool skip certificate), and the redesign
-// candidate that closes their dual commit (pool-ratified commits).
+// Model E (register: specs/README.md) — beacon consensus, checked for
+// INV-BEACON-1 (one block per epoch): the inner prefix-consensus (PC)
+// value algebra, the pool-ratified commit path, and the two-path twin
+// whose dual commit shows why both outcomes must ride one pool quorum.
 //
 // Three modules:
 //
@@ -20,27 +20,23 @@
 //   inputs collapse the committed low to empty while every proposal is
 //   pooled somewhere; the collapse violates none of the paper's properties
 //   — Validity is vacuous on divergent inputs — which is why the shipped
-//   fix is the full-coverage feed gate, whose non-collapse property the
+//   feed gate demands full coverage, whose non-collapse property the
 //   `beacon_pc_full` instance pins).
 //
-//   `beacon_epoch` — the two commit paths for one epoch, with PC agreement
-//   as an oracle (at most one Normal block value exists). Checks
-//   INV-BEACON-1 across the paths: no two honest replicas adopt different
-//   blocks at the same epoch. The SPC cert is quorum-signed by the
-//   committee; the skip cert by > 2/3 of the wider pool; adoption is
-//   first-verified-wins at tip + 1 with no cross-path reconciliation
-//   (a replica that verifies a competing block for its adopted epoch
-//   halts — the implementation detects the fork loudly, which this
-//   model treats identically to reaching the invariant violation). The
-//   shipped honest rule is the EXCLUSIVE instance's: a round-3 vote and
-//   a skip request are mutually exclusive per validator per epoch.
+//   `beacon_epoch` — the two-path twin: SPC cert and pool skip cert as
+//   independent commits. Its quorums need not intersect, and
+//   `poolQuorumFork` reaches the dual commit with zero Byzantine
+//   signatures once the pool outgrows the committee — the geometry
+//   ratification exists to close. Checks INV-BEACON-1 across the paths
+//   with PC agreement as an oracle (at most one Normal block value
+//   exists).
 //
-//   `beacon_epoch_ratified` — the redesign candidate (not shipped) that
-//   closes the dual commit: the pool is the single quorum system for
-//   both outcomes, so any two commit certificates intersect in an
-//   honest member at every pool-to-committee ratio. Ratification is
-//   two-phase with locks — single-shot Tendermint over the two values —
-//   because a single-phase pool vote is safe only under a strict
+//   `beacon_epoch_ratified` — the shipped design: the pool is the
+//   single quorum system for both outcomes, so any two commit
+//   certificates intersect in an honest member at every
+//   pool-to-committee ratio. Ratification is two-phase with locks —
+//   single-shot Tendermint over the two values — because a
+//   single-phase pool vote is safe only under a strict
 //   one-vote-per-epoch register, which wedges the epoch when a
 //   late-arriving block splits honest votes near the skip deadline, and
 //   every recovery that re-votes without lock discipline re-opens the
@@ -65,11 +61,13 @@
 //     `on_spc_input_dwell_timer` / `feed_view_one_input` — the positional
 //     proposal-hash vector, fed at full coverage with a bounded dwell
 //     fallback to partial.
-//   - Skip path: crates/beacon/src/skip_tracker.rs — pool quorum
-//     `ceil(2P/3) + 1`; crates/beacon/src/coordinator.rs
-//     `on_beacon_block_received` (admission only at tip + 1 with matching
-//     prev hash; a block at or below the tip is dropped) and `adopt_block`
-//     (no fork choice, no cross-path arbitration).
+//   - Ratification: crates/beacon/src/ratify.rs (`RatifyTracker` —
+//     registers, polka detection, locks, cert assembly);
+//     crates/types/src/beacon/ratify.rs (`RatifyVote`, `RatifyCert`,
+//     `ratify_quorum`); crates/beacon/src/coordinator.rs
+//     `assemble_and_broadcast_candidate` / `on_beacon_ratify_timer` /
+//     `commit_ratified_block`, with `on_beacon_block_received`
+//     admission only at tip + 1 and terminal adoption.
 //
 // Modeling assumptions:
 //   - Crypto is ideal: certificates exist iff the vote sets they claim
@@ -85,6 +83,13 @@
 //   - Input vectors carry two positions over a three-value alphabet
 //     (0 = BOTTOM, 1/2 = proposal hashes) — a scoped-down positional
 //     vector; the prefix algebra is length-generic.
+//   - One epoch, static pool. The implementation derives the pool per
+//     tip (`derive_active_pool`, crates/types/src/beacon/state.rs): the
+//     beacon-eligible serving set — ready on a live chain, reshape-fold
+//     seats excluded until their chain seeds — so every candidate
+//     outcome at one tip shares one signer base, which is the model's
+//     POOL. Cross-epoch replay is out of scope: votes bind
+//     (anchor, epoch), and chained-epoch mechanization is deferred.
 //   - One PC instance. SPC view sequencing, indirect certificates
 //     (paper Lemmas A.3-A.5), and the commit-walk parent resolution are
 //     deferred to a revision, as is PC liveness. The implementation's
@@ -98,48 +103,47 @@
 // Run:
 //   quint typecheck specs/beacon_spc.qnt
 //   quint run    --main=beacon_pc_ok    --invariant=invAll --max-samples=50 --max-steps=8 specs/beacon_spc.qnt
-//     (~75s; the per-step nondet map spaces make random simulation slow —
+//     (the per-step nondet map spaces make random simulation slow —
 //      Apalache is the effective tier for this model)
-//   quint verify --main=beacon_pc_ok    --invariant=invAll --max-steps=8 specs/beacon_spc.qnt   (~15 min)
-//   quint verify --main=beacon_pc_full  --invariant=invLowIsFull --max-steps=8 specs/beacon_spc.qnt   (~3 min)
+//   quint verify --main=beacon_pc_ok    --invariant=invAll --max-steps=8 specs/beacon_spc.qnt
+//   quint verify --main=beacon_pc_full  --invariant=invLowIsFull --max-steps=8 specs/beacon_spc.qnt
 //   quint test   --main=beacon_pc_eager --match=eagerCollapse specs/beacon_spc.qnt
 //   quint verify --main=beacon_pc_eager --invariant=invLowNonEmpty --max-steps=6 specs/beacon_spc.qnt
-//     (counterexample in ~21s: the prefix collapse — divergent inputs
+//     (counterexample: the prefix collapse — divergent inputs
 //      commit empty)
 //   quint test   --main=beacon_pc_two_round --match=equivocationWindow specs/beacon_spc.qnt
 //   quint verify --main=beacon_pc_two_round --invariant=invDecisionsConsistent --max-steps=5 specs/beacon_spc.qnt
-//     (counterexample in ~32s: round-1 equivocation forks the decided highs)
+//     (counterexample: round-1 equivocation forks the decided highs)
 //   quint test   --main=beacon_epoch_dual --match=dualPathFork specs/beacon_spc.qnt
 //   quint verify --main=beacon_epoch_dual --invariant=invOneBlock --max-steps=5 specs/beacon_spc.qnt
-//     (counterexample in ~7s: Normal and Skip both commit for one epoch —
+//     (counterexample: Normal and Skip both commit for one epoch —
 //      no Byzantine signer required, only asymmetric delivery)
 //   quint verify --main=beacon_epoch_exclusive --invariant=invOneBlock --max-steps=8 specs/beacon_spc.qnt
-//     (holds, ~20s: sign-path mutual exclusion restores safety at
+//     (holds: sign-path mutual exclusion restores safety at
 //      pool == committee)
 //   quint test   --main=beacon_epoch_exclusive_pool --match=poolQuorumFork specs/beacon_spc.qnt
 //     (mutual exclusion is insufficient once the pool outgrows the
 //      committee — the skip quorum forms without any committee overlap)
 //   quint verify --main=beacon_epoch_ratified_pool --invariant=invAll --max-steps=6 specs/beacon_spc.qnt
-//     (holds, ~90 min: pool-quorum ratification of both paths closes
-//      the dual commit at the exact geometry that refutes the shipped
+//     (holds: pool-quorum ratification of both paths closes
+//      the dual commit at the exact geometry that refutes sign-path
 //      exclusion. Depth 6 is this size's fork horizon, not a guess:
 //      the DIRECT_COMMIT twin's dual commit lands within 6 steps at
 //      the same pool of 12, and each batched action is a whole
 //      protocol phase — a full attack shape is ~5 phases. Depth 7+
-//      is intractable here (state 7 alone projects to hours); the
-//      deeper depth-8 sweeps run on the smaller instances below)
+//      is intractable here; the deeper depth-8 sweeps run on the
+//      smaller instances below)
 //   quint verify --main=beacon_epoch_ratified_committee --invariant=invAll --max-steps=8 specs/beacon_spc.qnt
-//     (holds, ~4 min: parity with beacon_epoch_exclusive at
+//     (holds: parity with beacon_epoch_exclusive at
 //      pool == committee)
 //   quint test   --main=beacon_epoch_ratified_pool --match="poolQuorumSettles|splitVoteConverges" specs/beacon_spc.qnt
 //   quint test   --main=beacon_epoch_ratified_relock --match=relockConverges specs/beacon_spc.qnt
 //   quint verify --main=beacon_epoch_ratified_relock --invariant=invAll --max-steps=7 specs/beacon_spc.qnt
-//     (holds, ~40 min: leaving a lock for a strictly newer polka
+//     (holds: leaving a lock for a strictly newer polka
 //      preserves safety — the subtlest honest rule, at the smallest
 //      pool where it can fire. Depth 7 covers the rule: the shortest
 //      dual cert a broken re-lock admits is five phases, and the
-//      three-round exploit shape is seven; step 8 projects to many
-//      hours)
+//      three-round exploit shape is seven; step 8 is intractable)
 //   quint test   --main=beacon_epoch_ratified_direct --match=directRevoteFork specs/beacon_spc.qnt
 //   quint verify --main=beacon_epoch_ratified_direct --invariant=invOneBlock --max-steps=6 specs/beacon_spc.qnt
 //     (counterexample: single-phase ratification with re-vote recovery
@@ -486,10 +490,8 @@ module beacon_epoch {
   // non-committee members.
   const F: int
   const POOL_EXTRA: int
-  // The shipped honest rule (coordinator vote-3 / skip-request
-  // exclusion): an honest validator signs at most one of the two paths
-  // per epoch. Instances with EXCLUSIVE = false are the twin without
-  // it.
+  // Sign-path exclusion: an honest validator signs at most one of the
+  // two paths per epoch. Instances with EXCLUSIVE = false drop it.
   const EXCLUSIVE: bool
 
   pure val N = 3 * F + 1
@@ -498,7 +500,7 @@ module beacon_epoch {
   pure val BYZ = 1.to(F)
   pure val POOL = 1.to(N + POOL_EXTRA)
   pure val HONEST_POOL = POOL.exclude(BYZ)
-  // skip_tracker quorum: ceil(2P/3) + 1 over the active pool.
+  // Skip-cert quorum: ceil(2P/3) + 1 over the active pool.
   pure val SKIP_QUORUM = (2 * (N + POOL_EXTRA) + 2) / 3 + 1
 
   pure val NONE = 0
@@ -639,17 +641,16 @@ module beacon_epoch_dual {
   import beacon_epoch(F = 1, POOL_EXTRA = 0, EXCLUSIVE = false).*
 }
 
-// The shipped rule at pool == committee: mutual exclusion between the
-// sign paths makes the two quorums intersect in an honest signer, so
-// both certificates cannot form.
+// Sign-path exclusion at pool == committee: the two quorums intersect
+// in an honest signer, so both certificates cannot form.
 module beacon_epoch_exclusive {
   import beacon_epoch(F = 1, POOL_EXTRA = 0, EXCLUSIVE = true).*
 }
 
-// The shipped rule with a pool of 12 over a committee of 4: the skip
-// quorum (9) forms without touching the SPC quorum, and the fork
+// Sign-path exclusion with a pool of 12 over a committee of 4: the
+// skip quorum (9) forms without touching the SPC quorum, and the fork
 // returns — the exclusion shrinks the window, it does not close it;
-// the open finding, detected at contact by the halt.
+// the geometry ratification closes.
 module beacon_epoch_exclusive_pool {
   import beacon_epoch(F = 1, POOL_EXTRA = 8, EXCLUSIVE = true).*
 }
@@ -657,10 +658,9 @@ module beacon_epoch_exclusive_pool {
 // ─────────────────────────────────────────────────────────────────────────
 
 module beacon_epoch_ratified {
-  // The redesign candidate for the dual commit (not shipped): the pool
-  // is the single quorum system for BOTH outcomes. The committee's SPC
-  // certificate stops being a commit and becomes a proposal
-  // certificate; a block — Normal or Skip — commits only through a pool
+  // The pool is the single quorum system for BOTH outcomes. The
+  // committee's SPC certificate is a proposal certificate, not a
+  // commit; a block — Normal or Skip — commits only through a pool
   // ratification certificate, so any two commit quorums intersect in
   // more than P/3 members, an honest one among them, whatever the
   // pool-to-committee ratio. Skip keeps its role (a dead committee
@@ -693,7 +693,12 @@ module beacon_epoch_ratified {
   pure val BYZ = 1.to(F)
   pure val POOL = 1.to(N + POOL_EXTRA)
   pure val HONEST_POOL = POOL.exclude(BYZ)
-  pure val POOL_QUORUM = (2 * (N + POOL_EXTRA) + 2) / 3 + 1
+  // The standard BFT quorum (`ratify_quorum`,
+  // crates/types/src/beacon/ratify.rs): 2f+1 at pool 3f+1 — any two
+  // quorums share an honest signer while tolerating f unresponsive
+  // members. At the pool of 12 this is 9, matching the two-path twin's
+  // skip threshold at that size.
+  pure val POOL_QUORUM = (N + POOL_EXTRA) - (N + POOL_EXTRA - 1) / 3
   pure val ROUNDS = 1.to(MAX_ROUND)
 
   pure val NONE = 0
@@ -868,7 +873,7 @@ module beacon_epoch_ratified {
 
   val invAll = invOneBlock and invOneCert
 
-  // The shipped design's pool-quorum fork, replayed against
+  // The two-path twin's pool-quorum fork, replayed against
   // ratification (pool 12, quorum 9, Byzantine seat 1): the SPC quorum
   // {1,2,3} certifies the proposal; the far side of the partition
   // prevotes SKIP and ratifies it without touching the committee — and
@@ -906,7 +911,7 @@ module beacon_epoch_ratified {
   // rest of the pool moves on: the round-2 SKIP polka is strictly newer
   // than the round-1 lock, so the locked member leaves it in round 3
   // and the pool ratifies Skip. Sized for the relock instance (pool 7,
-  // quorum 6, MAX_ROUND = 3).
+  // quorum 5, MAX_ROUND = 3).
   run relockConverges = {
     init
       .then(signSpcBy(Set(1, 2, 3)))
@@ -938,8 +943,8 @@ module beacon_epoch_ratified {
   }
 }
 
-// The redesign at the exact geometry that refutes the shipped
-// exclusion (pool 12 over committee 4 — beacon_epoch_exclusive_pool's
+// Ratification at the exact geometry that refutes sign-path exclusion
+// (pool 12 over committee 4 — beacon_epoch_exclusive_pool's
 // configuration): both paths commit through the pool quorum and the
 // dual commit is closed, whatever the delivery order.
 module beacon_epoch_ratified_pool {
@@ -948,10 +953,9 @@ module beacon_epoch_ratified_pool {
 
 // Three rounds: enough for a lock to form AND be left behind (lock at
 // round 1, newer polka at round 2, re-prevote at round 3) — the
-// re-lock rule's full reach. The pool shrinks to 7 (quorum 6): the
-// smallest with slack for a polka to form past a locked member
-// (P − Q = 1), keeping the extra round verifiable; the fork geometry
-// needs no third round and stays with the pool-of-12 instances.
+// re-lock rule's full reach. The pool shrinks to 7 (quorum 5),
+// keeping the extra round verifiable; the fork geometry needs no
+// third round and stays with the pool-of-12 instances.
 module beacon_epoch_ratified_relock {
   import beacon_epoch_ratified(F = 1, POOL_EXTRA = 3, MAX_ROUND = 3, DIRECT_COMMIT = false).*
 }

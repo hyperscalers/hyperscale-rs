@@ -249,7 +249,7 @@ impl RatifyCert {
 /// members, which the commit path's liveness rides on.
 #[must_use]
 pub const fn ratify_quorum(pool_size: usize) -> usize {
-    pool_size - (pool_size - 1) / 3
+    pool_size - pool_size.saturating_sub(1) / 3
 }
 
 // ─── Verifiers ─────────────────────────────────────────────────────────────
