@@ -1,8 +1,9 @@
 // Model E (register: specs/README.md) — beacon consensus: the inner
-// prefix-consensus (PC) value algebra, and the epoch's two commit paths
-// (SPC certificate vs pool skip certificate).
+// prefix-consensus (PC) value algebra, the epoch's two commit paths
+// (SPC certificate vs pool skip certificate), and the redesign
+// candidate that closes their dual commit (pool-ratified commits).
 //
-// Two layers, two modules:
+// Three modules:
 //
 //   `beacon_pc` — the three-round PC value pipeline: the Prefix Consensus
 //   protocol of Xiang/Tonkikh/Spiegelman, "Prefix Consensus For Censorship
@@ -33,6 +34,17 @@
 //   model treats identically to reaching the invariant violation). The
 //   shipped honest rule is the EXCLUSIVE instance's: a round-3 vote and
 //   a skip request are mutually exclusive per validator per epoch.
+//
+//   `beacon_epoch_ratified` — the redesign candidate (not shipped) that
+//   closes the dual commit: the pool is the single quorum system for
+//   both outcomes, so any two commit certificates intersect in an
+//   honest member at every pool-to-committee ratio. Ratification is
+//   two-phase with locks — single-shot Tendermint over the two values —
+//   because a single-phase pool vote is safe only under a strict
+//   one-vote-per-epoch register, which wedges the epoch when a
+//   late-arriving block splits honest votes near the skip deadline, and
+//   every recovery that re-votes without lock discipline re-opens the
+//   fork (the DIRECT_COMMIT twin).
 //
 // Code anchors:
 //   - Prefix algebra: crates/types/src/beacon/prefix_ops.rs — `mcp`,
@@ -107,6 +119,31 @@
 //   quint test   --main=beacon_epoch_exclusive_pool --match=poolQuorumFork specs/beacon_spc.qnt
 //     (mutual exclusion is insufficient once the pool outgrows the
 //      committee — the skip quorum forms without any committee overlap)
+//   quint verify --main=beacon_epoch_ratified_pool --invariant=invAll --max-steps=6 specs/beacon_spc.qnt
+//     (holds, ~90 min: pool-quorum ratification of both paths closes
+//      the dual commit at the exact geometry that refutes the shipped
+//      exclusion. Depth 6 is this size's fork horizon, not a guess:
+//      the DIRECT_COMMIT twin's dual commit lands within 6 steps at
+//      the same pool of 12, and each batched action is a whole
+//      protocol phase — a full attack shape is ~5 phases. Depth 7+
+//      is intractable here (state 7 alone projects to hours); the
+//      deeper depth-8 sweeps run on the smaller instances below)
+//   quint verify --main=beacon_epoch_ratified_committee --invariant=invAll --max-steps=8 specs/beacon_spc.qnt
+//     (holds, ~4 min: parity with beacon_epoch_exclusive at
+//      pool == committee)
+//   quint test   --main=beacon_epoch_ratified_pool --match="poolQuorumSettles|splitVoteConverges" specs/beacon_spc.qnt
+//   quint test   --main=beacon_epoch_ratified_relock --match=relockConverges specs/beacon_spc.qnt
+//   quint verify --main=beacon_epoch_ratified_relock --invariant=invAll --max-steps=7 specs/beacon_spc.qnt
+//     (holds, ~40 min: leaving a lock for a strictly newer polka
+//      preserves safety — the subtlest honest rule, at the smallest
+//      pool where it can fire. Depth 7 covers the rule: the shortest
+//      dual cert a broken re-lock admits is five phases, and the
+//      three-round exploit shape is seven; step 8 projects to many
+//      hours)
+//   quint test   --main=beacon_epoch_ratified_direct --match=directRevoteFork specs/beacon_spc.qnt
+//   quint verify --main=beacon_epoch_ratified_direct --invariant=invOneBlock --max-steps=6 specs/beacon_spc.qnt
+//     (counterexample: single-phase ratification with re-vote recovery
+//      re-opens the fork)
 
 module beacon_pc {
   // Byzantine tolerance: committee 3F+1, quorum 2F+1 (= n - f).
@@ -615,4 +652,318 @@ module beacon_epoch_exclusive {
 // the open finding, detected at contact by the halt.
 module beacon_epoch_exclusive_pool {
   import beacon_epoch(F = 1, POOL_EXTRA = 8, EXCLUSIVE = true).*
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+
+module beacon_epoch_ratified {
+  // The redesign candidate for the dual commit (not shipped): the pool
+  // is the single quorum system for BOTH outcomes. The committee's SPC
+  // certificate stops being a commit and becomes a proposal
+  // certificate; a block — Normal or Skip — commits only through a pool
+  // ratification certificate, so any two commit quorums intersect in
+  // more than P/3 members, an honest one among them, whatever the
+  // pool-to-committee ratio. Skip keeps its role (a dead committee
+  // produces no SPC cert and the pool ratifies Skip unaided), and the
+  // committee loses unilateral commit authority (a fully Byzantine
+  // committee draw can certify proposals, never commit them).
+  //
+  // Ratification is two-phase with locks — single-shot Tendermint over
+  // the two values: a prevote quorum (polka) gates precommits, a
+  // precommit quorum commits, and precommitting locks the member; a
+  // later round may leave a lock only toward a value with a strictly
+  // newer polka. The phases are not ceremony. A single-phase pool vote
+  // is safe only under a strict one-vote-per-epoch register, and that
+  // wedges the epoch whenever a block arriving near the skip deadline
+  // splits honest votes below both quorums — nobody may vote again.
+  // Every recovery that re-votes without lock discipline re-opens the
+  // fork: the DIRECT_COMMIT twin commits Skip in round 1 and "recovers"
+  // into a Normal commit in round 2.
+  const F: int
+  const POOL_EXTRA: int
+  // Rounds available to the ratification instance.
+  const MAX_ROUND: int
+  // Twin switch: commit at a bare prevote quorum — single-phase, no
+  // precommits, no locks — the naive re-vote recovery design.
+  const DIRECT_COMMIT: bool
+
+  pure val N = 3 * F + 1
+  pure val QUORUM = 2 * F + 1
+  pure val COMMITTEE = 1.to(N)
+  pure val BYZ = 1.to(F)
+  pure val POOL = 1.to(N + POOL_EXTRA)
+  pure val HONEST_POOL = POOL.exclude(BYZ)
+  pure val POOL_QUORUM = (2 * (N + POOL_EXTRA) + 2) / 3 + 1
+  pure val ROUNDS = 1.to(MAX_ROUND)
+
+  pure val NONE = 0
+  pure val NORMAL = 1
+  pure val SKIP = 2
+  pure val VALUES = Set(NORMAL, SKIP)
+
+  // Committee members backing the epoch's SPC certificate — a proposal
+  // certificate here, not a commit. PC agreement is the oracle: at
+  // most one Normal block value exists.
+  var spcSigners: Set[int]
+  // Honest ratification votes, one per member per round per phase.
+  // Byzantine signatures never appear as records: every quorum check
+  // adds F wildcards — "every Byzantine seat countersigns every
+  // aggregate", at least as strong as any concrete Byzantine schedule.
+  var prevotes: Set[{ m: int, r: int, v: int }]
+  var precommits: Set[{ m: int, r: int, v: int }]
+  // Highest-round precommit per honest member (v = NONE, r = 0 while
+  // unlocked).
+  var locks: int -> { v: int, r: int }
+  // Honest members' current round — votes never go backwards. Without
+  // this the model reaches states no real execution has (a member
+  // prevoting round 1 after acting in round 2), and those states fork.
+  var roundOf: int -> int
+  // Per-replica adopted block for the epoch; adoption is terminal.
+  var adopted: int -> int
+
+  val spcCert = spcSigners.size() >= QUORUM
+
+  def prevoteQuorum(r: int, v: int): bool =
+    prevotes.filter(p => p.r == r and p.v == v).size() + F >= POOL_QUORUM
+
+  def precommitQuorum(r: int, v: int): bool =
+    precommits.filter(p => p.r == r and p.v == v).size() + F >= POOL_QUORUM
+
+  // The commit rule: a pool ratification certificate for `v`.
+  def committed(v: int): bool =
+    if (DIRECT_COMMIT) ROUNDS.exists(r => prevoteQuorum(r, v))
+    else ROUNDS.exists(r => precommitQuorum(r, v))
+
+  action init = all {
+    spcSigners' = Set(),
+    prevotes' = Set(),
+    precommits' = Set(),
+    locks' = HONEST_POOL.mapBy(m => { v: NONE, r: 0 }),
+    roundOf' = HONEST_POOL.mapBy(m => 1),
+    adopted' = POOL.mapBy(m => NONE),
+  }
+
+  // Committee members sign the SPC path — unconditionally: with the
+  // pool certificate as the commit rule, nothing about safety rides on
+  // who signs the proposal certificate.
+  action signSpcBy(s: Set[int]): bool = all {
+    s.subseteq(COMMITTEE),
+    s.size() > 0,
+    spcSigners' = spcSigners.union(s),
+    prevotes' = prevotes, precommits' = precommits, locks' = locks,
+    roundOf' = roundOf, adopted' = adopted,
+  }
+
+  action signSpc = {
+    nondet s = COMMITTEE.powerset().oneOf()
+    signSpcBy(s)
+  }
+
+  // Honest members prevote `v` in round `r`: NORMAL only once the
+  // SPC-certified block exists to have been received, SKIP any time
+  // (the local skip deadline or round timeout — free under asynchrony).
+  // A locked member prevotes its lock, unless a strictly newer polka
+  // backs the other value (the re-lock rule liveness needs).
+  action castPrevotesAs(s: Set[int], r: int, v: int): bool = all {
+    s.subseteq(HONEST_POOL),
+    s.size() > 0,
+    ROUNDS.contains(r),
+    VALUES.contains(v),
+    v == SKIP or spcCert,
+    s.forall(m => all {
+      roundOf.get(m) <= r,
+      not(prevotes.exists(p => p.m == m and p.r == r)),
+      or {
+        locks.get(m).v == NONE,
+        locks.get(m).v == v,
+        ROUNDS.exists(rp => locks.get(m).r < rp and rp < r and prevoteQuorum(rp, v)),
+      },
+    }),
+    prevotes' = prevotes.union(s.map(m => { m: m, r: r, v: v })),
+    roundOf' = HONEST_POOL.mapBy(m => if (s.contains(m)) r else roundOf.get(m)),
+    spcSigners' = spcSigners, precommits' = precommits, locks' = locks,
+    adopted' = adopted,
+  }
+
+  action castPrevotes = {
+    nondet s = HONEST_POOL.powerset().oneOf()
+    nondet r = ROUNDS.oneOf()
+    nondet v = VALUES.oneOf()
+    castPrevotesAs(s, r, v)
+  }
+
+  // Honest members precommit `v` in round `r` upon its polka, locking
+  // themselves to it: a precommit is a signed commit-share, and once it
+  // exists its signer must assume a certificate may assemble around it.
+  action castPrecommitsAs(s: Set[int], r: int, v: int): bool = all {
+    not(DIRECT_COMMIT),
+    s.subseteq(HONEST_POOL),
+    s.size() > 0,
+    ROUNDS.contains(r),
+    VALUES.contains(v),
+    prevoteQuorum(r, v),
+    s.forall(m => all {
+      roundOf.get(m) <= r,
+      not(precommits.exists(p => p.m == m and p.r == r)),
+    }),
+    precommits' = precommits.union(s.map(m => { m: m, r: r, v: v })),
+    locks' = HONEST_POOL.mapBy(m =>
+      if (s.contains(m) and r > locks.get(m).r) { v: v, r: r } else locks.get(m)),
+    roundOf' = HONEST_POOL.mapBy(m => if (s.contains(m)) r else roundOf.get(m)),
+    spcSigners' = spcSigners, prevotes' = prevotes, adopted' = adopted,
+  }
+
+  action castPrecommits = {
+    nondet s = HONEST_POOL.powerset().oneOf()
+    nondet r = ROUNDS.oneOf()
+    nondet v = VALUES.oneOf()
+    castPrecommitsAs(s, r, v)
+  }
+
+  // Adoption follows certificates. A member that once precommitted the
+  // other value still adopts what committed — locks discipline votes,
+  // not adoption.
+  action adoptNormalBy(m: int): bool = all {
+    HONEST_POOL.contains(m),
+    spcCert,
+    committed(NORMAL),
+    adopted.get(m) == NONE,
+    adopted' = adopted.put(m, NORMAL),
+    spcSigners' = spcSigners, prevotes' = prevotes, precommits' = precommits,
+    locks' = locks, roundOf' = roundOf,
+  }
+
+  action adoptSkipBy(m: int): bool = all {
+    HONEST_POOL.contains(m),
+    committed(SKIP),
+    adopted.get(m) == NONE,
+    adopted' = adopted.put(m, SKIP),
+    spcSigners' = spcSigners, prevotes' = prevotes, precommits' = precommits,
+    locks' = locks, roundOf' = roundOf,
+  }
+
+  action adoptNormal = {
+    nondet m = HONEST_POOL.oneOf()
+    adoptNormalBy(m)
+  }
+
+  action adoptSkip = {
+    nondet m = HONEST_POOL.oneOf()
+    adoptSkipBy(m)
+  }
+
+  action step = any { signSpc, castPrevotes, castPrecommits, adoptNormal, adoptSkip }
+
+  // INV-BEACON-1: no two honest replicas hold different blocks for the
+  // epoch.
+  val invOneBlock = not(HONEST_POOL.exists(a => HONEST_POOL.exists(b => all {
+    adopted.get(a) == NORMAL,
+    adopted.get(b) == SKIP,
+  })))
+
+  // The certificate-level core: the two ratification certificates
+  // cannot coexist. Two pool quorums share honest members; within a
+  // round each votes once, and across rounds the lock rule pins them.
+  val invOneCert = not(committed(NORMAL) and committed(SKIP))
+
+  val invAll = invOneBlock and invOneCert
+
+  // The shipped design's pool-quorum fork, replayed against
+  // ratification (pool 12, quorum 9, Byzantine seat 1): the SPC quorum
+  // {1,2,3} certifies the proposal; the far side of the partition
+  // prevotes SKIP and ratifies it without touching the committee — and
+  // that is now the epoch's ONLY commit. The near side's NORMAL
+  // prevotes stall below quorum, Normal is unadoptable, and the
+  // minority syncs the skip block on heal instead of forking.
+  run poolQuorumSettles = {
+    init
+      .then(signSpcBy(Set(1, 2, 3)))
+      .then(castPrevotesAs(Set(5, 6, 7, 8, 9, 10, 11, 12), 1, SKIP))
+      .then(castPrecommitsAs(Set(5, 6, 7, 8, 9, 10, 11, 12), 1, SKIP))
+      .then(adoptSkipBy(5))
+      .then(castPrevotesAs(Set(2, 3, 4), 1, NORMAL))
+      .expect(committed(SKIP) and not(committed(NORMAL)) and invOneBlock)
+  }
+
+  // A block arriving at the skip deadline splits round 1 below both
+  // quorums — the case a strict one-vote-per-epoch register wedges on.
+  // Round 2 converges: no polka formed, so nobody precommitted, nobody
+  // is locked, and the pool re-prevotes freely and ratifies Normal.
+  run splitVoteConverges = {
+    init
+      .then(signSpcBy(Set(2, 3, 4)))
+      .then(castPrevotesAs(Set(2, 3, 4, 5, 6, 7), 1, NORMAL))
+      .then(castPrevotesAs(Set(8, 9, 10, 11, 12), 1, SKIP))
+      .then(castPrevotesAs(Set(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 2, NORMAL))
+      .then(castPrecommitsAs(Set(2, 3, 4, 5, 6, 7, 8, 9), 2, NORMAL))
+      .then(adoptNormalBy(2))
+      .then(adoptNormalBy(12))
+      .expect(committed(NORMAL) and not(committed(SKIP)) and invOneBlock)
+  }
+
+  // A partial round-1 lock on Normal (one member precommits on the
+  // polka; no certificate forms) must not wedge the epoch after the
+  // rest of the pool moves on: the round-2 SKIP polka is strictly newer
+  // than the round-1 lock, so the locked member leaves it in round 3
+  // and the pool ratifies Skip. Sized for the relock instance (pool 7,
+  // quorum 6, MAX_ROUND = 3).
+  run relockConverges = {
+    init
+      .then(signSpcBy(Set(1, 2, 3)))
+      .then(castPrevotesAs(Set(2, 3, 4, 5, 6), 1, NORMAL))
+      .then(castPrecommitsAs(Set(2), 1, NORMAL))
+      .then(castPrevotesAs(Set(3, 4, 5, 6, 7), 2, SKIP))
+      .then(castPrevotesAs(Set(2), 3, SKIP))
+      .then(castPrevotesAs(Set(3, 4, 5, 6, 7), 3, SKIP))
+      .then(castPrecommitsAs(Set(2, 3, 4, 5, 6), 3, SKIP))
+      .then(adoptSkipBy(2))
+      .expect(committed(SKIP) and not(committed(NORMAL)) and invOneBlock)
+  }
+
+  // The naive recovery, mechanized: single-phase ratification (commit
+  // at a bare prevote quorum) with re-voting across rounds. The
+  // partitioned side ratifies Skip in round 1; the SPC block then
+  // surfaces and round 2 "recovers" by re-voting Normal — both
+  // certificates exist and the fork is back. Locks are the escape from
+  // the register-wedges-or-revote-forks dilemma, which is what the
+  // second phase is for.
+  run directRevoteFork = {
+    init
+      .then(signSpcBy(Set(1, 2, 3)))
+      .then(castPrevotesAs(Set(5, 6, 7, 8, 9, 10, 11, 12), 1, SKIP))
+      .then(adoptSkipBy(5))
+      .then(castPrevotesAs(Set(2, 3, 4, 5, 6, 7, 8, 9), 2, NORMAL))
+      .then(adoptNormalBy(2))
+      .expect(not(invOneBlock))
+  }
+}
+
+// The redesign at the exact geometry that refutes the shipped
+// exclusion (pool 12 over committee 4 — beacon_epoch_exclusive_pool's
+// configuration): both paths commit through the pool quorum and the
+// dual commit is closed, whatever the delivery order.
+module beacon_epoch_ratified_pool {
+  import beacon_epoch_ratified(F = 1, POOL_EXTRA = 8, MAX_ROUND = 2, DIRECT_COMMIT = false).*
+}
+
+// Three rounds: enough for a lock to form AND be left behind (lock at
+// round 1, newer polka at round 2, re-prevote at round 3) — the
+// re-lock rule's full reach. The pool shrinks to 7 (quorum 6): the
+// smallest with slack for a polka to form past a locked member
+// (P − Q = 1), keeping the extra round verifiable; the fork geometry
+// needs no third round and stays with the pool-of-12 instances.
+module beacon_epoch_ratified_relock {
+  import beacon_epoch_ratified(F = 1, POOL_EXTRA = 3, MAX_ROUND = 3, DIRECT_COMMIT = false).*
+}
+
+// Pool == committee parity with `beacon_epoch_exclusive`.
+module beacon_epoch_ratified_committee {
+  import beacon_epoch_ratified(F = 1, POOL_EXTRA = 0, MAX_ROUND = 2, DIRECT_COMMIT = false).*
+}
+
+// The single-phase twin: commits at a bare prevote quorum, so nobody
+// ever locks, and cross-round re-voting — any recovery from a split —
+// re-opens the dual commit.
+module beacon_epoch_ratified_direct {
+  import beacon_epoch_ratified(F = 1, POOL_EXTRA = 8, MAX_ROUND = 2, DIRECT_COMMIT = true).*
 }
