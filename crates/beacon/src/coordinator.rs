@@ -2080,6 +2080,19 @@ impl BeaconCoordinator {
         if self.pending_candidate.is_some() || self.ratify.candidate().is_some() {
             return Vec::new();
         }
+        // The SPC cert authenticates `committed_proposals`, not the
+        // `shard_contributions` projected from them. Re-derive the
+        // canonical projection before dispatching verification, so a
+        // Byzantine assembler's variant (fabricated, stale, extra, or
+        // omitted contribution) never becomes the value honest pool
+        // members prevote.
+        if !rules::contributions_well_formed(&self.state, candidate.block()) {
+            warn!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate has malformed shard contributions — dropping",
+            );
+            return Vec::new();
+        }
         if !self
             .verification
             .mark_candidate_in_flight(candidate.block_hash())
@@ -2815,6 +2828,74 @@ mod tests {
             &coord.state,
             &block_with(short)
         ));
+    }
+
+    /// A gossiped candidate whose `shard_contributions` deviate from
+    /// the canonical projection is dropped before verification is
+    /// dispatched, so honest pool members never prevote a Byzantine
+    /// assembler's variant. The canonical projection of the same
+    /// content dispatches verification normally.
+    #[test]
+    fn malformed_candidate_drops_before_verification_dispatch() {
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"cand-anchor"));
+        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
+        let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
+        let contribution = ShardEpochContribution {
+            boundary_header: b.header().clone(),
+            witnesses: witnesses.into(),
+        };
+        let epoch = coord.state.current_epoch.next();
+        let prev = coord.latest_block.block_hash();
+
+        // The cert content is irrelevant here — the contributions gate
+        // runs before any crypto dispatch — but `SpcCert` has no
+        // structural placeholder, so build a real one.
+        let n = coord.state.committee.len();
+        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
+        let cert_signers: Vec<_> = coord
+            .state
+            .committee
+            .iter()
+            .copied()
+            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .collect();
+        let signer_positions: Vec<usize> = (0..n - (n - 1) / 3).collect();
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            epoch,
+            &keys,
+            &cert_signers,
+            &signer_positions,
+            &PcVector::empty(),
+        );
+        let candidate_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
+            Arc::new(Verifiable::from(CandidateBeaconBlock::new(
+                BeaconBlock::new_with_contributions(epoch, prev, committed.clone(), contribs),
+                Box::new(cert.clone()),
+            )))
+        };
+
+        // Omits the committed shard's contribution — dropped, nothing
+        // dispatched, no prevotable value held.
+        let actions = coord.on_beacon_candidate_received(candidate_with(BTreeMap::new()));
+        assert!(
+            actions.is_empty(),
+            "malformed candidate must not dispatch verification: {actions:?}",
+        );
+        assert!(coord.pending_candidate_hash().is_none());
+
+        // The canonical projection dispatches verification — the drop
+        // above is the contributions gate, not an earlier check.
+        let actions = coord.on_beacon_candidate_received(candidate_with(
+            std::iter::once((shard, contribution)).collect(),
+        ));
+        assert!(
+            matches!(actions.as_slice(), [Action::VerifyBeaconCandidate { .. }]),
+            "canonical candidate dispatches verification: {actions:?}",
+        );
     }
 
     /// Drive any beacon-verify actions in `actions` through to their

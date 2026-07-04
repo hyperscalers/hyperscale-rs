@@ -1207,6 +1207,12 @@ impl BeaconState {
     /// them before the seed would raise the quorum above the set of
     /// nodes that can vote. The parent halves, serving throughout, carry
     /// the pool across that window.
+    ///
+    /// Membership ⊆ shard-serving nodes is also load-bearing for
+    /// delivery: candidate and ratify-vote gossip reaches a node
+    /// through its hosted shards' global-topic fans, and shard-less
+    /// pool followers drop ratify actions — a pool member serving no
+    /// shard would silently lose its vote.
     #[must_use]
     pub fn derive_active_pool(&self) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
         self.beacon_eligible()
