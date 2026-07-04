@@ -1,54 +1,31 @@
-//! Production runner with async I/O.
+//! Production runner with real async I/O.
 //!
-//! This crate provides the production runner that wraps the deterministic
-//! state machine with real async I/O:
+//! Wraps the deterministic node core with the process architecture a live
+//! validator runs: one pinned `std::thread` per hosted shard, each driving
+//! that shard's [`ShardLoop`] and draining a (timer, callback, shutdown)
+//! channel triple in priority order, plus a shared tokio runtime carrying
+//! libp2p, the RPC server, the per-shard timer sleep tasks, and the
+//! per-host metrics + JMT GC ticks.
 //!
-//! - Network messages via tokio channels
-//! - Timers via tokio intervals
-//! - Crypto verification on dedicated rayon thread pool
-//! - Transaction execution on dedicated rayon thread pool
+//! Runtime shard membership — beacon-driven joins and leaves, reshape
+//! duties, and the shard-less follower pool — is executed by the
+//! `ShardSupervisor` on the runner's tokio loop, never on a shard thread.
 //!
-//! # Architecture
-//!
-//! Uses the event aggregator pattern: a single task owns the state machine
-//! and receives events via an mpsc channel. This avoids mutex contention.
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                         Production Node                                 │
-//! │                                                                         │
-//! │  Core 0 (pinned):  State Machine + Event Loop                           │
-//! │  ┌─────────────────────────────────────────────────────────────────────┐│
-//! │  │  ProductionRunner                                                   ││
-//! │  │    └─ loop { event = recv(); actions = state.handle(event); }       ││
-//! │  └─────────────────────────────────────────────────────────────────────┘│
-//! │                                │                                        │
-//! │    ┌───────────────────────────┼───────────────────────────────┐        │
-//! │    ▼                           ▼                               ▼        │
-//! │  Crypto Pool (rayon)      Execution Pool (rayon)       I/O Pool (tokio) │
-//! │  - BLS verification       - Radix Engine               - Network        │
-//! │  - Signature checks       - Merkle computation         - Storage        │
-//! │                                                        - Timers         │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Thread Pool Configuration
-//!
-//! The number of threads for each pool is configurable:
+//! Crypto verification and transaction execution are delegated through a
+//! [`PooledDispatch`] whose thread counts and core pinning are configurable:
 //!
 //! ```no_run
 //! use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
-//! use hyperscale_production::ProductionRunner;
 //! use std::sync::Arc;
 //!
-//! // Configure thread pools with explicit counts
+//! // Configure thread pools with explicit counts.
 //! let config = ThreadPoolConfig::builder()
 //!     .consensus_threads(2)
 //!     .throughput_threads(12)
 //!     .build()
 //!     .unwrap();
 //!
-//! // Enable core pinning for cache locality (Linux only)
+//! // Enable core pinning for cache locality (Linux only).
 //! let config = ThreadPoolConfig::builder()
 //!     .consensus_threads(2)
 //!     .throughput_threads(12)
@@ -60,9 +37,12 @@
 //!
 //! let dispatch = PooledDispatch::new(config, tokio::runtime::Handle::current()).unwrap();
 //!
-//! // Share dispatch across multiple runners (e.g., multi-shard node)
+//! // Share one dispatch across every shard thread on the host.
 //! let shared_dispatch = Arc::new(dispatch);
 //! ```
+//!
+//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
 mod bootstrap;
 pub mod rpc;
