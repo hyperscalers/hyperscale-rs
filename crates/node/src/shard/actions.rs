@@ -689,7 +689,18 @@ where
         // signing actions dropped here, before any signature exists.
         // The state machines stay single-node — passivity is purely a
         // driver decision at this funnel.
-        if let Some(epoch) = action.beacon_signing_epoch()
+        if let Some(position) = action.ratify_signing_position() {
+            if !self.process.allow_ratify_signing(me, position) {
+                trace!(
+                    validator = ?me,
+                    shard = shard.inner(),
+                    epoch = position.0.inner(),
+                    round = position.1.inner(),
+                    "Dropping already-covered ratify vote position"
+                );
+                return;
+            }
+        } else if let Some(epoch) = action.beacon_signing_epoch()
             && !self.process.allow_beacon_signing(me, shard, epoch)
         {
             trace!(

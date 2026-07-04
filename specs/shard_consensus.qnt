@@ -45,7 +45,7 @@
 //   quint typecheck specs/shard_consensus.qnt
 //   quint run    --main=shard_ok    --invariant=invNoFork specs/shard_consensus.qnt
 //   quint verify --main=shard_ok    --invariant=invNoFork --max-steps=8 specs/shard_consensus.qnt
-//     (~2 min; per-step cost grows steeply past depth 8)
+//     (per-step cost grows steeply past depth 8)
 //   quint test   --main=shard_crash --match=crashForkAttack specs/shard_consensus.qnt
 //     (the scripted 9-step crash-equivocation witness: one crash + F
 //      Byzantine forks the commit)

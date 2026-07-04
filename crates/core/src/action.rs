@@ -1476,8 +1476,7 @@ impl Action {
             | Self::SignAndBroadcastEmptyView { epoch, .. }
             | Self::BroadcastSpcNewView { epoch, .. }
             | Self::BroadcastSpcNewCommit { epoch, .. }
-            | Self::BuildAndBroadcastBeaconProposal { epoch, .. }
-            | Self::SignAndBroadcastRatifyVote { epoch, .. } => Some(*epoch),
+            | Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some(*epoch),
             Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
@@ -1521,6 +1520,7 @@ impl Action {
             | Self::Fetch(_)
             | Self::AbandonFetch(_)
             | Self::BroadcastBeaconBlock { .. }
+            | Self::SignAndBroadcastRatifyVote { .. }
             | Self::BroadcastBeaconCandidate { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifyRatifyVote { .. }
@@ -1532,6 +1532,30 @@ impl Action {
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. }
             | Self::CommitBeaconBlock { .. } => None,
+        }
+    }
+
+    /// The ratify-vote position this action signs under the emitting
+    /// validator's identity, or `None` for everything else.
+    ///
+    /// Distinct from [`Self::beacon_signing_epoch`]: ratify votes are
+    /// fenced per `(epoch, round, phase)` — strictly monotone across
+    /// all of a validator's co-hosted vnodes — rather than per epoch
+    /// seat, so a vnode torn down mid-epoch (a reshape drain) hands
+    /// the *next vote position* to its successor instead of fencing
+    /// the validator out of the whole epoch. An epoch fence here would
+    /// wedge ratification at every reshape; a coarser fence than the
+    /// vote position would allow cross-vnode equivocation.
+    #[must_use]
+    pub const fn ratify_signing_position(&self) -> Option<(Epoch, RatifyRound, RatifyPhase)> {
+        match self {
+            Self::SignAndBroadcastRatifyVote {
+                epoch,
+                round,
+                phase,
+                ..
+            } => Some((*epoch, *round, *phase)),
+            _ => None,
         }
     }
 

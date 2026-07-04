@@ -565,6 +565,21 @@ impl CoordinatorSim {
         resolved
     }
 
+    /// Hand a verified candidate to one replica, bypassing the wire
+    /// verification round-trip — for scenarios that stage *when* each
+    /// replica sees the candidate relative to its clock. The replica's
+    /// reaction (its prevote, if the round's register is free) is
+    /// absorbed and queued like any other traffic.
+    pub fn deliver_candidate_to(
+        &mut self,
+        replica_idx: usize,
+        candidate: &Arc<Verified<CandidateBeaconBlock>>,
+    ) {
+        let actions =
+            self.coordinators[replica_idx].on_beacon_candidate_verified(Ok(Arc::clone(candidate)));
+        self.absorb(replica_idx, actions);
+    }
+
     /// Walk `actions`: pass non-verify actions through, and for each
     /// beacon-verify action run the verifier inline, re-enter the
     /// matching result handler, and recursively expand. Returns the
@@ -1350,10 +1365,12 @@ impl CoordinatorSim {
             | Action::AbandonFetch(_)
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
-            | Action::TopologyChanged { .. } => {
+            | Action::TopologyChanged { .. }
+            | Action::ReconfigureParticipation(_) => {
                 // Other Fetch/Abandon variants don't surface from the
-                // beacon coordinator under this sim; timers + topology
-                // are runner concerns the sim doesn't model.
+                // beacon coordinator under this sim; timers, topology,
+                // and participation are runner concerns the sim
+                // doesn't model.
             }
             other => panic!(
                 "CoordinatorSim received unmodelled action variant: {}",

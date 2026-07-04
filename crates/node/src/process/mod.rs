@@ -24,7 +24,8 @@ use hyperscale_engine::TransactionValidation;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Epoch, RoutableTransaction, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
+    Epoch, RatifyPhase, RatifyRound, RoutableTransaction, RoutingCommittees, ShardId,
+    TopologySnapshot, ValidatorId,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -52,6 +53,13 @@ struct BeaconSignerSeat {
     /// the dispatch funnel before the signature exists, so the fence is
     /// conservative even when the dispatched action never sends.
     max_signed_epoch: Epoch,
+    /// Last ratify-vote position any of this validator's vnodes was
+    /// allowed to sign, strictly monotone process-wide. Independent of
+    /// the shard seat: a torn-down vnode's successor continues from
+    /// the next position rather than losing the epoch, and two live
+    /// co-hosted vnodes at the same tip dedup their identical intents
+    /// through the same monotonicity.
+    max_ratify: Option<(Epoch, RatifyRound, RatifyPhase)>,
 }
 
 impl BeaconSignerSeat {
@@ -59,6 +67,7 @@ impl BeaconSignerSeat {
         Self {
             shard: None,
             max_signed_epoch: Epoch::GENESIS,
+            max_ratify: None,
         }
     }
 
@@ -78,6 +87,21 @@ impl BeaconSignerSeat {
                 true
             }
             Some(_) | None => false,
+        }
+    }
+
+    /// Whether a vnode may sign the ratify vote at `position`: strictly
+    /// greater than every position already allowed, whichever vnode
+    /// emitted it. Never two signatures at one `(epoch, round, phase)`
+    /// — cross-vnode equivocation is impossible by construction — and
+    /// never a fenced-out epoch: a successor's first fresh position
+    /// passes.
+    fn allow_ratify(&mut self, position: (Epoch, RatifyRound, RatifyPhase)) -> bool {
+        if Some(position) > self.max_ratify {
+            self.max_ratify = Some(position);
+            true
+        } else {
+            false
         }
     }
 }
@@ -272,6 +296,7 @@ where
             .or_insert(BeaconSignerSeat {
                 shard: Some(shard),
                 max_signed_epoch: Epoch::GENESIS,
+                max_ratify: None,
             });
     }
 
@@ -314,6 +339,24 @@ where
             .entry(validator)
             .or_insert(BeaconSignerSeat::vacant())
             .allow(my_shard, epoch)
+    }
+
+    /// Whether `validator` may sign the ratify vote at `position` —
+    /// see [`BeaconSignerSeat::allow_ratify`].
+    ///
+    /// # Panics
+    /// Panics if the seat registry mutex is poisoned.
+    pub fn allow_ratify_signing(
+        &self,
+        validator: ValidatorId,
+        position: (Epoch, RatifyRound, RatifyPhase),
+    ) -> bool {
+        self.beacon_signers
+            .lock()
+            .expect("beacon signer registry lock")
+            .entry(validator)
+            .or_insert(BeaconSignerSeat::vacant())
+            .allow_ratify(position)
     }
 
     /// Process-level beacon chain storage handle.
