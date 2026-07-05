@@ -495,6 +495,12 @@ struct TerminalMarks {
 /// terminals fold in separate epochs. A split parent seeds in-fold and
 /// never composes, so only merge children (no `split_child_roots`)
 /// carry it.
+///
+/// Terminal is judged by the cut the contribution *crosses*, not the
+/// window its QC lands in: the boundary instant counts as not yet
+/// crossed, so the final window's own refresh — which can certify
+/// exactly on the terminal cut — stays non-terminal, and its pre-freeze
+/// state root never reaches a merge compose.
 fn carried_terminal_marks(
     state: &BeaconState,
     shard: ShardId,
@@ -506,8 +512,14 @@ fn carried_terminal_marks(
         state.boundaries.get(&shard).map_or((None, None), |b| {
             (b.terminal_epoch, b.reshape_admitted_epoch)
         });
-    let is_terminal =
-        terminal_epoch.is_some_and(|t| windows.epoch_for(qc.weighted_timestamp()) > t);
+    let is_terminal = terminal_epoch.is_some_and(|t| {
+        windows
+            .crossing_epoch(
+                header.parent_qc().weighted_timestamp(),
+                qc.weighted_timestamp(),
+            )
+            .is_some_and(|crossed| crossed > t)
+    });
     let terminal_qc_wt =
         (is_terminal && header.split_child_roots().is_none()).then(|| qc.weighted_timestamp());
     (
@@ -2250,6 +2262,96 @@ mod tests {
         // roots stay readable for the composition.
         assert!(state.boundaries.contains_key(&left));
         assert!(state.boundaries.contains_key(&right));
+    }
+
+    /// A final-window refresh certified exactly on the terminal cut is
+    /// not the terminal contribution — the boundary instant counts as
+    /// not yet crossed — so its pre-freeze root never composes the
+    /// merge parent. The real coast block past the cut then composes
+    /// with the frozen terminal root.
+    #[test]
+    fn exact_cut_refresh_does_not_compose_the_merge_parent() {
+        let (mut state, parent, left_root, right_root) = merge_terminating_state();
+        let (left, right) = parent.children();
+
+        // Right child: genuine terminal coast (crosses the 2_000 cut).
+        let (rh, rw) =
+            boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
+        // Left child: spans its whole final window — anchored before the
+        // window opens, certified exactly on the terminal cut. A genuine
+        // crossing (of the cut INTO the final window), carrying the
+        // still-running chain's pre-freeze root.
+        let pre_freeze = StateRoot::from_raw(Hash::from_bytes(b"left pre-freeze root"));
+        let (span_header, span_witnesses) =
+            boundary_block_with_payloads_full(left, 9, 900, pre_freeze, vec![], None, None);
+        let proposal = BeaconProposal::new(
+            [
+                (left, Some(qc_over(&span_header, 2_000))),
+                (right, Some(qc_over(&rh, 2_500))),
+            ]
+            .into_iter()
+            .collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions = [
+            (
+                left,
+                ShardEpochContribution {
+                    boundary_header: span_header,
+                    witnesses: span_witnesses.into(),
+                },
+            ),
+            (
+                right,
+                ShardEpochContribution {
+                    boundary_header: rh.clone(),
+                    witnesses: rw.into(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+
+        // The spanning refresh recorded — but as a live refresh, not a
+        // terminal: no terminal_qc_wt, and the parent stays pending
+        // rather than composing with the pre-freeze root.
+        let left_record = state.boundaries.get(&left).expect("left refreshed");
+        assert_eq!(left_record.state_root, pre_freeze);
+        assert_eq!(left_record.terminal_qc_wt, None);
+        let parent_record = state.boundaries.get(&parent).expect("parent tracked");
+        assert_eq!(
+            parent_record.block_hash,
+            BlockHash::ZERO,
+            "parent composed early"
+        );
+
+        // The real coast block crosses the cut with the frozen root; the
+        // parent composes from it and the lingering right terminal.
+        let (coast_header, coast_witnesses) =
+            boundary_block_with_payloads_full(left, 10, 2_000, left_root, vec![], None, None);
+        let proposal = BeaconProposal::new(
+            std::iter::once((left, Some(qc_over(&coast_header, 2_100)))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions = std::iter::once((
+            left,
+            ShardEpochContribution {
+                boundary_header: coast_header.clone(),
+                witnesses: coast_witnesses.into(),
+            },
+        ))
+        .collect();
+        record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+
+        let anchor = expected_merge_anchor(parent, &coast_header, &rh, 2_000);
+        let record = state.boundaries.get(&parent).expect("parent composed");
+        assert_eq!(record.state_root, anchor.state_root());
+        assert_eq!(record.block_hash, anchor.hash());
     }
 
     /// A lone terminal child holds its record across folds until its
