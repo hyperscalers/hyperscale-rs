@@ -6,9 +6,13 @@
 //! thread; a leave refcounts memberships down and tears the thread, maps,
 //! and storage down at zero. The reconcile pair is the committed-state
 //! backstop: [`ShardSupervisor::reconcile_joins`] brings up any shard a
-//! local validator is committed to that a lost delta never joined, and
-//! [`ShardSupervisor::reconcile_teardown`] retires a shard once no local
-//! validator holds a consensus or routing role in it.
+//! local validator holds a consensus seat in that a lost delta never
+//! joined, and [`ShardSupervisor::reconcile_teardown`] retires a shard
+//! once no local validator holds a committee or routing role in it. The
+//! two read different committee views on purpose: joining asks "must this
+//! host run consensus" (the seatable view, observer riders excluded);
+//! teardown asks "does this host hold any window role" (full membership,
+//! riders included).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -352,10 +356,10 @@ impl ShardSupervisor {
     }
 
     /// Reconcile hosted shards against the committed routing window: tear
-    /// down a shard once no local validator holds a consensus role in it
-    /// (absent from the active committee) and none sits in its routing
-    /// committee (no serve obligation — the shard aged out of the routable
-    /// window, or the validator rotated off a still-live shard).
+    /// down a shard once no local validator holds a role in its active
+    /// committee and none sits in its routing committee (no serve
+    /// obligation — the shard aged out of the routable window, or the
+    /// validator rotated off a still-live shard).
     ///
     /// The active-committee guard keeps a shard up through its current
     /// window even after a lookahead delta moved the validator on in
@@ -384,9 +388,11 @@ impl ShardSupervisor {
     }
 
     /// Reconcile hosted shards against the committed committee assignment: bring
-    /// up any shard a local validator is a committed member of that this host is
+    /// up any shard a local validator holds a consensus seat in that this host is
     /// not already hosting, bootstrapping, draining, seating from a reshape
-    /// duty, or holding queued behind a drain.
+    /// duty, or holding queued behind a drain. A split-observer ride is not a
+    /// seat — the observer's physical work is its child store, driven by the
+    /// reshape orchestrator, never a consensus vnode on the splitting parent.
     ///
     /// The membership-up mirror of [`Self::reconcile_teardown`]. The placement
     /// delta still drives a join immediately (it arrives an epoch ahead, so the
@@ -403,7 +409,7 @@ impl ShardSupervisor {
             .shard_trie()
             .leaves()
             .filter(|&shard| {
-                host_assigned(shard, &topology_snapshot, &host_ids)
+                host_holds_seat(shard, &topology_snapshot, &host_ids)
                     && !self.shards.contains_key(&shard)
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains(&shard)
@@ -481,22 +487,23 @@ impl ShardSupervisor {
         }
     }
 
-    /// One [`VnodeConfig`] per member of `shard`'s committee whose signing
-    /// key this host holds — the local vnodes a seat or reconciled join
-    /// brings up.
+    /// One [`VnodeConfig`] per seat-holding member of `shard`'s committee
+    /// whose signing key this host holds — the local vnodes a seat or
+    /// reconciled join brings up. Reads the seatable view, so a local
+    /// split observer riding the committee is never built into a vnode
+    /// alongside co-hosted real members.
     pub(super) fn local_committee_vnodes(
         &self,
         topology_snapshot: &TopologySnapshot,
         shard: ShardId,
     ) -> Vec<VnodeConfig> {
         topology_snapshot
-            .committee_for_shard(shard)
-            .iter()
+            .seatable_committee_for_shard(shard)
             .filter_map(|validator| {
                 self.vnode_keys
-                    .get(validator)
+                    .get(&validator)
                     .map(|signing_key| VnodeConfig {
-                        validator_id: *validator,
+                        validator_id: validator,
                         local_shard: shard,
                         signing_key: Arc::clone(signing_key),
                     })
@@ -532,9 +539,8 @@ impl ShardSupervisor {
 }
 
 /// Whether a hosted shard has aged out of this host's serving duty: no
-/// local validator holds a consensus role in it (absent from the active
-/// committee) and none sits in its routing committee (no serve
-/// obligation).
+/// local validator holds any role in its active committee and none sits
+/// in its routing committee (no serve obligation).
 ///
 /// The active-committee guard keeps a shard up through its current window
 /// even after a lookahead delta has moved the validator on in the routing
@@ -555,14 +561,16 @@ fn shard_retired(
     // routable window: under make-before-break its committee keeps coasting and
     // serving its terminal until the successors are live, so they can seed and
     // finalize against it.
-    !host_assigned(shard, topology_snapshot, host_ids)
+    !host_in_committee(shard, topology_snapshot, host_ids)
         && !in_routing
         && !topology_snapshot.reshape_handoff_pending(shard)
 }
 
-/// Whether `shard`'s committed committee includes a local validator — the host
-/// holds a consensus role in it and must run it.
-fn host_assigned(
+/// Whether `shard`'s committed committee includes a local validator in any
+/// window role — a consensus seat or a split-observer ride. The teardown
+/// half's membership question: an observer rides the committee for serving,
+/// gossip, and ready-signal admission, so a shard it rides stays up.
+fn host_in_committee(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     host_ids: &HashSet<ValidatorId>,
@@ -571,6 +579,22 @@ fn host_assigned(
         .committee_for_shard(shard)
         .iter()
         .any(|v| host_ids.contains(v))
+}
+
+/// Whether a local validator holds a consensus seat in `shard`'s committed
+/// committee — the join half's membership question, read from the seatable
+/// view. A split observer riding the committee never reads as a seat: seating
+/// it would emit a shard-joiner ready signal that classifies as the cohort's
+/// `ReshapeReady` and could fire the split gate before its child store has
+/// synced.
+fn host_holds_seat(
+    shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    host_ids: &HashSet<ValidatorId>,
+) -> bool {
+    topology_snapshot
+        .seatable_committee_for_shard(shard)
+        .any(|v| host_ids.contains(&v))
 }
 
 #[cfg(test)]
@@ -582,13 +606,21 @@ mod tests {
         ValidatorInfo, ValidatorSet, generate_bls_keypair,
     };
 
-    use super::{host_assigned, shard_retired};
+    use super::{host_holds_seat, host_in_committee, shard_retired};
 
     const HOST: ValidatorId = ValidatorId::new(1);
 
     /// A head snapshot carrying `committees` as each shard's active
     /// membership — a complete sibling set so the trie is well-formed.
     fn head(committees: HashMap<ShardId, Vec<ValidatorId>>) -> TopologySnapshot {
+        head_with_observers(committees, BTreeMap::new())
+    }
+
+    /// [`head`] with pending-split observer cohorts riding the committees.
+    fn head_with_observers(
+        committees: HashMap<ShardId, Vec<ValidatorId>>,
+        observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    ) -> TopologySnapshot {
         let ids: BTreeSet<ValidatorId> = committees.values().flatten().copied().collect();
         let validators: Vec<ValidatorInfo> = ids
             .iter()
@@ -604,7 +636,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
-            BTreeMap::new(),
+            observers,
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -714,9 +746,10 @@ mod tests {
     }
 
     /// The join reconcile targets exactly the committed committees a local
-    /// validator belongs to.
+    /// validator belongs to; without a pending split the two membership
+    /// views agree.
     #[test]
-    fn host_assigned_tracks_committed_committee_membership() {
+    fn host_holds_seat_tracks_committed_committee_membership() {
         let mine = ShardId::leaf(1, 0);
         let theirs = ShardId::leaf(1, 1);
         let topology_snapshot = head(HashMap::from([
@@ -724,7 +757,63 @@ mod tests {
             (theirs, vec![ValidatorId::new(3)]),
         ]));
         let host_ids = HashSet::from([HOST]);
-        assert!(host_assigned(mine, &topology_snapshot, &host_ids));
-        assert!(!host_assigned(theirs, &topology_snapshot, &host_ids));
+        assert!(host_holds_seat(mine, &topology_snapshot, &host_ids));
+        assert!(!host_holds_seat(theirs, &topology_snapshot, &host_ids));
+        assert!(host_in_committee(mine, &topology_snapshot, &host_ids));
+        assert!(!host_in_committee(theirs, &topology_snapshot, &host_ids));
+    }
+
+    /// A split-observer ride is a committee role but not a consensus seat:
+    /// the join reconcile must not bring the splitting parent up on a host
+    /// whose only stake in it is the observer, while a co-hosted real
+    /// member still reads as a seat.
+    #[test]
+    fn an_observer_ride_is_not_a_consensus_seat() {
+        let parent = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (child, _) = parent.children();
+        let member = ValidatorId::new(2);
+        let topology_snapshot = head_with_observers(
+            HashMap::from([
+                (parent, vec![member, ValidatorId::new(3), HOST]),
+                (sibling, vec![ValidatorId::new(4)]),
+            ]),
+            BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]),
+        );
+
+        let observer_only = HashSet::from([HOST]);
+        assert!(!host_holds_seat(parent, &topology_snapshot, &observer_only));
+        assert!(host_in_committee(
+            parent,
+            &topology_snapshot,
+            &observer_only
+        ));
+
+        let co_hosting = HashSet::from([HOST, member]);
+        assert!(host_holds_seat(parent, &topology_snapshot, &co_hosting));
+    }
+
+    /// The teardown half deliberately reads full membership: a hosted shard
+    /// whose only local committee link is an observer ride stays up for the
+    /// window even with no routing entry.
+    #[test]
+    fn keeps_a_shard_the_host_only_observes() {
+        let parent = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (child, _) = parent.children();
+        let topology_snapshot = head_with_observers(
+            HashMap::from([
+                (parent, vec![ValidatorId::new(2), HOST]),
+                (sibling, vec![ValidatorId::new(3)]),
+            ]),
+            BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]),
+        );
+        let routing = RoutingCommittees::new();
+        assert!(!shard_retired(
+            parent,
+            &topology_snapshot,
+            &routing,
+            &HashSet::from([HOST])
+        ));
     }
 }
