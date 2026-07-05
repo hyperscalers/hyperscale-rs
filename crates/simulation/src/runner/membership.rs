@@ -11,6 +11,10 @@
 //! shared storage handle so a later rejoin exercises the
 //! retained-storage fast path.
 //!
+//! The join half reads the seatable committee view (split-observer riders
+//! excluded); the teardown half reads full membership — the same
+//! asymmetry as the production supervisor's reconcile pair.
+//!
 //! Nothing here runs unless a test calls it, so simulations that never
 //! reconcile membership are byte-identical to before.
 
@@ -29,21 +33,9 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{
-    BeaconState, BlockHeight, ShardAnchor, ShardId, ValidatorId, ValidatorStatus, shard_prefix_path,
-};
+use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, ValidatorId, shard_prefix_path};
 
 use super::SimulationRunner;
-
-/// Whether `validator` is committed `OnShard(shard)` in `beacon` — the
-/// placement that should run `shard`'s consensus. Excludes `Observing`,
-/// `Keeping`, and `Pooled`, which sit in the networking `committee_for_shard`
-/// but must not be seated as consensus members.
-fn validator_on_shard(beacon: &BeaconState, validator: ValidatorId, shard: ShardId) -> bool {
-    beacon.validators.get(&validator).is_some_and(|record| {
-        matches!(record.status, ValidatorStatus::OnShard { shard: placed, .. } if placed == shard)
-    })
-}
 
 /// Drive cap for the snap-sync pump — generous over the dozens of
 /// rounds a small-state bootstrap takes, so exhaustion means a wedge.
@@ -177,10 +169,11 @@ impl SimulationRunner {
     /// members off). A shard a reshape duty owns (`is_seating`) is left to the
     /// orchestrator. Idempotent; safe to call every slice.
     ///
-    /// Placement is read from the committed `OnShard` status rather than the
-    /// networking `committee_for_shard`, which also carries split observers and
-    /// not-yet-ready joiners; an `Observing`/`Keeping`/`Pooled` validator must
-    /// not be seated as a consensus member. A terminated parent is an internal
+    /// Placement is read from the seatable committee view — full membership
+    /// minus split-observer riders — the same view the production supervisor's
+    /// join half reads. An observer rides the networking committee for
+    /// serving, gossip, and ready-signal admission but must not be seated as
+    /// a consensus member. A terminated parent is an internal
     /// trie host, not a leaf, so it is never torn down here — it stays retained
     /// for serving. The placement deltas the hosted vnodes emit are drained for
     /// parity with production's delta-driven path, but the committed projection
@@ -207,10 +200,6 @@ impl SimulationRunner {
             let Some(snapshot) = self.host_topology(host) else {
                 continue;
             };
-            let Some((_, beacon)) = self.beacon_storage(host).and_then(|s| s.latest_committed())
-            else {
-                continue;
-            };
             let leaves: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
             let hosted: Vec<ShardId> = self.hosted_shards_of(host);
 
@@ -219,13 +208,8 @@ impl SimulationRunner {
                     continue;
                 }
                 let placed: Vec<ValidatorId> = snapshot
-                    .committee_for_shard(shard)
-                    .iter()
-                    .copied()
-                    .filter(|&validator| {
-                        self.homes_validator(host, validator)
-                            && validator_on_shard(&beacon, validator, shard)
-                    })
+                    .seatable_committee_for_shard(shard)
+                    .filter(|&validator| self.homes_validator(host, validator))
                     .collect();
                 if !placed.is_empty() {
                     let storage = self
@@ -244,9 +228,10 @@ impl SimulationRunner {
                 // A stalled ex-member: the host runs a live shard but the rotated
                 // committee no longer carries any of its validators. An empty
                 // committee is a terminated chain the host retains for serving,
-                // not an ex-member, so it stays. Membership is the networking
-                // committee, not the `OnShard` placement, so a freshly seated
-                // member whose status has not yet settled is never torn down.
+                // not an ex-member, so it stays. Teardown reads full membership
+                // rather than the seatable view: any window role — an observer
+                // ride included — keeps the shard up, mirroring the production
+                // supervisor's `host_in_committee` rule.
                 let ex_member = !committee.is_empty()
                     && !committee
                         .iter()
