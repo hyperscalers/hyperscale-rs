@@ -10,7 +10,7 @@
 //! identically in simulation and production.
 
 use hyperscale_jmt::{Key, TreeReader};
-use hyperscale_types::{BlockHeight, StateRoot, StoredReceipt};
+use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
 
 /// How many boundary pins a backend retains before evicting the oldest.
 pub const BOUNDARY_RETAIN: usize = 3;
@@ -109,4 +109,47 @@ pub trait BoundaryStore {
         height: BlockHeight,
         receipts: &[StoredReceipt],
     ) -> Result<StateRoot, String>;
+
+    /// Adopt a split child's derived `genesis` into this parent-cloned
+    /// store: re-root the state at the child subtree and install the block
+    /// as the chain origin. Returns the adopted state root for the caller
+    /// to verify against the beacon-attested anchor before trusting the
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure — a genesis block off the
+    /// origin's height, an unresolvable child subtree, or a backend error.
+    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String>;
+
+    /// Adopt a split observer's followed-store `genesis`: the store already
+    /// sits at the child state (snap-synced span plus followed parent
+    /// writes), so this installs the block as the chain origin. Returns the
+    /// adopted state root for the caller's anchor check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure — a genesis block off the
+    /// origin's height or carrying a root other than the followed one, or a
+    /// backend error.
+    fn adopt_followed_child(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String>;
+
+    /// Adopt a merge keeper's composed-parent `genesis` into this
+    /// union-imported store, installing the block as the chain origin.
+    /// Returns the adopted state root for the caller's anchor check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure — a genesis block off the
+    /// origin's height, a store tip elsewhere, or a root mismatch.
+    fn adopt_merge_parent(&self, origin: ChainOrigin, genesis: &Block)
+    -> Result<StateRoot, String>;
+
+    /// The committed substate byte total at `version`, or `None` when the
+    /// store's version line doesn't carry it.
+    fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
 }

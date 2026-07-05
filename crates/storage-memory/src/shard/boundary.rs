@@ -15,7 +15,7 @@ use hyperscale_storage::{
     BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, filter_updates_to_prefix,
     merge_owned_nodes, merge_updates_from_receipts,
 };
-use hyperscale_types::{BlockHeight, StateRoot, StoredReceipt};
+use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
 
 use super::core::SimShardStorage;
 use super::snapshot::value_at_version;
@@ -142,6 +142,30 @@ impl BoundaryStore for SimShardStorage {
         let root = apply_state_writes(&mut state, &filtered, &owner_map, height);
         drop(state);
         Ok(root)
+    }
+
+    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
+        Self::adopt_split_child(self, origin, genesis)
+    }
+
+    fn adopt_followed_child(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        Self::adopt_followed_child(self, origin, genesis)
+    }
+
+    fn adopt_merge_parent(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        Self::adopt_merge_parent(self, origin, genesis)
+    }
+
+    fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
+        Self::substate_bytes_at_version(self, version)
     }
 }
 

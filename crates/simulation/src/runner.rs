@@ -19,6 +19,7 @@ use hyperscale_network_memory::{
     SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
+use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
@@ -46,8 +47,6 @@ use crate::event_queue::EventKey;
 pub mod relocation;
 pub mod reshape;
 pub mod system_action;
-
-use reshape::ReshapeStore;
 
 /// Cluster and transport configuration for a simulation.
 ///
@@ -201,7 +200,7 @@ pub struct SimulationRunner {
 
     /// In-flight reshape stores the orchestrators opened, imported, and adopted
     /// into, keyed by `(host, duty shard)`, held until the seat installs each.
-    reshape_stores: HashMap<(NodeIndex, ShardId), ReshapeStore>,
+    reshape_stores: HashMap<(NodeIndex, ShardId), PreparedStore<SimShardStorage>>,
 
     /// Per-host reshape fetches whose target block had not committed yet,
     /// carried to the next slice as `FetchFailed` events so the sequencer

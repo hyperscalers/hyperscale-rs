@@ -21,3 +21,21 @@ pub mod observer;
 pub mod orchestrator;
 pub mod split_flip;
 pub mod view;
+
+use hyperscale_storage::RecoveredState;
+use hyperscale_types::Block;
+
+/// A reshape duty's in-flight store, held by the driver between the
+/// orchestrator's `OpenStore` and `Seat` requests.
+///
+/// Bundles the open store the duty imports and adopts into, the recovered
+/// state its seated vnodes boot from (rebuilt at the adopt), and the derived
+/// genesis the seat installs.
+pub struct PreparedStore<S> {
+    /// The opened store the duty imports and adopts into.
+    pub storage: S,
+    /// The recovered state the seat boots from, rebuilt at the adopt.
+    pub recovered: RecoveredState,
+    /// The derived genesis, set at the adopt, installed at the seat.
+    pub genesis: Option<Block>,
+}

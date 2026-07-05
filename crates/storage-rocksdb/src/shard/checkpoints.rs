@@ -21,7 +21,7 @@ use hyperscale_storage::{
     BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, JmtSnapshot, ResolveLeaf, filter_updates_to_prefix,
     merge_owned_nodes, merge_updates_from_receipts,
 };
-use hyperscale_types::{BlockHeight, Hash, StateRoot, StoredReceipt};
+use hyperscale_types::{Block, BlockHeight, ChainOrigin, Hash, StateRoot, StoredReceipt};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{DB, Options, WriteBatch};
 use tracing::warn;
@@ -338,6 +338,30 @@ impl BoundaryStore for RocksDbShardStorage {
             .write(batch)
             .map_err(|e| format!("follow write failed: {e}"))?;
         Ok(new_root)
+    }
+
+    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
+        Self::adopt_split_child(self, origin, genesis).map_err(|e| e.to_string())
+    }
+
+    fn adopt_followed_child(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        Self::adopt_followed_child(self, origin, genesis).map_err(|e| e.to_string())
+    }
+
+    fn adopt_merge_parent(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        Self::adopt_merge_parent(self, origin, genesis).map_err(|e| e.to_string())
+    }
+
+    fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
+        Self::substate_bytes_at_version(self, version)
     }
 }
 
