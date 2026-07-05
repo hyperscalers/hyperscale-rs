@@ -1,15 +1,15 @@
 //! The simulation harness's reshape adapter.
 //!
-//! The deterministic counterpart of the production `ShardSupervisor`'s reshape
-//! pump: one [`ReshapeOrchestrator`] per host, each driven once per slice from
-//! its own committed-state projection. The orchestrator owns the observe /
-//! keep / re-assert / follow / adopt / seat sequencing; this adapter performs
-//! the io it returns against the in-memory backend and feeds each result back
-//! as a [`ReshapeEvent`]. Both harnesses run the *same* orchestrator, so the
-//! sequencing can no longer drift between them.
+//! The deterministic counterpart of the production `ShardSupervisor`'s
+//! `reshape_step`: one [`ReshapeOrchestrator`] per host, each driven once per
+//! slice from its own committed-state projection. The orchestrator owns the
+//! observe / keep / re-assert / follow / adopt / seat sequencing; this adapter
+//! performs the io it returns against the in-memory backend and feeds each
+//! result back as a [`ReshapeEvent`]. Both harnesses run the *same*
+//! orchestrator, so the sequencing can no longer drift between them.
 //!
 //! io is synchronous here — a fetch serves straight from a committee host's
-//! store, an import writes the in-memory tree — so each host's pump drives its
+//! store, an import writes the in-memory tree — so each host's step drives its
 //! orchestrator to a fixpoint per slice rather than waiting on async
 //! completions. Progress between slices is gated only by the committed view
 //! advancing, which [`SimulationRunner::run_until`] drives.
@@ -52,39 +52,39 @@ use super::SimulationRunner;
 /// Drive cap for one host's per-slice reshape fixpoint — generous over the
 /// dozens of synchronous rounds a duty's open/sync/follow/adopt/seat chain
 /// takes, so exhaustion means a wedge rather than a budget.
-const MAX_PUMP_ROUNDS: usize = 100_000;
+const MAX_FIXPOINT_ROUNDS: usize = 100_000;
 
 impl SimulationRunner {
     /// Step every host's reshape orchestrator one slice, driving its duties to a
     /// fixpoint against the synchronous in-memory io. Idempotent — safe to call
     /// every slice.
-    pub fn pump_reshape(&mut self) {
-        for node in 0..self.num_hosts() {
-            self.pump_reshape_host(node);
+    pub fn reshape_step(&mut self) {
+        for host in 0..self.num_hosts() {
+            self.reshape_step_host(host);
         }
     }
 
     /// Drive one host's orchestrator to a fixpoint: step it, perform each
     /// request, feed the results back, and repeat until a step produces no io.
-    fn pump_reshape_host(&mut self, node: NodeIndex) {
-        let Some(topology_snapshot) = self.host_topology(node) else {
+    fn reshape_step_host(&mut self, host: NodeIndex) {
+        let Some(topology_snapshot) = self.host_topology(host) else {
             return;
         };
         let view = ReshapeView::new(&topology_snapshot);
-        let mut orch = std::mem::take(&mut self.reshape[node as usize]);
+        let mut orch = std::mem::take(&mut self.reshape[host as usize]);
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's not-yet-committed block fetches re-arm their sequencers
         // (a `FetchFailed` clears the in-flight flag set when they were issued),
         // so this slice re-requests them — production's fetch callback firing on
         // a later tick.
-        let mut events = std::mem::take(&mut self.reshape_pending[node as usize]);
+        let mut events = std::mem::take(&mut self.reshape_pending[host as usize]);
         let mut retries: Vec<ReshapeEvent> = Vec::new();
-        for _ in 0..MAX_PUMP_ROUNDS {
+        for _ in 0..MAX_FIXPOINT_ROUNDS {
             let requests = orch.step(&view, std::mem::take(&mut events));
             let mut progressed = false;
             for request in requests {
                 if let Some(event) =
-                    self.dispatch_reshape(node, &view, request, &mut broadcasted, &mut retries)
+                    self.dispatch_reshape(host, &view, request, &mut broadcasted, &mut retries)
                 {
                     events.push(event);
                     progressed = true;
@@ -94,8 +94,8 @@ impl SimulationRunner {
                 break;
             }
         }
-        self.reshape_pending[node as usize] = retries;
-        self.reshape[node as usize] = orch;
+        self.reshape_pending[host as usize] = retries;
+        self.reshape[host as usize] = orch;
     }
 
     /// Perform one reshape request, answering with the [`ReshapeEvent`] the
@@ -103,7 +103,7 @@ impl SimulationRunner {
     /// the terminal seat).
     fn dispatch_reshape(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         view: &ReshapeView,
         request: ReshapeRequest,
         broadcasted: &mut HashSet<ValidatorId>,
@@ -111,14 +111,14 @@ impl SimulationRunner {
     ) -> Option<ReshapeEvent> {
         match request {
             ReshapeRequest::OpenStore { shard } => {
-                self.reshape_open_store(node, shard);
+                self.reshape_open_store(host, shard);
                 Some(ReshapeEvent::Opened { shard })
+            }
+            ReshapeRequest::SeedFromParent { parent, child } => {
+                self.reshape_seed_from_parent(host, parent, child, retries)
             }
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
-            }
-            ReshapeRequest::SeedFromParent { parent, child } => {
-                self.reshape_seed_from_parent(node, parent, child, retries)
             }
             ReshapeRequest::ImportBoundary {
                 shard,
@@ -127,7 +127,7 @@ impl SimulationRunner {
             } => {
                 let root = self
                     .reshape_stores
-                    .get(&(node, shard))?
+                    .get(&(host, shard))?
                     .storage
                     .import_boundary_state(height, leaves)
                     .expect("reshape boundary import into the opened store");
@@ -140,7 +140,7 @@ impl SimulationRunner {
             } => {
                 let root = self
                     .reshape_stores
-                    .get(&(node, shard))?
+                    .get(&(host, shard))?
                     .storage
                     .follow_block_writes(height, &receipts)
                     .expect("reshape follow apply into the opened store");
@@ -178,9 +178,9 @@ impl SimulationRunner {
                 kind,
                 origin,
                 genesis,
-            } => self.reshape_adopt(node, view, shard, kind, origin, *genesis),
+            } => self.reshape_adopt(host, view, shard, kind, origin, *genesis),
             ReshapeRequest::Seat { shard } => {
-                self.reshape_seat(node, view, shard);
+                self.reshape_seat(host, view, shard);
                 None
             }
         }
@@ -188,7 +188,7 @@ impl SimulationRunner {
 
     /// Open a fresh duty store, replicate the engine bootstrap into it, and
     /// cache it for the duty.
-    fn reshape_open_store(&mut self, node: NodeIndex, shard: ShardId) {
+    fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) {
         let storage = SimShardStorage::new(shard_prefix_path(shard));
         replicate_engine_bootstrap(
             &storage,
@@ -197,7 +197,7 @@ impl SimulationRunner {
         );
         let recovered = storage.load_recovered_state();
         self.reshape_stores.insert(
-            (node, shard),
+            (host, shard),
             PreparedStore {
                 storage,
                 genesis: None,
@@ -212,27 +212,27 @@ impl SimulationRunner {
     /// the next slice so the seed re-arms.
     fn reshape_seed_from_parent(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         parent: ShardId,
         child: ShardId,
         retries: &mut Vec<ReshapeEvent>,
     ) -> Option<ReshapeEvent> {
         let ready = self
-            .host_topology(node)
+            .host_topology(host)
             .and_then(|topology_snapshot| topology_snapshot.boundary(child))
-            .zip(self.hosts_shard(node, parent))
+            .zip(self.hosts_shard(host, parent))
             .is_some_and(|(anchor, storage)| storage.committed_height() >= anchor.height);
         if !ready {
             retries.push(ReshapeEvent::SeedDeferred { child });
             return None;
         }
-        let storage = self.hosts[node as usize]
+        let storage = self.hosts[host as usize]
             .shard_io(parent)
             .storage()
             .clone_for_split_child(shard_prefix_path(child));
         let recovered = storage.load_recovered_state();
         self.reshape_stores.insert(
-            (node, child),
+            (host, child),
             PreparedStore {
                 storage,
                 genesis: None,
@@ -260,10 +260,10 @@ impl SimulationRunner {
                 // the sub-range) rather than feeding an empty chunk that would
                 // spin the fixpoint.
                 let response = (0..self.num_hosts())
-                    .filter(|&node| self.hosts_shard(node, from).is_some())
-                    .map(|node| {
+                    .filter(|&host| self.hosts_shard(host, from).is_some())
+                    .map(|host| {
                         serve_state_range_request(
-                            self.hosts[node as usize].shard_io(from).storage(),
+                            self.hosts[host as usize].shard_io(from).storage(),
                             &request,
                         )
                     })
@@ -332,11 +332,11 @@ impl SimulationRunner {
             sources.push(parent);
         }
         for shard in sources {
-            for node in 0..self.num_hosts() {
-                if self.hosts_shard(node, shard).is_none() {
+            for host in 0..self.num_hosts() {
+                if self.hosts_shard(host, shard).is_none() {
                     continue;
                 }
-                let io = self.hosts[node as usize].shard_io(shard);
+                let io = self.hosts[host as usize].shard_io(shard);
                 let response =
                     serve_block_request(io.pending_chain(), io.provision_store(), request);
                 if response.certified.is_some() {
@@ -352,18 +352,18 @@ impl SimulationRunner {
     /// state the seat boots from.
     fn reshape_adopt(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         view: &ReshapeView,
         shard: ShardId,
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
     ) -> Option<ReshapeEvent> {
-        let storage = self.reshape_stores.get(&(node, shard))?.storage.clone();
+        let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
         let anchor_root = view.boundary(shard).map(|anchor| anchor.state_root);
         let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, anchor_root)
             .expect("adopted reshape root must match the beacon anchor");
-        let entry = self.reshape_stores.get_mut(&(node, shard))?;
+        let entry = self.reshape_stores.get_mut(&(host, shard))?;
         entry.genesis = Some(genesis);
         entry.recovered = recovered;
         Some(ReshapeEvent::Adopted { shard })
@@ -372,12 +372,12 @@ impl SimulationRunner {
     /// Seat a prepared duty: install its genesis and start consensus for every
     /// committee member of `shard` this host homes, from the duty's adopted
     /// store.
-    fn reshape_seat(&mut self, node: NodeIndex, view: &ReshapeView, shard: ShardId) {
+    fn reshape_seat(&mut self, host: NodeIndex, view: &ReshapeView, shard: ShardId) {
         let Some(PreparedStore {
             storage,
             genesis,
             recovered,
-        }) = self.reshape_stores.remove(&(node, shard))
+        }) = self.reshape_stores.remove(&(host, shard))
         else {
             return;
         };
@@ -386,21 +386,21 @@ impl SimulationRunner {
             .committee(shard)
             .iter()
             .copied()
-            .filter(|validator| self.homes_validator(node, *validator))
+            .filter(|validator| self.homes_validator(host, *validator))
             .collect();
         if validators.is_empty() {
             return;
         }
-        self.seat_reshape_shard(node, shard, &validators, storage, &genesis, &recovered);
+        self.seat_shard_with_genesis(host, shard, &validators, storage, &genesis, &recovered);
     }
 
-    /// Install a prepared store on `node`: seat one vnode per `validator`,
+    /// Install a prepared store on `host`: seat one vnode per `validator`,
     /// commit the genesis through the normal pipeline, and retire any pool
     /// follower the seated validator carried. Tears down a stale chain under
     /// the same id first — a merge reforms the grow's terminated parent.
-    fn seat_reshape_shard(
+    fn seat_shard_with_genesis(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         shard: ShardId,
         validators: &[ValidatorId],
         storage: SimShardStorage,
@@ -415,42 +415,42 @@ impl SimulationRunner {
         // terminated parent at a height above its pre-split terminal). Mirrors
         // the production supervisor dropping a seat for an already-hosted shard.
         if self
-            .hosts_shard(node, shard)
+            .hosts_shard(host, shard)
             .is_some_and(|s| s.committed_height() > genesis.height())
         {
             return;
         }
-        let _ = self.hosts[node as usize].remove_shard(shard);
+        let _ = self.hosts[host as usize].remove_shard(shard);
         let mut inits = Vec::with_capacity(validators.len());
         for &validator in validators {
-            inits.push(self.runtime_vnode_init(node, validator, shard, recovered));
-            self.network.bind_validator(validator, node);
+            inits.push(self.runtime_vnode_init(host, validator, shard, recovered));
+            self.network.bind_validator(validator, host);
         }
-        self.hosts[node as usize].add_shard(inits, storage, self.event_txs[node as usize].clone());
-        self.hosts[node as usize].initialize_shard_genesis(genesis);
-        self.hosts[node as usize].flush_all_batches();
-        let output = self.hosts[node as usize].drain_pending_output();
-        self.drain_node_io(node);
-        self.process_step_output(node, output);
+        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
+        self.hosts[host as usize].initialize_shard_genesis(genesis);
+        self.hosts[host as usize].flush_all_batches();
+        let output = self.hosts[host as usize].drain_pending_output();
+        self.drain_host_io(host);
+        self.process_step_output(host, output);
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),
         ));
         self.schedule_event(
-            node,
+            host,
             self.now,
             HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
         );
         for &validator in validators {
-            self.hosts[node as usize].drop_pooled_vnode(validator);
+            self.hosts[host as usize].drop_pooled_vnode(validator);
         }
     }
 
-    /// Whether `validator`'s fixed home host is `node`.
-    pub(super) fn homes_validator(&self, node: NodeIndex, validator: ValidatorId) -> bool {
+    /// Whether `validator`'s fixed home host is `host`.
+    pub(super) fn homes_validator(&self, host: NodeIndex, validator: ValidatorId) -> bool {
         self.validator_home
             .get(usize::try_from(validator.inner()).expect("id fits usize"))
             .copied()
-            == Some(node)
+            == Some(host)
     }
 
     /// Grow the current single-shard topology until it holds `target_shards`
@@ -461,7 +461,7 @@ impl SimulationRunner {
     /// (`initialize_genesis` / `initialize_genesis_with_balances`) and armed
     /// the split trigger (`ReshapeThresholds { split_bytes: 0 }`) with one
     /// cohort of pooled extras per split — `(target_shards - 1) * shard_size`
-    /// in total. A thin wrapper over [`Self::pump_reshape`]: each slice pumps
+    /// in total. A thin wrapper over [`Self::reshape_step`]: each slice steps
     /// every host's orchestrator and advances the clock, until the leaves
     /// reshape into the target partition and commit.
     ///
@@ -488,7 +488,7 @@ impl SimulationRunner {
                 self.now < deadline,
                 "grow_to did not reach {target_shards} shards within {budget_epochs} epochs",
             );
-            self.pump_reshape();
+            self.reshape_step();
             let next = self.now + Duration::from_secs(1);
             self.run_until(next);
         }
@@ -499,7 +499,7 @@ impl SimulationRunner {
     /// genesis. Waiting for the whole committee — not just a quorum on some
     /// host — keeps a post-grow workload from racing a straggler that seats
     /// after the transaction lands and so never carries it to a terminal
-    /// outcome; the pump only advances duties while `grow_to` drives it, so a
+    /// outcome; duties only advance while `grow_to` drives the step, so a
     /// member left unseated at return never catches up.
     fn grown_to(&self, target: u64) -> bool {
         let Some(topology_snapshot) = self.host_topology(0) else {
@@ -508,8 +508,8 @@ impl SimulationRunner {
         let leaves: Vec<ShardId> = topology_snapshot.shard_trie().leaves().collect();
         leaves.len() as u64 >= target
             && leaves.iter().all(|&leaf| {
-                let past_genesis = (0..self.num_hosts()).any(|node| {
-                    self.hosts_shard(node, leaf)
+                let past_genesis = (0..self.num_hosts()).any(|host| {
+                    self.hosts_shard(host, leaf)
                         .is_some_and(|storage| storage.committed_height() > BlockHeight::GENESIS)
                 });
                 let seated: Vec<ValidatorId> = self

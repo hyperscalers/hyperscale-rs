@@ -1,6 +1,6 @@
 //! Deterministic simulation runner.
 //!
-//! Uses [`NodeHost`] to process all actions per-node, with the simulation harness
+//! Uses [`NodeHost`] to process all actions per-host, with the simulation harness
 //! controlling event scheduling, network delivery, and time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -122,17 +122,17 @@ type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 /// Processes events in deterministic order using [`NodeHost`] for action handling.
 /// Given the same seed, produces identical results every run.
 ///
-/// Each node has its own independent storage and executor inside its `NodeHost`.
+/// Each host has its own independent storage and executor inside its `NodeHost`.
 /// The harness controls the event queue, network delivery (latency, partitions,
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
-    /// Per-node `NodeHost` instances. Index corresponds to `NodeIndex`.
+    /// Per-host `NodeHost` instances. Index corresponds to `NodeIndex`.
     hosts: Vec<SimHost>,
 
-    /// Per-node event receivers (from crossbeam channels passed to `NodeHost`).
+    /// Per-host event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<HostEvent>>,
 
-    /// Per-node event senders, retained so a shard added at runtime
+    /// Per-host event senders, retained so a shard added at runtime
     /// (vnode relocation) can be wired onto the host's existing channel.
     event_txs: Vec<Sender<HostEvent>>,
 
@@ -170,7 +170,7 @@ pub struct SimulationRunner {
     rng: ChaCha8Rng,
 
     /// Timer registry for cancellation support.
-    /// Maps `(node, timer_id) -> event_key` for removal.
+    /// Maps `(host, timer_id) -> event_key` for removal.
     timers: HashMap<(NodeIndex, ShardId, TimerId), EventKey>,
 
     /// Statistics.
@@ -193,9 +193,9 @@ pub struct SimulationRunner {
     pool_tick_pending: Vec<bool>,
 
     /// One reshape orchestrator per host, each `me`-scoped to that host's home
-    /// validators. Pumped once per slice by [`Self::pump_reshape`] — the
+    /// validators. Stepped once per slice by [`Self::reshape_step`] — the
     /// deterministic counterpart of the production supervisor's per-host
-    /// reshape pump.
+    /// `reshape_step`.
     reshape: Vec<ReshapeOrchestrator>,
 
     /// In-flight reshape stores the orchestrators opened, imported, and adopted
@@ -213,7 +213,7 @@ pub struct SimulationRunner {
     /// the in-memory stand-in for the production supervisor's retained store.
     retained_storages: HashMap<(NodeIndex, ShardId), SimShardStorage>,
 
-    /// Per-host committed beacon epoch last reconciled by `pump_placement`.
+    /// Per-host committed beacon epoch last reconciled by `reconcile_placement`.
     /// Committee membership only changes at an epoch boundary, so the
     /// reconciliation runs once per host per epoch rather than every slice.
     placement_epoch: Vec<Option<Epoch>>,
@@ -244,7 +244,7 @@ pub struct SimulationStats {
     pub messages_dropped_loss: u64,
     /// Messages dropped by an installed fault rule.
     pub messages_dropped_fault: u64,
-    /// Messages deduplicated (same message already received by node).
+    /// Messages deduplicated (same message already received by host).
     pub messages_deduplicated: u64,
     /// Timers set.
     pub timers_set: u64,
@@ -544,11 +544,11 @@ impl SimulationRunner {
         NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex")
     }
 
-    /// Get a reference to a node's storage for a specific hosted shard,
+    /// Get a reference to a host's storage for a specific hosted shard,
     /// or `None` when the host doesn't carry it.
     #[must_use]
-    pub fn hosts_shard(&self, node: NodeIndex, shard: ShardId) -> Option<&SimShardStorage> {
-        let host = self.hosts.get(node as usize)?;
+    pub fn hosts_shard(&self, host: NodeIndex, shard: ShardId) -> Option<&SimShardStorage> {
+        let host = self.hosts.get(host as usize)?;
         host.hosted_shards()
             .any(|s| s == shard)
             .then(|| &**host.shard_io(shard).storage())
@@ -557,34 +557,34 @@ impl SimulationRunner {
     /// Process-shared beacon storage for a host. One handle per host,
     /// shared across every vnode on that host.
     #[must_use]
-    pub fn beacon_storage(&self, node: NodeIndex) -> Option<&Arc<dyn BeaconStorage>> {
-        self.hosts.get(node as usize).map(NodeHost::beacon_storage)
+    pub fn beacon_storage(&self, host: NodeIndex) -> Option<&Arc<dyn BeaconStorage>> {
+        self.hosts.get(host as usize).map(NodeHost::beacon_storage)
     }
 
-    /// Number of shard-less beacon-following vnodes in `node`'s pool.
+    /// Number of shard-less beacon-following vnodes in `host`'s pool.
     #[must_use]
-    pub fn pooled_len(&self, node: NodeIndex) -> usize {
+    pub fn pooled_len(&self, host: NodeIndex) -> usize {
         self.hosts
-            .get(node as usize)
+            .get(host as usize)
             .map_or(0, NodeHost::pooled_len)
     }
 
-    /// The shards `node` currently hosts. A grown host retains its
+    /// The shards `host` currently hosts. A grown host retains its
     /// terminated parent alongside its active child, so this can hold more
     /// than the live leaf.
     #[must_use]
-    pub fn hosted_shards_of(&self, node: NodeIndex) -> Vec<ShardId> {
+    pub fn hosted_shards_of(&self, host: NodeIndex) -> Vec<ShardId> {
         self.hosts
-            .get(node as usize)
+            .get(host as usize)
             .map(|h| h.hosted_shards().collect())
             .unwrap_or_default()
     }
 
-    /// Get the last emitted transaction status for a node.
+    /// Get the last emitted transaction status for a host.
     #[must_use]
-    pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
+    pub fn tx_status(&self, host: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
         self.hosts
-            .get(node as usize)
+            .get(host as usize)
             .and_then(|nl| nl.tx_status(tx_hash))
     }
 
@@ -606,7 +606,7 @@ impl SimulationRunner {
     /// state machine on that host. For multi-vnode hosting, use
     /// [`Self::vnode_state_in`] to pick a specific host's shard vnode.
     #[must_use]
-    pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
+    pub fn first_vnode_state(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
         let host = self.hosts.get(index as usize)?;
         let shard = host.hosted_shards().next()?;
         Some(host.vnode_state(shard, 0))
@@ -616,7 +616,7 @@ impl SimulationRunner {
     ///
     /// Walks each host, keeps those that carry `shard`, and collects every
     /// matching vnode's state machine. Use this — not host-indexed
-    /// [`Self::node`] — to assert over a committee after a split: a flip
+    /// [`Self::host`] — to assert over a committee after a split: a flip
     /// leaves the terminated parent vnodes lingering on their hosts under the
     /// parent shard, and a host seated cross-shard carries a second vnode that
     /// host-indexing hides.
@@ -633,26 +633,26 @@ impl SimulationRunner {
         vnodes
     }
 
-    /// The state machine of `node`'s vnode in `shard`, or `None` when
+    /// The state machine of `host`'s vnode in `shard`, or `None` when
     /// the host doesn't carry that shard. Relocation puts two vnodes
     /// with one validator id on a host (the draining shard's and the
     /// joined shard's), so lookups here are shard-scoped where a
     /// validator-id walk would be ambiguous.
     #[must_use]
-    pub fn vnode_state_in(&self, node: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
-        let host = self.hosts.get(node as usize)?;
+    pub fn vnode_state_in(&self, host: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
+        let host = self.hosts.get(host as usize)?;
         host.hosted_shards()
             .any(|s| s == shard)
             .then(|| host.vnode_state(shard, 0))
     }
 
-    /// Host `node`'s current topology snapshot, or `None` if `node` is out of
+    /// Host `host`'s current topology snapshot, or `None` if `host` is out of
     /// range.
     #[must_use]
-    pub fn host_topology(&self, node: NodeIndex) -> Option<Arc<TopologySnapshot>> {
+    pub fn host_topology(&self, host: NodeIndex) -> Option<Arc<TopologySnapshot>> {
         Some(
             self.hosts
-                .get(node as usize)?
+                .get(host as usize)?
                 .process()
                 .topology_snapshot()
                 .load_full(),
@@ -675,9 +675,9 @@ impl SimulationRunner {
     /// in the appropriate [`HostEvent`] envelope: shard-scoped variants
     /// via [`HostEvent::shard`] / [`HostEvent::protocol`],
     /// `SubmitTransaction` via [`HostEvent::process`].
-    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: HostEvent) {
+    pub fn schedule_initial_event(&mut self, host: NodeIndex, delay: Duration, event: HostEvent) {
         let time = self.now + delay;
-        self.schedule_event(node, time, event);
+        self.schedule_event(host, time, event);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -739,7 +739,7 @@ impl SimulationRunner {
                     "Initialized genesis for the ROOT shard"
                 );
             }
-            self.drain_node_io(host_index);
+            self.drain_host_io(host_index);
             self.process_step_output(host_index, setup_output);
             self.schedule_event(
                 host_index,
@@ -748,7 +748,7 @@ impl SimulationRunner {
             );
         }
 
-        // Wire each node into the in-memory network now that genesis is settled.
+        // Wire each host into the in-memory network now that genesis is settled.
         for host in &mut self.hosts {
             host.register_inbound_handlers();
         }
@@ -824,11 +824,11 @@ impl SimulationRunner {
                 }
 
                 let (key, event) = self.event_queue.pop_first().unwrap();
-                let node_index = key.node_index;
+                let host_index = key.node_index;
 
                 trace!(
                     time = ?self.now,
-                    node = node_index,
+                    host = host_index,
                     "Processing event"
                 );
 
@@ -840,13 +840,13 @@ impl SimulationRunner {
                 let fired_pool_tick = event.is_pool_fetch_tick();
 
                 let now = self.local_now();
-                self.hosts[node_index as usize].set_time(now);
-                let output = self.hosts[node_index as usize].step(event);
-                self.hosts[node_index as usize].flush_all_batches();
+                self.hosts[host_index as usize].set_time(now);
+                let output = self.hosts[host_index as usize].step(event);
+                self.hosts[host_index as usize].flush_all_batches();
 
-                self.drain_node_io(node_index);
-                self.process_step_output(node_index, output);
-                self.refresh_pool_tick(node_index, fired_pool_tick);
+                self.drain_host_io(host_index);
+                self.process_step_output(host_index, output);
+                self.refresh_pool_tick(host_index, fired_pool_tick);
             }
         }
 
@@ -867,21 +867,21 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Drain network outbox, pending requests, pending notifications, and
-    /// buffered events from a node.
+    /// buffered events from a host.
     ///
     /// Converts host-internal outputs into harness-level operations:
     /// - Outbox entries → gossip latency queue
     /// - Pending requests → handler invoked, response callback deferred
     /// - Pending notifications → notification latency queue
     /// - Buffered events (from error callbacks, `NodeHost` step) → event queue
-    fn drain_node_io(&mut self, node: NodeIndex) {
-        let i = node as usize;
+    fn drain_host_io(&mut self, host: NodeIndex) {
+        let i = host as usize;
         let outbox = self.hosts[i].network().drain_outbox();
 
         for entry in outbox {
             let stats = self
                 .network
-                .accept_gossip(node, self.now, entry, &mut self.rng);
+                .accept_gossip(host, self.now, entry, &mut self.rng);
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
@@ -896,7 +896,7 @@ impl SimulationRunner {
         if !pending_requests.is_empty() {
             let stats =
                 self.network
-                    .accept_requests(node, self.now, pending_requests, &mut self.rng);
+                    .accept_requests(host, self.now, pending_requests, &mut self.rng);
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
@@ -907,7 +907,7 @@ impl SimulationRunner {
         let pending_notifications = self.hosts[i].network().drain_pending_notifications();
         if !pending_notifications.is_empty() {
             let stats = self.network.accept_notifications(
-                node,
+                host,
                 self.now,
                 pending_notifications,
                 &mut self.rng,
@@ -921,18 +921,18 @@ impl SimulationRunner {
         // Drain buffered events (from error callbacks in accept_requests,
         // plus any events the host's step itself pushed).
         while let Ok(event) = self.event_rxs[i].try_recv() {
-            self.schedule_event(node, self.now, event);
+            self.schedule_event(host, self.now, event);
         }
     }
 
     /// Process `StepOutput`: stats, timer ops, and placement deltas.
-    fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
+    fn process_step_output(&mut self, host: NodeIndex, output: StepOutput) {
         self.stats.actions_generated += u64::try_from(output.actions_generated).unwrap_or(u64::MAX);
         for op in output.timer_ops {
-            self.process_timer_op(node, op);
+            self.process_timer_op(host, op);
         }
         for change in output.participation_changes {
-            self.pending_participation_changes.push((node, change));
+            self.pending_participation_changes.push((host, change));
         }
     }
 
@@ -940,8 +940,8 @@ impl SimulationRunner {
     /// step: while the pool is syncing, keep exactly one tick queued so a
     /// deferred fetch eventually retries; once the pool catches up, stop. The
     /// production pool thread self-ticks off its `select!` timeout instead.
-    fn refresh_pool_tick(&mut self, node: NodeIndex, fired_tick: bool) {
-        let i = node as usize;
+    fn refresh_pool_tick(&mut self, host: NodeIndex, fired_tick: bool) {
+        let i = host as usize;
         if fired_tick {
             self.pool_tick_pending[i] = false;
         }
@@ -952,7 +952,7 @@ impl SimulationRunner {
         if !self.pool_tick_pending[i] {
             self.pool_tick_pending[i] = true;
             let fire = self.now + POOL_FETCH_TICK_INTERVAL;
-            self.schedule_event(node, fire, HostEvent::beacon_fetch_tick());
+            self.schedule_event(host, fire, HostEvent::beacon_fetch_tick());
         }
     }
 
@@ -960,8 +960,8 @@ impl SimulationRunner {
     // Timer Handling
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Process a [`TimerOp`] emitted by a node's state machine.
-    fn process_timer_op(&mut self, node: NodeIndex, op: TimerOp) {
+    /// Process a [`TimerOp`] emitted by a host's state machine.
+    fn process_timer_op(&mut self, host: NodeIndex, op: TimerOp) {
         match op {
             TimerOp::Set {
                 shard,
@@ -974,15 +974,15 @@ impl SimulationRunner {
                 // production runner (which aborts the old sleep task).
                 // Leaving the old event queued would deliver a stale fire
                 // for every re-arm.
-                if let Some(old) = self.timers.remove(&(node, shard, id.clone())) {
+                if let Some(old) = self.timers.remove(&(host, shard, id.clone())) {
                     self.event_queue.remove(&old);
                 }
-                let key = self.schedule_event(node, fire_time, event);
-                self.timers.insert((node, shard, id), key);
+                let key = self.schedule_event(host, fire_time, event);
+                self.timers.insert((host, shard, id), key);
                 self.stats.timers_set += 1;
             }
             TimerOp::Cancel { shard, id } => {
-                if let Some(key) = self.timers.remove(&(node, shard, id)) {
+                if let Some(key) = self.timers.remove(&(host, shard, id)) {
                     self.event_queue.remove(&key);
                     self.stats.timers_cancelled += 1;
                 }
@@ -994,9 +994,9 @@ impl SimulationRunner {
     // Helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
+    fn schedule_event(&mut self, host: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
         self.sequence += 1;
-        let key = EventKey::new(time, &event, node, self.sequence);
+        let key = EventKey::new(time, &event, host, self.sequence);
         self.event_queue.insert(key, event);
         key
     }
@@ -1054,7 +1054,7 @@ fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
         // Each pool extra gets its own host running a shard-less beacon
         // follower. Pool-extra validator ids start past the committee
         // validators, and the `vnodes_per_host == 1` invariant the
-        // dedicated layout requires puts each at its own node.
+        // dedicated layout requires puts each at its own host.
         for k in 0..config.pool_surplus {
             plans.push(HostPlan {
                 seated: Vec::new(),

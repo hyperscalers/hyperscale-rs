@@ -2,7 +2,7 @@
 //!
 //! Wraps a [`SimulationRunner`] driven on its logical clock. Each [`Cluster`]
 //! method maps onto an existing runner sampler; [`Cluster::run_until`] advances
-//! the clock in one-second slices, pumping every host's reshape orchestrator
+//! the clock in one-second slices, stepping every host's reshape orchestrator
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
@@ -37,7 +37,7 @@ const SLICE: Duration = Duration::from_secs(1);
 pub struct SimCluster {
     runner: SimulationRunner,
     /// In-memory metrics, scoped over `run_until` so [`FaultableCluster::metric`]
-    /// can read node-emitted counters. The sim is single-threaded, so the
+    /// can read host-emitted counters. The sim is single-threaded, so the
     /// thread-local scoped recorder captures every emission.
     recorder: MemoryRecorder,
 }
@@ -160,7 +160,7 @@ impl SimCluster {
     }
 
     /// Run a fault `scenario` with the in-memory recorder scoped, so
-    /// [`FaultableCluster::metric`] reads node-emitted counters. The sim is
+    /// [`FaultableCluster::metric`] reads host-emitted counters. The sim is
     /// single-threaded, so the thread-local scoped recorder captures every
     /// emission. Steady-state scenarios that read no metrics call the scenario
     /// directly instead.
@@ -189,9 +189,9 @@ impl SimCluster {
             .copied()
             .collect();
         (0..self.runner.num_hosts())
-            .filter(|&node| {
+            .filter(|&host| {
                 self.runner
-                    .vnode_state_in(node, shard)
+                    .vnode_state_in(host, shard)
                     .is_some_and(|vnode| committee.contains(&vnode.validator_id()))
             })
             .collect()
@@ -204,11 +204,11 @@ impl SimCluster {
         let topology_snapshot = self.runner.host_topology(0)?;
         let shards: BTreeSet<ShardId> = tx
             .all_declared_nodes()
-            .map(|node| topology_snapshot.shard_for_node_id(node))
+            .map(|host| topology_snapshot.shard_for_node_id(host))
             .collect();
-        (0..self.runner.num_hosts()).find(|&node| {
+        (0..self.runner.num_hosts()).find(|&host| {
             self.runner
-                .hosted_shards_of(node)
+                .hosted_shards_of(host)
                 .iter()
                 .any(|shard| shards.contains(shard))
         })
@@ -240,8 +240,8 @@ impl Cluster for SimCluster {
             // ordinary committee membership (shuffles, relocations) against the
             // committed topology — the orchestrator and the placement path, the
             // two seaters production runs, coordinated the same way.
-            self.runner.pump_reshape();
-            self.runner.pump_placement();
+            self.runner.reshape_step();
+            self.runner.reconcile_placement();
             let next = (self.runner.now() + SLICE).min(deadline);
             self.runner.run_until(next);
             if cond(self) {
@@ -257,7 +257,7 @@ impl Cluster for SimCluster {
 
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {
         (0..self.runner.num_hosts())
-            .filter_map(|node| self.runner.hosts_shard(node, shard))
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
             .map(ShardChainReader::committed_height)
             .max()
     }
@@ -268,7 +268,7 @@ impl Cluster for SimCluster {
         // reformed copy carries the beacon-composed root the scenarios assert.
         self.live_committee_hosts(shard)
             .into_iter()
-            .find_map(|node| self.runner.hosts_shard(node, shard))
+            .find_map(|host| self.runner.hosts_shard(host, shard))
             .map(SubstateStore::state_root)
     }
 
@@ -278,7 +278,7 @@ impl Cluster for SimCluster {
 
     fn beacon_state(&self) -> Option<Arc<BeaconState>> {
         (0..self.runner.num_hosts())
-            .filter_map(|node| self.runner.beacon_storage(node))
+            .filter_map(|host| self.runner.beacon_storage(host))
             .filter_map(|storage| storage.latest_committed())
             .max_by_key(|(_, state)| state.current_epoch)
             .map(|(_, state)| state)
@@ -286,7 +286,7 @@ impl Cluster for SimCluster {
 
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
         (0..self.runner.num_hosts())
-            .filter_map(|node| self.runner.tx_status(node, &tx))
+            .filter_map(|host| self.runner.tx_status(host, &tx))
             .max_by_key(status_rank)
     }
 
@@ -299,7 +299,7 @@ impl Cluster for SimCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         let Some(store) =
-            (0..self.runner.num_hosts()).find_map(|node| self.runner.hosts_shard(node, shard))
+            (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))
         else {
             return (None, None);
         };
@@ -385,7 +385,7 @@ impl FaultableCluster for SimCluster {
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.live_committee_hosts(shard)
             .into_iter()
-            .map(|node| node as usize)
+            .map(|host| host as usize)
             .collect()
     }
 
