@@ -2,9 +2,10 @@
 [profile.ci]
 # Report every failure in a run rather than stopping at the first.
 fail-fast = false
-# Flag a test as slow after 2 minutes; kill it after 30. The cluster sims run
-# for minutes, but anything past half an hour is a wedge, not a test.
-slow-timeout = { period = "120s", terminate-after = 15 }
+# Flag a test as slow after 5 minutes; kill it after an hour. The heaviest
+# reshape sims run 20-45 minutes on 4-core hosted runners (~7x slower than a
+# 16-core dev machine); past an hour is a wedge, not a test.
+slow-timeout = { period = "300s", terminate-after = 12 }
 
 # Cluster sims hold multi-node state in memory; on 4-thread runners this caps
 # them at two concurrent so they don't exhaust the 16GB of RAM.
