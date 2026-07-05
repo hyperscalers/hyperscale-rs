@@ -185,11 +185,7 @@ fn account_in_n(
         }
         let key = ed25519_keypair_from_seed(&[seed; 32]);
         let address = ComponentAddress::preallocated_account_from_public_key(&key.public_key());
-        let node = NodeId(
-            address.into_node_id().0[..30]
-                .try_into()
-                .expect("account address carries a 30-byte node id"),
-        );
+        let node = NodeId::from_radix(address.into_node_id());
         if uniform_shard_for_node(&node, num_shards) == shard {
             taken.push(seed);
             return (key, address);
@@ -215,11 +211,7 @@ fn bulk_fund_into(
         bytes[..8].copy_from_slice(&seed.to_le_bytes());
         let key = ed25519_keypair_from_seed(&bytes);
         let address = ComponentAddress::preallocated_account_from_public_key(&key.public_key());
-        let node = NodeId(
-            address.into_node_id().0[..30]
-                .try_into()
-                .expect("account address carries a 30-byte node id"),
-        );
+        let node = NodeId::from_radix(address.into_node_id());
         if uniform_shard_for_node(&node, num_shards) == shard {
             balances.push((address, Decimal::from(10_000)));
             found += 1;

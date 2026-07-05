@@ -118,8 +118,7 @@ impl FundedAccount {
 
     /// Determine which shard an address belongs to.
     fn shard_for_address(address: &ComponentAddress, num_shards: u64) -> ShardId {
-        let node_id = address.into_node_id();
-        let det_node_id = NodeId(node_id.0[..30].try_into().unwrap());
+        let det_node_id = NodeId::from_radix(address.into_node_id());
         uniform_shard_for_node(&det_node_id, num_shards)
     }
 }

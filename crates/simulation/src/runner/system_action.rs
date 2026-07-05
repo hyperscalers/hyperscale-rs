@@ -74,12 +74,7 @@ impl SimulationRunner {
             routable_from_notarized_v1(notarized, validity).expect("system action is routable");
         let tx_hash = tx.hash();
 
-        let radix_node = account.into_node_id();
-        let det_node = NodeId(
-            radix_node.0[..30]
-                .try_into()
-                .expect("component address node id is at least 30 bytes"),
-        );
+        let det_node = NodeId::from_radix(account.into_node_id());
         let shard = self
             .host_topology(0)
             .expect("host 0 carries a topology")
