@@ -5,7 +5,7 @@ on:
     branches: [ "**" ]
     tags: [ "v*" ]
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened]
     branches: [ "main" ]
 
 env:
@@ -13,24 +13,28 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  check:
-    name: Cargo Check
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: swatinem/rust-cache@v2
-      - name: Cargo Check
-        run: cargo check
+      - name: Cargo Fmt
+        run: cargo fmt --all --check
+      - name: Cargo Clippy
+        run: cargo clippy --no-deps -- -D warnings
 
-  test:
-    name: Test Suite
+  build-tests:
+    name: Build Test Archive
     runs-on: ubuntu-latest
     if: >
-      github.event_name == 'pull_request' || 
-      startsWith(github.ref, 'refs/tags/') || 
+      github.event_name == 'pull_request' ||
+      startsWith(github.ref, 'refs/tags/') ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
@@ -48,18 +52,54 @@ jobs:
           sudo docker image prune --all --force || true
           echo "After cleanup:"
           df -h /
-          
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-      
+      - uses: taiki-e/install-action@nextest
+
       - name: Install lld
         run: sudo apt-get update && sudo apt-get install -y lld
-      - name: Cargo Test
+      - name: Build Test Archive
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=0"
-        run: cargo test --features hyperscale-simulation/ci
-      - name: Cargo Clippy
-        run: cargo clippy --no-deps -- -D warnings
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+        run: >
+          cargo nextest archive --cargo-profile ci
+          --features hyperscale-simulation/ci
+          --archive-file nextest-archive.tar.zst
+      - name: Doc Tests
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+        run: cargo test --doc --profile ci --features hyperscale-simulation/ci
+      - name: Upload Test Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: build-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - name: Download Test Archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      - name: Run Tests
+        run: >
+          cargo nextest run --archive-file nextest-archive.tar.zst
+          --workspace-remap . --profile ci
+          --partition hash:${{ matrix.shard }}/6
 
   build:
     name: Build Docker Image
@@ -345,7 +385,7 @@ jobs:
       contents: read 
     if: >
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && (github.event.action == 'opened' || (github.event.action == 'closed' && github.event.pull_request.merged == true)))
+      (github.event_name == 'pull_request' && github.event.action == 'opened')
     steps:
       - name: Send message to Telegram
         continue-on-error: true
@@ -354,14 +394,10 @@ jobs:
           CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action }}
-          PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
-          PR_MERGER_LOGIN: ${{ github.event.pull_request.merged_by.login }}
           PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
-          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           PR_ADDITIONS: ${{ github.event.pull_request.additions }}
           PR_DELETIONS: ${{ github.event.pull_request.deletions }}
@@ -391,71 +427,76 @@ jobs:
             gh api "users/$login" --jq '.name // .login' 2>/dev/null || echo "$login"
           }
 
-          # sanitize inputs that might contain special chars
-          SAFE_PR_TITLE=$(escape_html "$PR_TITLE")
-          SAFE_COMMIT_MSG=$(escape_html "$COMMIT_MSG")
-          SAFE_COMMIT_AUTHOR=$(escape_html "$COMMIT_AUTHOR")
-
           if [ "$EVENT_NAME" == "pull_request" ]; then
-            if [ "$EVENT_ACTION" == "closed" ] && [ "$PR_MERGED" == "true" ]; then
-              FRIENDLY_NAME=$(get_gh_name "$PR_MERGER_LOGIN")
+            SAFE_PR_TITLE=$(escape_html "$PR_TITLE")
+            FRIENDLY_NAME=$(get_gh_name "$PR_USER_LOGIN")
+            SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+
+            TEXT="🔨 <b>New PR:</b> $SAFE_PR_TITLE"
+            TEXT+=$'\n'
+            TEXT+=$'\n'"<b>Author:</b> $SAFE_FRIENDLY_NAME"
+            TEXT+=$'\n'"<b>Date:</b> $PR_CREATED_AT"
+            TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
+            TEXT+=$'\n'
+            TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
+          else
+            # Push event. A push that lands a PR merge is announced from the PR
+            # itself: this runs in the base repo with secrets, so it also covers
+            # fork PRs, whose pull_request events cannot send. Only direct pushes
+            # fall through to a plain commit notification.
+            PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA/pulls" 2>/dev/null \
+              | jq -r --arg sha "$COMMIT_SHA" \
+                '[.[] | select(.merge_commit_sha == $sha and .merged_at != null)][0].number // empty' \
+                2>/dev/null || echo "")
+
+            PR_JSON=""
+            if [ -n "$PR_NUMBER" ]; then
+              PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" 2>/dev/null || echo "")
+            fi
+
+            if [ -n "$PR_JSON" ]; then
+              SAFE_PR_TITLE=$(escape_html "$(jq -r '.title' <<< "$PR_JSON")")
+              FRIENDLY_NAME=$(get_gh_name "$(jq -r '.merged_by.login // .user.login' <<< "$PR_JSON")")
               SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
-              
+
               TEXT="🚀 <b>PR Merged:</b> $SAFE_PR_TITLE"
               TEXT+=$'\n'
               TEXT+=$'\n'"<b>By:</b> $SAFE_FRIENDLY_NAME"
-              TEXT+=$'\n'"<b>Date:</b> $PR_MERGED_AT"
-              TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
+              TEXT+=$'\n'"<b>Date:</b> $(jq -r '.merged_at' <<< "$PR_JSON")"
+              TEXT+=$'\n'"<b>Diff:</b> $(jq -r '.changed_files' <<< "$PR_JSON") file(s) (+$(jq -r '.additions' <<< "$PR_JSON") -$(jq -r '.deletions' <<< "$PR_JSON"))"
               TEXT+=$'\n'
-              TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
+              TEXT+=$'\n'"<a href=\"$(jq -r '.html_url' <<< "$PR_JSON")\">View on GitHub</a>"
             else
-              FRIENDLY_NAME=$(get_gh_name "$PR_USER_LOGIN")
-              SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+              SAFE_COMMIT_MSG=$(escape_html "$COMMIT_MSG")
+              SAFE_COMMIT_AUTHOR=$(escape_html "$COMMIT_AUTHOR")
 
-              TEXT="🔨 <b>New PR:</b> $SAFE_PR_TITLE"
+              # fetch detailed stats and file count for the commit
+              STATS_JSON=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" \
+                --jq '{files: (.files | length), additions: .stats.additions, deletions: .stats.deletions}' \
+                2>/dev/null || echo "")
+
+              if [ -n "$STATS_JSON" ]; then
+                TOTAL_CHANGED=$(echo "$STATS_JSON" | jq '.files')
+                COMMIT_ADDITIONS=$(echo "$STATS_JSON" | jq '.additions')
+                COMMIT_DELETIONS=$(echo "$STATS_JSON" | jq '.deletions')
+              else
+                # fallback to payload data if API fails
+                ADDED_LEN=$(echo "$COMMIT_ADDED" | jq 'length' 2>/dev/null || echo 0)
+                REMOVED_LEN=$(echo "$COMMIT_REMOVED" | jq 'length' 2>/dev/null || echo 0)
+                MODIFIED_LEN=$(echo "$COMMIT_MODIFIED" | jq 'length' 2>/dev/null || echo 0)
+                TOTAL_CHANGED=$((ADDED_LEN + REMOVED_LEN + MODIFIED_LEN))
+                COMMIT_ADDITIONS="?"
+                COMMIT_DELETIONS="?"
+              fi
+
+              TEXT="✨ <b>New Commit:</b> $SAFE_COMMIT_MSG"
               TEXT+=$'\n'
-              TEXT+=$'\n'"<b>Author:</b> $SAFE_FRIENDLY_NAME"
-              TEXT+=$'\n'"<b>Date:</b> $PR_CREATED_AT"
-              TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
+              TEXT+=$'\n'"<b>Author:</b> $SAFE_COMMIT_AUTHOR"
+              TEXT+=$'\n'"<b>Date:</b> $COMMIT_TIMESTAMP"
+              TEXT+=$'\n'"<b>Diff:</b> $TOTAL_CHANGED file(s) (+$COMMIT_ADDITIONS -$COMMIT_DELETIONS)"
               TEXT+=$'\n'
-              TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
+              TEXT+=$'\n'"<a href=\"$COMMIT_URL\">View on GitHub</a>"
             fi
-          else
-            # Push event
-
-            # commenting this out for now, otherwise PRs from forks get no notifications
-            
-            # if [[ "$COMMIT_MSG" == "Merge pull request"* ]] || [[ "$COMMIT_MSG" == "Merge branch"* ]]; then
-            #   echo "Merge commit detected, skipping."
-            #   exit 0
-            # fi
-            
-            # fetch detailed stats and file count for the commit
-            STATS_JSON=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" \
-              --jq '{files: (.files | length), additions: .stats.additions, deletions: .stats.deletions}' \
-              2>/dev/null || echo "")
-            
-            if [ -n "$STATS_JSON" ]; then
-              TOTAL_CHANGED=$(echo "$STATS_JSON" | jq '.files')
-              COMMIT_ADDITIONS=$(echo "$STATS_JSON" | jq '.additions')
-              COMMIT_DELETIONS=$(echo "$STATS_JSON" | jq '.deletions')
-            else
-              # fallback to payload data if API fails
-              ADDED_LEN=$(echo "$COMMIT_ADDED" | jq 'length' 2>/dev/null || echo 0)
-              REMOVED_LEN=$(echo "$COMMIT_REMOVED" | jq 'length' 2>/dev/null || echo 0)
-              MODIFIED_LEN=$(echo "$COMMIT_MODIFIED" | jq 'length' 2>/dev/null || echo 0)
-              TOTAL_CHANGED=$((ADDED_LEN + REMOVED_LEN + MODIFIED_LEN))
-              COMMIT_ADDITIONS="?"
-              COMMIT_DELETIONS="?"
-            fi
-
-            TEXT="✨ <b>New Commit:</b> $SAFE_COMMIT_MSG"
-            TEXT+=$'\n'
-            TEXT+=$'\n'"<b>Author:</b> $SAFE_COMMIT_AUTHOR"
-            TEXT+=$'\n'"<b>Date:</b> $COMMIT_TIMESTAMP"
-            TEXT+=$'\n'"<b>Diff:</b> $TOTAL_CHANGED file(s) (+$COMMIT_ADDITIONS -$COMMIT_DELETIONS)"
-            TEXT+=$'\n'
-            TEXT+=$'\n'"<a href=\"$COMMIT_URL\">View on GitHub</a>"
           fi
 
           # safely create the payload for TG

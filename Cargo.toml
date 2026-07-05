@@ -131,3 +131,10 @@ broken_intra_doc_links = "warn"
 invalid_codeblock_attributes = "warn"
 private_intra_doc_links = "allow"
 redundant_explicit_links = "warn"
+
+# CI test profile: release-grade optimization so the simulation suite runs at
+# full speed, with debug assertions and overflow checks kept on.
+[profile.ci]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
