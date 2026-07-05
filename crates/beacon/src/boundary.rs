@@ -209,6 +209,14 @@ fn boundary_header_for(
 /// not-yet-committed one is this node lagging the proposer (abstain and let
 /// it catch up), a below-floor one marks a crossing every consumer frontier
 /// has passed.
+///
+/// Resolution is terminal-clamped (`lookup_for_shard`): a splitting
+/// shard's terminal crossing can be anchored exactly on (or past) its
+/// cut — `is_boundary_crossing` is parent-inclusive at the cut — and the
+/// anchor's half-open window no longer carries the shard. The block is
+/// still proposed and signed by the shard's final-epoch committee, the
+/// same resolution its own replicas applied when voting it, so the QC
+/// must verify against that committee.
 fn boundary_qc_authentic(
     shard: ShardId,
     boundary_header: &BlockHeader,
@@ -219,17 +227,18 @@ fn boundary_qc_authentic(
     if qc.block_hash() != boundary_header.hash() {
         return false;
     }
-    let snapshot = match topology_schedule.lookup(boundary_header.parent_qc().weighted_timestamp())
+    let snapshot = match topology_schedule
+        .lookup_for_shard(shard, boundary_header.parent_qc().weighted_timestamp())
     {
-        ScheduleLookup::Committee(snapshot) => snapshot,
-        ScheduleLookup::NotYetCommitted => {
+        (ScheduleLookup::Committee(snapshot), _) => snapshot,
+        (ScheduleLookup::NotYetCommitted, _) => {
             debug!(
                 shard = shard.inner(),
                 "Boundary QC's committee epoch not committed yet — abstaining"
             );
             return false;
         }
-        ScheduleLookup::Evicted => {
+        (ScheduleLookup::Evicted, _) => {
             warn!(
                 shard = shard.inner(),
                 "Boundary QC's committee epoch is below the schedule floor — abstaining"
