@@ -52,5 +52,5 @@ mod supervisor;
 mod telemetry;
 pub use runner::{LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, VnodeConfig};
 pub use status::SyncStatus;
-pub use supervisor::{ShardCommand, StorageDirResolver, StorageFactory};
+pub use supervisor::{ShardCommand, StorageDirResolver, StorageFactory, shard_data_dir};
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

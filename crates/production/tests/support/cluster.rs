@@ -29,8 +29,7 @@ use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_node::TxStatusCache;
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
-    LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageDirResolver,
-    StorageFactory,
+    LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
 use hyperscale_scenarios::query::chain_fate;
 use hyperscale_shard::ShardConsensusConfig;
@@ -45,6 +44,8 @@ use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::{sleep, timeout};
+
+use super::temp_storage_dir;
 
 /// Per-host registry of every `RocksDbShardStorage` the host has opened —
 /// the startup shards plus any the supervisor opens at a reshape flip.
@@ -63,25 +64,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Graceful-shutdown budget per host on teardown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Storage-directory resolver rooted in a host's temp dir, mirroring the
-/// validator binary's `shard-d{depth}p{path}` data-dir convention.
-pub fn temp_storage_dir(dir: &TempDir) -> StorageDirResolver {
-    let root = dir.path().to_path_buf();
-    Arc::new(move |shard: ShardId| root.join(format!("shard-d{}p{}", shard.depth(), shard.path())))
-}
-
-/// Storage factory rooted in a host's temp dir, opening a fresh
-/// `RocksDbShardStorage` for any shard the supervisor joins at runtime
-/// (the split children / merged parent of a reshape).
-pub fn temp_storage_factory(dir: &TempDir) -> StorageFactory {
-    let resolve = temp_storage_dir(dir);
-    Arc::new(move |shard: ShardId| {
-        RocksDbShardStorage::open(resolve(shard), shard_prefix_path(shard))
-            .map(Arc::new)
-            .map_err(|e| format!("{e:?}"))
-    })
-}
 
 /// Like [`temp_storage_factory`], but records every opened store into a
 /// shared registry so the harness can scan a runtime-joined shard's chain

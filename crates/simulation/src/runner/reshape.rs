@@ -13,11 +13,6 @@
 //! orchestrator to a fixpoint per slice rather than waiting on async
 //! completions. Progress between slices is gated only by the committed view
 //! advancing, which [`SimulationRunner::run_until`] drives.
-//!
-//! Split parent halves — the splitting committee's own members, which production
-//! seats off the placement delta rather than the orchestrator — are flipped
-//! here by [`Self::flip_parent_halves`], the simulation's stand-in for that
-//! join path. Observers and keepers are the orchestrator's.
 
 use std::collections::HashSet;
 use std::sync::Arc;
