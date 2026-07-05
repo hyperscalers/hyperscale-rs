@@ -326,6 +326,23 @@ impl TopologySchedule {
             .map(|(epoch, _)| windows.window_of(*epoch).end)
     }
 
+    /// The epoch window a *parent-anchor* timestamp resolves: an anchor
+    /// exactly on a window boundary belongs to the closing window,
+    /// mirroring [`EpochWindows::is_crossing`]'s parent-inclusive cut
+    /// (`parent ≤ cut < qc`). A block anchored exactly at the cut is a
+    /// valid crossing of that cut, so the reshape verdicts stamped on it
+    /// (and the committee that signs it) must read the closing window —
+    /// the half-open `epoch_for` would resolve the window the shard has
+    /// already left.
+    fn anchor_epoch_for(&self, wt: WeightedTimestamp) -> Epoch {
+        let epoch = self.epoch_for(wt);
+        if epoch > Epoch::GENESIS && self.windows().window_of(epoch).start == wt {
+            Epoch::new(epoch.inner() - 1)
+        } else {
+            epoch
+        }
+    }
+
     /// Whether `shard` splits into its two children at the end of `wt`'s
     /// epoch window — [`Children`](SplitAtBoundary::Children) exactly
     /// when `wt` falls in the splitting shard's final epoch, resolved by
@@ -350,7 +367,7 @@ impl TopologySchedule {
         if self.epoch_duration_ms == 0 {
             return SplitAtBoundary::No;
         }
-        let epoch = self.epoch_for(wt);
+        let epoch = self.anchor_epoch_for(wt);
         let Some(current) = self.by_epoch.get(&epoch) else {
             return SplitAtBoundary::Unresolved;
         };
@@ -397,7 +414,7 @@ impl TopologySchedule {
         if self.epoch_duration_ms == 0 {
             return Some(false);
         }
-        let epoch = self.epoch_for(wt);
+        let epoch = self.anchor_epoch_for(wt);
         let current = self.by_epoch.get(&epoch)?;
         if !current.shard_trie().contains(shard) {
             return Some(false);
@@ -681,6 +698,58 @@ mod tests {
         assert_eq!(
             sched.split_at_next_boundary(p, WeightedTimestamp::from_millis(7500)),
             SplitAtBoundary::No
+        );
+    }
+
+    /// A parent anchor exactly on a window boundary belongs to the
+    /// closing window — the crossing predicate is parent-inclusive at
+    /// the cut, so a terminal crossing anchored exactly on its cut is
+    /// still the splitting shard's final-epoch block and must carry the
+    /// split verdicts. The half-open `epoch_for` resolution would read
+    /// the post-split window (which no longer carries the parent) and
+    /// strip the child roots from the one crossing that can seed them.
+    #[test]
+    fn boundary_instant_anchor_resolves_the_closing_window() {
+        let p = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (left, right) = p.children();
+        let snap_with = |leaves: &[ShardId], pending: &[ShardId]| -> Arc<TopologySnapshot> {
+            Arc::new(TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                leaves.iter().map(|s| (*s, Vec::new())).collect(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                pending.iter().copied().collect(),
+            ))
+        };
+        let mut sched = TopologySchedule::new(1000, Epoch::new(5), snap_with(&[p, sibling], &[p]));
+        sched.insert(Epoch::new(6), snap_with(&[p, sibling], &[p]));
+        sched.insert(Epoch::new(7), snap_with(&[left, right, sibling], &[]));
+
+        // Anchored exactly on the terminal cut (window 6's end): still
+        // the final-epoch crossing — the children ride it.
+        assert_eq!(
+            sched.split_at_next_boundary(p, WeightedTimestamp::from_millis(7000)),
+            SplitAtBoundary::Children(left, right)
+        );
+        assert_eq!(
+            sched.terminates_at_next_boundary(p, WeightedTimestamp::from_millis(7000)),
+            Some(true)
+        );
+        // Anchored exactly on the prior cut: the closing window is 5,
+        // whose next window still carries p — not the final epoch.
+        assert_eq!(
+            sched.split_at_next_boundary(p, WeightedTimestamp::from_millis(6000)),
+            SplitAtBoundary::No
+        );
+        assert_eq!(
+            sched.terminates_at_next_boundary(p, WeightedTimestamp::from_millis(6000)),
+            Some(false)
         );
     }
 
