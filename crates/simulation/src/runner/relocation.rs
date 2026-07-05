@@ -74,7 +74,7 @@ impl SimulationRunner {
         std::mem::take(&mut self.pending_participation_changes)
     }
 
-    /// Begin hosting `shard` for `validator` on `node` at runtime,
+    /// Begin hosting `shard` for `validator` on `host` at runtime,
     /// bootstrapping `storage` exactly the way the production
     /// supervisor would: a retained store (committed past genesis)
     /// seats directly, a fresh store snap-syncs against the
@@ -88,12 +88,12 @@ impl SimulationRunner {
     /// committee), or if the imported root diverges from the anchor.
     pub fn join_shard(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         validator: ValidatorId,
         shard: ShardId,
         storage: SimShardStorage,
     ) -> JoinKind {
-        self.seat_joined_group(node, shard, &[validator], storage)
+        self.seat_joined_group(host, shard, &[validator], storage)
     }
 
     /// Seat a group of this host's committee members onto `shard` from one
@@ -111,7 +111,7 @@ impl SimulationRunner {
     /// the imported root diverges from the anchor.
     fn seat_joined_group(
         &mut self,
-        node: NodeIndex,
+        host: NodeIndex,
         shard: ShardId,
         validators: &[ValidatorId],
         storage: SimShardStorage,
@@ -121,7 +121,7 @@ impl SimulationRunner {
             let committed_height = recovered.committed_height;
             (recovered, JoinKind::Retained { committed_height })
         } else {
-            let snapshot = self.hosts[node as usize]
+            let snapshot = self.hosts[host as usize]
                 .process()
                 .topology_snapshot()
                 .load_full();
@@ -137,7 +137,7 @@ impl SimulationRunner {
                 &self.beacon_network,
                 &GenesisConfig::test_default(),
             );
-            let Some(recovered) = self.bootstrap_from_committee(node, shard, anchor, &storage)
+            let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &storage)
             else {
                 // The attested anchor's state has aged out of the serving
                 // committee — a transient fold freeze. Defer the seat; the
@@ -156,14 +156,14 @@ impl SimulationRunner {
 
         let inits: Vec<VnodeInit> = validators
             .iter()
-            .map(|&validator| self.runtime_vnode_init(node, validator, shard, &recovered))
+            .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
             .collect();
-        self.hosts[node as usize].add_shard(inits, storage, self.event_txs[node as usize].clone());
+        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
         // Parity with the production supervisor's `unfollow_in_pool`: each
         // seated validator now drives its beacon from this shard, so retire any
         // pool follower it carried (it drained here earlier).
         for &validator in validators {
-            self.hosts[node as usize].drop_pooled_vnode(validator);
+            self.hosts[host as usize].drop_pooled_vnode(validator);
         }
         kind
     }
@@ -181,41 +181,41 @@ impl SimulationRunner {
     /// networking `committee_for_shard`, which also carries split observers and
     /// not-yet-ready joiners; an `Observing`/`Keeping`/`Pooled` validator must
     /// not be seated as a consensus member. A terminated parent is an internal
-    /// trie node, not a leaf, so it is never torn down here — it stays retained
+    /// trie host, not a leaf, so it is never torn down here — it stays retained
     /// for serving. The placement deltas the hosted vnodes emit are drained for
     /// parity with production's delta-driven path, but the committed projection
     /// drives the actual join/leave: the snap-sync usually completes within the
     /// slice, and a join whose attested anchor has gone stale (a transient fold
     /// freeze evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.
-    pub fn pump_placement(&mut self) {
+    pub fn reconcile_placement(&mut self) {
         let _ = self.take_participation_changes();
-        for node in 0..self.num_hosts() {
+        for host in 0..self.num_hosts() {
             // Committee membership only changes at an epoch boundary, so skip the
             // reconciliation scan until this host's committed epoch advances.
             let Some(epoch) = self
-                .beacon_storage(node)
+                .beacon_storage(host)
                 .and_then(|storage| storage.latest_committed_epoch())
             else {
                 continue;
             };
-            if self.placement_epoch[node as usize] == Some(epoch) {
+            if self.placement_epoch[host as usize] == Some(epoch) {
                 continue;
             }
-            self.placement_epoch[node as usize] = Some(epoch);
+            self.placement_epoch[host as usize] = Some(epoch);
 
-            let Some(snapshot) = self.host_topology(node) else {
+            let Some(snapshot) = self.host_topology(host) else {
                 continue;
             };
-            let Some((_, beacon)) = self.beacon_storage(node).and_then(|s| s.latest_committed())
+            let Some((_, beacon)) = self.beacon_storage(host).and_then(|s| s.latest_committed())
             else {
                 continue;
             };
             let leaves: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
-            let hosted: Vec<ShardId> = self.hosted_shards_of(node);
+            let hosted: Vec<ShardId> = self.hosted_shards_of(host);
 
             for &shard in &leaves {
-                if hosted.contains(&shard) || self.reshape[node as usize].is_seating(shard) {
+                if hosted.contains(&shard) || self.reshape[host as usize].is_seating(shard) {
                     continue;
                 }
                 let placed: Vec<ValidatorId> = snapshot
@@ -223,21 +223,21 @@ impl SimulationRunner {
                     .iter()
                     .copied()
                     .filter(|&validator| {
-                        self.homes_validator(node, validator)
+                        self.homes_validator(host, validator)
                             && validator_on_shard(&beacon, validator, shard)
                     })
                     .collect();
                 if !placed.is_empty() {
                     let storage = self
                         .retained_storages
-                        .remove(&(node, shard))
+                        .remove(&(host, shard))
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
-                    self.seat_joined_group(node, shard, &placed, storage);
+                    self.seat_joined_group(host, shard, &placed, storage);
                 }
             }
 
             for &shard in &hosted {
-                if self.reshape[node as usize].is_seating(shard) {
+                if self.reshape[host as usize].is_seating(shard) {
                     continue;
                 }
                 let committee = snapshot.committee_for_shard(shard);
@@ -250,24 +250,24 @@ impl SimulationRunner {
                 let ex_member = !committee.is_empty()
                     && !committee
                         .iter()
-                        .any(|&validator| self.homes_validator(node, validator));
+                        .any(|&validator| self.homes_validator(host, validator));
                 if ex_member {
-                    let storage = self.leave_shard(node, shard);
-                    self.retained_storages.insert((node, shard), storage);
+                    let storage = self.leave_shard(host, shard);
+                    self.retained_storages.insert((host, shard), storage);
                 }
             }
         }
     }
 
-    /// Stop hosting `shard` on `node`, returning a shared handle onto
+    /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.
     ///
     /// # Panics
     ///
-    /// Panics if `shard` isn't hosted on `node`.
-    pub fn leave_shard(&mut self, node: NodeIndex, shard: ShardId) -> SimShardStorage {
-        let shard_loop = self.hosts[node as usize]
+    /// Panics if `shard` isn't hosted on `host`.
+    pub fn leave_shard(&mut self, host: NodeIndex, shard: ShardId) -> SimShardStorage {
+        let shard_loop = self.hosts[host as usize]
             .remove_shard(shard)
             .expect("leave of an unhosted shard");
         let departed: Vec<ValidatorId> = shard_loop.vnodes.iter().map(|v| v.validator_id).collect();
@@ -280,21 +280,21 @@ impl SimulationRunner {
         // coordinator and needs no follower.
         let now = self.local_now();
         for validator in departed {
-            if self.hosts[node as usize].hosts_validator(validator) {
+            if self.hosts[host as usize].hosts_validator(validator) {
                 continue;
             }
             let signing_key = Arc::clone(
                 &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
             );
             let init = seat_follower(SeatFollower {
-                beacon_storage: self.hosts[node as usize].beacon_storage().as_ref(),
+                beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
                 beacon_network: self.beacon_network.clone(),
                 beacon_config_hash: self.beacon_config_hash,
                 now,
                 validator,
                 signing_key,
             });
-            self.hosts[node as usize].add_pooled_vnode(init);
+            self.hosts[host as usize].add_pooled_vnode(init);
         }
         storage
     }
@@ -316,13 +316,13 @@ impl SimulationRunner {
     /// anchor the moment it observes the boundary move.
     fn bootstrap_from_committee(
         &self,
-        node: NodeIndex,
+        host: NodeIndex,
         shard: ShardId,
         anchor: ShardAnchor,
         storage: &SimShardStorage,
     ) -> Option<RecoveredState> {
         let serving: Vec<usize> = (0..self.hosts.len())
-            .filter(|&i| i != node as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
+            .filter(|&i| i != host as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
             .collect();
         assert!(
             !serving.is_empty(),
@@ -387,12 +387,12 @@ impl SimulationRunner {
     /// time.
     pub(super) fn runtime_vnode_init(
         &self,
-        node: NodeIndex,
+        host: NodeIndex,
         validator: ValidatorId,
         shard: ShardId,
         recovered: &RecoveredState,
     ) -> VnodeInit {
-        let host = &self.hosts[node as usize];
+        let host = &self.hosts[host as usize];
         let now = self.local_now();
         let signing_key = Arc::clone(
             &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],

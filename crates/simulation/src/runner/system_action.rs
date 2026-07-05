@@ -80,7 +80,7 @@ impl SimulationRunner {
             .expect("host 0 carries a topology")
             .shard_for_node_id(&det_node);
         let host = (0..self.num_hosts())
-            .find(|&node| self.hosts_shard(node, shard).is_some())
+            .find(|&host| self.hosts_shard(host, shard).is_some())
             .expect("a host carries the payer account's shard");
         self.schedule_initial_event(
             host,

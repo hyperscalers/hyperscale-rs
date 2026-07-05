@@ -99,14 +99,20 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
         heights: (0..4u32)
             .map(|i| {
                 runner
-                    .node(i)
+                    .first_vnode_state(i)
                     .unwrap()
                     .shard_coordinator()
                     .committed_height()
             })
             .collect(),
         views: (0..4u32)
-            .map(|i| runner.node(i).unwrap().shard_coordinator().view())
+            .map(|i| {
+                runner
+                    .first_vnode_state(i)
+                    .unwrap()
+                    .shard_coordinator()
+                    .view()
+            })
             .collect(),
         state_roots: (0..4u32)
             .map(|i| {
