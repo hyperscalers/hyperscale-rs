@@ -7,8 +7,7 @@
 //! `-- --ignored` (a 30-second epoch, the simulation default). Default
 //! `cargo test` skips them.
 
-mod cluster;
-mod prod_cluster;
+mod support;
 
 use std::time::Duration;
 
@@ -32,8 +31,8 @@ use hyperscale_scenarios::{
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
-use prod_cluster::ProdCluster;
 use serial_test::serial;
+use support::prod_cluster::ProdCluster;
 use tracing_subscriber::fmt;
 
 /// Production epoch length: the real 5-minute deployment epoch under `ci`, a

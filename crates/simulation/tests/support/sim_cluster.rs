@@ -15,6 +15,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_scenarios::query::{chain_fate, status_rank};
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -219,15 +220,6 @@ fn host_index(host: usize) -> NodeIndex {
     NodeIndex::try_from(host).expect("host index fits a NodeIndex")
 }
 
-/// Rank a status so the cluster-wide view takes the most advanced observation.
-const fn status_rank(status: &TransactionStatus) -> u8 {
-    match status {
-        TransactionStatus::Pending => 0,
-        TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
-    }
-}
-
 impl Cluster for SimCluster {
     fn submit(&mut self, tx: Arc<RoutableTransaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
@@ -311,27 +303,7 @@ impl Cluster for SimCluster {
         else {
             return (None, None);
         };
-        let mut committed = None;
-        let mut finalized = None;
-        let tip = store.committed_height();
-        let mut height = BlockHeight::new(1);
-        while height <= tip {
-            if let Some(certified) = store.get_block(height) {
-                let block = certified.block();
-                if block.transactions().iter().any(|t| t.hash() == tx) {
-                    committed = Some(height);
-                }
-                for fw in block.certificates().iter() {
-                    if let Some((_, decision)) =
-                        fw.tx_decisions().into_iter().find(|(h, _)| *h == tx)
-                    {
-                        finalized = Some((height, decision));
-                    }
-                }
-            }
-            height = height.next();
-        }
-        (committed, finalized)
+        chain_fate(store, tx)
     }
 }
 
