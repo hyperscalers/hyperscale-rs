@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
@@ -37,6 +38,12 @@ use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process::ProcessIo;
 use crate::shard::StepOutput;
 use crate::vnode::Vnode;
+
+/// Cadence at which a syncing pool retries deferred beacon-block fetches.
+///
+/// An idle pool never fires it: the production thread's `select!` just
+/// re-checks shutdown each interval, and the simulation schedules no tick.
+pub const POOL_FETCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Active driver for a host's shard-less, beacon-following vnodes.
 pub struct PoolLoop<S, N, D>

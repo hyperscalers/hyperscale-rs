@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
-use hyperscale_beacon::genesis::{GenesisBoot, build_genesis};
+use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
@@ -40,7 +40,7 @@ use hyperscale_network_libp2p::{
     RequestStreamPool, generate_random_keypair,
 };
 use hyperscale_node::bootstrap::EngineBootstrap;
-use hyperscale_node::pool_loop::PoolLoop;
+use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, ShardGenesis, SharedTopologySnapshot,
@@ -376,14 +376,15 @@ impl ProductionRunnerBuilder {
         // ArcSwap update follows, so the topology is derived rather than
         // supplied alongside a beacon state it has to be kept consistent with.
         let beacon_network = genesis_validators.network.clone();
-        let GenesisBoot {
-            block: beacon_genesis_block,
-            state: beacon_genesis_state,
-            config_hash: beacon_config_hash,
-            topology_snapshot: projected_topology,
-        } = build_genesis(&genesis_validators, chain_config);
+        let boot = build_genesis(&genesis_validators, chain_config);
+        // Warm-restart: resume the beacon coordinator from the latest
+        // committed (block, state) in storage. On an empty store, commit the
+        // genesis pair first so fresh-start and restart converge on the same
+        // load — the coordinator's resume epoch is whatever state it's handed.
+        boot.commit_if_empty(self.beacon_storage.as_ref());
+        let beacon_config_hash = boot.config_hash;
 
-        let shared_topology = Arc::new(projected_topology);
+        let shared_topology = Arc::clone(&boot.topology_snapshot);
         let topology_snapshot: SharedTopologySnapshot =
             Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
@@ -403,15 +404,6 @@ impl ProductionRunnerBuilder {
             .iter()
             .map(|v| (v.validator_id, Arc::clone(&v.signing_key)))
             .collect();
-
-        // Warm-restart: resume the beacon coordinator from the latest
-        // committed (block, state) in storage. On an empty store, commit the
-        // genesis pair first so fresh-start and restart converge on the same
-        // load — the coordinator's resume epoch is whatever state it's handed.
-        if self.beacon_storage.latest_committed_epoch().is_none() {
-            self.beacon_storage
-                .commit_beacon_block(&beacon_genesis_block, &beacon_genesis_state);
-        }
 
         // Participation is a projection of the committed beacon state: a
         // validator placed `OnShard` is seated on that shard; one that is
@@ -1640,11 +1632,6 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
     }
     info!("Pool event loop exiting");
 }
-
-/// Cadence at which a syncing pool retries deferred beacon-block fetches.
-/// Matches the shard loop's fetch-tick granularity; an idle pool never fires
-/// it (the select simply re-checks shutdown each interval).
-const POOL_FETCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spawn the host's pool thread, mirroring [`spawn_shard_loop`].
 pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::thread::JoinHandle<()> {
