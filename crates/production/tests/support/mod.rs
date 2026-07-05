@@ -1,10 +1,14 @@
-//! Shared helpers for the production e2e test binaries.
+//! Shared helpers for the production e2e test binaries, plus the two
+//! harnesses: the bespoke QUIC + `RocksDB` [`cluster`] and the portable
+//! scenarios adaptor [`prod_cluster`] over it.
 //!
-//! The network, validator-bind, runner, and multi-vnode suites each compile
-//! their own copy of this module and use a different subset, so a helper
-//! unused in any one binary isn't dead code.
+//! The suites each compile their own copy of this module and use a
+//! different subset, so a helper unused in any one binary isn't dead code.
 
 #![allow(dead_code)]
+
+pub mod cluster;
+pub mod prod_cluster;
 
 use std::sync::Arc;
 use std::time::Duration;

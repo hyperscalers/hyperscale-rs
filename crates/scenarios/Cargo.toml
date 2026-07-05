@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Portable node-behavioral scenarios run on both the simulation and production harnesses."
 
 [dependencies]
+hyperscale-storage = { workspace = true }
 hyperscale-types = { workspace = true }
 radix-common = { workspace = true }
 radix-transactions = { workspace = true }

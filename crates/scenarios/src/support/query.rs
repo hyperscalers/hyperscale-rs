@@ -1,16 +1,68 @@
-//! Derived read-only combinators over a [`Cluster`].
+//! Derived read-only combinators over a [`Cluster`], plus the store-level
+//! queries the adaptors share.
 //!
-//! Each is a projection of [`Cluster::beacon_state`], kept out of the trait so
-//! both adaptors share one definition and cannot drift apart.
+//! The combinators are projections of [`Cluster::beacon_state`]; the
+//! store-level queries ([`chain_fate`], [`status_rank`]) back both adaptors'
+//! trait impls. All are kept out of the trait so the two adaptors share one
+//! definition and cannot drift apart.
 
 use std::collections::BTreeSet;
 
+use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool, StakePoolId, StateRoot,
-    ValidatorId, ValidatorStatus,
+    BlockHeight, Bls12381G1PublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool,
+    StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    ValidatorStatus,
 };
 
 use super::Cluster;
+
+/// Walk `store`'s committed chain from height 1 for `tx`'s fate.
+///
+/// Returns the height at which `tx` was committed (rides a block's
+/// `transactions`) and the height plus decision at which it was finalized
+/// (rides a `FinalizedWave` certificate). The decision matters at a reshape
+/// boundary: a counterpart abort finalizes the straddler with `Aborted`,
+/// which a presence-only check would misread as a one-sided apply.
+#[must_use]
+pub fn chain_fate(
+    store: &impl ShardChainReader,
+    tx: TxHash,
+) -> (
+    Option<BlockHeight>,
+    Option<(BlockHeight, TransactionDecision)>,
+) {
+    let mut committed = None;
+    let mut finalized = None;
+    let tip = store.committed_height();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height) {
+            let block = certified.block();
+            if block.transactions().iter().any(|t| t.hash() == tx) {
+                committed = Some(height);
+            }
+            for fw in block.certificates().iter() {
+                if let Some((_, decision)) = fw.tx_decisions().into_iter().find(|(h, _)| *h == tx) {
+                    finalized = Some((height, decision));
+                }
+            }
+        }
+        height = height.next();
+    }
+    (committed, finalized)
+}
+
+/// Rank a transaction status so a cluster-wide view takes the most advanced
+/// observation.
+#[must_use]
+pub const fn status_rank(status: &TransactionStatus) -> u8 {
+    match status {
+        TransactionStatus::Pending => 0,
+        TransactionStatus::Committed(_) => 1,
+        TransactionStatus::Completed(_) => 2,
+    }
+}
 
 /// The latest committed beacon epoch, if the cluster has folded one.
 #[must_use]

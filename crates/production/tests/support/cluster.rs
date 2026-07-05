@@ -32,6 +32,7 @@ use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageDirResolver,
     StorageFactory,
 };
+use hyperscale_scenarios::query::chain_fate;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
@@ -543,14 +544,9 @@ impl Cluster {
         })
     }
 
-    /// Walk `shard`'s committed chain from height 1: the height at which
-    /// `hash` was committed (rides a block's `transactions`) and the height
-    /// plus decision at which it was finalized (rides a `FinalizedWave`
-    /// certificate). The decision matters at a reshape boundary: a
-    /// counterpart abort finalizes the straddler with `Aborted`, which a
-    /// presence-only check would misread as a one-sided apply. Reads straight
-    /// off the live store the runner writes to. `(None, None)` if no host
-    /// serves `shard`.
+    /// [`chain_fate`] over the live store the runner writes to — the shared
+    /// committed/finalized walk both harness adaptors use. `(None, None)` if
+    /// no host serves `shard`.
     pub fn chain_fate(
         &self,
         shard: ShardId,
@@ -562,27 +558,7 @@ impl Cluster {
         let Some(store) = self.store_for(shard) else {
             return (None, None);
         };
-        let mut committed = None;
-        let mut finalized = None;
-        let tip = store.committed_height();
-        let mut height = BlockHeight::new(1);
-        while height <= tip {
-            if let Some(certified) = store.get_block(height) {
-                let block = certified.block();
-                if block.transactions().iter().any(|tx| tx.hash() == hash) {
-                    committed = Some(height);
-                }
-                for fw in block.certificates().iter() {
-                    if let Some((_, decision)) =
-                        fw.tx_decisions().into_iter().find(|(h, _)| *h == hash)
-                    {
-                        finalized = Some((height, decision));
-                    }
-                }
-            }
-            height = height.next();
-        }
-        (committed, finalized)
+        chain_fate(store.as_ref(), hash)
     }
 
     /// The committed JMT byte total `shard` carries at its tip — the input

@@ -14,6 +14,7 @@ use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_production::LocalValidator;
+use hyperscale_scenarios::query::status_rank;
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -29,7 +30,7 @@ use radix_common::types::ComponentAddress;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
 
-use crate::cluster::{Cluster as Harness, ClusterSpec, HostSpec};
+use super::cluster::{Cluster as Harness, ClusterSpec, HostSpec};
 
 /// Poll cadence between predicate samples in `run_until`, matching the
 /// harness's own `await_*` interval.
@@ -180,15 +181,6 @@ impl ProdCluster {
         tx.all_declared_nodes()
             .map(|node| topology_snapshot.shard_for_node_id(node))
             .find_map(|shard| self.inner.host_serving(shard))
-    }
-}
-
-/// Rank a status so the cluster-wide view takes the most advanced observation.
-const fn status_rank(status: &TransactionStatus) -> u8 {
-    match status {
-        TransactionStatus::Pending => 0,
-        TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
     }
 }
 
