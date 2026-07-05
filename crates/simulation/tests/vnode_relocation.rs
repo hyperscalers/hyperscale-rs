@@ -67,7 +67,7 @@ fn run_until_or(
     while runner.now() < deadline {
         let next = runner.now() + Duration::from_secs(1);
         runner.run_until(next);
-        moves.extend(runner.take_reconfigurations());
+        moves.extend(runner.take_participation_changes());
         if predicate(runner) {
             return true;
         }
@@ -122,7 +122,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     // then discard the grow's placement deltas so only the shuffle's move is
     // collected below.
     runner.grow_to(2);
-    let _ = runner.take_reconfigurations();
+    let _ = runner.take_participation_changes();
 
     // ── Detection: the epoch-16 shuffle surfaces a direct move ──────
     let shuffle =

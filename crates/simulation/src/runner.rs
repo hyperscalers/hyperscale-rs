@@ -152,8 +152,8 @@ pub struct SimulationRunner {
     /// Placement deltas the hosted vnodes emitted via
     /// `Action::ReconfigureParticipation`, in deterministic event
     /// order. Drained by the harness via
-    /// [`Self::take_reconfigurations`].
-    pending_reconfigurations: Vec<(NodeIndex, ParticipationChange)>,
+    /// [`Self::take_participation_changes`].
+    pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,
 
     /// Global event queue, ordered deterministically.
     event_queue: BTreeMap<EventKey, HostEvent>,
@@ -497,7 +497,7 @@ impl SimulationRunner {
             signing_keys,
             beacon_config_hash,
             beacon_network,
-            pending_reconfigurations: Vec::new(),
+            pending_participation_changes: Vec::new(),
             event_queue: BTreeMap::new(),
             sequence: 0,
             now: Duration::ZERO,
@@ -943,8 +943,8 @@ impl SimulationRunner {
         for op in output.timer_ops {
             self.process_timer_op(node, op);
         }
-        for change in output.reconfigurations {
-            self.pending_reconfigurations.push((node, change));
+        for change in output.participation_changes {
+            self.pending_participation_changes.push((node, change));
         }
     }
 

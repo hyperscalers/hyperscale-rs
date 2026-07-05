@@ -65,7 +65,7 @@ where
     /// Per-step scratch: placement deltas emitted via
     /// `Action::ReconfigureParticipation` — the seat/drain triggers the runner
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
-    pub(crate) pending_reconfigurations: Vec<ParticipationChange>,
+    pub(crate) pending_participation_changes: Vec<ParticipationChange>,
 
     /// Per-step scratch: count of actions the pooled vnodes produced.
     pub(crate) actions_generated: usize,
@@ -92,7 +92,7 @@ where
             process,
             vnodes,
             now: LocalTimestamp::ZERO,
-            pending_reconfigurations: Vec::new(),
+            pending_participation_changes: Vec::new(),
             actions_generated: 0,
             beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
         }
@@ -118,7 +118,7 @@ where
     /// Clear per-step scratch. Called by [`NodeHost::step`](crate::host::NodeHost::step)
     /// before dispatch so the drained output reflects only this step.
     pub(crate) fn clear_scratch(&mut self) {
-        self.pending_reconfigurations.clear();
+        self.pending_participation_changes.clear();
         self.actions_generated = 0;
     }
 
@@ -131,7 +131,7 @@ where
     pub fn run_step(&mut self, input: PoolScopedInput) -> Vec<ParticipationChange> {
         self.clear_scratch();
         self.dispatch_event(input);
-        self.take_output().reconfigurations
+        self.take_output().participation_changes
     }
 
     /// Drain this step's scratch into a [`StepOutput`]. A follower emits no
@@ -143,7 +143,7 @@ where
     pub(crate) fn take_output(&mut self) -> StepOutput {
         StepOutput {
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
-            reconfigurations: std::mem::take(&mut self.pending_reconfigurations),
+            participation_changes: std::mem::take(&mut self.pending_participation_changes),
             ..StepOutput::default()
         }
     }
@@ -250,7 +250,7 @@ where
                     .apply_topology(epoch, &topology_snapshot, routing_committees);
             }
             Action::ReconfigureParticipation(change) => {
-                self.pending_reconfigurations.push(change);
+                self.pending_participation_changes.push(change);
             }
             // A follower is never on the beacon committee, so its consensus
             // timers fire only into handlers that no-op; drop them rather than

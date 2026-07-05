@@ -242,7 +242,7 @@ pub struct StepOutput {
     /// during this step. The runner reconfigures physical shard
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.
-    pub reconfigurations: Vec<ParticipationChange>,
+    pub participation_changes: Vec<ParticipationChange>,
 }
 
 impl StepOutput {
@@ -254,7 +254,8 @@ impl StepOutput {
         self.emitted_statuses.extend(other.emitted_statuses);
         self.actions_generated += other.actions_generated;
         self.timer_ops.extend(other.timer_ops);
-        self.reconfigurations.extend(other.reconfigurations);
+        self.participation_changes
+            .extend(other.participation_changes);
     }
 }
 
@@ -316,7 +317,7 @@ where
     pub emitted_statuses: Vec<(TxHash, TransactionStatus)>,
     /// Per-step scratch: placement deltas emitted via
     /// `Action::ReconfigureParticipation`. Drained into [`StepOutput`].
-    pub pending_reconfigurations: Vec<ParticipationChange>,
+    pub pending_participation_changes: Vec<ParticipationChange>,
     /// Per-step scratch: count of actions this shard's vnodes produced
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
@@ -625,7 +626,7 @@ where
     pub(crate) fn clear_scratch(&mut self) {
         self.pending_timer_ops.clear();
         self.emitted_statuses.clear();
-        self.pending_reconfigurations.clear();
+        self.pending_participation_changes.clear();
         self.actions_generated = 0;
     }
 
@@ -637,7 +638,7 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
-            reconfigurations: std::mem::take(&mut self.pending_reconfigurations),
+            participation_changes: std::mem::take(&mut self.pending_participation_changes),
         }
     }
 

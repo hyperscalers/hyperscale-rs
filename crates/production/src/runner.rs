@@ -1429,7 +1429,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                 timer_mgr.process_op(op);
             }
             if let Some(tx) = &config.participation_tx {
-                for change in output.reconfigurations {
+                for change in output.participation_changes {
                     // Send failure means the runner is shutting down.
                     let _ = tx.send(change);
                 }

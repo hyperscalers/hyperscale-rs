@@ -242,7 +242,7 @@ where
                     now: LocalTimestamp::ZERO,
                     pending_timer_ops: Vec::new(),
                     emitted_statuses: Vec::new(),
-                    pending_reconfigurations: Vec::new(),
+                    pending_participation_changes: Vec::new(),
                     actions_generated: 0,
                 };
                 (shard, shard_loop)
@@ -659,7 +659,7 @@ where
         now: LocalTimestamp::ZERO,
         pending_timer_ops: Vec::new(),
         emitted_statuses: Vec::new(),
-        pending_reconfigurations: Vec::new(),
+        pending_participation_changes: Vec::new(),
         actions_generated: 0,
     };
     register_shard_request_handlers(process, &shard_loop.io, shard);

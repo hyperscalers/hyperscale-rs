@@ -225,7 +225,7 @@ where
                 self.handle_topology_changed(epoch, &topology_snapshot, routing_committees);
             }
             Action::ReconfigureParticipation(change) => {
-                self.pending_reconfigurations.push(change);
+                self.pending_participation_changes.push(change);
             }
         }
     }

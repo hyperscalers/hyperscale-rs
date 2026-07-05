@@ -32,7 +32,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     // Grow to two shards; the grow draws one cohort from the pool and leaves
     // one surplus extra `Pooled` — a real shard-less beacon follower.
     runner.grow_to(2);
-    let _ = runner.take_reconfigurations();
+    let _ = runner.take_participation_changes();
 
     // ── A surplus pool follower keeps its host's beacon storage warm ──
     let pool_host = (0..runner.num_hosts())
@@ -90,7 +90,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
         "the drained pool follower must keep folding committed beacon blocks \
          ({before} -> {after})"
     );
-    let _ = runner.take_reconfigurations();
+    let _ = runner.take_participation_changes();
 
     let kind = runner.join_shard(
         node,
@@ -126,7 +126,7 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED, &[]);
     let runner = cluster.runner_mut();
     runner.grow_to(2);
-    let _ = runner.take_reconfigurations();
+    let _ = runner.take_participation_changes();
 
     let pool_host = (0..runner.num_hosts())
         .find(|&n| runner.pooled_len(n) > 0)
