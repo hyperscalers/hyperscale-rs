@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_production::{StorageDirResolver, StorageFactory};
+use hyperscale_production::{StorageDirResolver, StorageFactory, shard_data_dir};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Bls12381G1PrivateKey, ShardId, ValidatorId, generate_bls_keypair, shard_prefix_path,
@@ -44,7 +44,7 @@ pub fn test_bind_args(
 /// binary's data-dir convention.
 pub fn temp_storage_dir(dir: &TempDir) -> StorageDirResolver {
     let root = dir.path().to_path_buf();
-    Arc::new(move |shard: ShardId| root.join(format!("shard-d{}p{}", shard.depth(), shard.path())))
+    Arc::new(move |shard: ShardId| shard_data_dir(&root, shard))
 }
 
 /// Storage factory rooted in the test's temp dir, opening a fresh

@@ -61,7 +61,7 @@ use hyperscale_network_libp2p::{Libp2pConfig, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, SyncStatus,
-    TelemetryConfig, TelemetryGuard, init_telemetry,
+    TelemetryConfig, TelemetryGuard, init_telemetry, shard_data_dir,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -1125,14 +1125,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             .context("Failed to initialize thread pools")?,
     );
 
-    // One directory convention for every open — startup seats, runtime joins,
-    // and split-flip seeding. Depth qualifies the name: trie paths alone
-    // collide across depths once shards split (a child `leaf(2, 0)` and
-    // its parent `leaf(1, 0)` share the path value 0).
     let dir_data_dir = config.node.data_dir.clone();
-    let storage_dir: StorageDirResolver = Arc::new(move |shard: ShardId| {
-        dir_data_dir.join(format!("shard-d{}p{}", shard.depth(), shard.path()))
-    });
+    let storage_dir: StorageDirResolver =
+        Arc::new(move |shard: ShardId| shard_data_dir(&dir_data_dir, shard));
 
     // Opens a shard's storage when the runner seats this host on it — a
     // beacon-derived startup seat or a runtime placement change — at one

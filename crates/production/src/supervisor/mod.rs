@@ -16,7 +16,7 @@
 //! must not tear the other down.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::{Receiver, Sender};
@@ -68,6 +68,18 @@ pub type StorageFactory =
 /// parent checkpoint before the open. Supplied by the validator binary
 /// alongside the factory.
 pub type StorageDirResolver = Arc<dyn Fn(ShardId) -> PathBuf + Send + Sync>;
+
+/// The directory `shard`'s store lives at under `root`.
+///
+/// One convention for every open (startup seats, runtime joins, split-flip
+/// seeding), so a restart reopens what an earlier seat created. Depth
+/// qualifies the name:
+/// trie paths alone collide across depths once shards split (a child
+/// `leaf(2, 0)` and its parent `leaf(1, 0)` share the path value 0).
+#[must_use]
+pub fn shard_data_dir(root: &Path, shard: ShardId) -> PathBuf {
+    root.join(format!("shard-d{}p{}", shard.depth(), shard.path()))
+}
 
 /// A runtime shard-membership change, executed by [`ShardSupervisor`].
 #[derive(Clone)]
