@@ -44,7 +44,7 @@ use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
 
-pub mod relocation;
+pub mod membership;
 pub mod reshape;
 pub mod system_action;
 

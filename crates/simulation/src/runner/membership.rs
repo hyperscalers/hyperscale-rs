@@ -1,18 +1,18 @@
-//! Runtime vnode relocation for the simulation harness.
+//! The harness's membership half: bring shards up and tear them down
+//! against the committed beacon placement.
 //!
-//! The deterministic counterpart of the production runner's
-//! reconfiguration loop: hosted vnodes surface
-//! [`ParticipationChange`]s through `StepOutput`, and the harness
-//! applies them — a join runs the same sans-io
-//! [`ShardBootstrap`] sequencer production pumps (state assembly →
-//! import + anchor verification → witness history → recovered state),
-//! served straight from the target committee's hosts' storages, then
-//! seats the vnode via `NodeHost::add_shard`; a leave tears the shard
-//! down via `NodeHost::remove_shard`, handing back a shared storage
-//! handle so a later rejoin exercises the retained-storage fast path.
+//! Hosted vnodes surface [`ParticipationChange`]s through `StepOutput`;
+//! the committed projection drives the actual joins and leaves — a join
+//! runs the same sans-io [`ShardBootstrap`] sequencer production drives
+//! (state assembly → import + anchor verification → witness history →
+//! recovered state), served straight from the target committee's hosts'
+//! storages, then seats the vnode via `NodeHost::add_shard`; a leave
+//! tears the shard down via `NodeHost::remove_shard`, handing back a
+//! shared storage handle so a later rejoin exercises the
+//! retained-storage fast path.
 //!
 //! Nothing here runs unless a test calls it, so simulations that never
-//! relocate are byte-identical to before.
+//! reconcile membership are byte-identical to before.
 
 use std::sync::Arc;
 
@@ -170,7 +170,7 @@ impl SimulationRunner {
 
     /// Reconcile this host's physical shard membership against the committed
     /// beacon placement — the deterministic counterpart of the production
-    /// supervisor's reconfiguration loop (`reconcile_joins` /
+    /// supervisor's reconcile pair (`reconcile_joins` /
     /// `reconcile_teardown`). Seats every live leaf the host holds a committed
     /// `OnShard` placement on but isn't running, and tears down every leaf it
     /// runs but no longer holds a placement on (a committee rotation moved its
