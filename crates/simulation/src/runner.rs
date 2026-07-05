@@ -433,17 +433,6 @@ impl SimulationRunner {
                 tx_validator,
             );
 
-            // Seat each genesis vnode's beacon-signing registry entry —
-            // the same wiring the production supervisor runs at spawn.
-            // At genesis every validator hosts one vnode, so each claim
-            // is the first and wins.
-            for (shard, validator_idxs) in &by_shard {
-                for &validator_idx in validator_idxs {
-                    host.process()
-                        .assign_beacon_signer(ValidatorId::new(u64::from(validator_idx)), *shard);
-                }
-            }
-
             hosts.push(host);
             event_rxs.push(event_rx);
             host_event_txs.push(event_tx);
