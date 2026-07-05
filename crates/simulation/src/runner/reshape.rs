@@ -28,7 +28,8 @@ use hyperscale_engine::GenesisConfig;
 use hyperscale_network::Network;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
-use hyperscale_node::reshape::adopt::verified_recovered_state;
+use hyperscale_node::reshape::PreparedStore;
+use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
@@ -52,18 +53,6 @@ use super::SimulationRunner;
 /// dozens of synchronous rounds a duty's open/sync/follow/adopt/seat chain
 /// takes, so exhaustion means a wedge rather than a budget.
 const MAX_PUMP_ROUNDS: usize = 100_000;
-
-/// A reshape duty's in-flight store, held between the orchestrator's open and
-/// seat for one `(host, duty shard)`. Mirrors the production supervisor's
-/// `BootstrappingStore`.
-pub(super) struct ReshapeStore {
-    /// The opened store the duty imports and adopts into.
-    pub(super) storage: SimShardStorage,
-    /// The derived genesis, set at adopt, installed at seat.
-    pub(super) genesis: Option<Block>,
-    /// The recovered state the seated vnodes boot from, rebuilt at adopt.
-    pub(super) recovered: RecoveredState,
-}
 
 impl SimulationRunner {
     /// Step every host's reshape orchestrator one slice, driving its duties to a
@@ -209,7 +198,7 @@ impl SimulationRunner {
         let recovered = storage.load_recovered_state();
         self.reshape_stores.insert(
             (node, shard),
-            ReshapeStore {
+            PreparedStore {
                 storage,
                 genesis: None,
                 recovered,
@@ -244,7 +233,7 @@ impl SimulationRunner {
         let recovered = storage.load_recovered_state();
         self.reshape_stores.insert(
             (node, child),
-            ReshapeStore {
+            PreparedStore {
                 storage,
                 genesis: None,
                 recovered,
@@ -358,8 +347,8 @@ impl SimulationRunner {
         GetBlockResponse::not_found()
     }
 
-    /// Adopt a duty's derived genesis into its store, verifying the adopted
-    /// root against the beacon anchor, and cache the genesis plus the recovered
+    /// Adopt a duty's derived genesis into its store via the shared
+    /// [`adopt_prepared_store`] gate, caching the genesis plus the recovered
     /// state the seat boots from.
     fn reshape_adopt(
         &mut self,
@@ -371,34 +360,8 @@ impl SimulationRunner {
         genesis: Block,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(node, shard))?.storage.clone();
-        let (adopted, expected) = match kind {
-            AdoptKind::Split => (
-                storage
-                    .adopt_followed_child(origin, &genesis)
-                    .expect("followed child adoption"),
-                genesis.header().state_root(),
-            ),
-            AdoptKind::ParentHalf => (
-                storage
-                    .adopt_split_child(origin, &genesis)
-                    .expect("split child subtree adoption"),
-                view.boundary(shard)
-                    .expect("split child anchor projects")
-                    .state_root,
-            ),
-            AdoptKind::Merge => (
-                storage
-                    .adopt_merge_parent(origin, &genesis)
-                    .expect("merge parent adoption"),
-                view.boundary(shard)
-                    .expect("merge parent anchor projects")
-                    .state_root,
-            ),
-        };
-        let substate_bytes = storage
-            .substate_bytes_at_version(origin.genesis_height.inner())
-            .unwrap_or(0);
-        let recovered = verified_recovered_state(adopted, expected, origin, substate_bytes)
+        let anchor_root = view.boundary(shard).map(|anchor| anchor.state_root);
+        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, anchor_root)
             .expect("adopted reshape root must match the beacon anchor");
         let entry = self.reshape_stores.get_mut(&(node, shard))?;
         entry.genesis = Some(genesis);
@@ -410,7 +373,7 @@ impl SimulationRunner {
     /// committee member of `shard` this host homes, from the duty's adopted
     /// store.
     fn reshape_seat(&mut self, node: NodeIndex, view: &ReshapeView, shard: ShardId) {
-        let Some(ReshapeStore {
+        let Some(PreparedStore {
             storage,
             genesis,
             recovered,

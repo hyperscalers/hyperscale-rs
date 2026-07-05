@@ -29,7 +29,8 @@ use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::pool_loop::PoolLoop;
 use hyperscale_node::process::ProcessIo;
-use hyperscale_node::reshape::adopt::verified_recovered_state;
+use hyperscale_node::reshape::PreparedStore;
+use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
@@ -110,17 +111,6 @@ pub struct CompletedBootstrap {
     vnodes: Vec<VnodeConfig>,
     storage: Arc<RocksDbShardStorage>,
     recovered: RecoveredState,
-}
-
-/// A reshape duty's in-flight store, held by the supervisor between the
-/// orchestrator's [`ReshapeRequest::OpenStore`] and its
-/// [`ReshapeRequest::Seat`]: the open store the duty imports and adopts
-/// into, the recovered state its state machines boot from (rebuilt at the
-/// adopt), and the derived genesis the seat installs.
-struct BootstrappingStore {
-    storage: Arc<RocksDbShardStorage>,
-    recovered: RecoveredState,
-    genesis: Option<Block>,
 }
 
 /// One reshape io result fed back into the orchestrator's pump. The io
@@ -278,7 +268,7 @@ pub struct ShardSupervisor {
     /// splitting child or a merging parent), held between the
     /// orchestrator's open and seat requests. Seated stores move into
     /// [`Self::storages`].
-    reshape_stores: HashMap<ShardId, BootstrappingStore>,
+    reshape_stores: HashMap<ShardId, PreparedStore<Arc<RocksDbShardStorage>>>,
     /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
     /// an ordinary placement-delta join is still opening the same shard's store
     /// directory, keyed by that store shard. A reshape duty owns its successor's
@@ -1156,13 +1146,9 @@ impl ShardSupervisor {
             .notify(recipients, &ReadySignalNotification::new(signal));
     }
 
-    /// Adopt a reshape duty's derived genesis off the loop —
-    /// `adopt_followed_child` for a split observer's followed store,
-    /// `adopt_merge_parent` for a merge keeper's union — verifying the
-    /// adopted root against the beacon-attested anchor and rebuilding the
-    /// recovered state the seat boots from. Answers with
-    /// [`ReshapeIo::Adopted`]; a verification failure logs and strands the
-    /// duty (the seat never fires).
+    /// Adopt a reshape duty's derived genesis off the loop via the shared
+    /// [`adopt_prepared_store`] gate, answering with [`ReshapeIo::Adopted`];
+    /// a gate failure logs and strands the duty (the seat never fires).
     fn reshape_adopt(
         &mut self,
         shard: ShardId,
@@ -1177,9 +1163,6 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape adopt for an unopened store; dropped");
             return;
         };
-        // A merge verifies against the beacon's composed parent anchor; a
-        // split observer verifies against its derived genesis root (itself
-        // reproduced from the parent terminal and the child anchor).
         let anchor_root = self
             .process
             .topology_snapshot()
@@ -1188,33 +1171,7 @@ impl ShardSupervisor {
             .map(|a| a.state_root);
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            let outcome = (|| -> Result<RecoveredState, String> {
-                let (adopted, expected) = match kind {
-                    AdoptKind::Split => (
-                        storage
-                            .adopt_followed_child(origin, &genesis)
-                            .map_err(|e| format!("followed adoption: {e}"))?,
-                        genesis.header().state_root(),
-                    ),
-                    AdoptKind::ParentHalf => (
-                        storage
-                            .adopt_split_child(origin, &genesis)
-                            .map_err(|e| format!("split child adoption: {e}"))?,
-                        anchor_root.ok_or("split child anchor no longer projects")?,
-                    ),
-                    AdoptKind::Merge => (
-                        storage
-                            .adopt_merge_parent(origin, &genesis)
-                            .map_err(|e| format!("merge adoption: {e}"))?,
-                        anchor_root.ok_or("merge parent anchor no longer projects")?,
-                    ),
-                };
-                let substate_bytes = storage
-                    .substate_bytes_at_version(origin.genesis_height.inner())
-                    .unwrap_or(0);
-                verified_recovered_state(adopted, expected, origin, substate_bytes)
-            })();
-            match outcome {
+            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis, anchor_root) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
                         shard,
@@ -1233,7 +1190,7 @@ impl ShardSupervisor {
     /// store the duty adopted into. The orchestrator owns this seating, so
     /// the placement-delta join for the same shard is suppressed.
     fn reshape_seat(&mut self, shard: ShardId) {
-        let Some(BootstrappingStore {
+        let Some(PreparedStore {
             storage,
             recovered,
             genesis,
@@ -1272,7 +1229,7 @@ impl ShardSupervisor {
                 Ok((storage, recovered)) => {
                     self.reshape_stores.insert(
                         shard,
-                        BootstrappingStore {
+                        PreparedStore {
                             storage,
                             recovered,
                             genesis: None,

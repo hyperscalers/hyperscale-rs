@@ -19,8 +19,8 @@ use hyperscale_storage::{
     ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
+    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
     ShardWitnessPayload, StateRoot, StoredReceipt, TxHash, Verifiable, Verified, WaveCertificate,
     WaveId,
@@ -185,6 +185,30 @@ impl BoundaryStore for SharedStorage {
         receipts: &[StoredReceipt],
     ) -> Result<StateRoot, String> {
         self.0.follow_block_writes(height, receipts)
+    }
+
+    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
+        BoundaryStore::adopt_split_child(&*self.0, origin, genesis)
+    }
+
+    fn adopt_followed_child(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        BoundaryStore::adopt_followed_child(&*self.0, origin, genesis)
+    }
+
+    fn adopt_merge_parent(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+    ) -> Result<StateRoot, String> {
+        BoundaryStore::adopt_merge_parent(&*self.0, origin, genesis)
+    }
+
+    fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
+        self.0.substate_bytes_at_version(version)
     }
 }
 
