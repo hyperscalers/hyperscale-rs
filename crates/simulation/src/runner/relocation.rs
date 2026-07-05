@@ -70,8 +70,8 @@ pub enum JoinKind {
 impl SimulationRunner {
     /// Drain the placement deltas hosted vnodes emitted since the last
     /// call, in deterministic event order.
-    pub fn take_reconfigurations(&mut self) -> Vec<(NodeIndex, ParticipationChange)> {
-        std::mem::take(&mut self.pending_reconfigurations)
+    pub fn take_participation_changes(&mut self) -> Vec<(NodeIndex, ParticipationChange)> {
+        std::mem::take(&mut self.pending_participation_changes)
     }
 
     /// Begin hosting `shard` for `validator` on `node` at runtime,
@@ -189,7 +189,7 @@ impl SimulationRunner {
     /// freeze evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.
     pub fn pump_placement(&mut self) {
-        let _ = self.take_reconfigurations();
+        let _ = self.take_participation_changes();
         for node in 0..self.num_hosts() {
             // Committee membership only changes at an epoch boundary, so skip the
             // reconciliation scan until this host's committed epoch advances.

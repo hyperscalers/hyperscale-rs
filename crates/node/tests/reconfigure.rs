@@ -330,7 +330,7 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
     host.set_time(LocalTimestamp::from_millis(1_000));
     let out = host.step(event);
     assert!(
-        out.reconfigurations.is_empty(),
+        out.participation_changes.is_empty(),
         "re-delivering the tip raises no participation change"
     );
 }
