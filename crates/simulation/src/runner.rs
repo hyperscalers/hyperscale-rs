@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use hyperscale_beacon::genesis::{GenesisBoot, build_genesis};
+use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
@@ -18,6 +18,7 @@ use hyperscale_network_memory::{
     BandwidthReport, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
+use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
@@ -116,11 +117,6 @@ impl SimConfig {
 
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
-
-/// Logical cadence at which a syncing follower pool retries deferred
-/// beacon-block fetches. Mirrors the production pool thread's tick interval;
-/// an idle pool schedules none.
-const POOL_FETCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Deterministic simulation runner.
 ///
@@ -336,13 +332,9 @@ impl SimulationRunner {
         // as `Pooled`; the seated ROOT validators, capped at the beacon
         // committee size, form the genesis beacon committee.
         let beacon_network = genesis_validators.network.clone();
-        let GenesisBoot {
-            block: beacon_genesis_block,
-            state: beacon_genesis_state,
-            config_hash: beacon_config_hash,
-            topology_snapshot: projected_topology,
-        } = build_genesis(&genesis_validators, chain_config);
-        let shared_topology = Arc::new(projected_topology);
+        let boot = build_genesis(&genesis_validators, chain_config);
+        let beacon_config_hash = boot.config_hash;
+        let shared_topology = Arc::clone(&boot.topology_snapshot);
 
         // Build the host→validators layout based on the hosting mode.
         // Each host carries a list of (validator_idx, shard) tuples.
@@ -364,9 +356,7 @@ impl SimulationRunner {
             // committed (block, state); commit the genesis pair first on an
             // empty store so fresh-start and restart share one load path.
             let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
-            if beacon_storage.latest_committed_epoch().is_none() {
-                beacon_storage.commit_beacon_block(&beacon_genesis_block, &beacon_genesis_state);
-            }
+            boot.commit_if_empty(beacon_storage.as_ref());
 
             // Seat each host's vnodes. Same-shard vnodes share one store
             // bundle, created inside `seat_vnode_group`; a dedicated pool

@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use hyperscale_storage::BeaconStorage;
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash,
     BlockHeight, CertifiedBeaconBlock, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
@@ -189,8 +190,22 @@ pub struct GenesisBoot {
     /// network.
     pub config_hash: GenesisConfigHash,
     /// Topology projected from `state`, identical in shape to the snapshot
-    /// the runtime `ArcSwap` update derives on every epoch commit.
-    pub topology_snapshot: TopologySnapshot,
+    /// the runtime `ArcSwap` update derives on every epoch commit. `Arc`ed
+    /// so a host shares one allocation across every vnode.
+    pub topology_snapshot: Arc<TopologySnapshot>,
+}
+
+impl GenesisBoot {
+    /// Commit the genesis (block, state) pair into `storage` if it holds no
+    /// committed epoch yet, so fresh-start and warm-restart converge on the
+    /// same resume load — the coordinator's resume epoch is whatever
+    /// committed pair the store hands it. A store with history is left
+    /// untouched.
+    pub fn commit_if_empty(&self, storage: &dyn BeaconStorage) {
+        if storage.latest_committed_epoch().is_none() {
+            storage.commit_beacon_block(&self.block, &self.state);
+        }
+    }
 }
 
 /// Build the genesis beacon chain from `genesis` and project its topology
@@ -239,7 +254,7 @@ pub fn build_genesis(genesis: &GenesisValidators, chain_config: BeaconChainConfi
     let state = Arc::new(build_genesis_beacon_state(&config));
     let config_hash = genesis_config_hash(&config, &genesis.network);
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
-    let topology_snapshot = state.derive_topology_snapshot(genesis.network.clone());
+    let topology_snapshot = Arc::new(state.derive_topology_snapshot(genesis.network.clone()));
     GenesisBoot {
         block,
         state,
