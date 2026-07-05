@@ -5,6 +5,7 @@ use std::iter::Sum;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use hex::encode as hex_encode;
+use radix_common::types::NodeId as RadixNodeId;
 use sbor::prelude::*;
 
 /// Validator identifier.
@@ -1028,8 +1029,9 @@ impl Display for HeaderFetchCount {
 
 /// Node identifier (30-byte address).
 ///
-/// This is a simplified version that doesn't depend on Radix types.
-/// It represents an address in the state tree.
+/// The engine-independent mirror of the Radix engine node id — the same 30
+/// address bytes, without the engine's methods. It represents an address in
+/// the state tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 pub struct NodeId(pub [u8; 30]);
 
@@ -1045,6 +1047,14 @@ impl NodeId {
         let mut arr = [0u8; 30];
         arr.copy_from_slice(bytes);
         Self(arr)
+    }
+
+    /// Rewrap a Radix engine node id (e.g. from
+    /// `ComponentAddress::into_node_id`) into the mirror type. The two carry
+    /// the same 30 address bytes.
+    #[must_use]
+    pub const fn from_radix(id: RadixNodeId) -> Self {
+        Self(id.0)
     }
 
     /// Get the bytes as a slice.

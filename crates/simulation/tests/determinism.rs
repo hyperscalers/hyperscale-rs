@@ -219,12 +219,7 @@ const fn cross_shard_config() -> ScenarioConfig {
 fn account_on_leaf(leaf: ShardId) -> (Ed25519PrivateKey, ComponentAddress) {
     for seed in 1u8..=u8::MAX {
         let account = account_from_seed(seed);
-        let radix_node = account.into_node_id();
-        let node = NodeId(
-            radix_node.0[..30]
-                .try_into()
-                .expect("account address carries a 30-byte node id"),
-        );
+        let node = NodeId::from_radix(account.into_node_id());
         if uniform_shard_for_node(&node, 2) == leaf {
             return (signer_from_seed(seed), account);
         }

@@ -102,7 +102,7 @@ where
     /// # Panics
     ///
     /// Panics if the JMT is already initialized (genesis must run on a fresh
-    /// store) or if a shard address can't be decoded to a `NodeId`.
+    /// store).
     pub fn install_engine_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> StateRoot
     where
         S: GenesisCommit,
@@ -114,12 +114,7 @@ where
         let topology_snapshot = self.process.topology_snapshot.load();
         let mut config = config.clone();
         config.xrd_balances.retain(|(address, _)| {
-            let radix_node_id = address.into_node_id();
-            let det_node_id = NodeId(
-                radix_node_id.0[..30]
-                    .try_into()
-                    .expect("NodeId is 30 bytes"),
-            );
+            let det_node_id = NodeId::from_radix(address.into_node_id());
             topology_snapshot.shard_for_node_id(&det_node_id) == shard
         });
         let merged = prepared_genesis(self.process.dispatch_handles.executor.network(), &config);
