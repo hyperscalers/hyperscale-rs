@@ -614,6 +614,28 @@ impl TopologySnapshot {
             .map_or(&[][..], |c| c.consensus_validators.as_slice())
     }
 
+    /// Committee members holding a consensus seat in `shard`'s window —
+    /// full membership minus split-observer riders, in committee order.
+    /// The set a runner seats vnodes for.
+    ///
+    /// An Observing cohort member rides [`Self::committee_for_shard`] for
+    /// serving, gossip, and ready-signal admission, but must never be
+    /// seated as a consensus member: a seated rider emits a shard-joiner
+    /// `ReadySignal` that classifies as the cohort's `ReshapeReady` and can
+    /// fire the split gate before its child store has synced. Both the
+    /// membership and the observer cohort are frozen at the same promotion,
+    /// so the view is window-coherent.
+    pub fn seatable_committee_for_shard(
+        &self,
+        shard: ShardId,
+    ) -> impl Iterator<Item = ValidatorId> + '_ {
+        let riders = self.reshape_observers.get(&shard);
+        self.committee_for_shard(shard)
+            .iter()
+            .copied()
+            .filter(move |v| !riders.is_some_and(|cohort| cohort.contains_key(v)))
+    }
+
     /// Total votes a shard's consensus committee can cast — one per ready
     /// member.
     #[must_use]
@@ -928,6 +950,63 @@ mod tests {
             make_snapshot(4).reshape_observer_child(shard, observer),
             None
         );
+    }
+
+    /// The seatable view drops an observer riding its splitting parent's
+    /// committee while passing every real member — including a keeper and a
+    /// not-yet-ready joiner — through in committee order.
+    #[test]
+    fn seatable_committee_excludes_observer_riders() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let validators: Vec<_> = (0..5).map(make_test_validator).collect();
+        let vs = ValidatorSet::new(validators);
+        let members: Vec<ValidatorId> = (0..5).map(ValidatorId::new).collect();
+        let observer = members[3];
+        let rider_elsewhere = members[4];
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &vs,
+            HashMap::from([(parent, members.clone())]),
+            // Members 0-1 are ready; 2 is a joiner still syncing; the
+            // observer and the other split's rider never enter the subset.
+            HashMap::from([(parent, members[..2].to_vec())]),
+            HashMap::new(),
+            HashMap::new(),
+            BTreeMap::from([
+                (parent, BTreeMap::from([(observer, left)])),
+                // A cohort seat on a different splitting shard does not
+                // exclude the validator here.
+                (
+                    ShardId::leaf(1, 1),
+                    BTreeMap::from([(rider_elsewhere, right)]),
+                ),
+            ]),
+            // A keeper seat never affects membership.
+            BTreeMap::from([(parent, BTreeMap::from([(members[0], parent)]))]),
+            BTreeMap::new(),
+            BTreeSet::from([parent]),
+        );
+
+        let seatable: Vec<ValidatorId> = snapshot.seatable_committee_for_shard(parent).collect();
+        assert_eq!(
+            seatable,
+            vec![members[0], members[1], members[2], rider_elsewhere],
+        );
+    }
+
+    /// With no pending split, the seatable view is the full committee.
+    #[test]
+    fn seatable_committee_matches_committee_without_a_pending_split() {
+        let snapshot = make_snapshot(4);
+        let shard = snapshot
+            .shard_trie()
+            .leaves()
+            .next()
+            .expect("single-shard snapshot has a leaf");
+        let seatable: Vec<ValidatorId> = snapshot.seatable_committee_for_shard(shard).collect();
+        assert_eq!(seatable, snapshot.committee_for_shard(shard).to_vec());
+        assert!(!seatable.is_empty());
     }
 
     /// Build a snapshot whose trie is `committees`' leaves, carrying `advanced`
