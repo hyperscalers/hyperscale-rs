@@ -419,9 +419,6 @@ impl ShardSupervisor {
             .iter()
             .map(|v| v.validator_id.inner())
             .collect();
-        for vnode in &shard_loop.vnodes {
-            self.process.assign_beacon_signer(vnode.validator_id, shard);
-        }
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
         self.shards.insert(
@@ -1331,13 +1328,6 @@ impl ShardSupervisor {
     ) {
         let inits = self.build_vnode_inits(shard, vnodes, recovered);
         let vnode_count = inits.len();
-        // Seat the beacon-signing registry before the loop can emit:
-        // first assign wins, so a flip child or relocation joiner whose
-        // validator already signs elsewhere is born passive.
-        for cfg in vnodes {
-            self.process.assign_beacon_signer(cfg.validator_id, shard);
-        }
-
         let (channels, callback_tx) = ShardChannels::new();
         let mut shard_loop = attach_shard(
             &self.process,
@@ -1514,17 +1504,14 @@ impl ShardSupervisor {
     /// drop the storage handle, scrub the RPC slots, and replay any
     /// join that queued behind the drain.
     fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
-        detach_shard(&self.process, shard);
+        let departed: Vec<ValidatorId> = validator_ids
+            .iter()
+            .map(|&id| ValidatorId::new(id))
+            .collect();
+        detach_shard(&self.process, shard, &departed);
         self.storages.lock().expect("storages lock").remove(&shard);
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
-        // The thread is joined — the dead vnodes can never emit again.
-        // Releasing their seats lets each validator's surviving vnode
-        // claim beacon signing at the funnel's epoch fence.
-        for id in validator_ids {
-            self.process
-                .release_beacon_signer(ValidatorId::new(*id), shard);
-        }
         info!(shard = ?shard, "Shard left and torn down");
         // A departed validator that runs no other shard would go dark — no
         // vnode to fold the beacon and raise its own re-seat trigger. Keep
@@ -1532,8 +1519,7 @@ impl ShardSupervisor {
         // warm for the eventual re-seat. A relocation that already seated
         // the destination leaves the validator on that shard, so it is not
         // pooled; a race that pools it is undone when the seat lands.
-        for &id in validator_ids {
-            let validator = ValidatorId::new(id);
+        for &validator in &departed {
             if !self.validator_on_any_shard(validator) {
                 self.follow_in_pool(validator);
             }
