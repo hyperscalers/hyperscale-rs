@@ -86,10 +86,11 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, ShardWitnessPayload, StateRoot,
-    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters,
+    ShardWitnessPayload, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
+    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -383,6 +384,11 @@ impl ShardCoordinator {
         // `committed_anchor_ts` from it keeps a restarted node's BFT clock equal
         // to a non-restarted peer's rather than one to two blocks ahead.
         let committed_anchor_ts = recovered.committee_anchor_ts();
+        let recovered_registers = recovered
+            .safe_vote_registers
+            .get(&me)
+            .copied()
+            .unwrap_or_default();
         Self {
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
@@ -398,11 +404,13 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
-            // Recover the lock conservatively at the high QC's round: we never
-            // regress below the chain we already certified, so the safe-vote
-            // lock can't slip beneath a committed block after a restart.
-            locked_round: high_qc_round,
-            last_voted_round: high_qc_round,
+            // Recover the registers from the durable record (which holds
+            // every position this validator signed — persisted before each
+            // signature left the process), floored at the high QC's round
+            // so the lock can't slip beneath a committed block even when
+            // no record survives (fresh store, new chain incarnation).
+            locked_round: high_qc_round.max(recovered_registers.locked_round),
+            last_voted_round: high_qc_round.max(recovered_registers.last_voted_round),
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(
                 recovered.committed_height,
@@ -2550,9 +2558,10 @@ impl ShardCoordinator {
         };
         let next_proposers = vote_recipients(recipient_snapshot, self.local_shard, self.me, round);
 
-        // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
-        // crypto pool, broadcasts, and feeds the signed vote back for local
-        // VoteSet tracking via VerifiedBlockVoteReceived.
+        // Emit SignAndBroadcastBlockVote — the io_loop persists the
+        // ratcheted registers, signs on the consensus crypto pool,
+        // broadcasts, and feeds the signed vote back for local VoteSet
+        // tracking via VerifiedBlockVoteReceived.
         vec![Action::SignAndBroadcastBlockVote {
             block_hash,
             parent_block_hash,
@@ -2560,6 +2569,7 @@ impl ShardCoordinator {
             round,
             timestamp,
             next_proposers,
+            registers: self.safe_vote_registers(),
         }]
     }
 
@@ -4392,6 +4402,7 @@ impl ShardCoordinator {
             round,
             high_qc: self.high_qc(),
             recipients,
+            registers: self.safe_vote_registers(),
         }]
     }
 
@@ -5076,6 +5087,17 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn locked_round(&self) -> Round {
         self.locked_round
+    }
+
+    /// Snapshot of both safe-vote registers, carried on vote and timeout
+    /// signing actions so the runner can persist them ahead of the
+    /// signature.
+    #[must_use]
+    pub const fn safe_vote_registers(&self) -> SafeVoteRegisters {
+        SafeVoteRegisters {
+            locked_round: self.locked_round,
+            last_voted_round: self.last_voted_round,
+        }
     }
 
     /// Check if we have a COMPLETE block at the given height that can be committed.

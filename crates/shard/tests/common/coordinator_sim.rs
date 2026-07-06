@@ -28,7 +28,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
-use hyperscale_storage::{ChainEntry, PendingChain, RecoveredState, ShardChainWriter};
+use hyperscale_storage::{
+    ChainEntry, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
+};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
@@ -888,7 +890,11 @@ impl ShardCoordinatorSim {
                 round,
                 timestamp,
                 next_proposers,
+                registers,
             } => {
+                // Mirror the production sign handler: the registers
+                // are durable before the signature exists.
+                self.storages[emitter_idx].persist_safe_vote_registers(me, registers);
                 let verified = Verified::<BlockVote>::sign_local(
                     &self.network,
                     block_hash,
@@ -928,7 +934,11 @@ impl ShardCoordinatorSim {
                 round,
                 high_qc,
                 recipients,
+                registers,
             } => {
+                // Mirror the production sign handler: the registers
+                // are durable before the signature exists.
+                self.storages[emitter_idx].persist_safe_vote_registers(me, registers);
                 let verified = Verified::<Timeout>::sign_local(
                     &self.network,
                     self.shard,
