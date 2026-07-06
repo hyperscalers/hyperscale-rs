@@ -18,10 +18,11 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::{HoldFilter, ShardCoordinatorSim};
-use hyperscale_types::{BlockHash, BlockHeight, Round, ValidatorId};
+use common::{HoldFilter, ShardCoordinatorSim, perturb_header_timestamp};
+use hyperscale_types::{BlockHash, BlockHeight, BlockManifest, Round, ValidatorId};
 
 const MAX_STEPS: usize = 5_000;
 const PAST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -157,5 +158,84 @@ fn safe_vote_and_contiguous_commit_close_the_fork() {
         committed_block(&sim, 2, h1),
         None,
         "V2's branch B (QC_B) must never commit at height 1",
+    );
+}
+
+/// The register-persistence crash witness, replayed with durable
+/// registers: a replica that voted at round 1, crashed, and restarted
+/// must refuse a sibling block at round 1 — even though its store
+/// recovered no QC (the harness never persists commits), so the durable
+/// safe-vote record alone carries the refusal. Re-initializing the
+/// registers from the recovered QC instead turns exactly this delivery
+/// into the second half of a dual commit: the restarted replica's view
+/// returns to round 1 with both registers at zero, every safe-vote
+/// guard passes for the sibling, and its vote completes a quorum on a
+/// branch conflicting with the one it already helped commit.
+#[test]
+fn crash_restarted_replica_refuses_revote_in_consumed_round() {
+    let mut sim = ShardCoordinatorSim::new(4, 0xC4A5);
+    let v3 = ValidatorId::new(3);
+    let r1 = Round::new(1);
+
+    // Happy path: the chain commits height 1 (and beyond); every
+    // replica votes at round 1.
+    sim.kick_off();
+    sim.run_for_at_most(MAX_STEPS);
+
+    let original = Arc::clone(
+        &sim.commits[0]
+            .iter()
+            .find(|c| c.height == BlockHeight::new(1))
+            .expect("height 1 committed on the happy path")
+            .certified,
+    );
+    let original_hash = original.block().hash();
+    assert!(
+        sim.votes_cast[3].contains(&(original_hash, r1)),
+        "V3 voted the original block at round 1 before the crash",
+    );
+
+    let pre_locked = sim.coordinators[3].locked_round();
+    let pre_last_voted = sim.coordinators[3].last_voted_round();
+    assert!(pre_last_voted >= r1);
+
+    sim.crash_and_restart(v3);
+
+    // The registers came back from the durable record: the store held
+    // no QC, so without the record both would re-initialize to round 0
+    // while the view returns to round 1 — and every safe-vote guard
+    // would pass for the sibling delivered below.
+    assert_eq!(sim.coordinators[3].locked_round(), pre_locked);
+    assert_eq!(sim.coordinators[3].last_voted_round(), pre_last_voted);
+    assert_eq!(sim.coordinators[3].view(), r1);
+
+    // Mint the sibling: same height, round, parent, and content roots
+    // as the block V3 voted — only the hash differs. Deliver it to the
+    // restarted replica alone.
+    let sibling = Arc::new(perturb_header_timestamp(original.block().header()));
+    assert_ne!(sibling.hash(), original_hash);
+    assert_eq!(sibling.round(), r1);
+    sim.deliver_header(
+        v3,
+        Arc::clone(&sibling),
+        BlockManifest::from_block(original.block()),
+    );
+    sim.run_for_at_most(MAX_STEPS);
+
+    // The refusal: no vote for the sibling, exactly one round-1 vote
+    // across the crash boundary, and no fork anywhere.
+    assert!(
+        !sim.votes_cast[3].iter().any(|(h, _)| *h == sibling.hash()),
+        "restarted replica voted the sibling — the crash re-vote window is open",
+    );
+    assert_eq!(
+        sim.votes_cast[3].iter().filter(|(_, r)| *r == r1).count(),
+        1,
+        "exactly one round-1 vote across the crash boundary",
+    );
+    assert!(
+        find_fork(&sim).is_none(),
+        "two honest replicas committed different blocks at one height: {:?}",
+        find_fork(&sim),
     );
 }
