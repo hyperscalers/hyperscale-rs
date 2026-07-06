@@ -303,6 +303,23 @@ pub fn straddler_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
     ]
 }
 
+/// The cross-shard accounts (`31` left, `30` right) plus two extra funded
+/// accounts (`40`, `41`) for single-shard control transfers.
+///
+/// The inter-shard partition scenario needs control accounts *disjoint* from the
+/// cross-shard pair: a self-transfer on `31` or `30` would collide with the
+/// in-flight cross-shard wave's reserved writes and stall behind it, so the
+/// controls run on `40` / `41` instead and settle purely intra-shard.
+#[must_use]
+pub fn intershard_partition_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
+    vec![
+        (account_from_seed(31), Decimal::from(10_000)),
+        (account_from_seed(30), Decimal::from(10_000)),
+        (account_from_seed(40), Decimal::from(10_000)),
+        (account_from_seed(41), Decimal::from(10_000)),
+    ]
+}
+
 /// Build a faucet-funded transfer.
 ///
 /// The faucet pays the fee and supplies free XRD, deposited to `to`. Portable —
