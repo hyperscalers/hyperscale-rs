@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
@@ -37,7 +38,7 @@ use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, CertRootVerifyError, CertificateRoot, CertificateRootContext,
-    CertifiedBlock, ConsensusReceipt, FinalizedWave, Hash, LocalReceiptRoot,
+    CertifiedBlock, ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
     LocalReceiptRootContext, LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition,
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
@@ -49,6 +50,17 @@ use hyperscale_types::{
 };
 
 use crate::common::fixtures::build_genesis_block;
+
+/// Sim-time step the pacing driver advances by when the delivery queues
+/// go quiescent short of the commit target. Comfortably under the round
+/// timeout so a sub-timeout delayed header always releases before its
+/// receivers fire.
+const PACING_TICK: Duration = Duration::from_millis(250);
+
+/// Per-tick drain cap for [`ShardCoordinatorSim::run_until_committed_paced`].
+/// `run_for_at_most` stops the moment the queues empty, so this only
+/// backstops a runaway tick.
+const PACING_DRAIN_BUDGET: usize = 100_000;
 
 /// One captured commit event from a replica's
 /// [`Action::CommitBlock`] / [`Action::CommitBlockByQcOnly`] emission.
@@ -73,6 +85,18 @@ pub struct CapturedCommit {
 struct Envelope {
     to_idx: usize,
     event: SimEvent,
+}
+
+/// The ancestor a [`ByzantineBehaviour::ExtendStaleParent`] proposal
+/// re-parents onto, replacing the high QC's block. Its
+/// `parent_qc`'s round sits strictly below the honest safe-vote lock.
+struct StaleReparent {
+    parent_block_hash: BlockHash,
+    parent_qc: QuorumCertificate,
+    parent_state_root: StateRoot,
+    parent_block_height: BlockHeight,
+    parent_in_flight: InFlightCount,
+    height: BlockHeight,
 }
 
 /// Match predicate for [`ShardCoordinatorSim::hold_matching`].
@@ -128,9 +152,12 @@ impl HoldFilter {
     }
 }
 
-/// Adversarial transform a flagged replica applies to its next
-/// matching outbound action. Each variant fires once, then clears
-/// — modelled after the beacon sim's `ByzantineBehaviour`.
+/// Adversarial transform a flagged replica applies to its outbound
+/// actions. One-shot variants ([`Self::EquivocateProposal`],
+/// [`Self::ExtendStaleParent`]) fire once then clear; sustained
+/// variants ([`Self::DelayProposal`]) apply to every matching action
+/// until the flag is cleared — modelled after the beacon sim's
+/// `ByzantineBehaviour`.
 #[derive(Clone, Copy, Debug)]
 pub enum ByzantineBehaviour {
     /// On the next `BroadcastBlockHeader`, also emit a second
@@ -139,8 +166,24 @@ pub enum ByzantineBehaviour {
     /// but a perturbed `timestamp` (`+1ms`). The two headers hash
     /// differently, so honest receivers admit both into
     /// `pending_blocks` but the own-vote lock keeps each receiver
-    /// from voting on more than one.
+    /// from voting on more than one. One-shot.
     EquivocateProposal,
+    /// Hold every `BroadcastBlockHeader` this replica emits for
+    /// `delay` in sim time before releasing it to peers. Sustained:
+    /// applies to each of the flagged replica's proposal slots, not
+    /// just the first. A `delay` under the round timeout is delivered
+    /// before receivers time out (slowness costs nothing); a `delay`
+    /// past the timeout lets receivers rotate the slot away before the
+    /// header lands (the late header is then stale and unvotable).
+    DelayProposal {
+        /// Sim-time hold applied to each emitted header before release.
+        delay: Duration,
+    },
+    /// On the next proposal turn, re-parent the block onto an ancestor
+    /// QC strictly below the replica's highest held QC instead of that
+    /// high QC — a proposer that ignores the freshest certificate and
+    /// tries to orphan its predecessor's certified block. One-shot.
+    ExtendStaleParent,
 }
 
 /// Wire-shape events translated from emitted [`Action`]s by
@@ -303,10 +346,18 @@ pub struct ShardCoordinatorSim {
     /// in `holds`. `release_held` reinjects them into the front of
     /// `network_q` in queue order.
     held: Vec<Vec<Envelope>>,
-    /// Per-replica adversarial transform queued for the next matching
-    /// outbound action. Fires once, then clears — mirrors beacon's
-    /// `byzantine` slot.
+    /// Per-replica adversarial transform applied to matching outbound
+    /// actions. One-shot variants clear after firing; sustained ones
+    /// persist — mirrors beacon's `byzantine` slot.
     byzantine: Vec<Option<ByzantineBehaviour>>,
+    /// Header envelopes a [`ByzantineBehaviour::DelayProposal`] replica
+    /// emitted, each paired with its release time. [`Self::advance_clock`]
+    /// drains those now due into `network_q`, oldest-scheduled first.
+    scheduled: Vec<(LocalTimestamp, Envelope)>,
+    /// Every proposed header seen, keyed by block hash.
+    /// [`ByzantineBehaviour::ExtendStaleParent`] walks these back from the
+    /// high QC's block to find the ancestor it re-parents onto.
+    header_by_block: HashMap<BlockHash, Arc<BlockHeader>>,
     /// Per-replica count of Byzantine transforms that have actually
     /// fired. Exposed for tests to confirm the adversarial path
     /// triggered.
@@ -391,6 +442,8 @@ impl ShardCoordinatorSim {
             holds: (0..n).map(|_| Vec::new()).collect(),
             held: (0..n).map(|_| Vec::new()).collect(),
             byzantine: vec![None; n],
+            scheduled: Vec::new(),
+            header_by_block: HashMap::new(),
             byzantine_fires: vec![0; n],
             sync_targets: (0..n).map(|_| Vec::new()).collect(),
             now: LocalTimestamp::ZERO,
@@ -584,8 +637,10 @@ impl ShardCoordinatorSim {
 
     /// Advance the shared sim clock by `delta` and push it to
     /// every coordinator via `set_time`. Used for ready-signal
-    /// dwell and view-change timeout tests.
-    pub fn advance_clock(&mut self, delta: std::time::Duration) {
+    /// dwell and view-change timeout tests. Also releases any
+    /// [`ByzantineBehaviour::DelayProposal`] headers whose hold has
+    /// elapsed by the new time.
+    pub fn advance_clock(&mut self, delta: Duration) {
         let new_ms = self.now.as_millis().saturating_add(
             u64::try_from(delta.as_millis()).expect("advance_clock delta fits u64 ms"),
         );
@@ -593,6 +648,28 @@ impl ShardCoordinatorSim {
         for idx in 0..self.n() {
             self.coordinators[idx].set_time(self.now);
         }
+        self.release_due_headers();
+    }
+
+    /// Move every delayed header whose release time has passed into the
+    /// network queue, preserving emission order.
+    fn release_due_headers(&mut self) {
+        let now = self.now;
+        let mut i = 0;
+        while i < self.scheduled.len() {
+            if self.scheduled[i].0 <= now {
+                let (_, env) = self.scheduled.remove(i);
+                self.network_q.push_back(env);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The release time for a header emitted now under a `delay` hold.
+    fn due_after(&self, delay: Duration) -> LocalTimestamp {
+        let ms = u64::try_from(delay.as_millis()).expect("delay fits u64 ms");
+        LocalTimestamp::from_millis(self.now.as_millis().saturating_add(ms))
     }
 
     /// Call `try_propose` on `idx` with its current admitted-tx
@@ -717,6 +794,70 @@ impl ShardCoordinatorSim {
             steps += 1;
         }
         steps
+    }
+
+    /// Drive the sim under wall-clock pacing until every replica in
+    /// `idxs` has committed `target` blocks. Drains the delivery
+    /// queues; each time they go quiescent short of the target, advances
+    /// the sim clock by [`PACING_TICK`], releasing any now-due delayed
+    /// headers, then lets every replica re-check its round timeout. This
+    /// is the driver for slow-proposer tests: the clock only moves when
+    /// the queues stall, so a header held under the round timeout always
+    /// lands before its receivers fire, and one held past it never does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_ticks` clock advances elapse before the target,
+    /// the same liveness tripwire as [`Self::run_until_committed_for`].
+    pub fn run_until_committed_paced(
+        &mut self,
+        idxs: &[usize],
+        target: usize,
+        max_ticks: usize,
+    ) -> usize {
+        let reached = |sim: &Self| idxs.iter().all(|i| sim.commits[*i].len() >= target);
+        let mut ticks = 0;
+        loop {
+            // Drain, but stop the instant the target is reached — a chain
+            // that unstalls after a timeout can otherwise commit far past
+            // `target` inside a single drain before the tick loop rechecks.
+            let mut steps = 0;
+            while steps < PACING_DRAIN_BUDGET && !reached(self) && self.step() {
+                steps += 1;
+            }
+            if reached(self) {
+                return ticks;
+            }
+            assert!(
+                ticks < max_ticks,
+                "paced sim exceeded {max_ticks} ticks; commits {:?}",
+                self.commit_counts(),
+            );
+            self.advance_clock(PACING_TICK);
+            self.fire_view_change_timer_all();
+            ticks += 1;
+        }
+    }
+
+    /// The current view (round) each replica sits at. Slow-proposer
+    /// tests read the max to bound the range of rounds to score.
+    #[must_use]
+    pub fn views(&self) -> Vec<Round> {
+        self.coordinators
+            .iter()
+            .map(ShardCoordinator::view)
+            .collect()
+    }
+
+    /// Count the rounds in `1..=up_to` whose proposer is `replica` — the
+    /// rotation slots a flagged proposer leads. Tests use this to pin how
+    /// many view changes a slow proposer's slots should have cost.
+    #[must_use]
+    pub fn rounds_led_by(&self, replica: ValidatorId, up_to: Round) -> usize {
+        let snapshot = self.topology_schedule.head();
+        (1..=up_to.inner())
+            .filter(|r| snapshot.proposer_for(self.shard, Round::new(*r)) == replica)
+            .count()
     }
 
     fn all_committed_at_least(&self, target: usize) -> bool {
@@ -889,23 +1030,39 @@ impl ShardCoordinatorSim {
             Action::BroadcastBlockHeader { header, manifest } => {
                 let header = Arc::new(*header);
                 let manifest = *manifest;
+                self.header_by_block
+                    .insert(header.hash(), Arc::clone(&header));
                 let committee_ids: Vec<ValidatorId> = self
                     .topology_schedule
                     .head()
                     .committee_for_shard(self.shard)
                     .to_vec();
+                // A `DelayProposal` replica holds every header it emits
+                // for `delay` before release; each firing counts, and the
+                // flag persists (sustained) so later slots are held too.
+                let hold = match self.byzantine[emitter_idx] {
+                    Some(ByzantineBehaviour::DelayProposal { delay }) => {
+                        self.byzantine_fires[emitter_idx] += 1;
+                        Some(self.due_after(delay))
+                    }
+                    _ => None,
+                };
                 for &peer in &committee_ids {
                     if peer == me {
                         continue;
                     }
                     let to_idx = self.idx_of(peer);
-                    self.network_q.push_back(Envelope {
+                    let env = Envelope {
                         to_idx,
                         event: SimEvent::BlockHeader {
                             header: Arc::clone(&header),
                             manifest: manifest.clone(),
                         },
-                    });
+                    };
+                    match hold {
+                        Some(due) => self.scheduled.push((due, env)),
+                        None => self.network_q.push_back(env),
+                    }
                 }
                 // No self-loopback: the proposer entered its own
                 // block into `pending_blocks` already via
@@ -1074,6 +1231,45 @@ impl ShardCoordinatorSim {
                 settled_waves_window_floor,
                 classification_topology_snapshot: classification_topology,
             } => {
+                // ExtendStaleParent re-parents the proposal onto an ancestor
+                // whose QC round sits below the honest lock, so honest
+                // replicas decline it under the safe-vote rule. It stays
+                // armed through the flagged replica's early (shallow) slots
+                // and fires on the first slot with a deep enough ancestry.
+                let stale = matches!(
+                    self.byzantine[emitter_idx],
+                    Some(ByzantineBehaviour::ExtendStaleParent),
+                )
+                .then(|| self.stale_reparent(parent_block_hash))
+                .flatten();
+                let (
+                    parent_block_hash,
+                    parent_qc,
+                    parent_state_root,
+                    parent_block_height,
+                    parent_in_flight,
+                    height,
+                ) = if let Some(reparent) = stale {
+                    self.byzantine[emitter_idx] = None;
+                    self.byzantine_fires[emitter_idx] += 1;
+                    (
+                        reparent.parent_block_hash,
+                        reparent.parent_qc,
+                        reparent.parent_state_root,
+                        reparent.parent_block_height,
+                        reparent.parent_in_flight,
+                        reparent.height,
+                    )
+                } else {
+                    (
+                        parent_block_hash,
+                        parent_qc,
+                        parent_state_root,
+                        parent_block_height,
+                        parent_in_flight,
+                        height,
+                    )
+                };
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
                 let pending_snapshots = view.pending_snapshots().to_vec();
@@ -1463,6 +1659,29 @@ impl ShardCoordinatorSim {
             .iter()
             .position(|(v, _)| *v == id)
             .expect("validator id present in sim committee")
+    }
+
+    /// Re-parent target for [`ByzantineBehaviour::ExtendStaleParent`]: the
+    /// block two ancestors below `high_qc_block` (the block the proposer's
+    /// high QC certifies), paired with the QC certifying it. The parent
+    /// block extends `QC(high_qc_block - 1)` and its grandparent extends
+    /// `QC(high_qc_block - 2)`, so the ancestor's own QC sits two rounds
+    /// below the parent's — strictly below the honest lock (which tracks
+    /// the parent's parent-QC round). `None` if fewer than two ancestors
+    /// were recorded, i.e. the chain is too shallow to re-parent below the
+    /// lock.
+    fn stale_reparent(&self, high_qc_block: BlockHash) -> Option<StaleReparent> {
+        let parent = self.header_by_block.get(&high_qc_block)?;
+        let grandparent = self.header_by_block.get(&parent.parent_block_hash())?;
+        let ancestor = self.header_by_block.get(&grandparent.parent_block_hash())?;
+        Some(StaleReparent {
+            parent_block_hash: grandparent.parent_block_hash(),
+            parent_qc: grandparent.parent_qc().clone(),
+            parent_state_root: ancestor.state_root(),
+            parent_block_height: ancestor.height(),
+            parent_in_flight: ancestor.in_flight(),
+            height: ancestor.height().next(),
+        })
     }
 }
 
