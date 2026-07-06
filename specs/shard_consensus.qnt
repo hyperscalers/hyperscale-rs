@@ -2,11 +2,11 @@
 // HotStuff-2 safe-vote rule and the round-contiguous two-chain commit.
 //
 // Checks INV-SHARD-1 (no two committed blocks off one chain) with
-// INV-SHARD-2/3/4 encoded structurally (see assumptions). The broken twin
-// (`ALLOW_CRASH = true`) models the acknowledged register-persistence gap:
-// safe-vote registers are in-memory and re-initialized from the highest
-// known QC on restart (docs/01-consensus-layers.md §1.2), so a crash can
-// reopen rounds the validator already consumed.
+// INV-SHARD-2/3/4 encoded structurally (see assumptions). The healthy
+// instance's never-reset registers are the implementation's durable
+// ones (docs/01-consensus-layers.md §1.2); the broken twin
+// (`ALLOW_CRASH = true`) models their loss: recovery from the highest
+// known QC alone reopens rounds the validator already consumed.
 //
 // Code anchors (crates/shard/src/coordinator.rs):
 //   - Safe-vote predicate: `can_safe_vote` — round strictly beyond
@@ -21,8 +21,10 @@
 //     `last_voted_round = last_voted_round.max(round)`.
 //   - Commit rule: `try_two_chain_commit` — a QC at exactly
 //     `parent.round + 1` commits its parent; non-contiguous QCs defer.
-//   - Crash re-init: startup recovery — both registers set to the highest
-//     known QC's round; genesis (registers at zero) when none is known.
+//   - Crash re-init (broken twin): both registers fall back to the
+//     highest known QC's round — the implementation's floor when no
+//     durable record survives (`ShardCoordinator::new`); genesis
+//     (registers at zero) when none is known.
 //
 // Modeling assumptions:
 //   - Crypto is ideal: a QC for block `b` exists iff a set of >= 2f+1
@@ -170,9 +172,10 @@ module shard_consensus {
     }
   }
 
-  // Crash and recover: both registers re-initialize from the highest QC
-  // the validator has persisted — which may trail what it voted. Genesis
-  // models the fresh-start path (registers at zero).
+  // Crash and recover with the durable register record lost: both
+  // registers re-initialize from the highest QC the validator has
+  // persisted — which may trail what it voted. Genesis models the
+  // fresh-start path (registers at zero).
   action crashAs(v: int, q: Block): bool = all {
     ALLOW_CRASH,
     HONEST.contains(v),
@@ -207,8 +210,8 @@ module shard_consensus {
   // commits b1 through validators {1,2,3}; validator 2 crashes and recovers
   // from the genesis QC (registers to zero); the Byzantine validator 1, the
   // recovered 2, and the fresh 4 then assemble a second committed chain.
-  // One crash plus F Byzantine forks the commit — the concrete cost of the
-  // in-memory registers.
+  // One crash plus F Byzantine forks the commit — the cost of losing
+  // the registers.
   run crashForkAttack = {
     val b1 = { rnd: 1, tag: 1, prnd: 0, ptag: 0 }
     val c1 = { rnd: 2, tag: 1, prnd: 1, ptag: 1 }
@@ -233,9 +236,9 @@ module shard_ok {
   import shard_consensus(F = 1, MAX_ROUND = 3, TAGS = 2, ALLOW_CRASH = false).*
 }
 
-// Register-persistence gap enabled: one honest crash re-opens consumed
-// rounds, and F Byzantine plus the crashed validator can assemble quorums
-// on two branches — the documented crash-equivocation window.
+// Register loss enabled: one honest crash re-opens consumed rounds, and
+// F Byzantine plus the crashed validator can assemble quorums on two
+// branches — the regression witness for the durable safe-vote registers.
 module shard_crash {
   import shard_consensus(F = 1, MAX_ROUND = 3, TAGS = 2, ALLOW_CRASH = true).*
 }

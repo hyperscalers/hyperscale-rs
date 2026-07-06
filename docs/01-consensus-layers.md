@@ -34,7 +34,7 @@ Each validator maintains two monotone local registers: `locked_round` (the highe
 2. `B.round > last_voted_round` — at most one vote per round, ever;
 3. `B.parent_qc.round >= locked_round` — the block extends a QC at least as high as the local lock.
 
-On voting, both registers ratchet up. On timing out of a round, `last_voted_round` ratchets too, so a timed-out round can never be voted afterwards (INV-SHARD-2). There is **no unlock rule** — `locked_round` never decreases, under any input (INV-SHARD-3). (The registers are currently in-memory only, re-initialized conservatively from the highest known QC on restart; durable persistence is a known deferred item.)
+On voting, both registers ratchet up. On timing out of a round, `last_voted_round` ratchets too, so a timed-out round can never be voted afterwards (INV-SHARD-2). There is **no unlock rule** — `locked_round` never decreases, under any input (INV-SHARD-3). (Both registers are durable: persisted before any vote or timeout signature leaves the process, recovered on restart floored at the highest known QC's round — a crash costs at most an abstention, never a second signature in a consumed round.)
 
 A validator votes only after holding the **complete block** — header plus every transaction, wave, and provision body. This turns every QC into a data-availability certificate: 2f+1 validators provably hold the full content, so it is recoverable from any of them (INV-SHARD-7).
 
