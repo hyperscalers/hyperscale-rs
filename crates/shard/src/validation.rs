@@ -448,7 +448,7 @@ fn verify_hash_sorted(
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
+    use hyperscale_types::test_utils::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BoundedVec,
         CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,

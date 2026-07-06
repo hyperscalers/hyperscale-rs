@@ -140,8 +140,7 @@ impl CommitDedupIndex {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_test_helpers::make_finalized_wave;
-    use hyperscale_types::test_utils::test_notarized_transaction_v1;
+    use hyperscale_types::test_utils::{make_finalized_wave, test_notarized_transaction_v1};
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
         TimestampRange, TransactionDecision, routable_from_notarized_v1,

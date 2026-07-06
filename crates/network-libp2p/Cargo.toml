@@ -30,7 +30,7 @@ tracing.workspace = true
 parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
-hyperscale-test-helpers = { workspace = true, features = ["fixtures"] }
+hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 serial_test = "3.5.0"
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

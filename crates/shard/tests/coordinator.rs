@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats, ShardStats};
 use hyperscale_storage::RecoveredState;
-use hyperscale_test_helpers::TestCommittee;
+use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, Round, SafeVoteRegisters, ShardId, TopologySchedule,
     VIEW_CHANGE_TIMEOUT, ValidatorId,

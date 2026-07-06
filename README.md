@@ -47,7 +47,6 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 | [`storage`](crates/storage) | Storage trait abstractions (SubstateStore, CommitStore, ConsensusStore) and JMT integration |
 | [`storage-memory`](crates/storage-memory) | In-memory storage using persistent data structures for deterministic simulation |
 | [`storage-rocksdb`](crates/storage-rocksdb) | Production RocksDB storage with JMT state roots and snapshot isolation |
-| [`test-helpers`](crates/test-helpers) | Test helpers providing properly-signed fixtures for crypto testing |
 | [`types`](crates/types) | Core types: hashes, blocks, votes, QCs, keys, transactions, topology |
 
 ## Installation

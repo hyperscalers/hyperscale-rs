@@ -24,11 +24,10 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
-use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::request::GetBlockRequest;
-use hyperscale_types::test_utils::test_transaction;
+use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey,
     CertifiedBeaconBlock, GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp,

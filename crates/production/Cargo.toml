@@ -98,7 +98,6 @@ hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
 hyperscale-scenarios.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
-hyperscale-test-helpers = { workspace = true, features = ["fixtures"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 radix-transactions.workspace = true
 tempfile.workspace = true

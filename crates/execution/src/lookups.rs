@@ -210,7 +210,7 @@ pub fn build_provision_requests(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_test_helpers::TestCommittee;
+    use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
 
     use super::*;

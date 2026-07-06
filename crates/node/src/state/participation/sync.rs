@@ -148,7 +148,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
-    use hyperscale_test_helpers::make_live_block;
+    use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
         CertifiedBlockHeader, ChainOrigin, LocalTimestamp, QuorumCertificate, ShardId, ValidatorId,

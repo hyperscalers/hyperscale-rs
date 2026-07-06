@@ -2504,10 +2504,9 @@ impl std::fmt::Debug for ExecutionCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_test_helpers::{
-        certify as test_certify, make_live_block as helpers_make_live_block,
+    use hyperscale_types::test_utils::{
+        certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
-    use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,

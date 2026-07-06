@@ -240,7 +240,7 @@ pub fn prospective_parent_witness_leaves(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use hyperscale_test_helpers::TestCommittee;
+    use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         BeaconWitnessRoot, BlockHeight, Bls12381G2Signature, NetworkDefinition, ReadySignal, Round,
         Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,

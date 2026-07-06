@@ -31,7 +31,6 @@ hyperscale-dispatch-sync.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
-hyperscale-test-helpers.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]

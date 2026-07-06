@@ -13,13 +13,13 @@ use hyperscale_engine::GenesisConfig;
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
+use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::status_rank;
 use hyperscale_scenarios::tx::{merge_vote_payer, straddler_genesis_balances};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
 };
-use hyperscale_test_helpers::fixtures::TestFixtures;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
     StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,

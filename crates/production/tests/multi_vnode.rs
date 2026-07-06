@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network_libp2p::Libp2pConfig;
+use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::{LocalValidator, ProductionRunner};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::RocksDbBeaconStorage;
-use hyperscale_test_helpers::fixtures::TestFixtures;
 use hyperscale_types::ValidatorId;
 use serial_test::serial;
 use support::{temp_storage_dir, temp_storage_factory};

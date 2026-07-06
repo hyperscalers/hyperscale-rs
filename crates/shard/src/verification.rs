@@ -2202,7 +2202,7 @@ mod tests {
     /// emitted) and park itself on the missing ancestor's hash.
     #[test]
     fn beacon_witness_verification_defers_on_missing_ancestor() {
-        use hyperscale_test_helpers::TestCommittee;
+        use hyperscale_types::test_utils::TestCommittee;
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
@@ -2242,7 +2242,7 @@ mod tests {
     /// otherwise resolved) is the caller's responsibility.
     #[test]
     fn deferred_beacon_witness_children_drain_by_parent_hash() {
-        use hyperscale_test_helpers::TestCommittee;
+        use hyperscale_types::test_utils::TestCommittee;
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
@@ -2288,7 +2288,7 @@ mod tests {
     /// matching leaves through a parent whose own root was wrong.
     #[test]
     fn failed_beacon_witness_clears_dependent_children() {
-        use hyperscale_test_helpers::TestCommittee;
+        use hyperscale_types::test_utils::TestCommittee;
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 

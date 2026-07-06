@@ -16,7 +16,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-storage-memory.workspace = true
-hyperscale-test-helpers.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
 tracing-test.workspace = true

@@ -27,3 +27,6 @@ pub mod fault_gate;
 /// Re-export the shared fault vocabulary so test clusters can drive the gate.
 #[cfg(feature = "test-utils")]
 pub use hyperscale_network::fault;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;

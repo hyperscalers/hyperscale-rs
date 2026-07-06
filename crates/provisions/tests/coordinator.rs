@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
-use hyperscale_test_helpers::TestCommittee;
+use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,

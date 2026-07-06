@@ -33,7 +33,7 @@ use hyperscale_storage::{
     ChainEntry, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
 };
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_test_helpers::TestCommittee;
+use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,

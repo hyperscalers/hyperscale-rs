@@ -829,7 +829,7 @@ mod tests {
 
     use crossbeam::channel::{Receiver, unbounded};
     use hyperscale_dispatch_sync::SyncDispatch;
-    use hyperscale_test_helpers::{TestCommittee, make_live_block};
+    use hyperscale_types::test_utils::{TestCommittee, make_live_block};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
         ValidatorId,

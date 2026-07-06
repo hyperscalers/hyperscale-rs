@@ -3,8 +3,7 @@
 //!
 //! Generates seeded BLS (consensus) and Ed25519 (libp2p) keypairs plus a
 //! topology snapshot from one seed, so every consumer derives byte-identical
-//! identities. Gated behind the `fixtures` feature, which pulls the libp2p and
-//! network dependencies the Ed25519 identities and validator key map need.
+//! identities.
 
 use std::sync::Arc;
 

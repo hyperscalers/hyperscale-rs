@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
-use hyperscale_test_helpers::TestCommittee;
+use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{BlockHeight, Hash, ShardId, TopologySchedule, TxHash, ValidatorId, WaveId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {

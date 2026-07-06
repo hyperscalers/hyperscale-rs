@@ -28,7 +28,6 @@ members = [
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
-    "crates/test-helpers",
     "crates/types",
 ]
 
@@ -65,7 +64,6 @@ hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
-hyperscale-test-helpers = { path = "crates/test-helpers" }
 hyperscale-types = { path = "crates/types" }
 
 # External dependencies
