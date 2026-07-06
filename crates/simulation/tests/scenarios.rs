@@ -8,7 +8,8 @@ mod support;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
-    merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
+    intershard_partition_genesis_balances, merge_straddler_setup, split_straddler_setup,
+    witness_genesis_balances,
 };
 use hyperscale_scenarios::{
     ScenarioConfig, cross_shard_compound_drop_fetch_fallback,
@@ -17,8 +18,9 @@ use hyperscale_scenarios::{
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
-    isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
-    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
+    inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
+    livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
+    merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
@@ -156,6 +158,20 @@ fn cross_shard_compound_drop_fetch_fallback_sim() {
 fn cross_shard_provisions_recovers_after_transient_outage_sim() {
     let mut cluster = SimCluster::new(&split_config(), 11);
     cluster.run_faultable(cross_shard_provisions_recovers_after_transient_outage);
+}
+
+#[test]
+fn inter_shard_partition_aborts_waves_at_deadline_sim() {
+    // A dedicated host per pool validator, so the split seats the two children on
+    // disjoint host sets — matching production's one-validator-per-host layout —
+    // and a host partition can sever every inter-shard edge without cutting
+    // intra-shard consensus.
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(
+        &split_config(),
+        11,
+        &intershard_partition_genesis_balances(),
+    );
+    cluster.run_faultable(inter_shard_partition_aborts_waves_at_deadline);
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's
