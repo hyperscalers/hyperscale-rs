@@ -13,9 +13,10 @@
 //! `RocksDbBeaconStorage` opens its own database directory; this CF
 //! set is disjoint from the per-shard tier.
 
-use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Hash};
+use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Hash, RatifyVoteRecord, ValidatorId};
 use rocksdb::{ColumnFamily, DB};
 
+use crate::shard::column_families::ValidatorIdCodec;
 use crate::typed_cf::{BeU64Codec, HashCodec, SborCodec, TypedCf};
 
 /// Default CF (presence required by `RocksDB`; unused by beacon today).
@@ -37,6 +38,14 @@ pub const BEACON_HASH_TO_EPOCH_CF: &str = "beacon_hash_to_epoch";
 /// (block, state) pair is atomically consistent on disk.
 pub const BEACON_STATE_BY_EPOCH_CF: &str = "beacon_state_by_epoch";
 
+/// Per-validator durable ratification registers, keyed by validator id
+/// (big-endian `u64`). Value: SBOR-encoded
+/// [`RatifyVoteRecord`](hyperscale_types::RatifyVoteRecord) — the
+/// validator's prevote/precommit per round for its newest epoch.
+/// Written with a synchronous (fsynced) write before the corresponding
+/// ratify-vote signature leaves the process.
+pub const RATIFY_REGISTERS_CF: &str = "ratify_registers";
+
 /// Full CF set passed to `DB::open_cf_descriptors` when initialising the
 /// beacon database.
 pub const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -44,6 +53,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     BEACON_BLOCKS_BY_EPOCH_CF,
     BEACON_HASH_TO_EPOCH_CF,
     BEACON_STATE_BY_EPOCH_CF,
+    RATIFY_REGISTERS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -52,11 +62,11 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
 ///
 /// Distinct from the per-shard tier's `CfHandles` because beacon runs
 /// its own `RocksDB` instance with a disjoint CF set.
-#[allow(clippy::struct_field_names)] // every handle binds a CF keyed by epoch; the postfix IS the key axis
 pub struct CfHandles<'a> {
     blocks_by_epoch: &'a ColumnFamily,
     hash_to_epoch: &'a ColumnFamily,
     state_by_epoch: &'a ColumnFamily,
+    ratify_registers: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -74,6 +84,7 @@ impl<'a> CfHandles<'a> {
             blocks_by_epoch: resolve(BEACON_BLOCKS_BY_EPOCH_CF),
             hash_to_epoch: resolve(BEACON_HASH_TO_EPOCH_CF),
             state_by_epoch: resolve(BEACON_STATE_BY_EPOCH_CF),
+            ratify_registers: resolve(RATIFY_REGISTERS_CF),
         }
     }
 }
@@ -122,5 +133,19 @@ impl TypedCf for BeaconStateByEpochCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.state_by_epoch
+    }
+}
+
+/// Per-validator ratification registers; see [`RATIFY_REGISTERS_CF`].
+pub struct RatifyRegistersCf;
+impl TypedCf for RatifyRegistersCf {
+    const NAME: &'static str = RATIFY_REGISTERS_CF;
+    type Key = ValidatorId;
+    type Value = RatifyVoteRecord;
+    type KeyCodec = ValidatorIdCodec;
+    type ValueCodec = SborCodec<RatifyVoteRecord>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.ratify_registers
     }
 }

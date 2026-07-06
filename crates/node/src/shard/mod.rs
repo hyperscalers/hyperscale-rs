@@ -52,7 +52,7 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
 use hyperscale_types::{
     Block, CertifiedBlock, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
     Verified,
@@ -106,6 +106,9 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     /// notification handler, read by the `GetBeaconProposalRequest`
     /// responder. No coordinator touches it.
     pub(crate) beacon_proposal_cache: Arc<BeaconProposalCache>,
+    /// Process-level beacon store, threaded to the ratify-vote sign
+    /// handler as its durable-register seam.
+    pub(crate) beacon_storage: Arc<dyn BeaconStorage>,
     pub(crate) per_shard: ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>,
 }
 

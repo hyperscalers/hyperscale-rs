@@ -1,8 +1,8 @@
 use hyperscale_storage::test_helpers::{
     make_test_beacon_block, make_test_beacon_state, make_test_block_and_state,
 };
-use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
-use hyperscale_types::{BeaconBlockHash, Epoch};
+use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
+use hyperscale_types::{BeaconBlockHash, Epoch, Hash, RatifyPhase, RatifyRound, ValidatorId};
 use tempfile::TempDir;
 
 use super::core::RocksDbBeaconStorage;
@@ -125,4 +125,43 @@ fn reopen_recovers_committed_block_and_state_pairs() {
         assert_eq!(b.block_hash(), expected[&epoch].0);
         assert_eq!(*s, expected[&epoch].1);
     }
+}
+
+/// Ratify records merge first-wins per slot, supersede on a newer
+/// epoch, and survive a reopen.
+#[test]
+fn ratify_records_survive_reopen_with_epoch_supersede() {
+    let tmp = TempDir::new().expect("tempdir");
+    let v = ValidatorId::new(1);
+    let hash_a = BeaconBlockHash::from_raw(Hash::from_bytes(b"ratify-a"));
+    let hash_b = BeaconBlockHash::from_raw(Hash::from_bytes(b"ratify-b"));
+    let (e5, r1) = (Epoch::new(5), RatifyRound::new(1));
+    {
+        let store = RocksDbBeaconStorage::open(tmp.path()).expect("open beacon store");
+        store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_a);
+        store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_b);
+        store.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a);
+    }
+
+    let reopened = RocksDbBeaconStorage::open(tmp.path()).expect("reopen beacon store");
+    let record = reopened.ratify_record(v).expect("record survives reopen");
+    assert_eq!(record.epoch, e5);
+    assert_eq!(record.prevoted.get(&r1), Some(&hash_a), "first write wins");
+    assert_eq!(record.precommitted.get(&r1), Some(&hash_a));
+    assert_eq!(
+        record.max_position(),
+        Some((e5, r1, RatifyPhase::Precommit))
+    );
+
+    // A newer epoch supersedes the whole record; an older one is ignored.
+    reopened.record_ratify_vote(v, Epoch::new(6), r1, RatifyPhase::Prevote, hash_b);
+    let record = reopened.ratify_record(v).expect("record exists");
+    assert_eq!(record.epoch, Epoch::new(6));
+    assert_eq!(record.prevoted.get(&r1), Some(&hash_b));
+    assert!(record.precommitted.is_empty());
+    reopened.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a);
+    assert_eq!(
+        reopened.ratify_record(v).expect("record exists").epoch,
+        Epoch::new(6),
+    );
 }

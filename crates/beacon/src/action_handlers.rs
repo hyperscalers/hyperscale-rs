@@ -194,6 +194,11 @@ where
             phase,
             block_hash,
         } => {
+            // The (round, phase) slot this vote consumes must be durable
+            // before the signature exists — a crash between them costs
+            // at most an abstention, never a double-vote or a lost lock.
+            ctx.ratify_registers
+                .record_ratify_vote(me, epoch, round, phase, block_hash);
             let verified = Verified::<RatifyVote>::sign_local(
                 ctx.signing_key,
                 me,

@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, Bls12381G1PublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
-    RatifyVote, ValidatorId, Verified, ratify_quorum,
+    RatifyVote, RatifyVoteRecord, ValidatorId, Verified, ratify_quorum,
 };
 
 /// Rounds ahead of the current one a vote may reference and still be
@@ -127,6 +127,36 @@ impl RatifyTracker {
             precommitted: BTreeMap::new(),
             votes: BTreeMap::new(),
             completed: false,
+        }
+    }
+
+    /// Install the validator's own-vote registers from the durable
+    /// record a restart recovered. No-op unless the record covers this
+    /// tracker's epoch.
+    ///
+    /// Recorded slots become spent (never re-signed), the highest
+    /// recovered precommit resumes as the lock, and the current round
+    /// fast-forwards to the highest recorded one so no already-left
+    /// round is re-entered. `deadline_passed` stays false — the local
+    /// timer re-derives it, so skip prevoting waits for a fresh fire
+    /// rather than trusting pre-crash timer state.
+    pub fn install_recovered_record(&mut self, record: &RatifyVoteRecord) {
+        if record.epoch != self.epoch || self.completed {
+            return;
+        }
+        if let Some(&max_round) = record
+            .prevoted
+            .keys()
+            .chain(record.precommitted.keys())
+            .max()
+        {
+            self.round = self.round.max(max_round);
+        }
+        for (&round, &block_hash) in &record.prevoted {
+            self.prevoted.entry(round).or_insert(block_hash);
+        }
+        for (&round, &block_hash) in &record.precommitted {
+            self.precommitted.entry(round).or_insert(block_hash);
         }
     }
 
@@ -731,5 +761,58 @@ mod tests {
         // Round 3: the new lock re-prevotes skip.
         let effects = t.on_round_timeout();
         assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
+    }
+
+    /// A recovered record spends its rounds: the tracker resumes at
+    /// the highest recorded round with the register occupied, so
+    /// neither the deadline nor the candidate can re-vote it — and the
+    /// recovered lock re-prevotes at the next round.
+    #[test]
+    fn recovered_record_spends_rounds_and_resumes_the_lock() {
+        let (mut t, _) = tracker(7);
+        let skip = t.skip_block_hash();
+        let mut record = RatifyVoteRecord::new(epoch());
+        record.record(RatifyRound::new(1), RatifyPhase::Prevote, skip);
+        record.record(RatifyRound::new(1), RatifyPhase::Precommit, skip);
+        record.record(RatifyRound::new(2), RatifyPhase::Prevote, skip);
+        t.install_recovered_record(&record);
+
+        assert_eq!(
+            t.round(),
+            RatifyRound::new(2),
+            "resumes at the highest recorded round"
+        );
+        let effects = t.on_deadline();
+        assert!(
+            effects.is_empty(),
+            "recovered round-2 prevote register is spent"
+        );
+        let effects = t.on_candidate(candidate_hash());
+        assert!(
+            effects.is_empty(),
+            "the candidate cannot re-vote a spent round either"
+        );
+
+        // The next round re-prevotes the recovered lock, not the
+        // candidate: no newer polka justifies leaving it.
+        let effects = t.on_round_timeout();
+        assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
+    }
+
+    /// A record from another epoch's ratification is ignored outright:
+    /// the registers are per-epoch state.
+    #[test]
+    fn recovered_record_for_another_epoch_is_ignored() {
+        let (mut t, _) = tracker(7);
+        let mut record = RatifyVoteRecord::new(epoch().next());
+        record.record(RatifyRound::new(1), RatifyPhase::Prevote, candidate_hash());
+        t.install_recovered_record(&record);
+
+        let effects = t.on_candidate(candidate_hash());
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((RatifyRound::INITIAL.inner(), candidate_hash())),
+            "fresh registers vote normally",
+        );
     }
 }

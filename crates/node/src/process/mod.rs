@@ -356,12 +356,24 @@ where
         validator: ValidatorId,
         position: (Epoch, RatifyRound, RatifyPhase),
     ) -> bool {
-        self.beacon_signers
+        let mut seats = self
+            .beacon_signers
             .lock()
-            .expect("beacon signer registry lock")
-            .entry(validator)
-            .or_insert(BeaconSignerSeat::vacant())
-            .allow_ratify(position)
+            .expect("beacon signer registry lock");
+        let seat = seats.entry(validator).or_insert(BeaconSignerSeat::vacant());
+        // A fresh fence resumes from the durable ratify record, so a
+        // restarted process agrees with its own pre-crash signatures —
+        // the coordinator's recovered registers refuse the same
+        // positions, and this keeps the two guards aligned.
+        if seat.max_ratify.is_none() {
+            seat.max_ratify = self
+                .beacon_storage
+                .ratify_record(validator)
+                .and_then(|record| record.max_position());
+        }
+        let allowed = seat.allow_ratify(position);
+        drop(seats);
+        allowed
     }
 
     /// Process-level beacon chain storage handle.

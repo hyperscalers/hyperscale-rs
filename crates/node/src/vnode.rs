@@ -133,7 +133,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
     args.vnodes
         .into_iter()
         .map(|(validator, signing_key)| {
-            let beacon_coordinator = BeaconCoordinator::new(
+            let mut beacon_coordinator = BeaconCoordinator::new(
                 Arc::clone(&latest_block),
                 beacon_history.clone(),
                 validator,
@@ -142,6 +142,12 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 args.beacon_network.clone(),
                 args.beacon_config_hash,
             );
+            // Resume the pending epoch's ratification registers from
+            // the durable record, so a restarted pool member abstains
+            // at spent rounds and keeps its lock.
+            if let Some(record) = args.beacon_storage.ratify_record(validator) {
+                beacon_coordinator.install_recovered_ratify_record(&record);
+            }
             let state = NodeStateMachine::new(
                 validator,
                 args.shard,
@@ -207,7 +213,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         .into_iter()
         .map(|state| state.as_ref().clone())
         .collect();
-    let beacon_coordinator = BeaconCoordinator::new(
+    let mut beacon_coordinator = BeaconCoordinator::new(
         latest_block,
         beacon_history,
         args.validator,
@@ -216,6 +222,12 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         args.beacon_network,
         args.beacon_config_hash,
     );
+    // Resume the pending epoch's ratification registers from the
+    // durable record, so a restarted pool member abstains at spent
+    // rounds and keeps its lock.
+    if let Some(record) = args.beacon_storage.ratify_record(args.validator) {
+        beacon_coordinator.install_recovered_ratify_record(&record);
+    }
     VnodeInit {
         state: NodeStateMachine::follower(args.validator, beacon_coordinator),
         signing_key: args.signing_key,
