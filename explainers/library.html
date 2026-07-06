@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — the moving day that never happens</title>
+<style>
+  :root {
+    --bg: #0a0e0c;
+    --bg2: #0f1512;
+    --card: #131b17;
+    --card-edge: #21302a;
+    --ink: #e9efeb;
+    --ink-dim: #9fada6;
+    --lamp: #5fd3a8;
+    --wood: #c89a6a;
+    --paper: #d8d0bc;
+    --rose: #e87a8a;
+    --grad: linear-gradient(100deg, #8fdcc0, #41a381);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 30% -10%, #0c1712 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--lamp); text-decoration: none; border-bottom: 1px solid #1e3c30; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--lamp); border: 1px solid #1e3c30; background: #0b1410;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--lamp); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--lamp); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html" aria-current="page">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · STATE &amp; RESHARDING</span>
+  <h1>The moving day that <em>never happens</em>.</h1>
+  <p class="lede">Every growing database eventually faces the dreaded resharding migration: copy everything, hope nothing drifts, cut over, pray. Hyperscale splits and merges entire shards — live, under load — <strong>without moving a single record</strong>. Not because the movers are fast, but because the data was shelved for it from the start.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE DREAD ============================== -->
+<section id="dread">
+  <span class="kicker">01 · The problem</span>
+  <h2>Why "resharding" is a word engineers dread</h2>
+  <p>When a database outgrows one machine, its data must be divided across several — and later re-divided as it keeps growing. Ask anyone who has run one at scale: the re-division is the nightmare. The industry's standard answers all involve <em>moving the data itself</em>, and everything painful follows from that:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ COPY &amp; CUT OVER</span><h4>The maintenance window</h4><p>Copy terabytes to new homes while writes continue, freeze, reconcile the drift, flip. "Service unavailable this weekend" is this, from the inside.</p></div>
+    <div class="card"><span class="x">✕ DUAL-WRITE</span><h4>Two versions of the truth</h4><p>Write to both old and new homes during the transition, and now every inconsistency question has two possible answers until the old side is finally torn down.</p></div>
+    <div class="card"><span class="x">✕ REBALANCE THE RING</span><h4>Everything scatters</h4><p>Hash-based partitioning spreads each user's records evenly — which means <em>evenly apart</em>. Every resize sends shrapnel of records flying between machines, and no user's data ever lives in one place.</p></div>
+  </div>
+
+  <p>For a blockchain the stakes are worse: there is no maintenance window on a chain that must never stop, no admin to reconcile drift, and the "database" must stay <em>provably</em> intact — thousands of machines that don't trust each other must agree, cryptographically, that nothing was lost or invented in the shuffle.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SHELVING RULE ============================== -->
+<section id="shelving">
+  <span class="kicker">02 · The shelving rule</span>
+  <h2>A library shelved for the split</h2>
+  <p>Imagine a library that knows, from the day it opens, that it will someday outgrow its building — so it adopts one iron shelving rule: <strong>everything a family owns sits together, on one contiguous run of shelving</strong>. Not sorted by topic, or acquisition date, or the whims of whoever shelved it: by owner, always. The books never need to know; the rule lives in the shelf-marks.</p>
+  <p>Hyperscale's version: all state lives in one giant catalogue — a binary merkle tree over a vast space of shelf-marks — and every object's shelf-mark is built in two halves:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 250" role="img" aria-label="Shelf-marks built from an owner half and an item half, grouping each account's objects contiguously.">
+      <!-- key anatomy -->
+      <rect x="230" y="30" width="180" height="40" rx="8" fill="#12261e" stroke="#41a381" stroke-width="1.5"/>
+      <text x="320" y="55" fill="#8fdcc0" font-size="13" text-anchor="middle" class="mono">owner's hash</text>
+      <rect x="410" y="30" width="180" height="40" rx="8" fill="#131b17" stroke="#21302a"/>
+      <text x="500" y="55" fill="#9fada6" font-size="13" text-anchor="middle" class="mono">item's hash</text>
+      <text x="320" y="92" fill="#9fada6" font-size="12" text-anchor="middle">places it on the owner's shelf</text>
+      <text x="500" y="92" fill="#9fada6" font-size="12" text-anchor="middle">tells the owner's things apart</text>
+      <text x="140" y="55" fill="#e9efeb" font-size="13" text-anchor="end">shelf-mark =</text>
+
+      <!-- the shelf -->
+      <line x1="40" y1="196" x2="780" y2="196" stroke="#3a3226" stroke-width="5"/>
+      <!-- ada's run -->
+      <rect x="60"  y="140" width="52" height="54" rx="4" fill="#12261e" stroke="#41a381"/>
+      <rect x="116" y="140" width="52" height="54" rx="4" fill="#12261e" stroke="#41a381"/>
+      <rect x="172" y="140" width="52" height="54" rx="4" fill="#12261e" stroke="#41a381"/>
+      <text x="142" y="222" fill="#8fdcc0" font-size="12" text-anchor="middle" class="mono">ada's account · vault · savings</text>
+      <!-- bo's run -->
+      <rect x="280" y="140" width="52" height="54" rx="4" fill="#1c2418" stroke="#8a9a5a"/>
+      <rect x="336" y="140" width="52" height="54" rx="4" fill="#1c2418" stroke="#8a9a5a"/>
+      <text x="334" y="222" fill="#aab86a" font-size="12" text-anchor="middle" class="mono">bo's account · vault</text>
+      <!-- cy's run -->
+      <rect x="444" y="140" width="52" height="54" rx="4" fill="#241a14" stroke="#c89a6a"/>
+      <rect x="500" y="140" width="52" height="54" rx="4" fill="#241a14" stroke="#c89a6a"/>
+      <rect x="556" y="140" width="52" height="54" rx="4" fill="#241a14" stroke="#c89a6a"/>
+      <rect x="612" y="140" width="52" height="54" rx="4" fill="#241a14" stroke="#c89a6a"/>
+      <text x="554" y="222" fill="#c89a6a" font-size="12" text-anchor="middle" class="mono">cy's account · 3 vaults</text>
+      <!-- next -->
+      <rect x="720" y="140" width="52" height="54" rx="4" fill="#131b17" stroke="#21302a" stroke-dasharray="4 4"/>
+      <text x="746" y="222" fill="#9fada6" font-size="12" text-anchor="middle" class="mono">…</text>
+    </svg>
+    <figcaption>The first half of every shelf-mark is the owner. A family's belongings are contiguous by construction — and stay that way forever.</figcaption>
+  </figure>
+
+  <p>The subtle part is that a smart-contract engine constantly creates internal objects — token vaults, key-value stores — whose native names have <em>nothing</em> to do with their owner. Shelved naively, your account would sit on one shard and your money on three others. The shelving rule reaches through that: every internal object is shelf-marked under the account that owns it. And because an object never changes owner once committed, <strong>no shelf-mark ever needs to change — nothing is ever re-shelved, for any reason, including the splits to come</strong>.</p>
+
+  <div class="callout">
+    <p><strong>A shard is simply a wing of this library</strong> — everything under one prefix of the shelf-mark space. And the catalogue is a merkle tree, so every wing has a one-line cryptographic summary: its subtree root.</p>
+    <span class="why">One structure is doing four jobs: per-block state commitments, the proofs that ship state between shards, verifiable fast-sync for newcomers — and, as follows, resharding.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SPLIT ============================== -->
+<section id="split">
+  <span class="kicker">03 · The split</span>
+  <h2>Hand over the wing, keep the books still</h2>
+  <p>When a wing grows past a size threshold, the shard <em>itself</em> asserts a split in its own blocks — a claim about committed facts that every validator checks against its own copy before voting, so it can't be faked or forced. Then the beautiful part. The wing's catalogue node has exactly two children: the left half-wing and the right half-wing. Splitting the shard means <strong>each child subtree becomes a new shard, whole</strong>:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 270" role="img" aria-label="A parent shard's subtree becoming two child shards with the hash of both roots equaling the old root.">
+      <!-- before -->
+      <text x="180" y="26" fill="#9fada6" font-size="13" text-anchor="middle" class="mono">ONE OVERFULL WING</text>
+      <circle cx="180" cy="72" r="17" fill="#1a2420" stroke="#c89a6a" stroke-width="2" class="pulse"/>
+      <text x="180" y="47" fill="#c89a6a" font-size="11.5" text-anchor="middle" class="mono">root R</text>
+      <line x1="168" y1="84" x2="120" y2="130" stroke="#2c3a32" stroke-width="2"/>
+      <line x1="192" y1="84" x2="240" y2="130" stroke="#2c3a32" stroke-width="2"/>
+      <circle cx="120" cy="142" r="12" fill="#131b17" stroke="#2c3a32"/>
+      <circle cx="240" cy="142" r="12" fill="#131b17" stroke="#2c3a32"/>
+      <line x1="112" y1="152" x2="90" y2="185" stroke="#21302a"/><line x1="128" y1="152" x2="150" y2="185" stroke="#21302a"/>
+      <line x1="232" y1="152" x2="210" y2="185" stroke="#21302a"/><line x1="248" y1="152" x2="270" y2="185" stroke="#21302a"/>
+      <circle cx="90" cy="192" r="6" fill="#1a2420"/><circle cx="150" cy="192" r="6" fill="#1a2420"/>
+      <circle cx="210" cy="192" r="6" fill="#1a2420"/><circle cx="270" cy="192" r="6" fill="#1a2420"/>
+      <text x="180" y="240" fill="#c89a6a" font-size="13" text-anchor="middle">state crosses the size threshold…</text>
+
+      <!-- arrow -->
+      <path d="M 350 130 L 440 130" stroke="#41a381" stroke-width="2" class="flow"/>
+      <path d="M 432 122 L 446 130 L 432 138" fill="none" stroke="#41a381" stroke-width="2"/>
+      <text x="395" y="115" fill="#8fdcc0" font-size="12.5" text-anchor="middle" class="mono">SPLIT</text>
+
+      <!-- after -->
+      <text x="630" y="26" fill="#9fada6" font-size="13" text-anchor="middle" class="mono">TWO WINGS, SAME SHELVES</text>
+      <circle cx="630" cy="72" r="14" fill="#0a0e0c" stroke="#2c3a32" stroke-dasharray="4 4"/>
+      <line x1="618" y1="82" x2="565" y2="126" stroke="#2c3a32" stroke-width="2"/>
+      <line x1="642" y1="82" x2="695" y2="126" stroke="#2c3a32" stroke-width="2"/>
+      <circle cx="565" cy="140" r="15" fill="#12261e" stroke="#5fd3a8" stroke-width="2"/>
+      <circle cx="695" cy="140" r="15" fill="#241a14" stroke="#c89a6a" stroke-width="2"/>
+      <text x="565" y="119" fill="#5fd3a8" font-size="11" text-anchor="middle" class="mono">L</text>
+      <text x="695" y="119" fill="#c89a6a" font-size="11" text-anchor="middle" class="mono">R'</text>
+      <line x1="557" y1="152" x2="535" y2="185" stroke="#21302a"/><line x1="573" y1="152" x2="595" y2="185" stroke="#21302a"/>
+      <line x1="687" y1="152" x2="665" y2="185" stroke="#21302a"/><line x1="703" y1="152" x2="725" y2="185" stroke="#21302a"/>
+      <circle cx="535" cy="192" r="6" fill="#12261e"/><circle cx="595" cy="192" r="6" fill="#12261e"/>
+      <circle cx="665" cy="192" r="6" fill="#241a14"/><circle cx="725" cy="192" r="6" fill="#241a14"/>
+      <text x="630" y="240" fill="#9fada6" font-size="13" text-anchor="middle">hash(<tspan fill="#5fd3a8" class="mono">L</tspan>, <tspan fill="#c89a6a" class="mono">R'</tspan>) = <tspan fill="#e9efeb" class="mono">R</tspan> — one operation proves nothing moved</text>
+    </svg>
+    <figcaption>Splitting hands each child an existing subtree. Merging recombines them with the same single hash. No record is copied, re-keyed, or lost — provably.</figcaption>
+  </figure>
+
+  <p>What does move is <em>people</em>: each child wing needs its own committee of validators. That handover is choreographed <strong>make-before-break</strong>, like staffing a new reading room before unlocking its door:</p>
+  <p><strong>Recruit.</strong> <a href="census.html">The beacon</a> — the network's coordination chain — draws fresh validators by <a href="kleroterion.html">lottery</a> and assigns half to each child.</p>
+  <p><strong>Copy, verifiably.</strong> While the parent shard keeps serving as if nothing were happening, each recruit downloads its child's half of the data. Every chunk arrives with a proof against the attested catalogue root — a proof that covers <em>completeness</em>, so a malicious server can't quietly omit a page — and the recruit's own government record (its copy of the beacon chain) tells it which root to demand. Then it tails the parent's new blocks, keeping its copy current.</p>
+  <p><strong>Gate.</strong> Nothing flips until <em>both</em> children could seat a live, supermajority-strong committee — each recruit's readiness is witnessed on-chain, not self-declared. If readiness never comes, the split lapses harmlessly and the recruits return to the pool.</p>
+  <p><strong>Flip, fail-closed.</strong> The parent runs to a terminal block fixed by <a href="clock.html">attested time</a>, then stops. Each child's first block is <em>derived</em> — computed by every member independently from the parent's frozen final block — and must hash to exactly the value the beacon recorded in advance. Any mismatch and the flip simply refuses to happen. Merging is the same movie in reverse: two sibling wings, keepers drawn half from each, one hash to recombine.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FINE PRINT ============================== -->
+<section id="fineprint">
+  <span class="kicker">04 · The fine print</span>
+  <h2>What keeps it honest</h2>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ NO OSCILLATION</span><h4>Wide hysteresis</h4><p>The merge threshold sits far below the split threshold, so a freshly split child can't immediately clamor to merge back. Split-merge flapping is priced out of the mechanics.</p></div>
+    <div class="card"><span class="ok">◦ NO OPERATOR</span><h4>No choreography to botch</h4><p>Trigger, recruitment, readiness, flip — every step is either a committed on-chain fact or a pure function of one. There is no runbook, no admin console, no 2 a.m. cutover call.</p></div>
+    <div class="card"><span class="ok">◦ NO TRUST IN THE MOVERS</span><h4>Proofs at every step</h4><p>Recruits verify every downloaded chunk against a root their own beacon copy attests; children verify their derived genesis against the beacon's recorded hash. A wrong byte anywhere fails closed.</p></div>
+  </div>
+
+  <p>And the hardest question of all — what happens to a cross-shard transaction <em>caught mid-flight</em> when one of its shards stops existing at a terminal block? That one is <a href="testament.html">the will</a>: the dying shard's frozen final records decide, and every survivor settles against them identically.</p>
+
+  <div class="callout">
+    <p><strong>The lesson:</strong> the cheapest data migration is the one made unnecessary years earlier, by a shelving rule. Decide where things live so that any future partition line falls <em>between</em> owners, never through one — and "resharding" stops being a moving day and becomes an org-chart change.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the tree, the owner-prefixed keying rule, verified snap-sync, the full split and merge lifecycles, and the invariants each one maintains.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/03-state-and-sync.md">docs/03 — state and sync</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/02-dynamic-sharding.md">docs/02 — dynamic sharding</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6b62">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

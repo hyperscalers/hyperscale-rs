@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — rehearsing the rarest day</title>
+<style>
+  :root {
+    --bg: #090d0e;
+    --bg2: #0e1416;
+    --card: #12191c;
+    --card-edge: #203034;
+    --ink: #e8eef0;
+    --ink-dim: #9cadb2;
+    --instr: #5fd8c8;
+    --hazard: #f0a050;
+    --green: #5fd39a;
+    --rose: #f07a9a;
+    --violet: #9b8bf0;
+    --grad: linear-gradient(100deg, #7fe3d3, #3fa8c0);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #0b1516 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--instr); text-decoration: none; border-bottom: 1px solid #1e3a3a; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--instr); border: 1px solid #1e3a3a; background: #0a1414;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--instr); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html" aria-current="page">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · DETERMINISM &amp; TESTING</span>
+  <h1>Rehearsing the <em>rarest day</em>.</h1>
+  <p class="lede">Aviation became safe by rehearsing its disasters: pilots fly engine failures in simulators for years before — if ever — meeting one. Hyperscale's scariest code paths — a shard splitting under load, a partition healing mid-transaction — are <strong>the most practiced code in the repository</strong>, replayed byte-for-byte from a seed, thousands of times, on purpose.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SHAME ============================== -->
+<section id="shame">
+  <span class="kicker">01 · The problem</span>
+  <h2>Software's rarest paths are its least tested</h2>
+  <p>A captain lands a burning simulator a hundred times before ever smelling smoke at altitude. That inversion — <em>the rarer the event, the more you practice it</em> — is why flying is safe. Distributed software mostly runs the opposite way: the everyday paths are tested to death, while the code that fires once a month in production — the failover, the partition, the migration under load — is exercised least, because you can't schedule a thunderstorm in CI:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ CAN'T STAGE IT</span><h4>The event won't come when called</h4><p>A network partition healing at the precise wrong moment, on demand, across fifty machines? Real infrastructure doesn't take direction.</p></div>
+    <div class="card"><span class="x">✕ CAN'T REPEAT IT</span><h4>"Cannot reproduce"</h4><p>When the rare day does arrive and something breaks, the exact interleaving of messages and timers that broke it is gone forever. The bug report outlives the evidence.</p></div>
+    <div class="card"><span class="x">✕ CAN'T TRUST THE TEST</span><h4>The flaky suite</h4><p>Tests that touch real time and real networks fail for reasons that aren't bugs, until failures are ignored by habit — which is how the one real failure gets waved through.</p></div>
+  </div>
+
+  <p>For a sharded blockchain this is intolerable, because the rare paths are exactly where the money is: resharding, settlement across a dying shard, recovery from partition. A system whose safety story rests on its least-tested code has no safety story.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE PRECONDITION ============================== -->
+<section id="precondition">
+  <span class="kicker">02 · The precondition</span>
+  <h2>A protocol that can be put in a box</h2>
+  <p>You can't build a flight simulator for an aircraft whose control surfaces secretly consult the weather. The precondition for simulation is that the thing being simulated takes <em>all</em> of its inputs through the front door. So the entire Hyperscale protocol is written as <strong>pure state machines</strong>: every component receives an event and the current time, and returns a list of requested actions. That's the whole interface.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 210" role="img" aria-label="Events and time flow into a pure state machine; explicit actions flow out; no clock, network, or randomness inside.">
+      <!-- inputs -->
+      <g class="mono" font-size="12">
+        <rect x="40" y="52" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="120" y="72" fill="#9cadb2" text-anchor="middle">event: message arrived</text>
+        <rect x="40" y="92" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="120" y="112" fill="#9cadb2" text-anchor="middle">event: timer fired</text>
+        <rect x="40" y="132" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="120" y="152" fill="#9cadb2" text-anchor="middle">now: the time, as data</text>
+      </g>
+      <path d="M 200 107 L 290 107" stroke="#3fa8c0" stroke-width="2" class="flow"/>
+      <!-- the machine -->
+      <rect x="290" y="62" width="240" height="90" rx="14" fill="#0e1416" stroke="#5fd8c8" stroke-width="1.5"/>
+      <text x="410" y="98" fill="#e8eef0" font-size="14" font-weight="700" text-anchor="middle">pure state machine</text>
+      <text x="410" y="118" fill="#9cadb2" font-size="11.5" text-anchor="middle" class="mono">handle(now, event) → actions</text>
+      <text x="410" y="136" fill="#9cadb2" font-size="10.5" text-anchor="middle">no clock · no threads · no network · no dice</text>
+      <path d="M 530 107 L 620 107" stroke="#3fa8c0" stroke-width="2" class="flow"/>
+      <!-- outputs -->
+      <g class="mono" font-size="12">
+        <rect x="620" y="52" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="700" y="72" fill="#9cadb2" text-anchor="middle">action: broadcast this</text>
+        <rect x="620" y="92" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="700" y="112" fill="#9cadb2" text-anchor="middle">action: persist that</text>
+        <rect x="620" y="132" width="160" height="30" rx="7" fill="#12191c" stroke="#203034"/>
+        <text x="700" y="152" fill="#9cadb2" text-anchor="middle">action: set a timer</text>
+      </g>
+      <text x="410" y="196" fill="#9cadb2" font-size="12.5" text-anchor="middle">the same inputs always produce the same outputs — that is the entire trick</text>
+    </svg>
+    <figcaption>Time is an input. Randomness is an input. Effects are outputs. Nothing inside the box can tell what world it's running in.</figcaption>
+  </figure>
+
+  <p>The rule with teeth: <strong>a state machine never reads a clock — it is told the time</strong>. The one place this discipline was once violated (a single hidden clock read inside a sync component) produced a genuinely load-dependent test flake, the exact class of maddening defect the rule exists to make structurally impossible. The same goes for randomness — consensus randomness comes only from <a href="kleroterion.html">the beacon's attested accumulator</a>, harness randomness only from seeds — and even serialization is deterministic by construction.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== TWO WORLDS ============================== -->
+<section id="worlds">
+  <span class="kicker">03 · Two worlds</span>
+  <h2>Same instruments, different sky</h2>
+  <p>A flight simulator earns trust by putting the trainee in front of the <em>same instruments</em> as the aircraft. Hyperscale does the software equivalent: one node implementation, generic over exactly three seams — storage, network, and how work is scheduled — and two worlds that differ <em>only</em> in what they plug into those seams.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="The identical protocol code plugged into a deterministic simulator on one side and production infrastructure on the other.">
+      <rect x="300" y="94" width="220" height="82" rx="14" fill="#12191c" stroke="#5fd8c8" stroke-width="1.5"/>
+      <text x="410" y="128" fill="#e8eef0" font-size="14" font-weight="700" text-anchor="middle">THE PROTOCOL</text>
+      <text x="410" y="148" fill="#9cadb2" font-size="11.5" text-anchor="middle">identical code, to the byte</text>
+
+      <rect x="30" y="54" width="210" height="166" rx="12" fill="#0e1a14" stroke="#2a5440"/>
+      <text x="135" y="82" fill="#5fd39a" font-size="13" font-weight="700" text-anchor="middle">SIMULATION</text>
+      <g font-size="11.5" fill="#9cadb2">
+        <text x="135" y="108" text-anchor="middle">in-memory storage</text>
+        <text x="135" y="128" text-anchor="middle">seeded network — latency,</text>
+        <text x="135" y="144" text-anchor="middle">loss, partitions, faults</text>
+        <text x="135" y="164" text-anchor="middle">one global event queue</text>
+        <text x="135" y="184" text-anchor="middle">whole networks, one process</text>
+      </g>
+      <rect x="580" y="54" width="210" height="166" rx="12" fill="#1a1520" stroke="#4a3060"/>
+      <text x="685" y="82" fill="#f0a050" font-size="13" font-weight="700" text-anchor="middle">PRODUCTION</text>
+      <g font-size="11.5" fill="#9cadb2">
+        <text x="685" y="108" text-anchor="middle">RocksDB on real disks</text>
+        <text x="685" y="128" text-anchor="middle">libp2p over real networks</text>
+        <text x="685" y="148" text-anchor="middle">thread pools, real CPUs</text>
+        <text x="685" y="168" text-anchor="middle">real time</text>
+      </g>
+      <line x1="242" y1="135" x2="298" y2="135" stroke="#203034" stroke-width="2" class="flow"/>
+      <line x1="522" y1="135" x2="578" y2="135" stroke="#203034" stroke-width="2" class="flow"/>
+      <text x="410" y="262" fill="#9cadb2" font-size="12.5" text-anchor="middle" class="mono">same code · both worlds · three pluggable seams</text>
+    </svg>
+    <figcaption>The simulator runs entire multi-shard networks — beacon, splits, merges, faults — in one process, under one deterministic event order.</figcaption>
+  </figure>
+
+  <p>In the simulated world, every source of scheduling chaos — message arrival order, timer interleavings, network weather — is replaced by a single event queue drawn from a seed. Which yields the property the entire crash lab stands on:</p>
+
+  <div class="callout">
+    <p><strong>Same seed, same run. Byte for byte. Faults included.</strong></p>
+    <span class="why">Injected partitions, message drops, and crash-rejoins draw from their own random stream salted off the master seed — so even the disasters replay identically.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SEED ============================== -->
+<section id="seed">
+  <span class="kicker">04 · The payoff</span>
+  <h2>Groundhog Day for bugs</h2>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 230" role="img" aria-label="One seed producing two identical event timelines, faults included, months apart.">
+      <rect x="330" y="24" width="160" height="34" rx="17" fill="#0a1414" stroke="#5fd8c8"/>
+      <text x="410" y="46" fill="#5fd8c8" font-size="13" text-anchor="middle" class="mono">seed 0x51F3</text>
+      <path d="M 385 58 C 330 80, 240 88, 180 96" fill="none" stroke="#203034" stroke-width="2" class="flow"/>
+      <path d="M 435 58 C 490 80, 580 88, 640 96" fill="none" stroke="#203034" stroke-width="2" class="flow"/>
+      <!-- run 1 -->
+      <text x="60" y="128" fill="#9cadb2" font-size="12" class="mono">run 1</text>
+      <g>
+        <rect x="60" y="140" width="330" height="26" rx="6" fill="#12191c" stroke="#203034"/>
+        <rect x="72"  y="146" width="5" height="14" fill="#5fd8c8"/><rect x="88"  y="146" width="5" height="14" fill="#5fd8c8"/><rect x="101" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="122" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="139" y="146" width="5" height="14" fill="#f07a9a"/><rect x="158" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="171" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="195" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="214" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="230" y="146" width="5" height="14" fill="#f07a9a"/><rect x="249" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="268" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="285" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="306" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="322" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="341" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="360" y="146" width="5" height="14" fill="#5fd8c8"/>
+      </g>
+      <!-- run 2 -->
+      <text x="430" y="128" fill="#9cadb2" font-size="12" class="mono">run 2 — months later, another machine</text>
+      <g>
+        <rect x="430" y="140" width="330" height="26" rx="6" fill="#12191c" stroke="#203034"/>
+        <rect x="442" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="458" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="471" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="492" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="509" y="146" width="5" height="14" fill="#f07a9a"/><rect x="528" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="541" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="565" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="584" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="600" y="146" width="5" height="14" fill="#f07a9a"/><rect x="619" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="638" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="655" y="146" width="5" height="14" fill="#9b8bf0"/><rect x="676" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="692" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="711" y="146" width="5" height="14" fill="#5fd8c8"/><rect x="730" y="146" width="5" height="14" fill="#5fd8c8"/>
+      </g>
+      <text x="410" y="200" fill="#9cadb2" font-size="12.5" text-anchor="middle">byte-identical — <tspan fill="#f07a9a">the injected faults</tspan> and <tspan fill="#9b8bf0">the reshapes</tspan> land on the same tick</text>
+    </svg>
+    <figcaption>A failure found once at seed N is a permanent, single-command reproduction. The evidence never goes cold.</figcaption>
+  </figure>
+
+  <p>This is what it buys in practice. The nastiest defects found while building this system — a subtle divergence in how <a href="library.html">reshape genesis blocks</a> read their clocks, a wedge in the commit pipeline's pruning, a case where <a href="census.html">the beacon's</a> consensus collapsed its agreed prefix under load — every one surfaced as a deterministic simulation failure, was replayed at will from its seed, minimized, fixed, and pinned with a permanent regression scenario. None of them had to be caught in production. None of them ever produced a "cannot reproduce."</p>
+  <p>The rehearsal schedule is deliberately inverted, aviation-style: reshapes under straddler load, partitions healing mid-settlement, committees losing members at the worst moment — weeks-apart events in any real deployment — run in thousands of seeded permutations in CI. <a href="testament.html">The fence</a> gets shoved through its worst cases on purpose; the fork-safety harness hunts for <a href="overlap.html">committable forks</a> under hostile scheduling and asserts it finds none.</p>
+
+  <div class="callout">
+    <p><strong>One more rule closes the loop:</strong> the same behavioral scenarios also run against a real multi-process cluster — identical test code, different plug-ins. A scenario that passes in one world and fails in the other has, <em>by construction</em>, found a real defect. Never a flaky test.</p>
+    <span class="why">Debugging effort always lands on a root cause: a bug in the production plumbing, a gap in the fault model's realism, or a determinism leak. There is no fourth category to shrug at.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DOUBLE DUTY ============================== -->
+<section id="doubleduty">
+  <span class="kicker">05 · The double duty</span>
+  <h2>One property, two jobs</h2>
+  <p>Here is the elegant part. A blockchain's replicas agree only because they compute identically: same blocks in, same state out, on thousands of machines (<a href="generals.html">the generals</a> is this idea end to end). That's determinism. And a simulator replays only because the system computes identically: same seed in, same run out. <strong>Same property, two jobs.</strong> The architectural muscle that makes the tests reproducible is the very muscle that makes the network agree — testing it exercises the thing itself.</p>
+  <p>It's also the bridge to something stronger. Because every protocol component is already a pure transition function with explicit inputs — not logic tangled up with sockets, threads, and clocks — extracting a formal model of it is translation, not archaeology. The system's safety properties are catalogued as an invariant register written against those transition functions, and <a href="proof.html">formal verification of the critical core</a> proceeds from there, cross-checked against the running system through the same scenarios.</p>
+
+  <div class="callout">
+    <p><strong>The aviation lesson, restated:</strong> safety is not hoping the rare day never comes. It is having flown that day a thousand times before it arrives — in a simulator faithful enough that the aircraft can't tell the difference.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the state-machine contract, the time discipline, both harnesses seam by seam, the portable scenario catalogue, and the invariants the whole discipline maintains.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/07-determinism-and-testing.md">docs/07 — determinism and testing</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6b6e">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — the dead shard's will</title>
+<style>
+  :root {
+    --bg: #0d0a0c;
+    --bg2: #141014;
+    --card: #1a1419;
+    --card-edge: #2e2430;
+    --ink: #efe9ec;
+    --ink-dim: #ab9fa8;
+    --wax: #d05a68;
+    --parchment: #ddd0b0;
+    --steel: #9aa5bd;
+    --green: #5fd39a;
+    --amber: #e0b060;
+    --grad: linear-gradient(100deg, #e28691, #b03a4c);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #1a0e12 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--wax); text-decoration: none; border-bottom: 1px solid #3e2830; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--wax); border: 1px solid #3e2830; background: #170e12;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--wax); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--wax); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html" aria-current="page">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · STRADDLER SETTLEMENT</span>
+  <h1>The dead shard's <em>will</em>.</h1>
+  <p class="lede">Shards in Hyperscale are mortal: they split, they merge, and when they do, a chain reaches its final block and ceases to exist. So what becomes of a transaction caught <strong>halfway through</strong> — money committed on a chain that is about to be gone? You settle it the way the living have always settled with the dead: <strong>not by asking around, but by reading the will</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE PREDICAMENT ============================== -->
+<section id="predicament">
+  <span class="kicker">01 · The predicament</span>
+  <h2>Caught in the doorway</h2>
+  <p>A cross-shard transaction normally finishes in a handshake of proofs: shard <strong>P</strong> and shard <strong>Q</strong> each run it, each produce a quorum-signed certificate over the result, and the transaction finalizes when the matching certificates assemble (<a href="generals.html">the generals</a>). Now let P be a shard that's terminating — its <a href="library.html">wing of the library</a> is being handed to successors, its chain approaching a fixed final block. A transaction is mid-flight between P and Q: committed on both, locks held on Q, P's certificate… somewhere. Two nightmares open up, and both were live incidents on the road to this design:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ NIGHTMARE ONE</span><h4>The estate never answers</h4><p>P dies without delivering its certificate. Q waits forever, holding locks on accounts that can never be released. A frozen inheritance nobody can touch.</p></div>
+    <div class="card"><span class="x">✕ NIGHTMARE TWO</span><h4>A signature from beyond the grave</h4><p>Worse: P's certificate is <em>assemblable after death</em>. Signature shares collected before the end can be combined into a valid-looking certificate at any later time — and Q could finalize a result that P's chain never actually applied. A one-sided commit: money real on one side, nonexistent on the other.</p></div>
+    <div class="card"><span class="x">✕ THE TEMPTING FIX</span><h4>Let the heirs finish the job</h4><p>Have P's successor shards adopt and complete the in-flight work? Rejected — and the reason is the whole lesson: whether a certificate "exists" depends on who heard what, when. Different observers can legitimately disagree. Any rule keyed on it turns atomicity into a race.</p></div>
+  </div>
+
+  <div class="callout">
+    <p><strong>The design principle that survived:</strong> nothing that depends on message timing may decide a straddler. The only admissible inputs are <em>frozen chain content</em> — what P provably committed before it died.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== PROBATE ============================== -->
+<section id="probate">
+  <span class="kicker">02 · Probate</span>
+  <h2>How the living settle with the dead</h2>
+  <p>Humanity has run this exact protocol for millennia. When someone dies, we do not settle their estate by canvassing acquaintances for what the deceased might have promised. We open the <strong>will</strong> — a record frozen at death — and an executor honors exactly the claims it supports. A creditor may arrive after the funeral waving a paper with a genuine-looking signature; if the estate's frozen records don't support the claim, it is refused. Not because the signature is fake, but because <em>the record is closed</em>. The dead can no longer be asked, so only the record speaks — and everyone reads the same record.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="A chain ending at a terminal block whose settled set is notarized up to the beacon chain.">
+      <!-- chain -->
+      <g class="mono" font-size="11.5">
+        <rect x="30" y="120" width="70" height="40" rx="8" fill="#1a1419" stroke="#2e2430"/>
+        <text x="65" y="145" fill="#ab9fa8" text-anchor="middle">block</text>
+        <rect x="120" y="120" width="70" height="40" rx="8" fill="#1a1419" stroke="#2e2430"/>
+        <text x="155" y="145" fill="#ab9fa8" text-anchor="middle">block</text>
+        <rect x="210" y="120" width="70" height="40" rx="8" fill="#1a1419" stroke="#2e2430"/>
+        <text x="245" y="145" fill="#ab9fa8" text-anchor="middle">block</text>
+      </g>
+      <line x1="100" y1="140" x2="120" y2="140" stroke="#2e2430" stroke-width="2"/>
+      <line x1="190" y1="140" x2="210" y2="140" stroke="#2e2430" stroke-width="2"/>
+      <line x1="280" y1="140" x2="300" y2="140" stroke="#2e2430" stroke-width="2"/>
+      <!-- terminal -->
+      <rect x="300" y="106" width="120" height="68" rx="10" fill="#201218" stroke="#d05a68" stroke-width="2"/>
+      <text x="360" y="132" fill="#efe9ec" font-size="13" font-weight="700" text-anchor="middle">TERMINAL</text>
+      <text x="360" y="150" fill="#ab9fa8" font-size="11.5" text-anchor="middle">P's final block</text>
+      <circle cx="420" cy="106" r="12" fill="#d05a68" class="pulse"/>
+      <text x="420" y="111" fill="#0d0a0c" font-size="12" font-weight="700" text-anchor="middle">✠</text>
+      <text x="360" y="196" fill="#ab9fa8" font-size="12" text-anchor="middle">the chain ends here — forever</text>
+
+      <!-- inventory -->
+      <rect x="500" y="70" width="190" height="140" rx="10" fill="#171317" stroke="#4a3a28"/>
+      <text x="595" y="94" fill="#ddd0b0" font-size="12.5" font-weight="700" text-anchor="middle" class="mono">THE SETTLED SET</text>
+      <text x="520" y="120" fill="#5fd39a" font-size="12" class="mono">✓ wave 12 settled</text>
+      <text x="520" y="140" fill="#5fd39a" font-size="12" class="mono">✓ wave 15 settled</text>
+      <text x="520" y="160" fill="#5fd39a" font-size="12" class="mono">✓ wave 19 settled</text>
+      <text x="520" y="186" fill="#ab9fa8" font-size="11.5" class="mono">root: 0x9c41…</text>
+      <path d="M 420 140 L 500 140" stroke="#4a3a28" stroke-width="2" class="flow"/>
+      <text x="460" y="130" fill="#ab9fa8" font-size="11" text-anchor="middle">derived</text>
+
+      <!-- beacon -->
+      <rect x="540" y="242" width="110" height="38" rx="19" fill="#1a1419" stroke="#e0b060"/>
+      <text x="595" y="266" fill="#e0b060" font-size="12.5" font-weight="600" text-anchor="middle">BEACON</text>
+      <path d="M 595 210 L 595 242" stroke="#e0b060" stroke-width="2" class="flow"/>
+      <text x="660" y="262" fill="#ab9fa8" font-size="11.5">the root, notarized —</text>
+      <text x="660" y="278" fill="#ab9fa8" font-size="11.5">in every survivor's copy</text>
+    </svg>
+    <figcaption>The will: everything P settled by its terminal block, derivable from the frozen chain alone — its fingerprint notarized into the beacon chain every survivor already folds for itself.</figcaption>
+  </figure>
+
+  <p>Hyperscale's will is the <strong>settled set</strong>: the exact list of cross-shard work P finalized on its own chain at or before the terminal block, over the window in which straddlers could exist. Three properties make it a will rather than a rumor:</p>
+  <p><strong>It's a pure function of the frozen chain.</strong> Each of P's blocks enumerates what it finalized; anyone holding the chain computes the same set. No memory, no testimony.</p>
+  <p><strong>It's notarized before it's read.</strong> P's final-epoch block headers carry the set's merkle root, and <a href="census.html">the beacon</a> records that root into P's terminal record. A survivor learns the fingerprint from <em>its own copy of the beacon chain</em> — before it fetches a single byte from anyone.</p>
+  <p><strong>It's fetched with the fingerprint in hand.</strong> A survivor that needs the actual list requests it from P's final committee, checks it against the notarized root, and rotates to another peer on any mismatch. Nobody can serve a doctored inventory.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE FENCE ============================== -->
+<section id="fence">
+  <span class="kicker">03 · The fence</span>
+  <h2>The probate court's one rule</h2>
+  <p>With the will in hand, survivors enforce a single consensus rule — <strong>the fence</strong> — applied wherever a straddler could finalize: a result naming a shard that is terminated <em>or scheduled to terminate</em> may finalize <strong>if and only if its wave is in that shard's settled set</strong>. Every verdict, laid out:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 330" role="img" aria-label="Claims arriving at the fence and being finalized, aborted, or deferred according to the settled set.">
+      <!-- the fence -->
+      <line x1="410" y1="30" x2="410" y2="300" stroke="#d05a68" stroke-width="2.5"/>
+      <line x1="410" y1="30" x2="410" y2="300" stroke="#d05a68" stroke-width="10" opacity="0.12"/>
+      <text x="410" y="20" fill="#d05a68" font-size="12.5" font-weight="700" text-anchor="middle" class="mono">THE FENCE</text>
+
+      <!-- claim 1: in the will -->
+      <rect x="60" y="52" width="240" height="40" rx="9" fill="#1a1419" stroke="#2e2430"/>
+      <text x="180" y="70" fill="#efe9ec" font-size="12.5" text-anchor="middle">wave 15 — in the will</text>
+      <text x="180" y="85" fill="#ab9fa8" font-size="11" text-anchor="middle" class="mono">P settled it before the end</text>
+      <path d="M 300 72 L 404 72" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <path d="M 416 72 L 520 72" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <text x="545" y="77" fill="#5fd39a" font-size="13" font-weight="600" class="mono">FINALIZE — everywhere</text>
+
+      <!-- claim 2: absent -->
+      <rect x="60" y="130" width="240" height="40" rx="9" fill="#1a1419" stroke="#2e2430"/>
+      <text x="180" y="148" fill="#efe9ec" font-size="12.5" text-anchor="middle">wave 22 — absent from the will</text>
+      <text x="180" y="163" fill="#ab9fa8" font-size="11" text-anchor="middle" class="mono">P never settled it</text>
+      <path d="M 300 150 L 398 150" stroke="#d05a68" stroke-width="2" class="flow"/>
+      <text x="410" y="155" fill="#d05a68" font-size="15" text-anchor="middle" font-weight="700">✕</text>
+      <text x="428" y="155" fill="#d05a68" font-size="13" font-weight="600" class="mono">ABORT — everywhere</text>
+
+      <!-- claim 3: will not yet readable -->
+      <rect x="60" y="208" width="240" height="40" rx="9" fill="#1a1419" stroke="#2e2430"/>
+      <text x="180" y="226" fill="#efe9ec" font-size="12.5" text-anchor="middle">wave 31 — P still dying,</text>
+      <text x="180" y="241" fill="#ab9fa8" font-size="11" text-anchor="middle" class="mono">will not yet written</text>
+      <path d="M 300 228 L 398 228" stroke="#e0b060" stroke-width="2" class="flow"/>
+      <text x="410" y="233" fill="#e0b060" font-size="15" text-anchor="middle" font-weight="700">⏸</text>
+      <text x="428" y="233" fill="#e0b060" font-size="13" font-weight="600" class="mono">WAIT — for evidence, never a clock</text>
+
+      <!-- claim 4: beyond the grave -->
+      <rect x="60" y="286" width="240" height="40" rx="9" fill="#201218" stroke="#d05a68"/>
+      <text x="180" y="304" fill="#e28691" font-size="12.5" text-anchor="middle">a certificate from beyond the grave</text>
+      <text x="180" y="319" fill="#ab9fa8" font-size="11" text-anchor="middle" class="mono">assembled from old vote shares</text>
+      <path d="M 300 306 L 398 306" stroke="#d05a68" stroke-width="2" class="flow"/>
+      <text x="410" y="311" fill="#d05a68" font-size="15" text-anchor="middle" font-weight="700">✕</text>
+      <text x="428" y="311" fill="#d05a68" font-size="13" font-weight="600" class="mono">REFUSED — the record is closed</text>
+    </svg>
+    <figcaption>One rule, four faces. Both sides of every straddler compute their verdict from the same frozen record — so they cannot disagree.</figcaption>
+  </figure>
+
+  <p>Three subtleties carry the safety:</p>
+  <p><strong>The fence goes up early.</strong> It engages the moment P's termination is <em>admitted</em> — not only after P is gone. Otherwise a survivor could finalize a straddler in the in-between window that P, on the far side of a network partition, never settles before its cut. Scheduled-to-die is already fenced.</p>
+  <p><strong>Waiting ends on evidence, never on a timer.</strong> A deferred verdict resolves when the will arrives, or the termination lapses, or the retention horizon passes — all facts every replica sees identically. A timeout abort would gamble against a settlement P might have committed; a local clock is exactly the message-timing dependence this design exists to exclude.</p>
+  <p><strong>Honest nodes obey their own fence.</strong> The same checks gate a replica's own finalization path, so no honest node ever produces a result the fence would refuse from others.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== CLOSING THE ESTATE ============================== -->
+<section id="estate">
+  <span class="kicker">04 · Closing the estate</span>
+  <h2>Locks released, claims swept</h2>
+  <p>The fence decides; two deterministic sweeps then tidy up, no consensus required. On the survivor: once the will is ingested, any transaction naming P that still lacks P's half <em>can never gain it</em> — every certificate the world could still produce is fenced — so its locks release and it aborts, cleanly. This closes the beyond-the-grave case for good: the late certificate is refused at the gate, and the refusal itself feeds the sweep. On P's own replicas at termination: everything committed but unfinalized aborts locally — pure cleanup, identical everywhere.</p>
+  <p>One courtesy softens the whole affair: a shard approaching its cut <strong>quiesces</strong> — its proposers stop taking on new cross-shard work in the final stretch, so few transactions are ever caught in the doorway at all. But it is a courtesy, not a load-bearing wall. The tests deliberately set the margin to zero and shove straddlers through the fence on purpose (<a href="crashlab.html">the crash lab</a>); safety never depends on the traffic having thinned.</p>
+
+  <div class="callout">
+    <p><strong>The net guarantee:</strong> a transaction caught in the boundary finalizes on the surviving shard <em>if and only if</em> the dead shard settled it on-chain before the end. Both verdicts are computed from the same frozen record — so no straddler can ever commit on one side and abort on the other.</p>
+    <span class="why">The probate lesson, restated for distributed systems: the dead can't be asked, so nothing the dead didn't write down may count — and then everyone must read the same writing. Frozen chain content is the only witness that never changes its story.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the settled set's exact window, the fence's verdict table, both sweeps, quiesce margins, and the invariants that make straddler atomicity hold across split and merge alike.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/02-dynamic-sharding.md">docs/02 — dynamic sharding</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/04-atomic-commitment.md">docs/04 — atomic commitment</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#6b5c64">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

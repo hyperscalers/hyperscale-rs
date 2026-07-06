@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — split the work, not the world</title>
+<style>
+  :root {
+    --bg: #0a0d14;
+    --bg2: #0e1320;
+    --card: #121828;
+    --card-edge: #1e2740;
+    --ink: #e8ecf6;
+    --ink-dim: #9aa5bd;
+    --ink-faint: #5c6780;
+    --cyan: #4fd8e8;
+    --violet: #8b7bf4;
+    --green: #5fd39a;
+    --amber: #f0b860;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #4fd8e8, #8b7bf4);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a, .callout .why a { color: var(--cyan); text-decoration: none; border-bottom: 1px solid #1e3c4a; }
+  p a:hover, li a:hover, .callout .why a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  /* hero */
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(40px, 7vw, 64px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 640px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--cyan); border: 1px solid #1e3a44; background: #0a161c;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  /* cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  /* callout */
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  /* figure */
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel {
+    background: var(--bg2); border: 1px solid var(--card-edge);
+    border-radius: 16px; padding: 22px;
+  }
+
+  /* svg text */
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  /* dashed flow animation */
+  .flow { stroke-dasharray: 6 6; animation: flow 1.2s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--cyan); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html" aria-current="page">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · THE AERIAL VIEW</span>
+  <h1>Split the work, <em>not the world</em>.</h1>
+  <p class="lede">Every blockchain that shards for scale gives something up — atomic transactions, composability, or finality. <strong>Hyperscale is built on the position that none of those trade-offs are necessary.</strong> Add shards, get proportional throughput, and keep the semantics of a single chain.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== PROBLEM ============================== -->
+<section id="problem">
+  <span class="kicker">01 · The problem</span>
+  <h2>Why sharding usually breaks things</h2>
+  <p>A single chain has a hard ceiling: every validator re-executes every transaction, so adding validators adds security, never throughput. Sharding fixes that by splitting state and validators into parallel groups — but then a transaction touching two shards needs both to agree, and <a href="asterisks.html">the known answers</a> all compromise:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ ASYNC MESSAGES</span><h4>Shards mail each other</h4><p>Cross-shard actions become multi-step sagas with user-visible half-done states. Your swap left one shard before it arrived at the other.</p></div>
+    <div class="card"><span class="x">✕ OPTIMISTIC ROLLBACK</span><h4>Execute now, apologize later</h4><p>Run it and reconcile afterwards. Finality becomes "probably final," and contracts must survive being un-run.</p></div>
+    <div class="card"><span class="x">✕ WALLED GARDENS</span><h4>Composability fenced off</h4><p>Contracts only interact within their own shard. The ecosystem fragments into islands that need bridges.</p></div>
+  </div>
+
+  <div class="callout">
+    <p>Hyperscale's answer: a transaction <strong>declares the state it touches</strong>, every shard that owns any of it participates, and the transaction <strong>commits atomically on all of them or none</strong> — synchronous, composable, final.</p>
+    <span class="why">How that's possible — and how the shard map itself grows and shrinks with demand — is the rest of the story.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THREE ENGINES ============================== -->
+<section id="consensus">
+  <span class="kicker">02 · Consensus</span>
+  <h2>Three engines, one clock</h2>
+  <p>Hyperscale runs <strong>three different consensus mechanisms</strong>, each shaped for its job, instead of forcing one protocol to do everything:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 330" role="img" aria-label="Three consensus layers joined by a weighted-time spine">
+      <!-- weighted time spine -->
+      <line x1="700" y1="20" x2="700" y2="310" stroke="#8b7bf4" stroke-width="2" class="flow"/>
+      <text x="712" y="30" fill="#8b7bf4" font-size="13" font-weight="600">weighted</text>
+      <text x="712" y="46" fill="#8b7bf4" font-size="13" font-weight="600">time</text>
+
+      <!-- shard band -->
+      <rect x="10" y="20" width="660" height="88" rx="12" fill="#121828" stroke="#1e2740"/>
+      <text x="28" y="46" fill="#4fd8e8" font-size="14" font-weight="700">SHARD CONSENSUS</text>
+      <text x="28" y="66" fill="#9aa5bd" font-size="13">Many independent BFT chains order transactions in parallel</text>
+      <g>
+        <circle cx="470" cy="52" r="5" fill="#4fd8e8"/><circle cx="500" cy="52" r="5" fill="#4fd8e8"/><circle cx="530" cy="52" r="5" fill="#4fd8e8"/><circle cx="560" cy="52" r="5" fill="#4fd8e8" class="pulse"/>
+        <circle cx="470" cy="76" r="5" fill="#4fd8e8"/><circle cx="500" cy="76" r="5" fill="#4fd8e8"/><circle cx="530" cy="76" r="5" fill="#4fd8e8" class="pulse"/>
+        <line x1="470" y1="52" x2="560" y2="52" stroke="#2a3654"/><line x1="470" y1="76" x2="530" y2="76" stroke="#2a3654"/>
+      </g>
+
+      <!-- execution band -->
+      <rect x="10" y="122" width="660" height="88" rx="12" fill="#121828" stroke="#1e2740"/>
+      <text x="28" y="148" fill="#5fd39a" font-size="14" font-weight="700">EXECUTION CONSENSUS</text>
+      <text x="28" y="168" fill="#9aa5bd" font-size="13">Validators certify what the transactions actually did</text>
+      <g class="mono">
+        <rect x="470" y="146" width="88" height="30" rx="6" fill="#0e1a14" stroke="#2a5440"/>
+        <text x="514" y="166" fill="#5fd39a" font-size="12" text-anchor="middle">certificate</text>
+      </g>
+
+      <!-- beacon band -->
+      <rect x="10" y="224" width="660" height="88" rx="12" fill="#121828" stroke="#1e2740"/>
+      <text x="28" y="250" fill="#f0b860" font-size="14" font-weight="700">BEACON CONSENSUS</text>
+      <text x="28" y="270" fill="#9aa5bd" font-size="13">One slow chain decides who validates which shard, and when</text>
+      <g>
+        <rect x="470" y="252" width="26" height="26" rx="5" fill="#1a150a" stroke="#4a3a1a"/>
+        <rect x="510" y="252" width="26" height="26" rx="5" fill="#1a150a" stroke="#4a3a1a"/>
+        <rect x="550" y="252" width="26" height="26" rx="5" fill="#1a150a" stroke="#4a3a1a" class="pulse"/>
+        <line x1="496" y1="265" x2="510" y2="265" stroke="#4a3a1a"/><line x1="536" y1="265" x2="550" y2="265" stroke="#4a3a1a"/>
+      </g>
+    </svg>
+    <figcaption>Ordering, execution, and coordination are separate agreements — synchronized by one BFT-attested clock.</figcaption>
+  </figure>
+
+  <h3>Shard chains order</h3>
+  <p>Each shard is its own BFT chain (a HotStuff-2 derivative: rotating proposers, two-round commits, <a href="overlap.html">provably fork-free</a>). Shards run concurrently and never wait on each other — <strong>this is where linear scaling comes from</strong>.</p>
+
+  <h3>Execution certifies</h3>
+  <p>Ordering a transaction and agreeing on its <em>result</em> are different problems. After a block commits, validators execute it and certify the outcomes with a second, lighter quorum. Splitting these apart is what lets a shard commit to <em>running</em> a cross-shard transaction before it can know the result.</p>
+
+  <h3>The beacon coordinates</h3>
+  <p><a href="census.html">One deliberately slow chain</a> — a block per epoch — tracks validators, stake, and the shard map. It never sees a transaction. Its one product: a <strong>schedule</strong> mapping any moment in time to the committee governing each shard.</p>
+
+  <div class="callout">
+    <p><strong>The clock that glues it together is <a href="clock.html">made of votes</a>.</strong> Every quorum certificate carries the average of its voters' clock readings, clamped so it can never run backwards — a timestamp no minority of liars can meaningfully move, agreed as part of consensus itself.</p>
+    <span class="why">Any artifact, from any shard, at any time, resolves to exactly one governing committee by looking up its attested timestamp in the schedule — computed one epoch ahead, so every honest node gets the identical answer. Dozens of unsynchronized chains, one unambiguous notion of "who's in charge right now."</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== ATOMIC COMMITS ============================== -->
+<section id="atomicity">
+  <span class="kicker">03 · Atomicity</span>
+  <h2>Cross-shard commits nobody votes on</h2>
+  <p>Here's the trick at the heart of the system. A transaction touching shards 01 and 10 goes through three stages — <strong>provision, execute, certify</strong> — and at no point does anyone <em>decide</em> the outcome. Everyone <em>computes</em> it.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="Provision, execute, certify pipeline across two shards">
+      <!-- lanes -->
+      <text x="14" y="52" fill="#4fd8e8" font-size="14" font-weight="700">SHARD 01</text>
+      <text x="14" y="238" fill="#8b7bf4" font-size="14" font-weight="700">SHARD 10</text>
+      <line x1="100" y1="46" x2="806" y2="46" stroke="#1e2740"/>
+      <line x1="100" y1="232" x2="806" y2="232" stroke="#1e2740"/>
+
+      <!-- stage labels -->
+      <text x="185" y="20" fill="#9aa5bd" font-size="12.5" text-anchor="middle" class="mono">1 · ORDER</text>
+      <text x="400" y="20" fill="#9aa5bd" font-size="12.5" text-anchor="middle" class="mono">2 · PROVISION</text>
+      <text x="580" y="20" fill="#9aa5bd" font-size="12.5" text-anchor="middle" class="mono">3 · EXECUTE</text>
+      <text x="730" y="20" fill="#9aa5bd" font-size="12.5" text-anchor="middle" class="mono">4 · CERTIFY</text>
+
+      <!-- order blocks -->
+      <rect x="150" y="30" width="70" height="32" rx="7" fill="#0d1e24" stroke="#2a5460"/>
+      <text x="185" y="51" fill="#4fd8e8" font-size="12" text-anchor="middle" class="mono">tx in block</text>
+      <rect x="150" y="216" width="70" height="32" rx="7" fill="#151030" stroke="#3a3060"/>
+      <text x="185" y="237" fill="#8b7bf4" font-size="12" text-anchor="middle" class="mono">tx in block</text>
+
+      <!-- provisions crossing -->
+      <path d="M 340 62 C 400 120, 400 160, 340 216" fill="none" stroke="#4fd8e8" stroke-width="2" class="flow"/>
+      <path d="M 460 216 C 400 160, 400 120, 460 62" fill="none" stroke="#8b7bf4" stroke-width="2" class="flow"/>
+      <rect x="330" y="118" width="140" height="42" rx="8" fill="#0e1320" opacity="0.92"/>
+      <text x="400" y="135" fill="#9aa5bd" font-size="12" text-anchor="middle">state + merkle proof</text>
+      <text x="400" y="152" fill="#9aa5bd" font-size="12" text-anchor="middle">both directions</text>
+
+      <!-- execute -->
+      <rect x="545" y="30" width="70" height="32" rx="7" fill="#0e1a14" stroke="#2a5440"/>
+      <text x="580" y="51" fill="#5fd39a" font-size="12" text-anchor="middle" class="mono">run VM</text>
+      <rect x="545" y="216" width="70" height="32" rx="7" fill="#0e1a14" stroke="#2a5440"/>
+      <text x="580" y="237" fill="#5fd39a" font-size="12" text-anchor="middle" class="mono">run VM</text>
+      <text x="580" y="146" fill="#5fd39a" font-size="12.5" text-anchor="middle" class="mono">identical inputs →</text>
+      <text x="580" y="163" fill="#5fd39a" font-size="12.5" text-anchor="middle" class="mono">identical result</text>
+
+      <!-- certify crossing -->
+      <path d="M 700 62 C 745 120, 745 160, 700 216" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <path d="M 760 216 C 715 160, 715 120, 760 62" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <rect x="692" y="129" width="82" height="42" rx="8" fill="#0e1320" opacity="0.92"/>
+      <text x="733" y="146" fill="#9aa5bd" font-size="12" text-anchor="middle">certificates</text>
+      <text x="733" y="163" fill="#9aa5bd" font-size="12" text-anchor="middle">cross</text>
+    </svg>
+    <figcaption>Both shards order the transaction independently, exchange proven state, execute the same computation, and swap quorum certificates over the result.</figcaption>
+  </figure>
+
+  <p><strong>Provision.</strong> Each shard sends the others the state values the transaction needs — not as a message to be trusted, but as a <strong>merkle proof against its own committed, quorum-signed blocks</strong>. A provision is a verifiable fact about a chain, not a claim by a node.</p>
+  <p><strong>Execute.</strong> Once a shard holds proven state from every counterparty, all participants have <em>byte-identical inputs</em>. Execution is deterministic, so they all compute the same receipts — independently, with no further communication.</p>
+  <p><strong>Certify.</strong> Each shard's validators sign a certificate over the outcome. The transaction finalizes only when certificates from <strong>every participating shard, all agreeing on the same result hash</strong>, are assembled. Divergent certificates simply can never assemble into a valid commit — atomicity is enforced by the shape of the artifact, not by a coordinator. (<a href="journey.html">The journey</a> follows one payment through all four stages.)</p>
+
+  <div class="callout">
+    <p><strong>If you're thinking "two-phase commit" — <a href="generals.html">it isn't</a>.</strong> There's no coordinator to crash, no votes that could go either way, and no blocking: outcomes are pure functions of what the chains committed, deadlines are attested on-chain time, and a stuck transaction aborts identically everywhere.</p>
+    <span class="why">Deadlocks between transactions can't form either — the mempool never lets two in-flight transactions share any declared piece of state, and genuine cross-shard conflicts resolve by a deterministic tiebreak every shard computes the same way.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DYNAMIC SHARDING ============================== -->
+<section id="elasticity">
+  <span class="kicker">04 · Elasticity</span>
+  <h2>A shard map that breathes</h2>
+  <p>All state lives in <strong><a href="library.html">one giant binary merkle tree</a></strong>, and a shard is simply a <em>subtree</em> — everything under one prefix. Objects owned by an account are keyed under that account's prefix, so ownership never straddles a boundary. That single design choice makes resharding almost embarrassingly clean:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 270" role="img" aria-label="A shard splitting into two children in the state tree">
+      <!-- before -->
+      <text x="180" y="26" fill="#9aa5bd" font-size="13" text-anchor="middle" class="mono">ONE BUSY SHARD</text>
+      <circle cx="180" cy="70" r="17" fill="#1a2440" stroke="#f0b860" stroke-width="2" class="pulse"/>
+      <line x1="168" y1="82" x2="120" y2="130" stroke="#2a3654" stroke-width="2"/>
+      <line x1="192" y1="82" x2="240" y2="130" stroke="#2a3654" stroke-width="2"/>
+      <circle cx="120" cy="142" r="12" fill="#121828" stroke="#2a3654"/>
+      <circle cx="240" cy="142" r="12" fill="#121828" stroke="#2a3654"/>
+      <line x1="112" y1="152" x2="90" y2="185" stroke="#1e2740"/><line x1="128" y1="152" x2="150" y2="185" stroke="#1e2740"/>
+      <line x1="232" y1="152" x2="210" y2="185" stroke="#1e2740"/><line x1="248" y1="152" x2="270" y2="185" stroke="#1e2740"/>
+      <circle cx="90" cy="192" r="6" fill="#1a2440"/><circle cx="150" cy="192" r="6" fill="#1a2440"/>
+      <circle cx="210" cy="192" r="6" fill="#1a2440"/><circle cx="270" cy="192" r="6" fill="#1a2440"/>
+      <text x="180" y="240" fill="#f0b860" font-size="13" text-anchor="middle">state grows past threshold…</text>
+
+      <!-- arrow -->
+      <path d="M 350 130 L 440 130" stroke="#8b7bf4" stroke-width="2" class="flow"/>
+      <path d="M 432 122 L 446 130 L 432 138" fill="none" stroke="#8b7bf4" stroke-width="2"/>
+      <text x="395" y="115" fill="#8b7bf4" font-size="12.5" text-anchor="middle" class="mono">SPLIT</text>
+
+      <!-- after -->
+      <text x="630" y="26" fill="#9aa5bd" font-size="13" text-anchor="middle" class="mono">TWO SHARDS, SAME TREE</text>
+      <circle cx="630" cy="70" r="14" fill="#0a0d14" stroke="#2a3654" stroke-dasharray="4 4"/>
+      <line x1="618" y1="80" x2="565" y2="125" stroke="#2a3654" stroke-width="2"/>
+      <line x1="642" y1="80" x2="695" y2="125" stroke="#2a3654" stroke-width="2"/>
+      <circle cx="565" cy="140" r="15" fill="#0d1e24" stroke="#4fd8e8" stroke-width="2"/>
+      <circle cx="695" cy="140" r="15" fill="#151030" stroke="#8b7bf4" stroke-width="2"/>
+      <line x1="557" y1="152" x2="535" y2="185" stroke="#1e2740"/><line x1="573" y1="152" x2="595" y2="185" stroke="#1e2740"/>
+      <line x1="687" y1="152" x2="665" y2="185" stroke="#1e2740"/><line x1="703" y1="152" x2="725" y2="185" stroke="#1e2740"/>
+      <circle cx="535" cy="192" r="6" fill="#0d1e24"/><circle cx="595" cy="192" r="6" fill="#0d1e24"/>
+      <circle cx="665" cy="192" r="6" fill="#151030"/><circle cx="725" cy="192" r="6" fill="#151030"/>
+      <text x="630" y="240" fill="#9aa5bd" font-size="13" text-anchor="middle">each child <tspan class="mono" fill="#5fd39a">is</tspan> a subtree — hash(left, right) = old root</text>
+    </svg>
+    <figcaption>No data migration, no re-keying. Splitting hands each child one existing subtree; merging recombines them with a single hash.</figcaption>
+  </figure>
+
+  <p>The lifecycle is fully automatic. A shard whose state crosses a size threshold asserts a split <em>in its own blocks</em> — a claim every validator checks against their own copy before voting, so it can't be faked. The beacon then drafts fresh validators from the standby pool, they sync their half of the data <strong>while the old shard keeps running</strong> (make-before-break), and only when both child committees provably have a supermajority ready does the flip execute. Each child's genesis block is derived purely from the parent's final block — every node computes it independently and it must hash to exactly what the beacon recorded, or the flip refuses to happen. Merging is the same movie in reverse.</p>
+
+  <div class="callout">
+    <p><strong>The hardest part: transactions caught in the boundary.</strong> What happens to a cross-shard transaction whose counterparty shard <em>stops existing</em> mid-flight?</p>
+    <span class="why">The dying shard's final block fixes, forever, exactly which transactions it settled — and that "settled set" is attested into the beacon. Survivors enforce <a href="testament.html">a fence</a>: a caught transaction finalizes if and only if the departed shard settled it; everything else aborts, identically, everywhere. Verdicts come from frozen chain history — never from whether some message happened to arrive in time.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== SECURITY ============================== -->
+<section id="security">
+  <span class="kicker">05 · Security</span>
+  <h2>A moving target for attackers</h2>
+  <p>Sharding's classic weakness: corrupting <em>one</em> committee is much cheaper than corrupting the whole network. Hyperscale's defense is to make every committee a <strong><a href="kleroterion.html">randomly drawn, constantly moving target</a></strong>:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ UNPREDICTABLE</span><h4>Seeded assignment</h4><p>Committees are sampled from on-chain randomness re-mixed every epoch. Nobody — including the adversary — knows placements far in advance.</p></div>
+    <div class="card"><span class="ok">◦ ALWAYS MOVING</span><h4>Continuous shuffle</h4><p>Membership rotates as a steady trickle, one seat at a time, so committees stay live while an adversary's slow corruption of any one shard keeps being dispersed.</p></div>
+    <div class="card"><span class="ok">◦ SELF-CLEANING</span><h4>Proven expulsion</h4><p>Double-signing is self-proving evidence: permanent jail. Chronic offline behavior is witnessed on-chain — via proofs a block proposer cannot censor or forge — and jailed on threshold.</p></div>
+  </div>
+
+  <p>Between shards, <strong>no node is ever trusted — only quorums and proofs</strong>. A shard believes another shard's headers because they carry supermajority signatures under the right committee; it believes state because of merkle proofs into those headers; it believes results because of execution certificates. Every check resolves its committee through the attested clock, so there is never ambiguity about whose signatures count.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== ECONOMICS ============================== -->
+<section id="economics">
+  <span class="kicker">06 · Economics</span>
+  <h2>A thermostat for validator supply</h2>
+  <p>An elastic shard map means elastic demand for validators — every split needs a fresh committee, every merge releases one. So the cost of activating a validator isn't fixed: <strong>the protocol prices it, every epoch, like a market</strong>.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 240" role="img" aria-label="Activation price rising with validator supply and falling with demand">
+      <line x1="70" y1="20" x2="70" y2="190" stroke="#2a3654"/>
+      <line x1="70" y1="190" x2="790" y2="190" stroke="#2a3654"/>
+      <text x="30" y="105" fill="#9aa5bd" font-size="12.5" transform="rotate(-90 30 105)" text-anchor="middle">activation price</text>
+      <text x="430" y="218" fill="#9aa5bd" font-size="12.5" text-anchor="middle">validator supply relative to what the topology needs</text>
+
+      <path d="M 90 168 C 300 165, 480 130, 770 40" fill="none" stroke="url(#g1)" stroke-width="3"/>
+      <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5fd39a"/><stop offset="1" stop-color="#f07a9a"/></linearGradient></defs>
+
+      <line x1="70" y1="168" x2="770" y2="168" stroke="#5fd39a" stroke-dasharray="4 5" opacity="0.5"/>
+      <text x="778" y="172" fill="#5fd39a" font-size="12" class="mono">floor</text>
+
+      <circle cx="180" cy="164" r="6" fill="#5fd39a"/>
+      <text x="180" y="126" fill="#5fd39a" font-size="12.5" text-anchor="middle">network short of validators</text>
+      <text x="180" y="143" fill="#5fd39a" font-size="12" text-anchor="middle" class="mono">→ cheap to join</text>
+
+      <circle cx="680" cy="66" r="6" fill="#f07a9a"/>
+      <text x="575" y="52" fill="#f07a9a" font-size="12.5" text-anchor="middle">abundant supply</text>
+      <text x="575" y="69" fill="#f07a9a" font-size="12" text-anchor="middle" class="mono">→ expensive to join</text>
+    </svg>
+    <figcaption>The minimum stake to activate a validator is a clearing price: high when the network doesn't need you, low exactly when it does.</figcaption>
+  </figure>
+
+  <p>Each epoch the beacon computes how many validators the topology needs — every committee, plus a standby buffer for shuffles, jailings, and the next split — and sets the activation stake at the <strong><a href="governor.html">marginal price where supply meets that target</a></strong>. Two guardrails: the price never rises past the point that would push out a sitting validator (repricing alone can never eject anyone), and it never falls below a hard floor, so buying influence always costs real stake.</p>
+  <p>The other half is <strong>vnodes</strong>: one machine can run many validator identities, sharing storage, execution, and networking — two seats on the same shard share one copy of the data and one execution of each transaction, and messages between co-hosted identities skip the network entirely. The marginal cost of a seat becomes its stake, not another server. That's deliberate: <strong>stake is the security parameter</strong>; hardware shouldn't be the bottleneck on an elastic validator supply.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DETERMINISM ============================== -->
+<section id="engineering">
+  <span class="kicker">07 · Engineering</span>
+  <h2>Deterministic to the core</h2>
+  <p>Everything above depends on different machines computing identical answers — and on rare, gnarly events (a shard splitting under load, a partition healing mid-transaction) being testable. So the entire protocol is written as <strong>pure state machines</strong>: no clocks, no threads, no network calls inside the logic. Time is an input. Randomness is an input. Every transition is a function.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 190" role="img" aria-label="The same state machine running under simulation and production">
+      <rect x="310" y="60" width="200" height="70" rx="12" fill="#121828" stroke="#8b7bf4" stroke-width="1.5"/>
+      <text x="410" y="90" fill="#e8ecf6" font-size="14" font-weight="700" text-anchor="middle">the protocol</text>
+      <text x="410" y="110" fill="#9aa5bd" font-size="12" text-anchor="middle" class="mono">pure state machines</text>
+
+      <rect x="30" y="55" width="190" height="80" rx="12" fill="#0e1a14" stroke="#2a5440"/>
+      <text x="125" y="84" fill="#5fd39a" font-size="13" font-weight="700" text-anchor="middle">SIMULATOR</text>
+      <text x="125" y="103" fill="#9aa5bd" font-size="11.5" text-anchor="middle">whole networks in one process</text>
+      <text x="125" y="119" fill="#9aa5bd" font-size="11.5" text-anchor="middle">seeded faults · exact replay</text>
+
+      <rect x="600" y="55" width="190" height="80" rx="12" fill="#1a1520" stroke="#4a3060"/>
+      <text x="695" y="84" fill="#f0b860" font-size="13" font-weight="700" text-anchor="middle">PRODUCTION</text>
+      <text x="695" y="103" fill="#9aa5bd" font-size="11.5" text-anchor="middle">real network · real disks</text>
+      <text x="695" y="119" fill="#9aa5bd" font-size="11.5" text-anchor="middle">real time</text>
+
+      <line x1="222" y1="95" x2="308" y2="95" stroke="#2a3654" stroke-width="2" class="flow"/>
+      <line x1="512" y1="95" x2="598" y2="95" stroke="#2a3654" stroke-width="2" class="flow"/>
+      <text x="410" y="165" fill="#9aa5bd" font-size="12.5" text-anchor="middle" class="mono">same code · both worlds</text>
+    </svg>
+    <figcaption>One codebase, two harnesses. A test that fails in one and passes in the other has found a real bug, by construction.</figcaption>
+  </figure>
+
+  <p>The payoff is enormous: entire multi-shard networks — beacon, splits, merges, partitions, message loss, all of it — <strong><a href="crashlab.html">replay byte-for-byte from a random seed</a></strong>. A failure found once is reproducible forever with one command. The scariest code paths in any sharded system, the ones that fire once a month in production, are the most heavily exercised code in this repository. And the same determinism that makes tests reproducible is what makes <em>replicas agree</em> — it's one property doing both jobs.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The full architecture is documented</h2>
+  <p>This page is the aerial view. The docs tell the whole story — the three consensus layers, the reshape lifecycle, the state tree, the settlement machinery, the economics — and consolidate the system's safety and liveness properties into an invariant register built as a starting point for <a href="proof.html">formal verification</a>.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/tree/main/docs">docs/ — architecture documentation</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/00-overview.md">the five-page overview</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6780">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

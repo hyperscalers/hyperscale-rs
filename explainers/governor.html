@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — a governor, not a vote</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --bg2: #11131c;
+    --card: #151827;
+    --card-edge: #232840;
+    --ink: #ece8dd;
+    --ink-dim: #a8a496;
+    --brass: #d9a441;
+    --brass-hi: #f2c26b;
+    --steam: #8fb8c8;
+    --green: #5fd39a;
+    --rose: #e87a8a;
+    --grad: linear-gradient(100deg, #f2c26b, #d9a441 55%, #b8763a);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #1a1408 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong { color: var(--ink); font-weight: 600; }
+  p a, li a, .callout .why a { color: var(--brass-hi); text-decoration: none; border-bottom: 1px solid #3e3220; }
+  p a:hover, li a:hover, .callout .why a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--brass); border: 1px solid #4a3a1a; background: #17120a;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  /* steam + flow animation (the governor linkage itself is driven by script) */
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .puff { animation: puff 3.2s ease-out infinite; }
+  .puff.p2 { animation-delay: 1.1s; }
+  .puff.p3 { animation-delay: 2.2s; }
+  @keyframes puff {
+    0%   { transform: translate(0, 0);      opacity: 0; }
+    15%  { opacity: .45; }
+    100% { transform: translate(30px, -22px); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { .flow, .puff { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--brass-hi); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html" aria-current="page">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · RESOURCE ECONOMICS</span>
+  <h1>A <em>governor</em>, not a governance vote.</h1>
+  <p class="lede">In 1788, a pair of spinning brass balls solved a coordination problem that no amount of human diligence could. Hyperscale prices its validator supply the same way — <strong>with a feedback mechanism, not a committee</strong>. This page is about that mechanism.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1788 ============================== -->
+<section id="watt">
+  <span class="kicker">01 · 1788</span>
+  <h2>The lad with the shovel</h2>
+  <p>A steam engine is an uncoordinated system. The boiler makes power; the mill consumes it; both vary minute to minute. Somewhere in between stands a stoker shoveling coal — and here is the thing: <strong>the lad stoking the furnace never calculated how much energy each shovelful released</strong>, or what the looms upstairs needed, or what the flywheel was doing. Nobody could. React too slowly and the engine stalls under load; too eagerly and it races itself to pieces.</p>
+  <p>James Watt's answer wasn't a smarter stoker or a schedule of rules. It was the <strong>centrifugal governor</strong>: two weighted arms spinning with the engine's own shaft. Run too fast and the balls fly outward and rise, closing the steam valve. Run too slow and they drop, opening it. The machine throttles itself.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 340" role="img" aria-label="A centrifugal flyball governor: spinning weighted arms lift a sleeve that works a lever, throttling a steam valve">
+      <!-- machine bed, spindle, drive pulley -->
+      <rect x="340" y="296" width="100" height="12" rx="4" fill="#1c1f2e" stroke="#2c3350"/>
+      <line x1="390" y1="296" x2="390" y2="70" stroke="#6e6046" stroke-width="5"/>
+      <ellipse cx="390" cy="288" rx="30" ry="9" fill="#17120a" stroke="#8a7748" stroke-width="2"/>
+      <ellipse cx="390" cy="258" rx="20" ry="5.5" fill="none" stroke="#8a7748" stroke-width="1.5" class="flow" opacity="0.7"/>
+      <rect x="382" y="62" width="16" height="12" rx="3" fill="#d9a441"/>
+      <circle cx="390" cy="60" r="5" fill="#f2c26b"/>
+      <!-- orbit traced by the spinning balls -->
+      <ellipse id="orbit" cx="390" cy="169.2" rx="61.5" ry="13" fill="none" stroke="#8a7748" stroke-width="1.5" stroke-dasharray="4 6" opacity="0.55"/>
+      <!-- arms and balls, hinged at the top of the spindle -->
+      <line id="armL" x1="390" y1="78" x2="328.5" y2="169.2" stroke="#d9a441" stroke-width="4" stroke-linecap="round"/>
+      <line id="armR" x1="390" y1="78" x2="451.5" y2="169.2" stroke="#d9a441" stroke-width="4" stroke-linecap="round"/>
+      <circle id="ballL" cx="328.5" cy="169.2" r="15" fill="#2a2010" stroke="#d9a441" stroke-width="3"/>
+      <circle id="ballR" cx="451.5" cy="169.2" r="15" fill="#2a2010" stroke="#d9a441" stroke-width="3"/>
+      <!-- link rods from mid-arm down to the sliding sleeve -->
+      <line id="linkL" x1="353.1" y1="132.7" x2="378" y2="196" stroke="#b8944a" stroke-width="3" stroke-linecap="round"/>
+      <line id="linkR" x1="426.9" y1="132.7" x2="402" y2="196" stroke="#b8944a" stroke-width="3" stroke-linecap="round"/>
+      <!-- sliding sleeve on the spindle -->
+      <rect id="sleeve" x="374" y="188" width="32" height="20" rx="6" fill="#d9a441"/>
+      <rect id="groove" x="376" y="208" width="28" height="5" rx="2.5" fill="#8a7748"/>
+      <!-- lever: sleeve pin → fulcrum → valve stem -->
+      <line x1="600" y1="201" x2="600" y2="232" stroke="#3a4160" stroke-width="5"/>
+      <path d="M 590 232 L 610 232 L 600 220 Z" fill="#3a4160"/>
+      <line id="lever" x1="402" y1="196" x2="690" y2="196" stroke="#8a7748" stroke-width="3.5" stroke-linecap="round"/>
+      <circle cx="600" cy="196" r="5.5" fill="#f2c26b" stroke="#8a7748" stroke-width="1.5"/>
+      <!-- valve: stem, bonnet, gate, pipe -->
+      <line id="stem" x1="690" y1="196" x2="690" y2="222" stroke="#8a7748" stroke-width="4"/>
+      <rect x="676" y="206" width="28" height="30" rx="4" fill="#141824" stroke="#2c3350"/>
+      <rect x="570" y="232" width="235" height="32" rx="6" fill="#141824" stroke="#2c3350"/>
+      <rect id="gate" x="682" y="222" width="16" height="34" rx="3" fill="#d9a441"/>
+      <line x1="578" y1="248" x2="676" y2="248" stroke="#8fb8c8" stroke-width="2.5" class="flow"/>
+      <line id="flowR" x1="704" y1="248" x2="797" y2="248" stroke="#8fb8c8" stroke-width="2" class="flow" opacity="0.55"/>
+      <circle class="puff"    cx="803" cy="240" r="4"   fill="#8fb8c8" opacity="0"/>
+      <circle class="puff p2" cx="803" cy="244" r="5.5" fill="#8fb8c8" opacity="0"/>
+      <circle class="puff p3" cx="803" cy="248" r="4.5" fill="#8fb8c8" opacity="0"/>
+      <!-- labels -->
+      <text x="250" y="118" fill="#a8a496" font-size="13.5" text-anchor="end">engine races →</text>
+      <text x="250" y="136" fill="#d9a441" font-size="13.5" text-anchor="end">balls fly out &amp; rise, valve closes</text>
+      <text x="250" y="170" fill="#a8a496" font-size="13.5" text-anchor="end">engine slows →</text>
+      <text x="250" y="188" fill="#8fb8c8" font-size="13.5" text-anchor="end">balls drop, valve opens</text>
+      <text x="330" y="266" fill="#a8a496" font-size="12.5" text-anchor="end">spun by the engine's own shaft →</text>
+      <text x="578" y="284" fill="#a8a496" font-size="12" class="mono">from the boiler</text>
+      <text x="800" y="284" fill="#8fb8c8" font-size="12" text-anchor="end" class="mono">to the engine</text>
+      <text x="410" y="330" fill="#a8a496" font-size="13" text-anchor="middle">shaft speed <tspan fill="#d9a441">is</tspan> the input · the valve <tspan fill="#d9a441">is</tspan> the output · nothing in between computes</text>
+    </svg>
+    <figcaption>Watt's flyball governor: negative feedback embodied in brass. Nobody measures, nobody decides — the mechanism <em>is</em> the decision.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <p><strong>The insight that outlived the steam age:</strong> a well-shaped feedback loop replaces a coordinator. The stoker kept shoveling by simple local habit; the governor absorbed the coordination problem entirely.</p>
+    <span class="why">Eighty years later, Maxwell's paper "On Governors" turned this device into control theory. The word itself goes back further — <em>kybernetes</em>, the Greek helmsman, which also gave us "cybernetics." Feedback is old technology.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== SAME PROBLEM ============================== -->
+<section id="problem">
+  <span class="kicker">02 · The same problem, 240 years on</span>
+  <h2>An engine whose load won't sit still</h2>
+  <p>Hyperscale's shard map is elastic: shards <strong>split</strong> when state grows and <strong>merge</strong> when it recedes (<a href="library.html">the library</a>). Every split needs a fresh committee of validators; every merge releases one; shuffling, jailings, and standby reserves all draw from the same pool (<a href="kleroterion.html">the lottery</a>). So the network's demand for validators is a moving target — an engine under constantly varying load.</p>
+  <p>The throttle on validator supply is the <strong>activation stake</strong>: the minimum a stake pool must hold per validator it wants active. And a fixed throttle fails exactly the way a fixed steam valve does:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ SET TOO HIGH</span><h4>The engine stalls</h4><p>A burst of splits needs new committees <em>now</em> — but seats are priced for yesterday's smaller network, and the standby pool runs dry.</p></div>
+    <div class="card"><span class="x">✕ SET TOO LOW</span><h4>The engine races</h4><p>When nobody is needed, cheap seats invite seat-farming — a crowd of marginal validators the topology has no work for.</p></div>
+    <div class="card"><span class="x">✕ HAND-TUNED</span><h4>The lad does calculus</h4><p>Governance votes to reprice are slow, political, and always chasing a number the chain itself already knows. That's the stoker computing joules per shovel.</p></div>
+  </div>
+
+  <div class="callout">
+    <p>So Hyperscale doesn't fix the price and doesn't vote on it. <strong>Every epoch, the protocol recomputes the activation stake from the chain's own committed state</strong> — a governor, spinning on the network's own shaft.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== MECHANISM ============================== -->
+<section id="mechanism">
+  <span class="kicker">03 · The mechanism</span>
+  <h2>A price where supply meets need</h2>
+  <p>Two quantities, both read straight off the chain:</p>
+  <p><strong>Demand</strong> is what the topology needs next epoch: every shard committee at full strength, plus a standing buffer of unplaced validators — slack for shuffles, jail replacements, and the next split. Demand is computed from the <em>upcoming</em> committee schedule (<a href="census.html">the census</a>), so a split that's been decided raises demand before its children even go live. A validator jailed for misbehavior stops counting toward supply the moment it's expelled — freeing room for its own replacement.</p>
+  <p><strong>Supply</strong> is what the stake pools could staff. Here's the elegant part: every pool implicitly <em>offers</em> seats at descending prices. A pool holding stake <span class="mono" style="color:var(--brass)">S</span> can back one validator at price <span class="mono" style="color:var(--brass)">S</span>, two at <span class="mono" style="color:var(--brass)">S/2</span>, three at <span class="mono" style="color:var(--brass)">S/3</span>… Line up every offer from every pool, best first, and count down to the demand target:</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="Offers from all pools sorted descending; the offer at the demand target sets the price">
+      <line x1="60" y1="250" x2="790" y2="250" stroke="#2c3350"/>
+      <!-- descending bars: funded seats -->
+      <g>
+        <rect x="70"  y="60"  width="38" height="190" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="118" y="84"  width="38" height="166" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="166" y="104" width="38" height="146" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="214" y="122" width="38" height="128" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="262" y="136" width="38" height="114" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="310" y="150" width="38" height="100" rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="358" y="161" width="38" height="89"  rx="5" fill="#1d2438" stroke="#2c3350"/>
+        <rect x="406" y="171" width="38" height="79"  rx="5" fill="#1d2438" stroke="#2c3350"/>
+      </g>
+      <!-- the marginal (clearing) bar -->
+      <rect x="454" y="180" width="38" height="70" rx="5" fill="#2a2010" stroke="#d9a441" stroke-width="2.5"/>
+      <!-- priced-out offers -->
+      <g opacity="0.45">
+        <rect x="502" y="188" width="38" height="62" rx="5" fill="#161a28" stroke="#232840"/>
+        <rect x="550" y="196" width="38" height="54" rx="5" fill="#161a28" stroke="#232840"/>
+        <rect x="598" y="203" width="38" height="47" rx="5" fill="#161a28" stroke="#232840"/>
+        <rect x="646" y="209" width="38" height="41" rx="5" fill="#161a28" stroke="#232840"/>
+        <rect x="694" y="214" width="38" height="36" rx="5" fill="#161a28" stroke="#232840"/>
+      </g>
+      <!-- demand line -->
+      <line x1="473" y1="34" x2="473" y2="250" stroke="#8fb8c8" stroke-width="1.5" stroke-dasharray="5 5"/>
+      <text x="473" y="24" fill="#8fb8c8" font-size="12.5" text-anchor="middle" class="mono">← demand target →</text>
+      <!-- price line -->
+      <line x1="60" y1="180" x2="454" y2="180" stroke="#d9a441" stroke-dasharray="4 5" opacity="0.65"/>
+      <text x="66" y="172" fill="#d9a441" font-size="12.5" class="mono">the clearing price</text>
+      <!-- labels -->
+      <text x="260" y="277" fill="#a8a496" font-size="12.5" text-anchor="middle">offers that get funded</text>
+      <text x="618" y="277" fill="#5c5a4e" font-size="12.5" text-anchor="middle">offers priced out</text>
+      <text x="473" y="296" fill="#a8a496" font-size="12.5" text-anchor="middle">every pool's offers (stake, stake/2, stake/3…), sorted best-first</text>
+    </svg>
+    <figcaption>The activation stake is set exactly at the last offer needed to fill demand — the marginal price where supply meets the network's need.</figcaption>
+  </figure>
+
+  <p>Watch what this does at the extremes. <strong>Stake pours in while the topology sits still?</strong> The offer at the target position is a rich one — the price rises, and joining a network that doesn't need you becomes expensive. The balls fly out; the valve closes. <strong>A wave of splits raises demand, or validators get jailed?</strong> The target now reaches deep into cheaper offers — the price falls, and seats become cheap at exactly the moment the network is short-handed. The balls drop; the valve opens.</p>
+  <p>And because it's a marginal price rather than a rule that flips between states, the adjustment is <strong>continuous</strong>. No thresholds to game, no bang-bang oscillation — the same reason Watt used smoothly rising arms rather than a switch.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE STOPS ============================== -->
+<section id="stops">
+  <span class="kicker">04 · The stops</span>
+  <h2>Two things the valve must never do</h2>
+  <p>A real governor has mechanical stops — positions the linkage physically cannot reach, because reaching them would wreck the engine. This one has two:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ NEVER SLAM SHUT</span><h4>Repricing never ejects</h4><p>The price is capped at the tightest pool's per-validator budget. However abundant supply gets, the throttle stops <em>just before</em> the point that would force a sitting validator out. Only actually withdrawing stake can do that — a rising market never unseats anyone.</p></div>
+    <div class="card"><span class="ok">◦ NEVER SWING WIDE OPEN</span><h4>A seat is never free</h4><p>However short-handed the network is, the price never falls below a hard floor. Influence over consensus must always cost real stake — the floor is what keeps "cheap when needed" from ever becoming "free for an attacker."</p></div>
+  </div>
+
+  <p>Between the stops, the full lifecycle is automatic. A pool whose stake is withdrawn may find it can no longer back all its validators — the surplus are parked, off-committee, harmless. The moment capacity reappears (stake arrives, the price eases, a slot frees), they're <strong>reactivated automatically</strong>, cheapest-recovery first, with the price recomputed after every step until the system settles. No application, no vote, no operator in the loop.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE LOOP ============================== -->
+<section id="loop">
+  <span class="kicker">05 · The loop</span>
+  <h2>Closed loop, no operator</h2>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 330" role="img" aria-label="The feedback loop: topology to demand to price to pool and back">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#d9a441"/>
+        </marker>
+      </defs>
+      <!-- nodes -->
+      <rect x="330" y="24"  width="160" height="46" rx="23" fill="#151827" stroke="#232840"/>
+      <text x="410" y="47"  fill="#ece8dd" font-size="14" font-weight="600" text-anchor="middle">TOPOLOGY</text>
+      <text x="410" y="63"  fill="#a8a496" font-size="11.5" text-anchor="middle">shards split &amp; merge</text>
+
+      <rect x="610" y="140" width="170" height="46" rx="23" fill="#151827" stroke="#232840"/>
+      <text x="695" y="163" fill="#ece8dd" font-size="14" font-weight="600" text-anchor="middle">DEMAND</text>
+      <text x="695" y="179" fill="#a8a496" font-size="11.5" text-anchor="middle">committees + buffer</text>
+
+      <rect x="330" y="258" width="160" height="46" rx="23" fill="#2a2010" stroke="#d9a441" stroke-width="1.5"/>
+      <text x="410" y="281" fill="#f2c26b" font-size="14" font-weight="700" text-anchor="middle">THE PRICE</text>
+      <text x="410" y="297" fill="#a8a496" font-size="11.5" text-anchor="middle">recomputed every epoch</text>
+
+      <rect x="40"  y="140" width="170" height="46" rx="23" fill="#151827" stroke="#232840"/>
+      <text x="125" y="163" fill="#ece8dd" font-size="14" font-weight="600" text-anchor="middle">THE POOL</text>
+      <text x="125" y="179" fill="#a8a496" font-size="11.5" text-anchor="middle">validators activate &amp; return</text>
+
+      <!-- arrows clockwise -->
+      <path d="M 500 62 C 600 80, 660 100, 690 134" fill="none" stroke="#d9a441" stroke-width="2" marker-end="url(#arr)" class="flow"/>
+      <path d="M 680 192 C 640 236, 560 262, 498 274" fill="none" stroke="#d9a441" stroke-width="2" marker-end="url(#arr)" class="flow"/>
+      <path d="M 322 274 C 240 262, 170 236, 132 192" fill="none" stroke="#d9a441" stroke-width="2" marker-end="url(#arr)" class="flow"/>
+      <path d="M 140 134 C 180 96, 240 74, 322 58" fill="none" stroke="#d9a441" stroke-width="2" marker-end="url(#arr)" class="flow"/>
+
+      <text x="648" y="70"  fill="#a8a496" font-size="12">splits raise it,</text>
+      <text x="648" y="86"  fill="#a8a496" font-size="12">merges lower it</text>
+      <text x="610" y="248" fill="#a8a496" font-size="12">scarcity opens the valve,</text>
+      <text x="610" y="264" fill="#a8a496" font-size="12">abundance closes it</text>
+      <text x="150" y="248" fill="#a8a496" font-size="12" text-anchor="end">cheap seats refill the pool</text>
+      <text x="100" y="70"  fill="#a8a496" font-size="12">a deep pool lets</text>
+      <text x="100" y="86"  fill="#a8a496" font-size="12">the map keep growing</text>
+    </svg>
+    <figcaption>Topology sets demand; demand and pooled stake set the price; the price gates activation; activation replenishes the pool the topology draws on.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <p><strong>One thing Watt never had to worry about: trusting the brass.</strong> His governor worked because physics is impartial. A decentralized network can't bolt one governor to one machine and trust whoever owns it — so Hyperscale makes the governor <em>a pure function of the chain's committed state</em>.</p>
+    <span class="why">Every node runs the same calculation on the same on-chain facts and gets the identical price — no oracle, no operator, no privileged party. Anyone can replay the chain and audit every price the network has ever set. It's a governor with no moving parts, replicated on every machine, and impossible to lean a thumb on.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE STOKER ============================== -->
+<section id="stoker">
+  <span class="kicker">06 · The stoker, today</span>
+  <h2>Operators shovel; the governor coordinates</h2>
+  <p>The point of the governor was never to replace the stoker — it was to let him work by <strong>simple local rules</strong> while the mechanism handled the coordination. Same here. A validator operator never needs to model the topology, forecast splits, or petition governance. They watch one number — the current activation price — and act locally: worth it, join; not worth it, wait. The price already contains everything the chain knows about what the network needs.</p>
+  <p>And the system is deliberately shaped so that <strong>stake is the only thing the governor needs to meter</strong>. One machine can host many validator identities — <em>vnodes</em> — sharing storage, execution, and networking; two seats on the same shard share one copy of the state and one execution of each transaction. Hardware costs are amortized until the marginal cost of a seat is, to first order, its stake. That's by design: stake is the quantity the security model prices, so the governor throttles stake — and nothing else gets to be the bottleneck.</p>
+
+  <div class="callout">
+    <p><strong>The 1788 lesson, restated for 2026:</strong> when a system's parts can't see the whole, don't appoint someone to compute the whole. Shape a feedback loop that makes the whole compute itself.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the pricing rule, its two guardrails, every lifecycle transition it gates, and the invariants it maintains — alongside the rest of the system this economy exists to staff.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/06-resource-economics.md">docs/06 — resource economics</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c5a4e">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var ids = ["armL","armR","ballL","ballR","linkL","linkR","sleeve","groove","orbit","lever","stem","gate","flowR"];
+  var el = {};
+  for (var i = 0; i < ids.length; i++) {
+    el[ids[i]] = document.getElementById(ids[i]);
+    if (!el[ids[i]]) return;
+  }
+  var TX = 390, TY = 78;   // top hinge of the arms
+  var ARM = 110;           // hinge → ball
+  var ATT = 66;            // hinge → link attachment, along the arm
+  var LINK = 68;           // link rod length
+  var PIN = 12;            // sleeve pin half-spacing
+  var FX = 600, FY = 196;  // lever fulcrum
+  var EX = 690;            // valve stem x
+  var RATIO = (EX - FX) / (FX - (TX + PIN));
+
+  function set(e, attrs) { for (var k in attrs) e.setAttribute(k, attrs[k]); }
+
+  // One arm angle determines the whole machine: balls, link rods,
+  // sleeve height (solved from the rod length), lever tilt, gate travel.
+  function pose(theta) {
+    var s = Math.sin(theta), c = Math.cos(theta);
+    var bx = ARM * s, by = TY + ARM * c;
+    var px = ATT * s, py = TY + ATT * c;
+    var dx = px - PIN;
+    var ys = py + Math.sqrt(LINK * LINK - dx * dx);
+    var ye = FY - (ys - FY) * RATIO;
+    var gateTop = ye + 26;
+    set(el.armL, { x2: TX - bx, y2: by });
+    set(el.armR, { x2: TX + bx, y2: by });
+    set(el.ballL, { cx: TX - bx, cy: by });
+    set(el.ballR, { cx: TX + bx, cy: by });
+    set(el.linkL, { x1: TX - px, y1: py, x2: TX - PIN, y2: ys });
+    set(el.linkR, { x1: TX + px, y1: py, x2: TX + PIN, y2: ys });
+    set(el.sleeve, { y: ys - 8 });
+    set(el.groove, { y: ys + 12 });
+    set(el.orbit, { cy: by, rx: bx, ry: Math.max(7, bx * 0.21) });
+    set(el.lever, { x1: TX + PIN + 4, y1: ys, x2: EX, y2: ye });
+    set(el.stem, { x1: EX, y1: ye, x2: EX, y2: gateTop });
+    set(el.gate, { y: gateTop });
+    var open = Math.max(0.05, Math.min(1, (226 - gateTop) / 8));
+    set(el.flowR, { opacity: 0.12 + 0.75 * open, "stroke-width": 1 + 1.6 * open });
+  }
+
+  var MID = 34 * Math.PI / 180, AMP = 10 * Math.PI / 180, PERIOD = 4500;
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduce) { pose(MID); return; }
+  var start;
+  function frame(t) {
+    if (start === undefined) start = t;
+    pose(MID + AMP * Math.sin((t - start) / PERIOD * 2 * Math.PI));
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — nobody is in charge of who's in charge</title>
+<style>
+  :root {
+    --bg: #0d0a0e;
+    --bg2: #131017;
+    --card: #181420;
+    --card-edge: #2a2238;
+    --ink: #ede9f0;
+    --ink-dim: #a89fb2;
+    --plum: #c890e0;
+    --gold: #d9b06a;
+    --green: #5fd39a;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #d8a8e8, #9a5fc8);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #170f1c 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--plum); text-decoration: none; border-bottom: 1px solid #35284a; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--plum); border: 1px solid #35284a; background: #120e18;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--plum); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html" aria-current="page">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · THE BEACON CHAIN</span>
+  <h1>Nobody is in charge of <em>who's in charge</em>.</h1>
+  <p class="lede">Every committee in Hyperscale is appointed by a schedule, and the schedule comes from one deliberately slow chain: the <strong>beacon</strong>. Whoever ran that chain would run everything — so nobody does. This is the chain that never sees a transaction, counts everything, and governs by formula. Less a government, more a <strong>census</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE PARADOX ============================== -->
+<section id="paradox">
+  <span class="kicker">01 · The paradox</span>
+  <h2>Who schedules the schedulers?</h2>
+  <p>Pull on any thread in this system and it ends at the same place. Which committee's signatures make a shard's block valid? The one <a href="clock.html">the schedule</a> names for that moment. Who staffs the committees? <a href="kleroterion.html">The lottery</a> — seeded from randomness the beacon accumulates. Who redraws the shard map, prices a validator seat, records a dying shard's <a href="testament.html">will</a>? The beacon, the beacon, the beacon. It is the root of authority for the entire system — which makes it the single most dangerous place to put an authority. A leader here wouldn't be one bribable proposer among thousands; it would be the apex of the whole pyramid, the one office worth capturing.</p>
+  <p>So the beacon is built to be constitutionally uninteresting to attack:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ NO AUTHOR</span><h4>Leaderless by design</h4><p>No one composes the beacon's blocks. Each epoch's record is the <em>overlap</em> of what the whole committee independently reports — there is no author's version to bribe, censor, or crash.</p></div>
+    <div class="card"><span class="ok">◦ SLOW ON PURPOSE</span><h4>One block per epoch</h4><p>Shard chains race; the beacon ticks. It is paced to the wall clock and refuses to run early — a coordination chain that outran the things it coordinates would be defining time windows for a future that hasn't happened.</p></div>
+    <div class="card"><span class="ok">◦ BLIND TO MONEY</span><h4>Never sees a transaction</h4><p>Not one payment, contract call, or balance ever touches it. There is nothing to front-run, nothing to extract, no fee to skim. It keeps the register; it never touches the till.</p></div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1920 ============================== -->
+<section id="census1920">
+  <span class="kicker">02 · 1920</span>
+  <h2>The count that Congress refused</h2>
+  <p>The United States constitution orders a census every ten years, and orders the House of Representatives reapportioned to match it. For 130 years the machine turned: count, then redistribute the seats. Then came the 1920 census — the first to show America's population had shifted from farms to cities — and the sitting Congress, packed with the rural seats that stood to vanish, did something without precedent: <strong>nothing</strong>. Year after year, reapportionment bills died. An entire decade ran on a count everyone could read and nobody would act on. It remains the only census in American history never used.</p>
+  <p>The fix, in 1929, was not electing better congressmen. It was <strong>removing the vote entirely</strong>: from then on, the seats would be <em>computed</em> from the returns, by a fixed published method, no act of Congress required. The deciders were interested parties, so the decision was deleted — replaced by a formula anyone could run and no one could stall.</p>
+
+  <div class="callout">
+    <p><strong>That is the beacon's founding insight:</strong> the validators are interested parties in the validator registry. So nothing about it is discretionary — no votes on outcomes, no announcements to trust. Sworn returns go up; a formula runs; the apportionment falls out.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE NOTEBOOKS ============================== -->
+<section id="notebooks">
+  <span class="kicker">03 · The record</span>
+  <h2>A block with no author</h2>
+  <p>On a shard, a block has an author: the proposer of the round assembles it and others check it — safe there, because proposers rotate under <a href="clock.html">the schedule</a> and <a href="overlap.html">the overlap</a> keeps any one of them harmless. The beacon can't afford even that much: an author who assembles the record that appoints everyone is an author who can leave things out of it. So each epoch, the beacon's committee — itself freshly drawn by <a href="kleroterion.html">lottery</a> — agrees differently: <strong>every member publishes its notebook</strong>, the reports and proposals it has seen, <strong>and the epoch's block is the part all the notebooks share</strong>.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 330" role="img" aria-label="Four committee members' notebooks with a shared prefix of entries; the epoch's block is exactly the shared part.">
+      <!-- shared band -->
+      <rect x="60" y="68" width="160" height="108" rx="8" fill="#5fd39a" opacity="0.07"/>
+      <rect x="242" y="68" width="160" height="108" rx="8" fill="#5fd39a" opacity="0.07"/>
+      <rect x="424" y="68" width="160" height="108" rx="8" fill="#5fd39a" opacity="0.07"/>
+      <rect x="606" y="68" width="160" height="108" rx="8" fill="#5fd39a" opacity="0.07"/>
+      <!-- notebooks -->
+      <g class="mono" font-size="11">
+        <rect x="60" y="34" width="160" height="216" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="140" y="56" fill="#ede9f0" font-size="11.5" text-anchor="middle" font-weight="600">MEMBER 1</text>
+        <text x="76" y="86"  fill="#a89fb2">shard 00 boundary</text>
+        <text x="76" y="112" fill="#a89fb2">shard 01 boundary</text>
+        <text x="76" y="138" fill="#a89fb2">shard 10 boundary</text>
+        <text x="76" y="164" fill="#a89fb2">validator 81 registers</text>
+        <text x="76" y="196" fill="#5c5470">stake move #12</text>
+
+        <rect x="242" y="34" width="160" height="216" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="322" y="56" fill="#ede9f0" font-size="11.5" text-anchor="middle" font-weight="600">MEMBER 2</text>
+        <text x="258" y="86"  fill="#a89fb2">shard 00 boundary</text>
+        <text x="258" y="112" fill="#a89fb2">shard 01 boundary</text>
+        <text x="258" y="138" fill="#a89fb2">shard 10 boundary</text>
+        <text x="258" y="164" fill="#a89fb2">validator 81 registers</text>
+
+        <rect x="424" y="34" width="160" height="216" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="504" y="56" fill="#ede9f0" font-size="11.5" text-anchor="middle" font-weight="600">MEMBER 3</text>
+        <text x="440" y="86"  fill="#a89fb2">shard 00 boundary</text>
+        <text x="440" y="112" fill="#a89fb2">shard 01 boundary</text>
+        <text x="440" y="138" fill="#a89fb2">shard 10 boundary</text>
+        <text x="440" y="164" fill="#a89fb2">validator 81 registers</text>
+        <text x="440" y="196" fill="#5c5470">stake move #12</text>
+
+        <rect x="606" y="34" width="160" height="216" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="686" y="56" fill="#ede9f0" font-size="11.5" text-anchor="middle" font-weight="600">MEMBER 4</text>
+        <text x="622" y="86"  fill="#a89fb2">shard 00 boundary</text>
+        <text x="622" y="112" fill="#a89fb2">shard 01 boundary</text>
+        <text x="622" y="138" fill="#a89fb2">shard 10 boundary</text>
+        <text x="622" y="164" fill="#a89fb2">validator 81 registers</text>
+        <text x="622" y="196" fill="#5c5470">reshape trigger: 10</text>
+      </g>
+      <text x="785" y="120" fill="#5fd39a" font-size="11.5" text-anchor="end" transform="rotate(90 785 120)" class="mono">SHARED</text>
+      <!-- block -->
+      <path d="M 410 250 L 410 276" stroke="#9a5fc8" stroke-width="2" class="flow"/>
+      <rect x="230" y="276" width="360" height="42" rx="10" fill="#1c1226" stroke="#c890e0" stroke-width="1.5" class="pulse"/>
+      <text x="410" y="294" fill="#ede9f0" font-size="12.5" text-anchor="middle" font-weight="600">THE EPOCH'S BLOCK</text>
+      <text x="410" y="310" fill="#a89fb2" font-size="11" text-anchor="middle">exactly what every notebook shares — nothing more</text>
+      <!-- annotation -->
+      <text x="668" y="276" fill="#a89fb2" font-size="11">seen by too few →</text>
+      <text x="668" y="292" fill="#a89fb2" font-size="11">waits for next epoch</text>
+    </svg>
+    <figcaption>Agreement by intersection: disagreement doesn't fork the record, it shortens it. An entry that missed this epoch simply rides the next one.</figcaption>
+  </figure>
+
+  <p>Notice what this shape buys. There is <strong>no one to bribe</strong> — no block-maker whose version wins. There is <strong>no one to censor with</strong> — suppressing an entry requires keeping it out of a whole quorum's notebooks, not one author's. And there is <strong>no one to lose</strong>: members take turns nudging the process forward, but a stalled turn is simply skipped by the rest, and even a wholly failed committee draw can be abandoned by the wider validator pool — nobody's participation is load-bearing. Divergence, the thing that breaks leader-based protocols, here just makes the epoch's record a little shorter and the next epoch's a little longer.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE LIFTING ============================== -->
+<section id="lifting">
+  <span class="kicker">04 · The lifting</span>
+  <h2>Returns rise, already sworn</h2>
+  <p>What fills those notebooks? Once per epoch, each shard submits its census return — and the elegance is that <strong>the return requires no new trust</strong>. It is simply the shard's boundary block header: the block whose attested timestamp crosses the epoch line, already quorum-signed by that shard's own committee. The beacon doesn't take the shard's word for anything; it takes the shard's <em>chain</em>.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 400" role="img" aria-label="The vertical loop: sworn shard headers rise to the beacon, the fold computes state, and schedules are derived back down on every node.">
+      <!-- beacon band -->
+      <rect x="140" y="24" width="540" height="62" rx="12" fill="#1c1226" stroke="#c890e0" stroke-width="1.5"/>
+      <text x="410" y="50" fill="#ede9f0" font-size="14" font-weight="700" text-anchor="middle">THE BEACON</text>
+      <text x="410" y="70" fill="#a89fb2" font-size="11.5" text-anchor="middle">one block per epoch · no author · no transactions</text>
+      <!-- fold -->
+      <rect x="330" y="160" width="160" height="66" rx="12" fill="#131017" stroke="#d9b06a" stroke-width="1.5"/>
+      <text x="410" y="187" fill="#d9b06a" font-size="13.5" font-weight="700" text-anchor="middle">THE FOLD ƒ</text>
+      <text x="410" y="206" fill="#a89fb2" font-size="11" text-anchor="middle">a formula everyone runs</text>
+      <path d="M 410 86 L 410 160" stroke="#d9b06a" stroke-width="2" class="flow"/>
+      <!-- shards -->
+      <g>
+        <rect x="70"  y="322" width="150" height="54" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="145" y="345" fill="#a89fb2" font-size="12" text-anchor="middle" class="mono">SHARD 00</text>
+        <text x="145" y="363" fill="#5c5470" font-size="10.5" text-anchor="middle">fast chain</text>
+        <rect x="250" y="322" width="150" height="54" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="325" y="345" fill="#a89fb2" font-size="12" text-anchor="middle" class="mono">SHARD 01</text>
+        <text x="325" y="363" fill="#5c5470" font-size="10.5" text-anchor="middle">fast chain</text>
+        <rect x="430" y="322" width="150" height="54" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="505" y="345" fill="#a89fb2" font-size="12" text-anchor="middle" class="mono">SHARD 10</text>
+        <text x="505" y="363" fill="#5c5470" font-size="10.5" text-anchor="middle">fast chain</text>
+        <rect x="610" y="322" width="150" height="54" rx="10" fill="#181420" stroke="#2a2238"/>
+        <text x="685" y="345" fill="#a89fb2" font-size="12" text-anchor="middle" class="mono">SHARD 11</text>
+        <text x="685" y="363" fill="#5c5470" font-size="10.5" text-anchor="middle">fast chain</text>
+      </g>
+      <!-- lifting arrows (left) -->
+      <path d="M 190 322 C 200 240, 200 130, 245 80" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <path d="M 325 322 C 300 250, 280 160, 250 100" fill="none" stroke="#5fd39a" stroke-width="2" class="flow" opacity="0.55"/>
+      <text x="60" y="170" fill="#5fd39a" font-size="12.5" font-weight="700">LIFTING ↑</text>
+      <text x="60" y="192" fill="#a89fb2" font-size="11.5">boundary headers,</text>
+      <text x="60" y="208" fill="#a89fb2" font-size="11.5">already quorum-signed</text>
+      <text x="60" y="230" fill="#a89fb2" font-size="11.5">witness chunks,</text>
+      <text x="60" y="246" fill="#a89fb2" font-size="11.5">merkle-proven,</text>
+      <text x="60" y="262" fill="#a89fb2" font-size="11.5">applied exactly once</text>
+      <!-- lowering arrows (right) -->
+      <path d="M 490 200 C 525 265, 570 305, 675 322" fill="none" stroke="#c890e0" stroke-width="2" class="flow"/>
+      <path d="M 490 212 C 505 265, 500 295, 505 322" fill="none" stroke="#c890e0" stroke-width="2" class="flow" opacity="0.55"/>
+      <text x="758" y="170" fill="#c890e0" font-size="12.5" font-weight="700" text-anchor="end">↓ LOWERING</text>
+      <text x="758" y="192" fill="#a89fb2" font-size="11.5" text-anchor="end">next epoch's committees,</text>
+      <text x="758" y="208" fill="#a89fb2" font-size="11.5" text-anchor="end">sync anchors, reshape duties,</text>
+      <text x="758" y="224" fill="#a89fb2" font-size="11.5" text-anchor="end">the seat price, the shared dice</text>
+      <text x="758" y="246" fill="#d9b06a" font-size="11.5" text-anchor="end">derived locally —</text>
+      <text x="758" y="262" fill="#d9b06a" font-size="11.5" text-anchor="end">nothing is broadcast to be believed</text>
+    </svg>
+    <figcaption>The vertical loop: sworn returns rise on the left, the formula folds them, and every node derives the schedule for itself on the right.</figcaption>
+  </figure>
+
+  <p>Riding inside each return is the shard's <strong>witness log</strong> — the governance record <a href="kleroterion.html">the lottery's audit</a> made uncensorable: validator registrations, stake movements, readiness declarations, missed proposals, reshape triggers, every entry merkle-proven against the header's attested fingerprint, delivered in unbroken sequence, and applied exactly once against a per-shard watermark. For a terminating shard, the return also carries its terminal record and the fingerprint of its <a href="testament.html">will</a>. And this is the load-bearing sentence: <strong>this proof-carrying channel is the <em>only</em> path by which anything that happens on any shard can ever affect who validates anything.</strong> A shard cannot flatter its own record, because the report is not <em>about</em> the record — the report <em>is</em> the record.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE FORMULA ============================== -->
+<section id="formula">
+  <span class="kicker">05 · The formula</span>
+  <h2>Nobody announces the result</h2>
+  <p>Here is the strangest fact about the beacon, and the most 1929 of all: <strong>its state is not on the chain</strong>. The validator registry, the stake pools, the pending reshapes, the shared randomness — none of it is stored in a block, none of it is voted on, none of it is announced. The blocks carry only the <em>returns</em>. The state is what you get by folding a fixed, published, pure function over those blocks, epoch by epoch, from the beginning: <span class="mono" style="color:var(--gold); font-size:15px">state = ƒ(ƒ(ƒ(genesis, epoch₁), epoch₂), …)</span>. Every machine that runs the formula over the same public blocks holds the byte-identical result.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 250" role="img" aria-label="A sequence of beacon blocks folded through the same formula on three machines, producing identical registries.">
+      <!-- blocks -->
+      <g class="mono" font-size="11">
+        <rect x="40"  y="100" width="64" height="40" rx="8" fill="#181420" stroke="#2a2238"/>
+        <text x="72"  y="124" fill="#a89fb2" text-anchor="middle">e₄₁</text>
+        <rect x="116" y="100" width="64" height="40" rx="8" fill="#181420" stroke="#2a2238"/>
+        <text x="148" y="124" fill="#a89fb2" text-anchor="middle">e₄₂</text>
+        <rect x="192" y="100" width="64" height="40" rx="8" fill="#181420" stroke="#2a2238"/>
+        <text x="224" y="124" fill="#a89fb2" text-anchor="middle">e₄₃</text>
+        <rect x="268" y="100" width="64" height="40" rx="8" fill="#181420" stroke="#2a2238"/>
+        <text x="300" y="124" fill="#a89fb2" text-anchor="middle">e₄₄</text>
+      </g>
+      <text x="352" y="126" fill="#5c5470" font-size="13">…</text>
+      <path d="M 372 120 L 430 120" stroke="#d9b06a" stroke-width="2" class="flow"/>
+      <circle cx="455" cy="120" r="24" fill="#131017" stroke="#d9b06a" stroke-width="2"/>
+      <text x="455" y="126" fill="#d9b06a" font-size="15" text-anchor="middle" class="mono">ƒ</text>
+      <!-- fan out -->
+      <path d="M 480 110 C 530 80, 560 66, 600 56" fill="none" stroke="#2a2238" stroke-width="1.5"/>
+      <path d="M 482 120 L 600 120" stroke="#2a2238" stroke-width="1.5"/>
+      <path d="M 480 130 C 530 160, 560 174, 600 184" fill="none" stroke="#2a2238" stroke-width="1.5"/>
+      <g class="mono" font-size="11">
+        <rect x="600" y="34"  width="186" height="44" rx="9" fill="#181420" stroke="#2a2238"/>
+        <text x="614" y="53" fill="#a89fb2">a validator in Lagos</text>
+        <text x="614" y="69" fill="#5fd39a">registry = 0x8c41…</text>
+        <rect x="600" y="98" width="186" height="44" rx="9" fill="#181420" stroke="#2a2238"/>
+        <text x="614" y="117" fill="#a89fb2">a validator in Osaka</text>
+        <text x="614" y="133" fill="#5fd39a">registry = 0x8c41…</text>
+        <rect x="600" y="162" width="186" height="44" rx="9" fill="#181420" stroke="#2a2238"/>
+        <text x="614" y="181" fill="#a89fb2">an auditor's laptop</text>
+        <text x="614" y="197" fill="#5fd39a">registry = 0x8c41…</text>
+      </g>
+      <text x="410" y="236" fill="#a89fb2" font-size="12.5" text-anchor="middle">same public blocks, same formula, byte-identical state — auditing is just replaying</text>
+    </svg>
+    <figcaption>The registry is never announced because it never needs to be: anyone can compute it, and everyone computes the same thing.</figcaption>
+  </figure>
+
+  <p>The fold's bookkeeping has the discipline of a well-run count: each epoch opens by putting last epoch's frozen appointments into effect and closes by freezing the next epoch's — the advance posting <a href="clock.html">the clock</a> depends on. In between, it applies the returns: boundaries recorded, witness chunks consumed, the randomness re-mixed from verifiable contributions, validator lifecycles advanced, <a href="governor.html">the seat price</a> recomputed, reshape triggers admitted and executed. Every step deterministic; every step replayable; nothing to take on faith and no one to take it from.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE LOWERING ============================== -->
+<section id="lowering">
+  <span class="kicker">06 · The lowering</span>
+  <h2>The apportionment falls out</h2>
+  <p>And what comes back down? Everything the rest of the system relies on — derived from the folded state, fresh each epoch: the <strong>schedule</strong> naming every shard's committee for the coming windows (<a href="clock.html">the clock</a>); the <strong>anchors</strong> that let a newcomer or a reshape observer sync a shard's state against a fingerprint its own fold vouches for (<a href="library.html">the library</a>); the <strong>duty assignments</strong> for splits and merges; the <strong>activation price</strong> for a validator seat (<a href="governor.html">the governor</a>); and the <strong>shared dice</strong> that make every committee draw unpredictable (<a href="kleroterion.html">the lottery</a>).</p>
+  <p>But "comes down" is a manner of speaking, and the distinction is the whole point: <strong>nothing is sent</strong>. There is no schedule broadcast to receive, no announcement to verify, no messenger to intercept. Each node folds the beacon's public blocks for itself and <em>derives</em> who is in charge — the same answer, everywhere, from the same returns. The beacon never tells anyone anything. It puts every machine in a position to work it out alone, and guarantees they all work out the same thing.</p>
+
+  <div class="callout">
+    <p><strong>The 1929 lesson, restated for chains:</strong> when the deciders are interested parties, don't search for impartial deciders — delete the decision. Sworn returns rise; a public formula runs; the apportionment falls out.</p>
+    <span class="why">Authority that must not be capturable is made <em>derivable</em>: no author, no announcement, no apex — only records and arithmetic.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FINE PRINT ============================== -->
+<section id="fineprint">
+  <span class="kicker">07 · The fine print</span>
+  <h2>What keeps the count honest</h2>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ ONE RETURN PER SHARD</span><h4>No double filing</h4><p>If competing boundary headers surface for a shard's epoch, the fold picks one canonically — by a fixed rule over attested content — so every replica records the same return. A shard files once, whatever its members gossip.</p></div>
+    <div class="card"><span class="ok">◦ EXACTLY ONCE</span><h4>Watermarked ledgers</h4><p>Witness chunks apply against a per-shard watermark: no gap, no repeat, no replay. A registration or a jailing counts once — not zero times, not twice.</p></div>
+    <div class="card"><span class="ok">◦ NEVER EARLY</span><h4>Paced to the wall clock</h4><p>The beacon refuses to start an epoch before its scheduled moment. The chain that defines everyone else's time windows is not permitted to arrive from the future.</p></div>
+  </div>
+
+  <p>None of this rests on being persuasive: whole networks — beacon, shards, reshapes, partitions — replay from seeds in <a href="crashlab.html">the crash lab</a>, with the fold's determinism doing double duty as both the audit trail and the test harness.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the beacon's agreement protocol, the fold and its bookend ordering, both channels' proof obligations, and the invariants that bind them.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/01-consensus-layers.md">docs/01 — the consensus layers · beacon consensus</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/02-dynamic-sharding.md">docs/02 — dynamic sharding</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#6b5f75">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — published means preserved</title>
+<style>
+  :root {
+    --bg: #0a0c12;
+    --bg2: #0f1320;
+    --card: #131a2c;
+    --card-edge: #22304e;
+    --ink: #e9ecf4;
+    --ink-dim: #9fa9c0;
+    --navy: #7f9fe0;
+    --gold: #d9b06a;
+    --green: #5fd39a;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #93b2ec, #4a68b8);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #0e1424 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a, .callout .why a { color: var(--navy); text-decoration: none; border-bottom: 1px solid #26365a; }
+  p a:hover, li a:hover, .callout .why a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--navy); border: 1px solid #26365a; background: #0d1220;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--navy); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html" aria-current="page">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · DATA AVAILABILITY</span>
+  <h1>Published means <em>preserved</em>.</h1>
+  <p class="lede">In 1610, an Oxford librarian struck a deal that quietly changed what "publishing" means: a copy of every new book must be lodged in his library — an obligation attached at the moment of publication, not a favor asked afterward. Hyperscale treats a blockchain's data the same way: <strong>nothing becomes history until enough machines provably hold every byte of it</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1610 ============================== -->
+<section id="bodley">
+  <span class="kicker">01 · 1610</span>
+  <h2>Sir Thomas Bodley's deal</h2>
+  <p>Thomas Bodley, rebuilding Oxford's ruined university library, understood something ahead of his time: a civilization's memory cannot depend on publishers' goodwill or collectors' luck. In 1610 he persuaded the Stationers' Company — the guild that controlled English printing — to lodge a copy of every book they registered with his library, <em>as a standing condition of the trade itself</em>. Parliament made the principle law in 1662, and "legal deposit" spread across the world; today six libraries in Britain and Ireland alone are entitled to a copy of everything published.</p>
+  <p>The genius is in the timing. Preservation isn't something that happens to a book later, if someone remembers, if the publisher cooperates, if a librarian notices a gap. <strong>The copy exists because the book does.</strong> Publication and deposit are one act — so nobody ever has to discover a loss and go begging for a reprint from a publisher who may be bankrupt, hostile, or gone.</p>
+
+  <div class="callout">
+    <p><strong>The principle that outlived the printing press:</strong> attach the obligation to preserve at the moment of publication — never rely on detecting a loss and repairing it after the fact.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== SAME PROBLEM ============================== -->
+<section id="problem">
+  <span class="kicker">02 · The same problem, 400 years on</span>
+  <h2>A ledger whose evidence is scattered</h2>
+  <p>A sharded blockchain scatters its records by design. Shard Q's correctness routinely depends on data <em>published by shard P</em>: the transactions it must run, the provisions proving P's state (<a href="generals.html">the generals</a>), the certificates sealing P's results. And the delivery layer is gossip over a real network — lossy, reordered, unfair. The deadly subtlety is that <strong>absence is invisible</strong>: a node that never received something usually doesn't know there was a something. "I never got it" and "it never existed" look identical from the inside. The naive postures all fail:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ HOPE THE GOSSIP WORKED</span><h4>You can't fetch what you can't name</h4><p>Best-effort broadcast delivers almost everything, almost always — and the missing fraction is precisely the data nobody knows to ask for.</p></div>
+    <div class="card"><span class="x">✕ KEEP EVERYTHING FOREVER</span><h4>Not an architecture</h4><p>"Never delete" turns every disk into a countdown clock, and still doesn't say <em>who</em> must serve <em>what</em> to <em>whom</em> — hoarding is not availability.</p></div>
+    <div class="card"><span class="x">✕ ASK THE PUBLISHER NICELY</span><h4>One node is not a guarantee</h4><p>The machine that sent the data may have restarted, rotated off the committee, or be lying. A polite request to a single peer is hope with an address.</p></div>
+  </div>
+
+  <p>Hyperscale's answer runs on one design principle, applied everywhere: <strong>the artifact you need is either held by someone obligated to serve it, or provably expired.</strong> There is no third state — no shrug, no "ask around." That principle runs on three mechanisms: deposit, obligations, and provable forgetting.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DEPOSIT ============================== -->
+<section id="deposit">
+  <span class="kicker">03 · Deposit at publication</span>
+  <h2>Every certificate is a deposit receipt</h2>
+  <p>The masterstroke is hidden inside consensus itself. A validator votes for a block only while holding <strong>the complete block</strong> — the header and every transaction, wave, and provision body it references. Not a summary, not a hash list: every byte. Which means a quorum certificate does double duty (<a href="overlap.html">the overlap</a> covers its first job): the moment 2f+1 signatures assemble, it is <em>proven</em> that 2f+1 machines each hold a full copy of everything the block carries — recoverable from any one of them.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 280" role="img" aria-label="A block's full contents held by each voter, whose votes aggregate into a certificate that doubles as a deposit receipt.">
+      <!-- block -->
+      <rect x="40" y="70" width="180" height="140" rx="12" fill="#131a2c" stroke="#22304e"/>
+      <text x="130" y="98" fill="#e9ecf4" font-size="13.5" font-weight="700" text-anchor="middle">THE BLOCK</text>
+      <g font-size="11.5" fill="#9fa9c0" class="mono">
+        <text x="130" y="124" text-anchor="middle">header</text>
+        <text x="130" y="144" text-anchor="middle">every transaction</text>
+        <text x="130" y="164" text-anchor="middle">every wave</text>
+        <text x="130" y="184" text-anchor="middle">every provision body</text>
+      </g>
+      <!-- voters -->
+      <g>
+        <rect x="310" y="42" width="190" height="42" rx="9" fill="#0f1320" stroke="#22304e"/>
+        <text x="330" y="68" fill="#5fd39a" font-size="12" class="mono">✓ holds every byte</text>
+        <rect x="310" y="96" width="190" height="42" rx="9" fill="#0f1320" stroke="#22304e"/>
+        <text x="330" y="122" fill="#5fd39a" font-size="12" class="mono">✓ holds every byte</text>
+        <rect x="310" y="150" width="190" height="42" rx="9" fill="#0f1320" stroke="#22304e"/>
+        <text x="330" y="176" fill="#5fd39a" font-size="12" class="mono">✓ holds every byte</text>
+        <rect x="310" y="204" width="190" height="42" rx="9" fill="#0f1320" stroke="#22304e" stroke-dasharray="4 4"/>
+        <text x="330" y="230" fill="#9fa9c0" font-size="12" class="mono">… 2f+1 of them</text>
+      </g>
+      <path d="M 220 140 L 310 140" stroke="#4a68b8" stroke-width="2" class="flow"/>
+      <text x="265" y="126" fill="#9fa9c0" font-size="11" text-anchor="middle">vote only</text>
+      <text x="265" y="157" fill="#9fa9c0" font-size="11" text-anchor="middle">if held</text>
+      <!-- certificate -->
+      <path d="M 500 140 L 580 140" stroke="#4a68b8" stroke-width="2" class="flow"/>
+      <rect x="580" y="100" width="200" height="80" rx="12" fill="#101a30" stroke="#93b2ec" stroke-width="1.5" class="pulse"/>
+      <text x="680" y="130" fill="#e9ecf4" font-size="13.5" font-weight="700" text-anchor="middle">THE CERTIFICATE</text>
+      <text x="680" y="150" fill="#9fa9c0" font-size="11.5" text-anchor="middle">consensus on order — and</text>
+      <text x="680" y="166" fill="#d9b06a" font-size="11.5" text-anchor="middle">a receipt for 2f+1 full copies</text>
+      <text x="410" y="270" fill="#9fa9c0" font-size="12.5" text-anchor="middle">nothing can become chain history whose contents aren't already multiply deposited</text>
+    </svg>
+    <figcaption>Deposit at publication, enforced by the voting rule itself: a block cannot be certified faster than it is copied.</figcaption>
+  </figure>
+
+  <p>Compare the ordinary alternative: certify a compact header now, distribute the heavy contents later, and discover during a crisis that "later" never came for the one block you need. Here the Bodley move closes that door structurally — <strong>a block cannot become official faster than it becomes preserved</strong>, because the signatures and the copies are the same act.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== OBLIGATIONS ============================== -->
+<section id="obligations">
+  <span class="kicker">04 · The obligations ledger</span>
+  <h2>Who must hold what, until when</h2>
+  <p>Beyond blocks, the cross-shard machinery generates artifacts with specific consumers — and each travels with an explicit obligation: a named class of holders, and a release condition. Three rules give the ledger its teeth:</p>
+  <p><strong>Release on receipt, not on silence.</strong> A shard that publishes provisions must keep serving them until the destination's own quorum-signed certificate covers the batch — a positive, cryptographic acknowledgment — or the attested deadline passes. "It's probably fine by now" is not a release condition anywhere in the system.</p>
+  <p><strong>Absence is announced.</strong> Since a missing thing can't announce itself, block headers <em>pre-announce</em>: which shards this block provisions, and a fingerprint of what each should expect. A destination therefore knows there is something to miss — and after a grace period, fetches it from the obligated committee rather than waiting on gossip's mood. The same pattern covers transactions a destination learns about but never received.</p>
+  <p><strong>Obligations survive restarts.</strong> Requests are answerable from committed storage — including historical reads within the retention window — so a source node that crashed and recovered can still honor its shard's obligations. The duty attaches to the role, not to a process's uptime.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 250" role="img" aria-label="A ledger of artifacts, their obligated holders, and the receipt or expiry that releases each obligation.">
+      <text x="70"  y="40" fill="#9fa9c0" font-size="12" class="mono">ARTIFACT</text>
+      <text x="360" y="40" fill="#9fa9c0" font-size="12" class="mono">OBLIGATED HOLDER</text>
+      <text x="575" y="40" fill="#9fa9c0" font-size="12" class="mono">RELEASED WHEN</text>
+      <line x1="60" y1="52" x2="780" y2="52" stroke="#22304e"/>
+      <g font-size="12.5">
+        <text x="70"  y="82" fill="#e9ecf4">block contents</text>
+        <text x="360" y="82" fill="#9fa9c0">its 2f+1 signers</text>
+        <text x="575" y="82" fill="#9fa9c0">retention horizon passes</text>
+        <line x1="60" y1="98" x2="780" y2="98" stroke="#181f33"/>
+        <text x="70"  y="126" fill="#e9ecf4">provision batch</text>
+        <text x="360" y="126" fill="#9fa9c0">the source committee</text>
+        <text x="575" y="126" fill="#5fd39a">destination's certificate covers it</text>
+        <line x1="60" y1="142" x2="780" y2="142" stroke="#181f33"/>
+        <text x="70"  y="170" fill="#e9ecf4">expected transactions</text>
+        <text x="360" y="170" fill="#9fa9c0">the source committee</text>
+        <text x="575" y="170" fill="#9fa9c0">fetched, or horizon passes</text>
+        <line x1="60" y1="186" x2="780" y2="186" stroke="#181f33"/>
+        <text x="70"  y="214" fill="#e9ecf4">a dead shard's settled set</text>
+        <text x="360" y="214" fill="#9fa9c0">its frozen terminal committee</text>
+        <text x="575" y="214" fill="#9fa9c0">horizon after the terminal block</text>
+      </g>
+    </svg>
+    <figcaption>Every row keys its release on a quorum-signed receipt or on attested time — never on one machine's guess. (The last row is <a href="testament.html" style="color:var(--navy)">the will's</a> acquisition path.)</figcaption>
+  </figure>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FORGETTING ============================== -->
+<section id="forgetting">
+  <span class="kicker">05 · Provable forgetting</span>
+  <h2>The archive that knows when to say no</h2>
+  <p>The mirror half of preservation is disciplined forgetting — an archive that keeps everything forever eventually keeps nothing well. Every eviction in the system keys on <a href="clock.html">BFT-attested time</a>, which makes "we are allowed to forget this now" a <strong>consensus fact</strong>: the same on every honest machine, at the same attested moment. Past the horizon, a request isn't met with a shrug or a maybe — it is refused, identically, everywhere, and every protocol that consumes history is designed to complete its business within the window. A request can be <em>satisfied</em> or <em>provably expired</em>; it can never fall into the crack between.</p>
+
+  <div class="callout">
+    <p><strong>Bodley's principle, restated for machines:</strong> an archive is not a building. It is a set of obligations attached at the moment of publication — held until receipted, or released by a clock everyone shares.</p>
+    <span class="why">And the loss paths are rehearsed, not hoped away: the fault suite kills each gossip channel in turn and asserts the fetch obligations recover it — <a href="crashlab.html">the crash lab</a>.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the voting-time DA rule, each tracker and its exact release condition, the serving fallbacks, and the attested-retention invariant that binds them all.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/04-atomic-commitment.md">docs/04 — atomic commitment · data availability</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/03-state-and-sync.md">docs/03 — state and sync</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6478">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

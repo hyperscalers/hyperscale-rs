@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — a jury you can't bribe</title>
+<style>
+  :root {
+    --bg: #0d0c0a;
+    --bg2: #131210;
+    --card: #191713;
+    --card-edge: #2c2820;
+    --ink: #ede9e0;
+    --ink-dim: #a8a294;
+    --marble: #d8d2c4;
+    --terra: #d97a55;
+    --olive: #a8b06a;
+    --aegean: #7fa8c8;
+    --rose: #e87a8a;
+    --grad: linear-gradient(100deg, #eae3d3, #b3a98f 60%, #8f866f);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #161310 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--terra); text-decoration: none; border-bottom: 1px solid #3c2c22; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--marble); border: 1px solid #3c382c; background: #12110d;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--olive); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  .drop { animation: drop 3.2s ease-in infinite; }
+  @keyframes drop {
+    0%, 55%  { transform: translateY(0); opacity: 1; }
+    80%      { transform: translateY(210px); opacity: 1; }
+    82%,100% { transform: translateY(210px); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse, .drop { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--terra); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html" aria-current="page">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · COMMITTEE SECURITY</span>
+  <h1>A jury you can't <em>bribe</em>.</h1>
+  <p class="lede">Twenty-four centuries ago, Athens ran its courts on a machine carved from stone, built on a radical theory of corruption: <strong>don't search for incorruptible people — make it impossible to know who to corrupt</strong>. Hyperscale staffs the committees that guard every shard on exactly that theory.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 400 BC ============================== -->
+<section id="athens">
+  <span class="kicker">01 · 400 BC</span>
+  <h2>The machine in the agora</h2>
+  <p>Athenian juries were enormous — 201, 401, sometimes 501 citizens — because the city understood its enemy precisely. A jury's size wasn't ceremony; it was arithmetic against bribery. But size alone doesn't help if the fixer knows <em>which</em> 501 to visit the night before. So the decisive invention wasn't the big jury. It was the <strong>kleroterion</strong>: a slab of stone that chose the jurors <em>on the morning of the trial</em>.</p>
+  <p>Every eligible citizen carried a bronze ID ticket — a <em>pinakion</em>. At dawn, tickets were slotted into the kleroterion's columns. Beside the slab ran a bronze tube; an official poured in white and black balls and released them one at a time with a crank. A white ball seated an entire row of ticket-holders; a black ball sent that row home. No one — not the magistrates, not the litigants, not the jurors themselves — knew who would judge the case until the balls had fallen. There was no jury to bribe, because until that moment, <strong>the jury did not exist</strong>.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 400" role="img" aria-label="The kleroterion: a stone slab of ticket slots with a ball tube beside it; a white ball seats a row, a black ball dismisses one.">
+      <!-- slab -->
+      <rect x="300" y="24" width="220" height="352" rx="10" fill="#191713" stroke="#3c382c" stroke-width="2"/>
+      <!-- slots: 5 cols x 8 rows -->
+      <g>
+        <!-- tickets (terracotta) and empty slots -->
+        <g fill="#d97a55" stroke="#8f4f34">
+          <rect x="318" y="56"  width="28" height="12" rx="2"/><rect x="358" y="56"  width="28" height="12" rx="2"/><rect x="398" y="56"  width="28" height="12" rx="2"/><rect x="438" y="56"  width="28" height="12" rx="2"/><rect x="478" y="56"  width="28" height="12" rx="2"/>
+          <rect x="318" y="92"  width="28" height="12" rx="2"/><rect x="358" y="92"  width="28" height="12" rx="2"/><rect x="398" y="92"  width="28" height="12" rx="2"/><rect x="478" y="92"  width="28" height="12" rx="2"/>
+          <rect x="318" y="128" width="28" height="12" rx="2"/><rect x="358" y="128" width="28" height="12" rx="2"/><rect x="398" y="128" width="28" height="12" rx="2"/><rect x="438" y="128" width="28" height="12" rx="2"/><rect x="478" y="128" width="28" height="12" rx="2"/>
+          <rect x="318" y="164" width="28" height="12" rx="2"/><rect x="398" y="164" width="28" height="12" rx="2"/><rect x="438" y="164" width="28" height="12" rx="2"/>
+          <rect x="318" y="200" width="28" height="12" rx="2"/><rect x="358" y="200" width="28" height="12" rx="2"/><rect x="398" y="200" width="28" height="12" rx="2"/><rect x="438" y="200" width="28" height="12" rx="2"/><rect x="478" y="200" width="28" height="12" rx="2"/>
+          <rect x="358" y="236" width="28" height="12" rx="2"/><rect x="398" y="236" width="28" height="12" rx="2"/><rect x="478" y="236" width="28" height="12" rx="2"/>
+          <rect x="318" y="272" width="28" height="12" rx="2"/><rect x="358" y="272" width="28" height="12" rx="2"/><rect x="398" y="272" width="28" height="12" rx="2"/><rect x="438" y="272" width="28" height="12" rx="2"/>
+          <rect x="318" y="308" width="28" height="12" rx="2"/><rect x="358" y="308" width="28" height="12" rx="2"/><rect x="398" y="308" width="28" height="12" rx="2"/><rect x="438" y="308" width="28" height="12" rx="2"/><rect x="478" y="308" width="28" height="12" rx="2"/>
+        </g>
+        <!-- empty slot outlines -->
+        <g fill="none" stroke="#2c2820">
+          <rect x="438" y="92"  width="28" height="12" rx="2"/>
+          <rect x="358" y="164" width="28" height="12" rx="2"/><rect x="478" y="164" width="28" height="12" rx="2"/>
+          <rect x="318" y="236" width="28" height="12" rx="2"/><rect x="438" y="236" width="28" height="12" rx="2"/>
+          <rect x="478" y="272" width="28" height="12" rx="2"/>
+        </g>
+      </g>
+      <!-- seated row highlight (row at y=128) -->
+      <rect x="310" y="122" width="200" height="24" rx="5" fill="none" stroke="#a8b06a" stroke-width="2" class="pulse"/>
+      <text x="530" y="139" fill="#a8b06a" font-size="12.5">← white ball: this row serves today</text>
+      <!-- dismissed row (y=236) -->
+      <rect x="310" y="230" width="200" height="24" rx="5" fill="none" stroke="#5a5142" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text x="530" y="247" fill="#a8a294" font-size="12.5">← black ball: row goes home</text>
+      <!-- tube -->
+      <path d="M 244 40 L 278 40 L 270 58 L 252 58 Z" fill="#131210" stroke="#3c382c"/>
+      <rect x="252" y="58" width="18" height="264" rx="4" fill="#131210" stroke="#3c382c"/>
+      <!-- balls in tube -->
+      <circle cx="261" cy="76" r="6.5" fill="#e8e4da" class="drop"/>
+      <circle cx="261" cy="96" r="6.5" fill="#3a3630" stroke="#5a5142"/>
+      <circle cx="261" cy="116" r="6.5" fill="#e8e4da"/>
+      <circle cx="261" cy="136" r="6.5" fill="#e8e4da"/>
+      <circle cx="261" cy="156" r="6.5" fill="#3a3630" stroke="#5a5142"/>
+      <!-- crank -->
+      <circle cx="261" cy="336" r="11" fill="#191713" stroke="#8f866f" stroke-width="2"/>
+      <line x1="261" y1="336" x2="278" y2="322" stroke="#8f866f" stroke-width="3" stroke-linecap="round"/>
+      <!-- annotations -->
+      <text x="180" y="70" fill="#a8a294" font-size="12.5" text-anchor="end">bronze ID tickets,</text>
+      <text x="180" y="87" fill="#a8a294" font-size="12.5" text-anchor="end">one per citizen →</text>
+      <text x="180" y="330" fill="#a8a294" font-size="12.5" text-anchor="end">one ball per crank,</text>
+      <text x="180" y="347" fill="#a8a294" font-size="12.5" text-anchor="end">the morning of the trial →</text>
+      <text x="410" y="394" fill="#a8a294" font-size="12.5" text-anchor="middle">no juror knows the court · no fixer knows the juror</text>
+    </svg>
+    <figcaption>The kleroterion — allotment embodied in stone. Fragments survive in the Agora Museum in Athens; Aristotle described its operation in detail.</figcaption>
+  </figure>
+
+  <p>And Athens paired the lottery with its complement: <strong>accountability after the fact</strong>. Every official, on leaving office, faced the <em>euthyna</em> — a mandatory public audit of everything done with power. Selection you cannot game going in; scrutiny you cannot escape going out.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== SAME ATTACK ============================== -->
+<section id="attack">
+  <span class="kicker">02 · The same attack, 2,400 years on</span>
+  <h2>Sharding's classic weakness</h2>
+  <p>Every consensus decision in Hyperscale — every block, every certificate — is made by a <strong>committee</strong> of validators, and each committee tolerates corruption of up to a third of its seats. One monolithic blockchain has one committee: to attack it you must corrupt a third of <em>everything</em>. But a sharded network runs dozens of committees, and there lies the classic objection: <strong>corrupting one small committee is vastly cheaper than corrupting the whole network</strong>. If an adversary can pick a shard and concentrate on its guards, sharding has traded security for throughput.</p>
+  <p>The naive stafferies all fall to the same fixer who haunted Athens:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ FIXED COMMITTEES</span><h4>A stationary target</h4><p>Assign validators to shards once and the adversary has unlimited time to work on one shard's members — bribe, coerce, compromise, seat by seat.</p></div>
+    <div class="card"><span class="x">✕ PREDICTABLE ASSIGNMENT</span><h4>The fixer's almanac</h4><p>Any schedule known far in advance — round-robin, stake order, anything derivable — tells the adversary exactly whom to visit, and how long they have.</p></div>
+    <div class="card"><span class="x">✕ UNACCOUNTABLE SEATS</span><h4>Corruption compounds</h4><p>If misbehavior carries no expulsion, every seat the adversary wins stays won. The corrupt fraction only ever rises.</p></div>
+  </div>
+
+  <div class="callout">
+    <p>Hyperscale's answer is the Athenian one, mechanized: <strong>a lottery nobody can predict, a jury that never stops changing, and an audit nobody can suppress.</strong></p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE DRAW ============================== -->
+<section id="draw">
+  <span class="kicker">03 · The draw</span>
+  <h2>Balls made of everyone's dice</h2>
+  <p>Committees are drawn from the validator pool by seeded randomness — but where do you get dice that thousands of mutually distrustful machines all agree on, and that none of them can load? <a href="census.html">The beacon</a> — the network's coordination chain — keeps a <strong>randomness accumulator</strong>, re-mixed every epoch from verifiable random contributions carried in beacon proposals. Each contribution is checkable (a validator can't choose its value, only compute it), and the mix binds them all: to bias the draw you'd have to control the contributions <em>and</em> know everyone else's in advance. Submitting malformed randomness is itself a jailing offense.</p>
+  <p>Crucially, the timing mirrors the agora: assignments for the next epoch are determined only when the current epoch's beacon block folds — <strong>moments before the term starts, never seasons ahead</strong>. An adversary contemplating shard 7 doesn't know who will guard shard 7 next month, because nobody does. Until the balls drop, the committee does not exist.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SHUFFLE ============================== -->
+<section id="shuffle">
+  <span class="kicker">04 · The shuffle</span>
+  <h2>A jury that never finishes forming</h2>
+  <p>Athens re-drew its juries every morning. A blockchain can't: a validator joining a shard must first sync that shard's state, so wholesale re-assignment would have entire committees perpetually mid-download — a security win purchased with a liveness disaster. Hyperscale's compromise is a <strong>trickle</strong>: on a fixed interval, every committee rotates out exactly one member, replaced by a fresh draw from the pool.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 310" role="img" aria-label="Committees above a shared pool, each rotating one member per interval while staying above quorum.">
+      <!-- shard boxes -->
+      <g>
+        <rect x="40" y="36" width="160" height="104" rx="12" fill="#191713" stroke="#2c2820"/>
+        <text x="120" y="60" fill="#a8a294" font-size="12.5" text-anchor="middle" class="mono">SHARD 00</text>
+        <circle cx="76" cy="86" r="7" fill="#d97a55"/><circle cx="104" cy="86" r="7" fill="#d97a55"/><circle cx="132" cy="86" r="7" fill="#d97a55"/><circle cx="160" cy="86" r="7" fill="#d97a55"/>
+        <circle cx="76" cy="114" r="7" fill="#d97a55"/><circle cx="104" cy="114" r="7" fill="#d97a55"/><circle cx="132" cy="114" r="7" fill="none" stroke="#a8b06a" stroke-width="2" class="pulse"/>
+      </g>
+      <g>
+        <rect x="230" y="36" width="160" height="104" rx="12" fill="#191713" stroke="#2c2820"/>
+        <text x="310" y="60" fill="#a8a294" font-size="12.5" text-anchor="middle" class="mono">SHARD 01</text>
+        <circle cx="266" cy="86" r="7" fill="#d97a55"/><circle cx="294" cy="86" r="7" fill="#d97a55"/><circle cx="322" cy="86" r="7" fill="#d97a55"/><circle cx="350" cy="86" r="7" fill="#d97a55"/>
+        <circle cx="266" cy="114" r="7" fill="#d97a55"/><circle cx="294" cy="114" r="7" fill="#d97a55"/><circle cx="322" cy="114" r="7" fill="none" stroke="#a8b06a" stroke-width="2" class="pulse"/>
+      </g>
+      <g>
+        <rect x="420" y="36" width="160" height="104" rx="12" fill="#191713" stroke="#2c2820"/>
+        <text x="500" y="60" fill="#a8a294" font-size="12.5" text-anchor="middle" class="mono">SHARD 10</text>
+        <circle cx="456" cy="86" r="7" fill="#d97a55"/><circle cx="484" cy="86" r="7" fill="#d97a55"/><circle cx="512" cy="86" r="7" fill="#d97a55"/><circle cx="540" cy="86" r="7" fill="#d97a55"/>
+        <circle cx="456" cy="114" r="7" fill="#d97a55"/><circle cx="484" cy="114" r="7" fill="#d97a55"/><circle cx="512" cy="114" r="7" fill="none" stroke="#a8b06a" stroke-width="2" class="pulse"/>
+      </g>
+      <g opacity="0.5">
+        <rect x="610" y="36" width="160" height="104" rx="12" fill="#191713" stroke="#2c2820" stroke-dasharray="5 5"/>
+        <text x="690" y="60" fill="#a8a294" font-size="12.5" text-anchor="middle" class="mono">SHARD 11</text>
+        <circle cx="646" cy="86" r="7" fill="#d97a55"/><circle cx="674" cy="86" r="7" fill="#d97a55"/><circle cx="702" cy="86" r="7" fill="#d97a55"/><circle cx="730" cy="86" r="7" fill="#d97a55"/>
+        <circle cx="646" cy="114" r="7" fill="#d97a55"/><circle cx="674" cy="114" r="7" fill="#d97a55"/><circle cx="702" cy="114" r="7" fill="#d97a55"/>
+        <text x="690" y="160" fill="#a8a294" font-size="11.5" text-anchor="middle">mid-split — the shuffle skips it</text>
+      </g>
+      <!-- arrows -->
+      <path d="M 165 148 C 200 190, 260 214, 330 222" fill="none" stroke="#8f866f" stroke-width="2" class="flow"/>
+      <text x="105" y="198" fill="#a8a294" font-size="11.5">one rotates out</text>
+      <path d="M 560 210 C 585 195, 590 170, 578 148" fill="none" stroke="#a8b06a" stroke-width="2" class="flow"/>
+      <text x="600" y="196" fill="#a8b06a" font-size="11.5">a fresh draw rotates in</text>
+      <!-- pool -->
+      <rect x="240" y="210" width="330" height="66" rx="14" fill="#131210" stroke="#3c382c"/>
+      <text x="405" y="236" fill="#ede9e0" font-size="13" font-weight="600" text-anchor="middle">THE POOL</text>
+      <circle cx="300" cy="256" r="6" fill="#8f866f"/><circle cx="330" cy="256" r="6" fill="#8f866f"/><circle cx="360" cy="256" r="6" fill="#8f866f"/><circle cx="390" cy="256" r="6" fill="#8f866f"/><circle cx="420" cy="256" r="6" fill="#8f866f"/><circle cx="450" cy="256" r="6" fill="#8f866f"/><circle cx="480" cy="256" r="6" fill="#8f866f"/><circle cx="510" cy="256" r="6" fill="#8f866f"/>
+      <text x="405" y="300" fill="#a8a294" font-size="12.5" text-anchor="middle">one seat per shard per interval — never below quorum, never standing still</text>
+    </svg>
+    <figcaption>The trickle: every committee stays continuously strong with at most one syncing seat, yet fully turns over on a bounded timescale.</figcaption>
+  </figure>
+
+  <p>The trickle's arithmetic is the point: a slowly-working adversary is on a treadmill. By the time they've compromised members of shard 7's committee, rotation has scattered some of them to other shards and seated strangers in their places. The details are all load-bearing: victims are chosen by domain-separated randomness (nobody can aim the exit at a rival), a rotated-out member can't be drawn straight back into the seat it left, only fully-synced members are rotated out (an exit that weakens the committee is worse than none), and committees mid-<a href="library.html">reshape</a> are skipped so the churn never undermines a handover in progress.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE AUDIT ============================== -->
+<section id="audit">
+  <span class="kicker">05 · The audit</span>
+  <h2>Euthyna: the log that can't skip a line</h2>
+  <p>Selection and churn keep the adversary from concentrating; <strong>expulsion</strong> makes every seat they do win a wasting asset. Misbehavior is punished only on proof, and both kinds of proof are Byzantine-resistant:</p>
+  <p><strong>Lying is self-proving.</strong> Signing two conflicting votes for the same slot is treason with a paper trail — the two signatures <em>are</em> the evidence. It rides to the beacon and the validator is jailed permanently. No trial needed; the crime carries its own conviction.</p>
+  <p><strong>Slacking is witnessed — uncensorably.</strong> Chronic offline behavior (skipped proposals, missed duties) generates witness records that every replica derives independently from the chain itself. These accumulate in a per-shard log whose fingerprint is quorum-attested in <em>every block header</em> — and here is the teeth: a proposer building a block must extend the log with <strong>every</strong> record the chain implies, because every verifier recomputes the expected fingerprint and rejects any header that omits one. A proposer can neither quietly drop the record that would jail a friend, nor mint one to frame a rival.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 260" role="img" aria-label="Witness records feeding a quorum-attested log fingerprint; a proposer's attempt to omit one is rejected by recomputing verifiers.">
+      <!-- leaves -->
+      <g class="mono" font-size="11.5">
+        <rect x="40" y="40" width="170" height="30" rx="7" fill="#191713" stroke="#2c2820"/>
+        <text x="125" y="60" fill="#a8a294" text-anchor="middle">validator registered</text>
+        <rect x="40" y="82" width="170" height="30" rx="7" fill="#191713" stroke="#2c2820"/>
+        <text x="125" y="102" fill="#a8a294" text-anchor="middle">stake moved</text>
+        <rect x="40" y="124" width="170" height="30" rx="7" fill="#241610" stroke="#d97a55" stroke-width="1.5"/>
+        <text x="125" y="144" fill="#d97a55" text-anchor="middle">missed proposal · r117</text>
+        <rect x="40" y="166" width="170" height="30" rx="7" fill="#191713" stroke="#2c2820"/>
+        <text x="125" y="186" fill="#a8a294" text-anchor="middle">observer ready</text>
+      </g>
+      <text x="125" y="226" fill="#a8a294" font-size="11.5" text-anchor="middle">derived by every replica, identically</text>
+      <!-- accumulator -->
+      <path d="M 210 55 C 280 60, 300 90, 330 108" fill="none" stroke="#3c382c" stroke-width="1.5"/>
+      <path d="M 210 97 C 270 100, 300 105, 330 112" fill="none" stroke="#3c382c" stroke-width="1.5"/>
+      <path d="M 210 139 C 270 132, 300 125, 330 118" fill="none" stroke="#d97a55" stroke-width="1.5"/>
+      <path d="M 210 181 C 280 172, 300 135, 330 122" fill="none" stroke="#3c382c" stroke-width="1.5"/>
+      <circle cx="345" cy="115" r="14" fill="#131210" stroke="#8f866f" stroke-width="2"/>
+      <text x="345" y="150" fill="#a8a294" font-size="11.5" text-anchor="middle">the log</text>
+      <!-- header -->
+      <path d="M 360 115 L 430 115" stroke="#8f866f" stroke-width="2" class="flow"/>
+      <rect x="430" y="82" width="180" height="66" rx="10" fill="#191713" stroke="#3c382c"/>
+      <text x="520" y="106" fill="#ede9e0" font-size="12.5" font-weight="600" text-anchor="middle">BLOCK HEADER</text>
+      <text x="520" y="126" fill="#a8a294" font-size="11.5" text-anchor="middle" class="mono">witness root: 0x5e2a…</text>
+      <text x="520" y="142" fill="#a8a294" font-size="10.5" text-anchor="middle">quorum-signed</text>
+      <!-- verifier -->
+      <path d="M 610 115 L 660 115" stroke="#8f866f" stroke-width="2" class="flow"/>
+      <rect x="660" y="70" width="130" height="90" rx="10" fill="#131210" stroke="#a8b06a"/>
+      <text x="725" y="96" fill="#a8b06a" font-size="12" font-weight="600" text-anchor="middle">EVERY VERIFIER</text>
+      <text x="725" y="116" fill="#a8a294" font-size="11" text-anchor="middle">recomputes the root</text>
+      <text x="725" y="132" fill="#a8a294" font-size="11" text-anchor="middle">from the chain itself</text>
+      <text x="725" y="150" fill="#e87a8a" font-size="11" text-anchor="middle">omission → rejected</text>
+      <text x="520" y="196" fill="#a8a294" font-size="12.5" text-anchor="middle">the record that would jail a friend cannot be dropped —</text>
+      <text x="520" y="214" fill="#a8a294" font-size="12.5" text-anchor="middle">the header that omits it doesn't verify</text>
+    </svg>
+    <figcaption>The modern euthyna: an audit log whose completeness is enforced by consensus itself. Contiguous, proven, applied exactly once.</figcaption>
+  </figure>
+
+  <p>Jailing then feeds back into the topology safely: the expelled validator leaves its committee immediately, quorum math adjusts, and the lottery refills the seat. Liveness offenses can be forgiven after a cooldown; equivocation never is.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE STOPS ============================== -->
+<section id="stops">
+  <span class="kicker">06 · The fine print</span>
+  <h2>What the lottery guarantees — and what it assumes</h2>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ GUARANTEED</span><h4>Unpredictability, churn, expulsion</h4><p>No placement is knowable ahead of the draw; no committee sits still; every provable offense costs the seat. These are mechanisms — code, not hope.</p></div>
+    <div class="card"><span class="ok">◦ ASSUMED — AND SAID SO</span><h4>The pool itself is mostly honest</h4><p>Random sampling from a mostly-honest pool yields mostly-honest committees <em>with overwhelming probability</em> — a probability that is a function of committee size. That residual assumption is stated in the invariant register as an assumption, not proven as a theorem, and deployments must size committees for it.</p></div>
+    <div class="card"><span class="ok">◦ PRICED</span><h4>Entry costs real stake</h4><p>Joining the pool at all means locking stake at a protocol-set price — so flooding the lottery with identities is not free. How that price tracks demand is <a href="governor.html">the governor's</a> story.</p></div>
+  </div>
+
+  <div class="callout">
+    <p><strong>The Athenian lesson, restated for 2026:</strong> integrity doesn't scale by finding better people. It scales by lottery, churn, and audit — arranged so that corrupting the system requires corrupting most of it, and holding what you corrupt is impossible.</p>
+    <span class="why">Athens ran its courts this way for the better part of two centuries. The stone did the trusting, so the citizens didn't have to.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the sampling and shuffle rules, the witness accumulator, the jailing lifecycle, and the threat model's exact statement — including which parts are theorems and which are sized assumptions.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/05-byzantine-safety.md">docs/05 — byzantine safety</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/06-resource-economics.md">docs/06 — resource economics</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#6b6558">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — a clock made of votes</title>
+<style>
+  :root {
+    --bg: #0a0c11;
+    --bg2: #10131b;
+    --card: #141826;
+    --card-edge: #222840;
+    --ink: #e9ecf4;
+    --ink-dim: #a0a8bc;
+    --steel: #aebfd4;
+    --signal: #e0606c;
+    --brass: #d9b06a;
+    --green: #63c795;
+    --grad: linear-gradient(100deg, #ccd8ea, #8fa5c2 55%, #6f87a8);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #0e131d 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--steel); text-decoration: none; border-bottom: 1px solid #2c3550; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--steel); border: 1px solid #2c3550; background: #0e1420;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--signal); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--steel); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html" aria-current="page">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · WEIGHTED TIME</span>
+  <h1>A clock made of <em>votes</em>.</h1>
+  <p class="lede">In 1883 the railroads learned that you cannot share a track without sharing a clock. In 1891 they learned the harder lesson: a shared standard is worthless unless the clock itself can be trusted. Hyperscale runs dozens of independent chains against one schedule, and no machine's clock can be trusted — so it builds its clock out of the one thing the system does trust: <strong>votes</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1883 ============================== -->
+<section id="railroads">
+  <span class="kicker">01 · 1883</span>
+  <h2>Fifty railroads, fifty noons</h2>
+  <p>Before standard time, noon was wherever the sun said it was. Boston's noon ran about twelve minutes ahead of New York's; every town set its clocks by its own sky, and every railroad ran on its own operating time — by the early 1880s, around fifty of them across the United States. A station platform might carry three clocks: local time, the railroad's time, and the connecting line's time.</p>
+  <p>On a single-track railroad this is not a bookkeeping nuisance; it is how people die. Trains sharing one track pass each other on schedule and clockwork — a southbound waits at a siding until the northbound is due to have passed. In August 1853, near Valley Falls, Rhode Island, a conductor's watch ran a couple of minutes slow and two trains met head-on. Fourteen people were killed by two minutes of disagreement about what time it was.</p>
+  <p>The answer arrived on <strong>November 18, 1883</strong> — the "Day of Two Noons." At local noon, stationmasters across America stopped their clocks and waited for the telegraph to bring the new standard-time noon of their zone. Hundreds of local times collapsed into four. Noon struck twice that day, and after that the timetable meant the same thing everywhere.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="Before: three towns with three different clock readings and two trains meeting on one track. After: one telegraph wire, all clocks agreeing.">
+      <!-- left: three disagreeing clocks -->
+      <text x="210" y="28" fill="#a0a8bc" font-size="13" text-anchor="middle" class="mono">EVERY TOWN ITS OWN NOON</text>
+      <!-- Boston 12:24 -->
+      <circle cx="100" cy="120" r="34" fill="#141826" stroke="#222840" stroke-width="2"/>
+      <line x1="100" y1="120" x2="115.3" y2="141" stroke="#e0606c" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="100" y1="120" x2="103.5" y2="103.4" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <text x="100" y="172" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">BOSTON</text>
+      <text x="100" y="188" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">12:24</text>
+      <!-- Providence 12:14 -->
+      <circle cx="210" cy="120" r="34" fill="#141826" stroke="#222840" stroke-width="2"/>
+      <line x1="210" y1="120" x2="235.9" y2="117.3" stroke="#e0606c" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="210" y1="120" x2="212.1" y2="103.1" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <text x="210" y="172" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">PROVIDENCE</text>
+      <text x="210" y="188" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">12:14</text>
+      <!-- New London 12:00 -->
+      <circle cx="320" cy="120" r="34" fill="#141826" stroke="#222840" stroke-width="2"/>
+      <line x1="320" y1="120" x2="320" y2="94" stroke="#e0606c" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="320" y1="120" x2="320" y2="103" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <text x="320" y="172" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">NEW LONDON</text>
+      <text x="320" y="188" fill="#a0a8bc" font-size="12" text-anchor="middle" class="mono">12:00</text>
+      <!-- one track, two trains -->
+      <line x1="40" y1="240" x2="390" y2="240" stroke="#2c3550" stroke-width="3"/>
+      <rect x="70" y="222" width="46" height="15" rx="4" fill="#1d2438" stroke="#2c3550"/>
+      <rect x="300" y="222" width="46" height="15" rx="4" fill="#1d2438" stroke="#2c3550"/>
+      <text x="208" y="236" fill="#e0606c" font-size="18" text-anchor="middle" class="pulse">✕</text>
+      <text x="210" y="272" fill="#a0a8bc" font-size="12.5" text-anchor="middle">one track, three noons</text>
+
+      <!-- right: one wire -->
+      <text x="620" y="28" fill="#a0a8bc" font-size="13" text-anchor="middle" class="mono">ONE SIGNAL ON THE WIRE</text>
+      <line x1="450" y1="56" x2="800" y2="56" stroke="#aebfd4" stroke-width="2" class="flow"/>
+      <line x1="470" y1="56" x2="470" y2="92" stroke="#2c3550" stroke-width="2"/>
+      <line x1="625" y1="56" x2="625" y2="92" stroke="#2c3550" stroke-width="2"/>
+      <line x1="780" y1="56" x2="780" y2="92" stroke="#2c3550" stroke-width="2"/>
+      <!-- three agreeing clocks -->
+      <circle cx="500" cy="150" r="34" fill="#141826" stroke="#2a4a3a" stroke-width="2"/>
+      <line x1="500" y1="150" x2="500" y2="124" stroke="#63c795" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="500" y1="150" x2="500" y2="133" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="620" cy="150" r="34" fill="#141826" stroke="#2a4a3a" stroke-width="2"/>
+      <line x1="620" y1="150" x2="620" y2="124" stroke="#63c795" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="620" y1="150" x2="620" y2="133" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="740" cy="150" r="34" fill="#141826" stroke="#2a4a3a" stroke-width="2"/>
+      <line x1="740" y1="150" x2="740" y2="124" stroke="#63c795" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="740" y1="150" x2="740" y2="133" stroke="#aebfd4" stroke-width="3" stroke-linecap="round"/>
+      <text x="500" y="205" fill="#63c795" font-size="12" text-anchor="middle" class="mono">12:00</text>
+      <text x="620" y="205" fill="#63c795" font-size="12" text-anchor="middle" class="mono">12:00</text>
+      <text x="740" y="205" fill="#63c795" font-size="12" text-anchor="middle" class="mono">12:00</text>
+      <text x="620" y="272" fill="#a0a8bc" font-size="12.5" text-anchor="middle">November 18, 1883 — noon struck twice</text>
+    </svg>
+    <figcaption>A timetable is an agreement about the future. It is only as strong as the clock everyone reads it against.</figcaption>
+  </figure>
+
+  <p>But there is a second act. In April 1891, at Kipton, Ohio, an engineer's watch stopped for four minutes and quietly started again. He believed he had seven minutes to reach the siding; he had three. The fast mail met the passenger express, and the railroads learned the second lesson: <strong>a shared standard means nothing if any one clock can silently lie</strong>. Their answer was the certified railroad watch — accuracy standards, mandatory regular inspection, tamper-evident service records. Not just one time, but <em>accountable</em> time.</p>
+
+  <div class="callout">
+    <p><strong>Two lessons from the railroad age:</strong> a system of independent actors sharing infrastructure needs one time — and it needs that time to survive a broken or lying clock.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== SAME PROBLEM ============================== -->
+<section id="problem">
+  <span class="kicker">02 · The same problem, 140 years on</span>
+  <h2>Dozens of chains, one timetable</h2>
+  <p>Hyperscale is many blockchains running at once: dozens of shard chains, each producing blocks at its own pace, plus one slow coordination chain — <a href="census.html">the beacon</a> — that publishes the network's timetable. That timetable, the <strong>topology schedule</strong>, answers the question everything else depends on: <em>which committee of validators governs which shard, at which moment?</em> Committees rotate continuously (<a href="kleroterion.html">the lottery</a>), shards split and merge (<a href="library.html">the library</a>) — yet every block, every piece of cross-shard evidence, every certificate must be checked against the committee that was in charge <em>at the time it was made</em>.</p>
+  <p>So everything hangs on a clock. And in a decentralized network, every source of time you might reach for is compromised:</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ TRUST EACH MACHINE</span><h4>Clocks drift — and lie</h4><p>Ordinary clocks wander apart on their own. Worse, a malicious validator's clock is a weapon: backdate or postdate an artifact and you might move it into a friendlier committee's window.</p></div>
+    <div class="card"><span class="x">✕ APPOINT A TIME SERVER</span><h4>The trusted middleman</h4><p>One authority announcing the time is exactly the single point of trust — and failure, and capture — the whole design exists to refuse.</p></div>
+    <div class="card"><span class="x">✕ COUNT BLOCKS INSTEAD</span><h4>No shared ruler</h4><p>Each chain runs at its own speed, and stalls and recovers on its own. Block heights on different shards don't line up with each other or with the beacon. There is nothing to count.</p></div>
+  </div>
+
+  <div class="callout">
+    <p>Hyperscale's answer: don't <em>find</em> a trustworthy clock — <strong>assemble one from the votes the validators are already casting</strong>.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== MECHANISM ============================== -->
+<section id="mechanism">
+  <span class="kicker">03 · The mechanism</span>
+  <h2>Time, agreed like everything else</h2>
+  <p>Every block on every shard is certified by a quorum of validator votes — that's just consensus. Weighted time rides on top of it: <strong>each vote carries the voter's own clock reading</strong>, and when the votes aggregate into a certificate, the readings aggregate into a timestamp. Two rules shape the aggregate:</p>
+  <p><strong>The clamp.</strong> Before averaging, every reading is raised to be no earlier than the parent block's attested timestamp. The chain's clock can therefore never run backwards — not by drift, not by lies. A voter claiming yesterday simply contributes the parent's time.</p>
+  <p><strong>The average.</strong> The clamped readings are averaged over the quorum, one vote one weight. No single reading — honest or hostile — sets the time; each can only lean on it.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 330" role="img" aria-label="Five voter clock readings clamped and averaged into one attested timestamp; a far-future certificate is rejected.">
+      <!-- parent stamp -->
+      <rect x="30" y="26" width="200" height="42" rx="9" fill="#141826" stroke="#222840"/>
+      <text x="46" y="44" fill="#a0a8bc" font-size="11.5">parent block's stamp</text>
+      <text x="46" y="60" fill="#aebfd4" font-size="13" class="mono">12:03</text>
+      <!-- clamp line -->
+      <line x1="30" y1="96" x2="470" y2="96" stroke="#aebfd4" stroke-dasharray="4 5" opacity="0.5"/>
+      <text x="34" y="88" fill="#a0a8bc" font-size="11.5" class="mono">clamp: no reading falls below 12:03</text>
+
+      <!-- voter chips -->
+      <rect x="40" y="118" width="150" height="26" rx="6" fill="#141826" stroke="#222840"/>
+      <text x="52" y="136" fill="#a0a8bc" font-size="12" class="mono">voter · 12:04</text>
+      <rect x="40" y="154" width="150" height="26" rx="6" fill="#141826" stroke="#222840"/>
+      <text x="52" y="172" fill="#a0a8bc" font-size="12" class="mono">voter · 12:05</text>
+      <rect x="40" y="190" width="150" height="26" rx="6" fill="#141826" stroke="#222840"/>
+      <text x="52" y="208" fill="#a0a8bc" font-size="12" class="mono">voter · 12:05</text>
+      <rect x="40" y="226" width="150" height="26" rx="6" fill="#141826" stroke="#222840"/>
+      <text x="52" y="244" fill="#a0a8bc" font-size="12" class="mono">voter · 12:06</text>
+      <rect x="40" y="262" width="170" height="26" rx="6" fill="#1d1420" stroke="#5a2c38"/>
+      <text x="52" y="280" fill="#e0606c" font-size="12" class="mono">liar · 11:41 → 12:03</text>
+      <text x="220" y="280" fill="#a0a8bc" font-size="11.5">← clamped up</text>
+
+      <!-- aggregator -->
+      <path d="M 200 200 L 300 200" stroke="#2c3550" stroke-width="2" class="flow"/>
+      <rect x="300" y="168" width="180" height="64" rx="10" fill="#10131b" stroke="#2c3550"/>
+      <text x="390" y="195" fill="#e9ecf4" font-size="13" font-weight="600" text-anchor="middle">clamp, then average</text>
+      <text x="390" y="213" fill="#a0a8bc" font-size="11.5" text-anchor="middle">over the whole quorum</text>
+      <path d="M 480 200 L 550 200" stroke="#2c3550" stroke-width="2" class="flow"/>
+
+      <!-- output -->
+      <rect x="550" y="172" width="180" height="56" rx="10" fill="#141c2c" stroke="#8fa5c2" stroke-width="1.5"/>
+      <text x="640" y="196" fill="#e9ecf4" font-size="13" font-weight="600" text-anchor="middle">block stamped</text>
+      <text x="640" y="215" fill="#aebfd4" font-size="14" text-anchor="middle" class="mono">12:05 · attested</text>
+
+      <!-- far-future rejection -->
+      <rect x="550" y="40" width="180" height="40" rx="9" fill="#1d1420" stroke="#5a2c38"/>
+      <text x="640" y="58" fill="#e0606c" font-size="12" text-anchor="middle" class="mono">certificate · 14:59</text>
+      <text x="640" y="73" fill="#a0a8bc" font-size="11" text-anchor="middle">implausibly far ahead</text>
+      <text x="640" y="108" fill="#e0606c" font-size="12.5" text-anchor="middle">✕ refused at every door</text>
+
+      <text x="390" y="316" fill="#a0a8bc" font-size="12.5" text-anchor="middle">the lie moved the average by seconds, not minutes — and never backwards</text>
+    </svg>
+    <figcaption>One vote, one clock reading. Clamped so the chain's time is monotone, averaged so no minority sets it, checked at every admission point so no far-future stamp can poison it.</figcaption>
+  </figure>
+
+  <p>What about lying <em>forward</em>? An average does move with every vote — but a certificate whose stamp lands implausibly far ahead of a replica's own watch is <strong>refused at every door</strong> where a certificate can enter the chain: header validation, block sync, timeout handling, aggregation itself. Forward pressure is bounded to the plausibility window; backward pressure is impossible by the clamp. The result: every committed block carries a <strong>BFT-attested timestamp</strong> — a clock reading that all honest replicas agree on and that no minority of liars can meaningfully move, produced as a side effect of votes that were being cast anyway.</p>
+
+  <div class="callout">
+    <p><strong>Which copy of the clock counts?</strong> The same block can be re-certified later by a fresh quorum, with a fresh (and different) stamp. The canonical time of a block is the stamp carried inside the <em>child block that committed it</em> — the one copy pinned into the chain by hashes.</p>
+    <span class="why">This sounds like fine print. It isn't: a bug once made replicas read a block's time from a re-certified copy instead of the pinned one, and their derived clocks disagreed. Every deadline and every committee lookup in the system uses the pinned copy, by rule.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== TIMETABLE ============================== -->
+<section id="timetable">
+  <span class="kicker">04 · The timetable</span>
+  <h2>Every question becomes a lookup</h2>
+  <p>With a trustworthy clock, the beacon's schedule works exactly like a railway timetable. Time is divided into fixed windows — <strong>epochs</strong> — and the schedule says which committee governs each shard in each window. Every verification in the system, everywhere, is then the same single move: <strong>take the artifact's attested stamp, find its window, read off the committee</strong>. Verifying a shard block, checking state shipped over from another shard, validating an execution certificate, admitting a shard's report into the beacon — all of it is <span class="mono" style="color:var(--steel); font-size:15px">schedule.at(attested_time)</span>.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 310" role="img" aria-label="A departure board mapping shards and epochs to committees, with one lookup highlighted.">
+      <!-- column headers -->
+      <text x="330" y="42" fill="#a0a8bc" font-size="13" text-anchor="middle" class="mono">EPOCH 41</text>
+      <text x="510" y="42" fill="#a0a8bc" font-size="13" text-anchor="middle" class="mono">EPOCH 42</text>
+      <text x="690" y="42" fill="#a0a8bc" font-size="13" text-anchor="middle" class="mono">EPOCH 43</text>
+      <text x="690" y="60" fill="#63c795" font-size="10.5" text-anchor="middle" class="mono">posted one epoch early</text>
+      <!-- row labels -->
+      <text x="150" y="98" fill="#a0a8bc" font-size="12.5" text-anchor="end" class="mono">SHARD 00</text>
+      <text x="150" y="148" fill="#a0a8bc" font-size="12.5" text-anchor="end" class="mono">SHARD 01</text>
+      <text x="150" y="198" fill="#a0a8bc" font-size="12.5" text-anchor="end" class="mono">SHARD 10</text>
+      <text x="150" y="248" fill="#a0a8bc" font-size="12.5" text-anchor="end" class="mono">SHARD 11</text>
+      <!-- cells -->
+      <g class="mono" font-size="12">
+        <rect x="250" y="76" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="330" y="98" fill="#a0a8bc" text-anchor="middle">committee C3</text>
+        <rect x="430" y="76" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="510" y="98" fill="#a0a8bc" text-anchor="middle">committee C3*</text>
+        <rect x="610" y="76" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="690" y="98" fill="#a0a8bc" text-anchor="middle">committee C3*</text>
+        <rect x="250" y="126" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="330" y="148" fill="#a0a8bc" text-anchor="middle">committee C5</text>
+        <rect x="430" y="126" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="510" y="148" fill="#a0a8bc" text-anchor="middle">committee C5</text>
+        <rect x="610" y="126" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="690" y="148" fill="#a0a8bc" text-anchor="middle">committee C5*</text>
+        <rect x="250" y="176" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="330" y="198" fill="#a0a8bc" text-anchor="middle">committee C9</text>
+        <rect x="430" y="176" width="160" height="34" rx="7" fill="#10182a" stroke="#8fa5c2" stroke-width="1.5" class="pulse"/><text x="510" y="198" fill="#e9ecf4" text-anchor="middle">committee C9</text>
+        <rect x="610" y="176" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="690" y="198" fill="#a0a8bc" text-anchor="middle">committee C9*</text>
+        <rect x="250" y="226" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="330" y="248" fill="#a0a8bc" text-anchor="middle">committee C2</text>
+        <rect x="430" y="226" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="510" y="248" fill="#a0a8bc" text-anchor="middle">committee C2</text>
+        <rect x="610" y="226" width="160" height="34" rx="7" fill="#141826" stroke="#222840"/><text x="690" y="248" fill="#a0a8bc" text-anchor="middle">committee C2*</text>
+      </g>
+      <!-- lookup -->
+      <path d="M 200 292 L 420 292 L 420 193 L 428 193" fill="none" stroke="#8fa5c2" stroke-width="1.5" class="flow"/>
+      <text x="60" y="296" fill="#aebfd4" font-size="12.5" class="mono">stamp 12:05 →</text>
+      <text x="490" y="296" fill="#a0a8bc" font-size="12">window 42 → shard 10 → committee C9, everywhere</text>
+    </svg>
+    <figcaption>The topology schedule: weighted-time windows down one axis, shards down the other, committees in the cells. (* the shuffle trickles membership continuously — see <a href="kleroterion.html" style="color:var(--steel)">the lottery</a>.)</figcaption>
+  </figure>
+
+  <p>Three details make the timetable sound rather than merely tidy:</p>
+  <p><strong>The binding is exact.</strong> There is no grace period, no overlap in which two committees are both acceptable. A grace period is precisely where an attacker would live — an interval where an artifact could be validated against the friendlier of two answers. One stamp, one window, one committee.</p>
+  <p><strong>It's posted in advance.</strong> Each epoch's committees are computed and frozen one epoch before its window opens. By the time any honest artifact can be stamped into a window, every replica has long since derived — from its own copy of the beacon chain, not from anyone's claim — exactly who governs it. The advance notice also gives incoming committee members a full epoch to sync before their shift starts.</p>
+  <p><strong>It never guesses.</strong> A replica whose beacon copy lags may see artifacts stamped "from the future"; the lookup simply waits until its own fold catches up. History is kept back to a floor derived from what could still legitimately need checking; below the floor, lookups are permanently refused rather than silently missing. The timetable either answers identically on every machine — or says <em>not yet</em>. It never mis-answers.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE STOPS ============================== -->
+<section id="stops">
+  <span class="kicker">05 · The fine print</span>
+  <h2>Three clocks, one law</h2>
+  <p>Weighted time is the only clock with legal force, but it is not the only clock in the building. The discipline is worth stating, because most distributed-systems disasters begin with clocks used for the wrong job:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ YOUR OWN WATCH</span><h4>For pacing only</h4><p>Each node's local clock drives timers, retries, and timeouts. It is never hashed, never signed, never visible to consensus — it can be wrong without making the <em>chain</em> wrong.</p></div>
+    <div class="card"><span class="ok">◦ A PROPOSER'S CLAIM</span><h4>Raw material</h4><p>The wall-clock reading a proposer puts in a block is just one opinion — an input to the vote, sanity-checked by everyone who signs.</p></div>
+    <div class="card"><span class="ok">◦ THE VOTED CLOCK</span><h4>The law</h4><p>Committee lookups, transaction deadlines, data-retention windows, reshape boundaries: everything with consequences reads the attested timestamp, and nothing else.</p></div>
+  </div>
+
+  <p>And one honest limit: the Byzantine bound is a <em>bound</em>, not zero. Hostile voters inside a quorum can lean the average forward within the plausibility window — the design caps the lean and makes it harmless to the schedule (the lookup machinery tolerates the full skew envelope by deferring, never by guessing). Like the railroad watch standards, the goal was never a perfect clock; it was a clock whose worst case is survivable and inspected.</p>
+
+  <div class="callout">
+    <p><strong>The 1883 lesson, restated:</strong> don't try to synchronize the towns. Synchronize the timetable — and make every watch that touches it accountable.</p>
+    <span class="why">Dozens of chains run at their own speeds, yet any replica, handed any artifact from any layer, resolves the same governing committee as every other replica — using nothing but the artifact's attested stamp and its own copy of the beacon chain.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the vote aggregation rule, the canonical-timestamp discipline, the schedule's lookahead and retention guarantees, and the invariants they maintain.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/01-consensus-layers.md">docs/01 — the consensus layers</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6478">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

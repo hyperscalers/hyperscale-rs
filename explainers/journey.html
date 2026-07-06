@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — one payment crosses a sharded world</title>
+<style>
+  :root {
+    --bg: #0a0d10;
+    --bg2: #0f141a;
+    --card: #131a22;
+    --card-edge: #22303e;
+    --ink: #e9eef2;
+    --ink-dim: #9fadb8;
+    --magenta: #ee8cc0;
+    --violet: #8b7bf4;
+    --cyanA: #4fd8e8;
+    --green: #5fd39a;
+    --amber: #e8b060;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #f49cc8, #c65090);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #190d15 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 64px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 32px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--magenta); text-decoration: none; border-bottom: 1px solid #3e2034; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--magenta); border: 1px solid #3e2034; background: #150b11;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card a { color: var(--magenta); text-decoration: none; border-bottom: 1px solid #3e2034; }
+  .card a:hover { color: var(--ink); }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 56px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--magenta); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html" aria-current="page">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · A TRANSACTION'S JOURNEY</span>
+  <h1>One payment crosses a <em>sharded world</em>.</h1>
+  <p class="lede">Ada pays Bo. Her account lives on one shard, his on another — two independent blockchains that will never pause for each other — and the money must arrive <strong>atomically: entirely, on both, or not at all</strong>. The machinery has its own pages. This one just follows the payment.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE MAP ============================== -->
+<section id="map">
+  <span class="kicker">The route</span>
+  <h2>Two chains, one itinerary</h2>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 340" role="img" aria-label="Route map: the payment passes the gate and ordering on both shards, proofs cross between them, both execute and seal, and the two lanes converge on finality.">
+      <!-- lane labels -->
+      <text x="60" y="52" fill="#4fd8e8" font-size="13.5" font-weight="700">SHARD 01 · Ada's side</text>
+      <text x="60" y="304" fill="#8b7bf4" font-size="13.5" font-weight="700">SHARD 10 · Bo's side</text>
+      <!-- lanes -->
+      <line x1="60" y1="90" x2="640" y2="90" stroke="#22303e" stroke-width="2" class="flow"/>
+      <line x1="60" y1="250" x2="640" y2="250" stroke="#22303e" stroke-width="2" class="flow"/>
+      <!-- stations top -->
+      <circle cx="130" cy="90" r="10" fill="#0d1e24" stroke="#4fd8e8" stroke-width="2"/>
+      <text x="130" y="68" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">GATE</text>
+      <circle cx="260" cy="90" r="10" fill="#0d1e24" stroke="#4fd8e8" stroke-width="2"/>
+      <text x="260" y="68" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">ORDERED</text>
+      <circle cx="520" cy="90" r="10" fill="#0e1a14" stroke="#5fd39a" stroke-width="2"/>
+      <text x="520" y="68" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">EXECUTED</text>
+      <circle cx="620" cy="90" r="10" fill="#0e1a14" stroke="#5fd39a" stroke-width="2"/>
+      <text x="620" y="68" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">SEALED</text>
+      <!-- stations bottom -->
+      <circle cx="130" cy="250" r="10" fill="#151030" stroke="#8b7bf4" stroke-width="2"/>
+      <text x="130" y="278" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">GATE</text>
+      <circle cx="260" cy="250" r="10" fill="#151030" stroke="#8b7bf4" stroke-width="2"/>
+      <text x="260" y="278" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">ORDERED</text>
+      <circle cx="520" cy="250" r="10" fill="#0e1a14" stroke="#5fd39a" stroke-width="2"/>
+      <text x="520" y="278" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">EXECUTED</text>
+      <circle cx="620" cy="250" r="10" fill="#0e1a14" stroke="#5fd39a" stroke-width="2"/>
+      <text x="620" y="278" fill="#9fadb8" font-size="11.5" text-anchor="middle" class="mono">SEALED</text>
+      <!-- crossing -->
+      <path d="M 285 100 C 360 150, 420 190, 495 240" fill="none" stroke="#4fd8e8" stroke-width="2" class="flow"/>
+      <path d="M 285 240 C 360 190, 420 150, 495 100" fill="none" stroke="#8b7bf4" stroke-width="2" class="flow"/>
+      <rect x="322" y="152" width="142" height="38" rx="8" fill="#0a0d10" opacity="0.94"/>
+      <text x="393" y="168" fill="#9fadb8" font-size="11.5" text-anchor="middle">provisions cross —</text>
+      <text x="393" y="184" fill="#9fadb8" font-size="11.5" text-anchor="middle">never trust, only verify</text>
+      <!-- convergence -->
+      <path d="M 632 98 C 690 130, 700 140, 726 160" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <path d="M 632 242 C 690 210, 700 200, 726 180" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <circle cx="745" cy="170" r="17" fill="#0e2418" stroke="#5fd39a" stroke-width="2.5" class="pulse"/>
+      <text x="745" y="175" fill="#5fd39a" font-size="13" text-anchor="middle" font-weight="700">✓</text>
+      <text x="745" y="212" fill="#5fd39a" font-size="11.5" text-anchor="middle" class="mono">FINAL</text>
+      <text x="745" y="228" fill="#9fadb8" font-size="10.5" text-anchor="middle">on both chains</text>
+    </svg>
+    <figcaption>Neither shard ever waits for the other's permission. Facts cross; decisions don't need to.</figcaption>
+  </figure>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 0 ============================== -->
+<section id="stop0">
+  <span class="kicker">Stop 0 · The declaration</span>
+  <h2>The payment states its business</h2>
+  <p>Before Ada's wallet submits anything, it writes the itinerary into the transaction itself: <strong>a declaration of every account the payment touches</strong> — Ada's, on shard 01; Bo's, on shard 10. Nothing is discovered en route. The declaration is what routes the payment to exactly the shards that own its state, what bounds what it will be allowed to write, and what lets shards reason about conflicts without running anything (<a href="generals.html">the generals</a> explains why this one honesty requirement powers the whole trip).</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 1 ============================== -->
+<section id="stop1">
+  <span class="kicker">Stop 1 · The gate</span>
+  <h2>No two guests reach for the same fork</h2>
+  <p>Both shards admit the payment to their waiting rooms — its signature checked once per machine, however many validators that machine hosts. Then it waits at the gate until <strong>none of its declared accounts is in use</strong>: the mempool never lets two transactions that touch any common account be in flight at once. That standing rule is why the deadlocks that haunt every lock-based system simply cannot form here. The moment Ada's account frees, the payment becomes eligible — on both shards, under the same hash-ordered rule, so every validator agrees on who's next without discussing it.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 2 ============================== -->
+<section id="stop2">
+  <span class="kicker">Stop 2 · Ordered, twice</span>
+  <h2>Two committees write it into history</h2>
+  <p>On each shard, the proposer of the moment includes the payment in a block, and the committee votes. Who is that committee? Whoever <a href="clock.html">the schedule</a> says governs this shard at this attested moment — a committee staffed by <a href="kleroterion.html">lottery</a> and never sitting still. Each validator votes only while holding the block's complete contents, so the resulting certificate doubles as a custody receipt for every byte (<a href="archive.html">the archive</a>) — and it stamps the block with the voted clock. Locks engage on Ada's and Bo's accounts. Note what was <em>not</em> decided: whether the payment succeeds. Ordering is the only thing consensus ever settles here — and thanks to <a href="overlap.html">the overlap</a>, it settles it exactly once per shard.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 3 ============================== -->
+<section id="stop3">
+  <span class="kicker">Stop 3 · Provisioning</span>
+  <h2>Facts ford the gap between chains</h2>
+  <p>Now the shards must show each other their halves, and the system's name for this is <strong>provisioning</strong>. Shard 01 ships Bo's chain a <strong>provision</strong>: the exact pieces of Ada-side state the payment needs, carried under a merkle proof against shard 01's quorum-certified block — and shard 10 ships its half back the same way. A provision isn't a message to be believed; it's <strong>a checkable fact about a committed block</strong>: the receiving shard verifies it against the sender's certified header and trusts no individual machine at all (<a href="generals.html">the generals</a>).</p>
+  <p>Two details make this stage sturdier than it looks. The payment doesn't wait alone: cross-shard transactions are grouped into <strong>waves</strong>, and a wave executes the moment every provision it depends on has arrived and verified — while the locks taken at ordering stay held across the whole crossing, so nothing else can touch Ada's or Bo's accounts mid-flight. And absence is covered: the headers pre-announced these shipments, so if gossip drops one, the destination knows something is missing and fetches it from the committee obligated to serve it (<a href="archive.html">the archive</a>) — over traffic classes that <a href="triage.html">bulk noise can't starve</a>. If a wave still can't be fully provisioned, it doesn't hang forever — that's the deadline detour below.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 4 ============================== -->
+<section id="stop4">
+  <span class="kicker">Stop 4 · The same computation, twice</span>
+  <h2>Nobody asks. Everybody knows.</h2>
+  <p>With every provision verified, both shards hold <strong>byte-identical inputs</strong>: the same declared accounts, the same proven balances, the same merged view. Each runs the same deterministic engine — and determinism does what no amount of messaging could: both compute the identical result, down to the receipt hashes, without exchanging another word. This is the sunrise moment from <a href="generals.html">the generals</a>: the outcome now simply <em>exists</em>, everywhere at once, because it was computed, not negotiated.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== STOP 5 ============================== -->
+<section id="stop5">
+  <span class="kicker">Stop 5 · The seal</span>
+  <h2>Two signatures on one truth</h2>
+  <p>Each shard's validators sign a certificate attesting the result they computed, outcome by outcome. The finalization rule is asymmetric on purpose: <strong>success requires a success from every participating shard; an abort from any one is terminal for all</strong>. The certificates cross, each side assembles the matched pair, the finalized result rides into a subsequent block, and the locks release. Ada's payment is now final on both chains — the same result, with full BFT finality, no reconciliation phase, no "pending" limbo, no rollback window.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DETOURS ============================== -->
+<section id="detours">
+  <span class="kicker">If things go wrong</span>
+  <h2>Every detour is signposted</h2>
+  <p>The happy path is the short story. The system's real character shows in the detours — each of which ends in the same place: <strong>one identical verdict on every shard</strong>.</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ THE ACCOUNT IS BUSY</span><h4>Held at the gate</h4><p>Another payment already holds Ada's account? Ours waits in line, promoted the instant the account frees. Contention costs latency, never correctness.</p></div>
+    <div class="card"><span class="x">✕ A GENUINE TANGLE</span><h4>The tiebreak</h4><p>Two payments deadlocked <em>across</em> shards — each holding what the other needs? Both shards detect it from the same committed facts and apply the same rule: lower hash wins, the loser aborts before running. <a href="generals.html">The generals →</a></p></div>
+    <div class="card"><span class="x">✕ THE PROVISIONS NEVER COME</span><h4>The deadline</h4><p>Every wave of cross-shard work carries a deadline on the attested clock. Unprovisioned when it strikes → the whole wave aborts, identically, everywhere. No one waits forever. <a href="clock.html">The clock →</a></p></div>
+    <div class="card"><span class="x">✕ A SHARD IS DYING</span><h4>The fence</h4><p>Shard 10 scheduled to terminate mid-flight? The payment's fate is read from the dying chain's frozen final records — settled there, finalize; absent, abort — never from message luck. <a href="testament.html">The will →</a></p></div>
+  </div>
+
+  <p>And an abort, when one happens, is not a half-state: it's a first-class terminal outcome sealed inside the certificates with the same finality as success. Ada's money is back, on every chain's account of events, everywhere.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== EPILOGUE ============================== -->
+<section id="epilogue">
+  <span class="kicker">Epilogue</span>
+  <h2>What Ada saw</h2>
+  <p>One signature. A short wait. One result. She never saw the two committees, the proofs fording the gap, the identical computation running twice, or the certificates matching outcome vectors — and she never saw the timetable resolving who was in charge, the lottery that staffed them, or the archive obligations underwriting every fetch. The entire apparatus exists so that a sharded world feels like one machine.</p>
+
+  <div class="callout">
+    <p><strong>One more thing she didn't see:</strong> this exact journey — every detour included, at the least convenient moments a seeded adversary can arrange — replayed thousands of times before her payment ever ran.</p>
+    <span class="why">That story is <a href="crashlab.html" style="color:var(--magenta)">the crash lab's</a>.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The mechanisms behind each stop</h2>
+  <p>Each stop on this route has a page of its own in this series — and a precise specification in the architecture docs.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/04-atomic-commitment.md">docs/04 — atomic commitment</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/00-overview.md">docs/00 — the overview</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6b6e">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

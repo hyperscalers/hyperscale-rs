@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — every design chooses its asterisks</title>
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --bg2: #121211;
+    --card: #171716;
+    --card-edge: #2a2a28;
+    --ink: #eeeeea;
+    --ink-dim: #a6a6a0;
+    --paper: #e8e8e2;
+    --red: #e85555;
+    --green: #5fd39a;
+    --amber: #e0b060;
+    --grad: linear-gradient(100deg, #f0f0ea, #a8a8a0);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #141412 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--paper); text-decoration: none; border-bottom: 1px solid #3a3a36; }
+  p a:hover, li a:hover { color: var(--ink); border-bottom-color: var(--paper); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--paper); border: 1px solid #3a3a36; background: #121210;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--red); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--paper); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html" aria-current="page">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · HOW IT COMPARES</span>
+  <h1>Every design chooses its <em>asterisks</em>.</h1>
+  <p class="lede">Every scaling pitch in this industry ends in a superscript: <em>*up to</em>, <em>*except when</em>, <em>*as long as</em>. That isn't dishonesty — it's engineering. Every architecture buys its headline with fine print somewhere. This page reads the fine print: the other families' — and, because fair is fair, <strong>ours</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE CLAIM ============================== -->
+<section id="claim">
+  <span class="kicker">01 · The claim</span>
+  <h2>Same headline, different footnotes</h2>
+  <p>Every serious blockchain architecture of the last decade advertises the same thing: more throughput. The headline is interchangeable. What distinguishes the designs — what actually determines what it's like to build on them and to use them — is never the number. It's the footnote.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 220" role="img" aria-label="Five identical throughput claims, each with a different fine-print footnote.">
+      <g>
+        <rect x="20" y="30" width="144" height="150" rx="10" fill="#171716" stroke="#2a2a28"/>
+        <text x="92" y="72" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">10× THE</text>
+        <text x="92" y="92" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">THROUGHPUT<tspan fill="#e85555">*</tspan></text>
+        <text x="92" y="130" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">*by buying bigger</text>
+        <text x="92" y="144" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">machines</text>
+        <text x="92" y="200" fill="#6a6a64" font-size="10.5" text-anchor="middle" class="mono">MONOLITHIC</text>
+      </g>
+      <g>
+        <rect x="178" y="30" width="144" height="150" rx="10" fill="#171716" stroke="#2a2a28"/>
+        <text x="250" y="72" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">10× THE</text>
+        <text x="250" y="92" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">THROUGHPUT<tspan fill="#e85555">*</tspan></text>
+        <text x="250" y="130" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">*within one rollup</text>
+        <text x="250" y="144" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">at a time</text>
+        <text x="250" y="200" fill="#6a6a64" font-size="10.5" text-anchor="middle" class="mono">ROLLUPS</text>
+      </g>
+      <g>
+        <rect x="336" y="30" width="144" height="150" rx="10" fill="#171716" stroke="#2a2a28"/>
+        <text x="408" y="72" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">10× THE</text>
+        <text x="408" y="92" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">THROUGHPUT<tspan fill="#e85555">*</tspan></text>
+        <text x="408" y="130" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">*your swap may pause</text>
+        <text x="408" y="144" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">between shards</text>
+        <text x="408" y="200" fill="#6a6a64" font-size="10.5" text-anchor="middle" class="mono">ASYNC SHARDS</text>
+      </g>
+      <g>
+        <rect x="494" y="30" width="144" height="150" rx="10" fill="#171716" stroke="#2a2a28"/>
+        <text x="566" y="72" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">10× THE</text>
+        <text x="566" y="92" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">THROUGHPUT<tspan fill="#e85555">*</tspan></text>
+        <text x="566" y="130" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">*bridge risk</text>
+        <text x="566" y="144" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">not included</text>
+        <text x="566" y="200" fill="#6a6a64" font-size="10.5" text-anchor="middle" class="mono">APP-CHAINS</text>
+      </g>
+      <g>
+        <rect x="652" y="30" width="144" height="150" rx="10" fill="#141412" stroke="#e8e8e2" stroke-width="1.5" class="pulse"/>
+        <text x="724" y="72" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">10× THE</text>
+        <text x="724" y="92" fill="#eeeeea" font-size="15" font-weight="700" text-anchor="middle">THROUGHPUT<tspan fill="#e85555">*</tspan></text>
+        <text x="724" y="130" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">*terms below — and in</text>
+        <text x="724" y="144" fill="#a6a6a0" font-size="9.5" text-anchor="middle" class="mono">the rest of the series</text>
+        <text x="724" y="200" fill="#6a6a64" font-size="10.5" text-anchor="middle" class="mono">HYPERSCALE</text>
+      </g>
+    </svg>
+    <figcaption>The headline never distinguishes anything. Read footnotes, not numbers.</figcaption>
+  </figure>
+
+  <p>The designs below are <strong>families, not logos</strong> — each a whole family of real systems, described by its architecture rather than any brand, partly out of fairness and mostly because the architecture is what lasts. Every one of them is built by serious engineers who chose its asterisks deliberately.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE FAMILIES ============================== -->
+<section id="families">
+  <span class="kicker">02 · The families</span>
+  <h2>Four ways to buy throughput</h2>
+
+  <h3>Don't shard — race</h3>
+  <p>The monolithic family keeps one chain and makes it as fast as hardware allows: every validator still executes every transaction, on ever-bigger machines. Full credit where due — this is the one approach that keeps atomicity, composability, and finality with <em>no</em> user-visible fine print at all. The asterisk is structural instead: <strong>the whole network's throughput is one machine's worth of compute</strong>, forever. Adding validators adds security, never capacity; scaling means raising the hardware bar, and every raise prices out independent validators. It's a ceiling with excellent semantics.</p>
+
+  <h3>Move execution elsewhere — rollups</h3>
+  <p>The rollup family scales by relocation: execution happens on many separate layers, which post their data and proofs back to one base chain for settlement. The base chain's security is genuinely inherited — for settlement. The asterisks live between the layers: <strong>each rollup is an island</strong>. Composability is rich within one and reduced to bridging between them; an atomic transaction spanning two rollups essentially does not exist. Day-to-day ordering typically rests with a sequencer — often a single operator — and moving value back out waits on challenge windows or proof pipelines. The ecosystem scales; the <em>unified world</em> that made composability valuable is what fragments.</p>
+
+  <h3>Shard and mail — asynchronous shards</h3>
+  <p>The async-sharding family splits one chain into many and has them message each other: a cross-shard transaction becomes a relay of receipts hopping shard to shard, block by block. Throughput genuinely scales, and everything staying within one shard is clean. The asterisk lands on whoever builds and uses cross-shard applications: <strong>the transaction has visible half-done states</strong> — your swap has left one shard and not yet arrived at the other — and contract authors inherit the distributed-systems homework: partial failures, compensating actions, retry logic. Atomicity isn't provided; it's do-it-yourself.</p>
+
+  <h3>Every app its own chain — app-chains and bridges</h3>
+  <p>The sovereign-chain family gives each application its own blockchain — its own rules, fees, and validators — and connects them with bridges. Sovereignty is real and sometimes exactly right. The asterisks: security no longer pools (each chain must recruit and pay its own defense), and composability means <strong>bridges</strong> — a smaller committee, multisig, or light-client contract standing between two security domains. Bridges are, by a wide margin, the costliest single exploit category in this industry's history. Every connection is another one.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 360" role="img" aria-label="A comparison matrix of the four families and Hyperscale across four properties.">
+      <!-- column headers -->
+      <g font-size="10.5" fill="#a6a6a0" class="mono">
+        <text x="330" y="42" text-anchor="middle">ATOMIC</text>
+        <text x="330" y="56" text-anchor="middle">CROSS-SHARD</text>
+        <text x="460" y="42" text-anchor="middle">ONE COMPOSABLE</text>
+        <text x="460" y="56" text-anchor="middle">WORLD</text>
+        <text x="590" y="42" text-anchor="middle">FINAL</text>
+        <text x="590" y="56" text-anchor="middle">MEANS FINAL</text>
+        <text x="720" y="42" text-anchor="middle">SCALES WITH</text>
+        <text x="720" y="56" text-anchor="middle">MACHINES</text>
+      </g>
+      <line x1="40" y1="70" x2="780" y2="70" stroke="#2a2a28"/>
+      <!-- rows -->
+      <g font-size="13">
+        <text x="40" y="104" fill="#eeeeea">Monolithic</text>
+        <text x="330" y="104" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="460" y="104" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="590" y="104" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="720" y="104" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <line x1="40" y1="122" x2="780" y2="122" stroke="#1d1d1b"/>
+
+        <text x="40" y="156" fill="#eeeeea">Rollups</text>
+        <text x="330" y="156" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <text x="460" y="156" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <text x="590" y="156" fill="#e0b060" text-anchor="middle" class="mono">~</text>
+        <text x="720" y="156" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <line x1="40" y1="174" x2="780" y2="174" stroke="#1d1d1b"/>
+
+        <text x="40" y="208" fill="#eeeeea">Async shards</text>
+        <text x="330" y="208" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <text x="460" y="208" fill="#e0b060" text-anchor="middle" class="mono">~</text>
+        <text x="590" y="208" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="720" y="208" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <line x1="40" y1="226" x2="780" y2="226" stroke="#1d1d1b"/>
+
+        <text x="40" y="260" fill="#eeeeea">App-chains</text>
+        <text x="330" y="260" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <text x="460" y="260" fill="#e85555" text-anchor="middle" class="mono">✕</text>
+        <text x="590" y="260" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="720" y="260" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <line x1="40" y1="278" x2="780" y2="278" stroke="#1d1d1b"/>
+
+        <rect x="30" y="292" width="760" height="42" rx="9" fill="#141412" stroke="#e8e8e2" opacity="0.9"/>
+        <text x="40" y="318" fill="#eeeeea" font-weight="700">Hyperscale<tspan fill="#e85555">*</tspan></text>
+        <text x="330" y="318" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="460" y="318" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="590" y="318" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+        <text x="720" y="318" fill="#5fd39a" text-anchor="middle" class="mono">✓</text>
+      </g>
+      <text x="780" y="352" fill="#a6a6a0" font-size="11" text-anchor="end" class="mono">~ = with significant caveats · * = fine print below — none of it on these columns</text>
+    </svg>
+    <figcaption>Monolithic gets three of four and hits a ceiling. Everyone else trades a row for scale. The last row claims all four, unqualified — its asterisk is on the name, not the columns, and that placement is the entire argument.</figcaption>
+  </figure>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE REFUSAL ============================== -->
+<section id="refusal">
+  <span class="kicker">03 · The refusal</span>
+  <h2>How the last row is possible</h2>
+  <p>In a single paragraph: a transaction declares the state it touches, so every shard that owns any of it participates. Shards exchange <em>proven facts</em> rather than trusted messages, execute the identical deterministic computation, and certify results that either match everywhere or abort everywhere — atomic, composable, final, with no coordinator and no votes on the outcome (<a href="generals.html">the generals</a>). Shards split and merge with demand without moving data (<a href="library.html">the library</a>), and one vote-attested clock keeps every committee lookup unambiguous (<a href="clock.html">the clock</a>). Throughput scales with the shard count; the semantics stay those of one chain.</p>
+
+  <div class="callout">
+    <p><strong>So where did the asterisks go?</strong> They didn't vanish — nobody gets zero. They moved.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== OUR ASTERISKS ============================== -->
+<section id="ours">
+  <span class="kicker">04 · Our asterisks</span>
+  <h2>The fine print on the last row</h2>
+
+  <div class="cards">
+    <div class="card"><span class="x">* DECLARED ACCESS</span><h4>You must say what you touch</h4><p>Every transaction names its state up front — that's what makes routing, atomicity, and conflict analysis computable. Most applications fit naturally; code built around touching arbitrary state discovered mid-execution needs rethinking. The single-chain semantics are bought with this discipline.</p></div>
+    <div class="card"><span class="x">* CROSS-SHARD LATENCY</span><h4>Atomic, not instant</h4><p>A cross-shard transaction runs a pipeline — order, provision, execute, certify — spanning blocks on multiple chains. It takes longer than a single-shard transaction. What it never has is a half-done state: slower, never partial.</p></div>
+    <div class="card"><span class="x">* A SIZED ASSUMPTION</span><h4>Committee honesty is statistical</h4><p>Each committee tolerates a third corrupt; keeping every committee under that line rests on sampling from a mostly-honest pool — a probability that must be <em>sized</em>, not a theorem. <a href="kleroterion.html">The lottery</a> states this plainly.</p></div>
+  </div>
+
+  <p>Notice where these three live — and notice where they don't. <strong>Not one of them attaches to the matrix's columns.</strong> The atomicity is not conditional, the composability is not partial, finality carries no window, and the scaling has no ceiling clause. That is the front page's promise — <em>split the work, not the world</em> — kept without a footnote: the world your transaction lives in stays whole. Fine print still exists; nothing escapes it. The other families' sits in user-visible semantics — the swap pausing mid-flight, the withdrawal waiting out a window, the assets crossing a bridge. Hyperscale's sits in the <strong>programming model and the security sizing</strong> — places engineers manage once, at design time. That relocation is the actual thesis of the whole system: <em>fine print is inevitable; putting it in front of users is not.</em></p>
+
+  <div class="callout">
+    <p><strong>The comparison we'd actually defend:</strong> not "no asterisks" — but asterisks deliberately moved out of what users experience and into what engineers engineer.</p>
+    <span class="why">The claim is checkable: the rest of the series is the terms and conditions, written out in full.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The terms and conditions, in full</h2>
+  <p>This page describes architecture families as they stand in mid-2026 — families evolve, and this page should evolve with them. The rest of the series is evergreen mechanism; start with the overview or the journey.</p>
+  <div class="foot-links">
+    <a href="index.html">the full system explainer</a>
+    <a href="journey.html">follow one payment end to end</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/00-overview.md">docs/00 — the overview</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#6a6a64">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

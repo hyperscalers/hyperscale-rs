@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — why the chain cannot fork</title>
+<style>
+  :root {
+    --bg: #0b0a10;
+    --bg2: #110f1a;
+    --card: #161326;
+    --card-edge: #262146;
+    --ink: #ebe9f2;
+    --ink-dim: #a5a0ba;
+    --violet: #a89af0;
+    --cyanA: #6fc8e0;
+    --amberB: #e8b060;
+    --green: #5fd39a;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #b8aaf5, #7a5fd8);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #131022 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--violet); text-decoration: none; border-bottom: 1px solid #2e2856; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--violet); border: 1px solid #2e2856; background: #0f0d1c;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--green); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--violet); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html" aria-current="page">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · FORK SAFETY</span>
+  <h1>Why the chain cannot <em>fork</em>.</h1>
+  <p class="lede">A committee where up to a third are corrupt. Two competing petitions. And one stubborn arithmetic fact: <strong>any two supermajorities must share an honest member</strong>. The deepest safety property in the system rests on a proof you can check on your fingers — used twice.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE SIN ============================== -->
+<section id="sin">
+  <span class="kicker">01 · The stakes</span>
+  <h2>The cardinal sin</h2>
+  <p>A <strong>fork</strong> is two versions of history, both claiming to be final: block #100 says Ada's coin went to Bo, the <em>other</em> block #100 says it went to Cy, and different parts of the world believe different copies. Every promise a blockchain makes collapses at that moment — "final" meant nothing, and the same coin was spent twice.</p>
+  <p>For Hyperscale the stakes compound, because everything else in the system leans on each shard having exactly one history: cross-shard transfers prove state against a shard's committed blocks (<a href="generals.html">the generals</a>), the beacon records each shard's boundary blocks as fact (<a href="clock.html">the clock</a>), and a dying shard's <a href="testament.html">will</a> is read from its one true chain. A forked shard wouldn't just double-spend locally — it would poison every proof drawn from it. So everything narrows to the one property under all the others: <strong>within a committee where fewer than a third are corrupt, two conflicting blocks can never both be committed</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE VILLAGE ============================== -->
+<section id="village">
+  <span class="kicker">02 · The arithmetic</span>
+  <h2>One village, two petitions</h2>
+  <p>Picture a village council of <strong>ten electors</strong>, of whom at most <strong>three</strong> are corrupt — you don't know which. Nothing becomes official without a petition signed by <strong>seven</strong>. Now suppose two competing petitions both claim to have passed in the same session. Count: 7 + 7 = 14 signatures, but only 10 electors exist — so <strong>at least 4 people signed both</strong>. At most 3 of those can be corrupt. Therefore at least one double-signer is <em>honest</em>.</p>
+  <p>And an honest elector follows one iron rule: <strong>one signature per session, ever</strong>. So the fourth double-signer is a contradiction — the second petition can never actually gather its seven. Not because anyone watched for cheating, but because the numbers don't leave room for it.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 320" role="img" aria-label="Ten villagers with two overlapping quorums of seven; the overlap of four must contain an honest member.">
+      <!-- quorum ovals -->
+      <ellipse cx="310" cy="150" rx="255" ry="95" fill="#0d1e26" fill-opacity="0.35" stroke="#6fc8e0" stroke-width="2"/>
+      <ellipse cx="510" cy="150" rx="255" ry="95" fill="#241a10" fill-opacity="0.35" stroke="#e8b060" stroke-width="2"/>
+      <text x="150" y="52" fill="#6fc8e0" font-size="13.5" font-weight="700">PETITION A · needs 7</text>
+      <text x="530" y="52" fill="#e8b060" font-size="13.5" font-weight="700">PETITION B · needs 7</text>
+      <!-- villagers: 10 across, overlap = positions 4..7 -->
+      <!-- honest: green-ish outline; corrupt: rose fill -->
+      <g>
+        <circle cx="120" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+        <circle cx="185" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+        <circle cx="250" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+        <!-- overlap four -->
+        <circle cx="345" cy="150" r="15" fill="#2c1420" stroke="#f07a9a" stroke-width="2"/>
+        <circle cx="410" cy="150" r="15" fill="#2c1420" stroke="#f07a9a" stroke-width="2"/>
+        <circle cx="475" cy="150" r="15" fill="#2c1420" stroke="#f07a9a" stroke-width="2"/>
+        <circle cx="540" cy="150" r="16" fill="#0e2418" stroke="#5fd39a" stroke-width="3" class="pulse"/>
+        <!-- right three -->
+        <circle cx="630" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+        <circle cx="695" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+        <circle cx="758" cy="150" r="15" fill="#161326" stroke="#5a5478" stroke-width="2"/>
+      </g>
+      <text x="410" y="205" fill="#f07a9a" font-size="12" text-anchor="middle">even if all 3 corrupt electors sit in the overlap…</text>
+      <text x="540" y="112" fill="#5fd39a" font-size="12.5" text-anchor="middle">…the 4th is honest</text>
+      <text x="410" y="262" fill="#a5a0ba" font-size="13" text-anchor="middle">7 + 7 = 14 signatures · 10 electors · overlap ≥ 4 · corrupt ≤ 3</text>
+      <text x="410" y="286" fill="#ebe9f2" font-size="13.5" font-weight="600" text-anchor="middle">at least one honest elector signed both — and honest electors don't.</text>
+    </svg>
+    <figcaption>Quorum intersection: check it on your fingers. In protocol terms — committee 3f+1, quorums 2f+1, at most f corrupt: any two quorums share at least f+1 members, at least one honest.</figcaption>
+  </figure>
+
+  <p>That's the whole engine. In Hyperscale each shard's committee plays the village, a block certificate is a petition (2f+1 signatures out of 3f+1 seats), and the honest one-signature rule is enforced by every validator on itself: <strong>at most one vote per round, ever</strong>. Two conflicting certificates in the same round are arithmetically impossible.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE TWIST ============================== -->
+<section id="twist">
+  <span class="kicker">03 · The twist</span>
+  <h2>Two certificates can exist. Two commits cannot.</h2>
+  <p>Here's the part that surprises people who expect the obvious defense to be the whole defense. Rounds don't always succeed — a proposer stalls, the round times out, a new round begins (<a href="clock.html">timeouts also burn rounds</a>). And <em>across different rounds</em>, two sibling blocks at the same height genuinely can each gather a full certificate, without a single honest validator breaking any rule. The system does not prevent this — <strong>and doesn't need to</strong>.</p>
+  <p>Because a certificate is not a commitment. A block <strong>commits</strong> only when a certificate forms for a child at <em>exactly the next round</em> — an immediate, back-to-back confirmation. And the act of signing that confirmation carries a promise: every signer <strong>locks</strong>, vowing never again to endorse anything that doesn't build on what they just confirmed. Now the village arithmetic strikes a second time: any future certificate needs 2f+1 signatures, and any 2f+1 must include at least one honest elector from the confirming quorum — a promise-keeper whose lock forbids endorsing the rival branch. The rival may hold a certificate; it can never gather another one on top. It withers.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 320" role="img" aria-label="Two sibling blocks both certified at one height; only the one with a round-contiguous child certificate commits, the other branch cannot extend.">
+      <!-- parent -->
+      <rect x="40" y="130" width="110" height="56" rx="10" fill="#161326" stroke="#262146"/>
+      <text x="95" y="154" fill="#ebe9f2" font-size="13" font-weight="600" text-anchor="middle">parent</text>
+      <text x="95" y="172" fill="#a5a0ba" font-size="11" text-anchor="middle" class="mono">height 99</text>
+      <!-- B top -->
+      <line x1="150" y1="145" x2="244" y2="80" stroke="#262146" stroke-width="2"/>
+      <rect x="244" y="52" width="136" height="56" rx="10" fill="#0d1e26" stroke="#6fc8e0" stroke-width="1.5"/>
+      <text x="312" y="76" fill="#6fc8e0" font-size="13" font-weight="600" text-anchor="middle">block B</text>
+      <text x="312" y="94" fill="#a5a0ba" font-size="10.5" text-anchor="middle" class="mono">height 100 · round 5</text>
+      <rect x="386" y="60" width="46" height="20" rx="10" fill="#0e2418" stroke="#5fd39a"/>
+      <text x="409" y="74" fill="#5fd39a" font-size="10.5" text-anchor="middle" class="mono">QC ✓</text>
+      <!-- B' bottom -->
+      <line x1="150" y1="172" x2="244" y2="238" stroke="#262146" stroke-width="2"/>
+      <rect x="244" y="212" width="136" height="56" rx="10" fill="#241a10" stroke="#e8b060" stroke-width="1.5"/>
+      <text x="312" y="236" fill="#e8b060" font-size="13" font-weight="600" text-anchor="middle">block B′</text>
+      <text x="312" y="254" fill="#a5a0ba" font-size="10.5" text-anchor="middle" class="mono">height 100 · round 7</text>
+      <rect x="386" y="220" width="46" height="20" rx="10" fill="#0e2418" stroke="#5fd39a"/>
+      <text x="409" y="234" fill="#5fd39a" font-size="10.5" text-anchor="middle" class="mono">QC ✓</text>
+      <!-- child of B -->
+      <line x1="380" y1="80" x2="466" y2="80" stroke="#6fc8e0" stroke-width="2" class="flow"/>
+      <rect x="466" y="52" width="146" height="56" rx="10" fill="#0d1e26" stroke="#6fc8e0" stroke-width="1.5"/>
+      <text x="539" y="76" fill="#6fc8e0" font-size="13" font-weight="600" text-anchor="middle">child C</text>
+      <text x="539" y="94" fill="#a5a0ba" font-size="10.5" text-anchor="middle" class="mono">round 6 — contiguous!</text>
+      <rect x="618" y="60" width="46" height="20" rx="10" fill="#0e2418" stroke="#5fd39a"/>
+      <text x="641" y="74" fill="#5fd39a" font-size="10.5" text-anchor="middle" class="mono">QC ✓</text>
+      <text x="712" y="70" fill="#5fd39a" font-size="13" font-weight="700">B COMMITS</text>
+      <text x="712" y="88" fill="#a5a0ba" font-size="11">signers lock on B</text>
+      <!-- B' withering -->
+      <line x1="380" y1="240" x2="466" y2="240" stroke="#4a4060" stroke-width="2" stroke-dasharray="4 6"/>
+      <text x="480" y="236" fill="#f07a9a" font-size="12.5">✕ every future quorum contains a promise-keeper</text>
+      <text x="480" y="254" fill="#a5a0ba" font-size="11.5">no next certificate can ever form — the branch withers</text>
+      <text x="410" y="306" fill="#a5a0ba" font-size="12.5" text-anchor="middle">the overlap, used twice: once per round, once through the locks</text>
+    </svg>
+    <figcaption>The division of labor: the one-vote rule makes same-round conflict impossible; the lock plus the contiguous-commit rule makes cross-round conflict uncommittable.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <p><strong>The design's honest shape:</strong> disagreement is allowed to exist; it is only forbidden to <em>matter</em>. Certificates are cheap and can conflict. Commitment is expensive precisely so that the arithmetic can guard it.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE RULES ============================== -->
+<section id="rules">
+  <span class="kicker">04 · The promises</span>
+  <h2>Three rules every honest validator keeps</h2>
+  <p>All of the above compiles down to a tiny personal discipline — two counters each validator maintains against itself, checked before every signature:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ ONE VOTE PER ROUND</span><h4>No second thoughts</h4><p>Vote or time out — either way the round is spent, forever. A round you gave up on can never be voted afterward, even if the missing block shows up late. (Signing twice anyway is self-proving treason: permanent expulsion — <a href="kleroterion.html">the audit</a>.)</p></div>
+    <div class="card"><span class="ok">◦ THE LOCK ONLY RISES</span><h4>Promises don't expire</h4><p>Once locked on a block, a validator will only ever endorse things that build at least that high. There is no unlock rule — no input, no timeout, no leader's plea can lower it.</p></div>
+    <div class="card"><span class="ok">◦ NEVER VOTE BLIND</span><h4>Hold the whole block first</h4><p>A vote is cast only while holding the block's complete contents — which quietly turns every certificate into a custody receipt too (<a href="archive.html">the archive</a>).</p></div>
+  </div>
+
+  <p>And the promises survive the promiser: both counters are written to disk <em>before</em> any signature leaves the machine, so a validator that crashes and restarts wakes up still bound by every vow it ever made. A promise that could be forgotten by pulling a power cord would be no promise at all.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE HUNT ============================== -->
+<section id="hunt">
+  <span class="kicker">05 · The hunt</span>
+  <h2>Trying very hard to break it</h2>
+  <p>An argument this load-bearing doesn't get to rest on being persuasive. A dedicated adversarial harness runs shard consensus under hostile scheduling — messages delayed, dropped, reordered, delivered at the cruelest moments a seeded adversary can find — and after every run asserts one thing: <strong>no committable fork exists anywhere in the wreckage</strong>. Partitioned committees are watched for the correct behavior too: a committee split below quorum <em>halts</em> rather than diverging, and resumes cleanly on heal — safety never depends on timing, only liveness does. Every one of those runs replays byte-for-byte from its seed (<a href="crashlab.html">the crash lab</a>), so a counterexample, if one ever appeared, would be a permanent exhibit rather than a rumor. The restart case gets its own rehearsal: a crash-restart scenario — its script produced not by a seed but by a model checker holding every possible schedule at once (<a href="proof.html">the proof</a>) — kills a validator mid-promise and asserts the revived node still keeps it.</p>
+
+  <div class="callout">
+    <p><strong>The lesson:</strong> don't build a system where disagreement is impossible — build one where disagreement can't be <em>ratified</em>. Let petitions conflict; make enactment require an immediate confirmation whose signers' promises, by pigeonhole, must surface in every future quorum.</p>
+    <span class="why">One height, at most one committed block — not by vigilance, but by counting.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs state the safe-vote rule, the round-contiguous commit rule, the pacemaker that keeps rounds advancing, and the invariants — including exactly which registers hold the promises.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/01-consensus-layers.md">docs/01 — the consensus layers</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/05-byzantine-safety.md">docs/05 — byzantine safety</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c5870">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

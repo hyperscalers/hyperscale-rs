@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — the critical never queues behind the bulk</title>
+<style>
+  :root {
+    --bg: #0c0c0a;
+    --bg2: #121210;
+    --card: #181712;
+    --card-edge: #2c2a1e;
+    --ink: #edecE4;
+    --ink-dim: #a8a696;
+    --tagyellow: #e0d060;
+    --tagred: #e05a5a;
+    --tagorange: #e8a050;
+    --taggreen: #5fd39a;
+    --rose: #f07a9a;
+    --grad: linear-gradient(100deg, #e8d868, #b0a030);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #14130a 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--tagyellow); text-decoration: none; border-bottom: 1px solid #3a3620; }
+  p a:hover, li a:hover { color: var(--ink); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--tagyellow); border: 1px solid #3a3620; background: #14130a;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--tagred); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--taggreen); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--tagyellow); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html" aria-current="page">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · OVERLOAD &amp; PRIORITY</span>
+  <h1>The critical never queues behind the <em>bulk</em>.</h1>
+  <p class="lede">On Napoleon's battlefields, a surgeon invented a rule that still runs every emergency room on earth: treat by urgency — never by rank, never by order of arrival. Hyperscale's network layer runs the same rule, because a node under overload is exactly a hospital in a disaster: <strong>demand spikes at the precise moment capacity drops</strong>.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1797 ============================== -->
+<section id="larrey">
+  <span class="kicker">01 · 1797</span>
+  <h2>The surgeon who sorted</h2>
+  <p>Before Dominique-Jean Larrey, the wounded waited where they fell until the battle ended — then were treated in order of rank: officers first, however lightly scratched. Larrey, Napoleon's chief surgeon, built fast horse-drawn ambulances — <em>ambulances volantes</em> — to reach the wounded during the fighting, and then did the more radical thing: he sorted them. By urgency alone. The dying colonel-of-nothing before the grazed general; the salvageable before the comfortable. The French verb <em>trier</em>, to sort, gave the practice its name: <strong>triage</strong>.</p>
+  <p>Underneath the battlefield drama is a cold scheduling insight that took medicine decades to articulate and computing decades more: <strong>when you cannot do everything, the decision of what never waits must be made in advance</strong> — because at the moment of overload, the queue itself is what kills.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== DEATH SPIRAL ============================== -->
+<section id="spiral">
+  <span class="kicker">02 · The death spiral</span>
+  <h2>How a node drowns in its own rescue</h2>
+  <p>Here is the failure that motivated this whole layer — observed live during this system's development. A validator falls behind (a GC pause, a network blip, anything). It starts catching up: bulk-fetching the blocks it missed. The catch-up traffic floods its own connection — and starves the small, urgent consensus messages that represent <em>now</em>. Starved of now, it falls further behind, so it fetches harder, so it starves longer. <strong>The rescue is the drowning.</strong> No amount of bandwidth fixes this; the fix is Larrey's: the fast heartbeat must never wait behind the history download, and that ordering must be decided before the crisis, not during it.</p>
+
+  <div class="cards">
+    <div class="card"><span class="x">✕ FIRST COME, FIRST SERVED</span><h4>Fair and fatal</h4><p>A FIFO queue can't tell a consensus vote from a megabyte of catch-up. Under load, "fair" means the urgent waits its turn behind the enormous.</p></div>
+    <div class="card"><span class="x">✕ ONE QUEUE FOR EVERYTHING</span><h4>Bulk wins by volume</h4><p>Recovery traffic is a firehose; consensus traffic is a whisper. Any shared, unranked channel is won by the firehose — precisely when the whisper matters most.</p></div>
+    <div class="card"><span class="x">✕ INFINITE WAITING ROOMS</span><h4>The buffer is the casualty</h4><p>Unbounded queues convert overload into memory exhaustion — the waiting room grows until it kills the hospital. Every queue needs a size and a policy for the overflow.</p></div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE TAGS ============================== -->
+<section id="tags">
+  <span class="kicker">03 · The tags</span>
+  <h2>Five colors of urgency</h2>
+  <p>So every message in Hyperscale carries a <strong>class</strong> — a triage tag on a spectrum from "treat immediately" to "can wait indefinitely": live consensus at the top; then the traffic that completes blocks; then cross-shard progress; then recovery; and at the bottom, bulk catch-up. The tail of the spectrum is <strong>sheddable by design</strong>: bounded queues, capped shares of the connection, drop-on-overflow. Under stress, catch-up degrades gracefully and retries later; consensus does not degrade at all.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 320" role="img" aria-label="Five message classes passing through an overloaded node; consensus passes untouched while bulk traffic is shed.">
+      <!-- tags -->
+      <g class="mono" font-size="12">
+        <rect x="40" y="34"  width="215" height="34" rx="8" fill="#241210" stroke="#e05a5a" stroke-width="1.5"/>
+        <text x="56" y="56" fill="#e05a5a">CONSENSUS · immediate</text>
+        <rect x="40" y="90"  width="215" height="34" rx="8" fill="#211808" stroke="#e8a050"/>
+        <text x="56" y="112" fill="#e8a050">BLOCK COMPLETION</text>
+        <rect x="40" y="146" width="215" height="34" rx="8" fill="#201d0a" stroke="#e0d060"/>
+        <text x="56" y="168" fill="#e0d060">CROSS-SHARD PROGRESS</text>
+        <rect x="40" y="202" width="215" height="34" rx="8" fill="#141a12" stroke="#7a9a6a"/>
+        <text x="56" y="224" fill="#9ab88a">RECOVERY</text>
+        <rect x="40" y="258" width="215" height="34" rx="8" fill="#171613" stroke="#5a584a"/>
+        <text x="56" y="280" fill="#8a887a">BULK CATCH-UP · sheddable</text>
+      </g>
+      <!-- the strait -->
+      <rect x="390" y="20" width="130" height="284" rx="14" fill="#121210" stroke="#2c2a1e"/>
+      <text x="455" y="76" fill="#a8a696" font-size="11.5" text-anchor="middle" class="mono">THE NODE,</text>
+      <text x="455" y="92" fill="#a8a696" font-size="11.5" text-anchor="middle" class="mono">OVERLOADED</text>
+      <!-- flows through -->
+      <line x1="255" y1="51"  x2="600" y2="51"  stroke="#e05a5a" stroke-width="3.5" class="flow"/>
+      <line x1="255" y1="107" x2="600" y2="107" stroke="#e8a050" stroke-width="2.5" class="flow"/>
+      <line x1="255" y1="163" x2="600" y2="163" stroke="#e0d060" stroke-width="2" class="flow"/>
+      <line x1="255" y1="219" x2="470" y2="219" stroke="#7a9a6a" stroke-width="1.5" class="flow" opacity="0.7"/>
+      <line x1="470" y1="219" x2="600" y2="219" stroke="#7a9a6a" stroke-width="1" stroke-dasharray="2 6" opacity="0.5"/>
+      <line x1="255" y1="275" x2="430" y2="275" stroke="#5a584a" stroke-width="1.5" class="flow" opacity="0.6"/>
+      <!-- shed -->
+      <path d="M 430 275 L 455 296" stroke="#5a584a" stroke-width="1.5" stroke-dasharray="3 4"/>
+      <text x="470" y="302" fill="#8a887a" font-size="11" class="mono">shed — retried later, bounded</text>
+      <!-- outcomes -->
+      <text x="612" y="55"  fill="#e05a5a" font-size="12" class="mono">the chain keeps beating</text>
+      <text x="612" y="111" fill="#e8a050" font-size="12" class="mono">blocks keep filling</text>
+      <text x="612" y="167" fill="#e0d060" font-size="12" class="mono">transfers keep moving</text>
+      <text x="612" y="223" fill="#9ab88a" font-size="12" class="mono">recovery slows…</text>
+    </svg>
+    <figcaption>Shedding is a designed behavior with a bounded blast radius — not a failure. The whisper always outranks the firehose.</figcaption>
+  </figure>
+
+  <p>Notice what this does to the death spiral: the lagging node's own bulk fetching can no longer starve its own consensus intake. It keeps hearing <em>now</em> while it back-fills <em>then</em> — at whatever rate the priority spectrum leaves for it — and the loop that fed on itself simply has nothing to eat. (The urgent classes are also precisely what <a href="archive.html">the archive's</a> fetch obligations and <a href="generals.html">the provisions</a> ride on when gossip fails them.)</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== INTAKE RULES ============================== -->
+<section id="intake">
+  <span class="kicker">04 · The intake rules</span>
+  <h2>Malice is just another load pattern</h2>
+  <p>Everything above assumes traffic that is merely <em>heavy</em>. But some of the crowd at the door is hostile — and the same triage discipline handles it, because the safety rules already make Byzantine <em>content</em> harmless (<a href="overlap.html">the overlap</a>), leaving only Byzantine <em>volume</em> to bound:</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ NO SELF-REPORTED WEIGHTS</span><h4>Checked at the door</h4><p>Wire formats carry hard size caps enforced <em>before</em> any memory is allocated. A peer claiming to send a three-tonne patient is refused at the ambulance bay, not weighed in the ward.</p></div>
+    <div class="card"><span class="ok">◦ CAPPED BEDS PER CASE</span><h4>Bounded buffers, useful excess</h4><p>Only a small constant number of competing block headers is ever buffered per consensus slot — an honest proposer signs exactly one, so the excess isn't just dropped, it's <a href="kleroterion.html">evidence</a>.</p></div>
+    <div class="card"><span class="ok">◦ POLITE PERSISTENCE</span><h4>Backoff and rotation</h4><p>Every fetch path retries with exponential backoff and rotates peers — a dead or malicious server converts into bounded retry load spread elsewhere, never a hammering loop.</p></div>
+  </div>
+
+  <p>Two quieter rules complete the intake. <strong>Bounded speculation:</strong> a flood of far-future garbage can't drag a replica's attention beyond a capped distance from its last certified block, so hostile peers can't inflate its view or burn its CPU verifying fantasy. <strong>Reputation with receipts:</strong> every gossiped message gets an explicit accept/reject verdict that feeds peer scoring — a peer that keeps sending junk loses standing deterministically, on every honest node that hears it.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE LESSON ============================== -->
+<section id="lesson">
+  <span class="kicker">05 · The lesson</span>
+  <h2>Overload tells the truth</h2>
+  <p>A system under overload reveals its actual priorities — the ones enforced by its queues, not the ones written in its mission statement. Priority isolation here is a standing invariant — exercised, not assumed: the fault suite floods, partitions, and drops traffic class by class and asserts the consensus heartbeat never misses (<a href="crashlab.html">the crash lab</a>).</p>
+
+  <div class="callout">
+    <p><strong>Larrey's rule, restated for networks:</strong> decide in advance what you will never fail to do — then build the queues so that, on the worst day, that decision executes itself.</p>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The architecture docs specify the message classes, the bounded queues and slot-pool shares, the decode-time caps, and the priority-isolation invariant they uphold.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/05-byzantine-safety.md">docs/05 — byzantine safety · bounded resources</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#6b6a58">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>

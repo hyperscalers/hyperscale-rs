@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — how do you know?</title>
+<style>
+  :root {
+    --bg: #0b0e0d;
+    --bg2: #101512;
+    --card: #151b17;
+    --card-edge: #26332c;
+    --ink: #eaf0ec;
+    --ink-dim: #a2b0a8;
+    --chalk: #cfe0d6;
+    --sage: #8fb0a0;
+    --qed: #5fd39a;
+    --rose: #f07a9a;
+    --amber: #e0b060;
+    --grad: linear-gradient(100deg, #d4e6da, #7fa892);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 70% -10%, #0e1611 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 72px 0 8px; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h2 { font-size: 34px; margin-bottom: 6px; }
+  h3 { font-size: 19px; margin: 26px 0 8px; }
+  p  { margin: 14px 0; color: var(--ink-dim); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  p a, li a { color: var(--chalk); text-decoration: none; border-bottom: 1px solid #2a3c33; }
+  p a:hover, li a:hover { color: var(--ink); border-bottom-color: var(--chalk); }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    background: var(--grad);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    display: block; margin-bottom: 14px;
+  }
+  .lede { font-size: 20px; color: var(--ink-dim); }
+
+  .site-nav {
+    max-width: 880px; margin: 0 auto; padding: 20px 24px 0;
+    display: flex; align-items: baseline; gap: 10px 22px; flex-wrap: wrap;
+  }
+  .site-nav .brand {
+    font: 700 13px/1 var(--mono); letter-spacing: 0.16em;
+    color: var(--ink); text-decoration: none;
+  }
+  .site-nav .links { display: flex; gap: 4px 16px; flex-wrap: wrap; }
+  .site-nav .links a {
+    font: 500 12px/1.6 var(--mono); letter-spacing: 0.05em;
+    color: var(--ink-dim); opacity: 0.72; text-decoration: none; white-space: nowrap;
+  }
+  .site-nav .links a:hover { opacity: 1; color: var(--ink); }
+  .site-nav .links a[aria-current="page"] {
+    opacity: 1;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .hero { padding: 84px 0 40px; }
+  .hero h1 { font-size: clamp(38px, 6.6vw, 60px); font-weight: 750; }
+  .hero h1 em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { max-width: 660px; margin-top: 20px; }
+  .plate {
+    display: inline-block; margin-bottom: 28px;
+    font: 600 12px/1 var(--mono); letter-spacing: 0.1em;
+    color: var(--chalk); border: 1px solid #2a3c33; background: #0d1410;
+    padding: 7px 12px; border-radius: 99px;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 26px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: 14px; padding: 20px 20px 16px;
+  }
+  .card h4 { font-size: 15.5px; margin-bottom: 6px; color: var(--ink); }
+  .card p { font-size: 14.5px; margin: 0; }
+  .card .x  { color: var(--rose); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+  .card .ok { color: var(--qed); font-family: var(--mono); font-size: 13px; display: block; margin-bottom: 8px; }
+
+  .callout {
+    border-left: 3px solid; border-image: var(--grad) 1;
+    background: var(--bg2); border-radius: 0 12px 12px 0;
+    padding: 16px 20px; margin: 26px 0;
+  }
+  .callout p { margin: 0; color: var(--ink); font-size: 16.5px; }
+  .callout .why { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14.5px; }
+
+  figure { margin: 30px 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 13.5px; color: var(--ink-dim); margin-top: 10px; text-align: center; }
+  .panel { background: var(--bg2); border: 1px solid var(--card-edge); border-radius: 16px; padding: 22px; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+
+  .flow { stroke-dasharray: 6 6; animation: flow 1.4s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -12; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+
+  .divider { height: 1px; background: linear-gradient(90deg, transparent, var(--card-edge), transparent); margin: 64px 0 0; }
+
+  footer { padding: 72px 0 80px; }
+  footer a { color: var(--chalk); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<nav class="site-nav" aria-label="Explainer series">
+  <a class="brand" href="index.html">HYPERSCALE</a>
+  <div class="links">
+    <a href="index.html">The System</a>
+    <a href="journey.html">The Journey</a>
+    <a href="clock.html">The Clock</a>
+    <a href="census.html">The Census</a>
+    <a href="overlap.html">The Overlap</a>
+    <a href="generals.html">The Generals</a>
+    <a href="archive.html">The Archive</a>
+    <a href="library.html">The Library</a>
+    <a href="testament.html">The Will</a>
+    <a href="kleroterion.html">The Lottery</a>
+    <a href="triage.html">The Triage</a>
+    <a href="governor.html">The Governor</a>
+    <a href="crashlab.html">The Crash Lab</a>
+    <a href="proof.html" aria-current="page">The Proof</a>
+    <a href="asterisks.html">The Asterisks</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <span class="plate">HYPERSCALE · FORMAL VERIFICATION</span>
+  <h1>How do you <em>know</em>?</h1>
+  <p class="lede">In 1970, Edsger Dijkstra wrote down the most uncomfortable sentence in software engineering: <strong>testing shows the presence of bugs — never their absence.</strong> <a href="crashlab.html">The crash lab</a> rehearses this system's disasters thousands of times, and Dijkstra's objection still stands. For the handful of properties that must not fail even once, there is a stronger tool: rewrite the protocol as mathematics and check <strong>every case at once</strong>. That work is underway. What follows is the tool itself, why it matters, and — honestly — how far it has gotten.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== 1994 ============================== -->
+<section id="pentium">
+  <span class="kicker">01 · 1994</span>
+  <h2>Five missing cells</h2>
+  <p>In the summer of 1994, Thomas Nicely, a mathematics professor in Virginia, was computing the reciprocals of twin primes on a brand-new Pentium. His sums came out subtly wrong. He spent months eliminating suspects — his code, his compilers, his other machines — until only one remained: <strong>the processor itself</strong>. Deep in the chip's division circuitry sat a lookup table missing five entries out of roughly a thousand. The flaw corrupted about one division in nine billion.</p>
+  <p>Here is the uncomfortable part: Intel had tested that chip with extraordinary thoroughness — and had even found the bug in-house, judged it too rare to matter, and shipped. At one error per nine billion random divisions, that judgment was <em>statistically defensible</em>. The public declined to take the actuarial view. The recall cost <strong>$475 million</strong>, and the industry drew the enduring conclusion: within a few processor generations, arithmetic units weren't tested into confidence anymore — they were <strong>proven</strong>, every table entry, every input, every case.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 270" role="img" aria-label="A representative division lookup table with five empty cells highlighted among a thousand.">
+      <text x="410" y="30" fill="#a2b0a8" font-size="12.5" text-anchor="middle" class="mono">THE DIVIDER'S LOOKUP TABLE · representative</text>
+      <g>
+        <!-- 24 x 6 grid, cells 26x22, origin (86,48), gaps 2 -->
+        <g fill="#1d2a22" stroke="#31423a">
+          <rect x="86" y="48" width="26" height="22"/><rect x="114" y="48" width="26" height="22"/><rect x="142" y="48" width="26" height="22"/><rect x="170" y="48" width="26" height="22"/><rect x="198" y="48" width="26" height="22"/><rect x="254" y="48" width="26" height="22"/><rect x="282" y="48" width="26" height="22"/><rect x="310" y="48" width="26" height="22"/><rect x="338" y="48" width="26" height="22"/><rect x="366" y="48" width="26" height="22"/><rect x="394" y="48" width="26" height="22"/><rect x="422" y="48" width="26" height="22"/><rect x="450" y="48" width="26" height="22"/><rect x="478" y="48" width="26" height="22"/><rect x="506" y="48" width="26" height="22"/><rect x="534" y="48" width="26" height="22"/><rect x="562" y="48" width="26" height="22"/><rect x="590" y="48" width="26" height="22"/><rect x="618" y="48" width="26" height="22"/><rect x="646" y="48" width="26" height="22"/><rect x="674" y="48" width="26" height="22"/><rect x="702" y="48" width="26" height="22"/><rect x="730" y="48" width="26" height="22"/>
+          <rect x="86" y="72" width="26" height="22"/><rect x="114" y="72" width="26" height="22"/><rect x="142" y="72" width="26" height="22"/><rect x="170" y="72" width="26" height="22"/><rect x="198" y="72" width="26" height="22"/><rect x="226" y="72" width="26" height="22"/><rect x="254" y="72" width="26" height="22"/><rect x="282" y="72" width="26" height="22"/><rect x="310" y="72" width="26" height="22"/><rect x="338" y="72" width="26" height="22"/><rect x="366" y="72" width="26" height="22"/><rect x="394" y="72" width="26" height="22"/><rect x="422" y="72" width="26" height="22"/><rect x="450" y="72" width="26" height="22"/><rect x="478" y="72" width="26" height="22"/><rect x="534" y="72" width="26" height="22"/><rect x="562" y="72" width="26" height="22"/><rect x="590" y="72" width="26" height="22"/><rect x="618" y="72" width="26" height="22"/><rect x="646" y="72" width="26" height="22"/><rect x="674" y="72" width="26" height="22"/><rect x="702" y="72" width="26" height="22"/><rect x="730" y="72" width="26" height="22"/>
+          <rect x="86" y="96" width="26" height="22"/><rect x="114" y="96" width="26" height="22"/><rect x="142" y="96" width="26" height="22"/><rect x="170" y="96" width="26" height="22"/><rect x="198" y="96" width="26" height="22"/><rect x="226" y="96" width="26" height="22"/><rect x="254" y="96" width="26" height="22"/><rect x="282" y="96" width="26" height="22"/><rect x="310" y="96" width="26" height="22"/><rect x="338" y="96" width="26" height="22"/><rect x="366" y="96" width="26" height="22"/><rect x="394" y="96" width="26" height="22"/><rect x="422" y="96" width="26" height="22"/><rect x="450" y="96" width="26" height="22"/><rect x="478" y="96" width="26" height="22"/><rect x="506" y="96" width="26" height="22"/><rect x="534" y="96" width="26" height="22"/><rect x="590" y="96" width="26" height="22"/><rect x="618" y="96" width="26" height="22"/><rect x="646" y="96" width="26" height="22"/><rect x="674" y="96" width="26" height="22"/><rect x="702" y="96" width="26" height="22"/><rect x="730" y="96" width="26" height="22"/>
+          <rect x="86" y="120" width="26" height="22"/><rect x="114" y="120" width="26" height="22"/><rect x="142" y="120" width="26" height="22"/><rect x="170" y="120" width="26" height="22"/><rect x="198" y="120" width="26" height="22"/><rect x="226" y="120" width="26" height="22"/><rect x="254" y="120" width="26" height="22"/><rect x="282" y="120" width="26" height="22"/><rect x="310" y="120" width="26" height="22"/><rect x="366" y="120" width="26" height="22"/><rect x="394" y="120" width="26" height="22"/><rect x="422" y="120" width="26" height="22"/><rect x="450" y="120" width="26" height="22"/><rect x="478" y="120" width="26" height="22"/><rect x="506" y="120" width="26" height="22"/><rect x="534" y="120" width="26" height="22"/><rect x="562" y="120" width="26" height="22"/><rect x="590" y="120" width="26" height="22"/><rect x="618" y="120" width="26" height="22"/><rect x="646" y="120" width="26" height="22"/><rect x="674" y="120" width="26" height="22"/><rect x="702" y="120" width="26" height="22"/><rect x="730" y="120" width="26" height="22"/>
+          <rect x="86" y="144" width="26" height="22"/><rect x="114" y="144" width="26" height="22"/><rect x="142" y="144" width="26" height="22"/><rect x="170" y="144" width="26" height="22"/><rect x="198" y="144" width="26" height="22"/><rect x="226" y="144" width="26" height="22"/><rect x="254" y="144" width="26" height="22"/><rect x="282" y="144" width="26" height="22"/><rect x="310" y="144" width="26" height="22"/><rect x="338" y="144" width="26" height="22"/><rect x="366" y="144" width="26" height="22"/><rect x="394" y="144" width="26" height="22"/><rect x="422" y="144" width="26" height="22"/><rect x="450" y="144" width="26" height="22"/><rect x="478" y="144" width="26" height="22"/><rect x="506" y="144" width="26" height="22"/><rect x="534" y="144" width="26" height="22"/><rect x="562" y="144" width="26" height="22"/><rect x="590" y="144" width="26" height="22"/><rect x="618" y="144" width="26" height="22"/><rect x="646" y="144" width="26" height="22"/><rect x="674" y="144" width="26" height="22"/><rect x="702" y="144" width="26" height="22"/><rect x="730" y="144" width="26" height="22"/>
+          <rect x="86" y="168" width="26" height="22"/><rect x="114" y="168" width="26" height="22"/><rect x="142" y="168" width="26" height="22"/><rect x="170" y="168" width="26" height="22"/><rect x="198" y="168" width="26" height="22"/><rect x="226" y="168" width="26" height="22"/><rect x="254" y="168" width="26" height="22"/><rect x="282" y="168" width="26" height="22"/><rect x="310" y="168" width="26" height="22"/><rect x="338" y="168" width="26" height="22"/><rect x="366" y="168" width="26" height="22"/><rect x="394" y="168" width="26" height="22"/><rect x="422" y="168" width="26" height="22"/><rect x="450" y="168" width="26" height="22"/><rect x="478" y="168" width="26" height="22"/><rect x="506" y="168" width="26" height="22"/><rect x="534" y="168" width="26" height="22"/><rect x="562" y="168" width="26" height="22"/><rect x="590" y="168" width="26" height="22"/><rect x="618" y="168" width="26" height="22"/><rect x="646" y="168" width="26" height="22"/><rect x="702" y="168" width="26" height="22"/><rect x="730" y="168" width="26" height="22"/>
+        </g>
+        <!-- five missing cells -->
+        <g fill="none" stroke="#f07a9a" stroke-width="1.5" stroke-dasharray="4 3">
+          <rect x="226" y="48" width="26" height="22" class="pulse"/>
+          <rect x="506" y="72" width="26" height="22" class="pulse"/>
+          <rect x="562" y="96" width="26" height="22" class="pulse"/>
+          <rect x="338" y="120" width="26" height="22" class="pulse"/>
+          <rect x="674" y="168" width="26" height="22" class="pulse"/>
+        </g>
+      </g>
+      <text x="410" y="222" fill="#f07a9a" font-size="12.5" text-anchor="middle" class="mono">five entries, never filled in</text>
+      <text x="410" y="246" fill="#a2b0a8" font-size="12.5" text-anchor="middle">triggered by roughly one division in 9,000,000,000 — a bug testing had every statistical right to miss</text>
+    </svg>
+    <figcaption>The FDIV flaw: not sloppy engineering — thoroughly tested engineering, defeated by a needle in a nine-billion-straw haystack.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <p><strong>"Program testing can be used to show the presence of bugs, but never to show their absence."</strong> — Edsger Dijkstra, 1970.</p>
+    <span class="why">Twenty-four years later, the invoice arrived.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE IDEA ============================== -->
+<section id="idea">
+  <span class="kicker">02 · The idea</span>
+  <h2>Every case at once</h2>
+  <p>A test runs the system once and looks at what happened. A <strong>proof</strong> is a different kind of object entirely: an argument that covers every possible case simultaneously — not because someone ran them all, but because the argument's structure leaves no case out. The practical workhorse between the two is the <strong>model checker</strong>: you write the protocol's rules in a precise mathematical notation — a <em>model</em> — state a property ("no two honest replicas ever commit different blocks"), and a tool explores the <em>entire</em> space of behaviors the rules permit: every message ordering, every timeout, every choice an adversary could make. Not a sample of the space. The space.</p>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ ONE PATH</span><h4>A test</h4><p>Each run walks a single path through the possible and checks what it finds there. Fast, concrete, endlessly useful — and mute about the paths not taken.</p></div>
+    <div class="card"><span class="ok">◦ MANY PATHS</span><h4>The crash lab</h4><p>Seeded adversarial simulation walks thousands of paths, deliberately hostile ones, each replayable forever. The best presence-of-bugs machine we know how to build — and still, a sample.</p></div>
+    <div class="card"><span class="ok">◦ ALL PATHS</span><h4>A checked model</h4><p>The model checker holds the whole space at once. It returns one of exactly two things: the property holds everywhere it looked — or a <strong>counterexample</strong>.</p></div>
+  </div>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 300" role="img" aria-label="Left: a field of possible executions with a few sampled by testing. Right: the same field entirely covered by a checked model, with one counterexample ringed.">
+      <text x="210" y="32" fill="#a2b0a8" font-size="12.5" text-anchor="middle" class="mono">TESTING · SAMPLES THE FIELD</text>
+      <rect x="20" y="46" width="380" height="180" rx="12" fill="#101512" stroke="#26332c"/>
+      <g fill="#39443d">
+        <circle cx="52" cy="76" r="4"/><circle cx="82" cy="76" r="4"/><circle cx="112" cy="76" r="4"/><circle cx="142" cy="76" r="4"/><circle cx="172" cy="76" r="4"/><circle cx="202" cy="76" r="4"/><circle cx="232" cy="76" r="4"/><circle cx="262" cy="76" r="4"/><circle cx="292" cy="76" r="4"/><circle cx="322" cy="76" r="4"/><circle cx="352" cy="76" r="4"/>
+        <circle cx="52" cy="106" r="4"/><circle cx="82" cy="106" r="4"/><circle cx="112" cy="106" r="4"/><circle cx="172" cy="106" r="4"/><circle cx="202" cy="106" r="4"/><circle cx="232" cy="106" r="4"/><circle cx="262" cy="106" r="4"/><circle cx="292" cy="106" r="4"/><circle cx="352" cy="106" r="4"/>
+        <circle cx="52" cy="136" r="4"/><circle cx="112" cy="136" r="4"/><circle cx="142" cy="136" r="4"/><circle cx="172" cy="136" r="4"/><circle cx="202" cy="136" r="4"/><circle cx="232" cy="136" r="4"/><circle cx="292" cy="136" r="4"/><circle cx="322" cy="136" r="4"/><circle cx="352" cy="136" r="4"/>
+        <circle cx="52" cy="166" r="4"/><circle cx="82" cy="166" r="4"/><circle cx="112" cy="166" r="4"/><circle cx="142" cy="166" r="4"/><circle cx="202" cy="166" r="4"/><circle cx="232" cy="166" r="4"/><circle cx="262" cy="166" r="4"/><circle cx="292" cy="166" r="4"/><circle cx="322" cy="166" r="4"/><circle cx="352" cy="166" r="4"/>
+        <circle cx="52" cy="196" r="4"/><circle cx="82" cy="196" r="4"/><circle cx="112" cy="196" r="4"/><circle cx="142" cy="196" r="4"/><circle cx="172" cy="196" r="4"/><circle cx="232" cy="196" r="4"/><circle cx="262" cy="196" r="4"/><circle cx="322" cy="196" r="4"/><circle cx="352" cy="196" r="4"/>
+      </g>
+      <g fill="#5fd39a">
+        <circle cx="142" cy="106" r="5"/><circle cx="322" cy="106" r="5"/><circle cx="82" cy="136" r="5"/><circle cx="262" cy="136" r="5"/><circle cx="172" cy="196" r="5"/><circle cx="292" cy="196" r="5"/>
+      </g>
+      <text x="210" y="252" fill="#a2b0a8" font-size="12" text-anchor="middle">even thousands of seeded runs visit finitely many dots</text>
+
+      <text x="610" y="32" fill="#a2b0a8" font-size="12.5" text-anchor="middle" class="mono">A CHECKED MODEL · HOLDS THE FIELD</text>
+      <rect x="420" y="46" width="380" height="180" rx="12" fill="#0f1a14" stroke="#5fd39a" stroke-width="1.5"/>
+      <g fill="#3f6a52">
+        <circle cx="452" cy="76" r="4"/><circle cx="482" cy="76" r="4"/><circle cx="512" cy="76" r="4"/><circle cx="542" cy="76" r="4"/><circle cx="572" cy="76" r="4"/><circle cx="602" cy="76" r="4"/><circle cx="632" cy="76" r="4"/><circle cx="662" cy="76" r="4"/><circle cx="692" cy="76" r="4"/><circle cx="722" cy="76" r="4"/><circle cx="752" cy="76" r="4"/>
+        <circle cx="452" cy="106" r="4"/><circle cx="482" cy="106" r="4"/><circle cx="512" cy="106" r="4"/><circle cx="542" cy="106" r="4"/><circle cx="572" cy="106" r="4"/><circle cx="602" cy="106" r="4"/><circle cx="662" cy="106" r="4"/><circle cx="692" cy="106" r="4"/><circle cx="722" cy="106" r="4"/><circle cx="752" cy="106" r="4"/>
+        <circle cx="452" cy="136" r="4"/><circle cx="482" cy="136" r="4"/><circle cx="512" cy="136" r="4"/><circle cx="542" cy="136" r="4"/><circle cx="572" cy="136" r="4"/><circle cx="602" cy="136" r="4"/><circle cx="632" cy="136" r="4"/><circle cx="662" cy="136" r="4"/><circle cx="692" cy="136" r="4"/><circle cx="722" cy="136" r="4"/><circle cx="752" cy="136" r="4"/>
+        <circle cx="452" cy="166" r="4"/><circle cx="482" cy="166" r="4"/><circle cx="512" cy="166" r="4"/><circle cx="542" cy="166" r="4"/><circle cx="572" cy="166" r="4"/><circle cx="602" cy="166" r="4"/><circle cx="632" cy="166" r="4"/><circle cx="662" cy="166" r="4"/><circle cx="692" cy="166" r="4"/><circle cx="722" cy="166" r="4"/><circle cx="752" cy="166" r="4"/>
+        <circle cx="452" cy="196" r="4"/><circle cx="482" cy="196" r="4"/><circle cx="512" cy="196" r="4"/><circle cx="542" cy="196" r="4"/><circle cx="572" cy="196" r="4"/><circle cx="602" cy="196" r="4"/><circle cx="632" cy="196" r="4"/><circle cx="662" cy="196" r="4"/><circle cx="692" cy="196" r="4"/><circle cx="722" cy="196" r="4"/><circle cx="752" cy="196" r="4"/>
+      </g>
+      <circle cx="632" cy="106" r="6" fill="#f07a9a"/>
+      <circle cx="632" cy="106" r="12" fill="none" stroke="#f07a9a" stroke-width="1.5" class="pulse"/>
+      <text x="610" y="252" fill="#a2b0a8" font-size="12" text-anchor="middle">coverage — or <tspan fill="#f07a9a">the one dot that breaks the property</tspan>, as a recipe</text>
+    </svg>
+    <figcaption>The two outputs of a model checker, and both are gold: certainty over the space it searched, or a minimal, step-by-step, replayable way to break your protocol.</figcaption>
+  </figure>
+
+  <p>The counterexample deserves emphasis, because it's what makes this engineering rather than philosophy. A failed check isn't a red X and a shrug — it is a <strong>concrete attack script</strong>: deliver this message before that one, time out here, have this validator do exactly this, and the property falls. You can hand it to an engineer. Better: you can hand it to a simulator.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE WORKLIST ============================== -->
+<section id="worklist">
+  <span class="kicker">03 · The worklist</span>
+  <h2>Five load-bearing walls</h2>
+  <p>Why does a blockchain, of all things, warrant this effort? Because consensus protocols are precisely where testing is weakest and stakes are highest. The bugs live in freak interleavings — a timeout landing between two messages that "always" arrive together, a partition healing at the one wrong moment of an epoch — and the field's history is humbling: <strong>protocols published, peer-reviewed, and deployed have had safety flaws surface years later</strong>, several found only when someone finally wrote the model. And unlike an application bug, a consensus bug isn't a malfunction; it's a fork — <a href="overlap.html">the one thing that must never happen</a>.</p>
+  <p>So the system keeps a register: every safety and liveness property it claims, written down with a stable name — built deliberately as a verification worklist, not documentation garnish. At its core sit five properties — the walls everything else leans on:</p>
+  <p><strong>No forks.</strong> No two honest replicas ever commit different blocks at a height — <a href="overlap.html">the overlap</a>.<br>
+  <strong>No half-payments.</strong> A cross-shard transaction ends the same way on every shard it touches — <a href="generals.html">the generals</a>.<br>
+  <strong>No one-sided settlements.</strong> …even when one of those shards ceases to exist mid-flight — <a href="testament.html">the will</a>.<br>
+  <strong>No ambiguous authority.</strong> Every honest machine derives the identical committee for any moment it can encounter — <a href="clock.html">the clock</a> and <a href="census.html">the census</a>.<br>
+  <strong>No lost state.</strong> Splitting and merging shards never loses, invents, or re-homes a single record — <a href="library.html">the library</a>.</p>
+  <p>Everything else in the architecture — the sync machinery, the caches, <a href="archive.html">the archive</a>, <a href="triage.html">the triage</a> — exists to keep those five true under real networks and real adversaries. They are the properties worth the strongest tool we can bring.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE LOOP ============================== -->
+<section id="loop">
+  <span class="kicker">04 · The program</span>
+  <h2>From register to rehearsal and back</h2>
+  <p>Most systems attempting this face an archaeology problem: the "protocol" exists only as code tangled with sockets, threads, and clocks, and building a faithful model means excavating it. Hyperscale skipped that fate by construction — <a href="crashlab.html">the crash lab</a>'s precondition is the same as the model's: every protocol component is already a pure transition function with explicit inputs. <strong>Extracting a model is translation, not archaeology.</strong> The specs are written in Quint — a modern notation from the TLA+ family, the lingua franca of protocol verification — and checked with Apalache, a model checker that explores the state space symbolically rather than one state at a time.</p>
+
+  <figure class="panel">
+    <svg viewBox="0 0 820 350" role="img" aria-label="The verification loop: register to model to checker; counterexamples become crash lab scenarios; fixes are re-checked.">
+      <!-- top row -->
+      <rect x="40" y="40" width="200" height="62" rx="12" fill="#151b17" stroke="#26332c"/>
+      <text x="140" y="66" fill="#eaf0ec" font-size="13" font-weight="700" text-anchor="middle">THE REGISTER</text>
+      <text x="140" y="86" fill="#a2b0a8" font-size="11" text-anchor="middle">every property, named</text>
+      <path d="M 240 71 L 310 71" stroke="#7fa892" stroke-width="2" class="flow"/>
+      <rect x="310" y="40" width="200" height="62" rx="12" fill="#151b17" stroke="#26332c"/>
+      <text x="410" y="66" fill="#eaf0ec" font-size="13" font-weight="700" text-anchor="middle">THE MODEL</text>
+      <text x="410" y="86" fill="#a2b0a8" font-size="11" text-anchor="middle">the rules, as mathematics</text>
+      <path d="M 510 71 L 580 71" stroke="#7fa892" stroke-width="2" class="flow"/>
+      <rect x="580" y="40" width="200" height="62" rx="12" fill="#101a14" stroke="#5fd39a" stroke-width="1.5"/>
+      <text x="680" y="66" fill="#eaf0ec" font-size="13" font-weight="700" text-anchor="middle">THE CHECKER</text>
+      <text x="680" y="86" fill="#a2b0a8" font-size="11" text-anchor="middle">every case, within bounds</text>
+      <!-- verdicts -->
+      <path d="M 720 102 C 750 130, 750 150, 730 168" fill="none" stroke="#5fd39a" stroke-width="2" class="flow"/>
+      <rect x="600" y="168" width="190" height="44" rx="10" fill="#101a14" stroke="#2a5440"/>
+      <text x="695" y="186" fill="#5fd39a" font-size="12" text-anchor="middle" class="mono">✓ holds, in bounds</text>
+      <text x="695" y="202" fill="#a2b0a8" font-size="10.5" text-anchor="middle">widen bounds · next property</text>
+      <path d="M 600 190 C 320 210, 150 160, 138 106" fill="none" stroke="#2a5440" stroke-width="1.5" stroke-dasharray="3 5"/>
+      <path d="M 640 102 C 610 130, 560 150, 520 162" fill="none" stroke="#f07a9a" stroke-width="2" class="flow"/>
+      <rect x="330" y="162" width="190" height="44" rx="10" fill="#1d1216" stroke="#f07a9a"/>
+      <text x="425" y="180" fill="#f07a9a" font-size="12" text-anchor="middle" class="mono">✕ counterexample</text>
+      <text x="425" y="196" fill="#a2b0a8" font-size="10.5" text-anchor="middle">a step-by-step attack script</text>
+      <!-- crash lab -->
+      <path d="M 425 206 L 425 246" stroke="#f07a9a" stroke-width="2" class="flow"/>
+      <rect x="310" y="246" width="230" height="62" rx="12" fill="#151b17" stroke="#26332c"/>
+      <text x="425" y="268" fill="#eaf0ec" font-size="13" font-weight="700" text-anchor="middle">THE CRASH LAB</text>
+      <text x="425" y="286" fill="#a2b0a8" font-size="11" text-anchor="middle">the script becomes a seeded,</text>
+      <text x="425" y="300" fill="#a2b0a8" font-size="11" text-anchor="middle">permanent scenario</text>
+      <!-- fix -->
+      <path d="M 310 277 L 240 277" stroke="#7fa892" stroke-width="2" class="flow"/>
+      <rect x="60" y="252" width="180" height="50" rx="12" fill="#151b17" stroke="#26332c"/>
+      <text x="150" y="274" fill="#eaf0ec" font-size="12.5" font-weight="600" text-anchor="middle">the fix lands</text>
+      <text x="150" y="292" fill="#a2b0a8" font-size="10.5" text-anchor="middle">code and model together</text>
+      <path d="M 130 252 C 100 190, 100 140, 128 106" fill="none" stroke="#7fa892" stroke-width="2" class="flow"/>
+      <text x="38" y="180" fill="#a2b0a8" font-size="11">re-checked</text>
+      <text x="410" y="340" fill="#a2b0a8" font-size="12.5" text-anchor="middle">nothing exits the loop as a verbal assurance — only as a passing check and a banked rehearsal</text>
+    </svg>
+    <figcaption>The loop. Its best property: a counterexample never dies as a bug report — it is banked as a permanent, replayable scenario before the fix is even written.</figcaption>
+  </figure>
+
+  <p>And the loop has already earned its keep. While the beacon's agreement protocol was being modeled against the algorithm it implements, the checker surfaced a real divergence: in one corner case, the implementation walked its history subtly differently from the paper — legal-looking, wrong under exactly the right absence of data. The model produced the recipe; <a href="crashlab.html">the deterministic simulator</a> replayed the recipe as a failing test; the fix landed with a permanent regression pinning it. No user ever saw it. That round trip — <strong>model finds, simulator reproduces, fix verifies</strong> — is the whole method in one anecdote.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== THE FINE PRINT ============================== -->
+<section id="fineprint">
+  <span class="kicker">05 · The fine print</span>
+  <h2>What is and isn't being claimed</h2>
+
+  <div class="cards">
+    <div class="card"><span class="ok">◦ IN PROGRESS</span><h4>A worklist, not a trophy case</h4><p>First-pass models of the critical core exist and are being checked today. That is not a claim of "proven" — the register is a to-do list, being worked through in the open.</p></div>
+    <div class="card"><span class="ok">◦ A MODEL IS NOT THE CODE</span><h4>Fidelity is its own discipline</h4><p>The checker certifies the mathematics; keeping the mathematics and the Rust in agreement is a separate obligation — made tractable because the code is already pure transition functions, and kept honest by replaying every model counterexample against the real implementation.</p></div>
+    <div class="card"><span class="ok">◦ EXHAUSTIVE, WITHIN BOUNDS</span><h4>Small worlds, searched completely</h4><p>Model checking explores everything inside explicit bounds — small committees, short horizons. The bet, backed by decades of practice: protocol bugs have small witnesses. Unbounded proofs of the deepest properties are the long game, not the current claim.</p></div>
+  </div>
+
+  <div class="callout">
+    <p><strong>The ladder of certainty:</strong> tests walk one path; <a href="crashlab.html" style="color:var(--chalk)">the crash lab</a> walks thousands of hostile ones; a checked model holds all of them at once, inside its bounds; a proof removes the bounds. Each rung catches what the rung below can only sample.</p>
+    <span class="why">Dijkstra's sentence still stands — testing will never show the absence of bugs. The point of this program is to make that stop mattering: one named property at a time.</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <span class="kicker">Go deeper</span>
+  <h2 style="font-size:26px">The precise version of this story</h2>
+  <p>The invariant register is the worklist itself — every property with a stable name. The determinism doc explains why extracting faithful models is translation rather than archaeology.</p>
+  <div class="foot-links">
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/08-invariants.md">the invariant register</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/07-determinism-and-testing.md">docs/07 — determinism and testing</a>
+    <a href="index.html">the full system explainer</a>
+    <a href="https://github.com/hyperscalers/hyperscale-rs/">the repository</a>
+  </div>
+  <p style="margin-top:36px; font-size:13px; color:#5c6b62">Hyperscale is a work-in-progress.</p>
+</footer>
+
+</main>
+</body>
+</html>
