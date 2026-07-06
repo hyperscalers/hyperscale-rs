@@ -2,13 +2,18 @@
 [profile.ci]
 # Report every failure in a run rather than stopping at the first.
 fail-fast = false
-# Flag a test as slow after 5 minutes; kill it after an hour. The heaviest
-# reshape sims run 20-45 minutes on 4-core hosted runners (~7x slower than a
-# 16-core dev machine); past an hour is a wedge, not a test.
-slow-timeout = { period = "300s", terminate-after = 12 }
+# Outside the sim harnesses the suite is sub-second unit and integration
+# tests; flag anything past 2 minutes and kill at 10 — that's a wedge, not
+# a test.
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 # Cluster sims hold multi-node state in memory; on 4-thread runners this caps
-# them at two concurrent so they don't exhaust the 16GB of RAM.
+# them at two concurrent so they don't exhaust the 16GB of RAM. The ci feature
+# runs sims at the production 5-minute epoch (hyperscale-simulator inherits it
+# through its simulation dependency), and hosted 4-core runners execute ~2.7x
+# slower than a 16-core dev machine, so the largest reshape sims legitimately
+# may need ~2 hours.
 [[profile.ci.overrides]]
-filter = "package(hyperscale-simulation) or package(hyperscale-production)"
+filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
 threads-required = 2
+slow-timeout = { period = "300s", terminate-after = 36 }

@@ -380,9 +380,10 @@ jobs:
 
   notify:
     runs-on: ubuntu-latest
-    # permission for gh api
+    # permissions for gh api: commit stats + merged PR lookup
     permissions:
-      contents: read 
+      contents: read
+      pull-requests: read
     if: >
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request' && github.event.action == 'opened')
@@ -444,14 +445,14 @@ jobs:
             # itself: this runs in the base repo with secrets, so it also covers
             # fork PRs, whose pull_request events cannot send. Only direct pushes
             # fall through to a plain commit notification.
-            PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA/pulls" 2>/dev/null \
+            PR_NUMBER=$(gh api "repos/${{ github.repository }}/pulls?state=closed&base=$GITHUB_REF_NAME&sort=updated&direction=desc&per_page=30" \
               | jq -r --arg sha "$COMMIT_SHA" \
                 '[.[] | select(.merge_commit_sha == $sha and .merged_at != null)][0].number // empty' \
-                2>/dev/null || echo "")
+                || echo "")
 
             PR_JSON=""
             if [ -n "$PR_NUMBER" ]; then
-              PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" 2>/dev/null || echo "")
+              PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" || echo "")
             fi
 
             if [ -n "$PR_JSON" ]; then
