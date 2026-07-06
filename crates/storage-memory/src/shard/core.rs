@@ -155,6 +155,15 @@ impl SimShardStorage {
             .range(beacon_witness_start.inner()..)
             .map(|(_, payload)| payload.leaf_hash())
             .collect();
+        let chain_origin = c.chain_origin;
+        // Records tagged with a different chain origin belong to a
+        // previous incarnation of this store's chain and are excluded.
+        let safe_vote_registers = c
+            .safe_vote_registers
+            .iter()
+            .filter(|(_, (origin, _))| *origin == chain_origin)
+            .map(|(validator, (_, registers))| (*validator, *registers))
+            .collect();
         drop(c);
 
         RecoveredState {
@@ -170,7 +179,8 @@ impl SimShardStorage {
                 .get(&committed_height.inner())
                 .copied()
                 .unwrap_or(0),
-            chain_origin: read_or_recover(&self.consensus).chain_origin,
+            chain_origin,
+            safe_vote_registers,
         }
     }
 

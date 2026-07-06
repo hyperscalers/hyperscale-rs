@@ -1,9 +1,12 @@
 //! State recovered from storage on startup, used to restore the consensus
 //! state machine after a crash or restart.
 
+use std::collections::BTreeMap;
+
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
-    QuorumCertificate, ShardAnchor, StateRoot, Verified, WeightedTimestamp,
+    QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot, ValidatorId, Verified,
+    WeightedTimestamp,
 };
 
 /// State recovered from storage on startup.
@@ -70,6 +73,14 @@ pub struct RecoveredState {
     /// genesis-fallback QCs from this value, so it must byte-match the
     /// chain's real genesis QC.
     pub chain_origin: ChainOrigin,
+
+    /// Durable safe-vote registers for each validator that has signed a
+    /// vote or timeout on this store's chain, excluding records from a
+    /// different chain incarnation. The coordinator floors its registers
+    /// at these values on restart, so it can never re-sign a round it
+    /// already consumed. Empty on a fresh start — including after
+    /// snap-sync, where the imported store carries no signing history.
+    pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 }
 
 impl RecoveredState {
@@ -115,6 +126,7 @@ impl RecoveredState {
             } else {
                 ChainOrigin::ROOT
             },
+            safe_vote_registers: BTreeMap::new(),
         }
     }
 

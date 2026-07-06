@@ -11,15 +11,16 @@ use hyperscale_storage::test_helpers::{
 };
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
-    PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
-    VersionedStore, merge_database_updates, merge_into,
+    PartitionDatabaseUpdates, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    Bls12381G2Signature, BoundedVec, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
-    QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, StoredReceipt, SyncHint, TxHash,
-    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    Bls12381G2Signature, BoundedVec, CertifiedBlock, ChainOrigin, ConsensusReceipt,
+    ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, SignerBitfield,
+    StateRoot, StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate,
+    WaveId, WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -41,11 +42,13 @@ fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCer
     ))
 }
 use hyperscale_storage::tree::hash_storage_key;
+use rocksdb::WriteBatch;
 use sbor::prelude::IndexMap;
 use tempfile::TempDir;
 
 use super::column_families::{LeafAssociationsCf, STATE_HISTORY_CF};
 use super::core::RocksDbShardStorage;
+use super::metadata::write_chain_origin;
 use crate::config::RocksDbConfig;
 
 /// Helper: wrap `DatabaseUpdates` into a single `StoredReceipt` for test commit calls.
@@ -1544,4 +1547,93 @@ fn witness_window_retention_and_recovery() {
         .map(ShardWitnessPayload::leaf_hash)
         .collect();
     assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
+}
+
+// ─── Safe-vote registers ─────────────────────────────────────────────────────
+
+fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
+    SafeVoteRegisters {
+        locked_round: Round::new(locked),
+        last_voted_round: Round::new(last_voted),
+    }
+}
+
+/// Persisted registers read back, survive a reopen, and land in
+/// `load_recovered_state`.
+#[test]
+fn safe_vote_registers_survive_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let v1 = ValidatorId::new(1);
+    let v2 = ValidatorId::new(2);
+    {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        storage.persist_safe_vote_registers(v1, registers(3, 5));
+        storage.persist_safe_vote_registers(v2, registers(2, 2));
+        assert_eq!(storage.safe_vote_registers(v1), Some(registers(3, 5)));
+    }
+
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(reopened.safe_vote_registers(v1), Some(registers(3, 5)));
+    let recovered = reopened.load_recovered_state();
+    assert_eq!(
+        recovered.safe_vote_registers.get(&v1),
+        Some(&registers(3, 5))
+    );
+    assert_eq!(
+        recovered.safe_vote_registers.get(&v2),
+        Some(&registers(2, 2))
+    );
+}
+
+/// Writes merge field-wise max, so a lower or mixed write can never
+/// regress either register — including on a cold write-path cache after
+/// a reopen, where the merge must consult the stored record.
+#[test]
+fn safe_vote_registers_writes_are_monotone() {
+    let temp_dir = TempDir::new().unwrap();
+    let v = ValidatorId::new(7);
+    {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        storage.persist_safe_vote_registers(v, registers(4, 6));
+        storage.persist_safe_vote_registers(v, registers(2, 9));
+        assert_eq!(storage.safe_vote_registers(v), Some(registers(4, 9)));
+    }
+
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    reopened.persist_safe_vote_registers(v, registers(3, 3));
+    assert_eq!(reopened.safe_vote_registers(v), Some(registers(4, 9)));
+}
+
+/// A record written under a different chain origin is invisible to
+/// reads and recovery — a checkpoint-seeded child store inherits the
+/// parent's records but must not apply them to the child chain's
+/// unrelated round numbering. The next write starts a fresh record
+/// under the new origin.
+#[test]
+fn safe_vote_registers_ignore_stale_chain_incarnation() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let v = ValidatorId::new(1);
+    storage.persist_safe_vote_registers(v, registers(8, 8));
+
+    let mut batch = WriteBatch::default();
+    write_chain_origin(
+        &mut batch,
+        ChainOrigin {
+            genesis_height: BlockHeight::new(11),
+            anchor_wt: WeightedTimestamp::from_millis(999),
+        },
+    );
+    storage.db.write(batch).unwrap();
+
+    assert_eq!(storage.safe_vote_registers(v), None);
+    assert!(
+        storage
+            .load_recovered_state()
+            .safe_vote_registers
+            .is_empty()
+    );
+
+    storage.persist_safe_vote_registers(v, registers(1, 2));
+    assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
 }

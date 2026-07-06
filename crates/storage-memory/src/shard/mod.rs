@@ -14,6 +14,7 @@ pub(crate) mod split;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod tree_store;
+pub(crate) mod vote_registers;
 
 #[cfg(test)]
 mod tests;

@@ -9,16 +9,17 @@ use hyperscale_storage::test_helpers::{
 use hyperscale_storage::tree::{hash_storage_key, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter,
-    SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
-    test_helpers,
+    NodeDatabaseUpdates, PartitionDatabaseUpdates, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates,
+    merge_into, test_helpers,
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BoundedVec, CertifiedBlock,
-    ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId, ProposerTimestamp,
-    QuorumCertificate, ShardId, StateRoot, StoredReceipt, SyncHint, TxHash, Verifiable, Verified,
-    WaveCertificate, WaveId,
+    ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId,
+    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, StateRoot,
+    StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1250,4 +1251,57 @@ fn witness_window_retention_and_recovery() {
         .map(ShardWitnessPayload::leaf_hash)
         .collect();
     assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
+}
+
+// ─── Safe-vote registers ─────────────────────────────────────────────────────
+
+fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
+    SafeVoteRegisters {
+        locked_round: Round::new(locked),
+        last_voted_round: Round::new(last_voted),
+    }
+}
+
+/// Writes merge field-wise max and survive a coordinator "restart" —
+/// the store handle outlives the state machine, so a rebuilt machine
+/// recovers them through `load_recovered_state`.
+#[test]
+fn safe_vote_registers_are_monotone_and_recoverable() {
+    let storage = SimShardStorage::default();
+    let v = ValidatorId::new(1);
+    storage.persist_safe_vote_registers(v, registers(4, 6));
+    storage.persist_safe_vote_registers(v, registers(2, 9));
+    assert_eq!(storage.safe_vote_registers(v), Some(registers(4, 9)));
+
+    let recovered = storage.load_recovered_state();
+    assert_eq!(
+        recovered.safe_vote_registers.get(&v),
+        Some(&registers(4, 9))
+    );
+}
+
+/// A record written under a different chain origin is invisible to
+/// reads and recovery; the next write starts a fresh record under the
+/// new origin.
+#[test]
+fn safe_vote_registers_ignore_stale_chain_incarnation() {
+    let storage = SimShardStorage::default();
+    let v = ValidatorId::new(1);
+    storage.persist_safe_vote_registers(v, registers(8, 8));
+
+    storage.consensus.write().unwrap().chain_origin = ChainOrigin {
+        genesis_height: BlockHeight::new(11),
+        anchor_wt: WeightedTimestamp::from_millis(999),
+    };
+
+    assert_eq!(storage.safe_vote_registers(v), None);
+    assert!(
+        storage
+            .load_recovered_state()
+            .safe_vote_registers
+            .is_empty()
+    );
+
+    storage.persist_safe_vote_registers(v, registers(1, 2));
+    assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
 }

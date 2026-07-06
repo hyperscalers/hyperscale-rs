@@ -13,8 +13,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, NodeId, QuorumCertificate, RoutableTransaction, ShardWitnessPayload,
-    StateRoot, StoredReceipt, TxHash, WaveCertificate, WaveId,
+    ExecutionMetadata, NodeId, QuorumCertificate, RoutableTransaction, SafeVoteRegisters,
+    ShardWitnessPayload, StateRoot, StoredReceipt, TxHash, ValidatorId, WaveCertificate, WaveId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -206,6 +206,11 @@ pub struct ConsensusState {
     /// child's adopted store, where recovery must reconstruct the
     /// continued height line and clock.
     pub chain_origin: ChainOrigin,
+    /// Durable safe-vote register records keyed by validator, each
+    /// tagged with the chain origin that wrote it. Mirrors the
+    /// production `safe_vote_registers` CF; reads ignore records whose
+    /// tag differs from the current `chain_origin`.
+    pub safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -227,6 +232,7 @@ impl ConsensusState {
             wave_certs_by_height: HashMap::new(),
             beacon_witnesses: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
+            safe_vote_registers: HashMap::new(),
         }
     }
 
