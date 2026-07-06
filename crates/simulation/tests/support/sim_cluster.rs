@@ -348,6 +348,12 @@ impl FaultableCluster for SimCluster {
         self.runner.network_mut().isolate_node(host_index(host));
     }
 
+    fn heal_between(&mut self, a: usize, b: usize) {
+        self.runner
+            .network_mut()
+            .heal_bidirectional(host_index(a), host_index(b));
+    }
+
     fn heal_all(&mut self) {
         self.runner.network_mut().heal_all();
     }
@@ -387,6 +393,18 @@ impl FaultableCluster for SimCluster {
             .into_iter()
             .map(|host| host as usize)
             .collect()
+    }
+
+    fn host_committed_height(&self, host: usize, shard: ShardId) -> Option<BlockHeight> {
+        self.runner
+            .hosts_shard(host_index(host), shard)
+            .map(ShardChainReader::committed_height)
+    }
+
+    fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot> {
+        self.runner
+            .hosts_shard(host_index(host), shard)
+            .map(SubstateStore::state_root)
     }
 
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {

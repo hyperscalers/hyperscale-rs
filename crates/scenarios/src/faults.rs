@@ -2,17 +2,18 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{ShardId, TransactionDecision, TransactionStatus};
+use hyperscale_types::{BlockHeight, ShardId, StateRoot, TransactionDecision, TransactionStatus};
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
 use crate::support::epochs;
 use crate::support::faultable::FaultableCluster;
+use crate::support::query::beacon_epoch;
 use crate::support::tx::{
     account_from_seed, build_faucet_tx, build_transfer_tx, signer_from_seed, validity_around,
 };
-use crate::support::wait::{await_height, await_tx_terminal};
+use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -139,6 +140,209 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "the transfer must complete despite an isolated validator; status = {status:?}",
+    );
+}
+
+/// The committed state root that *every* host agrees on, or `None` if any host
+/// disagrees or has not yet reported one. The stall-not-fork check: after a
+/// heal, this becoming `Some` means the whole committee — the rejoined dark
+/// hosts included — converged on one chain. A host still catching up reports a
+/// different (or no) root, so it holds this at `None` until the fragment is
+/// fully back in step.
+fn agreed_state_root(c: &impl FaultableCluster, shard: ShardId) -> Option<StateRoot> {
+    let first = c.host_committed_state_root(0, shard)?;
+    for host in 1..c.host_count() {
+        if c.host_committed_state_root(host, shard)? != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// A connected minority fragment partitions off, stays dark across an epoch
+/// boundary, then rejoins as a group.
+///
+/// The regression shape behind the rejoin-wedge class, where fragment members
+/// share stale state with each other while partitioned.
+///
+/// Requires a seven-host single-shard committee: quorum is five (strict >2/3),
+/// so cutting the two-host fragment `{0, 1}` off the majority `{2..6}` leaves
+/// both the shard and the beacon majority live — the majority keeps committing
+/// and crossing epoch boundaries while the fragment is frozen. A full
+/// bipartition, so both harnesses agree on the cut.
+///
+/// # Panics
+///
+/// Panics if consensus does not commit before the partition, the majority fails
+/// to progress while the fragment is dark, the fragment advances while
+/// partitioned, or the rejoined fragment fails to catch up and agree on the
+/// committed root after the heal.
+pub fn minority_fragment_rejoins_after_partition(c: &mut impl FaultableCluster) {
+    assert_eq!(
+        c.host_count(),
+        7,
+        "this scenario needs a seven-host committee so a two-host fragment leaves quorum live",
+    );
+
+    // Every host — the future fragment included — must be seated and committing
+    // before the cut, so the fragment goes dark from a real synced state (not a
+    // never-seated genesis host) and rejoins by catching up a bounded gap.
+    let seated = c.run_until(epochs(6), |c| {
+        (0..7).all(|host| {
+            c.host_committed_height(host, ShardId::ROOT)
+                .is_some_and(|h| h.inner() >= 1)
+        })
+    });
+    assert!(
+        seated,
+        "every host must commit a block before the partition"
+    );
+    let start_epoch = beacon_epoch(c).expect("a committed beacon epoch").inner();
+
+    c.partition(&[0, 1], &[2, 3, 4, 5, 6]);
+    let before = c
+        .committed_height(ShardId::ROOT)
+        .expect("a committed height before the partition")
+        .inner();
+    let frag_before: Vec<u64> = [0, 1]
+        .iter()
+        .map(|&host| {
+            c.host_committed_height(host, ShardId::ROOT)
+                .map_or(0, BlockHeight::inner)
+        })
+        .collect();
+
+    // Keep the fragment dark across exactly one epoch boundary — the majority
+    // (five of seven) keeps both shard and beacon consensus live, and bounding
+    // the dark window to a single epoch keeps the fragment's catch-up gap inside
+    // the block-retention window.
+    assert!(
+        await_beacon_epoch(c, start_epoch + 1, epochs(6)),
+        "the five-host majority must cross an epoch boundary while the fragment is dark",
+    );
+    let during = c
+        .committed_height(ShardId::ROOT)
+        .expect("a committed height during the partition")
+        .inner();
+    assert!(
+        during > before + 2,
+        "the five-host majority must keep committing while the fragment is dark: \
+         before={before}, during={during}",
+    );
+
+    // The dark fragment has no quorum of its own, so neither of its hosts commits.
+    for (&host, &frozen) in [0, 1].iter().zip(&frag_before) {
+        let now = c
+            .host_committed_height(host, ShardId::ROOT)
+            .map_or(0, BlockHeight::inner);
+        assert!(
+            now <= frozen + 1,
+            "fragment host {host} committed while partitioned (frozen={frozen}, now={now})",
+        );
+    }
+
+    // Heal: the fragment resynchronises via block fetch, catches up to a tip past
+    // the dark window, and every host — fragment included — agrees on the root.
+    c.heal_all();
+    let target = during + 2;
+    let caught_up = c.run_until(epochs(10), |c| {
+        [0, 1].iter().all(|&host| {
+            c.host_committed_height(host, ShardId::ROOT)
+                .is_some_and(|h| h.inner() >= target)
+        }) && agreed_state_root(c, ShardId::ROOT).is_some()
+    });
+    assert!(
+        caught_up,
+        "the rejoined fragment must catch up past the dark window ({target}) and \
+         every host must agree on the committed state root",
+    );
+}
+
+/// Liveness needs a quorum, not the whole committee.
+///
+/// After a partition drops the cluster below quorum, restoring exactly a quorum
+/// — with the remaining member still dark — must resume progress; the final
+/// member then catches up.
+///
+/// Requires a four-host single-shard committee (quorum three). Hosts 0 and 1 are
+/// isolated rather than split `{0,1} | {2,3}`, so host 0 is genuinely edgeless:
+/// a plain partition would leave the 0–1 edge open, and production gossip would
+/// relay across it once the staged heal reconnects host 1. `{2, 3}` alone is two
+/// of four, below quorum, so consensus halts; reconnecting host 1 to hosts 2 and
+/// 3 forms an exact three-of-four quorum that resumes progress before host 0 is
+/// healed back in.
+///
+/// # Panics
+///
+/// Panics if consensus does not commit before the partition, progress fails to
+/// halt under it, the exact-quorum heal fails to resume progress, or host 0 fails
+/// to catch up and agree on the committed root after the final heal.
+pub fn partition_heals_at_exact_quorum(c: &mut impl FaultableCluster) {
+    assert_eq!(
+        c.host_count(),
+        4,
+        "this scenario needs a four-host committee so three connected hosts are exactly quorum",
+    );
+    // Every host — host 0 included — must be seated and committing before the
+    // isolation, so the host that stays dark rejoins from a real synced state.
+    let seated = c.run_until(epochs(6), |c| {
+        (0..4).all(|host| {
+            c.host_committed_height(host, ShardId::ROOT)
+                .is_some_and(|h| h.inner() >= 1)
+        })
+    });
+    assert!(
+        seated,
+        "every host must commit a block before the partition"
+    );
+
+    // Isolate both 0 and 1 so the 0–1 edge is cut too; `{2, 3}` is below quorum.
+    c.isolate(0);
+    c.isolate(1);
+    let before = c
+        .committed_height(ShardId::ROOT)
+        .expect("a committed height before the partition")
+        .inner();
+    c.run_until(epochs(1), |_| false);
+    let during = c
+        .committed_height(ShardId::ROOT)
+        .expect("a committed height during the partition")
+        .inner();
+    assert!(
+        during <= before + 2,
+        "with only two of four connected there is no quorum, so progress must halt: \
+         before={before}, during={during}",
+    );
+
+    // Reconnect host 1 to hosts 2 and 3 — an exact three-of-four quorum, host 0
+    // still dark. Progress must resume before the final heal.
+    c.heal_between(1, 2);
+    c.heal_between(1, 3);
+    let resumed = during + 3;
+    assert!(
+        await_height(c, ShardId::ROOT, resumed, epochs(6)),
+        "an exact three-of-four quorum (host 0 still dark) must resume progress",
+    );
+    let host0 = c
+        .host_committed_height(0, ShardId::ROOT)
+        .map_or(0, BlockHeight::inner);
+    assert!(
+        host0 < resumed,
+        "the still-dark host 0 must not have kept pace (host0={host0}, tip={resumed})",
+    );
+
+    // Heal host 0 back in; it catches up and every host agrees on the root.
+    c.heal_all();
+    let target = resumed + 2;
+    let caught_up = c.run_until(epochs(8), |c| {
+        c.host_committed_height(0, ShardId::ROOT)
+            .is_some_and(|h| h.inner() >= target)
+            && agreed_state_root(c, ShardId::ROOT).is_some()
+    });
+    assert!(
+        caught_up,
+        "host 0 must catch up to the tip ({target}) and every host must agree on \
+         the committed state root after the final heal",
     );
 }
 
