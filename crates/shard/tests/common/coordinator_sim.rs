@@ -281,6 +281,12 @@ pub struct ShardCoordinatorSim {
     pub shard: ShardId,
     /// Per-replica capture log: one push per `CommitBlock` / `CommitBlockByQcOnly`.
     pub commits: Vec<Vec<CapturedCommit>>,
+    /// Per-replica capture log: one `(block_hash, round)` push per
+    /// `SignAndBroadcastBlockVote`. Safety tests assert on what a
+    /// replica signed — in particular that a crash-restarted replica
+    /// never votes a second block in a round it consumed before the
+    /// crash.
+    pub votes_cast: Vec<Vec<(BlockHash, Round)>>,
     /// Per-replica counter of inbound envelopes to silently drop on
     /// delivery — modelled the same as beacon's `drop_counters`.
     pub drop_counters: Vec<usize>,
@@ -378,6 +384,7 @@ impl ShardCoordinatorSim {
             network,
             shard,
             commits: (0..n).map(|_| Vec::new()).collect(),
+            votes_cast: (0..n).map(|_| Vec::new()).collect(),
             drop_counters: vec![0; n],
             network_q: VecDeque::new(),
             loopback_q: VecDeque::new(),
@@ -409,6 +416,55 @@ impl ShardCoordinatorSim {
     pub fn stop_dropping(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
         self.drop_counters[idx] = 0;
+    }
+
+    /// Crash `replica` and reboot it over its retained store: the
+    /// coordinator — and with it every in-memory register — is dropped
+    /// and rebuilt from `load_recovered_state`, modelling a process
+    /// restart that keeps disk. The pending-chain overlay and tx pool
+    /// are process memory, so they reset too. The harness never
+    /// persists commits, so the store recovers no QC — exactly the
+    /// window where only the durable safe-vote registers stand between
+    /// the replica and re-signing a consumed round.
+    pub fn crash_and_restart(&mut self, replica: ValidatorId) {
+        let idx = self.idx_of(replica);
+        let recovered = self.storages[idx].load_recovered_state();
+        let mut coord = ShardCoordinator::new(
+            replica,
+            self.shard,
+            ShardConsensusConfig::default(),
+            recovered,
+        );
+        self.pending_chains[idx] = Arc::new(PendingChain::new(Arc::clone(&self.storages[idx])));
+        self.tx_pools[idx].clear();
+        // Re-seed the chain tip the way boot does; the genesis block is
+        // deterministic over the store's installed genesis state root.
+        let genesis = build_genesis_block(&self.storages[idx], self.members[0].0);
+        coord.set_time(self.now);
+        let actions = coord.initialize_genesis(&genesis);
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::SetTimer { .. })),
+            "initialize_genesis emitted non-SetTimer action: {:?}",
+            actions.iter().map(Action::type_name).collect::<Vec<_>>(),
+        );
+        self.coordinators[idx] = coord;
+    }
+
+    /// Queue a block header for delivery to `replica`, as though its
+    /// proposer had broadcast it there. Adversarial tests mint sibling
+    /// headers and probe the safe-vote guard with this; drain with
+    /// [`Self::run_for_at_most`].
+    pub fn deliver_header(
+        &mut self,
+        replica: ValidatorId,
+        header: Arc<BlockHeader>,
+        manifest: BlockManifest,
+    ) {
+        let to_idx = self.idx_of(replica);
+        self.network_q.push_back(Envelope {
+            to_idx,
+            event: SimEvent::BlockHeader { header, manifest },
+        });
     }
 
     /// Hand `certified` to `replica`'s
@@ -892,6 +948,7 @@ impl ShardCoordinatorSim {
                 next_proposers,
                 registers,
             } => {
+                self.votes_cast[emitter_idx].push((block_hash, round));
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
                 self.storages[emitter_idx].persist_safe_vote_registers(me, registers);
@@ -1422,7 +1479,7 @@ fn collect_finalized_receipts(
 /// conflicting half of an equivocating proposer's pair: every
 /// other field stays identical so the receiver's per-root
 /// verifiers still pass.
-fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
+pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
     let waves: Vec<_> = h.waves().iter().cloned().collect();
     let provision_tx_roots: BTreeMap<_, _> = h
         .provision_tx_roots()
