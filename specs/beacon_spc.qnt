@@ -87,14 +87,13 @@
 //     fraction-uniform; the mechanized coverage is not. A pool-scaled
 //     Byzantine const is deferred.
 //   - Honest vote registers persist for the whole run: the
-//     one-vote-per-round-per-phase discipline is never reset. The
-//     implementation holds the ratify registers and the process
-//     signing fence in memory and re-inits them on restart
-//     (`RatifyTracker`, crates/beacon/src/ratify.rs;
-//     `allow_ratify_signing`, crates/node/src/process/mod.rs) —
-//     Model B's register-persistence gap, identical here and
-//     unmodeled; register persistence is deferred for both layers
-//     together.
+//     one-vote-per-round-per-phase discipline is never reset. This
+//     matches the implementation: the ratify registers are persisted
+//     before each vote signature leaves the process and recovered on
+//     restart (`RatifyTracker::install_recovered_record`,
+//     crates/beacon/src/ratify.rs), and the process signing fence
+//     resumes from the same durable record
+//     (`allow_ratify_signing`, crates/node/src/process/mod.rs).
 //   - Vote casting and QC formation fold into single actions (Model B's
 //     encoding); honest round-2/3 vote content is over-approximated as
 //     any certified value of the previous round (the implementation picks
