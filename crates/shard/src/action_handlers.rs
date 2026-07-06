@@ -823,7 +823,13 @@ where
             round,
             timestamp,
             next_proposers,
+            registers,
         } => {
+            // The registers this vote ratcheted must be durable before
+            // the signature exists — a crash between them costs at most
+            // an abstention, never a second vote in a consumed round.
+            ctx.vote_registers
+                .persist_safe_vote_registers(ctx.me, registers);
             let verified = Verified::<BlockVote>::sign_local(
                 ctx.topology_snapshot.network(),
                 block_hash,
@@ -845,7 +851,12 @@ where
             round,
             high_qc,
             recipients,
+            registers,
         } => {
+            // Same persistence rule as the vote arm: the abandoned round
+            // is durable before the timeout signature exists.
+            ctx.vote_registers
+                .persist_safe_vote_registers(ctx.me, registers);
             let verified = Verified::<Timeout>::sign_local(
                 ctx.topology_snapshot.network(),
                 ctx.shard,

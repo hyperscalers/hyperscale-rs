@@ -14,10 +14,11 @@ use hyperscale_types::{
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
-    RoutingCommittees, SettledWavesRoot, ShardId, SharedCertificates, SharedTransactions,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
+    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, SharedCertificates,
+    SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
+    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -186,6 +187,10 @@ pub enum Action {
         /// Local-shard validators eligible to propose the next block; they
         /// need this vote to assemble the QC.
         next_proposers: Vec<ValidatorId>,
+        /// The safe-vote registers as ratcheted by this vote. The runner
+        /// persists them durably before the signature leaves the process,
+        /// so a crash-restarted validator can never re-vote this round.
+        registers: SafeVoteRegisters,
     },
 
     /// Sign and broadcast a timeout to the local-shard committee.
@@ -203,6 +208,11 @@ pub enum Action {
         high_qc: QuorumCertificate,
         /// Local-shard committee members who tally timeouts for this round.
         recipients: Vec<ValidatorId>,
+        /// The safe-vote registers as ratcheted by this timeout. The runner
+        /// persists them durably before the signature leaves the process,
+        /// so a crash-restarted validator can never vote a round it
+        /// already abandoned.
+        registers: SafeVoteRegisters,
     },
 
     /// Sign and broadcast a "ready on shard" signal to the local committee.

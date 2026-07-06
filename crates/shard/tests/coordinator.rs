@@ -10,7 +10,8 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats,
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, Round, ShardId, TopologySchedule, VIEW_CHANGE_TIMEOUT, ValidatorId,
+    BlockHeight, LocalTimestamp, Round, SafeVoteRegisters, ShardId, TopologySchedule,
+    VIEW_CHANGE_TIMEOUT, ValidatorId,
 };
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
@@ -195,4 +196,57 @@ fn check_round_timeout_does_not_fire_without_recorded_activity() {
             .check_round_timeout(&topology_schedule)
             .is_none()
     );
+}
+
+/// A recovered safe-vote register record floors the boot registers: the
+/// coordinator must never sign below a position the durable record says
+/// it already consumed.
+#[test]
+fn recovered_registers_floor_boot_values() {
+    let me = ValidatorId::new(0);
+    let mut recovered = RecoveredState::default();
+    recovered.safe_vote_registers.insert(
+        me,
+        SafeVoteRegisters {
+            locked_round: Round::new(3),
+            last_voted_round: Round::new(7),
+        },
+    );
+
+    let coordinator = ShardCoordinator::new(
+        me,
+        ShardId::ROOT,
+        ShardConsensusConfig::default(),
+        recovered,
+    );
+
+    assert_eq!(coordinator.locked_round(), Round::new(3));
+    assert_eq!(coordinator.last_voted_round(), Round::new(7));
+}
+
+/// Register records are per-validator: another validator's record on the
+/// same (shared, co-hosted) store must not leak into this coordinator's
+/// boot values.
+#[test]
+fn recovered_registers_of_other_validators_are_ignored() {
+    let mut recovered = RecoveredState::default();
+    recovered.safe_vote_registers.insert(
+        ValidatorId::new(9),
+        SafeVoteRegisters {
+            locked_round: Round::new(3),
+            last_voted_round: Round::new(7),
+        },
+    );
+
+    let coordinator = ShardCoordinator::new(
+        ValidatorId::new(0),
+        ShardId::ROOT,
+        ShardConsensusConfig::default(),
+        recovered,
+    );
+
+    // No record for this validator and no recovered QC: both registers
+    // boot at the genesis QC's round.
+    assert_eq!(coordinator.locked_round(), Round::INITIAL);
+    assert_eq!(coordinator.last_voted_round(), Round::INITIAL);
 }

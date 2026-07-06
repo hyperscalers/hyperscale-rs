@@ -743,6 +743,7 @@ where
                 me,
                 shard,
                 pending_chain: &shard_handles.pending_chain,
+                vote_registers: shard_handles.storage.as_ref(),
                 execution_cache: &handles.execution_cache,
                 network: &handles.network,
                 signing_key: &signing_key,

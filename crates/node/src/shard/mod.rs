@@ -131,6 +131,7 @@ impl<S: ShardStorage, N> DispatchHandles<S, N> {
 
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
 pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
+    pub(crate) storage: Arc<S>,
     pub(crate) pending_chain: Arc<PendingChain<S>>,
     pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap>>,
 }
@@ -138,6 +139,7 @@ pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
 impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
     fn clone(&self) -> Self {
         Self {
+            storage: Arc::clone(&self.storage),
             pending_chain: Arc::clone(&self.pending_chain),
             prepared_commits: Arc::clone(&self.prepared_commits),
         }
