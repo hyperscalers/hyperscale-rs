@@ -26,9 +26,9 @@ mod transactions;
 mod witnesses;
 
 pub use faults::{
-    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, gossip_drop_engages_fetch_fallback,
     inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
