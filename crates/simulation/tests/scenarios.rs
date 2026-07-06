@@ -19,7 +19,8 @@ use hyperscale_scenarios::{
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
     isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
+    minority_fragment_rejoins_after_partition, multi_vnode_progress, partition_halts_and_heals,
+    partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_shard_tx, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
@@ -69,6 +70,31 @@ fn partition_halts_and_heals_sim() {
 fn isolated_validator_still_settles_sim() {
     let mut cluster = SimCluster::new(&liveness_config(), 42);
     cluster.run_faultable(isolated_validator_still_settles);
+}
+
+/// Seven-host single-shard config: quorum is five, so a connected two-host
+/// fragment can partition off while the majority keeps consensus live.
+const fn seven_host_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 7,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+#[test]
+fn minority_fragment_rejoins_after_partition_sim() {
+    let mut cluster = SimCluster::new(&seven_host_config(), 42);
+    cluster.run_faultable(minority_fragment_rejoins_after_partition);
+}
+
+#[test]
+fn partition_heals_at_exact_quorum_sim() {
+    let mut cluster = SimCluster::new(&liveness_config(), 42);
+    cluster.run_faultable(partition_heals_at_exact_quorum);
 }
 
 /// Single-shard config with the split trigger armed (`split_bytes = 0`) and one

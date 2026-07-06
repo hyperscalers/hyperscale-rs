@@ -23,7 +23,8 @@ use hyperscale_scenarios::{
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
     isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    multi_vnode_progress, partition_halts_and_heals, pool_capacity_caps_registrations,
+    minority_fragment_rejoins_after_partition, multi_vnode_progress, partition_halts_and_heals,
+    partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_shard_tx, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
@@ -132,6 +133,45 @@ fn isolated_validator_still_settles_prod() {
     let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(isolated_validator_still_settles);
+    cluster.shutdown();
+}
+
+/// Seven single-vnode hosts: quorum is five, so a connected two-host fragment
+/// can partition off while the majority keeps consensus live.
+const fn seven_host_fault_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 7,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(60),
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn minority_fragment_rejoins_after_partition_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&seven_host_fault_config(), 7, EPOCH_MS);
+    cluster.run_faultable(minority_fragment_rejoins_after_partition);
+    cluster.shutdown();
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn partition_heals_at_exact_quorum_prod() {
+    let _ = fmt().with_test_writer().try_init();
+    let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
+    cluster.run_faultable(partition_heals_at_exact_quorum);
     cluster.shutdown();
 }
 

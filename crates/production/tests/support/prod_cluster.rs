@@ -311,6 +311,10 @@ impl FaultableCluster for ProdCluster {
         self.inner.fault_isolate(host);
     }
 
+    fn heal_between(&mut self, a: usize, b: usize) {
+        self.inner.fault_heal_between(a, b);
+    }
+
     fn heal_all(&mut self) {
         self.inner.fault_heal_all();
     }
@@ -346,6 +350,16 @@ impl FaultableCluster for ProdCluster {
 
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.inner.hosts_serving(shard)
+    }
+
+    fn host_committed_height(&self, host: usize, shard: ShardId) -> Option<BlockHeight> {
+        self.inner
+            .host_committed_height(host, shard)
+            .map(BlockHeight::new)
+    }
+
+    fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot> {
+        self.inner.host_committed_state_root(host, shard)
     }
 
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {

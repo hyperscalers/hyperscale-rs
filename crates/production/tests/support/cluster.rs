@@ -275,6 +275,28 @@ impl Cluster {
         self.store_for(shard).map(|store| store.state_root())
     }
 
+    /// The committed height on `shard` at host `host` specifically — read off
+    /// that host's own RPC status, not the cluster-wide max — so a scenario can
+    /// watch a lagging fragment catch up after a heal.
+    pub fn host_committed_height(&self, host: usize, shard: ShardId) -> Option<u64> {
+        let key = shard.inner();
+        self.hosts
+            .get(host)?
+            .rpc_status
+            .load()
+            .vnodes
+            .iter()
+            .find(|v| v.shard == key)
+            .map(|v| v.block_height)
+    }
+
+    /// The raw committed JMT root for `shard` on host `host` specifically, read
+    /// off that host's own live store. `None` if host `host` serves no vnode
+    /// there.
+    pub fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot> {
+        self.host_store(host, shard).map(|store| store.state_root())
+    }
+
     /// Whether any host in the cluster currently serves `shard` — the
     /// "the reshape seated this shard" signal (a split's children, the
     /// merged parent).
@@ -526,6 +548,18 @@ impl Cluster {
         })
     }
 
+    /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
+    /// `None` if that host has not opened one there.
+    fn host_store(&self, host: usize, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
+        self.hosts
+            .get(host)?
+            .stores
+            .lock()
+            .expect("store registry")
+            .get(&shard)
+            .cloned()
+    }
+
     /// [`chain_fate`] over the live store the runner writes to — the shared
     /// committed/finalized walk both harness adaptors use. `(None, None)` if
     /// no host serves `shard`.
@@ -630,6 +664,13 @@ impl Cluster {
                 h.adapter.fault_gate().block_host(host_id(host));
             }
         }
+    }
+
+    /// Heal the partition between hosts `a` and `b` only — each side lifts
+    /// its block against the other, leaving every other cut intact.
+    pub fn fault_heal_between(&self, a: usize, b: usize) {
+        self.hosts[a].adapter.fault_gate().unblock_host(host_id(b));
+        self.hosts[b].adapter.fault_gate().unblock_host(host_id(a));
     }
 
     /// Heal every partition on every host.
