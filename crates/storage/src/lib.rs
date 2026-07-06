@@ -32,6 +32,7 @@ pub mod test_helpers;
 
 pub use beacon::chain_reader::BeaconChainReader;
 pub use beacon::chain_writer::BeaconChainWriter;
+pub use beacon::ratify_registers::RatifyRegisterStore;
 pub use beacon::storage::BeaconStorage;
 use hyperscale_jmt::TreeReader;
 pub use shard::boundary::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf};

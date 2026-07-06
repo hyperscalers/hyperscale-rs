@@ -10,7 +10,9 @@ use std::sync::Arc;
 use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{JmtSnapshot, PendingChain, SafeVoteRegisterStore, ShardStorage};
+use hyperscale_storage::{
+    JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage,
+};
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, Epoch,
     PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified, WaveId,
@@ -39,12 +41,15 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
     pub pending_chain: &'a Arc<PendingChain<S>>,
-    /// Durable safe-vote registers on the shard's backing store — the
-    /// only raw storage capability handlers hold. Vote and timeout sign
-    /// handlers persist through it before creating the signature, so no
-    /// signature can leave the process ahead of the registers that
-    /// forbid re-signing its round after a crash.
+    /// Durable safe-vote registers on the shard's backing store. Vote
+    /// and timeout sign handlers persist through it before creating the
+    /// signature, so no signature can leave the process ahead of the
+    /// registers that forbid re-signing its round after a crash.
     pub vote_registers: &'a dyn SafeVoteRegisterStore,
+    /// Durable ratification registers on the process's beacon store —
+    /// the same persist-before-sign contract as `vote_registers`, for
+    /// the ratify-vote sign handler.
+    pub ratify_registers: &'a dyn RatifyRegisterStore,
     /// Process-scope cache of shard-invariant execution outputs.
     /// Execute handlers consult this before dispatching to `executor`;
     /// hits skip the Radix VM call and only run the per-shard

@@ -32,12 +32,12 @@ use hyperscale_types::{
     MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement,
     PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
-    RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError,
-    SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee, ShardId, ShardWitness,
-    SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteRecord,
+    RatifyVoteVerifyError, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee,
+    ShardId, ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -382,6 +382,15 @@ impl BeaconCoordinator {
             now: LocalTimestamp::ZERO,
             input_dwell_rearms: 0,
         }
+    }
+
+    /// Install the durable ratification record a restart recovered —
+    /// see [`RatifyTracker::install_recovered_record`]. Call once,
+    /// right after construction, before any input is processed; a
+    /// record for a different epoch than the pending ratification is
+    /// ignored.
+    pub fn install_recovered_ratify_record(&mut self, record: &RatifyVoteRecord) {
+        self.ratify.install_recovered_record(record);
     }
 
     /// Whether the local validator sits on the current beacon

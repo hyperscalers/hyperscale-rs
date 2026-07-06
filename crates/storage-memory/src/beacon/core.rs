@@ -10,10 +10,13 @@
 //! Used by `SimulationRunner`; one `Arc<SimBeaconStorage>` per process
 //! is shared across every vnode's `BeaconCoordinator`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, Verified};
+use hyperscale_types::{
+    BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, RatifyVoteRecord, ValidatorId,
+    Verified,
+};
 
 /// In-memory implementation of the beacon storage tier.
 ///
@@ -36,6 +39,9 @@ pub(super) struct Inner {
     /// Parallel state store keyed by epoch. Written in the same
     /// critical section as `blocks_by_epoch` so the pair never drifts.
     pub(super) state_by_epoch: BTreeMap<Epoch, Arc<BeaconState>>,
+    /// Per-validator durable ratification registers. Mirrors the
+    /// production `ratify_registers` CF.
+    pub(super) ratify_records: HashMap<ValidatorId, RatifyVoteRecord>,
 }
 
 impl SimBeaconStorage {

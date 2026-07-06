@@ -92,8 +92,11 @@ impl Default for BeaconCommitCoordinator {
 mod tests {
     use crossbeam::channel::{Receiver, Sender, bounded};
     use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
-    use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
+    use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
     use hyperscale_storage_memory::SimBeaconStorage;
+    use hyperscale_types::{
+        BeaconBlockHash, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
+    };
 
     use super::*;
 
@@ -148,6 +151,24 @@ mod tests {
             self.entered.send(()).expect("entered receiver alive");
             self.release.recv().expect("release sender alive");
             self.inner.commit_beacon_block(block, state);
+        }
+    }
+
+    impl RatifyRegisterStore for BlockingBeaconStorage {
+        fn record_ratify_vote(
+            &self,
+            validator: ValidatorId,
+            epoch: Epoch,
+            round: RatifyRound,
+            phase: RatifyPhase,
+            block_hash: BeaconBlockHash,
+        ) {
+            self.inner
+                .record_ratify_vote(validator, epoch, round, phase, block_hash);
+        }
+
+        fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {
+            self.inner.ratify_record(validator)
         }
     }
 

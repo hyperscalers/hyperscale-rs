@@ -35,6 +35,9 @@ pub struct RocksDbBeaconStorage {
     /// of the same `(epoch, hash, state_root)` no-op at the storage
     /// level.
     pub(super) commit_lock: Mutex<()>,
+    /// Serialises the read-modify-write in `record_ratify_vote` so
+    /// concurrent signers' writes stay monotone.
+    pub(super) ratify_lock: Mutex<()>,
 }
 
 impl RocksDbBeaconStorage {
@@ -83,6 +86,7 @@ impl RocksDbBeaconStorage {
         Ok(Self {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
+            ratify_lock: Mutex::new(()),
         })
     }
 

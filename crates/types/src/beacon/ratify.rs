@@ -28,6 +28,8 @@
 //! The ratification tracker — rounds, polka detection, locks — lives
 //! in the beacon crate; these pure verifiers see single messages.
 
+use std::collections::{BTreeMap, btree_map};
+
 use sbor::prelude::*;
 use thiserror::Error;
 
@@ -63,6 +65,77 @@ impl RatifyPhase {
             Self::Prevote => 0,
             Self::Precommit => 1,
         }
+    }
+}
+
+/// A validator's durable ratification registers for one epoch: every
+/// prevote and precommit it signed, keyed by round.
+///
+/// Persisted before each ratify-vote signature leaves the process and
+/// read back on restart, so a crashed pool member resumes with its
+/// spent rounds and its lock instead of a blank register. One record
+/// per validator; a vote for a newer epoch supersedes the whole record
+/// — ratification is per-epoch state.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct RatifyVoteRecord {
+    /// Epoch the registers belong to.
+    pub epoch: Epoch,
+    /// Own prevote per round.
+    pub prevoted: BTreeMap<RatifyRound, BeaconBlockHash>,
+    /// Own precommit per round. The highest entry is the lock.
+    pub precommitted: BTreeMap<RatifyRound, BeaconBlockHash>,
+}
+
+impl RatifyVoteRecord {
+    /// Empty record for `epoch`.
+    #[must_use]
+    pub const fn new(epoch: Epoch) -> Self {
+        Self {
+            epoch,
+            prevoted: BTreeMap::new(),
+            precommitted: BTreeMap::new(),
+        }
+    }
+
+    /// Record `block_hash` at `(round, phase)`. First-wins per slot —
+    /// the register keeps what was actually signed first — and returns
+    /// whether anything changed, so callers can skip a durable write
+    /// that raises nothing.
+    pub fn record(
+        &mut self,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        block_hash: BeaconBlockHash,
+    ) -> bool {
+        let map = match phase {
+            RatifyPhase::Prevote => &mut self.prevoted,
+            RatifyPhase::Precommit => &mut self.precommitted,
+        };
+        match map.entry(round) {
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(block_hash);
+                true
+            }
+            btree_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    /// The highest `(epoch, round, phase)` position recorded — the
+    /// floor the process signing fence resumes from after a restart.
+    /// `None` for a record with no votes.
+    #[must_use]
+    pub fn max_position(&self) -> Option<(Epoch, RatifyRound, RatifyPhase)> {
+        let prevote = self
+            .prevoted
+            .keys()
+            .next_back()
+            .map(|&round| (self.epoch, round, RatifyPhase::Prevote));
+        let precommit = self
+            .precommitted
+            .keys()
+            .next_back()
+            .map(|&round| (self.epoch, round, RatifyPhase::Precommit));
+        prevote.max(precommit)
     }
 }
 

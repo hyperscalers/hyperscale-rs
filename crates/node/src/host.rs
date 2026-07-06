@@ -204,6 +204,7 @@ where
             network: Arc::clone(&network),
             execution_cache,
             beacon_proposal_cache: Arc::new(BeaconProposalCache::new(beacon_network)),
+            beacon_storage: Arc::clone(&beacon_storage),
             per_shard: ArcSwap::from_pointee(per_shard_dispatch),
         });
         assert_eq!(
