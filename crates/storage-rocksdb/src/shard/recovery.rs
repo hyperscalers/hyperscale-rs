@@ -1,16 +1,18 @@
 //! Crash recovery for `RocksDB` storage.
 
+use std::collections::BTreeMap;
+
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, Hash, ShardWitnessPayload,
-    WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash,
+    SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
 };
 
-use super::column_families::{BeaconWitnessesCf, BlocksCf};
+use super::column_families::{BeaconWitnessesCf, BlocksCf, SafeVoteRegistersCf};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_chain_origin;
-use crate::typed_cf::{TypedCf, get, iter_from};
+use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
 
 impl RocksDbShardStorage {
     /// Load recovered state from storage for crash recovery.
@@ -62,6 +64,8 @@ impl RocksDbShardStorage {
             "Loaded recovered state from storage"
         );
 
+        let chain_origin = read_chain_origin(&*self.db);
+
         RecoveredState {
             committed_height,
             committed_hash: committed_hash.map(BlockHash::from_raw),
@@ -73,8 +77,25 @@ impl RocksDbShardStorage {
             substate_bytes: self
                 .substate_bytes_at_version(committed_height.inner())
                 .unwrap_or(0),
-            chain_origin: read_chain_origin(&*self.db),
+            chain_origin,
+            safe_vote_registers: self.load_safe_vote_registers(chain_origin),
         }
+    }
+
+    /// Durable safe-vote register records whose chain-origin tag matches
+    /// the store's current origin. Records inherited through a
+    /// checkpoint-seeded child store carry the parent's origin and are
+    /// excluded — the child chain's round numbering is unrelated.
+    fn load_safe_vote_registers(
+        &self,
+        origin: ChainOrigin,
+    ) -> BTreeMap<ValidatorId, SafeVoteRegisters> {
+        let cf = self.cf();
+        iter_all::<SafeVoteRegistersCf>(&self.db, SafeVoteRegistersCf::handle(&cf))
+            .filter_map(|(validator, (record_origin, registers))| {
+                (record_origin == origin).then_some((validator, registers))
+            })
+            .collect()
     }
 
     /// Weighted timestamp of the committed tip's parent QC — the anchor its

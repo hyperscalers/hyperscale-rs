@@ -25,7 +25,10 @@ use hyperscale_storage::{
     GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
     SubstateStore, tree,
 };
-use hyperscale_types::{Block, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified};
+use hyperscale_types::{
+    Block, BlockHeight, ChainOrigin, Hash, NodeId, QuorumCertificate, SafeVoteRegisters, StateRoot,
+    ValidatorId, Verified,
+};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
     SliceTransform, WriteBatch,
@@ -90,6 +93,13 @@ pub struct RocksDbShardStorage {
     /// Checkpoint ring for snap-sync boundary pins, rooted at the
     /// `checkpoints` directory beside the database.
     pub(crate) checkpoints: super::checkpoints::CheckpointRing,
+
+    /// Write-path cache of the last-persisted safe-vote register record
+    /// per validator. One guard spans the read-merge-write in
+    /// `persist_safe_vote_registers`, keeping concurrent writes monotone
+    /// and letting a write that raises nothing (e.g. a timeout
+    /// retransmit) skip the fsync entirely.
+    pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,
 }
 
 impl RocksDbShardStorage {
@@ -243,6 +253,7 @@ impl RocksDbShardStorage {
             jmt_history_length: config.jmt_history_length,
             root_path,
             checkpoints,
+            vote_registers: Mutex::new(HashMap::new()),
         })
     }
 

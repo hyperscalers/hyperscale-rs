@@ -10,6 +10,8 @@
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
 //! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
+//! - [`vote_registers`]: snapshot type for the two monotone safe-vote
+//!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).
 //! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
 //!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
@@ -30,6 +32,7 @@ pub mod roots;
 pub mod storage_commit;
 pub mod timeout;
 pub mod vote;
+pub mod vote_registers;
 
 pub use block::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,

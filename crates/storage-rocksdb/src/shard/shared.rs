@@ -15,15 +15,15 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, ImportLeaf, JmtSnapshot, PartitionEntry, ShardChainReader,
-    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
+    DbSubstateValue, GenesisCommit, ImportLeaf, JmtSnapshot, PartitionEntry, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, StateRoot, StoredReceipt, TxHash, Verifiable, Verified, WaveCertificate,
-    WaveId,
+    SafeVoteRegisters, ShardWitnessPayload, StateRoot, StoredReceipt, TxHash, ValidatorId,
+    Verifiable, Verified, WaveCertificate, WaveId,
 };
 
 use super::core::RocksDbShardStorage;
@@ -242,6 +242,16 @@ impl ShardChainWriter for SharedStorage {
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
         self.0.memory_usage_bytes()
+    }
+}
+
+impl SafeVoteRegisterStore for SharedStorage {
+    fn persist_safe_vote_registers(&self, validator: ValidatorId, registers: SafeVoteRegisters) {
+        self.0.persist_safe_vote_registers(validator, registers);
+    }
+
+    fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {
+        self.0.safe_vote_registers(validator)
     }
 }
 

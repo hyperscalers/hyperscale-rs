@@ -25,6 +25,7 @@ pub(crate) mod split;
 pub(crate) mod store;
 pub(crate) mod substate_key;
 pub(crate) mod versioned_key;
+pub(crate) mod vote_registers;
 
 #[cfg(test)]
 mod tests;

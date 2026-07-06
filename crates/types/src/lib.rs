@@ -146,6 +146,7 @@ pub use shard::roots::{
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
+pub use shard::vote_registers::SafeVoteRegisters;
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
     shared_transactions_from_raw,

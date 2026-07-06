@@ -42,6 +42,7 @@ pub use shard::overlay::{SubstateDbLookup, SubstateLookup};
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{SubstateStore, VersionedStore};
+pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{
     filter_updates_to_prefix, merge_database_updates, merge_into, merge_owned_nodes,
     merge_updates_from_receipts,
@@ -63,6 +64,7 @@ pub trait ShardStorage:
     + ShardChainReader
     + TreeReader
     + BoundaryStore
+    + SafeVoteRegisterStore
     + Send
     + Sync
 {
@@ -75,6 +77,7 @@ impl<S> ShardStorage for S where
         + ShardChainReader
         + TreeReader
         + BoundaryStore
+        + SafeVoteRegisterStore
         + Send
         + Sync
 {

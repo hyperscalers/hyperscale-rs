@@ -4,8 +4,9 @@
 //! what they store, and how their keys/values are encoded.
 
 use hyperscale_types::{
-    BlockMetadata, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata, Hash,
-    RoutableTransaction, ShardWitnessPayload, WaveCertificate, WaveId,
+    BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata, Hash,
+    Round, RoutableTransaction, SafeVoteRegisters, ShardWitnessPayload, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 use rocksdb::{ColumnFamily, DB};
@@ -14,7 +15,8 @@ use super::jmt_stored::{StaleTreePart, StoredNodeKey, VersionedStoredNode};
 use super::substate_key::SubstateKeyCodec;
 use super::versioned_key::VersionedSubstateKeyCodec;
 use crate::typed_cf::{
-    BeU64Codec, DbCodec, DbEncode, HashCodec, JmtKeyCodec, RawCodec, SborCodec, TypedCf,
+    BeU64Codec, ChainOriginCodec, DbCodec, DbEncode, HashCodec, JmtKeyCodec, RawCodec, SborCodec,
+    TypedCf,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -104,6 +106,18 @@ pub const BEACON_WITNESSES_CF: &str = "beacon_witnesses";
 /// `jmt_history_length` cutoff as historical tree data.
 pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
 
+/// Column family for durable safe-vote registers, keyed by validator.
+///
+/// Key: `validator_id_BE_8B`. Value: packed 32-byte record
+/// `[chain_origin_16B][locked_round_BE_8B][last_voted_round_BE_8B]`.
+/// The chain-origin tag binds the record to the chain incarnation that
+/// wrote it — a child store seeded from a parent shard's checkpoint
+/// carries the parent's records, and reads ignore any record whose tag
+/// differs from the store's current origin. Written with a synchronous
+/// (fsynced) write before the corresponding vote or timeout signature
+/// leaves the process.
+pub const SAFE_VOTE_REGISTERS_CF: &str = "safe_vote_registers";
+
 /// Column family mapping hashed JMT leaf keys back to raw substate
 /// storage keys.
 ///
@@ -141,6 +155,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     BEACON_WITNESSES_CF,
     LEAF_ASSOCIATIONS_CF,
     SUBSTATE_BYTES_CF,
+    SAFE_VOTE_REGISTERS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -166,6 +181,7 @@ pub struct CfHandles<'a> {
     beacon_witnesses: &'a ColumnFamily,
     leaf_associations: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
+    safe_vote_registers: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -193,6 +209,7 @@ impl<'a> CfHandles<'a> {
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             leaf_associations: resolve(LEAF_ASSOCIATIONS_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
+            safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
         }
     }
 }
@@ -448,6 +465,73 @@ impl TypedCf for BeaconWitnessesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.beacon_witnesses
+    }
+}
+
+// Safe-vote registers.
+
+/// Key codec for [`SafeVoteRegistersCf`]: validator id as a big-endian
+/// `u64`, so recovery's full scan decodes in stable validator order.
+#[derive(Default)]
+pub struct ValidatorIdCodec;
+
+impl DbEncode<ValidatorId> for ValidatorIdCodec {
+    fn encode_to(&self, value: &ValidatorId, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.inner().to_be_bytes());
+    }
+}
+
+impl DbCodec<ValidatorId> for ValidatorIdCodec {
+    fn decode(&self, bytes: &[u8]) -> ValidatorId {
+        let arr: [u8; 8] = bytes.try_into().expect("validator key must be 8 bytes");
+        ValidatorId::new(u64::from_be_bytes(arr))
+    }
+}
+
+/// Value codec for [`SafeVoteRegistersCf`]: packed 32-byte record
+/// `[chain_origin_16B][locked_round_BE_8B][last_voted_round_BE_8B]`.
+#[derive(Default)]
+pub struct SafeVoteRegisterRecordCodec;
+
+impl DbEncode<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
+    fn encode_to(&self, value: &(ChainOrigin, SafeVoteRegisters), buf: &mut Vec<u8>) {
+        ChainOriginCodec.encode_to(&value.0, buf);
+        buf.extend_from_slice(&value.1.locked_round.inner().to_be_bytes());
+        buf.extend_from_slice(&value.1.last_voted_round.inner().to_be_bytes());
+    }
+}
+
+impl DbCodec<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
+    fn decode(&self, bytes: &[u8]) -> (ChainOrigin, SafeVoteRegisters) {
+        assert_eq!(
+            bytes.len(),
+            32,
+            "safe-vote register record must be 32 bytes"
+        );
+        let origin = ChainOriginCodec.decode(&bytes[..16]);
+        let registers = SafeVoteRegisters {
+            locked_round: Round::new(u64::from_be_bytes(
+                bytes[16..24].try_into().expect("length checked above"),
+            )),
+            last_voted_round: Round::new(u64::from_be_bytes(
+                bytes[24..32].try_into().expect("length checked above"),
+            )),
+        };
+        (origin, registers)
+    }
+}
+
+/// Durable safe-vote registers per validator; see [`SAFE_VOTE_REGISTERS_CF`].
+pub struct SafeVoteRegistersCf;
+impl TypedCf for SafeVoteRegistersCf {
+    const NAME: &'static str = SAFE_VOTE_REGISTERS_CF;
+    type Key = ValidatorId;
+    type Value = (ChainOrigin, SafeVoteRegisters);
+    type KeyCodec = ValidatorIdCodec;
+    type ValueCodec = SafeVoteRegisterRecordCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.safe_vote_registers
     }
 }
 
