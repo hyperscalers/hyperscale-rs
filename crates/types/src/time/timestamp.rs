@@ -3,9 +3,10 @@
 //! Three distinct timestamp categories share millisecond representation but
 //! carry very different trust guarantees:
 //!
-//! - [`WeightedTimestamp`] — BFT-authenticated stake-weighted median produced
-//!   on every QC. Safe to anchor consensus deadlines on; all validators derive
-//!   the same value for a given committed block.
+//! - [`WeightedTimestamp`] — BFT-authenticated aggregate produced on every
+//!   QC: the mean of the quorum's vote timestamps, clamped so it never
+//!   precedes the parent QC's value. Safe to anchor consensus deadlines on;
+//!   all validators derive the same value for a given committed block.
 //! - [`ProposerTimestamp`] — the proposer's local wall-clock embedded in a
 //!   block header at proposal time. Not authenticated; used only for shard consensus
 //!   liveness bounds (rushed/stale header rejection) and local-only latency
