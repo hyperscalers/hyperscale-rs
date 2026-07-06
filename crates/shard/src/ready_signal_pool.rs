@@ -75,15 +75,29 @@ impl ReadySignalPool {
     }
 
     /// Admit `signal` into the pool with `received_at` as its arrival
-    /// stamp. Replaces any previous entry from the same validator — a
-    /// fresh re-emission resets the dwell clock and supersedes the
-    /// older window.
+    /// stamp. A re-emission carrying a *new* window supersedes the older
+    /// entry and resets the dwell clock; a re-emission of the window
+    /// already held keeps the earlier `received_at`, so the dwell accrues.
+    ///
+    /// The keep-on-repeat rule is load-bearing: a reshape observer
+    /// re-asserts its ready signal every reshape pump — far more often
+    /// than [`MIN_READY_SIGNAL_DWELL`] — against the same anchor window
+    /// until the split executes. Overwriting `received_at` on each repeat
+    /// would pin the dwell below the threshold forever, so
+    /// [`Self::drain_eligible`] would never collect the signal and the
+    /// cohort's `ReshapeReady` would never commit.
     ///
     /// Caller is responsible for any cryptographic verification (BLS
     /// sig over [`crate::signing::ready_signal_message`]) before
     /// calling — the pool trusts what it's given and only enforces
     /// pool-shape invariants.
     pub fn admit(&mut self, signal: ReadySignal, received_at: LocalTimestamp) {
+        if let Some(existing) = self.pending.get(&signal.validator_id())
+            && existing.signal.wt_window_start() == signal.wt_window_start()
+            && existing.signal.wt_window_end() == signal.wt_window_end()
+        {
+            return;
+        }
         self.pending.insert(
             signal.validator_id(),
             PendingReadySignal {
@@ -212,6 +226,33 @@ mod tests {
         let (_, entry) = pool.iter().next().unwrap();
         assert_eq!(entry.signal.wt_window_end(), wt(200));
         assert_eq!(entry.received_at, ts(500));
+    }
+
+    #[test]
+    fn admit_keeps_received_at_for_repeated_window() {
+        // A reshape observer re-asserts the same-window signal every pump.
+        // The first arrival's stamp must survive so the dwell accrues.
+        let mut pool = ReadySignalPool::new();
+        pool.admit(signal(3, 0, 100), ts(0));
+        pool.admit(signal(3, 0, 100), ts(500));
+        let (_, entry) = pool.iter().next().unwrap();
+        assert_eq!(
+            entry.received_at,
+            ts(0),
+            "an identical re-emission must not reset the dwell clock",
+        );
+    }
+
+    #[test]
+    fn admit_resets_received_at_for_a_fresh_window() {
+        // A genuinely new window (fresh anchor epoch) supersedes and
+        // restarts the dwell — it is a distinct signal to converge on.
+        let mut pool = ReadySignalPool::new();
+        pool.admit(signal(3, 0, 100), ts(0));
+        pool.admit(signal(3, 50, 200), ts(500));
+        let (_, entry) = pool.iter().next().unwrap();
+        assert_eq!(entry.received_at, ts(500));
+        assert_eq!(entry.signal.wt_window_end(), wt(200));
     }
 
     #[test]
