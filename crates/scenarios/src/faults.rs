@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{BlockHeight, ShardId, StateRoot, TransactionDecision, TransactionStatus};
+use hyperscale_types::{
+    BlockHeight, Epoch, ShardId, StateRoot, TransactionDecision, TransactionStatus,
+};
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
@@ -143,15 +145,17 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
     );
 }
 
-/// The committed state root that *every* host agrees on, or `None` if any host
-/// disagrees or has not yet reported one. The stall-not-fork check: after a
-/// heal, this becoming `Some` means the whole committee — the rejoined dark
-/// hosts included — converged on one chain. A host still catching up reports a
-/// different (or no) root, so it holds this at `None` until the fragment is
-/// fully back in step.
+/// The committed state root that every host serving `shard` agrees on, or `None`
+/// if any two disagree or one has not yet reported. The stall-not-fork check:
+/// after a heal, this becoming `Some` means the shard's whole committee — the
+/// rejoined dark hosts included — converged on one chain. A host still catching
+/// up reports a different (or no) root, so it holds this at `None` until every
+/// committee member is back in step. Scoped to the shard's committee so it works
+/// in a multi-shard cluster, where only some hosts serve any given shard.
 fn agreed_state_root(c: &impl FaultableCluster, shard: ShardId) -> Option<StateRoot> {
-    let first = c.host_committed_state_root(0, shard)?;
-    for host in 1..c.host_count() {
+    let hosts = c.committee_hosts(shard);
+    let first = c.host_committed_state_root(*hosts.first()?, shard)?;
+    for &host in &hosts[1..] {
         if c.host_committed_state_root(host, shard)? != first {
             return None;
         }
@@ -540,6 +544,107 @@ pub fn inter_shard_partition_aborts_waves_at_deadline(c: &mut impl FaultableClus
         ),
         "a fresh cross-shard transfer must settle once the severance heals; \
          status = {fresh_status:?}",
+    );
+}
+
+/// A ratification pool partitioned below quorum halts epoch production, and the
+/// shards defer at the schedule head rather than fork.
+///
+/// A disjoint two-shard cluster (eight hosts, one validator each).
+/// `partition(committee_hosts(left), committee_hosts(right))` splits the beacon
+/// pool 4|4 — neither side reaches quorum, so no beacon block commits and epoch
+/// production halts — while each shard keeps its own four hosts together, so
+/// shard consensus stays live. The partition then holds *past* the `L = 1`
+/// lookahead runway. The shards coast on the committees the last committed beacon
+/// epoch resolved, so their heights climb for the runway and then plateau once
+/// the weighted timestamp crosses past the last resolved committee window —
+/// stall, not fork. Healing restores the pool quorum, epoch production resumes,
+/// and both shards commit on past their frozen heights.
+///
+/// # Panics
+///
+/// Panics if the partitioned pool advances the epoch, a shard fails to coast then
+/// freeze, either shard keeps committing past its runway (a fork or a wedge
+/// rather than a clean defer), or the heal fails to resume epochs, shard
+/// progress, or cross-host root agreement.
+pub fn beacon_pool_partition_stalls_epoch_production(c: &mut impl FaultableCluster) {
+    let (left, right) = ShardId::ROOT.children();
+    split_lifecycle(c);
+
+    let left_hosts = c.committee_hosts(left);
+    let right_hosts = c.committee_hosts(right);
+    assert!(
+        !left_hosts.is_empty() && !right_hosts.is_empty(),
+        "both split children must be served before the partition",
+    );
+    assert!(
+        left_hosts.iter().all(|h| !right_hosts.contains(h)),
+        "the two committees must sit on disjoint host sets: left={left_hosts:?}, right={right_hosts:?}",
+    );
+
+    let start_epoch = beacon_epoch(c)
+        .expect("a committed beacon epoch before the partition")
+        .inner();
+    let left_before = c.committed_height(left).expect("left serves").inner();
+    let right_before = c.committed_height(right).expect("right serves").inner();
+
+    // Split the beacon pool below quorum. Each shard keeps its own hosts, so
+    // shard consensus survives; the pool spanning both shards does not.
+    c.partition(&left_hosts, &right_hosts);
+
+    // Coast past the L = 1 runway, then the shards defer at the schedule head.
+    c.run_until(epochs(3), |_| false);
+    let left_frozen = c.committed_height(left).expect("left serves").inner();
+    let right_frozen = c.committed_height(right).expect("right serves").inner();
+    assert_eq!(
+        beacon_epoch(c).map(Epoch::inner),
+        Some(start_epoch),
+        "the pool partitioned below quorum must halt epoch production",
+    );
+    assert!(
+        left_frozen > left_before && right_frozen > right_before,
+        "both shards must coast the lookahead runway before deferring \
+         (left {left_before}->{left_frozen}, right {right_before}->{right_frozen})",
+    );
+
+    // Hold longer: the deferred shards make no further progress — a stall, not a
+    // fork, and not an unbounded run past the runway.
+    c.run_until(epochs(2), |_| false);
+    assert_eq!(
+        c.committed_height(left).map(BlockHeight::inner),
+        Some(left_frozen),
+        "the left shard must defer at the schedule head, not commit past its runway",
+    );
+    assert_eq!(
+        c.committed_height(right).map(BlockHeight::inner),
+        Some(right_frozen),
+        "the right shard must defer at the schedule head, not commit past its runway",
+    );
+    assert_eq!(
+        beacon_epoch(c).map(Epoch::inner),
+        Some(start_epoch),
+        "epoch production must stay halted while the pool is partitioned",
+    );
+
+    // Heal: the pool reaches quorum again, epochs resume, and both shards commit
+    // past their frozen heights on the one chain every serving host agrees on.
+    c.heal_all();
+    assert!(
+        await_beacon_epoch(c, start_epoch + 1, epochs(8)),
+        "epoch production must resume once the pool heals (stalled at epoch {start_epoch})",
+    );
+    assert!(
+        await_height(c, left, left_frozen + 1, epochs(8))
+            && await_height(c, right, right_frozen + 1, epochs(8)),
+        "both shards must resume committing past their frozen heights after the heal \
+         (left {left_frozen}, right {right_frozen})",
+    );
+    let agreed = c.run_until(epochs(8), |c| {
+        agreed_state_root(c, left).is_some() && agreed_state_root(c, right).is_some()
+    });
+    assert!(
+        agreed,
+        "every serving host must agree on each shard's committed root after the heal",
     );
 }
 

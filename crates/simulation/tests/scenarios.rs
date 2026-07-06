@@ -12,9 +12,10 @@ use hyperscale_scenarios::tx::{
     witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_header_fetch_fallback,
-    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
@@ -172,6 +173,16 @@ fn inter_shard_partition_aborts_waves_at_deadline_sim() {
         &intershard_partition_genesis_balances(),
     );
     cluster.run_faultable(inter_shard_partition_aborts_waves_at_deadline);
+}
+
+#[test]
+fn beacon_pool_partition_stalls_epoch_production_sim() {
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(
+        &split_config(),
+        11,
+        &intershard_partition_genesis_balances(),
+    );
+    cluster.run_faultable(beacon_pool_partition_stalls_epoch_production);
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's
