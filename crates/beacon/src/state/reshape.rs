@@ -95,8 +95,9 @@ pub(super) fn draw_split_cohort(
 }
 
 /// Draw the keeper committee for a now-paired merge of `parent`'s two
-/// children: half the merged committee from each child's ready members,
-/// seeded like every reshape draw.
+/// children: half the merged committee from each child, preferring ready
+/// members and backfilling from the not-yet-ready half, seeded like every
+/// reshape draw.
 ///
 /// Keepers stay `OnShard` on their child for the whole grow — they keep
 /// running that chain and hard-link the merged store from it — so the
@@ -114,29 +115,45 @@ pub(super) fn draw_merge_keepers(
     let (left, right) = parent.children();
     let mut keepers = BTreeMap::new();
     for (child, take) in [(left, size.div_ceil(2)), (right, size / 2)] {
-        let mut members: Vec<ValidatorId> = state
+        let on_child = |id: &ValidatorId, want_ready: bool| {
+            matches!(
+                state.validators.get(id).map(|r| r.status),
+                Some(ValidatorStatus::OnShard { shard, ready, .. })
+                    if shard == child && ready == want_ready
+            )
+        };
+        let members = state
             .next_shard_committees
             .get(&child)
-            .map(|committee| {
-                committee
-                    .members
-                    .iter()
-                    .copied()
-                    .filter(|id| {
-                        matches!(
-                            state.validators.get(id).map(|r| r.status),
-                            Some(ValidatorStatus::OnShard { shard, ready: true, .. })
-                                if shard == child
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        members.sort_unstable();
+            .map_or(&[][..], |committee| committee.members.as_slice());
+        let mut ready: Vec<ValidatorId> = members
+            .iter()
+            .copied()
+            .filter(|id| on_child(id, true))
+            .collect();
+        let mut backfill: Vec<ValidatorId> = members
+            .iter()
+            .copied()
+            .filter(|id| on_child(id, false))
+            .collect();
+        ready.sort_unstable();
+        backfill.sort_unstable();
         let mut prng = reshape_prng(DOMAIN_RESHAPE_KEEPER, state, child);
-        shuffle(&mut members, &mut prng);
-        members.truncate(take);
-        for id in members {
+        shuffle(&mut ready, &mut prng);
+        shuffle(&mut backfill, &mut prng);
+        // Prefer ready keepers — they hold a synced child half and can
+        // hard-link the merged store at once — then fill any shortfall from
+        // the not-yet-ready half so the reformed committee reaches `take`
+        // even when a member's `Ready` witness has not folded by the pairing
+        // fold. A backfilled keeper seats `OnShard` and completes via the
+        // normal `Ready` path; the execution gate still holds the merge until
+        // a `2f+1` keeper quorum is ready.
+        let mut drawn = ready;
+        drawn.truncate(take);
+        if drawn.len() < take {
+            drawn.extend(backfill.into_iter().take(take - drawn.len()));
+        }
+        for id in drawn {
             keepers.insert(
                 id,
                 KeeperSeat {
@@ -1098,6 +1115,47 @@ mod tests {
                     .contains(id)
             );
         }
+    }
+
+    /// A child short on ready members at the pairing fold still yields
+    /// `take` keepers: the draw backfills the shortfall from the not-yet-ready
+    /// `OnShard` half, so the reformed committee reaches full strength even
+    /// when a member's `Ready` witness has not folded by then.
+    #[test]
+    fn merge_pairing_backfills_keepers_when_a_child_is_short_on_ready() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+
+        // Leave the left child with a single ready member; the rest stay
+        // `OnShard` on the left but their readiness has not folded.
+        let short: Vec<ValidatorId> = state.next_shard_committees[&left]
+            .members
+            .iter()
+            .copied()
+            .skip(1)
+            .collect();
+        for id in short {
+            if let Some(rec) = state.validators.get_mut(&id)
+                && let ValidatorStatus::OnShard { ready, .. } = &mut rec.status
+            {
+                *ready = false;
+            }
+        }
+
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, left, &merge);
+        apply_shard_payload(&mut state, right, &merge);
+
+        let keepers = keepers_of(&state, parent);
+        assert_eq!(
+            keepers.len(),
+            4,
+            "backfill must reach full keeper strength when a child is short on ready members",
+        );
+        let from_left = keepers.values().filter(|s| s.child == left).count();
+        let from_right = keepers.values().filter(|s| s.child == right).count();
+        assert_eq!((from_left, from_right), (2, 2));
     }
 
     /// A paired merge projects its keepers into the lookahead topology
