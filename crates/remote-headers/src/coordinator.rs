@@ -539,11 +539,21 @@ impl RemoteHeaderCoordinator {
     /// the `2f+1` that admits its terminal boundary QC. The terminal clamp on
     /// the schedule retains the shard until the drain horizon, exactly long
     /// enough for its terminal to fold.
+    ///
+    /// But stop probing a terminated reshape parent the moment its successors
+    /// are live: past that its terminal crossing has already folded (the
+    /// children seeded and produced past genesis), so there is nothing left to
+    /// sync — and its serving members have transitioned to the children and
+    /// deregistered its per-shard request protocol, so every further probe only
+    /// draws `UnsupportedProtocol` that retries and congests the shared request
+    /// pipeline for the rest of the retention window.
     fn refresh_expected(&mut self, topology_schedule: &TopologySchedule) {
         let routable = topology_schedule.routable_shards();
-        self.expected.retain(|shard, _| routable.contains(shard));
+        self.expected.retain(|shard, _| {
+            routable.contains(shard) && !topology_schedule.successors_live(*shard)
+        });
         for shard in routable {
-            if shard == self.local_shard {
+            if shard == self.local_shard || topology_schedule.successors_live(shard) {
                 continue;
             }
             // Anchor a freshly tracked shard at its attested boundary, not
