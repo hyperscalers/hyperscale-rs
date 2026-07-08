@@ -560,6 +560,23 @@ impl RemoteHeaderCoordinator {
                 .map_or(BlockHeight::new(0), |a| a.height);
             self.expected
                 .entry(shard)
+                .and_modify(|entry| {
+                    // Re-anchor a child first tracked before its boundary was
+                    // known locally: it seeded at genesis (0, the `map_or`
+                    // fallback), below its real chain start, so the
+                    // contiguous-prefix sync requests non-existent sub-genesis
+                    // heights and stalls — and a production split child's store
+                    // (a checkpoint of the parent) answers those with the
+                    // parent's wrong-shard headers. Once the attested boundary
+                    // arrives, raise a not-yet-verified anchor to it. Safe
+                    // because no real header has verified (`last_verified_at`
+                    // is `None`), so no reached height is skipped.
+                    if entry.last_verified_at.is_none()
+                        && entry.last_verified_height < anchor_height
+                    {
+                        entry.last_verified_height = anchor_height;
+                    }
+                })
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.local_committed_ts,
                     last_verified_height: anchor_height,
@@ -574,6 +591,16 @@ impl RemoteHeaderCoordinator {
     /// Called on sync-complete so the validator quickly discovers provision
     /// needs for blocks committed during the sync window.
     pub fn flush_expected_headers(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        // Reconcile anchors before flushing. `on_block_committed` is the
+        // usual re-anchor point, but a shard whose chain has quiesced — a
+        // coasting reshape predecessor past its terminal block — stops
+        // committing, so it never picks up a reshaped-in child's boundary
+        // once that boundary folds. This tick-driven path still fires (the
+        // stall-recovery timer flushes on an unchanged committed height), so
+        // reconciling here re-anchors a child scope stuck at the genesis-0
+        // fallback it was first seeded with.
+        self.refresh_expected(topology_schedule);
+
         let mut actions = vec![];
 
         for (&shard, expected) in &self.expected {
