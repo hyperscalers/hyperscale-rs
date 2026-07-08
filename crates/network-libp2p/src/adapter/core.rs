@@ -22,7 +22,7 @@ use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore as KadMemoryStore;
 use libp2p::kad::{Behaviour as KadBehaviour, Mode as KadMode};
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId, Stream};
-use libp2p_stream::{Behaviour as StreamBehaviour, Control as StreamControl};
+use libp2p_stream::{Behaviour as StreamBehaviour, Control as StreamControl, OpenStreamError};
 use tokio::spawn;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, trace};
@@ -495,8 +495,10 @@ impl Libp2pAdapter {
     ///
     /// # Errors
     ///
-    /// Returns [`NetworkError::StreamOpenFailed`] if the underlying libp2p
-    /// stream control rejects the open (peer unknown, protocol unsupported, etc.).
+    /// Returns [`NetworkError::ProtocolUnsupported`] when the peer does not
+    /// serve `shard`'s request protocol, and
+    /// [`NetworkError::StreamOpenFailed`] for any other rejected open (peer
+    /// unknown, handshake I/O failure, etc.).
     pub async fn open_request_stream(
         &self,
         peer: Libp2pPeerId,
@@ -506,7 +508,12 @@ impl Libp2pAdapter {
             .clone()
             .open_stream(peer, request_protocol(shard))
             .await
-            .map_err(|e| NetworkError::StreamOpenFailed(format!("{e:?}")))
+            .map_err(|e| match e {
+                OpenStreamError::UnsupportedProtocol(proto) => {
+                    NetworkError::ProtocolUnsupported(proto.to_string())
+                }
+                other => NetworkError::StreamOpenFailed(format!("{other:?}")),
+            })
     }
 
     /// Open a fire-and-forget notification stream to a peer.

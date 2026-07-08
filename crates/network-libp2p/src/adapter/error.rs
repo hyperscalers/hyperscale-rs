@@ -30,4 +30,11 @@ pub enum NetworkError {
     /// Could not open a new stream to the peer.
     #[error("Stream open failed: {0}")]
     StreamOpenFailed(String),
+
+    /// The peer's live protocol table does not include the requested
+    /// protocol — a definitive "not serving" answer, unlike the transient
+    /// faults above. A peer only starts or stops serving a shard's request
+    /// protocol when a reshape seats or unseats a vnode there.
+    #[error("Protocol unsupported by peer: {0}")]
+    ProtocolUnsupported(String),
 }

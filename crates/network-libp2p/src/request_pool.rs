@@ -272,11 +272,11 @@ impl RequestStreamPool {
             Ok(s) => s,
             Err(e) => {
                 warn!(peer = %peer, shard = shard.inner(), error = ?e, "Failed to open persistent request stream");
+                apply_open_failure_backoff(&backoff_map, &key, &e);
                 // Fail every pending request so callers see the error promptly.
                 drain_with_error(&mut req_rx, || {
                     NetworkError::StreamOpenFailed(format!("{e:?}"))
                 });
-                peer_backoff::apply_backoff(&backoff_map, &key);
                 peers.remove(&key);
                 return;
             }
@@ -327,9 +327,7 @@ impl RequestStreamPool {
                         }
                         Err(reopen_err) => {
                             warn!(peer = %peer, shard = shard.inner(), error = ?reopen_err, "Failed to reopen persistent request stream");
-                            Ok(IoOutcome::ResponseFailed(NetworkError::StreamOpenFailed(
-                                format!("{reopen_err:?}"),
-                            )))
+                            Ok(IoOutcome::ResponseFailed(reopen_err))
                         }
                     }
                 }
@@ -342,12 +340,12 @@ impl RequestStreamPool {
                 }
                 Ok(IoOutcome::WriteFailed(e) | IoOutcome::ResponseFailed(e)) => {
                     let msg = format!("{e:?}");
+                    apply_open_failure_backoff(&backoff_map, &key, &e);
                     let _ = req.resp_tx.send(Err(e));
                     warn!(peer = %peer, shard = shard.inner(), error = %msg, "Persistent request stream I/O failed");
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after prior failure".into())
                     });
-                    peer_backoff::apply_backoff(&backoff_map, &key);
                     peers.remove(&key);
                     return;
                 }
@@ -418,6 +416,23 @@ async fn do_request_response<S: AsyncRead + AsyncWrite + Unpin>(
         Err(e) => {
             IoOutcome::ResponseFailed(NetworkError::StreamIo(format!("decompression failed: {e}")))
         }
+    }
+}
+
+/// Schedule `(peer, shard)`'s next reconnect attempt after a stream failure,
+/// picking the series by what failed: a peer that answered "protocol
+/// unsupported" definitively does not serve the shard, so it earns the long
+/// unsupported series; everything else (handshake I/O, timeout, reset) is
+/// transient and stays on the standard short series.
+fn apply_open_failure_backoff(
+    backoff_map: &DashMap<(PeerId, ShardId), BackoffState>,
+    key: &(PeerId, ShardId),
+    error: &NetworkError,
+) {
+    if matches!(error, NetworkError::ProtocolUnsupported(_)) {
+        peer_backoff::apply_unsupported_backoff(backoff_map, key);
+    } else {
+        peer_backoff::apply_backoff(backoff_map, key);
     }
 }
 

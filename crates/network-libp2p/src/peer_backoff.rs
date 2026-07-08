@@ -23,6 +23,19 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Multiplier applied on each consecutive failure.
 pub const BACKOFF_MULTIPLIER: u32 = 2;
 
+/// Initial backoff after a peer answers that it does not serve the requested
+/// protocol. Starts near [`MAX_BACKOFF`] so a seating race — probing a peer
+/// moments before a reshape registers a fresh shard's handler — recovers in
+/// seconds.
+pub const UNSUPPORTED_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Backoff cap once a peer keeps answering "protocol unsupported". A peer's
+/// protocol table only changes when a reshape seats or unseats a vnode — an
+/// epoch-scale event — so a requester chasing a drained shard converges to
+/// one probe a minute instead of hammering every peer at [`MAX_BACKOFF`]
+/// cadence for the whole retention window.
+pub const UNSUPPORTED_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Per-key backoff state. Callers store this in a `DashMap` keyed by
 /// whatever identifies the connection target (`PeerId` for the notify
 /// pool, `(PeerId, ShardId)` for the per-shard request pool) and
@@ -39,8 +52,38 @@ pub fn apply_backoff<K>(backoff_map: &DashMap<K, BackoffState>, key: &K)
 where
     K: Eq + Hash + Clone,
 {
-    let current_backoff = backoff_map.get(key).map_or(INITIAL_BACKOFF, |state| {
-        (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
+    apply_backoff_with(backoff_map, key, INITIAL_BACKOFF, MAX_BACKOFF);
+}
+
+/// Apply (or escalate) the unsupported-protocol backoff for `key`: from
+/// [`UNSUPPORTED_INITIAL_BACKOFF`] doubling to [`UNSUPPORTED_MAX_BACKOFF`].
+/// A later failure of a different class re-enters the standard series via
+/// [`apply_backoff`]'s cap, so the long hold only persists while the peer
+/// keeps answering "unsupported".
+pub fn apply_unsupported_backoff<K>(backoff_map: &DashMap<K, BackoffState>, key: &K)
+where
+    K: Eq + Hash + Clone,
+{
+    apply_backoff_with(
+        backoff_map,
+        key,
+        UNSUPPORTED_INITIAL_BACKOFF,
+        UNSUPPORTED_MAX_BACKOFF,
+    );
+}
+
+/// Escalate `key`'s series by [`BACKOFF_MULTIPLIER`] within `[initial, max]`,
+/// scheduling the next allowed attempt. Replaces any existing entry.
+fn apply_backoff_with<K>(
+    backoff_map: &DashMap<K, BackoffState>,
+    key: &K,
+    initial: Duration,
+    max: Duration,
+) where
+    K: Eq + Hash + Clone,
+{
+    let current_backoff = backoff_map.get(key).map_or(initial, |state| {
+        (state.current_backoff * BACKOFF_MULTIPLIER).clamp(initial, max)
     });
 
     backoff_map.insert(
@@ -126,6 +169,69 @@ mod tests {
             apply_backoff(&map, &peer);
             assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_series_starts_high_and_caps_at_unsupported_max() {
+        let map = DashMap::new();
+        let peer = PeerId::random();
+
+        apply_unsupported_backoff(&map, &peer);
+        assert_eq!(
+            map.get(&peer).unwrap().current_backoff,
+            UNSUPPORTED_INITIAL_BACKOFF
+        );
+
+        // Walk the series to saturation: 5s → 10s → 20s → 40s → 60s.
+        let mut expected = UNSUPPORTED_INITIAL_BACKOFF;
+        while expected < UNSUPPORTED_MAX_BACKOFF {
+            apply_unsupported_backoff(&map, &peer);
+            expected = (expected * BACKOFF_MULTIPLIER).min(UNSUPPORTED_MAX_BACKOFF);
+            assert_eq!(map.get(&peer).unwrap().current_backoff, expected);
+        }
+
+        apply_unsupported_backoff(&map, &peer);
+        assert_eq!(
+            map.get(&peer).unwrap().current_backoff,
+            UNSUPPORTED_MAX_BACKOFF
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_failure_after_unsupported_returns_to_standard_cap() {
+        // A different failure class means the peer is no longer definitively
+        // "not serving" — the series must fall back to the standard cadence,
+        // not stay pinned at the minute-scale hold.
+        let map = DashMap::new();
+        let peer = PeerId::random();
+
+        for _ in 0..8 {
+            apply_unsupported_backoff(&map, &peer);
+        }
+        assert_eq!(
+            map.get(&peer).unwrap().current_backoff,
+            UNSUPPORTED_MAX_BACKOFF
+        );
+
+        apply_backoff(&map, &peer);
+        assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn unsupported_after_generic_jumps_to_unsupported_initial() {
+        // A definitive "unsupported" answer mid-way through a short generic
+        // series must not inherit the sub-second cadence.
+        let map = DashMap::new();
+        let peer = PeerId::random();
+
+        apply_backoff(&map, &peer);
+        assert_eq!(map.get(&peer).unwrap().current_backoff, INITIAL_BACKOFF);
+
+        apply_unsupported_backoff(&map, &peer);
+        assert_eq!(
+            map.get(&peer).unwrap().current_backoff,
+            UNSUPPORTED_INITIAL_BACKOFF
+        );
     }
 
     #[tokio::test]
