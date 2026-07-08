@@ -284,6 +284,15 @@ pub fn surviving_sibling_split_seats_full_committees(c: &mut impl Cluster) {
         "both splitter children's roots must reproduce the beacon anchor",
     );
 
+    // A committed-height probe can transiently read `None` while a vnode's
+    // serving surface hands over (the anchor probe above may have sampled a
+    // host that has since rotated), so wait the heights back into view
+    // before taking the bases.
+    assert!(
+        c.run_until(epochs(2), |c| c.committed_height(child_left).is_some()
+            && c.committed_height(child_right).is_some()),
+        "both splitter children must report a committed height",
+    );
     let left_base = c
         .committed_height(child_left)
         .expect("the left child commits");
