@@ -53,6 +53,18 @@ pub trait Cluster {
     /// The latest committed beacon state across the cluster (highest epoch).
     fn beacon_state(&self) -> Option<Arc<BeaconState>>;
 
+    /// Upper bound on the wall-clock cost for a submitted governance vote to
+    /// fold into the beacon: transaction inclusion, an epoch-boundary crossing
+    /// carrying the vote leaf, and a beacon quorum observing that crossing.
+    /// The cascade is priced by the harness's clock, not by epoch count — the
+    /// default covers a logical-clock harness that delivers every hop in
+    /// simulated milliseconds; a real-network cluster overrides with the
+    /// seconds-per-hop cost it actually pays. Scenarios divide this by the
+    /// epoch length to size epoch-denominated vote leads.
+    fn vote_fold_budget_ms(&self) -> u64 {
+        5_000
+    }
+
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;
 

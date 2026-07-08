@@ -190,6 +190,13 @@ impl Cluster for ProdCluster {
         self.inner.submit_transaction(host, tx);
     }
 
+    fn vote_fold_budget_ms(&self) -> u64 {
+        // Real QUIC pays wall-clock for every hop of the cast-to-fold cascade:
+        // inclusion, the epoch-boundary crossing, and a beacon quorum
+        // remote-syncing that crossing.
+        240_000
+    }
+
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
         let within = Duration::from_millis(self.epoch_ms) * budget.0;
         self.runtime.block_on(async {

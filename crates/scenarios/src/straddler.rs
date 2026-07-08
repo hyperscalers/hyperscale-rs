@@ -60,8 +60,18 @@ pub fn isolate_ec_intake(
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
 
-/// Epochs of lead before the threshold vote activates.
-const VOTE_ACTIVATE_LEAD: u64 = 4;
+/// Epochs of lead the threshold vote carries beyond the fold budget, covering
+/// the tally read at `activate_at - 1` plus scheduling slack.
+const VOTE_ACTIVATE_LEAD_BASE: u64 = 3;
+
+/// Epochs of lead before the threshold vote activates: the harness's vote
+/// fold budget expressed in epochs, plus the base. Unlike
+/// `vote_reshape_threshold`'s retry loop, this vote is cast once — the
+/// activation epoch anchors the straddler boundary choreography — so the lead
+/// must cover the harness's cast-to-fold latency up front.
+const fn vote_activate_lead(fold_budget_ms: u64, epoch_ms: u64) -> u64 {
+    VOTE_ACTIVATE_LEAD_BASE + fold_budget_ms.div_ceil(epoch_ms)
+}
 
 /// Reshape `split_bytes` the vote installs after the grow: between the survivor's
 /// byte total and the splitter's, so only the heavier splitter crosses and
@@ -153,10 +163,15 @@ pub fn split_straddler_run<C: Cluster>(
     // Vote the reshape threshold down so only the heavier splitter crosses.
     let payer = &setup.straddlers[0].0;
     let current = beacon_epoch(c).expect("post-grow beacon epoch");
+    let epoch_ms = c
+        .beacon_state()
+        .expect("post-grow beacon state")
+        .chain_config
+        .epoch_duration_ms;
     let vote = build_reshape_threshold_vote_tx(
         payer,
         STRADDLER_SPLIT_BYTES,
-        Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD),
+        Epoch::new(current.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms)),
         &network,
         1,
         validity_around(c.now()),
