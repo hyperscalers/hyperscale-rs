@@ -318,6 +318,16 @@ pub struct VerificationPipeline {
     /// [`Self::take_committed_beacon_witness_children`]).
     deferred_beacon_witness_verifications: HashMap<BlockHash, Vec<BlockHash>>,
 
+    /// Beacon-witness verifications whose block's governing committee is not
+    /// yet resolvable because this node's beacon is behind — the topology
+    /// schedule has not committed the epoch that seats the block's committee.
+    /// Unlike [`Self::deferred_beacon_witness_verifications`], the blocker is
+    /// beacon progress, not a shard ancestor, so no shard-side event drains it;
+    /// it is retried when the beacon advances (`on_beacon_block_persisted`).
+    /// Without this a block dropped during a transient beacon lag would stay
+    /// `NOT_STARTED` forever and wedge the shard on a view-change loop.
+    beacon_witness_awaiting_committee: HashSet<BlockHash>,
+
     // === In-flight count verification ===
     /// Blocks with verified in-flight counts (synchronous tolerance check).
     verified_in_flight: HashSet<BlockHash>,
@@ -359,6 +369,7 @@ impl VerificationPipeline {
             last_persisted_height: persisted_height,
             roots: HashMap::new(),
             deferred_beacon_witness_verifications: HashMap::new(),
+            beacon_witness_awaiting_committee: HashSet::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
             verified_certified_blocks: HashMap::new(),
@@ -1343,6 +1354,21 @@ impl VerificationPipeline {
         self.deferred_beacon_witness_verifications
             .remove(&parent_hash)
             .unwrap_or_default()
+    }
+
+    /// Park `block_hash`'s beacon-witness verification until the beacon
+    /// advances far enough to resolve its governing committee. The blocker
+    /// is beacon progress, not a shard ancestor, so no shard event drains
+    /// this — [`Self::take_beacon_witness_awaiting_committee`] does, on
+    /// beacon advance.
+    pub(crate) fn park_beacon_witness_awaiting_committee(&mut self, block_hash: BlockHash) {
+        self.beacon_witness_awaiting_committee.insert(block_hash);
+    }
+
+    /// Drain the blocks parked awaiting a beacon-resolvable committee. The
+    /// caller re-initiates each; any still beacon-behind re-parks itself.
+    pub(crate) fn take_beacon_witness_awaiting_committee(&mut self) -> Vec<BlockHash> {
+        self.beacon_witness_awaiting_committee.drain().collect()
     }
 
     /// Drop deferred beacon-witness verifications keyed on a

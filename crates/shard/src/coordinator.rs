@@ -3163,36 +3163,72 @@ impl ShardCoordinator {
         let children = self
             .verification
             .take_deferred_beacon_witness_children(parent_hash);
-        let mut actions = Vec::new();
-        for child_hash in children {
-            let Some(child_block) = self.pending_blocks.get_block(child_hash).map(Arc::clone)
-            else {
-                continue;
-            };
-            // The child's missed-proposal leaves resolve against its own
-            // committee; the child's header is in hand, so `None` is a
-            // beacon-behind stall — skip it rather than derive under head.
-            let Some(committee) = self.committee_of_block(topology_schedule, child_hash) else {
-                continue;
-            };
-            actions.extend(self.verification.initiate_beacon_witness_root_verification(
-                child_hash,
-                &child_block,
-                &self.pending_blocks,
-                &self.beacon_witness_accumulator,
-                self.committed_hash,
-                self.local_shard,
-                committee,
-                topology_schedule,
-                SubstateCountSource {
-                    thresholds: committee.reshape_thresholds(),
-                    frontier: self.substate_bytes_frontier,
-                    committed_height: self.committed_height,
-                    deltas: &self.pending_bytes_deltas,
-                },
-            ));
-        }
-        actions
+        children
+            .into_iter()
+            .flat_map(|child_hash| {
+                self.dispatch_or_park_beacon_witness(topology_schedule, child_hash)
+            })
+            .collect()
+    }
+
+    /// Retry beacon-witness verifications parked because this node's beacon
+    /// was behind the block's committee epoch. Called on beacon advance: the
+    /// schedule may now seat that epoch, so the walk can resolve the committee
+    /// and dispatch. A block still beacon-behind re-parks; one no longer
+    /// pending (committed or pruned) is dropped. This is the only path that
+    /// revives such a block — no shard event does — so without it a transient
+    /// beacon lag during a reshape strands the block at `NOT_STARTED`.
+    fn retry_beacon_witness_awaiting_committee(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<Action> {
+        let parked = self.verification.take_beacon_witness_awaiting_committee();
+        parked
+            .into_iter()
+            .flat_map(|block_hash| {
+                self.dispatch_or_park_beacon_witness(topology_schedule, block_hash)
+            })
+            .collect()
+    }
+
+    /// Resolve `block_hash`'s governing committee and dispatch its
+    /// beacon-witness root verification. Empty if the block is no longer
+    /// pending (committed or pruned). On a committee miss the block's header
+    /// is in hand, so `None` is a beacon-behind stall — its committee's epoch
+    /// isn't committed here yet — and the block parks for retry when the
+    /// beacon advances rather than dropping: deriving under the head would
+    /// verify against the wrong committee, but silently discarding strands the
+    /// block at `NOT_STARTED` with no shard event to revive it, wedging the
+    /// shard on a view-change loop.
+    fn dispatch_or_park_beacon_witness(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+    ) -> Vec<Action> {
+        let Some(block) = self.pending_blocks.get_block(block_hash).map(Arc::clone) else {
+            return Vec::new();
+        };
+        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
+            self.verification
+                .park_beacon_witness_awaiting_committee(block_hash);
+            return Vec::new();
+        };
+        self.verification.initiate_beacon_witness_root_verification(
+            block_hash,
+            &block,
+            &self.pending_blocks,
+            &self.beacon_witness_accumulator,
+            self.committed_hash,
+            self.local_shard,
+            committee,
+            topology_schedule,
+            SubstateCountSource {
+                thresholds: committee.reshape_thresholds(),
+                frontier: self.substate_bytes_frontier,
+                committed_height: self.committed_height,
+                deltas: &self.pending_bytes_deltas,
+            },
+        )
     }
 
     /// Handle proposal built by the runner.
@@ -4104,6 +4140,10 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
         let mut actions = self.try_drain_buffered_synced_blocks(topology_schedule);
+        // The beacon just advanced, so an epoch that was uncommitted here may
+        // now seat a block's committee — retry any beacon-witness verification
+        // that was parked on that lag before it strands the shard.
+        actions.extend(self.retry_beacon_witness_awaiting_committee(topology_schedule));
         if !self.is_block_syncing() {
             actions.extend(self.maybe_emit_ready_signal(topology_schedule));
         }
@@ -7766,6 +7806,63 @@ mod tests {
             !state
                 .block_sync
                 .has_buffered(BlockHeight::new(4), &block_hash)
+        );
+    }
+
+    #[test]
+    fn beacon_witness_parked_on_beacon_lag_retries_on_epoch_adoption() {
+        // A block whose committee epoch this node's beacon hasn't committed
+        // yet must survive the committee lookup miss: its beacon-witness
+        // verification parks and replays when the beacon adopts the epoch.
+        // Dropping it strands the block at `NOT_STARTED` — no shard event can
+        // revive it — so the shard wedges on a view-change loop.
+        const ED: u64 = 1_000;
+        let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
+
+        let mut state = ShardCoordinator::new(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+        state.committed_height = BlockHeight::new(3);
+        // The block's parent is the committed tip, so the witness-leaf walk
+        // terminates immediately and verification can dispatch the moment the
+        // committee resolves.
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+
+        // Parent QC weighted timestamp in epoch 5 — above the schedule head,
+        // so the block's committee is unresolvable until the beacon catches up.
+        let block = block_with_parent_qc_ts(BlockHeight::new(4), 5 * ED);
+        let block_hash = block.hash();
+        install_complete_block(&mut state, &block);
+
+        // Park exactly as the beacon-behind retry path does on a committee miss.
+        state
+            .verification
+            .park_beacon_witness_awaiting_committee(block_hash);
+
+        // Beacon still behind epoch 5: the block re-parks, nothing dispatches.
+        let actions = state.on_beacon_block_persisted(&schedule);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. })),
+            "a still-behind beacon must not dispatch: {actions:?}"
+        );
+
+        // Beacon adopts epoch 5: the parked verification replays.
+        schedule.insert(
+            Epoch::new(5),
+            Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3])),
+        );
+        let actions = state.on_beacon_block_persisted(&schedule);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. })),
+            "epoch adoption must replay the parked beacon-witness verification; got {actions:?}"
         );
     }
 
