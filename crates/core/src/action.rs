@@ -1465,9 +1465,9 @@ impl Action {
         }
     }
 
-    /// The SPC epoch this action signs (or attributably broadcasts)
-    /// beacon consensus for under the emitting validator's identity,
-    /// or `None` for everything else.
+    /// The SPC `(epoch, view)` position this action signs beacon
+    /// consensus for under the emitting validator's identity, or
+    /// `None` for everything else.
     ///
     /// A validator can host several vnodes at once (a split's parent
     /// and child overlap through the drain; a relocation's old and new
@@ -1475,19 +1475,25 @@ impl Action {
     /// the same identity — two of them emitting independently derived
     /// SPC messages is equivocation, which the beacon fold jails. The
     /// dispatch funnel consults this to let exactly one vnode per
-    /// validator emit for any epoch. Maintained as a total match so a
-    /// new signing action can't silently bypass the filter.
+    /// validator sign within any one view. A proposal precedes the
+    /// first view, so it maps to view zero — the epoch's earliest
+    /// claimable position. The `SpcNewView`/`SpcNewCommit` relays are
+    /// deliberately absent: their wrapper signature attributes relay
+    /// of a self-authenticating cert, which cannot equivocate, and
+    /// fencing them would burn a view claim on a non-vote. Maintained
+    /// as a total match so a new signing action can't silently bypass
+    /// the filter.
     #[must_use]
-    pub const fn beacon_signing_epoch(&self) -> Option<Epoch> {
+    pub const fn beacon_signing_position(&self) -> Option<(Epoch, SpcView)> {
         match self {
-            Self::SignAndBroadcastPcVote1 { epoch, .. }
-            | Self::SignAndBroadcastPcVote2 { epoch, .. }
-            | Self::SignAndBroadcastPcVote3 { epoch, .. }
-            | Self::SignAndBroadcastEmptyView { epoch, .. }
-            | Self::BroadcastSpcNewView { epoch, .. }
-            | Self::BroadcastSpcNewCommit { epoch, .. }
-            | Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some(*epoch),
-            Self::BroadcastBlockHeader { .. }
+            Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some((*epoch, SpcView::new(0))),
+            Self::SignAndBroadcastPcVote1 { epoch, view, .. }
+            | Self::SignAndBroadcastPcVote2 { epoch, view, .. }
+            | Self::SignAndBroadcastPcVote3 { epoch, view, .. }
+            | Self::SignAndBroadcastEmptyView { epoch, view, .. } => Some((*epoch, *view)),
+            Self::BroadcastSpcNewView { .. }
+            | Self::BroadcastSpcNewCommit { .. }
+            | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
             | Self::SignAndBroadcastReadySignal { .. }
@@ -1545,17 +1551,29 @@ impl Action {
         }
     }
 
+    /// Whether this action emits SPC consensus traffic — signed votes,
+    /// proposals, or attributed relays. The set a dissolved shard's
+    /// vnode must stop emitting once its successors are live: its
+    /// validator's live vnode carries the duty from there.
+    #[must_use]
+    pub const fn is_beacon_consensus_emission(&self) -> bool {
+        self.beacon_signing_position().is_some()
+            || matches!(
+                self,
+                Self::BroadcastSpcNewView { .. } | Self::BroadcastSpcNewCommit { .. }
+            )
+    }
+
     /// The ratify-vote position this action signs under the emitting
     /// validator's identity, or `None` for everything else.
     ///
-    /// Distinct from [`Self::beacon_signing_epoch`]: ratify votes are
-    /// fenced per `(epoch, round, phase)` — strictly monotone across
-    /// all of a validator's co-hosted vnodes — rather than per epoch
-    /// seat, so a vnode torn down mid-epoch (a reshape drain) hands
-    /// the *next vote position* to its successor instead of fencing
-    /// the validator out of the whole epoch. An epoch fence here would
-    /// wedge ratification at every reshape; a coarser fence than the
-    /// vote position would allow cross-vnode equivocation.
+    /// Distinct from [`Self::beacon_signing_position`]: ratify votes
+    /// are fenced per `(epoch, round, phase)` — strictly monotone
+    /// across all of a validator's co-hosted vnodes — rather than by
+    /// view claim, so a vnode torn down mid-epoch (a reshape drain)
+    /// hands the *next vote position* to its successor instead of
+    /// fencing the validator out. A coarser fence than the vote
+    /// position would allow cross-vnode equivocation.
     #[must_use]
     pub const fn ratify_signing_position(&self) -> Option<(Epoch, RatifyRound, RatifyPhase)> {
         match self {

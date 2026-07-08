@@ -233,12 +233,6 @@ where
         let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
-                // Seat each vnode's beacon-signing claim before any loop can
-                // emit. First assign wins, so a validator whose vnode on
-                // another shard already claimed stays passive here.
-                for vnode in &vnodes {
-                    process.assign_beacon_signer(vnode.validator_id, shard);
-                }
                 let shard_loop = ShardLoop {
                     shard,
                     event_tx: process.shard_sender(shard),
@@ -317,12 +311,7 @@ where
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {
         let shard_loop = self.shards.remove(&shard)?;
-        let departed: Vec<ValidatorId> = shard_loop
-            .vnodes
-            .iter()
-            .map(|vnode| vnode.validator_id)
-            .collect();
-        detach_shard(&self.process, shard, &departed);
+        detach_shard(&self.process, shard);
         Some(shard_loop)
     }
 
@@ -674,30 +663,20 @@ where
         pending_participation_changes: Vec::new(),
         actions_generated: 0,
     };
-    // Seat each vnode's beacon-signing claim before the loop can emit.
-    // First assign wins, so a joiner whose validator already signs from
-    // another shard's vnode is born passive.
-    for vnode in &shard_loop.vnodes {
-        process.assign_beacon_signer(vnode.validator_id, shard);
-    }
     register_shard_request_handlers(process, &shard_loop.io, shard);
     shard_loop
 }
 
-/// Reverse of [`attach_shard`]: unwire a shard from the process maps and
-/// release the `departed` vnodes' beacon-signing seats.
+/// Reverse of [`attach_shard`]: unwire a shard from the process maps.
 ///
 /// Call once the shard's loop has stopped stepping (the sim path drops
-/// the loop; the production supervisor joins the thread first) — the
-/// dead vnodes can never emit again, so releasing their seats lets each
-/// validator's surviving vnode claim beacon signing at the funnel's
-/// epoch fence. Inbound traffic for the shard is rejected from the
-/// moment the maps swap.
-pub fn detach_shard<S, N, D>(
-    process: &Arc<ProcessIo<S, N, D>>,
-    shard: ShardId,
-    departed: &[ValidatorId],
-) where
+/// the loop; the production supervisor joins the thread first). Inbound
+/// traffic for the shard is rejected from the moment the maps swap. The
+/// dead vnodes' beacon signing needs no hand-off — the view-claim fence
+/// lets each validator's surviving vnode claim the next SPC view on its
+/// own dispatch.
+pub fn detach_shard<S, N, D>(process: &Arc<ProcessIo<S, N, D>>, shard: ShardId)
+where
     S: ShardStorage,
     N: Network,
     D: Dispatch,
@@ -709,9 +688,6 @@ pub fn detach_shard<S, N, D>(
         .dispatch_handles
         .execution_cache
         .remove_hosted_shard(shard);
-    for &validator in departed {
-        process.release_beacon_signer(validator, shard);
-    }
 }
 
 /// Build one shard's `ShardIo` plus its dispatch-handle entry from the

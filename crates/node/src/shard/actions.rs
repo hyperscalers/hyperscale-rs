@@ -684,11 +684,26 @@ where
         let vnode = self.vnode(vnode_idx);
         let me = vnode.validator_id;
 
-        // One beacon signer per validator: a co-hosted vnode that
-        // doesn't hold the validator's signing seat has its beacon
+        // One beacon signature per validator per position: a co-hosted
+        // vnode that hasn't claimed the current SPC view has its beacon
         // signing actions dropped here, before any signature exists.
         // The state machines stay single-node — passivity is purely a
-        // driver decision at this funnel.
+        // driver decision at this funnel. A dissolved shard's vnode
+        // stops emitting SPC traffic entirely: its successors are live,
+        // so the validator's live vnode carries the duty, and a stale
+        // coordinator claiming views it can't follow through starves
+        // the beacon of this validator's signatures.
+        if action.is_beacon_consensus_emission()
+            && self.process.topology_snapshot.load().successors_live(shard)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                action = action.type_name(),
+                "Dropping beacon emission from a dissolved shard's vnode"
+            );
+            return;
+        }
         if let Some(position) = action.ratify_signing_position() {
             if !self.process.allow_ratify_signing(me, position) {
                 trace!(
@@ -700,15 +715,16 @@ where
                 );
                 return;
             }
-        } else if let Some(epoch) = action.beacon_signing_epoch()
-            && !self.process.allow_beacon_signing(me, shard, epoch)
+        } else if let Some((epoch, view)) = action.beacon_signing_position()
+            && !self.process.allow_beacon_signing(me, shard, epoch, view)
         {
             trace!(
                 validator = ?me,
                 shard = shard.inner(),
                 epoch = epoch.inner(),
+                view = view.inner(),
                 action = action.type_name(),
-                "Dropping beacon signing action from a passive vnode"
+                "Dropping beacon signing action for an unclaimed view"
             );
             return;
         }

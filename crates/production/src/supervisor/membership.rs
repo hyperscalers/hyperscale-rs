@@ -429,11 +429,7 @@ impl ShardSupervisor {
     /// drop the storage handle, scrub the RPC slots, and replay any
     /// join that queued behind the drain.
     pub(super) fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
-        let departed: Vec<ValidatorId> = validator_ids
-            .iter()
-            .map(|&id| ValidatorId::new(id))
-            .collect();
-        detach_shard(&self.process, shard, &departed);
+        detach_shard(&self.process, shard);
         self.storages.lock().expect("storages lock").remove(&shard);
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
@@ -444,7 +440,8 @@ impl ShardSupervisor {
         // warm for the eventual re-seat. A relocation that already seated
         // the destination leaves the validator on that shard, so it is not
         // pooled; a race that pools it is undone when the seat lands.
-        for &validator in &departed {
+        for &id in validator_ids {
+            let validator = ValidatorId::new(id);
             if !self.validator_on_any_shard(validator) {
                 self.follow_in_pool(validator);
             }

@@ -24,7 +24,7 @@ use hyperscale_engine::TransactionValidation;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Epoch, RatifyPhase, RatifyRound, RoutableTransaction, RoutingCommittees, ShardId,
+    Epoch, RatifyPhase, RatifyRound, RoutableTransaction, RoutingCommittees, ShardId, SpcView,
     TopologySnapshot, ValidatorId,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
@@ -41,21 +41,21 @@ use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 /// and the reconfiguring thread is the sole writer.
 pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEvent>>>>;
 
-/// Beacon-signing seat for one hosted validator: which shard's vnode
-/// currently signs beacon consensus under the validator's identity,
-/// and the highest SPC epoch any holder has signed for — the fence a
-/// successor must clear before claiming a vacated seat.
+/// Beacon-signing fence for one hosted validator: which shard's vnode
+/// signs SPC consensus within the current `(epoch, view)`, and the
+/// last ratify-vote position any vnode signed.
 struct BeaconSignerSeat {
-    /// Shard loop whose vnode holds the seat; `None` once the holder's
-    /// teardown released it.
-    shard: Option<ShardId>,
-    /// Highest SPC epoch a holder was allowed to sign for. Recorded at
-    /// the dispatch funnel before the signature exists, so the fence is
+    /// The `(epoch, view)` most recently signed under this validator's
+    /// identity and the vnode that claimed it. A view belongs wholly
+    /// to its claimant — every phase of one view comes from one
+    /// coordinator's state — while any later view is claimable by
+    /// whichever vnode dispatches into it first. Recorded at the
+    /// dispatch funnel before the signature exists, so the fence is
     /// conservative even when the dispatched action never sends.
-    max_signed_epoch: Epoch,
+    claim: Option<(Epoch, SpcView, ShardId)>,
     /// Last ratify-vote position any of this validator's vnodes was
     /// allowed to sign, strictly monotone process-wide. Independent of
-    /// the shard seat: a torn-down vnode's successor continues from
+    /// the view claim: a torn-down vnode's successor continues from
     /// the next position rather than losing the epoch, and two live
     /// co-hosted vnodes at the same tip dedup their identical intents
     /// through the same monotonicity.
@@ -65,28 +65,32 @@ struct BeaconSignerSeat {
 impl BeaconSignerSeat {
     const fn vacant() -> Self {
         Self {
-            shard: None,
-            max_signed_epoch: Epoch::GENESIS,
+            claim: None,
             max_ratify: None,
         }
     }
 
-    /// Whether `my_shard`'s vnode may sign for `epoch` under this seat:
-    /// the holder records the epoch and passes; a vacant seat is
-    /// claimed when `epoch` clears the fence (the teardown handoff);
-    /// anything else is denied.
-    fn allow(&mut self, my_shard: ShardId, epoch: Epoch) -> bool {
-        match self.shard {
-            Some(shard) if shard == my_shard => {
-                self.max_signed_epoch = self.max_signed_epoch.max(epoch);
+    /// Whether `my_shard`'s vnode may sign at `(epoch, view)` under
+    /// this validator's identity: the claimant of the current view
+    /// re-passes freely (phase progression, retries — its coordinator
+    /// state machine keeps the content consistent), a strictly later
+    /// view transfers the claim to the caller, and anything else is
+    /// denied. Two vnodes can therefore never both sign within one
+    /// `(epoch, view)` — no conflicting SPC signatures at one position
+    /// — while a claimant that dies or degrades costs exactly its one
+    /// view: the sibling's view-change dispatch claims the next.
+    fn allow(&mut self, my_shard: ShardId, epoch: Epoch, view: SpcView) -> bool {
+        match self.claim {
+            Some((e, v, claimant)) if (e, v) == (epoch, view) => claimant == my_shard,
+            Some((e, v, _)) if (epoch, view) > (e, v) => {
+                self.claim = Some((epoch, view, my_shard));
                 true
             }
-            None if epoch > self.max_signed_epoch => {
-                self.shard = Some(my_shard);
-                self.max_signed_epoch = epoch;
+            Some(_) => false,
+            None => {
+                self.claim = Some((epoch, view, my_shard));
                 true
             }
-            Some(_) | None => false,
         }
     }
 
@@ -284,51 +288,11 @@ where
         Arc::clone(&self.beacon_route_active)
     }
 
-    /// Seat `validator`'s beacon signing on `shard`'s vnode. First
-    /// assign wins: a vnode seated while the validator already holds a
-    /// seat (live or released) is born passive. Claiming a released
-    /// seat happens at the dispatch funnel under the epoch fence, so a
-    /// flip or relocation overlap can never produce two signers for
-    /// one epoch.
-    ///
-    /// # Panics
-    /// Panics if the seat registry mutex is poisoned.
-    pub fn assign_beacon_signer(&self, validator: ValidatorId, shard: ShardId) {
-        self.beacon_signers
-            .lock()
-            .expect("beacon signer registry lock")
-            .entry(validator)
-            .or_insert(BeaconSignerSeat {
-                shard: Some(shard),
-                max_signed_epoch: Epoch::GENESIS,
-                max_ratify: None,
-            });
-    }
-
-    /// Release `validator`'s beacon-signing seat at `shard`'s teardown.
-    /// The epoch fence stays behind: a surviving vnode claims the
-    /// vacant seat on its next emission for an epoch strictly above
-    /// anything the dead vnode was allowed to sign.
-    ///
-    /// # Panics
-    /// Panics if the seat registry mutex is poisoned.
-    pub fn release_beacon_signer(&self, validator: ValidatorId, shard: ShardId) {
-        if let Some(seat) = self
-            .beacon_signers
-            .lock()
-            .expect("beacon signer registry lock")
-            .get_mut(&validator)
-            && seat.shard == Some(shard)
-        {
-            seat.shard = None;
-        }
-    }
-
-    /// Whether `my_shard`'s vnode may emit a beacon signing action for
-    /// `epoch` under `validator`'s identity — one lock for
+    /// Whether `my_shard`'s vnode may emit a beacon signing action at
+    /// `(epoch, view)` under `validator`'s identity — one lock for
     /// check-and-record, per [`BeaconSignerSeat::allow`]. A validator
-    /// with no seat on record claims one, so single-vnode hosts behave
-    /// identically with or without driver wiring.
+    /// with no fence on record claims the view, so single-vnode hosts
+    /// behave identically with or without driver wiring.
     ///
     /// # Panics
     /// Panics if the seat registry mutex is poisoned.
@@ -337,13 +301,14 @@ where
         validator: ValidatorId,
         my_shard: ShardId,
         epoch: Epoch,
+        view: SpcView,
     ) -> bool {
         self.beacon_signers
             .lock()
             .expect("beacon signer registry lock")
             .entry(validator)
             .or_insert(BeaconSignerSeat::vacant())
-            .allow(my_shard, epoch)
+            .allow(my_shard, epoch, view)
     }
 
     /// Whether `validator` may sign the ratify vote at `position` —
@@ -639,9 +604,98 @@ pub enum SubmitFanout {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::Epoch;
+    use hyperscale_types::{Epoch, ShardId, SpcView};
 
-    use super::admit_topology_epoch;
+    use super::{BeaconSignerSeat, admit_topology_epoch};
+
+    fn pos(epoch: u64, view: u32) -> (Epoch, SpcView) {
+        (Epoch::new(epoch), SpcView::new(view))
+    }
+
+    /// The view claimant re-passes freely (phase progression, retries)
+    /// while any other vnode is denied within the claimed view.
+    #[test]
+    fn view_claimant_re_passes_and_others_are_denied() {
+        let mut seat = BeaconSignerSeat::vacant();
+        let root = ShardId::ROOT;
+        let (left, right) = root.children();
+        let (e, v) = pos(3, 1);
+
+        assert!(
+            seat.allow(root, e, v),
+            "vacant fence: first dispatch claims"
+        );
+        assert!(
+            seat.allow(root, e, v),
+            "claimant re-emission within its view"
+        );
+        assert!(!seat.allow(left, e, v), "same view, other vnode");
+        assert!(!seat.allow(right, e, v), "same view, third vnode");
+        assert!(
+            seat.allow(root, e, v),
+            "claimant still passes after denials"
+        );
+    }
+
+    /// A strictly later view — same epoch or later epoch — transfers the
+    /// claim to whichever vnode dispatches into it first; the old claimant
+    /// is then denied at the transferred position.
+    #[test]
+    fn later_view_transfers_the_claim() {
+        let mut seat = BeaconSignerSeat::vacant();
+        let root = ShardId::ROOT;
+        let (left, _) = root.children();
+
+        let (e, v1) = pos(3, 1);
+        assert!(seat.allow(root, e, v1));
+
+        // Next view within the epoch: the live sibling claims it.
+        let (_, v2) = pos(3, 2);
+        assert!(seat.allow(left, e, v2), "sibling claims the next view");
+        assert!(
+            !seat.allow(root, e, v2),
+            "old claimant denied in the new view"
+        );
+
+        // Next epoch: claimable again by anyone.
+        let (e4, v0) = pos(4, 0);
+        assert!(seat.allow(root, e4, v0), "new epoch's proposal slot");
+    }
+
+    /// A dispatch for a view below the claimed one is regressive and denied
+    /// regardless of which vnode asks — including the claimant itself.
+    #[test]
+    fn regressive_view_is_denied() {
+        let mut seat = BeaconSignerSeat::vacant();
+        let root = ShardId::ROOT;
+        let (left, _) = root.children();
+
+        let (e, v2) = pos(3, 2);
+        assert!(seat.allow(root, e, v2));
+
+        let (_, v1) = pos(3, 1);
+        assert!(!seat.allow(root, e, v1), "claimant regressing");
+        assert!(!seat.allow(left, e, v1), "sibling regressing");
+
+        let (e2, v9) = pos(2, 9);
+        assert!(!seat.allow(left, e2, v9), "older epoch, any view");
+    }
+
+    /// The proposal slot (view zero) precedes view one, so an epoch's
+    /// proposal is claimable before its first vote and a vote claim fences
+    /// a late proposal of the same epoch.
+    #[test]
+    fn proposal_slot_orders_before_the_first_view() {
+        let mut seat = BeaconSignerSeat::vacant();
+        let root = ShardId::ROOT;
+        let (left, _) = root.children();
+
+        let (e, v0) = pos(5, 0);
+        let (_, v1) = pos(5, 1);
+        assert!(seat.allow(root, e, v0), "proposal claims view zero");
+        assert!(seat.allow(left, e, v1), "vote view claimable after");
+        assert!(!seat.allow(root, e, v0), "proposal slot now regressive");
+    }
 
     /// The topology-epoch gate admits a strictly newer fold and drops a stale
     /// or duplicate one — including an older fold arriving after a newer one,
