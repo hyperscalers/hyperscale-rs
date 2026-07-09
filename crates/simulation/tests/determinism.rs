@@ -18,25 +18,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_scenarios::tx::{
-    account_from_seed, build_transfer_tx, signer_from_seed, validity_around,
-};
+use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
 use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs, grow_to};
 use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    BeaconBlockHash, BlockHeight, Ed25519PrivateKey, NodeId, Round, ShardId, StateRoot,
-    TransactionStatus, uniform_shard_for_node,
+    BeaconBlockHash, BlockHeight, Round, ShardId, StateRoot, TransactionStatus,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
-use radix_common::types::ComponentAddress;
 use support::sim_cluster::SimCluster;
 
 /// A four-validator single-shard network with light jitter; beacon options
 /// default.
-fn test_network_config() -> SimConfig {
+fn base_config() -> SimConfig {
     SimConfig {
         shard_size: 4,
         jitter_fraction: 0.1,
@@ -49,7 +45,7 @@ fn test_network_config() -> SimConfig {
 fn determinism_config() -> SimConfig {
     SimConfig {
         packet_loss_rate: 0.10,
-        ..test_network_config()
+        ..base_config()
     }
 }
 
@@ -220,19 +216,6 @@ const fn cross_shard_config() -> ScenarioConfig {
     }
 }
 
-/// The first seed whose preallocated account routes to `leaf` under a two-shard
-/// trie, with its signing key.
-fn account_on_leaf(leaf: ShardId) -> (Ed25519PrivateKey, ComponentAddress) {
-    for seed in 1u8..=u8::MAX {
-        let account = account_from_seed(seed);
-        let node = NodeId::from_radix(account.into_node_id());
-        if uniform_shard_for_node(&node, 2) == leaf {
-            return (signer_from_seed(seed), account);
-        }
-    }
-    panic!("no account routes to {leaf:?}");
-}
-
 /// Two same-seed runs of genesis → grow to two shards → cross-shard transfer
 /// produce identical committed heights and event/message counts: the split
 /// lifecycle and the cross-shard execution are deterministic, like the
@@ -240,8 +223,8 @@ fn account_on_leaf(leaf: ShardId) -> (Ed25519PrivateKey, ComponentAddress) {
 #[test]
 fn cross_shard_grow_replays_byte_identical() {
     let run = |seed: u64| -> (Vec<BlockHeight>, u64, u64) {
-        let (kp_a, acc_a) = account_on_leaf(ShardId::leaf(1, 0));
-        let (_kp_b, acc_b) = account_on_leaf(ShardId::leaf(1, 1));
+        let (kp_a, acc_a) = account_routing_to(ShardId::leaf(1, 0), 2);
+        let (_kp_b, acc_b) = account_routing_to(ShardId::leaf(1, 1), 2);
         let balances = [
             (acc_a, Decimal::from(10_000)),
             (acc_b, Decimal::from(10_000)),
