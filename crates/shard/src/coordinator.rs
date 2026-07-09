@@ -4270,7 +4270,7 @@ impl ShardCoordinator {
         // `collect_commit_prefix` ancestor — once its child is admitted.
         self.verification
             .insert_verified_certified_block(block_hash, Arc::clone(&certified));
-        self.block_sync.set_sync_applied_height(height);
+        self.block_sync.mark_applied(height, block_hash);
 
         let mut actions = self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync);
 
@@ -7906,9 +7906,10 @@ mod tests {
         state.committed_height = BlockHeight::new(3);
         state.set_block_syncing(true);
         // Height 4 admitted to chain state, commit lagging a block behind.
-        state
-            .block_sync
-            .set_sync_applied_height(BlockHeight::new(4));
+        state.block_sync.mark_applied(
+            BlockHeight::new(4),
+            BlockHash::from_raw(Hash::from_bytes(b"applied4")),
+        );
 
         let deliver = |state: &mut ShardCoordinator, height: u64, ts: u64| {
             let block = block_with_parent_qc_ts(BlockHeight::new(height), ts);
@@ -7963,6 +7964,83 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
             "re-fetched block at the hole must resubmit for verification; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn sync_applies_certified_sibling_at_already_applied_height() {
+        // HotStuff-2 fork-safety allows two QCs to certify sibling blocks
+        // at one height, and a peer can serve block sync the sibling that
+        // never commits. The committing sibling's later delivery must
+        // still verify and apply — buried below the applied frontier, the
+        // round-contiguous commit walk defers forever on its missing
+        // handle and the node wedges on a height it believes is synced.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.set_block_syncing(true);
+
+        let deliver = |state: &mut ShardCoordinator, height: u64, ts: u64| {
+            let block = block_with_parent_qc_ts(BlockHeight::new(height), ts);
+            let block_hash = block.hash();
+            let mut signers = SignerBitfield::new(4);
+            signers.set(0);
+            signers.set(1);
+            signers.set(2);
+            let qc = QuorumCertificate::new(
+                block_hash,
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                block.header().parent_block_hash(),
+                block.header().round(),
+                signers,
+                zero_bls_signature(),
+                WeightedTimestamp::from_millis(ts),
+            );
+            let actions = state.on_sync_block_ready_to_apply(
+                &topology_schedule,
+                CertifiedBlock::new_unchecked(block, qc),
+            );
+            (block_hash, actions)
+        };
+
+        // The losing sibling at height 4 arrives first and applies.
+        let (loser, actions) = deliver(&mut state, 4, 100);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
+        let qc = make_test_qc(loser, BlockHeight::new(4));
+        let _ = state.on_qc_signature_verified(&topology_schedule, loser, Ok(qc));
+        assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+
+        // The committing sibling arrives on a re-fetch at the same height.
+        let (winner, actions) = deliver(&mut state, 4, 200);
+        assert_ne!(winner, loser);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "certified sibling at an applied height must resubmit for verification; got {actions:?}"
+        );
+        let qc = make_test_qc(winner, BlockHeight::new(4));
+        let _ = state.on_qc_signature_verified(&topology_schedule, winner, Ok(qc));
+
+        // Both siblings' handles are cached; the two-chain rule commits
+        // whichever one a round-contiguous child extends.
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(loser)
+                .is_some()
+        );
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(winner)
+                .is_some(),
+            "the committing sibling's handle must be available to the commit walk"
         );
     }
 

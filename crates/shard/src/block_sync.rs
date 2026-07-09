@@ -88,6 +88,18 @@ pub struct BlockSyncManager {
     /// next height without racing the commit pipeline's own advancement.
     sync_applied_height: BlockHeight,
 
+    /// Hashes applied at each height in `(committed_height,
+    /// sync_applied_height]`. HotStuff-2 fork-safety allows two QCs to
+    /// certify sibling blocks at one height, and a serving peer may hand
+    /// sync the sibling that never commits — so applied-dedup is per
+    /// `(height, hash)`, not per height. A certified sibling arriving at
+    /// an already-applied height applies too: the coordinator's
+    /// certified-block cache is hash-keyed and synced blocks adopt
+    /// without committing, so holding both siblings is coherent and the
+    /// round-contiguous two-chain rule commits whichever one the chain
+    /// extends. Pruned at or below `committed_height` by [`Self::cleanup`].
+    applied_uncommitted: BTreeMap<BlockHeight, Vec<BlockHash>>,
+
     /// Highest `latest_qc.height()` `health_check` has observed. Together with
     /// `view_changes_at_last_qc_advance` lets the health check distinguish
     /// "I'm spinning view changes but the chain is also moving" from
@@ -120,6 +132,7 @@ impl BlockSyncManager {
             syncing: false,
             sync_target_height: None,
             sync_applied_height: BlockHeight::GENESIS,
+            applied_uncommitted: BTreeMap::new(),
             last_qc_height_seen: BlockHeight::GENESIS,
             view_changes_at_last_qc_advance: 0,
             buffered_synced_blocks: BTreeMap::new(),
@@ -154,10 +167,24 @@ impl BlockSyncManager {
         self.sync_target_height
     }
 
-    /// Record that a synced block at `height` has been submitted for
-    /// state-root verification (but not yet committed).
-    pub fn set_sync_applied_height(&mut self, height: BlockHeight) {
+    /// Record that a synced block has been admitted to the chain state
+    /// (its round-contiguous commit may still be pending). Advances the
+    /// applied frontier and remembers the hash so re-deliveries dedup per
+    /// `(height, hash)` — a certified sibling at the same height stays
+    /// eligible to apply.
+    pub fn mark_applied(&mut self, height: BlockHeight, block_hash: BlockHash) {
         self.sync_applied_height = self.sync_applied_height.max(height);
+        let hashes = self.applied_uncommitted.entry(height).or_default();
+        if !hashes.contains(&block_hash) {
+            hashes.push(block_hash);
+        }
+    }
+
+    /// Whether `(height, block_hash)` has already been applied.
+    fn is_applied(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+        self.applied_uncommitted
+            .get(&height)
+            .is_some_and(|hashes| hashes.contains(block_hash))
     }
 
     /// Highest synced height admitted to the chain state. Its round-contiguous
@@ -240,18 +267,19 @@ impl BlockSyncManager {
     /// Plan the next batch of buffered synced blocks to dispatch for QC
     /// verification. Respects `max_parallel_sync_verifications`.
     ///
-    /// Walks heights from one above the applied frontier (the max of the
-    /// committed tip and `sync_applied_height` — the latter covers blocks
-    /// admitted to the chain state but not yet finalized, since the
-    /// round-contiguous commit lags admission by a block). A height with a
+    /// Walks heights from one above the committed tip. A height with a
     /// pending verification is already covered and is skipped without
-    /// touching its buffered candidates; a height with only buffered
-    /// candidates is a hole — drain it. This lets a re-fetched block fill a
-    /// gap left by a failed or dropped verification even while
-    /// already-verified entries sit stranded at higher heights; starting
-    /// above the highest pending height instead would pin the drain past
-    /// the hole forever. The walk stops at the first height with neither
-    /// (nothing contiguous remains) or once the slots are spent.
+    /// touching its buffered candidates; a height with buffered
+    /// candidates is a hole — drain it (minus candidates whose
+    /// `(height, hash)` already applied); a height covered only by an
+    /// applied block keeps the walk going, so a certified sibling
+    /// buffered at or below the applied frontier is reachable. This lets
+    /// a re-fetched block fill a gap left by a failed or dropped
+    /// verification even while already-verified entries sit stranded at
+    /// higher heights; starting above the highest pending height instead
+    /// would pin the drain past the hole forever. The walk stops at the
+    /// first height with none of the three (nothing contiguous remains)
+    /// or once the slots are spent.
     ///
     /// At a hole, *every* buffered candidate at that height drains together
     /// (one Byzantine and several honest blocks may sit at the same height
@@ -271,25 +299,33 @@ impl BlockSyncManager {
         }
         let slots_available = max_parallel - pending_count;
 
-        let mut height = committed_height.max(self.sync_applied_height) + 1u64;
+        let mut height = committed_height + 1u64;
         let mut result = Vec::new();
         while result.len() < slots_available {
             if self.has_pending_at_height(height) {
                 height += 1u64;
                 continue;
             }
-            let Some(entries) = self.buffered_synced_blocks.remove(&height) else {
-                break;
-            };
-            for (block_hash, certified) in entries {
-                debug!(
-                    height = height.inner(),
-                    ?block_hash,
-                    "Draining buffered synced block"
-                );
-                result.push(certified);
+            if let Some(entries) = self.buffered_synced_blocks.remove(&height) {
+                for (block_hash, certified) in entries {
+                    if self.is_applied(height, &block_hash) {
+                        continue;
+                    }
+                    debug!(
+                        height = height.inner(),
+                        ?block_hash,
+                        "Draining buffered synced block"
+                    );
+                    result.push(certified);
+                }
+                height += 1u64;
+                continue;
             }
-            height += 1u64;
+            if height <= self.sync_applied_height {
+                height += 1u64;
+                continue;
+            }
+            break;
         }
 
         result
@@ -329,6 +365,15 @@ impl BlockSyncManager {
                 committed = committed_height.inner(),
                 horizon = MAX_BUFFER_FUTURE_HORIZON,
                 "Synced block beyond buffer horizon — dropping"
+            );
+            return IngestOutcome::Drop;
+        }
+
+        if self.is_applied(height, &block_hash) {
+            info!(
+                height = height.inner(),
+                ?block_hash,
+                "Synced block already applied - filtering"
             );
             return IngestOutcome::Drop;
         }
@@ -511,54 +556,51 @@ impl BlockSyncManager {
     // Drain verified blocks
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Take the next consecutive verified block at the given height.
-    ///
-    /// Returns the (block, verified QC) pair if a QC-verified entry exists
-    /// at `height`, otherwise `None`. The pairing invariant
+    /// Take the next block to apply. Walks the QC-verified entries in
+    /// `(committed_height, frontier]` — the frontier being one above the
+    /// applied high-water mark — and pops the lowest-height entry whose
+    /// `(height, hash)` has not been applied yet. The pairing invariant
     /// `qc.block_hash == block.hash()` is preserved across the move.
-    pub fn take_verified_at_height(
-        &mut self,
-        height: BlockHeight,
-    ) -> Option<(Block, Verified<QuorumCertificate>)> {
-        let block_hash =
-            self.pending_synced_block_verifications
-                .iter()
-                .find_map(|(h, p)| match p {
-                    PendingSyncedBlockVerification::QcVerified { block, .. }
-                        if block.height() == height =>
-                    {
-                        Some(*h)
-                    }
-                    _ => None,
-                })?;
-
-        let pending = self
-            .pending_synced_block_verifications
-            .remove(&block_hash)
-            .unwrap();
-
-        match pending {
-            PendingSyncedBlockVerification::QcVerified { block, qc } => Some((block, qc)),
-            PendingSyncedBlockVerification::InFlight(_) => {
-                unreachable!("filter above selected only QcVerified entries")
-            }
-        }
-    }
-
-    /// Take the next block to apply in the consecutive-verified sequence.
-    /// Computes the target height from `committed_height` and our own
-    /// `sync_applied_height` marker (both advance together in apply), then
-    /// pops the matching verified entry. Returns `None` once the chain
-    /// catches up to the verified frontier; also logs the verified /
-    /// unverified pending heights for diagnostics.
+    ///
+    /// Heights below the frontier only yield certified siblings of an
+    /// already-applied block: two QCs can certify siblings at one height,
+    /// a peer may have served the one that never commits, and the
+    /// committing lookup would otherwise defer forever on the missing
+    /// winner while the height reads as already synced. Returns `None`
+    /// once the chain catches up to the verified frontier; also logs the
+    /// verified / unverified pending heights for diagnostics.
     pub fn take_next_verified(
         &mut self,
         committed_height: BlockHeight,
     ) -> Option<(Block, Verified<QuorumCertificate>)> {
-        let base = committed_height.max(self.sync_applied_height);
-        let next_height = base + 1u64;
-        self.log_verification_state(committed_height, next_height);
-        self.take_verified_at_height(next_height)
+        let frontier = committed_height.max(self.sync_applied_height) + 1u64;
+        self.log_verification_state(committed_height, frontier);
+        let (height, block_hash) = self
+            .pending_synced_block_verifications
+            .iter()
+            .filter_map(|(hash, p)| match p {
+                PendingSyncedBlockVerification::QcVerified { block, .. }
+                    if block.height() > committed_height
+                        && block.height() <= frontier
+                        && !self.is_applied(block.height(), hash) =>
+                {
+                    Some((block.height(), *hash))
+                }
+                _ => None,
+            })
+            .min_by_key(|(height, _)| *height)?;
+        if height < frontier {
+            warn!(
+                height = height.inner(),
+                ?block_hash,
+                applied = ?self.applied_uncommitted.get(&height),
+                "Taking certified sibling at an already-applied height — a served sibling is not committing"
+            );
+        }
+        match self.pending_synced_block_verifications.remove(&block_hash) {
+            Some(PendingSyncedBlockVerification::QcVerified { block, qc }) => Some((block, qc)),
+            _ => unreachable!("selection above matched a QcVerified entry"),
+        }
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -606,6 +648,9 @@ impl BlockSyncManager {
 
         self.pending_synced_block_verifications
             .retain(|_, pending| pending.block().height() > committed_height);
+
+        self.applied_uncommitted
+            .retain(|height, _| *height > committed_height);
     }
 
     /// Total number of buffered candidates across all heights. May exceed
@@ -1004,7 +1049,10 @@ mod tests {
         // the highest pending height instead would pin it past the hole
         // forever and wedge sync.
         let mut sm = BlockSyncManager::new();
-        sm.set_sync_applied_height(BlockHeight::new(5));
+        sm.mark_applied(
+            BlockHeight::new(5),
+            certified(BlockHeight::new(5), b"applied5").block().hash(),
+        );
         sm.track_verified_for_test(certified(BlockHeight::new(7), b"v7"));
         sm.track_verified_for_test(certified(BlockHeight::new(8), b"v8"));
         sm.buffer_block(
@@ -1055,7 +1103,133 @@ mod tests {
             sm.on_qc_verified(hash, None),
             Some(BlockSyncVerificationResult::Verified)
         ));
-        assert!(sm.take_verified_at_height(BlockHeight::new(6)).is_some());
+        assert!(sm.take_next_verified(BlockHeight::new(5)).is_some());
+    }
+
+    // ─── certified sibling recovery ─────────────────────────────────────
+
+    #[test]
+    fn take_next_verified_yields_certified_sibling_at_applied_height() {
+        // Two QCs can certify sibling blocks at one height, and a peer
+        // can serve the sibling that never commits. Once the committing
+        // sibling is re-fetched and QC-verified, the apply walk must
+        // reach back to the already-applied height instead of burying it
+        // below the applied frontier — buried, the committing lookup
+        // defers forever on the missing block and the node wedges.
+        let mut sm = BlockSyncManager::new();
+        let loser = certified(BlockHeight::new(6), b"loser");
+        sm.mark_applied(BlockHeight::new(6), loser.block().hash());
+
+        let winner = certified(BlockHeight::new(6), b"winner");
+        let winner_hash = winner.block().hash();
+        sm.track_verified_for_test(winner);
+
+        let (block, _) = sm
+            .take_next_verified(BlockHeight::new(5))
+            .expect("certified sibling at an applied height is takeable");
+        assert_eq!(block.hash(), winner_hash);
+    }
+
+    #[test]
+    fn take_next_verified_skips_already_applied_hash() {
+        let mut sm = BlockSyncManager::new();
+        let applied = certified(BlockHeight::new(6), b"applied");
+        sm.mark_applied(BlockHeight::new(6), applied.block().hash());
+        sm.track_verified_for_test(applied);
+
+        assert!(sm.take_next_verified(BlockHeight::new(5)).is_none());
+    }
+
+    #[test]
+    fn take_next_verified_prefers_lowest_height() {
+        // A sibling at an applied height applies before the frontier
+        // entry so parents precede children.
+        let mut sm = BlockSyncManager::new();
+        sm.mark_applied(
+            BlockHeight::new(6),
+            certified(BlockHeight::new(6), b"applied6").block().hash(),
+        );
+        sm.track_verified_for_test(certified(BlockHeight::new(7), b"frontier"));
+        sm.track_verified_for_test(certified(BlockHeight::new(6), b"sibling"));
+
+        let (block, _) = sm.take_next_verified(BlockHeight::new(5)).unwrap();
+        assert_eq!(block.height(), BlockHeight::new(6));
+        let (block, _) = sm.take_next_verified(BlockHeight::new(5)).unwrap();
+        assert_eq!(block.height(), BlockHeight::new(7));
+    }
+
+    #[test]
+    fn ingest_drops_applied_hash_but_submits_certified_sibling() {
+        let mut sm = BlockSyncManager::new();
+        let applied = certified(BlockHeight::new(6), b"applied");
+        sm.mark_applied(BlockHeight::new(6), applied.block().hash());
+
+        assert!(matches!(
+            sm.ingest(applied, BlockHeight::new(5)),
+            IngestOutcome::Drop
+        ));
+        assert!(matches!(
+            sm.ingest(
+                certified(BlockHeight::new(6), b"sibling"),
+                BlockHeight::new(5)
+            ),
+            IngestOutcome::Submit(_)
+        ));
+    }
+
+    #[test]
+    fn next_submitable_reaches_sibling_buffered_below_applied_frontier() {
+        // Applied coverage at 6..=8; a certified sibling buffered at 7
+        // must drain even though every height below the frontier already
+        // has an applied block — stopping at the first "empty" height
+        // would strand it.
+        let mut sm = BlockSyncManager::new();
+        for h in 6..=8u64 {
+            sm.mark_applied(
+                BlockHeight::new(h),
+                certified(BlockHeight::new(h), b"applied").block().hash(),
+            );
+        }
+        let sibling = certified(BlockHeight::new(7), b"sibling");
+        let sibling_hash = sibling.block().hash();
+        assert!(matches!(
+            sm.ingest(sibling, BlockHeight::new(5)),
+            IngestOutcome::Buffered
+        ));
+
+        let out = sm.next_submitable(BlockHeight::new(5), 4);
+        let hashes: Vec<_> = out.iter().map(|c| c.block().hash()).collect();
+        assert_eq!(hashes, vec![sibling_hash]);
+    }
+
+    #[test]
+    fn next_submitable_filters_applied_duplicates_from_buffer() {
+        // A copy of an already-applied block buffered before its apply
+        // drains to nothing rather than re-submitting for verification.
+        let mut sm = BlockSyncManager::new();
+        let block = certified(BlockHeight::new(6), b"dup");
+        sm.buffer_block(BlockHeight::new(6), block.clone());
+        sm.mark_applied(BlockHeight::new(6), block.block().hash());
+
+        let out = sm.next_submitable(BlockHeight::new(5), 4);
+        assert!(out.is_empty());
+        assert!(!sm.has_any_buffered_at_height(BlockHeight::new(6)));
+    }
+
+    #[test]
+    fn cleanup_prunes_applied_hashes_at_or_below_committed() {
+        let mut sm = BlockSyncManager::new();
+        sm.mark_applied(
+            BlockHeight::new(6),
+            certified(BlockHeight::new(6), b"six").block().hash(),
+        );
+        sm.mark_applied(
+            BlockHeight::new(7),
+            certified(BlockHeight::new(7), b"seven").block().hash(),
+        );
+        sm.cleanup(BlockHeight::new(6));
+        assert!(!sm.applied_uncommitted.contains_key(&BlockHeight::new(6)));
+        assert!(sm.applied_uncommitted.contains_key(&BlockHeight::new(7)));
     }
 
     // ─── health_check ───────────────────────────────────────────────────

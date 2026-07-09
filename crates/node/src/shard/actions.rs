@@ -201,9 +201,19 @@ where
                 );
             }
             Action::AttachCertifiedUncommitted { certified } => {
-                self.io
+                let block_hash = certified.block().hash();
+                let height = certified.block().height();
+                if !self
+                    .io
                     .pending_chain
-                    .attach_certified_uncommitted(certified.block().hash(), certified);
+                    .attach_certified_uncommitted(block_hash, certified)
+                {
+                    debug!(
+                        ?block_hash,
+                        height = height.inner(),
+                        "No chain entry for certified uncommitted block — not servable to sync until commit"
+                    );
+                }
             }
             Action::EmitTransactionStatus {
                 tx_hash,

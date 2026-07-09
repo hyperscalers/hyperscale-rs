@@ -204,15 +204,20 @@ where
     /// Attach a certified block whose commit is still pending, making it
     /// servable through [`Self::block_for_sync`] only — see
     /// [`ChainEntry::certified_uncommitted`] for why the other serving
-    /// surfaces don't read it. A no-op when no entry exists for
-    /// `block_hash`, like [`Self::attach_certified_block`].
+    /// surfaces don't read it. Returns `false` without attaching when no
+    /// entry exists for `block_hash` (the block stays unservable to sync
+    /// until commit); callers with a logging context should surface the
+    /// miss.
     pub fn attach_certified_uncommitted(
         &self,
         block_hash: BlockHash,
         certified: Arc<Verified<CertifiedBlock>>,
-    ) {
+    ) -> bool {
         if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
             entry.certified_uncommitted = Some(certified);
+            true
+        } else {
+            false
         }
     }
 
@@ -537,9 +542,14 @@ where
     }
 
     /// Certified-but-uncommitted entry at `height`, if any. Forks can
-    /// certify two siblings at one height; the highest QC round wins —
-    /// the committing child extends the newest QC its proposer holds,
-    /// so the newer sibling is the one a fetcher can make progress on.
+    /// certify two siblings at one height; only the one a
+    /// round-contiguous child extends ever commits. Serving the highest
+    /// QC round is a best guess at that winner — the committing child
+    /// extends the newest QC its proposer holds, which is usually the
+    /// newest QC anyone holds. A wrong guess is safe: fetchers track
+    /// applied blocks by height and hash, so one that applied a losing
+    /// sibling applies the winner on a later fetch instead of treating
+    /// the height as done.
     fn pending_certified_uncommitted_at(
         &self,
         height: BlockHeight,
