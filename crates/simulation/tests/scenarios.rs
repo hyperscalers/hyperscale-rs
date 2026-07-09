@@ -255,7 +255,7 @@ fn split_straddler_atomic_sim() {
 /// the survivor's finalization races its own counterpart-abort sweep; none may
 /// resolve one-sided.
 #[test]
-fn split_straddler_asymmetric_ec_partition() {
+fn split_straddler_ec_partition_atomic_sim() {
     for seed in [7u64, 11, 42, 2026, 1337] {
         let setup = split_straddler_setup();
         let mut cluster =

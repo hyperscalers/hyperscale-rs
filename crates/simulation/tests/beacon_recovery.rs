@@ -1,8 +1,9 @@
-//! End-to-end beacon-runner integration.
+//! Beacon recovery paths under committee obstruction.
 //!
-//! Boots a multi-host sim with a beacon committee, runs through several
-//! epochs, and asserts every host's `BeaconStorage` agrees on the
-//! committed `(block, state)` pair at every epoch.
+//! Boots a multi-host sim with a beacon committee, blocks the commit path
+//! (every SPC/PC notification dropped, or one host's proposals), and asserts
+//! the chain advances past the obstruction — by skip cert or proposal fetch —
+//! with every host agreeing on the committed `(block, state)` pair.
 
 use std::time::Duration;
 
