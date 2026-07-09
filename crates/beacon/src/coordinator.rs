@@ -440,9 +440,7 @@ impl BeaconCoordinator {
             },
             Action::SetTimer {
                 id: TimerId::BeaconRatifyTrigger,
-                duration: self
-                    .duration_until_next_epoch_boundary()
-                    .saturating_add(self.skip_timeout()),
+                duration: self.duration_until_next_ratify_fire(),
             },
         ]
     }
@@ -533,11 +531,36 @@ impl BeaconCoordinator {
         RatifyRound::new(RatifyRound::INITIAL.inner().saturating_add(rounds))
     }
 
+    /// Duration until the next ratify fire: the epoch's skip deadline,
+    /// then each round boundary after it — the same shared schedule
+    /// [`Self::wall_clock_ratify_round`] reads, so the timer fires at
+    /// the instant the wall-clock round changes. Arming at boundaries
+    /// rather than a fixed interval from the previous fire means every
+    /// pool member enters a round at the same moment and its votes get
+    /// the round's whole window to propagate. A member firing late in
+    /// the window casts votes that complete its peers' polkas one round
+    /// behind, where they are no longer precommittable — at exact pool
+    /// quorum, one such member starves certificate assembly entirely.
+    fn duration_until_next_ratify_fire(&self) -> Duration {
+        let now = self.now.as_millis();
+        let deadline = self
+            .next_epoch_boundary()
+            .plus(self.skip_timeout())
+            .as_millis();
+        if now < deadline {
+            return Duration::from_millis(deadline - now);
+        }
+        let timeout_ms = u64::try_from(RATIFY_ROUND_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let past_boundary = (now - deadline) % timeout_ms;
+        Duration::from_millis(timeout_ms - past_boundary)
+    }
+
     /// `TimerId::BeaconRatifyTrigger` fired. The first fire past the
     /// pending epoch's deadline makes the skip hash prevotable (the
     /// expected block didn't commit in time); each subsequent fire is a
     /// round timeout that re-prevotes per the tracker's lock rule. The
-    /// timer re-arms at [`RATIFY_ROUND_TIMEOUT`] while the epoch is
+    /// timer re-arms at the next round boundary
+    /// ([`Self::duration_until_next_ratify_fire`]) while the epoch is
     /// undecided.
     ///
     /// The deadline is re-validated at fire time because votes are
@@ -553,9 +576,12 @@ impl BeaconCoordinator {
             // harness, and without a follow-up fire the epoch's skip
             // rounds never start here — starving the pool quorum that
             // an epoch stalled below SPC quorum needs to resume.
+            // Re-arming at the boundary fires again at the deadline
+            // itself, keeping this member's rounds in step with the
+            // pool rather than a full round window late.
             return vec![Action::SetTimer {
                 id: TimerId::BeaconRatifyTrigger,
-                duration: RATIFY_ROUND_TIMEOUT,
+                duration: self.duration_until_next_ratify_fire(),
             }];
         }
         if self.ratify.is_completed() {
@@ -569,7 +595,7 @@ impl BeaconCoordinator {
         let mut actions = self.lift_ratify_effects(effects);
         actions.push(Action::SetTimer {
             id: TimerId::BeaconRatifyTrigger,
-            duration: RATIFY_ROUND_TIMEOUT,
+            duration: self.duration_until_next_ratify_fire(),
         });
         actions
     }
@@ -1327,6 +1353,19 @@ impl BeaconCoordinator {
         &mut self,
         vote: Arc<Verifiable<RatifyVote>>,
     ) -> Vec<Action> {
+        let expected_epoch = self.state.current_epoch.next();
+        // A vote ratifying an epoch past the in-flight one means committed
+        // beacon blocks exist that this replica never received. A stalled
+        // epoch produces no new block gossip, so these votes are the only
+        // traffic that reveals the gap — trigger gap-fill sync toward the
+        // vote's anchor epoch. The target is a hint (mirrors
+        // `on_beacon_block_received`): sync backs off on epochs nobody
+        // serves, so a bogus far-future claim can't busy-loop the network.
+        if vote.epoch() > expected_epoch {
+            return vec![Action::StartBeaconBlockSync {
+                target: vote.epoch().saturating_sub(1),
+            }];
+        }
         if vote.anchor_hash() != self.latest_block.block_hash() {
             trace!(
                 signer = ?vote.signer(),
@@ -1334,7 +1373,6 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        let expected_epoch = self.state.current_epoch.next();
         if vote.epoch() != expected_epoch {
             trace!(
                 signer = ?vote.signer(),
@@ -1840,9 +1878,7 @@ impl BeaconCoordinator {
             // commit lands by then.
             Action::SetTimer {
                 id: TimerId::BeaconRatifyTrigger,
-                duration: self
-                    .duration_until_next_epoch_boundary()
-                    .saturating_add(self.skip_timeout()),
+                duration: self.duration_until_next_ratify_fire(),
             },
         ];
 
@@ -4496,7 +4532,7 @@ mod tests {
     }
 
     #[test]
-    fn on_ratify_vote_drops_at_wrong_epoch() {
+    fn on_ratify_vote_triggers_sync_for_future_epoch() {
         let mut coord = fresh_coord();
         let skip_hash = coord.ratify.skip_block_hash();
         let vote = signed_ratify_vote(
@@ -4506,7 +4542,7 @@ mod tests {
             RatifyPhase::Prevote,
             skip_hash,
         );
-        let wrong_epoch = Arc::new(Verifiable::from(RatifyVote::new(
+        let future_epoch = Arc::new(Verifiable::from(RatifyVote::new(
             vote.anchor_hash(),
             Epoch::new(99),
             vote.round(),
@@ -4515,7 +4551,44 @@ mod tests {
             vote.signer(),
             vote.sig(),
         )));
-        let actions = coord.on_unverified_ratify_vote_received(wrong_epoch);
+        let actions = coord.on_unverified_ratify_vote_received(future_epoch);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBeaconBlockSync { target } if *target == Epoch::new(98)
+            )),
+            "a vote ratifying a future epoch reveals missing beacon blocks \
+             and must trigger gap-fill sync toward its anchor epoch; got {actions:?}",
+        );
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            0
+        );
+    }
+
+    #[test]
+    fn on_ratify_vote_drops_at_stale_epoch() {
+        let mut coord = fresh_coord();
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = signed_ratify_vote(
+            &coord,
+            0,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
+        );
+        let stale_epoch = Arc::new(Verifiable::from(RatifyVote::new(
+            vote.anchor_hash(),
+            Epoch::GENESIS,
+            vote.round(),
+            vote.phase(),
+            vote.block_hash(),
+            vote.signer(),
+            vote.sig(),
+        )));
+        let actions = coord.on_unverified_ratify_vote_received(stale_epoch);
         assert!(actions.is_empty());
         assert_eq!(
             coord
