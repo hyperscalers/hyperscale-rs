@@ -11,14 +11,12 @@ use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
-use hyperscale_types::{ShardId, ValidatorId};
+use hyperscale_types::ShardId;
 use tracing_test::traced_test;
 
-mod common;
 mod support;
 
-use common::rotation_config;
-use support::sim_cluster::SimCluster;
+use support::{SimCluster, committee_member_host, rotation_config};
 
 /// Any seed works — the cycle is harness-driven over the deterministic grow,
 /// not dependent on a particular shuffle outcome.
@@ -52,7 +50,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     // so the validator drains off its last shard only once every shard the
     // host runs is gone; the follower appears on that final leave.
     let leaf = ShardId::leaf(1, 0);
-    let (node, validator) = committee_member_host(&*runner, leaf);
+    let (node, validator) = committee_member_host(&*runner, leaf, None);
     assert_eq!(
         runner.pooled_len(node),
         0,
@@ -179,24 +177,4 @@ fn committed_beacon_epoch(runner: &SimulationRunner, node: NodeIndex) -> u64 {
         .latest_committed_epoch()
         .expect("beacon committed")
         .inner()
-}
-
-/// A host running a current consensus member of `shard`, and that member's
-/// validator id — read from the committee so a post-grow placement is found
-/// without assuming the host layout.
-fn committee_member_host(runner: &SimulationRunner, shard: ShardId) -> (NodeIndex, ValidatorId) {
-    let (_, state) = runner
-        .beacon_storage(0)
-        .expect("host 0 exists")
-        .latest_committed()
-        .expect("beacon committed");
-    let members = state
-        .shard_consensus_members
-        .get(&shard)
-        .expect("shard has a consensus committee");
-    members
-        .iter()
-        .map(|m| (runner.network().validator_to_node(*m), *m))
-        .find(|(node, _)| runner.vnode_state_in(*node, shard).is_some())
-        .expect("a current member of the shard is hosted")
 }

@@ -21,16 +21,14 @@ use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BlockHeight, READY_TIMEOUT_EPOCHS, SHUFFLE_INTERVAL_EPOCHS, ShardId, ValidatorId,
-    ValidatorStatus, shard_prefix_path,
+    BlockHeight, READY_TIMEOUT_EPOCHS, SHUFFLE_INTERVAL_EPOCHS, ValidatorId, ValidatorStatus,
+    shard_prefix_path,
 };
 use tracing_test::traced_test;
 
-mod common;
 mod support;
 
-use common::rotation_config;
-use support::sim_cluster::SimCluster;
+use support::{SimCluster, committee_member_host, rotation_config};
 
 /// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
 /// move: one shard's rotation victim is drawn straight into the other
@@ -84,28 +82,6 @@ fn mover_status(
 ) -> Option<ValidatorStatus> {
     let (_, state) = runner.beacon_storage(node)?.latest_committed()?;
     state.validators.get(&validator).map(|r| r.status)
-}
-
-/// A host (other than `except`) of a *current* consensus member of `shard`,
-/// for reading the shard's chain from a member that tracks the live tip. A
-/// shuffle rotates members out, but an ex-member's host keeps running the
-/// shard as a stalled non-member, so membership must be read from the
-/// committee, not from "hosts a `shard` vnode".
-fn member_host(runner: &SimulationRunner, shard: ShardId, except: NodeIndex) -> NodeIndex {
-    let (_, state) = runner
-        .beacon_storage(except)
-        .expect("host exists")
-        .latest_committed()
-        .expect("beacon committed");
-    let members = state
-        .shard_consensus_members
-        .get(&shard)
-        .expect("shard has a consensus committee");
-    members
-        .iter()
-        .map(|m| runner.network().validator_to_node(*m))
-        .find(|&h| h != except && runner.vnode_state_in(h, shard).is_some())
-        .expect("a current consensus member host other than `except`")
 }
 
 #[traced_test]
@@ -182,7 +158,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .expect("joined shard is hosted")
         .shard_coordinator()
         .committed_height();
-    let peer = member_host(&*runner, to, node);
+    let (peer, _) = committee_member_host(&*runner, to, Some(node));
     let proposed_deadline = runner.now() + Duration::from_millis(EPOCH_MS * PROPOSAL_BUDGET_EPOCHS);
     let proposed = run_until_or(&mut *runner, proposed_deadline, &mut moves, |r| {
         let tip = r
@@ -265,7 +241,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         "the mover's window on the origin shard has closed"
     );
     let retained = runner.leave_shard(node, from);
-    let origin_peer = member_host(&*runner, from, node);
+    let (origin_peer, _) = committee_member_host(&*runner, from, Some(node));
     let origin_before = runner
         .vnode_state_in(origin_peer, from)
         .expect("origin member host")

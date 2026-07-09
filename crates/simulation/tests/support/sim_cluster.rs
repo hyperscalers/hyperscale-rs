@@ -6,11 +6,6 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
-// Each test binary compiles its own copy of this module and exercises a
-// different subset of the constructors and accessors, so a helper unused in
-// any one binary isn't dead code.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;

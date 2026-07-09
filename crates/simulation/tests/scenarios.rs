@@ -31,7 +31,7 @@ use hyperscale_scenarios::{
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
-use support::sim_cluster::SimCluster;
+use support::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {

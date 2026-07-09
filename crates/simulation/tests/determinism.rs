@@ -28,7 +28,7 @@ use hyperscale_types::{
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
-use support::sim_cluster::SimCluster;
+use support::SimCluster;
 
 /// A four-validator single-shard network with light jitter; beacon options
 /// default.
