@@ -517,6 +517,22 @@ impl BeaconCoordinator {
         self.now.as_millis() >= expected_block_time.plus(self.skip_timeout()).as_millis()
     }
 
+    /// The ratify round the wall clock says the pool should be in:
+    /// elapsed time past the skip deadline divided by the round
+    /// timeout, starting from the round after [`RatifyRound::INITIAL`].
+    /// Every pool member reads the same deadline off its own beacon
+    /// fold, so members converge on one round despite timer jitter.
+    fn wall_clock_ratify_round(&self) -> RatifyRound {
+        let deadline = self
+            .next_epoch_boundary()
+            .plus(self.skip_timeout())
+            .as_millis();
+        let elapsed = self.now.as_millis().saturating_sub(deadline);
+        let timeout_ms: u128 = RATIFY_ROUND_TIMEOUT.as_millis();
+        let rounds = u32::try_from(u128::from(elapsed) / timeout_ms).unwrap_or(u32::MAX);
+        RatifyRound::new(RatifyRound::INITIAL.inner().saturating_add(rounds))
+    }
+
     /// `TimerId::BeaconRatifyTrigger` fired. The first fire past the
     /// pending epoch's deadline makes the skip hash prevotable (the
     /// expected block didn't commit in time); each subsequent fire is a
@@ -531,14 +547,22 @@ impl BeaconCoordinator {
     /// Re-checking makes any stale or early fire harmless.
     pub fn on_beacon_ratify_timer(&mut self) -> Vec<Action> {
         if !self.skip_trigger_due(self.next_epoch_boundary()) {
-            trace!("BeaconRatifyTrigger fired before the next epoch's skip deadline");
-            return Vec::new();
+            // An early fire must re-arm or this validator's skip
+            // machinery dies with the timer chain: the initial arm can
+            // land marginally before the deadline on a wall-clock
+            // harness, and without a follow-up fire the epoch's skip
+            // rounds never start here — starving the pool quorum that
+            // an epoch stalled below SPC quorum needs to resume.
+            return vec![Action::SetTimer {
+                id: TimerId::BeaconRatifyTrigger,
+                duration: RATIFY_ROUND_TIMEOUT,
+            }];
         }
         if self.ratify.is_completed() {
             return Vec::new();
         }
         let effects = if self.ratify.deadline_passed() {
-            self.ratify.on_round_timeout()
+            self.ratify.on_round_timeout(self.wall_clock_ratify_round())
         } else {
             self.ratify.on_deadline()
         };
@@ -3101,9 +3125,23 @@ mod tests {
         let skip_hash = coord.ratify.skip_block_hash();
 
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms - 1));
+        let actions = coord.on_beacon_ratify_timer();
         assert!(
-            coord.on_beacon_ratify_timer().is_empty(),
-            "an early fire must not vote",
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastRatifyVote { .. })),
+            "an early fire must not vote; got {actions:?}",
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::BeaconRatifyTrigger,
+                    ..
+                }
+            )),
+            "an early fire must re-arm — a dead timer chain kills the \
+             validator's skip machinery; got {actions:?}",
         );
 
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));

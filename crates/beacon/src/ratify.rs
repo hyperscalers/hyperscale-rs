@@ -41,6 +41,12 @@ use hyperscale_types::{
 /// once this replica catches up.
 const MAX_ROUND_AHEAD: u32 = 4;
 
+/// Round from which an unlocked member stops prevoting its candidate
+/// and concedes to the skip hash. Two full rounds of a held candidate
+/// failing to polka past the deadline means the pool isn't converging
+/// on it — joining skip breaks the value split.
+const CANDIDATE_PATIENCE_ROUNDS: u32 = 3;
+
 /// What the tracker wants done after absorbing an event.
 ///
 /// The coordinator lifts sign intents into signing actions (the signed
@@ -221,14 +227,25 @@ impl RatifyTracker {
     }
 
     /// The current round timed out without a commit: enter the next
-    /// round and re-prevote per the lock rule.
-    pub fn on_round_timeout(&mut self) -> Vec<RatifyEffect> {
+    /// round — or jump straight to `target_round` when it is further
+    /// ahead — and re-prevote per the lock rule.
+    ///
+    /// `target_round` is the caller's wall-clock round: elapsed time
+    /// past the epoch's skip deadline divided by the round timeout.
+    /// Deriving progression from the shared deadline instead of
+    /// counting local fires keeps every pool member in the same round
+    /// despite per-host timer jitter — a polka needs a 2f+1 quorum at
+    /// one round, and members whose counters drift apart starve it:
+    /// a polka completing behind a member's current round is not
+    /// precommittable (the vote register is position-monotone), so
+    /// skew that outruns the round window loses the quorum entirely.
+    pub fn on_round_timeout(&mut self, target_round: RatifyRound) -> Vec<RatifyEffect> {
         if self.completed {
             return vec![];
         }
         // A round timeout only fires past the epoch's deadline.
         self.deadline_passed = true;
-        self.round = self.round.next();
+        self.round = self.round.next().max(target_round);
         self.try_own_prevote().into_iter().collect()
     }
 
@@ -296,6 +313,15 @@ impl RatifyTracker {
     /// value is available: the lock if one is held (leaving it only
     /// for the other value's strictly newer polka), else the candidate
     /// when held, else the skip hash once the deadline passed.
+    ///
+    /// An unlocked member's candidate preference is bounded: from
+    /// [`CANDIDATE_PATIENCE_ROUNDS`] on, it concedes to the skip hash.
+    /// Without the concession a pool can split on values forever —
+    /// members that saw a skip polka lock skip, while candidate-holding
+    /// members keep prevoting a candidate whose polka never forms, and
+    /// neither side reaches quorum. On the healthy path the candidate
+    /// polkas rounds before the patience runs out, so the concession
+    /// only ever fires on an already-stalled epoch.
     fn try_own_prevote(&mut self) -> Option<RatifyEffect> {
         if self.prevoted.contains_key(&self.round) {
             return None;
@@ -311,6 +337,9 @@ impl RatifyTracker {
                     Some(w) if self.newer_polka_exists(w, lock_round) => Some(w),
                     _ => Some(locked),
                 }
+            }
+            None if self.deadline_passed && self.round.inner() >= CANDIDATE_PATIENCE_ROUNDS => {
+                Some(self.skip_hash)
             }
             None => self
                 .candidate
@@ -494,7 +523,7 @@ mod tests {
         let effects = t.on_candidate(candidate_hash());
         assert!(effects.is_empty(), "round 1 prevote register is spent");
 
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
     }
 
@@ -626,7 +655,7 @@ mod tests {
             t.observe(vote(&keys, 6, 1, RatifyPhase::Precommit, candidate_hash()))
                 .is_empty()
         );
-        assert!(t.on_round_timeout().is_empty());
+        assert!(t.on_round_timeout(RatifyRound::INITIAL).is_empty());
         assert!(t.on_deadline().is_empty());
         assert!(t.on_candidate(candidate_hash()).is_empty());
     }
@@ -636,8 +665,8 @@ mod tests {
     #[test]
     fn stale_round_precommit_quorum_still_commits() {
         let (mut t, keys) = tracker(7);
-        let _ = t.on_round_timeout();
-        let _ = t.on_round_timeout();
+        let _ = t.on_round_timeout(RatifyRound::INITIAL);
+        let _ = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(t.round(), RatifyRound::new(3));
 
         let mut committed = false;
@@ -689,7 +718,7 @@ mod tests {
             "polka completes with the loopback vote",
         );
 
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(
             sign_prevote_round(&effects),
             Some((2, candidate_hash())),
@@ -713,9 +742,9 @@ mod tests {
         assert_eq!(t.round(), RatifyRound::new(1));
 
         // Rounds 2 and 3: the lock re-prevotes the candidate.
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((2, candidate_hash())));
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((3, candidate_hash())));
 
         // A skip polka at round 2 lands late — the tracker is at
@@ -732,7 +761,7 @@ mod tests {
 
         // ...but it is a strictly newer polka than the round-1 lock,
         // so round 4's prevote follows the pool to skip.
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((4, skip)));
     }
 
@@ -750,7 +779,7 @@ mod tests {
 
         // Round 2: the rest of the pool prevotes skip; the polka
         // (6 of 7 without us) precommits and re-locks (skip, 2).
-        let _ = t.on_round_timeout();
+        let _ = t.on_round_timeout(RatifyRound::INITIAL);
         let skip = t.skip_block_hash();
         let mut effects = vec![];
         for i in 1..=6 {
@@ -759,7 +788,7 @@ mod tests {
         assert_eq!(sign_precommit_round(&effects), Some((2, skip)));
 
         // Round 3: the new lock re-prevotes skip.
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
     }
 
@@ -795,7 +824,7 @@ mod tests {
 
         // The next round re-prevotes the recovered lock, not the
         // candidate: no newer polka justifies leaving it.
-        let effects = t.on_round_timeout();
+        let effects = t.on_round_timeout(RatifyRound::INITIAL);
         assert_eq!(sign_prevote_round(&effects), Some((3, skip)));
     }
 
