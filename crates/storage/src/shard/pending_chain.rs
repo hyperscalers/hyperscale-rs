@@ -1175,6 +1175,9 @@ mod tests {
         fn get_root_key(&self, _version: u64) -> Option<JmtNodeKey> {
             None
         }
+        fn root_path(&self) -> NibblePath {
+            NibblePath::empty()
+        }
     }
 
     impl ShardChainReader for StubStore {

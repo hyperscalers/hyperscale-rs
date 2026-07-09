@@ -35,12 +35,10 @@ pub trait TreeReader: Sync {
     fn get_root_key(&self, version: u64) -> Option<NodeKey>;
 
     /// The path this store's tree is rooted at. Whole-keyspace stores root
-    /// at the empty path (the default); a per-shard store overrides this with
-    /// its shard's prefix so its root node — and thus its `state_root` — is the
-    /// subtree at that prefix.
-    fn root_path(&self) -> NibblePath {
-        NibblePath::empty()
-    }
+    /// at the empty path; a per-shard store answers its shard's prefix so
+    /// its root node — and thus its `state_root` — is the subtree at that
+    /// prefix.
+    fn root_path(&self) -> NibblePath;
 }
 
 /// Read-only storage interface. Proof generation, reads, and the internal
@@ -56,12 +54,10 @@ pub trait TreeReader {
     fn get_root_key(&self, version: u64) -> Option<NodeKey>;
 
     /// The path this store's tree is rooted at. Whole-keyspace stores root
-    /// at the empty path (the default); a per-shard store overrides this with
-    /// its shard's prefix so its root node — and thus its `state_root` — is the
-    /// subtree at that prefix.
-    fn root_path(&self) -> NibblePath {
-        NibblePath::empty()
-    }
+    /// at the empty path; a per-shard store answers its shard's prefix so
+    /// its root node — and thus its `state_root` — is the subtree at that
+    /// prefix.
+    fn root_path(&self) -> NibblePath;
 }
 
 /// Write storage interface. `TreeUpdateBatch` fields are applied via
@@ -165,6 +161,10 @@ impl TreeReader for MemoryStore {
     fn get_root_key(&self, version: u64) -> Option<NodeKey> {
         self.root_keys.get(&version).cloned()
     }
+
+    fn root_path(&self) -> NibblePath {
+        NibblePath::empty()
+    }
 }
 
 impl TreeWriter for MemoryStore {
@@ -195,6 +195,9 @@ impl<T: TreeReader + Send + ?Sized> TreeReader for Arc<T> {
     fn get_root_key(&self, version: u64) -> Option<NodeKey> {
         (**self).get_root_key(version)
     }
+    fn root_path(&self) -> NibblePath {
+        (**self).root_path()
+    }
 }
 
 #[cfg(not(feature = "parallel"))]
@@ -205,6 +208,9 @@ impl<T: TreeReader + ?Sized> TreeReader for Arc<T> {
     fn get_root_key(&self, version: u64) -> Option<NodeKey> {
         (**self).get_root_key(version)
     }
+    fn root_path(&self) -> NibblePath {
+        (**self).root_path()
+    }
 }
 
 impl<T: TreeReader + ?Sized> TreeReader for &T {
@@ -213,5 +219,8 @@ impl<T: TreeReader + ?Sized> TreeReader for &T {
     }
     fn get_root_key(&self, version: u64) -> Option<NodeKey> {
         (**self).get_root_key(version)
+    }
+    fn root_path(&self) -> NibblePath {
+        (**self).root_path()
     }
 }

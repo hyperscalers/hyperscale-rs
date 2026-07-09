@@ -853,6 +853,9 @@ impl TreeReader for NeverStore {
     fn get_root_key(&self, _version: u64) -> Option<NodeKey> {
         unreachable!("NeverStore accessed")
     }
+    fn root_path(&self) -> NibblePath {
+        unreachable!("NeverStore accessed")
+    }
 }
 
 #[cfg(test)]
