@@ -10,133 +10,41 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_libp2p::Libp2pConfig;
 use hyperscale_network_libp2p::test_utils::TestFixtures;
-use hyperscale_production::{LocalValidator, ProductionRunner, ShardCommand, VnodeConfig};
-use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage};
-use hyperscale_storage_rocksdb::RocksDbBeaconStorage;
+use hyperscale_production::{ShardCommand, VnodeConfig};
+use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::{BeaconChainConfig, ReshapeThresholds, ShardId, ValidatorId};
 use serial_test::serial;
-use support::{CONNECTION_TIMEOUT, temp_storage_dir, temp_storage_factory};
-use tempfile::TempDir;
+use support::{CONNECTION_TIMEOUT, build_runner};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
-use tracing::info;
 use tracing_subscriber::fmt;
 
+/// A single-validator runner builds against real networking, listens on
+/// localhost QUIC, and exits cleanly (returning `Ok`) when its shutdown
+/// handle drops.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_production_runner_with_network() {
+async fn runner_boots_listens_and_shuts_down_cleanly() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(42, 1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
 
-    let temp_dir = TempDir::new().unwrap();
-
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: vec![],
-        ..Default::default()
-    };
-
-    let beacon_storage: Arc<dyn BeaconStorage> =
-        Arc::new(RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).unwrap());
-    let runner = ProductionRunner::builder(
-        vec![LocalValidator {
-            validator_id: ValidatorId::new(0),
-            signing_key: fixtures.signing_key(0),
-        }],
-        fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_storage,
-        network_config,
-        temp_storage_factory(&temp_dir),
-        temp_storage_dir(&temp_dir),
-    )
-    .build();
-
-    assert!(runner.is_ok(), "Runner creation should succeed");
-    let mut runner = runner.unwrap();
-
-    // Verify network is configured
-    let network = runner.network();
-    info!(peer_id = %network.local_peer_id(), "Runner has network");
-
-    // Get listen addresses
     sleep(Duration::from_millis(100)).await;
-    let addrs = network.listen_addresses().await;
-    info!(addresses = ?addrs, "Runner listening on");
+    let addrs = runner.network().listen_addresses().await;
+    assert!(!addrs.is_empty(), "runner listens on localhost QUIC");
 
-    // Get shutdown handle before running
-    let shutdown = runner
-        .shutdown_handle()
-        .expect("Should have shutdown handle");
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
-
-    sleep(Duration::from_millis(500)).await;
-    drop(shutdown);
-
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "Runner should exit cleanly");
-
-    info!("Production runner with network test completed");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_graceful_shutdown() {
-    let _ = fmt().with_test_writer().try_init();
-
-    let fixtures = TestFixtures::new(42, 1);
-
-    let temp_dir = TempDir::new().unwrap();
-
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: vec![],
-        ..Default::default()
-    };
-
-    let beacon_storage: Arc<dyn BeaconStorage> =
-        Arc::new(RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).unwrap());
-    let mut runner = ProductionRunner::builder(
-        vec![LocalValidator {
-            validator_id: ValidatorId::new(0),
-            signing_key: fixtures.signing_key(0),
-        }],
-        fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_storage,
-        network_config,
-        temp_storage_factory(&temp_dir),
-        temp_storage_dir(&temp_dir),
-    )
-    .build()
-    .unwrap();
-
-    let shutdown = runner
-        .shutdown_handle()
-        .expect("Should have shutdown handle");
-    let handle = spawn(runner.run());
-
-    // Let it run briefly
     sleep(Duration::from_millis(200)).await;
-
-    // Shutdown via handle
     drop(shutdown);
 
-    // Should exit within 5 seconds (graceful shutdown max)
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(
-        result.is_ok(),
-        "Runner should exit within graceful shutdown timeout"
-    );
-
-    let run_result = result.unwrap();
-    assert!(run_result.is_ok(), "Runner should return Ok on shutdown");
-
-    info!("Graceful shutdown test completed");
+    let joined = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runner exits within the graceful-shutdown budget")
+        .expect("runner task joins");
+    assert!(joined.is_ok(), "runner returns Ok on shutdown");
 }
 
 /// Runtime shard teardown through the supervisor: a runner seated on the root
@@ -146,40 +54,15 @@ async fn test_graceful_shutdown() {
 /// [`pooled_validator_boots_as_follower_only_host`].
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_runtime_shard_leave_tears_down() {
+async fn runtime_shard_leave_tears_down() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(43, 1);
-
-    let temp_dir = TempDir::new().unwrap();
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: vec![],
-        ..Default::default()
-    };
-    let beacon_storage: Arc<dyn BeaconStorage> =
-        Arc::new(RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).unwrap());
-
-    let mut runner = ProductionRunner::builder(
-        vec![LocalValidator {
-            validator_id: ValidatorId::new(0),
-            signing_key: fixtures.signing_key(0),
-        }],
-        fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_storage,
-        network_config,
-        temp_storage_factory(&temp_dir),
-        temp_storage_dir(&temp_dir),
-    )
-    .build()
-    .unwrap();
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
 
     let adapter = Arc::clone(runner.network());
     let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner
-        .shutdown_handle()
-        .expect("Should have shutdown handle");
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
     assert!(adapter.local_shards().contains(&ShardId::ROOT));
@@ -205,10 +88,8 @@ async fn test_runtime_shard_leave_tears_down() {
 
     drop(shutdown);
     let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "Runner should exit after the leave");
-    assert!(result.unwrap().is_ok(), "Runner should return Ok");
-
-    info!("Runtime shard leave/teardown test completed");
+    assert!(result.is_ok(), "runner exits after the leave");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
 }
 
 /// A validator the beacon genesis leaves `Pooled` — registered in the global
@@ -226,30 +107,7 @@ async fn pooled_validator_boots_as_follower_only_host() {
     // the genesis committee never seats.
     let fixtures = TestFixtures::with_surplus(44, 1, 1);
     let surplus = ValidatorId::new(1);
-
-    let temp_dir = TempDir::new().unwrap();
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: vec![],
-        ..Default::default()
-    };
-    let beacon_storage: Arc<dyn BeaconStorage> =
-        Arc::new(RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).unwrap());
-
-    let mut runner = ProductionRunner::builder(
-        vec![LocalValidator {
-            validator_id: surplus,
-            signing_key: fixtures.signing_key(1),
-        }],
-        fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_storage,
-        network_config,
-        temp_storage_factory(&temp_dir),
-        temp_storage_dir(&temp_dir),
-    )
-    .build()
-    .unwrap();
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
 
     // Derivation seated nothing: the host carries no shard before it runs.
     assert!(
@@ -259,9 +117,7 @@ async fn pooled_validator_boots_as_follower_only_host() {
 
     let adapter = Arc::clone(runner.network());
     let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner
-        .shutdown_handle()
-        .expect("Should have shutdown handle");
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
 
@@ -294,10 +150,8 @@ async fn pooled_validator_boots_as_follower_only_host() {
 
     drop(shutdown);
     let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "Runner should exit after seating");
-    assert!(result.unwrap().is_ok(), "Runner should return Ok");
-
-    info!("Pooled follower-boot test completed");
+    assert!(result.is_ok(), "runner exits after seating");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
 }
 
 /// The `beacon_chain_config` builder setter threads a custom config through into
@@ -310,16 +164,6 @@ async fn beacon_chain_config_reaches_genesis() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(42, 1);
-
-    let temp_dir = TempDir::new().unwrap();
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: vec![],
-        ..Default::default()
-    };
-    let beacon_storage =
-        Arc::new(RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).unwrap());
-
     let chain_config = BeaconChainConfig {
         epoch_duration_ms: 400,
         reshape_thresholds: ReshapeThresholds {
@@ -327,26 +171,7 @@ async fn beacon_chain_config_reaches_genesis() {
         },
         ..BeaconChainConfig::default()
     };
-
-    let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();
-    let runner = ProductionRunner::builder(
-        vec![LocalValidator {
-            validator_id: ValidatorId::new(0),
-            signing_key: fixtures.signing_key(0),
-        }],
-        fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_reader,
-        network_config,
-        temp_storage_factory(&temp_dir),
-        temp_storage_dir(&temp_dir),
-    )
-    .beacon_chain_config(chain_config)
-    .build();
-    assert!(
-        runner.is_ok(),
-        "runner builds with a custom beacon chain config"
-    );
+    let (_runner, _dir, beacon_storage) = build_runner(&fixtures, &[0], vec![], Some(chain_config));
 
     // Build commits the genesis (block, state) pair into the beacon store.
     let (_block, state) = beacon_storage
