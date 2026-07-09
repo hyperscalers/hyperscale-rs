@@ -36,7 +36,7 @@ use hyperscale_scenarios::{
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
 use serial_test::serial;
-use support::prod_cluster::ProdCluster;
+use support::ProdCluster;
 
 /// Production epoch length: the real 5-minute deployment epoch under `ci`, a
 /// 30-second epoch otherwise — mirroring `simulation`'s `EPOCH_MS` so a budget
@@ -399,8 +399,12 @@ const fn merge_straddler_config() -> ScenarioConfig {
 )]
 fn merge_straddler_atomic_prod() {
     let setup = merge_straddler_setup();
-    let mut cluster =
-        ProdCluster::with_grown_balances(&merge_straddler_config(), 11, EPOCH_MS, setup.balances);
+    let mut cluster = ProdCluster::start_with_grown_balances(
+        &merge_straddler_config(),
+        11,
+        EPOCH_MS,
+        setup.balances,
+    );
     merge_straddler_atomic(&mut cluster);
 }
 

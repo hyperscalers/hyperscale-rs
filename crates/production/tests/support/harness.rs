@@ -85,7 +85,7 @@ impl HostSpec {
     }
 }
 
-/// Inputs for [`Cluster::start`].
+/// Inputs for [`Harness::start`].
 pub struct ClusterSpec {
     /// The genesis validators each host projects its topology from.
     pub genesis: GenesisValidators,
@@ -133,14 +133,14 @@ struct Host {
 }
 
 /// A running multi-host production cluster.
-pub struct Cluster {
+pub struct Harness {
     hosts: Vec<Host>,
     // Temp dirs kept alive for the cluster's lifetime; the on-disk stores
     // are deleted only when the cluster (and these) drop.
     _temp_dirs: Vec<TempDir>,
 }
 
-impl Cluster {
+impl Harness {
     /// Build and start the cluster: open per-host stores, build runners,
     /// bootstrap-peer the hosts to host 0, and spawn every runner. The
     /// adapters peer during the build; consensus starts when the runners
@@ -387,7 +387,7 @@ fn host_id(index: usize) -> HostId {
 
 /// Fault injection: drive every host's gate. The cluster addresses hosts by
 /// index; each host's gate keys on [`HostId`].
-impl Cluster {
+impl Harness {
     /// Configure every host's gate with its own id and the full `PeerId →
     /// HostId` map, so partition and gossip filtering resolve peers. Call once
     /// before installing faults.

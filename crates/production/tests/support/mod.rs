@@ -1,5 +1,5 @@
 //! Shared helpers for the production e2e test binaries, plus the two
-//! harnesses: the bespoke QUIC + `RocksDB` [`cluster`] and the portable
+//! harnesses: the bespoke QUIC + `RocksDB` [`harness`] and the portable
 //! scenarios adaptor [`prod_cluster`] over it.
 //!
 //! The suites each compile their own copy of this module and use a
@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-pub mod cluster;
+pub mod harness;
 pub mod prod_cluster;
 
 use std::sync::Arc;
@@ -23,6 +23,8 @@ use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{BeaconChainConfig, ShardId, ValidatorId, shard_prefix_path};
 use libp2p::Multiaddr;
+#[allow(unused_imports)] // the lifecycle binaries compile support but never drive the adaptor
+pub use prod_cluster::ProdCluster;
 use tempfile::TempDir;
 
 /// Budget for a transport connection / validator-bind handshake to complete
