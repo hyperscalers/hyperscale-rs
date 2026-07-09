@@ -602,7 +602,8 @@ impl Cluster {
 
     /// Signal every host to shut down and join its runner task. Drops the
     /// real shard threads so they don't leak across `#[serial]` tests.
-    pub async fn shutdown(mut self) {
+    /// Idempotent: the hosts are drained, so a second call is a no-op.
+    pub async fn shutdown(&mut self) {
         for host in &mut self.hosts {
             if let Some(s) = host.shutdown.take() {
                 s.shutdown();

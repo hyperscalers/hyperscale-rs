@@ -37,7 +37,6 @@ use hyperscale_scenarios::{
 };
 use serial_test::serial;
 use support::prod_cluster::ProdCluster;
-use tracing_subscriber::fmt;
 
 /// Production epoch length: the real 5-minute deployment epoch under `ci`, a
 /// 30-second epoch otherwise — mirroring `simulation`'s `EPOCH_MS` so a budget
@@ -67,10 +66,8 @@ const fn liveness_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn liveness_baseline_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     liveness_baseline(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -80,10 +77,8 @@ fn liveness_baseline_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn single_shard_tx_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     single_shard_tx(&mut cluster);
-    cluster.shutdown();
 }
 
 /// Fault-scenario config: four single-vnode hosts, so a `transaction.gossip`
@@ -107,10 +102,8 @@ const fn fault_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn gossip_drop_engages_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(gossip_drop_engages_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -120,10 +113,8 @@ fn gossip_drop_engages_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn partition_halts_and_heals_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(partition_halts_and_heals);
-    cluster.shutdown();
 }
 
 #[test]
@@ -133,10 +124,8 @@ fn partition_halts_and_heals_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn isolated_validator_still_settles_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(isolated_validator_still_settles);
-    cluster.shutdown();
 }
 
 /// Seven single-vnode hosts: quorum is five, so a connected two-host fragment
@@ -159,10 +148,8 @@ const fn seven_host_fault_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn minority_fragment_rejoins_after_partition_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&seven_host_fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(minority_fragment_rejoins_after_partition);
-    cluster.shutdown();
 }
 
 #[test]
@@ -172,10 +159,8 @@ fn minority_fragment_rejoins_after_partition_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn partition_heals_at_exact_quorum_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&fault_config(), 7, EPOCH_MS);
     cluster.run_faultable(partition_heals_at_exact_quorum);
-    cluster.shutdown();
 }
 
 /// Single-shard config with the split trigger armed (`split_bytes = 0`), one
@@ -200,10 +185,8 @@ const fn split_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn split_lifecycle_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     split_lifecycle(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -213,10 +196,8 @@ fn split_lifecycle_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_tx_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cross_shard_tx(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -226,10 +207,8 @@ fn cross_shard_tx_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_provisions_drop_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_provisions_drop_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -239,10 +218,8 @@ fn cross_shard_provisions_drop_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_exec_cert_drop_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -252,10 +229,8 @@ fn cross_shard_exec_cert_drop_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_compound_drop_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_compound_drop_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -265,10 +240,8 @@ fn cross_shard_compound_drop_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_transaction_da_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_transaction_da_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -278,10 +251,8 @@ fn cross_shard_transaction_da_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_header_fetch_fallback_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_header_fetch_fallback);
-    cluster.shutdown();
 }
 
 #[test]
@@ -291,10 +262,8 @@ fn cross_shard_header_fetch_fallback_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_provisions_recovers_after_transient_outage_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     cluster.run_faultable(cross_shard_provisions_recovers_after_transient_outage);
-    cluster.shutdown();
 }
 
 #[test]
@@ -304,7 +273,6 @@ fn cross_shard_provisions_recovers_after_transient_outage_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn inter_shard_partition_aborts_waves_at_deadline_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &split_config(),
         11,
@@ -312,7 +280,6 @@ fn inter_shard_partition_aborts_waves_at_deadline_prod() {
         intershard_partition_genesis_balances(),
     );
     cluster.run_faultable(inter_shard_partition_aborts_waves_at_deadline);
-    cluster.shutdown();
 }
 
 #[test]
@@ -322,7 +289,6 @@ fn inter_shard_partition_aborts_waves_at_deadline_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn beacon_pool_partition_stalls_epoch_production_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &split_config(),
         11,
@@ -330,7 +296,6 @@ fn beacon_pool_partition_stalls_epoch_production_prod() {
         intershard_partition_genesis_balances(),
     );
     cluster.run_faultable(beacon_pool_partition_stalls_epoch_production);
-    cluster.shutdown();
 }
 
 #[test]
@@ -340,12 +305,10 @@ fn beacon_pool_partition_stalls_epoch_production_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn cross_shard_provisions_fetch_with_request_loss_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 42, EPOCH_MS);
     // The body's liveness invariants are the prod assertion; the returned drop
     // count (deterministic only on the sim) is not asserted here.
     let _request_drops = cluster.run_faultable(cross_shard_provisions_fetch_with_request_loss);
-    cluster.shutdown();
 }
 
 #[test]
@@ -355,10 +318,8 @@ fn cross_shard_provisions_fetch_with_request_loss_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn livelock_resolves_promptly_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     livelock_resolves_promptly(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -368,10 +329,8 @@ fn livelock_resolves_promptly_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn merge_lifecycle_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     merge_lifecycle(&mut cluster);
-    cluster.shutdown();
 }
 
 /// Two cohorts of pool surplus and a grow trigger above each child but below
@@ -395,12 +354,10 @@ const fn straddler_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn split_straddler_atomic_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let setup = split_straddler_setup();
     let mut cluster =
         ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
     split_straddler_atomic(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -410,12 +367,10 @@ fn split_straddler_atomic_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn split_straddler_ec_partition_atomic_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let setup = split_straddler_setup();
     let mut cluster =
         ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
     split_straddler_ec_partition_atomic(&mut cluster);
-    cluster.shutdown();
 }
 
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing
@@ -443,12 +398,10 @@ const fn merge_straddler_config() -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn merge_straddler_atomic_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let setup = merge_straddler_setup();
     let mut cluster =
         ProdCluster::with_grown_balances(&merge_straddler_config(), 11, EPOCH_MS, setup.balances);
     merge_straddler_atomic(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -458,12 +411,10 @@ fn merge_straddler_atomic_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn multi_vnode_progress_prod() {
-    let _ = fmt().with_test_writer().try_init();
     // `liveness_config` already hosts the committee at two vnodes per host — the
     // same-shard multi-vnode hosting under test.
     let mut cluster = ProdCluster::start(&liveness_config(), 7, EPOCH_MS);
     multi_vnode_progress(&mut cluster);
-    cluster.shutdown();
 }
 
 /// Single-shard witness config: the committee equals the whole validator set
@@ -489,7 +440,6 @@ const fn witness_config(validators: u32) -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn stake_deposit_folds_into_beacon_state_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0x57AC,
@@ -497,7 +447,6 @@ fn stake_deposit_folds_into_beacon_state_prod() {
         witness_genesis_balances(),
     );
     stake_deposit_folds_into_beacon_state(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -507,7 +456,6 @@ fn stake_deposit_folds_into_beacon_state_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn register_validator_pools_a_node_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0x5EED,
@@ -515,7 +463,6 @@ fn register_validator_pools_a_node_prod() {
         witness_genesis_balances(),
     );
     register_validator_pools_a_node(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -525,7 +472,6 @@ fn register_validator_pools_a_node_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn register_without_capacity_is_rejected_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0x0CA9,
@@ -533,7 +479,6 @@ fn register_without_capacity_is_rejected_prod() {
         witness_genesis_balances(),
     );
     register_without_capacity_is_rejected(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -543,7 +488,6 @@ fn register_without_capacity_is_rejected_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn stake_withdraw_drops_effective_stake_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0xD7A1,
@@ -551,7 +495,6 @@ fn stake_withdraw_drops_effective_stake_prod() {
         witness_genesis_balances(),
     );
     stake_withdraw_drops_effective_stake(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -561,7 +504,6 @@ fn stake_withdraw_drops_effective_stake_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn registered_validator_activates_onto_a_shard_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0xAC11,
@@ -569,7 +511,6 @@ fn registered_validator_activates_onto_a_shard_prod() {
         witness_genesis_balances(),
     );
     registered_validator_activates_onto_a_shard(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -579,7 +520,6 @@ fn registered_validator_activates_onto_a_shard_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn withdrawal_ejects_a_validator_that_a_deposit_reactivates_prod() {
-    let _ = fmt().with_test_writer().try_init();
     // Seven validators give the committee slack to keep quorum while a couple
     // eject.
     let mut cluster = ProdCluster::start_with_balances(
@@ -589,7 +529,6 @@ fn withdrawal_ejects_a_validator_that_a_deposit_reactivates_prod() {
         witness_genesis_balances(),
     );
     withdrawal_ejects_a_validator_that_a_deposit_reactivates(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -599,7 +538,6 @@ fn withdrawal_ejects_a_validator_that_a_deposit_reactivates_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn re_registration_of_a_live_validator_is_a_no_op_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0xDEAD,
@@ -607,7 +545,6 @@ fn re_registration_of_a_live_validator_is_a_no_op_prod() {
         witness_genesis_balances(),
     );
     re_registration_of_a_live_validator_is_a_no_op(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -617,7 +554,6 @@ fn re_registration_of_a_live_validator_is_a_no_op_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn pool_capacity_caps_registrations_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start_with_balances(
         &witness_config(4),
         0xCA9A,
@@ -625,7 +561,6 @@ fn pool_capacity_caps_registrations_prod() {
         witness_genesis_balances(),
     );
     pool_capacity_caps_registrations(&mut cluster);
-    cluster.shutdown();
 }
 
 /// Single-shard genesis with the split armed and exactly `(target - 1)` cohorts
@@ -650,10 +585,8 @@ const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn grow_reaches_two_shard_topology_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&grow_config(2), 11, EPOCH_MS);
     grow_reaches_two_shard_topology(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -663,10 +596,8 @@ fn grow_reaches_two_shard_topology_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn grow_reaches_four_shard_topology_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&grow_config(4), 11, EPOCH_MS);
     grow_reaches_four_shard_topology(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -676,10 +607,8 @@ fn grow_reaches_four_shard_topology_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn merge_seats_full_keeper_committee_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let mut cluster = ProdCluster::start(&split_config(), 11, EPOCH_MS);
     merge_seats_full_keeper_committee(&mut cluster);
-    cluster.shutdown();
 }
 
 #[test]
@@ -689,10 +618,8 @@ fn merge_seats_full_keeper_committee_prod() {
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
 fn surviving_sibling_split_seats_full_committees_prod() {
-    let _ = fmt().with_test_writer().try_init();
     let setup = split_straddler_setup();
     let mut cluster =
         ProdCluster::start_with_balances(&straddler_config(), 11, EPOCH_MS, setup.balances);
     surviving_sibling_split_seats_full_committees(&mut cluster);
-    cluster.shutdown();
 }

@@ -29,6 +29,7 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
+use tracing_subscriber::fmt;
 
 use super::cluster::{Cluster as Harness, ClusterSpec, HostSpec};
 
@@ -65,6 +66,7 @@ impl ProdCluster {
         epoch_ms: u64,
         balances: Vec<(ComponentAddress, Decimal)>,
     ) -> Self {
+        let _ = fmt().with_test_writer().try_init();
         let runtime = Builder::new_multi_thread()
             .worker_threads(16)
             .enable_all()
@@ -107,12 +109,6 @@ impl ProdCluster {
         grow_to(&mut cluster, config.num_shards);
         vote_reshape_threshold(&mut cluster, &merge_vote_payer(), config.split_bytes);
         cluster
-    }
-
-    /// Drive the cluster to a clean shutdown, joining every host's runner task.
-    pub fn shutdown(self) {
-        let Self { runtime, inner, .. } = self;
-        runtime.block_on(inner.shutdown());
     }
 
     /// Translate the portable config into a production `ClusterSpec`. Genesis is
@@ -181,6 +177,16 @@ impl ProdCluster {
         tx.all_declared_nodes()
             .map(|node| topology_snapshot.shard_for_node_id(node))
             .find_map(|shard| self.inner.host_serving(shard))
+    }
+}
+
+/// Drive the cluster to a clean shutdown, joining every host's runner task.
+/// Running on drop rather than by explicit call means a scenario that panics
+/// mid-run still tears its hosts down instead of leaking QUIC ports and
+/// runner threads into the next `#[serial]` test.
+impl Drop for ProdCluster {
+    fn drop(&mut self) {
+        self.runtime.block_on(self.inner.shutdown());
     }
 }
 
