@@ -1324,6 +1324,7 @@ impl ShardCoordinatorSim {
                         settled_waves: local_settled_wave_ids(&finalized_waves, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
+                        certified_uncommitted: None,
                     },
                 );
                 self.loopback_q.push_back(Envelope {
@@ -1572,6 +1573,7 @@ impl ShardCoordinatorSim {
                             settled_waves: local_settled_wave_ids(&finalized_waves, self.shard),
                             jmt_snapshot,
                             certified_block: None,
+                            certified_uncommitted: None,
                         },
                     );
                     // Production `io_loop` stashes `prepared` in
@@ -1637,6 +1639,12 @@ impl ShardCoordinatorSim {
                 // recovery via `deliver_synced_block` +
                 // `deliver_block_persisted`.
                 self.sync_targets[emitter_idx].push(target);
+            }
+            Action::AttachCertifiedUncommitted { certified } => {
+                // Mirror the production handler: the certified tip
+                // becomes servable to block sync ahead of its commit.
+                self.pending_chains[emitter_idx]
+                    .attach_certified_uncommitted(certified.block().hash(), certified);
             }
             Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SetTimer { .. }

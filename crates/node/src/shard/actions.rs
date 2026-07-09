@@ -200,6 +200,11 @@ where
                     witness,
                 );
             }
+            Action::AttachCertifiedUncommitted { certified } => {
+                self.io
+                    .pending_chain
+                    .attach_certified_uncommitted(certified.block().hash(), certified);
+            }
             Action::EmitTransactionStatus {
                 tx_hash,
                 status,

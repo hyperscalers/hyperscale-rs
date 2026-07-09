@@ -905,6 +905,19 @@ pub enum Action {
         witness: BeaconWitnessCommit,
     },
 
+    /// Attach a certified-but-not-yet-committed block to the pending
+    /// chain's serving surface. Emitted as soon as a QC verifies against
+    /// a held pending block, so block sync can serve the certified tip
+    /// to a peer that missed its body — a tip commits only once a child
+    /// certifies at the next round, and a peer wedged below the tip may
+    /// be exactly the vote that child needs. Fetchers adopt the served
+    /// QC without committing on it, so serving a certified sibling that
+    /// later loses its round is safe.
+    AttachCertifiedUncommitted {
+        /// Block + certifying QC.
+        certified: Arc<Verified<CertifiedBlock>>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // RPC Status / Telemetry
     // ═══════════════════════════════════════════════════════════════════════
@@ -1547,7 +1560,8 @@ impl Action {
             | Self::VerifySpcNewView { .. }
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. }
-            | Self::CommitBeaconBlock { .. } => None,
+            | Self::CommitBeaconBlock { .. }
+            | Self::AttachCertifiedUncommitted { .. } => None,
         }
     }
 

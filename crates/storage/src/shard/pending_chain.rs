@@ -61,6 +61,17 @@ pub struct ChainEntry {
     /// `BlockCommitCoordinator::accumulate`, making the block visible to
     /// fetch handlers throughout the shard-committed / JMT-persisted window.
     pub certified_block: Option<Arc<Verified<CertifiedBlock>>>,
+    /// Certified block whose commit is still pending — attached by
+    /// [`PendingChain::attach_certified_uncommitted`] as soon as a QC
+    /// verifies against the held block, before the round-contiguous
+    /// child that commits it exists. Read only by block-sync serving
+    /// ([`PendingChain::block_for_sync`]): a peer wedged below the
+    /// certified tip may be exactly the vote the committing child
+    /// needs, and fetchers adopt a served QC without committing on it,
+    /// so serving a certified block that later loses its round is
+    /// safe. Every other serving surface reads `certified_block` and
+    /// keeps its committed-only meaning.
+    pub certified_uncommitted: Option<Arc<Verified<CertifiedBlock>>>,
 }
 
 /// Append-only index of pending block state, shared between the `io_loop`
@@ -184,6 +195,24 @@ where
     ) {
         if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
             entry.certified_block = Some(certified);
+            // The committed handle supersedes the pre-commit one; the
+            // committed-only accessors serve this entry from here on.
+            entry.certified_uncommitted = None;
+        }
+    }
+
+    /// Attach a certified block whose commit is still pending, making it
+    /// servable through [`Self::block_for_sync`] only — see
+    /// [`ChainEntry::certified_uncommitted`] for why the other serving
+    /// surfaces don't read it. A no-op when no entry exists for
+    /// `block_hash`, like [`Self::attach_certified_block`].
+    pub fn attach_certified_uncommitted(
+        &self,
+        block_hash: BlockHash,
+        certified: Arc<Verified<CertifiedBlock>>,
+    ) {
+        if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
+            entry.certified_uncommitted = Some(certified);
         }
     }
 
@@ -240,7 +269,13 @@ where
     /// [`ShardChainReader::get_block_for_sync`], which returns
     /// [`Block::Sealed`] paired with the manifest's hashes.
     pub fn block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        if let Some(certified) = self.pending_certified_at(height) {
+        // Committed entry first; then a certified-but-uncommitted one —
+        // the fetcher adopts the QC without committing on it, so the
+        // certified tip is servable before its committing child exists.
+        let pending = self
+            .pending_certified_at(height)
+            .or_else(|| self.pending_certified_uncommitted_at(height));
+        if let Some(certified) = pending {
             let block = certified.block().clone();
             let qc = certified.qc().clone();
             let provision_hashes = block.provision_hashes();
@@ -497,8 +532,23 @@ where
     fn pending_certified_at(&self, height: BlockHeight) -> Option<Arc<Verified<CertifiedBlock>>> {
         read_or_recover(&self.entries)
             .values()
-            .find(|e| e.height == height)
+            .find(|e| e.height == height && e.certified_block.is_some())
             .and_then(|e| e.certified_block.clone())
+    }
+
+    /// Certified-but-uncommitted entry at `height`, if any. Forks can
+    /// certify two siblings at one height; the highest QC round wins —
+    /// the committing child extends the newest QC its proposer holds,
+    /// so the newer sibling is the one a fetcher can make progress on.
+    fn pending_certified_uncommitted_at(
+        &self,
+        height: BlockHeight,
+    ) -> Option<Arc<Verified<CertifiedBlock>>> {
+        read_or_recover(&self.entries)
+            .values()
+            .filter(|e| e.height == height)
+            .filter_map(|e| e.certified_uncommitted.clone())
+            .max_by_key(|certified| certified.qc().round())
     }
 
     /// Walk `parent_block_hash` back through ancestors and flatten the chain
@@ -1296,6 +1346,7 @@ mod tests {
             settled_waves: Vec::new(),
             jmt_snapshot: empty_snapshot(),
             certified_block: None,
+            certified_uncommitted: None,
         }
     }
 
@@ -1528,6 +1579,7 @@ mod tests {
                 settled_waves: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
+                certified_uncommitted: None,
             },
         );
         if attach {
@@ -1569,6 +1621,65 @@ mod tests {
     fn certified_block_returns_none_for_unknown_height() {
         let chain = empty_chain();
         assert!(chain.certified_block(BlockHeight::new(99)).is_none());
+    }
+
+    #[test]
+    fn certified_uncommitted_serves_block_sync_only() {
+        // A certified-but-uncommitted tip is servable to block-sync
+        // fetchers (they adopt the QC without committing on it), but
+        // must stay invisible to the committed-only serving surfaces —
+        // a certified sibling can still lose its round, and remote
+        // consumers of headers and provisions treat served entries as
+        // final.
+        let chain = empty_chain();
+        let certified = insert_pending(&chain, BlockHeight::new(5), false);
+        chain.attach_certified_uncommitted(certified.block().hash(), Arc::clone(&certified));
+
+        let served = chain
+            .block_for_sync(BlockHeight::new(5))
+            .expect("block sync serves the certified tip");
+        assert_eq!(served.block.hash(), certified.block().hash());
+
+        assert!(chain.certified_block(BlockHeight::new(5)).is_none());
+        assert!(chain.certified_header(BlockHeight::new(5)).is_none());
+        assert!(chain.transactions_for_block(BlockHeight::new(5)).is_none());
+        // The dedup-horizon reference stays anchored to committed QCs.
+        assert!(chain.latest_qc().is_none());
+    }
+
+    #[test]
+    fn committed_sibling_wins_over_certified_uncommitted() {
+        // Two QCs can certify sibling blocks at one height; only one
+        // commits. Once a sibling has committed, block sync must serve
+        // it — a fetcher that applies the losing sibling never
+        // re-fetches the height and wedges on the real chain.
+        let chain = empty_chain();
+        let winner = insert_pending(&chain, BlockHeight::new(5), true);
+
+        let loser_block = make_test_block_with_anchor_wt(BlockHeight::new(5), 7_777);
+        let loser_qc = make_test_qc(&loser_block);
+        let loser = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(loser_block, loser_qc),
+        ));
+        assert_ne!(loser.block().hash(), winner.block().hash());
+        chain.insert(
+            loser.block().hash(),
+            ChainEntry {
+                parent_block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(5),
+                receipts: Vec::new(),
+                settled_waves: Vec::new(),
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+                certified_uncommitted: None,
+            },
+        );
+        chain.attach_certified_uncommitted(loser.block().hash(), Arc::clone(&loser));
+
+        let served = chain
+            .block_for_sync(BlockHeight::new(5))
+            .expect("block sync serves the committed sibling");
+        assert_eq!(served.block.hash(), winner.block().hash());
     }
 
     #[test]
@@ -1749,6 +1860,7 @@ mod tests {
                 settled_waves: vec![wa.clone()],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
+                certified_uncommitted: None,
             },
         );
         chain.insert(
@@ -1760,6 +1872,7 @@ mod tests {
                 settled_waves: vec![wb.clone()],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
+                certified_uncommitted: None,
             },
         );
         let set = chain.settled_waves_in_window(
@@ -1804,6 +1917,7 @@ mod tests {
                 settled_waves: vec![parent_wave.clone()],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
+                certified_uncommitted: None,
             },
         );
         let set = chain.settled_waves_in_window(

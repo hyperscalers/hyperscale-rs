@@ -1921,10 +1921,23 @@ impl ShardCoordinator {
         );
         self.latest_qc = Some(qc.clone());
         self.advance_view_for_qc(qc);
+        // Every adoption path lands here — including timeout-carried
+        // high QCs and byte-equal cached QCs that skip the signature
+        // dispatch — so this is where the certified tip becomes
+        // servable to block sync ahead of its commit.
+        let mut actions = Vec::new();
+        let certified_hash = qc.block_hash();
+        if let Some(block) = self.pending_blocks.get_block(certified_hash) {
+            let block = Arc::clone(block);
+            if let Some(certified) = self.populate_certified_for(certified_hash, block, qc.clone())
+            {
+                actions.push(Action::AttachCertifiedUncommitted { certified });
+            }
+        }
         // Non-proposers learn about QCs via block headers rather than
         // forming them locally — they need two-chain commit + a proposal
         // kick to advance the chain in the event-driven model.
-        let actions = self.try_two_chain_commit(qc, CommitSource::Header);
+        actions.extend(self.try_two_chain_commit(qc, CommitSource::Header));
         self.queue_ready_proposal();
         actions
     }
@@ -2724,12 +2737,18 @@ impl ShardCoordinator {
                 "QC built successfully"
             );
             self.votes.mark_qc_built(block_hash);
+            let mut actions = Vec::new();
             if let Some(block) = self.pending_blocks.get_block(block_hash) {
-                self.populate_certified_for(block_hash, Arc::clone(block), qc.clone());
+                let block = Arc::clone(block);
+                if let Some(certified) = self.populate_certified_for(block_hash, block, qc.clone())
+                {
+                    actions.push(Action::AttachCertifiedUncommitted { certified });
+                }
             }
-            return vec![Action::Continuation(
+            actions.push(Action::Continuation(
                 ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
-            )];
+            ));
+            return actions;
         }
 
         // Per-vote: view sync + equivocation tracking. Tracking runs only on
@@ -2846,16 +2865,20 @@ impl ShardCoordinator {
         // `verified_certified_blocks` entry exists when `try_two_chain_commit`
         // looks it up.
         let parent_block_hash = verified_qc.block_hash();
+        let mut actions = Vec::new();
         if let Some(parent_block) = self.pending_blocks.get_block(parent_block_hash) {
             let parent_block = Arc::clone(parent_block);
-            self.populate_certified_for(parent_block_hash, parent_block, verified_qc.clone());
+            if let Some(certified) =
+                self.populate_certified_for(parent_block_hash, parent_block, verified_qc.clone())
+            {
+                actions.push(Action::AttachCertifiedUncommitted { certified });
+            }
         }
 
         // The parent QC is now provably authentic; perform the adoption
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
-        let mut actions = Vec::new();
         if self.has_complete_block_at_height(verified_qc.height()) {
             actions.extend(self.try_adopt_verified_qc(&verified_qc));
         }
@@ -3115,19 +3138,20 @@ impl ShardCoordinator {
     /// aggregator that collected 2f+1 votes without voting itself, so
     /// never ran the per-root verifiers locally — the QC's BFT
     /// majority attests they pass).
+    ///
+    /// Returns the handle it landed so callers can emit
+    /// [`Action::AttachCertifiedUncommitted`], making the certified
+    /// block servable to block sync ahead of its commit; `None` when
+    /// neither path could establish the linkage.
     fn populate_certified_for(
         &mut self,
         block_hash: BlockHash,
         block: Arc<Block>,
         qc: Verified<QuorumCertificate>,
-    ) {
+    ) -> Option<Arc<Verified<CertifiedBlock>>> {
         self.verification.track_pending_assembly(Arc::clone(&block));
-        if self
-            .verification
-            .record_qc_assembly(block_hash, qc.clone())
-            .is_some()
-        {
-            return;
+        if let Some(assembled) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
+            return assembled.ok();
         }
         // Local assembly couldn't complete — synthesize via the
         // BFT-transitive trust gate. SAFETY: `qc` is verified and
@@ -3137,8 +3161,10 @@ impl ShardCoordinator {
         let certified_raw = CertifiedBlock::new_unchecked(block, qc.clone());
         match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, qc) {
             Ok(certified) => {
+                let certified = Arc::new(certified);
                 self.verification
-                    .insert_verified_certified_block(block_hash, Arc::new(certified));
+                    .insert_verified_certified_block(block_hash, Arc::clone(&certified));
+                Some(certified)
             }
             Err(e) => {
                 warn!(
@@ -3146,6 +3172,7 @@ impl ShardCoordinator {
                     ?e,
                     "Verified<CertifiedBlock> linkage check failed at populate"
                 );
+                None
             }
         }
     }
