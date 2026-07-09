@@ -13,31 +13,14 @@ pub mod prod_cluster;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network::ValidatorKeyMap;
 use hyperscale_production::{StorageDirResolver, StorageFactory, shard_data_dir};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
-use hyperscale_types::{
-    Bls12381G1PrivateKey, ShardId, ValidatorId, generate_bls_keypair, shard_prefix_path,
-};
+use hyperscale_types::{ShardId, shard_prefix_path};
 use tempfile::TempDir;
 
 /// Budget for a transport connection / validator-bind handshake to complete
 /// over localhost QUIC.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Create a dummy bind signing key + validator key map for tests that create
-/// adapters directly. Returns the BLS signing key (consumed by the
-/// validator-bind service to produce per-session signatures) plus the keymap
-/// that will verify signatures from this validator.
-pub fn test_bind_args(
-    validator_id: ValidatorId,
-) -> (Arc<Bls12381G1PrivateKey>, Arc<ValidatorKeyMap>) {
-    let bls_key = generate_bls_keypair();
-    let pubkey = bls_key.public_key();
-    let mut keys = ValidatorKeyMap::new();
-    keys.insert(validator_id, pubkey);
-    (Arc::new(bls_key), Arc::new(keys))
-}
 
 /// Storage-directory resolver rooted in the test's temp dir. Runtime-joined
 /// shards get `shard-d{depth}p{path}` directories, mirroring the validator

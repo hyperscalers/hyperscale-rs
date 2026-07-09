@@ -35,8 +35,7 @@ fn beacon_committee_config() -> SimConfig {
 }
 
 /// Assert that every host's beacon storage holds an identical
-/// `(block_hash, state)` pair at `epoch`. Returns the agreed pair so
-/// callers can chain further assertions.
+/// `(block_hash, state)` pair at `epoch`.
 fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u32) {
     let storage_0 = runner.beacon_storage(0).expect("host 0 exists");
     let block_0 = storage_0
@@ -170,13 +169,11 @@ fn skip_path_advances_past_blocked_epoch() {
 #[traced_test]
 #[test]
 fn fetch_recovery_path_unblocks_dropped_peer() {
-    // At the production epoch the whole drop-and-recover run sits well
-    // within one epoch, below the committee shuffle, so a fetch-recovered
-    // block never commits against an evicted committee — the 3-epoch
-    // topology retention window is sized for exactly this epoch.
-    let mut config = beacon_committee_config();
-    config.beacon_chain_config = Some(beacon_chain_config(EPOCH_MS));
-    let mut runner = SimulationRunner::new(&config, 0xFE_7C);
+    // The whole drop-and-recover run stays below the epoch-16 committee
+    // shuffle, so a fetch-recovered block never commits against an evicted
+    // committee — the 3-epoch topology retention window is sized for exactly
+    // this shape.
+    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xFE_7C);
     runner.initialize_genesis();
 
     let drop_rule = runner

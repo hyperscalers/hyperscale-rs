@@ -6,6 +6,11 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
+// Each test binary compiles its own copy of this module and exercises a
+// different subset of the constructors and accessors, so a helper unused in
+// any one binary isn't dead code.
+#![allow(dead_code)]
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +51,6 @@ impl SimCluster {
     /// Build a genesis cluster from `config`, seeded by `seed`, funding the
     /// shared straddler accounts (seed `31` left, `30` right) the cross-shard
     /// scenarios spend.
-    #[allow(dead_code)] // some test binaries fund their own balances (reshape_sibling), not every one
     #[must_use]
     pub fn new(config: &ScenarioConfig, seed: u64) -> Self {
         Self::with_balances(config, seed, &straddler_genesis_balances())
@@ -72,7 +76,6 @@ impl SimCluster {
     /// destination shard, so every committee host stays single-shard. Portable
     /// scenarios never need it — they express host packing through
     /// `vnodes_per_host` alone.
-    #[allow(dead_code)] // only the relocation binaries build a dedicated-pool layout
     #[must_use]
     pub fn with_dedicated_pool_hosts(
         config: &ScenarioConfig,
@@ -125,7 +128,6 @@ impl SimCluster {
     /// # Panics
     ///
     /// Panics if the grow or the threshold activation misses its budget.
-    #[allow(dead_code)] // only the merge-straddler binary pre-grows; others fund a flat genesis
     #[must_use]
     pub fn with_grown_balances(
         config: &ScenarioConfig,
@@ -145,7 +147,6 @@ impl SimCluster {
     /// The underlying runner, for bespoke sim tests that compose a portable
     /// scenario and then assert white-box internals the [`Cluster`] surface
     /// doesn't expose (raw stores, committed blocks, validator placement).
-    #[allow(dead_code)] // consumed by some test binaries (reshape_grow), not every one
     #[must_use]
     pub const fn runner(&self) -> &SimulationRunner {
         &self.runner
@@ -154,7 +155,6 @@ impl SimCluster {
     /// The underlying runner for the white-box *mutations* the [`Cluster`]
     /// surface deliberately doesn't model — network faults, vnode lifecycle,
     /// system actions, host-targeted or delayed submission.
-    #[allow(dead_code)] // consumed by some test binaries, not every one
     pub const fn runner_mut(&mut self) -> &mut SimulationRunner {
         &mut self.runner
     }
@@ -164,7 +164,6 @@ impl SimCluster {
     /// single-threaded, so the thread-local scoped recorder captures every
     /// emission. Steady-state scenarios that read no metrics call the scenario
     /// directly instead.
-    #[allow(dead_code)] // only the fault-scenario binaries drive metrics
     pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
         let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
         with_scoped_recorder(recorder, || scenario(self))
