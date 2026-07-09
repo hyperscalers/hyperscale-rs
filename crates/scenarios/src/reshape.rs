@@ -204,6 +204,13 @@ pub fn merge_seats_full_keeper_committee(c: &mut impl Cluster) {
         "the reformed parent must seat a full keeper committee of {strength}",
     );
 
+    // A committed-height probe can transiently read `None` while a vnode's
+    // serving surface hands over, so wait the height into view before
+    // taking the base.
+    assert!(
+        c.run_until(epochs(2), |c| c.committed_height(root).is_some()),
+        "the reformed parent must report a committed height",
+    );
     let base = c
         .committed_height(root)
         .expect("the reformed parent commits");

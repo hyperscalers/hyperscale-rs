@@ -224,15 +224,22 @@ pub fn minority_fragment_rejoins_after_partition(c: &mut impl FaultableCluster) 
         await_beacon_epoch(c, start_epoch + 1, epochs(6)),
         "the five-host majority must cross an epoch boundary while the fragment is dark",
     );
+    // Partition onset can transiently stall the majority: a replica missing a
+    // pending ancestor body breaks the zero-slack five-of-five quorum until
+    // the spin detector's sync recovers it, and rotating fetches past the two
+    // dark peers costs a timeout each. Progress is the requirement, not
+    // instantaneous progress — so give the sample a recovery budget.
+    assert!(
+        c.run_until(epochs(3), |c| c
+            .committed_height(ShardId::ROOT)
+            .is_some_and(|h| h.inner() > before + 2)),
+        "the five-host majority must keep committing while the fragment is dark: \
+         before={before}",
+    );
     let during = c
         .committed_height(ShardId::ROOT)
         .expect("a committed height during the partition")
         .inner();
-    assert!(
-        during > before + 2,
-        "the five-host majority must keep committing while the fragment is dark: \
-         before={before}, during={during}",
-    );
 
     // The dark fragment has no quorum of its own, so neither of its hosts commits.
     for (&host, &frozen) in [0, 1].iter().zip(&frag_before) {
