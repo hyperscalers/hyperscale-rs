@@ -225,7 +225,7 @@ impl Cluster for ProdCluster {
     }
 
     fn committed_state_root(&self, shard: ShardId) -> Option<StateRoot> {
-        self.inner.committed_state_root_raw(shard)
+        self.inner.committed_state_root(shard)
     }
 
     fn serves_shard(&self, shard: ShardId) -> bool {

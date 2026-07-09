@@ -1,28 +1,21 @@
-//! Multi-host production cluster harness for the reshape e2e suite.
+//! Multi-host production cluster harness.
 //!
 //! Spins up an N-host localhost-QUIC cluster on real `RocksDbShardStorage`
 //! and a real beacon chain, bootstrap-peers the hosts to host 0, drives
-//! real consensus, and exposes poll-with-timeout observation hooks:
-//! `local_shards` (the shards a host serves), per-shard committed height
-//! (the RPC status `block_height`), and the committed beacon epoch (read
-//! straight from each host's beacon store). Reshape scenarios drive this
-//! harness instead of injecting `ShardCommand`s, so the production
+//! real consensus, and exposes synchronous observation hooks (committed
+//! heights and state roots, beacon state, transaction status) plus per-host
+//! fault gates. The portable scenarios drive it through the `ProdCluster`
+//! adaptor rather than injecting `ShardCommand`s, so the production
 //! beacon-fold → duty → flip chain runs end to end.
 //!
 //! These are real-time tests: there is no logical clock. Callers set a
-//! small `epoch_duration_ms`, mark `#[serial]`, and assert against the
-//! `await_*` helpers — never fixed sleeps.
+//! small `epoch_duration_ms` and mark `#[serial]`.
 
-// Shared harness consumed piecemeal across reshape test binaries; each
-// compiles its own copy and exercises a different subset.
-#![allow(dead_code)]
-
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use hex::encode as hex_encode;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
@@ -33,12 +26,11 @@ use hyperscale_production::{
 };
 use hyperscale_scenarios::query::chain_fate;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
+use hyperscale_storage::{BeaconChainReader, BeaconStorage, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, Epoch, GenesisValidators, PendingReshape,
-    RoutableTransaction, ShardId, StateRoot, TransactionDecision, TransactionStatus, TxHash,
-    shard_prefix_path,
+    BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, RoutableTransaction, ShardId,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -58,9 +50,6 @@ pub type StoreRegistry = Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>;
 /// How long to wait for host 0 to surface a listen address before
 /// bootstrapping the rest of the cluster to it.
 const LISTEN_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Cadence for the `await_*` observation polls.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Graceful-shutdown budget per host on teardown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -226,12 +215,6 @@ impl Cluster {
         self.hosts.len()
     }
 
-    /// The shards host `idx` currently serves (children of a split / the
-    /// merged parent appear here once the flip seats them).
-    pub fn local_shards(&self, idx: usize) -> Arc<HashSet<ShardId>> {
-        self.hosts[idx].adapter.local_shards()
-    }
-
     /// Highest committed height observed for `shard` across all hosts'
     /// RPC status (`block_height`). `None` until some host reports a
     /// vnode in `shard`.
@@ -251,27 +234,10 @@ impl Cluster {
             .max()
     }
 
-    /// The hex-encoded committed JMT root observed for `shard` across all
-    /// hosts' RPC status (`state_root_hash`). All committee members converge
-    /// on the same root, so any one host's entry suffices; `None` until some
-    /// host reports a vnode in `shard`.
-    pub fn committed_state_root(&self, shard: ShardId) -> Option<String> {
-        let key = shard.inner();
-        self.hosts.iter().find_map(|h| {
-            h.rpc_status
-                .load()
-                .vnodes
-                .iter()
-                .find(|v| v.shard == key)
-                .map(|v| v.state_root_hash.clone())
-        })
-    }
-
-    /// The raw committed JMT root for `shard`, read straight off a serving
-    /// host's live store — the byte-exact `StateRoot` that
-    /// [`Self::committed_state_root`] hex encodes, for typed comparison against
-    /// a beacon-composed anchor. `None` if no host serves `shard`.
-    pub fn committed_state_root_raw(&self, shard: ShardId) -> Option<StateRoot> {
+    /// The committed JMT root for `shard`, read straight off a serving host's
+    /// live store — for typed comparison against a beacon-composed anchor.
+    /// `None` if no host serves `shard`.
+    pub fn committed_state_root(&self, shard: ShardId) -> Option<StateRoot> {
         self.store_for(shard).map(|store| store.state_root())
     }
 
@@ -316,184 +282,6 @@ impl Cluster {
             .filter_map(|h| h.beacon_storage.latest_committed())
             .max_by_key(|(_, state)| state.current_epoch)
             .map(|(_, state)| state)
-    }
-
-    /// Wait until any host serves `shard`. Panics on timeout.
-    pub async fn await_any_host_serves(&self, shard: ShardId, within: Duration) {
-        self.poll(within, || self.any_host_serves(shard).then_some(()))
-            .await
-            .unwrap_or_else(|| panic!("no host served {shard:?} within {within:?}"));
-    }
-
-    /// Whether the beacon has admitted a split for `parent` — a pending
-    /// `Split` record carrying the drawn observer cohort.
-    pub fn split_admitted(&self, parent: ShardId) -> bool {
-        self.beacon_state().is_some_and(|state| {
-            matches!(
-                state.pending_reshapes.get(&parent),
-                Some(PendingReshape::Split { .. })
-            )
-        })
-    }
-
-    /// Wait until the beacon admits a split for `parent`. Panics on timeout.
-    pub async fn await_split_admitted(&self, parent: ShardId, within: Duration) {
-        self.poll(within, || self.split_admitted(parent).then_some(()))
-            .await
-            .unwrap_or_else(|| panic!("split for {parent:?} not admitted within {within:?}"));
-    }
-
-    /// The number of keepers drawn for a merge into `parent`, once the
-    /// beacon has paired it (both children hold a live half). `None` before
-    /// pairing.
-    pub fn merge_keeper_count(&self, parent: ShardId) -> Option<usize> {
-        self.beacon_state()
-            .and_then(|state| match state.pending_reshapes.get(&parent) {
-                Some(PendingReshape::Merge {
-                    keepers,
-                    admitted_at: Some(_),
-                    ..
-                }) => Some(keepers.len()),
-                _ => None,
-            })
-    }
-
-    /// Wait until the beacon pairs a merge into `parent` with exactly
-    /// `keepers` keepers drawn. Panics on timeout.
-    pub async fn await_merge_paired(&self, parent: ShardId, keepers: usize, within: Duration) {
-        self.poll(within, || {
-            self.merge_keeper_count(parent)
-                .filter(|count| *count == keepers)
-                .map(|_| ())
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "merge into {parent:?} did not pair {keepers} keepers within {within:?}; \
-                 latest keeper count = {:?}",
-                self.merge_keeper_count(parent)
-            )
-        });
-    }
-
-    /// The beacon-composed anchor root for `shard` (hex of the
-    /// `boundaries` `state_root`), to compare against a flipped shard's
-    /// committed root.
-    pub fn anchor_root(&self, shard: ShardId) -> Option<String> {
-        self.beacon_state().and_then(|state| {
-            state
-                .boundaries
-                .get(&shard)
-                .map(|b| hex_encode(b.state_root.as_bytes()))
-        })
-    }
-
-    /// Wait until `shard`'s committed root matches the beacon-composed
-    /// anchor — the subtree-root-continuity check a flip must satisfy. The
-    /// adopted child seats at the composed root, so the two agree at the
-    /// child's genesis. Panics on timeout.
-    pub async fn await_root_matches_anchor(&self, shard: ShardId, within: Duration) {
-        self.poll(within, || {
-            let committed = self.committed_state_root(shard)?;
-            let anchor = self.anchor_root(shard)?;
-            (committed == anchor).then_some(())
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "{shard:?} committed root never matched the anchor within {within:?}; \
-                 committed = {:?}, anchor = {:?}",
-                self.committed_state_root(shard),
-                self.anchor_root(shard),
-            )
-        });
-    }
-
-    /// Assert `shard`'s committed height does not change over `window` —
-    /// the "this shard stopped" signal (a terminated split parent). Unlike
-    /// the `await_*` helpers this is a confirm-no-change check, so it sleeps
-    /// the full window rather than polling for a condition.
-    pub async fn assert_height_frozen(&self, shard: ShardId, window: Duration) {
-        let before = self.committed_height(shard);
-        sleep(window).await;
-        let after = self.committed_height(shard);
-        assert_eq!(
-            before, after,
-            "{shard:?} height changed from {before:?} to {after:?} over {window:?}; expected frozen"
-        );
-    }
-
-    /// Wait for `shard` to report a committed height and then advance past
-    /// it — proof the seated store + committee commit blocks. Returns the
-    /// advanced height. Panics on timeout.
-    pub async fn await_height_advances(&self, shard: ShardId, within: Duration) -> u64 {
-        let baseline = self
-            .poll(within, || self.committed_height(shard))
-            .await
-            .unwrap_or_else(|| panic!("{shard:?} reported no committed height within {within:?}"));
-        self.poll(within, || {
-            self.committed_height(shard).filter(|h| *h > baseline)
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!("{shard:?} height did not advance past {baseline} within {within:?}")
-        })
-    }
-
-    /// Highest committed beacon epoch across all hosts' beacon stores.
-    pub fn beacon_epoch(&self) -> Option<u64> {
-        self.hosts
-            .iter()
-            .filter_map(|h| h.beacon_storage.latest_committed_epoch())
-            .map(Epoch::inner)
-            .max()
-    }
-
-    /// Wait until the committed beacon epoch reaches `target`, returning
-    /// the observed epoch. Panics on timeout.
-    pub async fn await_beacon_epoch(&self, target: u64, within: Duration) -> u64 {
-        self.poll(within, || self.beacon_epoch().filter(|e| *e >= target))
-            .await
-            .unwrap_or_else(|| {
-                panic!(
-                    "beacon did not reach epoch {target} within {within:?}; latest = {:?}",
-                    self.beacon_epoch()
-                )
-            })
-    }
-
-    /// Wait until `shard`'s committed height reaches `target`, returning
-    /// the observed height. Panics on timeout.
-    pub async fn await_committed_height(
-        &self,
-        shard: ShardId,
-        target: u64,
-        within: Duration,
-    ) -> u64 {
-        self.poll(within, || {
-            self.committed_height(shard).filter(|h| *h >= target)
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "shard {shard:?} did not reach height {target} within {within:?}; latest = {:?}",
-                self.committed_height(shard)
-            )
-        })
-    }
-
-    /// Wait until host `idx` serves `shard`. Panics on timeout.
-    pub async fn await_local_shard(&self, idx: usize, shard: ShardId, within: Duration) {
-        self.poll(within, || {
-            self.local_shards(idx).contains(&shard).then_some(())
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "host {idx} did not serve {shard:?} within {within:?}; serving = {:?}",
-                self.local_shards(idx)
-            )
-        });
     }
 
     /// Submit a transaction into host `idx`'s process — the production
@@ -575,29 +363,6 @@ impl Cluster {
             return (None, None);
         };
         chain_fate(store.as_ref(), hash)
-    }
-
-    /// The committed JMT byte total `shard` carries at its tip — the input
-    /// to the reshape threshold. Lets a straddle test measure and bracket
-    /// `split_bytes` against the real production genesis rather than guess.
-    pub fn substate_bytes(&self, shard: ShardId) -> Option<u64> {
-        let store = self.store_for(shard)?;
-        store.substate_bytes_at_version(store.committed_height().inner())
-    }
-
-    /// Poll `f` every [`POLL_INTERVAL`] until it returns `Some` or
-    /// `within` elapses.
-    async fn poll<T>(&self, within: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
-        timeout(within, async {
-            loop {
-                if let Some(v) = f() {
-                    return v;
-                }
-                sleep(POLL_INTERVAL).await;
-            }
-        })
-        .await
-        .ok()
     }
 
     /// Signal every host to shut down and join its runner task. Drops the
