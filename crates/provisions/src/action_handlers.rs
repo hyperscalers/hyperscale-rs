@@ -122,6 +122,14 @@ where
                 &requests,
                 &shard_recipients,
             );
+            if batches.is_empty() && !requests.is_empty() {
+                warn!(
+                    source_shard = source_shard.inner(),
+                    block_height = block_height.inner(),
+                    requests = requests.len(),
+                    "provision broadcast built no batches"
+                );
+            }
             let validator_id = ctx.me;
             for (provisions, recipients) in batches {
                 // Provisions built from the local JMT view satisfy their
