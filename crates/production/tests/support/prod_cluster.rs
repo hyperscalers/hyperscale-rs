@@ -31,7 +31,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
 
-use super::cluster::{Cluster as Harness, ClusterSpec, HostSpec};
+use super::harness::{ClusterSpec, Harness, HostSpec};
 
 /// Poll cadence between predicate samples in `run_until`, matching the
 /// harness's own `await_*` interval.
@@ -95,7 +95,7 @@ impl ProdCluster {
     /// `SimCluster::with_grown_balances`, so a scenario starts identically on both
     /// harnesses.
     #[must_use]
-    pub fn with_grown_balances(
+    pub fn start_with_grown_balances(
         config: &ScenarioConfig,
         seed: u64,
         epoch_ms: u64,
