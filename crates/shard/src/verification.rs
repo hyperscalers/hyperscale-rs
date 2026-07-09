@@ -1092,11 +1092,12 @@ impl VerificationPipeline {
 
     /// Mark all roots as verified for the proposer's own block.
     ///
-    /// The proposer built the block, so all merkle roots are inherently
-    /// correct. This marks state root, transaction root, certificate root,
-    /// local receipt root, provision root, and in-flight as verified so
-    /// the verification pipeline is complete. Without this, a view change
-    /// would report these as `NOT_STARTED` since the proposer path bypasses
+    /// The proposer built the block, so all merkle roots — including the
+    /// beacon witness root it derived from its own accumulator — are
+    /// inherently correct. This marks every root kind, the state root,
+    /// and in-flight as verified so the verification pipeline is
+    /// complete. Without this, a view change would report these as
+    /// `NOT_STARTED` since the proposer path bypasses
     /// `try_vote_on_block`.
     pub fn mark_proposal_fully_verified(&mut self, block_hash: BlockHash) {
         self.mark_proposal_state_root_verified(block_hash);
@@ -1106,6 +1107,7 @@ impl VerificationPipeline {
             VerificationKind::LocalReceiptRoot,
             VerificationKind::ProvisionRoot,
             VerificationKind::ProvisionTxRoots,
+            VerificationKind::BeaconWitnessRoot,
         ] {
             self.roots.insert((block_hash, kind), RootStage::Verified);
         }
