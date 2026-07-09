@@ -194,6 +194,17 @@ fn account_in_n(
     panic!("no account seed routes to {shard:?}");
 }
 
+/// The first seeded account routing to `shard` under a `num_shards`-wide
+/// uniform trie, with its signing key — for tests that pin a payer or payee
+/// to a specific leaf.
+#[must_use]
+pub fn account_routing_to(
+    shard: ShardId,
+    num_shards: u64,
+) -> (Ed25519PrivateKey, ComponentAddress) {
+    account_in_n(shard, num_shards, &mut Vec::new())
+}
+
 /// Push `count` funded accounts routing to `shard` under a `num_shards`-wide
 /// trie onto `balances`, drawing from the wide `u64` seed space so a single
 /// shard's prefix can be funded far past the `u8`-seeded [`account_in_n`] ceiling
