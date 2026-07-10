@@ -749,3 +749,226 @@ module reshape_unbound_ready {
     UNBOUND_READY = true
   ).*
 }
+
+// The shipped fix's twin, no pool churn needed: an epoch-seeded draw (not the
+// frozen `cohort_seed`) re-rolls the child assignment on every re-staff, so a
+// lapse and re-assert at a later epoch drifts an observer off its first child.
+// This is the joiner child-swap the frozen seed closed; `invSeatStability`
+// fails, showing the freeze is load-bearing against epoch churn.
+module reshape_epoch_seeded {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = true, POOL_CHURN = false,
+    UNBOUND_READY = false
+  ).*
+}
+
+// The merge fold, and the split/merge asymmetry it makes precise. Two sibling
+// children C1 and C2 merge into their parent: both assert a merge trigger,
+// and on pairing the beacon draws a keeper committee — half from each child,
+// from the members that child already runs. Keepers stay on their child and
+// take on a second duty (assembling the merged store); a keeper's assignment
+// is therefore its *membership*, not a seed-derived slot, so it cannot drift
+// the way a split observer's child can. A merge whose half goes quiet cancels
+// clean — keepers were never moved, so nothing is retained and no re-staff can
+// re-roll them.
+//
+// The keeper draw prefers members already ready and backfills any shortfall
+// from the not-yet-ready half, so the merged committee always reaches target
+// size; execution still gates on a 2f+1 ready keeper quorum. The
+// `reshape_short_draw` twin draws ready members only, with no backfill, so a
+// child short on ready at pairing seats a merged committee below target — the
+// `merge_seats_full_keeper_committee` regression (a single-shard merge is not
+// top-up-eligible, so an under-sized committee never heals).
+//
+// Code anchors: crates/beacon/src/state/reshape.rs `draw_merge_keepers`
+// (ready-preferring draw with backfill), `try_execute_merge` (2f+1 ready
+// gate); crates/beacon/src/state/witness.rs (pairing, per-child cancel);
+// crates/beacon/src/state/committee.rs (the shuffle pins keepers).
+//
+// Run:
+//   quint verify --main=reshape_epoch_seeded --invariant=invSeatStability --max-steps=10 specs/reshape_lifecycle.qnt
+//     (epoch-seeded re-staff drifts the assignment; expect a counterexample)
+//   quint verify --main=reshape_merge_ok    --invariant=invAll --max-steps=8 specs/reshape_lifecycle.qnt
+//     (backfilled draw: the merged committee seats at target with a ready quorum)
+//   quint verify --main=reshape_merge_short --invariant=invKeeperSized --max-steps=8 specs/reshape_lifecycle.qnt
+//     (ready-only draw: a child short on ready seats below target; expect a counterexample)
+module reshape_merge {
+  // Merged committee target; each child contributes half its keepers.
+  const SHARD_SIZE: int
+  // Byzantine tolerance and quorum: committee 3F+1, quorum 2F+1.
+  const F: int
+  // A merge half goes quiet for this many epochs → the merge cancels.
+  const TRIGGER_TTL: int
+  // The fixed Byzantine keeper set. Honest = complement.
+  const BYZ: Set[int]
+  // Broken twin: draw only ready members, no backfill, so a child short on
+  // ready at pairing seats the merged committee below target. False is the
+  // shipped ready-preferring draw that backfills to target size.
+  const SHORT_DRAW: bool
+
+  pure val QUORUM = 2 * F + 1
+  pure val HALF = SHARD_SIZE / 2
+  // The two sibling children's committees: the low half and the high half.
+  pure val C1 = 1.to(HALF)
+  pure val C2 = (HALF + 1).to(SHARD_SIZE)
+
+  // Current epoch.
+  var epoch: int
+  // Last epoch each child asserted its merge trigger (-1 = not asserted).
+  var assert1: int
+  var assert2: int
+  // The merge has paired and drawn keepers.
+  var paired: bool
+  // Drawn keepers (each runs the child it is a member of).
+  var keepers: Set[int]
+  // Members that have synced their own child (readiness the draw reads).
+  var readyC1: Set[int]
+  var readyC2: Set[int]
+  // Keepers that have assembled the merged store (synced the sibling).
+  var keeperSynced: Set[int]
+  // The merge has executed; the model is terminal.
+  var executed: bool
+
+  action init = all {
+    epoch' = 0,
+    assert1' = -1,
+    assert2' = -1,
+    paired' = false,
+    keepers' = Set(),
+    readyC1' = Set(),
+    readyC2' = Set(),
+    keeperSynced' = Set(),
+    executed' = false,
+  }
+
+  // A child asserts (or refreshes) its merge trigger.
+  action assertHalf1 = all {
+    not(executed),
+    assert1' = epoch,
+    epoch' = epoch, assert2' = assert2, paired' = paired, keepers' = keepers,
+    readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
+    executed' = false,
+  }
+
+  action assertHalf2 = all {
+    not(executed),
+    assert2' = epoch,
+    epoch' = epoch, assert1' = assert1, paired' = paired, keepers' = keepers,
+    readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
+    executed' = false,
+  }
+
+  // A member finishes syncing its own child (grows the readiness the draw
+  // reads at pairing).
+  action readyStep = {
+    nondet v = C1.union(C2).oneOf()
+    all {
+      not(executed),
+      not(paired),
+      readyC1' = if (C1.contains(v)) readyC1.union(Set(v)) else readyC1,
+      readyC2' = if (C2.contains(v)) readyC2.union(Set(v)) else readyC2,
+      epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
+      keepers' = keepers, keeperSynced' = keeperSynced, executed' = false,
+    }
+  }
+
+  // Both halves asserted: draw the keeper committee. The healthy draw takes
+  // each child's half (backfilled to size); the twin takes only ready members.
+  action pair = all {
+    not(executed),
+    not(paired),
+    assert1 >= 0,
+    assert2 >= 0,
+    keepers' = if (SHORT_DRAW) readyC1.union(readyC2) else C1.union(C2),
+    paired' = true,
+    epoch' = epoch, assert1' = assert1, assert2' = assert2,
+    readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
+    executed' = false,
+  }
+
+  // A keeper assembles the merged store (syncs the sibling child).
+  action keeperSyncStep = {
+    nondet v = C1.union(C2).oneOf()
+    all {
+      not(executed),
+      paired,
+      keepers.contains(v),
+      keeperSynced' = keeperSynced.union(Set(v)),
+      epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
+      keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
+      executed' = false,
+    }
+  }
+
+  // A half goes quiet past the trigger TTL: the merge cancels clean —
+  // keepers are released (they never left their child), halves must reassert.
+  action cancel = all {
+    not(executed),
+    paired,
+    epoch - assert1 >= TRIGGER_TTL or epoch - assert2 >= TRIGGER_TTL,
+    paired' = false,
+    keepers' = Set(),
+    keeperSynced' = Set(),
+    assert1' = -1,
+    assert2' = -1,
+    epoch' = epoch, readyC1' = readyC1, readyC2' = readyC2, executed' = false,
+  }
+
+  // The gate: a 2f+1 quorum of keepers has assembled the merged store.
+  action execute = all {
+    not(executed),
+    paired,
+    keeperSynced.size() >= QUORUM,
+    executed' = true,
+    epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
+    keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
+    keeperSynced' = keeperSynced,
+  }
+
+  action tick = all {
+    epoch' = epoch + 1,
+    assert1' = assert1, assert2' = assert2, paired' = paired, keepers' = keepers,
+    readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
+    executed' = executed,
+  }
+
+  action step = any {
+    assertHalf1, assertHalf2, readyStep, pair, keeperSyncStep, cancel, execute, tick,
+  }
+
+  // Keepers are drawn from the two children only, and only synced keepers
+  // count as merge-ready — every keeper runs the child it belongs to, so a
+  // keeper's assignment cannot drift (the split/merge asymmetry).
+  val invConservation = and {
+    keepers.subseteq(C1.union(C2)),
+    keeperSynced.subseteq(keepers),
+    readyC1.subseteq(C1),
+    readyC2.subseteq(C2),
+  }
+
+  // INV-RESHAPE-1 / INV-RESHAPE-8 staffing: a paired merge draws a committee
+  // at target size. The short-draw twin seats a child short on ready below it.
+  val invKeeperSized = paired implies keepers.size() == SHARD_SIZE
+
+  // INV-RESHAPE-1 (semantic floor): an executed merge has a 2f+1 honest quorum
+  // of keepers holding the merged store.
+  val invKeeperGate =
+    executed implies keeperSynced.exclude(BYZ).size() >= QUORUM
+
+  val invAll = and { invConservation, invKeeperSized, invKeeperGate }
+}
+
+// Healthy merge: ready-preferring draw with backfill. The merged committee
+// seats at target size and executes on a 2f+1 ready keeper quorum.
+module reshape_merge_ok {
+  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, BYZ = Set(), SHORT_DRAW = false).*
+}
+
+// Broken twin: ready-only draw. A child short on ready at pairing seats the
+// merged committee below target size — the `merge_seats_full_keeper_committee`
+// regression, which a single-shard merge cannot top up.
+module reshape_merge_short {
+  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, BYZ = Set(), SHORT_DRAW = true).*
+}
