@@ -540,7 +540,19 @@ impl SpcInstance {
         }
         view_state.vpc_input_fed = true;
         let pc_effects = view_state.vpc.handle(PcEvent::Input(v));
-        self.translate_pc_effects(SpcView::new(1), pc_effects)
+        let mut out = self.translate_pc_effects(SpcView::new(1), pc_effects);
+        // Arm the heartbeat: view 1 has no entry cert to arm it (it's
+        // eager at construction), so the input feed is where its
+        // retransmission clock starts. A feed landing after a
+        // cert-driven advance arms nothing — the view ≥ 2 entry armed
+        // its own.
+        if self.high_output.is_none() && self.current_view.inner() == 1 {
+            out.push(SpcEffect::SetTimer {
+                view: SpcView::new(1),
+                duration: self.view_timeout,
+            });
+        }
+        out
     }
 
     fn translate_pc_effects(&mut self, view: SpcView, pc_effects: Vec<PcEffect>) -> Vec<SpcEffect> {
@@ -807,23 +819,89 @@ impl SpcInstance {
         self.process_empty_view(msg)
     }
 
-    /// Forces `RunVPC(view)` on timer expiry even with a partial
-    /// proposal-object buffer. Idempotent if VPC already fired.
+    /// Heartbeat for the current view. The first expiry after a
+    /// view ≥ 2 entry forces `RunVPC(view)` on a partial
+    /// proposal-object buffer so a silent leader can't stall the view;
+    /// every later expiry retransmits the node's own already-emitted
+    /// messages for the view, restoring the reliable-channel
+    /// assumption the PC rounds' termination rests on over a transport
+    /// that can drop a vote outright. Re-arms until the instance
+    /// concludes; a peer still stalled after the committee concludes
+    /// heals through the committed beacon block, not this heartbeat.
     fn on_timer_expired(&mut self, view: SpcView) -> Vec<SpcEffect> {
-        if view.inner() <= 1 {
+        if self.high_output.is_some() {
+            return vec![];
+        }
+        if view != self.current_view {
             return vec![];
         }
         let Some(view_state) = self.views.get_mut(&view) else {
             return vec![];
         };
+        let mut out = vec![];
         if view_state.vpc_input_fed {
-            return vec![];
+            out.extend(self.replay_current_view());
+        } else {
+            if view.inner() == 1 {
+                // A stale timer from the previous instance fired
+                // before this one's view-1 input arrived. There is no
+                // forced input at view 1 — it comes from the
+                // application, and feeding it arms the heartbeat.
+                return vec![];
+            }
+            view_state.vpc_input_fed = true;
+            let input = self.compute_view_input(view);
+            let view_state = self.views.get_mut(&view).expect("present");
+            let pc_effects = view_state.vpc.handle(PcEvent::Input(input));
+            out.extend(self.translate_pc_effects(view, pc_effects));
         }
-        view_state.vpc_input_fed = true;
-        let input = self.compute_view_input(view);
-        let view_state = self.views.get_mut(&view).expect("present");
-        let pc_effects = view_state.vpc.handle(PcEvent::Input(input));
-        self.translate_pc_effects(view, pc_effects)
+        if self.high_output.is_none() {
+            out.push(SpcEffect::SetTimer {
+                view: self.current_view,
+                duration: self.view_timeout,
+            });
+        }
+        out
+    }
+
+    /// Re-emit this node's own recorded messages for the current view,
+    /// verbatim — see [`PcInstance::replay_sign_intents`] for the
+    /// byte-identity guarantee that makes a replay unable to
+    /// equivocate. Re-relayed certs and pooled attestations are the
+    /// exact held objects, so every replayed message is one the
+    /// network could equally have duplicated on its own.
+    fn replay_current_view(&mut self) -> Vec<SpcEffect> {
+        let view = self.current_view;
+        let Some(view_state) = self.views.get(&view) else {
+            return vec![];
+        };
+        let mut out = vec![];
+        // Re-relay a cert authorising this view: entry at view ≥ 2 is
+        // cert-driven, so a peer that lost every NewView for the view
+        // can't join its round at all. The own relay slot is
+        // preferred; any held proposal object carries an equivalent
+        // authorisation.
+        if view.inner() > 1
+            && let Some(po) = view_state
+                .proposal_objects
+                .get(&self.me)
+                .or_else(|| view_state.proposal_objects.values().next())
+        {
+            out.push(SpcEffect::BroadcastNewView {
+                view,
+                cert: Box::new(po.verified_cert()),
+            });
+        }
+        // Own empty-view attestation, if this view produced one.
+        if let Some(msg) = view_state.empty_views.get(&self.me) {
+            out.push(SpcEffect::SignAndBroadcastEmptyView {
+                view,
+                reported: Box::new(Verified::<SpcHighTriple>::from_verified_empty_view(msg)),
+            });
+        }
+        let pc_effects = view_state.vpc.replay_sign_intents();
+        out.extend(self.translate_pc_effects(view, pc_effects));
+        out
     }
 
     /// Add a verified empty-view to `Q_i,w`, and on reaching `f + 1`
@@ -1158,20 +1236,62 @@ mod tests {
         assert!(fsm.high_output().is_none());
     }
 
-    /// Feeding `Input` at view 1 emits exactly one
-    /// `SignAndBroadcastPcVote1` at the local view — the inner PC
-    /// surfaces a sign intent as its first effect.
+    /// Feeding `Input` at view 1 emits a `SignAndBroadcastPcVote1` at
+    /// the local view — the inner PC surfaces a sign intent as its
+    /// first effect.
     #[test]
     fn spc_input_emits_vote1_sign_intent() {
         let mut fsm = fsm_instance(0);
         let v = PcVector::new(std::iter::once(PcValueElement::new([7u8; 32])));
         let effects = fsm.handle(SpcEvent::Input(v.clone()));
-        assert_eq!(effects.len(), 1);
         let SpcEffect::SignAndBroadcastPcVote1 { view, v_in } = &effects[0] else {
             panic!("expected SignAndBroadcastPcVote1, got {:?}", effects[0]);
         };
         assert_eq!(*view, SpcView::new(1));
         assert_eq!(*v_in, v);
+    }
+
+    /// The view-1 input feed arms the heartbeat timer — view 1 has no
+    /// entry cert to arm it.
+    #[test]
+    fn input_arms_view_one_timer() {
+        let mut fsm = fsm_instance(0);
+        let v = PcVector::new(std::iter::once(PcValueElement::new([7u8; 32])));
+        let effects = fsm.handle(SpcEvent::Input(v));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SetTimer { view, .. } if view.inner() == 1)),
+            "input must arm the view-1 timer; got {effects:?}",
+        );
+    }
+
+    /// An input feed landing after a cert-driven advance past view 1
+    /// arms nothing — the view ≥ 2 entry armed its own heartbeat.
+    #[test]
+    fn late_input_feed_does_not_arm_heartbeat() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let cert = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xE5; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert)),
+        });
+        assert_eq!(fsm.current_view(), SpcView::new(2));
+
+        let v = PcVector::new([PcValueElement::new([0xE6; 32])]);
+        let effects = fsm.handle(SpcEvent::Input(v));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SetTimer { .. })),
+            "late feed must not arm a timer; got {effects:?}",
+        );
     }
 
     /// Subsequent `Input` events at view 1 are idempotent — already
@@ -1466,10 +1586,11 @@ mod tests {
         assert_ne!(h1, PcValueElement::BOTTOM);
     }
 
-    /// `TimerExpired` for view ≤ 1 is a no-op — view 1 has no timer
-    /// (input drives it directly).
+    /// `TimerExpired` at view 1 before the input is fed is a no-op
+    /// without a re-arm — a stale timer from the previous instance;
+    /// the input feed is what arms this one's heartbeat.
     #[test]
-    fn timer_expiry_at_view_one_is_noop() {
+    fn timer_noop_before_view_one_input() {
         let mut fsm = fsm_instance(0);
         let effects = fsm.handle(SpcEvent::TimerExpired {
             view: SpcView::new(1),
@@ -1485,6 +1606,268 @@ mod tests {
             view: SpcView::new(42),
         });
         assert!(effects.is_empty());
+    }
+
+    /// A view-1 heartbeat expiry on a stalled round retransmits the
+    /// node's own vote1 with the original input vector and re-arms.
+    #[test]
+    fn view_one_timer_replays_votes_and_rearms() {
+        let mut fsm = fsm_instance(0);
+        let v = PcVector::new(std::iter::once(PcValueElement::new([7u8; 32])));
+        let _ = fsm.handle(SpcEvent::Input(v.clone()));
+
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(1),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SpcEffect::SignAndBroadcastPcVote1 { view, v_in }
+                    if view.inner() == 1 && *v_in == v
+            )),
+            "expiry must replay vote1 with the original v_in; got {effects:?}",
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SetTimer { view, .. } if view.inner() == 1)),
+            "expiry must re-arm the heartbeat; got {effects:?}",
+        );
+    }
+
+    /// `TimerExpired` for a view behind the current one is a no-op —
+    /// the current view's heartbeat is the live one.
+    #[test]
+    fn timer_noop_for_non_current_view() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let cert = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xD1; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert)),
+        });
+        assert_eq!(fsm.current_view(), SpcView::new(2));
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(1),
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// Once the high output is latched the heartbeat dies: expiry
+    /// produces nothing and does not re-arm.
+    #[test]
+    fn timer_does_not_rearm_after_high_output() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+
+        let v_short = PcVector::new([PcValueElement::new([0xA1; 32])]);
+        let cert_a = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: v_short.clone(),
+            proof: dummy_pc_qc3().into(),
+        };
+        let h_a = hash_proposal_object(&SpcProposalObject {
+            view: SpcView::new(2),
+            cert: cert_a.clone(),
+        });
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert_a)),
+        });
+
+        let low = PcVector::new([h_a]);
+        let proof = pc_qc3_with(low.clone());
+        let _ = fsm.handle(SpcEvent::NewCommitVerified {
+            view: SpcView::new(2),
+            value: low,
+            proof: Box::new(Verified::<PcQc3>::new_unchecked_for_test(proof)),
+        });
+        assert_eq!(fsm.high_output(), Some(&v_short));
+
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: fsm.current_view(),
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// At view ≥ 2 the first expiry forces the inner PC onto the
+    /// partial proposal buffer (existing semantics); subsequent
+    /// expiries replay the view's messages, including a `NewView`
+    /// re-relay of a held cert authorising the view.
+    #[test]
+    fn heartbeat_replays_entry_cert_at_later_views() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let cert = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xE1; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert.clone())),
+        });
+        assert_eq!(fsm.current_view(), SpcView::new(2));
+
+        // First expiry: silent-leader escape — the inner PC is fed the
+        // partial buffer and signs its vote1.
+        let first = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SignAndBroadcastPcVote1 { view, .. } if view.inner() == 2)),
+            "first expiry forces the view input; got {first:?}",
+        );
+
+        // Second expiry: retransmission — the entry cert is re-relayed
+        // alongside the recorded vote1, and the heartbeat re-arms.
+        let second = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        assert!(
+            second.iter().any(|e| matches!(
+                e,
+                SpcEffect::BroadcastNewView { view, cert: c }
+                    if view.inner() == 2 && *c.as_ref().as_ref() == cert
+            )),
+            "second expiry re-relays the held entry cert; got {second:?}",
+        );
+        assert!(
+            second
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SignAndBroadcastPcVote1 { view, .. } if view.inner() == 2)),
+            "second expiry replays the recorded vote1; got {second:?}",
+        );
+        assert!(
+            second
+                .iter()
+                .any(|e| matches!(e, SpcEffect::SetTimer { view, .. } if view.inner() == 2)),
+            "heartbeat re-arms; got {second:?}",
+        );
+    }
+
+    /// The heartbeat re-emits the node's own pooled empty-view
+    /// attestation with the originally reported triple.
+    #[test]
+    fn heartbeat_replays_own_empty_view() {
+        let (sks, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let spc_ctx = spc_context(Epoch::new(1));
+
+        // Enter view 2 so the empty-view targets the current view.
+        let entry = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xE2; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let _ = fsm.handle(SpcEvent::NewViewVerified {
+            from: members[1].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(entry)),
+        });
+
+        // The node's own empty-view for view 2 lands back on the FSM
+        // via the same verified path peer messages use, and pools.
+        let reported = SpcHighTriple {
+            view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xE2; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let own = Verified::<SpcEmptyViewMsg>::sign_local(
+            &sks[0],
+            members[0].0,
+            &net(),
+            &spc_ctx,
+            SpcView::new(2),
+            Verified::<SpcHighTriple>::new_unchecked_for_test(reported.clone()),
+        );
+        let _ = fsm.handle(SpcEvent::EmptyViewVerified(Box::new(own)));
+
+        // First expiry force-feeds the input; the second replays.
+        let _ = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                SpcEffect::SignAndBroadcastEmptyView { view, reported: r }
+                    if view.inner() == 2
+                        && r.view == reported.view
+                        && r.value == reported.value
+            )),
+            "heartbeat replays the pooled own empty-view; got {effects:?}",
+        );
+    }
+
+    /// The observed incident geometry: a peer stalled at view 1 (its
+    /// round lost votes) is healed by an advanced peer's heartbeat
+    /// re-relaying the view-2 entry cert — a `prev_view = 1` direct
+    /// cert enters without any parent resolution.
+    #[test]
+    fn stalled_view_one_peer_heals_via_replayed_new_view() {
+        let (_, members) = fsm_committee(4);
+        let mk = |idx: usize| {
+            SpcInstance::new(
+                Epoch::new(1),
+                members.clone(),
+                members[idx].0,
+                Duration::from_millis(100),
+            )
+        };
+        let mut x = mk(0);
+        let mut y = mk(1);
+
+        // Y feeds its input but its view-1 round stalls (no quorum).
+        let v = PcVector::new([PcValueElement::new([0xE3; 32])]);
+        let _ = y.handle(SpcEvent::Input(v));
+        assert_eq!(y.current_view(), SpcView::new(1));
+
+        // X advanced to view 2 (entry relayed by a third peer).
+        let cert = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xE4; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        let _ = x.handle(SpcEvent::NewViewVerified {
+            from: members[2].0,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert)),
+        });
+        let _ = x.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        let replay = x.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        let relayed = replay
+            .iter()
+            .find_map(|e| match e {
+                SpcEffect::BroadcastNewView { view, cert } if view.inner() == 2 => {
+                    Some(cert.clone())
+                }
+                _ => None,
+            })
+            .expect("X's heartbeat re-relays its view-2 entry cert");
+
+        // The replayed relay reaches Y; Y joins view 2 directly.
+        let _ = y.handle(SpcEvent::NewViewVerified {
+            from: members[0].0,
+            view: SpcView::new(2),
+            cert: relayed,
+        });
+        assert_eq!(y.current_view(), SpcView::new(2));
     }
 
     /// `EmptyView` whose `view <= reported.view` is rejected — paper

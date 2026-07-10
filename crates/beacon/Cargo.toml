@@ -16,6 +16,7 @@ rand_chacha.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
 
 [lints]

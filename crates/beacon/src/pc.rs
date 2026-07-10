@@ -89,8 +89,14 @@ pub struct PcInstance {
     vote3_pool: BTreeMap<ValidatorId, Verified<PcVote3>>,
 
     input: Option<PcVector>,
-    sent_vote2: bool,
-    sent_vote3: bool,
+    /// The exact QC the round-2 vote was derived from, recorded at
+    /// emission. Doubles as the round latch. Replay must re-sign this
+    /// QC and never re-aggregate from the (since grown) vote pool — a
+    /// different subset can certify a different prefix, and signing
+    /// two prefixes for one round is equivocation.
+    sent_vote2: Option<Box<Verified<PcQc1>>>,
+    /// Round-3 counterpart of `sent_vote2`.
+    sent_vote3: Option<Box<Verified<PcQc2>>>,
     decided: bool,
 }
 
@@ -120,8 +126,8 @@ impl PcInstance {
             vote2_pool: BTreeMap::new(),
             vote3_pool: BTreeMap::new(),
             input: None,
-            sent_vote2: false,
-            sent_vote3: false,
+            sent_vote2: None,
+            sent_vote3: None,
             decided: false,
         }
     }
@@ -238,27 +244,33 @@ impl PcInstance {
     }
 
     fn maybe_advance_to_round2(&mut self) -> Vec<PcEffect> {
-        if self.sent_vote2 || self.vote1_pool.len() < self.quorum() {
+        if self.sent_vote2.is_some() || self.vote1_pool.len() < self.quorum() {
             return vec![];
         }
         let q = self.quorum();
         let vote1s: Vec<&Verified<PcVote1>> = self.vote1_pool.values().take(q).collect();
-        let qc1 = Verified::<PcQc1>::from_verified_votes(&vote1s, &self.committee);
-        self.sent_vote2 = true;
-        let mut effects = vec![PcEffect::SignAndBroadcastVote2 { qc1: Box::new(qc1) }];
+        let qc1 = Box::new(Verified::<PcQc1>::from_verified_votes(
+            &vote1s,
+            &self.committee,
+        ));
+        self.sent_vote2 = Some(qc1.clone());
+        let mut effects = vec![PcEffect::SignAndBroadcastVote2 { qc1 }];
         effects.extend(self.maybe_advance_to_round3());
         effects
     }
 
     fn maybe_advance_to_round3(&mut self) -> Vec<PcEffect> {
-        if self.sent_vote3 || self.vote2_pool.len() < self.quorum() {
+        if self.sent_vote3.is_some() || self.vote2_pool.len() < self.quorum() {
             return vec![];
         }
         let q = self.quorum();
         let vote2s: Vec<&Verified<PcVote2>> = self.vote2_pool.values().take(q).collect();
-        let qc2 = Verified::<PcQc2>::from_verified_votes(&vote2s, &self.committee);
-        self.sent_vote3 = true;
-        let mut effects = vec![PcEffect::SignAndBroadcastVote3 { qc2: Box::new(qc2) }];
+        let qc2 = Box::new(Verified::<PcQc2>::from_verified_votes(
+            &vote2s,
+            &self.committee,
+        ));
+        self.sent_vote3 = Some(qc2.clone());
+        let mut effects = vec![PcEffect::SignAndBroadcastVote3 { qc2 }];
         effects.extend(self.maybe_finalize());
         effects
     }
@@ -272,6 +284,26 @@ impl PcInstance {
         let qc3 = Verified::<PcQc3>::from_verified_votes(&vote3s, &self.committee);
         self.decided = true;
         vec![PcEffect::Decided(Box::new(qc3))]
+    }
+
+    /// Re-emit the sign intents this instance has already produced,
+    /// verbatim, for retransmission of rounds a peer may have lost.
+    /// Vote2/vote3 re-carry the QC recorded at emission; deterministic
+    /// BLS then reproduces the original signature bit-for-bit, so a
+    /// replay can never equivocate. Pure read — pools and latches are
+    /// untouched.
+    pub(crate) fn replay_sign_intents(&self) -> Vec<PcEffect> {
+        let mut out = vec![];
+        if let Some(v_in) = &self.input {
+            out.push(PcEffect::SignAndBroadcastVote1 { v_in: v_in.clone() });
+        }
+        if let Some(qc1) = &self.sent_vote2 {
+            out.push(PcEffect::SignAndBroadcastVote2 { qc1: qc1.clone() });
+        }
+        if let Some(qc2) = &self.sent_vote3 {
+            out.push(PcEffect::SignAndBroadcastVote3 { qc2: qc2.clone() });
+        }
+        out
     }
 
     const fn equivocation_wire(
@@ -380,6 +412,65 @@ mod tests {
         // Second input — already set, no effects.
         let effects2 = fsm.handle(PcEvent::Input(v));
         assert!(effects2.is_empty());
+    }
+
+    /// Before any input, there is nothing to replay.
+    #[test]
+    fn replay_sign_intents_empty_before_input() {
+        let fsm = fsm_instance();
+        assert!(fsm.replay_sign_intents().is_empty());
+    }
+
+    /// Replay re-emits the QC recorded at emission even after the vote
+    /// pool has grown — re-aggregating from the larger pool could
+    /// certify a different prefix, and signing two round-2 payloads is
+    /// equivocation.
+    #[test]
+    fn replay_reemits_recorded_qcs_not_reaggregated() {
+        let (sks, members) = fsm_committee(4);
+        let mut fsm = PcInstance::new(Epoch::new(1), SpcView::new(0), members.clone());
+        let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));
+
+        let v = PcVector::new(std::iter::once(elem(7)));
+        let _ = fsm.handle(PcEvent::Input(v.clone()));
+
+        // Quorum (3 of 4) of round-1 votes from members 1..=3 forms
+        // qc1 over exactly that subset.
+        let vote1 = |i: usize| {
+            Verified::<PcVote1>::sign_local(&sks[i], members[i].0, &net(), &pc_ctx_bytes, v.clone())
+        };
+        let _ = fsm.handle(PcEvent::Vote1Verified(vote1(1)));
+        let _ = fsm.handle(PcEvent::Vote1Verified(vote1(2)));
+        let effects = fsm.handle(PcEvent::Vote1Verified(vote1(3)));
+        let [PcEffect::SignAndBroadcastVote2 { qc1: original }] = effects.as_slice() else {
+            panic!("expected SignAndBroadcastVote2 at quorum, got {effects:?}");
+        };
+        let original = original.clone();
+
+        // The pool grows past the emission subset: member 0's vote
+        // sorts first, so a re-aggregation would pick a different
+        // vote set.
+        let _ = fsm.handle(PcEvent::Vote1Verified(vote1(0)));
+
+        let replay = fsm.replay_sign_intents();
+        assert!(
+            replay
+                .iter()
+                .any(|e| matches!(e, PcEffect::SignAndBroadcastVote1 { v_in } if *v_in == v)),
+            "replay must include the recorded vote1 intent; got {replay:?}",
+        );
+        let replayed_qc1 = replay
+            .iter()
+            .find_map(|e| match e {
+                PcEffect::SignAndBroadcastVote2 { qc1 } => Some(qc1.clone()),
+                _ => None,
+            })
+            .expect("replay includes the vote2 intent");
+        assert_eq!(
+            replayed_qc1.x_signers(),
+            original.x_signers(),
+            "replay must re-carry the QC recorded at emission, not a re-aggregation",
+        );
     }
 
     /// Two distinct round-1 votes from the same peer (different
