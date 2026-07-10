@@ -15,7 +15,7 @@ Run: python3 specs/committee_security.py
 from math import exp, lgamma
 
 # ── Deployment parameters (defaults mirror intent, not the dev constants) ──
-EPOCH_SECONDS = 30              # docs' production aspiration; dev sim uses 2s
+EPOCH_SECONDS = 300             # production target (BeaconChainConfig default); dev sim uses 2s
 SHUFFLE_INTERVAL_EPOCHS = 16    # crates/types/src/beacon/constants.rs
 EPOCHS_PER_YEAR = 365.25 * 86400 / EPOCH_SECONDS
 SHUFFLE_EVENTS_PER_SHARD_YEAR = EPOCHS_PER_YEAR / SHUFFLE_INTERVAL_EPOCHS
@@ -212,9 +212,10 @@ def main() -> None:
     n = 128
     N = POOL_FACTOR * n
     f = f_of(n)
-    tau = 16000
+    tau = 1600
     print("\nH. Shuffle-interval sweep at n=128 (one seat per I epochs; "
-          f"tau={tau} epochs, beta=0.10 for r_max)")
+          f"tau={tau} epochs = {tau * EPOCH_SECONDS / 86400:.1f} days, "
+          "beta=0.10 for r_max)")
     print("    I  | tenure(h) | cross/shard-yr b=0.10 | max beta @1e-6 | r_max/epoch")
     print("  " + "-" * 74)
     for interval in [16, 8, 4, 2, 1]:
@@ -248,6 +249,32 @@ def main() -> None:
         net = rate * shards
         right = f"1 per {1 / net:,.0f} yr" if net < 1 else f"{net:.2f} / yr"
         print(f"    {beta:5.3f}  |   {rate:8.2e}   | {right}")
+
+    # I: the beacon committee's per-epoch resample — the independent-redraw
+    # column of C made real (one committee network-wide, redrawn every epoch
+    # from the seated-ready eligible set, ~shards * n at full staffing).
+    # Epoch-commit safety rides the pool ratification quorum (INV-BEACON-1),
+    # so an over-threshold draw here prices liveness and randomness-bias
+    # exposure, not a fork.
+    shards = 100
+    print(f"\nI. Beacon committee: fresh draw every epoch "
+          f"({EPOCHS_PER_YEAR:,.0f} draws/year; eligible = {shards} shards x n)")
+    print("    n      | " + " ".join(f"beta={b:<4}" for b in BETA_SWEEP)
+          + " | max beta @1e-6/yr")
+    print("  " + "-" * (11 + 10 * len(BETA_SWEEP) + 20))
+    for n in CANDIDATES:
+        N = shards * n
+        f = f_of(n)
+        cells = [
+            fmt(EPOCHS_PER_YEAR * hyper_tail(N, round(N * b), n, f + 1))
+            for b in BETA_SWEEP
+        ]
+        best = 0
+        for M in range(0, N // 2):
+            if EPOCHS_PER_YEAR * hyper_tail(N, M, n, f + 1) > 1e-6:
+                break
+            best = M
+        print(f"    {n:>6} | " + " ".join(cells) + f" |      {best / N:5.3f}")
 
 
 if __name__ == "__main__":
