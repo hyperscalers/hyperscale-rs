@@ -133,16 +133,41 @@ sampled at shuffle boundaries, and an unready seat is victim-ineligible —
 §7), so survival(τ) = 1 for τ up to two intervals. Little's law pins the
 *mean* tenure at n·I regardless; only the shape moves.
 
-**Finding 2 — at a fixed one-seat-per-interval rotation, larger committees
-are *more* exposed to slow-adaptive adversaries.** Per-member tenure is n·I
-epochs, so it grows with n — and at 300s epochs it is long in wall-clock
-terms (n=128, I=16: 7.1 days). At β=0.10 and τ=1,600 epochs (≈5.6 days),
-n=32 sustains ~0.3 targeted corruptions/epoch, n=128 only ~0.03, and n=256
-~0.02 — a multi-day corruption pipeline *half-survives* n=128's rotation
-(survival 0.49). Sampling luck (§1) pushes n up; adaptivity resistance
-pushes per-member tenure down. The reconciliation is a design change
-candidate for production sizing: **shrink the shuffle interval as n grows**
-(one seat per event, smaller I) — §6 settles the mechanism and the rate.
+`r_max` is a rate heuristic; the actual quantity is a compromise
+*probability* over a campaign, which the corrupt-count chain computes
+exactly. Script table J drives one shard committee (n=128, β=0.10) under
+sustained pressure and reports P[k ever reaches f+1 within a 90-day
+campaign], the transient the heuristic approximates:
+
+- **Fast corruption (τ=160 epochs ≈ 13h) beats any interval on the grid**
+  — the campaign compromises with probability 1 at every I from 16 down to
+  2. Rotation cannot flush a target that turns in half a day.
+- **Slow corruption (τ=1,600 epochs ≈ 5.6 days) is where the interval
+  bites.** At the default I=16 the campaign still wins (0.63 even at
+  pressure 16); at I=2 it is forced onto the graded tail (P = 0.016 at
+  pressure 64, 0.25 at pressure 85 — and 85 concurrent attempts costs ~111
+  targeted corruptions/day, sustained).
+
+**Finding 2 — fast rotation converts slow cheap corruption into fast
+expensive corruption; it does not stop a fast adversary.** This is the
+heuristic's qualitative claim, now exact. Per-member tenure grows with n
+(n=128, I=16: 7.1 days at 300s epochs), so larger committees are more
+exposed to slow adaptation; shrinking I is the lever (§6). What the rate
+heuristic misses entirely is the **budget-constrained** adversary.
+
+**Finding 3 — a budget-limited adversary gains materially from adapting,
+so the sustained-pressure table J is a lower bound, not the worst case.**
+Exact value iteration over (corrupt seats, in-flight attempts, remaining
+budget) on a tractable instance (script table K, n=32) finds the optimal
+policy compromises at 2.3× the rate of blind launch-maximum (0.058 vs
+0.025). The mechanism is a clean threshold: the optimal policy launches
+*nothing* until a lucky rotation lifts the committee to within three seats
+of the boundary, then spends its whole budget at once. Corruption budget is
+best spent on luck, not sprayed uniformly — the intuition that constant
+maximum pressure is optimal is wrong under a finite budget. The absolute
+numbers stay tiny (both policies well under the per-shard budget at n=32's
+weak sampling), and the finding does not move the sizing; it sharpens the
+worst-case adversary §8 consolidates.
 
 ## 5. Seats versus stake
 
@@ -157,14 +182,18 @@ carries c × min_stake, the stake share the adversary needs for seat share
 | 0.10 | 0.100 | 0.053 | 0.022 |
 | 0.33 | 0.333 | 0.200 | 0.091 |
 
-**Finding 3 — honest overstaking is a security leak.** At c=5, an adversary
+**Finding 4 — honest overstaking is a security leak.** At c=5, an adversary
 with 9% of total stake owns a third of the seats. The design's own answer is
 the vnode: marginal seat cost approaches stake, so rational honest operators
 split stake into many minimum-stake seats, driving c → 1 — vnodes are load-
 bearing for the security model, not just for economics. The absolute cost
 floor for f+1 seats in one committee is `(f+1) × MIN_STAKE_FLOOR` (10⁶ tokens
 per seat) times the sampling odds of §1; the dynamic price (`t_admit`) raises
-it further whenever supply is abundant.
+it further whenever supply is abundant. Splitting into vnodes helps the
+stake metric but concentrates control and often infrastructure under one
+party; a hack corrupts the shared infrastructure and a bribe the party
+behind it, neither priced by stake — §7 prices the concentration and shows
+the protocol cannot bound it.
 
 ## 6. Operating point: n = 128
 
@@ -286,28 +315,64 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   replacement probability, and the cell built to break it — four committees
   seating *half* the population — still fits the single-committee formulas
   (occupancy TV ≤ 0.007).
-- **Per-seat corruption unit** — a compromised operator yields all its
-  seats at once. Conditional on M corrupt seats the fold treats validators
-  exchangeably, so clustering is invisible to every table here: an M-subset
-  is an M-subset, and the expected-compromises budget is
+- **Corruption unit coarser than the seat.** Conditional on M corrupt seats
+  the fold treats validators exchangeably, so clustering is invisible to
+  every *seat-count* table here — an M-subset is an M-subset,
   correlation-invariant by linearity. What clustering changes is the *cost*
-  of reaching M — operators compromise in lumps, so the corruption budget
-  is denominated in operators, not seats — which is exactly the input §8's
-  adversary model prices.
+  of reaching M whenever the adversary's unit is coarser than one seat: a
+  compromised machine (hacking) and a bribed controlling entity (bribery)
+  each flip every seat they hold at once. Script table L prices it over one
+  pool (N = 2,560 seats): under uniform 1-seat holders 336 must be subverted
+  to reach the β = 0.131 boundary, but under a Zipf profile the largest
+  holder already carries 16% of the pool — one machine, or one negotiation,
+  clears it. **The protocol has no lever on the concentration.** It cannot
+  attribute seats to a controlling entity: distinct stake-pool identities
+  are indistinguishable from distinct entities — the same Sybil limit that
+  makes stake, not identity, the admission gate — so a cap keyed on any
+  observable identity is defeated by splitting it. Spread across independent
+  operators and infrastructure is an operational premise the protocol cannot
+  verify, the identity-only-selection fault-domain gap already noted at
+  [06 §4](06-resource-economics.md). Against bribery the lever is
+  accountability, not sampling: the bribe must clear the seat's value at
+  risk under permanent jailing for provable equivocation (INV-SEC-3), so
+  fork subversion is dear while hard-to-attribute liveness subversion
+  (censorship, going dark) is the cheaper corner — and bribery is the
+  fast-adaptive limit of §4, a negotiation rather than a multi-day
+  intrusion, so it lands in table J's τ→small rows where rotation cannot
+  help. Only the *buying* adversary is concentration-neutral: `min_stake` is
+  charged per seat regardless, so §1–3 hold in seats.
 - **Crossing = compromise** stays conservative by choice, and **unbiased
   randomness** stays an assumption — the randomness pipeline's grinding
   surface is its own analysis, out of scope here.
 
-## 8. Next phase
+## 8. Adversary synthesis — the computed worst case
 
-- **Phase 3 — adversary synthesis.** The corrupt-count chain plus an
-  operator-denominated, lumpy corruption budget is a small finite MDP;
-  exact value iteration (dependency-free, in the companion script) computes
-  the optimal adaptive strategy, replacing §4's heuristic adversary with a
-  worst case and pricing the seats-per-operator distribution §7 defers
-  here. A probabilistic model checker was considered and rejected: a finite
-  MDP solves exactly by value iteration, and the script stays
-  dependency-free.
+The rate heuristic of §4 is replaced by exact computation on the
+corrupt-count chain (script tables J–L). Three
+findings, in ascending threat sophistication:
+
+- **Sustained pressure (table J).** P[compromise within a 90-day campaign]
+  computed exactly over the event chain. Fast corruption (τ ≈ 13h) wins at
+  every interval; slow corruption (τ ≈ 5.6 days) is forced onto a graded
+  tail only once the interval shrinks to I=2 — the quantitative form of §4's
+  "fast rotation buys nothing against a fast adversary, everything against a
+  slow one."
+- **Optimal adaptation (table K).** Exact value iteration over (corrupt
+  seats, in-flight attempts, budget) shows a budget-constrained adversary
+  beats blind maximum pressure by 2.3×, via a threshold policy: hold the
+  budget until a lucky rotation lifts the committee near the boundary, then
+  spend it all. The sustained-pressure table is therefore a lower bound on a
+  fixed-budget adversary — the correction the heuristic could not have made.
+- **Concentration cost (table L).** For an adversary whose unit is coarser
+  than a seat — a hacked machine or a bribed entity — the corruption budget
+  is denominated in those units, not seats; concentration collapses it, and
+  the protocol cannot bound concentration (above).
+
+Value iteration runs on the n=32 instance where the state space is
+tractable; the argument is fraction-uniform, so the mechanism (spend on
+luck) carries to n=128, where the absolute probabilities are the §6 tail.
+A probabilistic model checker was considered and rejected: a finite MDP
+solves exactly by value iteration, and the script stays dependency-free.
 
 ## 9. Composition with the models
 

@@ -78,6 +78,151 @@ def crossing_rate(N: int, M: int, n: int) -> float:
     return hyper_pmf(N, M, n, f) * p_up(N, M, n, f)
 
 
+# ── The adaptive adversary, computed exactly (tables J/K/L) ─────────────────
+# Time step = one shuffle event, the chain's native clock. The adversary
+# holds `pressure` targeted corruption attempts in flight against seated
+# honest members; each attempt lands per event with probability I/tau
+# (tau epochs per attempt), landings are Binomial(pressure, I/tau) with the
+# tail folded into the top branch. The rotation then swaps one uniform seat
+# (mean-field replacement corruption, as in the chain). Sustaining the
+# pressure costs the launches that land plus the ones rotation flushes.
+
+
+def landing_weights(in_flight: int, p: float, max_land: int = 3) -> list:
+    """Binomial(in_flight, p) over 0..max_land, tail folded into the top."""
+    weights = []
+    rest = 1.0
+    for j in range(max_land):
+        if in_flight >= j and p > 0.0:
+            w = exp(log_comb(in_flight, j)) * p**j * (1 - p) ** (in_flight - j)
+        else:
+            w = 1.0 if j == 0 else 0.0
+        weights.append(w)
+        rest -= w
+    weights.append(max(rest, 0.0))
+    return weights
+
+
+def compromise_probability(
+    n: int, beta: float, interval: int, tau: int, pressure: int, horizon_events: int
+) -> tuple:
+    """P[k ever >= f+1 within the horizon] under sustained pressure, from the
+    stationary start conditioned below the boundary, and the launch rate
+    (attempts/day) the pressure costs."""
+    N = POOL_FACTOR * n
+    M = round(N * beta)
+    f = f_of(n)
+    dist = [hyper_pmf(N, M, n, k) for k in range(f + 1)]
+    z = sum(dist)
+    dist = [p / z for p in dist]
+    success = 0.0
+    p_land = interval / tau
+    weights_for = [landing_weights(a, p_land) for a in range(n + 1)]
+    for _ in range(horizon_events):
+        new = [0.0] * (f + 1)
+        for k, pk in enumerate(dist):
+            if pk == 0.0:
+                continue
+            in_flight = min(pressure, n - k)
+            q = (M - k) / (N - n)
+            for landed, w_land in enumerate(weights_for[in_flight]):
+                if w_land == 0.0:
+                    continue
+                k1 = k + landed
+                if k1 > f:
+                    success += pk * w_land
+                    continue
+                for dk, w_rot in (
+                    (-1, (k1 / n) * (1 - q)),
+                    (0, (k1 / n) * q + (1 - k1 / n) * (1 - q)),
+                    (1, (1 - k1 / n) * q),
+                ):
+                    w = pk * w_land * w_rot
+                    if k1 + dk > f:
+                        success += w
+                    else:
+                        new[k1 + dk] += w
+        dist = new
+    events_per_day = 86400 / (EPOCH_SECONDS * interval)
+    launches_per_event = pressure * p_land + pressure / n
+    return success, launches_per_event * events_per_day
+
+
+def adversary_value_iteration(
+    n: int,
+    beta: float,
+    interval: int,
+    tau: int,
+    budget: int,
+    max_in_flight: int,
+    horizon_events: int,
+    greedy_only: bool,
+    want_policy: bool = False,
+):
+    """Exact backward induction over (k, in-flight, budget): max P[compromise
+    within the horizon], action = attempts launched per event (0..4). With
+    `greedy_only`, evaluates the launch-maximum policy instead of optimizing —
+    the gap between the two is the value of adaptivity. With `want_policy`,
+    also returns the t=0 optimal launch count per k at (in-flight 0, full
+    budget), which exposes the conserve-then-spend shape."""
+    N = POOL_FACTOR * n
+    M = round(N * beta)
+    f = f_of(n)
+    p_land = interval / tau
+    k_dim, a_dim, b_dim = f + 1, max_in_flight + 1, budget + 1
+    weights_for = [landing_weights(a, p_land) for a in range(max_in_flight + 1)]
+
+    # value[k][a][b]; terminal value 0 (no compromise by the horizon).
+    value = [[[0.0] * b_dim for _ in range(a_dim)] for _ in range(k_dim)]
+    policy = [0] * k_dim
+    for step in range(horizon_events):
+        nxt = [[[0.0] * b_dim for _ in range(a_dim)] for _ in range(k_dim)]
+        last_step = step == horizon_events - 1
+        for k in range(k_dim):
+            q = (M - k) / (N - n)
+            for a in range(a_dim):
+                for b in range(b_dim):
+                    best, best_j = -1.0, 0
+                    j_max = min(4, b, max_in_flight - a, n - k - a)
+                    actions = (
+                        (max(j_max, 0),) if greedy_only else range(max(j_max, 0) + 1)
+                    )
+                    for j in actions:
+                        a1, b1 = a + j, b - j
+                        total = 0.0
+                        for landed, w_land in enumerate(weights_for[a1]):
+                            if w_land == 0.0:
+                                continue
+                            landed = min(landed, a1)
+                            k1, a2 = k + landed, a1 - landed
+                            if k1 > f:
+                                total += w_land
+                                continue
+                            for (dk, da), w_rot in (
+                                ((-1, 0), (k1 / n) * (1 - q)),
+                                ((0, 0), (k1 / n) * q),
+                                ((0, -1), (a2 / n) * (1 - q)),
+                                ((1, -1), (a2 / n) * q),
+                                ((0, 0), ((n - k1 - a2) / n) * (1 - q)),
+                                ((1, 0), ((n - k1 - a2) / n) * q),
+                            ):
+                                if w_rot == 0.0:
+                                    continue
+                                k2, a3 = k1 + dk, max(a2 + da, 0)
+                                if k2 > f:
+                                    total += w_land * w_rot
+                                else:
+                                    total += w_land * w_rot * value[k2][a3][b1]
+                        if total > best:
+                            best, best_j = total, j
+                    nxt[k][a][b] = best
+                    if last_step and a == 0 and b == budget:
+                        policy[k] = best_j
+        value = nxt
+    start = value[round(beta * n)][0][budget]
+    return (start, policy) if want_policy else start
+
+
 def fmt(x: float) -> str:
     if x == 0.0:
         return "   ~0    "
@@ -275,6 +420,102 @@ def main() -> None:
                 break
             best = M
         print(f"    {n:>6} | " + " ".join(cells) + f" |      {best / N:5.3f}")
+
+    # L: corruption cost for an adversary whose unit is coarser than a seat
+    # — a hacked machine or a bribed controlling entity, each flipping every
+    # seat it holds at once. Conditional on M corrupt seats every table above
+    # is unchanged (exchangeability — an M-subset is an M-subset), but
+    # concentration collapses the units-to-subvert count. The protocol cannot
+    # see or bound this: distinct stake-pool identities are indistinguishable
+    # from distinct entities (the Sybil limit that makes stake, not identity,
+    # the gate), so no per-identity cap binds it. Largest-first subversion
+    # over three concentration profiles of one pool (N = 20 * 128 seats).
+    N = POOL_FACTOR * 128
+    profiles = [
+        ("uniform (1 seat/entity)", [1] * N),
+        ("10 seats/entity", [10] * (N // 10)),
+        ("zipf, 256 entities", None),
+    ]
+    j_ops = 256
+    harmonic = sum(1 / j for j in range(1, j_ops + 1))
+    zipf = [max(1, round(N / harmonic / j)) for j in range(1, j_ops + 1)]
+    profiles[2] = ("zipf, 256 entities", zipf)
+    targets = [0.05, 0.10, 0.131]
+    print("\nL. Units to subvert (largest-first) to reach a corrupt seat share")
+    print("   (a hacked machine or bribed entity; the protocol cannot bound "
+          "concentration)")
+    print("   profile                 | " + " ".join(f"beta_s={t:<5}" for t in targets))
+    print("  " + "-" * 60)
+    for label, sizes in profiles:
+        sizes = sorted(sizes, reverse=True)
+        cells = []
+        for t in targets:
+            need = t * N
+            acc = 0
+            ops = 0
+            for s in sizes:
+                if acc >= need:
+                    break
+                acc += s
+                ops += 1
+            cells.append(f"  {ops if acc >= need else '-':>6}    ")
+        print(f"   {label:<23} | " + " ".join(cells))
+    top = sorted(zipf, reverse=True)
+    print(f"   (zipf top entity holds {top[0] / N:.1%} of seats, "
+          f"top 10 hold {sum(top[:10]) / N:.1%})")
+
+    # J: sustained targeted pressure vs rotation, computed exactly on the
+    # event chain — replaces the r_max heuristic of the note's §4. The
+    # adversary holds `pressure` concurrent attempts (tau epochs each)
+    # against one shard committee; the table gives P[compromise within a
+    # 90-day campaign] and the sustained launch cost.
+    n = 128
+    beta = 0.10
+    horizon_days = 90
+    print(f"\nJ. n={n}, beta={beta}: P[compromise within {horizon_days} days] "
+          "under sustained targeted pressure")
+    print("    tau (epochs) | I  | pressure=16      32        64        85")
+    print("  " + "-" * 66)
+    for tau in (160, 1600):
+        for interval in (16, 8, 4, 2):
+            events = round(horizon_days * 86400 / (EPOCH_SECONDS * interval))
+            cells = []
+            cost = None
+            for pressure in (16, 32, 64, 85):
+                p, launches_day = compromise_probability(
+                    n, beta, interval, tau, pressure, events
+                )
+                cells.append(fmt(p))
+                cost = launches_day
+            print(f"    {tau:>12} | {interval:>2} | " + " ".join(cells)
+                  + f"   ({cost:.1f} launches/day at 85)")
+
+    # K: does a budget-constrained adversary gain from adapting? Exact
+    # backward induction over (k, in-flight, budget) on a small instance,
+    # the optimal state-dependent policy vs blind launch-maximum. The gap
+    # is the value of adaptivity; the policy row shows its mechanism.
+    n, beta, interval, tau = 32, 0.10, 16, 1600
+    budget, max_in_flight = 16, 8
+    events = round(15 * 86400 / (EPOCH_SECONDS * interval))
+    opt, policy = adversary_value_iteration(
+        n, beta, interval, tau, budget, max_in_flight, events,
+        greedy_only=False, want_policy=True,
+    )
+    greedy = adversary_value_iteration(
+        n, beta, interval, tau, budget, max_in_flight, events, greedy_only=True
+    )
+    f = f_of(n)
+    print(f"\nK. Optimal-vs-greedy budget-limited adversary (n={n}, f={f}, "
+          f"I={interval}, tau={tau}, budget={budget}, in-flight cap "
+          f"{max_in_flight}, 15-day horizon)")
+    print(f"    optimal (state-dependent): P[compromise] = {opt:.5f}")
+    print(f"    launch-maximum:            P[compromise] = {greedy:.5f}")
+    print(f"    adaptivity gain: {opt - greedy:.2e}  ({opt / greedy:.1f}x) — "
+          "adapting beats blind spending")
+    row = " ".join(f"{policy[k]}" for k in range(f + 1))
+    print(f"    t=0 optimal launches by k (0..f={f}, full budget): {row}")
+    print("    conserve-then-spend: budget is held until a lucky rotation "
+          "lifts k toward the boundary")
 
 
 if __name__ == "__main__":

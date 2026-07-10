@@ -20,7 +20,7 @@ Statistical companions to the models — properties that are probabilistic rathe
 
 | Analysis | Files | Scope | Status |
 |---|---|---|---|
-| **SEC-1** | [committee_security.md](committee_security.md), [committee_security.py](committee_security.py), `crates/beacon/tests/committee_security.rs` | Prices the INV-SEC-1 premise: hypergeometric draw tails, the trickle shuffle as a birth–death chain, adaptive-corruption bounds, the seat-vs-stake wedge, the beacon committee's per-epoch redraw. Every model's `BYZ = 1..F` axiom composes with this bound. The Monte Carlo tier drives the shipped fold and validates the chain's kernel against it (the seeded cells run in CI); measured deviations — ready-lag flush floor, reshape pauses, depletion — are priced in the note's §7 | Phases 1–2 done; Phase 3 is the optimal adversary by exact value iteration |
+| **SEC-1** | [committee_security.md](committee_security.md), [committee_security.py](committee_security.py), `crates/beacon/tests/committee_security.rs` | Prices the INV-SEC-1 premise: hypergeometric draw tails, the trickle shuffle as a birth–death chain, the seat-vs-stake wedge, the beacon committee's per-epoch redraw, and the adaptive adversary computed exactly (transient compromise probability + value iteration over corrupt-seats/in-flight/budget; the optimal policy conserves budget and spends on lucky rotations). Every model's `BYZ = 1..F` axiom composes with this bound. The Monte Carlo tier drives the shipped fold and validates the chain's kernel against it (the seeded cells run in CI); measured deviations are priced in §7, and operator concentration is priced in the seat-cost table | Phases 1–3 done |
 
 ## Discipline
 
