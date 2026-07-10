@@ -85,7 +85,7 @@ The consolidated register of the system's safety and liveness properties, with s
 | ID | Class | Property |
 |---|---|---|
 | **INV-SEC-2** | Safety | **Shuffle soundness.** Rotation is seeded-deterministic, at most one seat per shard per interval, never self-replacing within a draw, never touching mid-reshape shards, never shrinking a committee. |
-| **INV-SEC-3** | Safety | **Accountable expulsion.** Equivocation evidence is self-proving and jails permanently; liveness jailing derives only from merkle-proven, exactly-once-applied witness leaves. |
+| **INV-SEC-3** | Safety | **Accountable expulsion.** Equivocation evidence is self-proving and permanently revokes the key (removal, not slashing — stake is preserved and withdrawable); liveness jailing derives only from merkle-proven, exactly-once-applied witness leaves and lifts after a cooldown. Accountability is structural: a corrupt seat is single-use and re-seats only through the beacon's random draw, never by operator choice. |
 | **INV-SEC-4** | Safety | **Witness completeness.** A block's witness root must commit every leaf implied by the chain since the parent (including missed-proposal leaves over uncommitted certified ancestors); verifiers recompute and reject omission or fabrication. |
 | **INV-SEC-5** | Safety | **Signature hygiene.** Every signature is domain-separated and context-bound; every certificate verifies against the WT-resolved committee for its artifact. |
 | **INV-SEC-6** | Safety | **Bounded decode.** No peer-supplied length is trusted before allocation; per-(height, round) buffers, view advancement, and speculative verification are all capped. |

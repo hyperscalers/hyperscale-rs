@@ -227,8 +227,9 @@ scales with it); the readiness gate is 85 ready per successor.
 
 Attack economics: exceeding the 10⁻⁶ budget requires >13% of all seats — at
 100 shards, ~1,680 seats ≥ 1.68B tokens at `MIN_STAKE_FLOOR` (more at the
-dynamic price), all exposed to permanent jailing on first provable
-equivocation. Per-committee arithmetic ("43 seats") is the wrong frame:
+dynamic price). Any seat that equivocates is permanently key-revoked on the
+self-proving evidence (INV-SEC-3) — its position forfeit, though the stake is
+not slashed. Per-committee arithmetic ("43 seats") is the wrong frame:
 sampling decides where seats land, so the adversary buys the pool fraction.
 
 Two riders, without which 128 is not this strong:
@@ -332,15 +333,22 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   observable identity is defeated by splitting it. Spread across independent
   operators and infrastructure is an operational premise the protocol cannot
   verify, the identity-only-selection fault-domain gap already noted at
-  [06 §4](06-resource-economics.md). Against bribery the lever is
-  accountability, not sampling: the bribe must clear the seat's value at
-  risk under permanent jailing for provable equivocation (INV-SEC-3), so
-  fork subversion is dear while hard-to-attribute liveness subversion
-  (censorship, going dark) is the cheaper corner — and bribery is the
-  fast-adaptive limit of §4, a negotiation rather than a multi-day
-  intrusion, so it lands in table J's τ→small rows where rotation cannot
-  help. Only the *buying* adversary is concentration-neutral: `min_stake` is
-  charged per seat regardless, so §1–3 hold in seats.
+  [06 §4](06-resource-economics.md). Accountability does not price this out:
+  there is no slashing anywhere — a jailed validator's stake is preserved and
+  withdrawable (INV-SEC-3 jails; it does not confiscate), so provable
+  equivocation revokes the *key* (permanent jail, no unjail) but not the
+  capital, which redeploys under a fresh identity. That is a re-registration
+  tax, not a bribe floor. So the defense against a bribed or hacked committee
+  is structural, not economic: a provable equivocation is self-proving
+  evidence that halts the shard rather than forking it (INV-SHARD-1
+  quorum intersection, INV-STATE-5 halt-loudly), degrading a safety attack to
+  a liveness halt — and the residual, an external consumer acting on one
+  branch before the evidence propagates, is a finality-latency question, not a
+  slashing one. Bribery is also the fast-adaptive limit of §4 (a negotiation,
+  not a multi-day intrusion), so it lands in table J's τ→small rows where
+  rotation cannot help either. Only the *buying* adversary is
+  concentration-neutral: `min_stake` is charged per seat regardless, so §1–3
+  hold in seats.
 - **Crossing = compromise** stays conservative by choice, and **unbiased
   randomness** stays an assumption — the randomness pipeline's grinding
   surface is its own analysis, out of scope here.
