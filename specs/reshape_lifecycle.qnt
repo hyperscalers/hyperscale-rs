@@ -23,7 +23,12 @@
 //   abandonment, and the 2f+1-per-child seating gate. A `synced` ground
 //   truth records which observers actually synced each child, so the
 //   seating gate can be checked at its semantic floor rather than by seat
-//   count alone.
+//   count alone. A ready signal is bound only to its emitter — it carries
+//   a validity window but no child; the fold classifies it by the emitter's
+//   *current* seat. Pool churn (a spare validator swapping in during a
+//   lapse) can move an observer's assignment even under a frozen seed, and
+//   the `UNBOUND_READY` twin then folds a still-valid signal from the
+//   observer's prior seat against its new one.
 //
 // Code anchors:
 //   - Pool + dwell rule: crates/shard/src/ready_signal_pool.rs —
@@ -31,7 +36,14 @@
 //     reset on a new one), `drain_eligible` (dwell + window-coverage gate),
 //     `evict_expired` (drop past window end). `MIN_READY_SIGNAL_DWELL`.
 //   - Signal window: crates/types/src/beacon/ready_signal.rs —
-//     `ready_signal_window` (two epochs, scaled to `epoch_duration_ms`).
+//     `ready_signal_window` (two epochs, scaled to `epoch_duration_ms`);
+//     the signal binds only `(network, validator, wt_window)`.
+//   - Fold + draw: crates/beacon/src/state/witness.rs (admission, re-staff,
+//     `ReshapeReady` fold, `prune_stale_reshapes`) and
+//     crates/beacon/src/state/reshape.rs (`draw_split_cohort`,
+//     `try_execute_split`); classification is
+//     crates/types/src/shard/roots/beacon_witness.rs `ready_leaf_payload`
+//     (by the emitter's current seat, not the signal's content).
 //
 // Properties (docs/08-invariants.md):
 //   invDwellAccrues — a signal held continuously since first admission for
@@ -43,30 +55,50 @@
 //                     resets the stamp on every repeat and violates it.
 //   invWellFormed  — a held signal's arrival stamp is not in the future.
 //
-//   invConservation      — placements partition: the pool and the two child
-//                          cohorts are disjoint and cover every observer;
-//                          lapse and abandon return the cohort exactly.
+//   invConservation      — placements partition: the pool, the two child
+//                          cohorts, and the bench are disjoint and cover
+//                          every observer; lapse/abandon/churn move whole
+//                          seats.
 //   invSeatStability     — an observer's child assignment never drifts from
 //                          its first-ever assignment across a lapse/re-staff
-//                          cycle (INV-RESHAPE-7).
+//                          cycle (INV-RESHAPE-7 as the register states it).
+//                          Holds without pool churn; the `reshape_split_churn`
+//                          instance shows a frozen-seed re-staff over a
+//                          *churned* pool violates it — the register's
+//                          "cannot move an observer's sync target" is only
+//                          true for an unchanged pool.
 //   invNoHonestFalseReady — no honest observer is ready-flagged for a child
-//                          it has not synced — the seating-soundness premise
-//                          the unbound-signal finding targets.
+//                          it has not synced — the seating-soundness premise.
+//                          A drifted assignment alone does not break it (a
+//                          child-bound signal will not fold for the new
+//                          seat); the `reshape_unbound_ready` twin, whose
+//                          fold ignores the signal's origin child, does.
 //   invSeatingGate       — if the split executed, each child seats a quorum
 //                          of genuinely honest-synced members (INV-RESHAPE-1
 //                          at its semantic floor, not seat count).
 //
 // Modeling assumptions:
-//   - One observer, one signal. The pool is keyed by validator, so entries
-//     are independent; a single entry captures the admit/drain/dwell rule.
 //   - Ticks are unit and deterministic. The dwell rule concerns re-admission,
-//     not timing granularity, so variable ticks add nothing here; the fold
-//     module reintroduces epoch-scale timing where it matters.
+//     not timing granularity; the fold module carries epoch-scale timing
+//     where the TTLs and the signal window matter.
 //   - `now` doubles as the proposal weighted timestamp: the window covers it
-//     when `wstart <= now <= wend`. Faithful to the `drain_eligible` gate,
-//     which tests the proposal's parent-QC WT against `[start, end]`.
+//     when `wstart <= now <= wend`. Faithful to the `drain_eligible` gate.
+//   - Parent halves are trusted honest-synced counts (a live parent committee,
+//     ready by construction); the cohort observers are the set-valued state.
 //   - Crypto and gossip are ideal: a signal in the pool is authentic; the
 //     `DWELL` rest stands in for fan-out convergence.
+//   - Eviction-timing note. `evict_expired` reaps a signal past its two-epoch
+//     window, but an observer re-emits every reshape pump (sub-second),
+//     refreshing the pooled copy, so the signal stays live until the
+//     observer detects the lapse and stops — about one epoch after the fold
+//     lapses. A re-assertion re-staffs within roughly one further epoch, so
+//     the two-epoch window has not closed: survival to the re-staff is the
+//     realistic case. `expireSig` models eviction as free (fire any time),
+//     so the checker covers both eviction-before-re-staff (no fold) and
+//     survival (the finding), rather than hard-coding a race outcome.
+//   - The shuffle key is parity-based, not the production hash — two
+//     orderings suffice to exercise a frozen-seed re-staff, pool-churn
+//     drift, and the epoch-seeded twin, and it keeps the checker tractable.
 //
 // Run:
 //   quint typecheck specs/reshape_lifecycle.qnt
@@ -75,9 +107,17 @@
 //     (the twin resets dwell on re-emit; expect a counterexample)
 //   quint test   --main=ready_signal_ok    --match=dwellAdmitsUnderReemit  specs/reshape_lifecycle.qnt
 //   quint test   --main=ready_signal_reset --match=dwellStarvesUnderReemit specs/reshape_lifecycle.qnt
-//   quint verify --main=reshape_split_ok    --invariant=invAll --max-steps=10 specs/reshape_lifecycle.qnt
+//   quint verify --main=reshape_split_ok     --invariant=invAll --max-steps=10 specs/reshape_lifecycle.qnt
 //     (the healthy split: staffing soundness holds through admit, lapse/
 //      re-staff, and the seating gate)
+//   quint verify --main=reshape_split_churn  --invariant=invSeatStability --max-steps=8 specs/reshape_lifecycle.qnt
+//     (pool churn drifts a frozen-seed re-staff off an observer's first
+//      assignment; expect a counterexample — the INV-RESHAPE-7 over-claim)
+//   quint verify --main=reshape_split_churn  --invariant=invNoHonestFalseReady --max-steps=8 specs/reshape_lifecycle.qnt
+//     (but with a child-bound signal the drift is benign; expect it to hold)
+//   quint verify --main=reshape_unbound_ready --invariant=invNoHonestFalseReady --max-steps=10 specs/reshape_lifecycle.qnt
+//     (the finding: an unbound signal from the observer's prior seat folds
+//      for its churned-to seat; expect a counterexample)
 
 module ready_signal_admission {
   // Ticks a signal must rest in the pool before it is drain-eligible.
@@ -222,31 +262,22 @@ module ready_signal_reset {
   import ready_signal_admission(DWELL = 3, WINDOW = 6, RESET_DWELL_ON_REEMIT = true).*
 }
 
-// The beacon fold for a split: trigger admission (pool gate), the
-// frozen-seed cohort draw and its child assignment, the sticky ready fold,
-// TTL lapse/re-staff and abandonment, and the 2f+1-per-child seating gate.
-// Layered on `ready_signal_admission`: "an observer's ready signal is
-// eventually drained and folded" is taken as an axiom, justified there.
+// The beacon fold for a split. The two children are L and R; one splitting
+// shard whose parent halves contribute `PARENT_HALF_L` / `PARENT_HALF_R`
+// trusted honest-synced members. Cohort observers are drawn from the pool;
+// a spare sits on the bench and can churn into the pool during a lapse.
 //
-// The two children are L and R. One splitting shard; its committee's parent
-// halves contribute `PARENT_HALF_L` / `PARENT_HALF_R` members per child,
-// modeled as trusted-honest-synced counts (a live parent committee, ready
-// by construction). The cohort observers — drawn from the pool — are the
-// set-valued state where staffing can go wrong.
+// The draw is rank-based on a seed frozen at admission (a seeded shuffle
+// split in half), so an observer's child assignment depends on the drawn
+// pool's composition — a re-staff over an unchanged pool reproduces it, a
+// re-staff over a churned pool can move it.
 //
-// The draw is rank-based on a seed frozen at admission: order the drawn
-// pool by `keyOf(seed, ·)`, the lower half to L, the upper half to R
-// (crates/beacon/src/state/reshape.rs `draw_split_cohort` — a seeded
-// shuffle split in half). An observer's assignment therefore depends on the
-// *composition* of the drawn pool, so a re-staff over an unchanged pool
-// reproduces it (this module) while a re-staff over a churned pool can move
-// it (the finding, a later phase).
-//
-// Ground truth: `syncedL` / `syncedR` — observers that have actually synced
-// the L / R child. An honest observer's ready leaf folds only for the child
-// it has synced (`foldReady` guard). The gate counts ready *seats*; the
-// invariants demand honest ready ⇒ genuinely synced, and enough honest
-// synced members per child that seating is sound.
+// A ready signal is held in the pool until evicted (`liveSig`) and carries
+// no child. The fold marks a validator ready for its current seat; the
+// healthy rule
+// additionally checks the validator synced that seat's child (a child-bound
+// signal), while the `UNBOUND_READY` twin does not — so a signal emitted for
+// a prior seat can fold for a churned-to seat.
 module reshape_lifecycle {
   // Committee target: a full cohort is this many observers.
   const SHARD_SIZE: int
@@ -267,19 +298,24 @@ module reshape_lifecycle {
   // Broken twin: the draw seeds on the running epoch, not the frozen seed,
   // so a re-staff re-rolls the assignment. False is the shipped frozen seed.
   const EPOCH_SEEDED_DRAW: bool
+  // Whether a benched spare can churn into the pool during a lapse.
+  const POOL_CHURN: bool
+  // Broken twin: the ready fold ignores the signal's origin child and marks
+  // the validator ready for whatever seat it currently holds. False is the
+  // child-bound signal the fix would carry.
+  const UNBOUND_READY: bool
 
   pure val QUORUM = 2 * F + 1
-  // The observer identities — the pool that staffs the split. Sized so a
-  // full draw takes the whole pool (|pool| == SHARD_SIZE at admission).
-  pure val ALLVALS = 1.to(SHARD_SIZE)
+  // The observer identities: a full cohort's worth plus one benched spare.
+  pure val IDS = 1.to(SHARD_SIZE + 1)
 
   // Deterministic per-(seed, validator) ordering key for the shuffle: the
   // seed's parity picks the direction, giving two distinct orderings over
   // the drawn set. Kept free of costly arithmetic (no modular hashing) so
   // the bounded checker stays tractable; the two orderings suffice to
-  // exercise both a frozen-seed re-staff and the epoch-seeded twin.
+  // exercise a frozen-seed re-staff, pool-churn drift, and the epoch twin.
   pure def keyOf(effSeed: int, v: int): int =
-    if (effSeed % 2 == 0) v else SHARD_SIZE + 1 - v
+    if (effSeed % 2 == 0) v else SHARD_SIZE + 2 - v
   // How many of `d` rank strictly below `v` (keys are distinct on 1..N).
   pure def lowerCount(effSeed: int, d: Set[int], v: int): int =
     d.filter(u => keyOf(effSeed, u) < keyOf(effSeed, v)).size()
@@ -291,8 +327,10 @@ module reshape_lifecycle {
 
   // Current epoch.
   var epoch: int
-  // Free observers not currently drawn into the cohort.
+  // Free observers eligible to be drawn into the cohort.
   var pool: Set[int]
+  // Inactive spares — neither pooled nor cohorted.
+  var benched: Set[int]
   // A split is admitted and pending.
   var pendingPresent: bool
   // The cohort seed, frozen at admission.
@@ -306,6 +344,12 @@ module reshape_lifecycle {
   // Ground truth: observers that have actually synced each child's state.
   var syncedL: Set[int]
   var syncedR: Set[int]
+  // Observers holding a still-valid ready signal in the proposer pool. A
+  // signal enters on sync and leaves by `expireSig` — the abstraction of
+  // `evict_expired`: eviction may fire at any time, or the signal may
+  // persist (an observer re-emits every pump, so it stays live until the
+  // observer detects the lapse; see the header's eviction-timing note).
+  var liveSig: Set[int]
   // First-ever child assignment of each observer, retained across lapse —
   // the anchor the stability invariant measures drift against.
   var everAssignedL: Set[int]
@@ -318,7 +362,8 @@ module reshape_lifecycle {
 
   action init = all {
     epoch' = 0,
-    pool' = ALLVALS,
+    pool' = 1.to(SHARD_SIZE),
+    benched' = Set(SHARD_SIZE + 1),
     pendingPresent' = false,
     seed' = 0,
     cohortL' = Set(),
@@ -327,6 +372,7 @@ module reshape_lifecycle {
     readyR' = Set(),
     syncedL' = Set(),
     syncedR' = Set(),
+    liveSig' = Set(),
     everAssignedL' = Set(),
     everAssignedR' = Set(),
     lastAsserted' = 0,
@@ -336,6 +382,8 @@ module reshape_lifecycle {
 
   // The seed a draw uses: frozen (healthy) or re-rolled from the epoch (twin).
   def drawSeed(s: int): int = if (EPOCH_SEEDED_DRAW) s + epoch else s
+  // Whether validator v holds an unexpired ready signal.
+  def live(v: int): bool = liveSig.contains(v)
 
   // First admission: pool gate met, draw the cohort, freeze the seed.
   action admit = {
@@ -348,6 +396,7 @@ module reshape_lifecycle {
       pool.size() == SHARD_SIZE,
       epoch' = epoch,
       pool' = Set(),
+      benched' = benched,
       pendingPresent' = true,
       seed' = s,
       cohortL' = newL,
@@ -356,6 +405,7 @@ module reshape_lifecycle {
       readyR' = Set(),
       syncedL' = syncedL,
       syncedR' = syncedR,
+      liveSig' = liveSig,
       everAssignedL' = everAssignedL.union(newL.exclude(everAssignedL.union(everAssignedR))),
       everAssignedR' = everAssignedR.union(newR.exclude(everAssignedL.union(everAssignedR))),
       lastAsserted' = epoch,
@@ -365,7 +415,8 @@ module reshape_lifecycle {
   }
 
   // Re-assertion after a lapse: re-staff from the retained seed over the
-  // current pool. Fresh seats fold ready:false; the synced store is kept.
+  // current pool. Fresh seats fold ready:false; the synced store and any
+  // still-valid ready signal are kept.
   action reassert = {
     val d = drawSeed(seed)
     val newL = drawL(d, pool)
@@ -377,6 +428,7 @@ module reshape_lifecycle {
       pool.size() == SHARD_SIZE,
       epoch' = epoch,
       pool' = Set(),
+      benched' = benched,
       pendingPresent' = true,
       seed' = seed,
       cohortL' = newL,
@@ -385,6 +437,7 @@ module reshape_lifecycle {
       readyR' = Set(),
       syncedL' = syncedL,
       syncedR' = syncedR,
+      liveSig' = liveSig,
       everAssignedL' = everAssignedL.union(newL.exclude(everAssignedL.union(everAssignedR))),
       everAssignedR' = everAssignedR.union(newR.exclude(everAssignedL.union(everAssignedR))),
       lastAsserted' = epoch,
@@ -393,16 +446,19 @@ module reshape_lifecycle {
     }
   }
 
-  // An observer completes syncing the child it is currently assigned.
+  // An observer completes syncing the child it is currently assigned, and
+  // emits a ready signal into the proposer pool.
   action syncStep = {
-    nondet v = ALLVALS.oneOf()
+    nondet v = IDS.oneOf()
     all {
       not(executed),
       cohortL.contains(v) or cohortR.contains(v),
       syncedL' = if (cohortL.contains(v)) syncedL.union(Set(v)) else syncedL,
       syncedR' = if (cohortR.contains(v)) syncedR.union(Set(v)) else syncedR,
+      liveSig' = liveSig.union(Set(v)),
       epoch' = epoch,
       pool' = pool,
+      benched' = benched,
       pendingPresent' = pendingPresent,
       seed' = seed,
       cohortL' = cohortL,
@@ -417,23 +473,89 @@ module reshape_lifecycle {
     }
   }
 
-  // An honest observer's ready leaf folds — only for the child it has synced.
-  action foldReady = {
-    nondet v = ALLVALS.oneOf()
+  // A held signal is evicted from the proposer pool (its window passed
+  // without collection). The abstraction of `evict_expired`: it may fire at
+  // any time, so the checker explores both eviction-before-re-staff and
+  // survival-to-re-staff.
+  action expireSig = {
+    nondet v = IDS.oneOf()
     all {
       not(executed),
-      (cohortL.contains(v) and syncedL.contains(v))
-        or (cohortR.contains(v) and syncedR.contains(v)),
-      readyL' = if (cohortL.contains(v) and syncedL.contains(v)) readyL.union(Set(v)) else readyL,
-      readyR' = if (cohortR.contains(v) and syncedR.contains(v)) readyR.union(Set(v)) else readyR,
+      liveSig.contains(v),
+      liveSig' = liveSig.exclude(Set(v)),
       epoch' = epoch,
       pool' = pool,
+      benched' = benched,
+      pendingPresent' = pendingPresent,
+      seed' = seed,
+      cohortL' = cohortL,
+      cohortR' = cohortR,
+      readyL' = readyL,
+      readyR' = readyR,
+      syncedL' = syncedL,
+      syncedR' = syncedR,
+      everAssignedL' = everAssignedL,
+      everAssignedR' = everAssignedR,
+      lastAsserted' = lastAsserted,
+      admittedAt' = admittedAt,
+      executed' = false,
+    }
+  }
+
+  // The ready fold. A validator with a live signal, currently seated on a
+  // child, is marked ready for that seat. The child-bound rule additionally
+  // requires it synced that child; the unbound twin does not.
+  action foldReady = {
+    nondet v = IDS.oneOf()
+    val readyForL = cohortL.contains(v) and live(v) and (UNBOUND_READY or syncedL.contains(v))
+    val readyForR = cohortR.contains(v) and live(v) and (UNBOUND_READY or syncedR.contains(v))
+    all {
+      not(executed),
+      readyForL or readyForR,
+      readyL' = if (readyForL) readyL.union(Set(v)) else readyL,
+      readyR' = if (readyForR) readyR.union(Set(v)) else readyR,
+      epoch' = epoch,
+      pool' = pool,
+      benched' = benched,
       pendingPresent' = pendingPresent,
       seed' = seed,
       cohortL' = cohortL,
       cohortR' = cohortR,
       syncedL' = syncedL,
       syncedR' = syncedR,
+      liveSig' = liveSig,
+      everAssignedL' = everAssignedL,
+      everAssignedR' = everAssignedR,
+      lastAsserted' = lastAsserted,
+      admittedAt' = admittedAt,
+      executed' = false,
+    }
+  }
+
+  // Pool churn during a lapse: a benched spare swaps in for a pooled member
+  // (a jail-plus-activation, or another reshape returning its cohort). Keeps
+  // the pool at target size but changes its composition.
+  action churn = {
+    nondet vout = pool.oneOf()
+    nondet vin = benched.oneOf()
+    all {
+      POOL_CHURN,
+      not(executed),
+      pendingPresent,
+      cohortL.union(cohortR) == Set(),
+      benched != Set(),
+      pool' = pool.exclude(Set(vout)).union(Set(vin)),
+      benched' = benched.exclude(Set(vin)).union(Set(vout)),
+      epoch' = epoch,
+      pendingPresent' = pendingPresent,
+      seed' = seed,
+      cohortL' = cohortL,
+      cohortR' = cohortR,
+      readyL' = readyL,
+      readyR' = readyR,
+      syncedL' = syncedL,
+      syncedR' = syncedR,
+      liveSig' = liveSig,
       everAssignedL' = everAssignedL,
       everAssignedR' = everAssignedR,
       lastAsserted' = lastAsserted,
@@ -452,6 +574,7 @@ module reshape_lifecycle {
     epoch - admittedAt < READY_TTL,
     epoch' = epoch,
     pool' = pool.union(cohortL).union(cohortR),
+    benched' = benched,
     pendingPresent' = true,
     seed' = seed,
     cohortL' = Set(),
@@ -460,6 +583,7 @@ module reshape_lifecycle {
     readyR' = Set(),
     syncedL' = syncedL,
     syncedR' = syncedR,
+    liveSig' = liveSig,
     everAssignedL' = everAssignedL,
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
@@ -467,14 +591,15 @@ module reshape_lifecycle {
     executed' = false,
   }
 
-  // Ungated for READY_TTL after admission: abandon, returning the cohort and
-  // clearing the reshape's identity.
+  // Ungated for READY_TTL after admission: abandon, returning the cohort to
+  // the pool and clearing the reshape's identity and any held signals.
   action abandon = all {
     not(executed),
     pendingPresent,
     epoch - admittedAt >= READY_TTL,
     epoch' = epoch,
     pool' = pool.union(cohortL).union(cohortR),
+    benched' = benched,
     pendingPresent' = false,
     seed' = 0,
     cohortL' = Set(),
@@ -483,6 +608,7 @@ module reshape_lifecycle {
     readyR' = Set(),
     syncedL' = Set(),
     syncedR' = Set(),
+    liveSig' = Set(),
     everAssignedL' = Set(),
     everAssignedR' = Set(),
     lastAsserted' = lastAsserted,
@@ -501,6 +627,7 @@ module reshape_lifecycle {
     executed' = true,
     epoch' = epoch,
     pool' = pool,
+    benched' = benched,
     pendingPresent' = false,
     seed' = seed,
     cohortL' = cohortL,
@@ -509,6 +636,7 @@ module reshape_lifecycle {
     readyR' = readyR,
     syncedL' = syncedL,
     syncedR' = syncedR,
+    liveSig' = liveSig,
     everAssignedL' = everAssignedL,
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
@@ -518,6 +646,7 @@ module reshape_lifecycle {
   action tick = all {
     epoch' = epoch + 1,
     pool' = pool,
+    benched' = benched,
     pendingPresent' = pendingPresent,
     seed' = seed,
     cohortL' = cohortL,
@@ -526,6 +655,7 @@ module reshape_lifecycle {
     readyR' = readyR,
     syncedL' = syncedL,
     syncedR' = syncedR,
+    liveSig' = liveSig,
     everAssignedL' = everAssignedL,
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
@@ -533,7 +663,9 @@ module reshape_lifecycle {
     executed' = executed,
   }
 
-  action step = any { admit, reassert, syncStep, foldReady, lapse, abandon, execute, tick }
+  action step = any {
+    admit, reassert, syncStep, expireSig, foldReady, churn, lapse, abandon, execute, tick,
+  }
 
   // Honest-synced members a child actually has: its parent half (trusted
   // live) plus ready cohort seats that genuinely synced that child and are
@@ -541,13 +673,16 @@ module reshape_lifecycle {
   def functionalL = PARENT_HALF_L + cohortL.intersect(syncedL).exclude(BYZ).size()
   def functionalR = PARENT_HALF_R + cohortR.intersect(syncedR).exclude(BYZ).size()
 
-  // Placements partition: pool and the two cohorts are disjoint and cover
-  // every observer; lapse/abandon return the cohort to the pool exactly.
+  // Placements partition: the pool, the two cohorts, and the bench are
+  // disjoint and cover every observer.
   val invConservation = and {
-    pool.union(cohortL).union(cohortR) == ALLVALS,
+    pool.union(cohortL).union(cohortR).union(benched) == IDS,
     cohortL.intersect(cohortR) == Set(),
     pool.intersect(cohortL) == Set(),
     pool.intersect(cohortR) == Set(),
+    benched.intersect(pool) == Set(),
+    benched.intersect(cohortL) == Set(),
+    benched.intersect(cohortR) == Set(),
   }
 
   // INV-RESHAPE-7: an observer's child assignment never drifts from its
@@ -578,12 +713,39 @@ module reshape_lifecycle {
   }
 }
 
-// Healthy split: frozen seed, honest cohort, unchurned pool. Admission,
-// lapse/re-staff, and the seating gate all preserve staffing soundness.
+// Healthy split: frozen seed, honest cohort, no pool churn, child-bound
+// signal. Staffing soundness holds through admit, lapse/re-staff, execute.
 module reshape_split_ok {
   import reshape_lifecycle(
     SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
-    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(), SEEDS = Set(1, 2),
-    EPOCH_SEEDED_DRAW = false
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
+    UNBOUND_READY = false
+  ).*
+}
+
+// Pool churn, child-bound signal. The frozen-seed re-staff over a churned
+// pool drifts an observer off its first assignment (invSeatStability fails),
+// but the drift is benign: a child-bound signal will not fold for the new
+// seat, so invNoHonestFalseReady and invSeatingGate still hold.
+module reshape_split_churn {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
+    UNBOUND_READY = false
+  ).*
+}
+
+// The finding. Pool churn plus an unbound signal: a still-valid ready signal
+// emitted for the observer's prior seat folds for the seat it churned to,
+// marking it ready without ever syncing that child — invNoHonestFalseReady
+// (and, downstream, invSeatingGate) fails with no Byzantine actor.
+module reshape_unbound_ready {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
+    UNBOUND_READY = true
   ).*
 }
