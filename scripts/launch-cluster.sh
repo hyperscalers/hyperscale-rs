@@ -371,19 +371,13 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     echo "  Validator $i: public_key=${PUBLIC_KEYS[$i]:0:16}..."
 done
 
-# Generate genesis balances for spammer accounts (per-shard)
-# Each validator only needs balances for accounts on its shard to avoid
-# memory issues with large account counts.
+# Generate genesis balances for spammer accounts. Genesis is single-shard:
+# every account is funded on ROOT, so every host embeds the same full set.
 echo "Generating genesis balances for spammer accounts..."
-declare -a SHARD_GENESIS_BALANCES
-for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    SHARD_GENESIS_BALANCES[$shard]=$("$SPAMMER_BIN" genesis \
-        --num-shards "$NUM_SHARDS" \
-        --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
-        --balance "$INITIAL_BALANCE" \
-        --shard "$shard")
-    echo "  Shard $shard: $ACCOUNTS_PER_SHARD accounts"
-done
+GENESIS_BALANCES=$("$SPAMMER_BIN" genesis \
+    --num-shards "$NUM_SHARDS" \
+    --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+    --balance "$INITIAL_BALANCE")
 echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts total"
 
 # Calculate bootstrap peer addresses. Pick NUM_SHARDS hosts for redundancy.
@@ -412,12 +406,9 @@ for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
         GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 "
     fi
-    validator_shard=$((j / VALIDATORS_PER_SHARD))
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
 id = $j
-shard = $validator_shard
-public_key = \"${PUBLIC_KEYS[$j]}\"
-voting_power = 1"
+public_key = \"${PUBLIC_KEYS[$j]}\""
 done
 
 # Generate one TOML per host. Packing strategy:
@@ -435,47 +426,31 @@ for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
     NODE_DATA_DIR="$HOST_DIR/data"
     mkdir -p "$NODE_DATA_DIR"
 
-    # Build [[vnode]] blocks and accumulate the per-shard genesis balance
-    # blocks this host needs (one block per distinct hosted shard). Shard
-    # indices are small integers, so an indexed array doubles as a dedup
-    # set without needing bash-4-only associative arrays.
+    # Build this host's [[vnode]] blocks.
     VNODE_BLOCKS=""
     HOSTED_LIST=""
     SHARD_SUMMARY=""
-    HOST_GENESIS_BALANCES=""
-    HOST_SHARDS_INCLUDED=()
 
     add_vnode_block() {
         local vid=$1
-        local sh=$2
         if [ -n "$VNODE_BLOCKS" ]; then
             VNODE_BLOCKS="$VNODE_BLOCKS
 "
         fi
         VNODE_BLOCKS="$VNODE_BLOCKS[[vnode]]
 validator_id = $vid
-shard = $sh
 key_path = \"${KEY_FILES[$vid]}\""
         if [ -n "$HOSTED_LIST" ]; then
             HOSTED_LIST="$HOSTED_LIST, "
         fi
         HOSTED_LIST="$HOSTED_LIST$vid"
-        if [ -z "${HOST_SHARDS_INCLUDED[$sh]:-}" ]; then
-            HOST_SHARDS_INCLUDED[$sh]=1
-            if [ -n "$HOST_GENESIS_BALANCES" ]; then
-                HOST_GENESIS_BALANCES="$HOST_GENESIS_BALANCES
-
-"
-            fi
-            HOST_GENESIS_BALANCES="$HOST_GENESIS_BALANCES${SHARD_GENESIS_BALANCES[$sh]}"
-        fi
     }
 
     if [ "$CROSS_SHARD_PACK" = true ]; then
         # One vnode from each shard at validator index (shard * VPS + host_idx).
         for shard in $(seq 0 $((NUM_SHARDS - 1))); do
             vnode_id=$((shard * VALIDATORS_PER_SHARD + host_idx))
-            add_vnode_block "$vnode_id" "$shard"
+            add_vnode_block "$vnode_id"
         done
         SHARD_SUMMARY="shards [0..$((NUM_SHARDS - 1))]"
     else
@@ -484,7 +459,7 @@ key_path = \"${KEY_FILES[$vid]}\""
         first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
         for k in $(seq 0 $((VNODES_PER_HOST - 1))); do
             vnode_id=$((first_vnode + k))
-            add_vnode_block "$vnode_id" "$shard"
+            add_vnode_block "$vnode_id"
         done
         SHARD_SUMMARY="shard $shard"
     fi
@@ -495,7 +470,6 @@ key_path = \"${KEY_FILES[$vid]}\""
 # Host $host_idx: $SHARD_SUMMARY, vnodes [$HOSTED_LIST]
 
 [node]
-num_shards = $NUM_SHARDS
 data_dir = "$NODE_DATA_DIR"
 
 $VNODE_BLOCKS
@@ -534,11 +508,10 @@ log_file = "$HOST_DIR/output.log"
 
 $GENESIS_VALIDATORS
 
-$HOST_GENESIS_BALANCES
+$GENESIS_BALANCES
 EOF
 
     echo "  Created config for host $host_idx ($SHARD_SUMMARY, vnodes [$HOSTED_LIST], rpc port $rpc_port)"
-    unset HOST_SHARDS_INCLUDED
 done
 
 # Apply network conditions before starting validators so they experience

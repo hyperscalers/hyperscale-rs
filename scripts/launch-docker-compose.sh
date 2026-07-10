@@ -124,14 +124,15 @@ done
 
 GENESIS_VALIDATORS="[genesis]"
 for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    v_shard=$((j / VALIDATORS_PER_SHARD))
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 [[genesis.validators]]
 id = $j
-shard = $v_shard
-public_key = \"${PUBLIC_KEYS[$j]}\"
-voting_power = 1"
+public_key = \"${PUBLIC_KEYS[$j]}\""
 done
+
+# Genesis is single-shard: every account is funded on ROOT, so every
+# container embeds the same full balance set.
+GENESIS_BALANCES=$("$SPAM_BIN" genesis --num-shards "$NUM_SHARDS" --accounts-per-shard "$ACCOUNTS_PER_SHARD" --balance "$INITIAL_BALANCE")
 
 # --- 4. Write Compose & Configs ---
 cat > "$COMPOSE_FILE" <<EOF
@@ -147,21 +148,17 @@ services:
 EOF
 
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    shard=$((i / VALIDATORS_PER_SHARD))
     NODE_DIR="$DATA_DIR/validator-$i"
     IP="172.99.0.$((10 + i))"
-    SHARD_BALANCES=$("$SPAM_BIN" genesis --num-shards "$NUM_SHARDS" --accounts-per-shard "$ACCOUNTS_PER_SHARD" --balance "$INITIAL_BALANCE" --shard "$shard")
 
     cat > "$NODE_DIR/config.toml" <<EOF
 [node]
-validator_id = $i
-shard = $shard
-num_shards = $NUM_SHARDS
-key_path = "/home/hyperscalers/signing.key"
 data_dir = "/home/hyperscalers/data"
+[[vnode]]
+validator_id = $i
+key_path = "/home/hyperscalers/signing.key"
 [network]
 listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
-external_addr = "/ip4/$IP/udp/9000/quic-v1"
 upnp_enabled = false
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 version_interop_mode = "relaxed"
@@ -169,7 +166,7 @@ version_interop_mode = "relaxed"
 enabled = true
 listen_addr = "0.0.0.0:8080"
 $GENESIS_VALIDATORS
-$SHARD_BALANCES
+$GENESIS_BALANCES
 EOF
 
     # Prepare optional configuration

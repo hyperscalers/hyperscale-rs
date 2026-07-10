@@ -105,11 +105,11 @@ cat > "$CONFIG_FILE" << EOF
 # Hyperscale Bootstrap Node Configuration
 
 [node]
-validator_id = 0
-shard = 0
-num_shards = 1
-key_path = "$KEY_FILE"
 data_dir = "$NODE_DATA_DIR"
+
+[[vnode]]
+validator_id = 0
+key_path = "$KEY_FILE"
 
 [network]
 listen_addr = "/ip4/0.0.0.0/udp/$BASE_PORT/quic-v1"
@@ -138,9 +138,7 @@ enabled = false
 
 [[genesis.validators]]
 id = 0
-shard = 0
 public_key = "$PUBLIC_KEY"
-voting_power = 1
 
 # No initial balances needed for bootstrap node specific logic yet
 EOF

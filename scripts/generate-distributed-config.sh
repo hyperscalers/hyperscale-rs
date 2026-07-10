@@ -234,16 +234,14 @@ done
 ACCOUNTS_PER_SHARD=16000
 INITIAL_BALANCE=1000000
 
+# Genesis is single-shard: every account is funded on ROOT, so every node
+# embeds the same full balance set.
 echo "Generating genesis balances for spammer accounts..."
-declare -a SHARD_GENESIS_BALANCES
-for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    SHARD_GENESIS_BALANCES[$shard]=$("$SPAMMER_BIN" genesis \
-        --num-shards "$NUM_SHARDS" \
-        --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
-        --balance "$INITIAL_BALANCE" \
-        --shard "$shard")
-    echo "  Shard $shard: $ACCOUNTS_PER_SHARD accounts"
-done
+GENESIS_BALANCES=$("$SPAMMER_BIN" genesis \
+    --num-shards "$NUM_SHARDS" \
+    --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+    --balance "$INITIAL_BALANCE")
+echo "  $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts total"
 
 # 3. Build Genesis Validator Set
 GENESIS_VALIDATORS=""
@@ -254,9 +252,7 @@ for id in $(seq 0 $((TOTAL_NODES - 1))); do
     fi
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
 id = $id
-shard = $((id / NODES_PER_SHARD))
-public_key = \"${PUBLIC_KEYS[$id]}\"
-voting_power = 1"
+public_key = \"${PUBLIC_KEYS[$id]}\""
 done
 
 # 4. Build Bootstrap Peer List
@@ -309,11 +305,11 @@ for i in "${!HOST_IPS[@]}"; do
 # Public IP: $IP
 
 [node]
-validator_id = $NODE_ID
-shard = $((NODE_ID / NODES_PER_SHARD))
-num_shards = $NUM_SHARDS
-key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
 data_dir = "./distributed-cluster-data/host-$i/node-$v/data"
+
+[[vnode]]
+validator_id = $NODE_ID
+key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
 
 [network]
 # bind to all interfaces
@@ -353,7 +349,7 @@ enabled = false
 
 $GENESIS_VALIDATORS
 
-${SHARD_GENESIS_BALANCES[0]}
+$GENESIS_BALANCES
 EOF
         echo "  Generated config for Host $i ($IP) Node $v (Port $RPC_PORT)"
     done

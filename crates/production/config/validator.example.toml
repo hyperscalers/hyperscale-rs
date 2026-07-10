@@ -170,19 +170,15 @@ service_name = "hyperscale-validator"
 # [[genesis.validators]]
 # id = 0
 # public_key = "0123456789abcdef..." # 64 hex chars (32 bytes Ed25519)
-# voting_power = 1
 #
 # [[genesis.validators]]
 # id = 1
 # public_key = "fedcba9876543210..."
-# voting_power = 1
 #
 # [[genesis.validators]]
 # id = 2
 # public_key = "abcdef0123456789..."
-# voting_power = 1
 #
 # [[genesis.validators]]
 # id = 3
 # public_key = "9876543210abcdef..."
-# voting_power = 1
