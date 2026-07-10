@@ -296,6 +296,7 @@ mod tests {
     fn ready_signal_for(validator: u64) -> ReadySignal {
         ReadySignal::new(
             ValidatorId::new(validator),
+            ShardId::ROOT,
             WeightedTimestamp::from_millis(1),
             WeightedTimestamp::from_millis(100),
             Bls12381G2Signature([0x42; 96]),
@@ -476,7 +477,7 @@ mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
         match &leaves[2] {
-            ShardWitnessPayload::ReshapeReady { validator } => assert_eq!(validator.inner(), 2),
+            ShardWitnessPayload::ReshapeReady { validator, .. } => assert_eq!(validator.inner(), 2),
             other => panic!("expected ReshapeReady, got {other:?}"),
         }
         match &leaves[3] {

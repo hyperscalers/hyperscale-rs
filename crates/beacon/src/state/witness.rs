@@ -537,16 +537,22 @@ pub(super) fn apply_shard_payload(
             );
             None
         }
-        ShardWitnessPayload::ReshapeReady { validator } => {
+        ShardWitnessPayload::ReshapeReady { validator, child } => {
             // Source pinning: a split's observers signal through the
             // splitting shard's own chain; a merge's keepers signal
             // through their child's chain (the merge is keyed by the
             // child's parent). Only the holder of a seat on that pending
-            // reshape can mark it; anything else is silently dropped.
+            // reshape can mark it, and only for the successor it actually
+            // synced: `child` is the emitter's signed attestation, and a
+            // seat is marked ready only when its target matches. A signal
+            // retained across a lapse and re-staffed onto the sibling child
+            // no longer matches its seat, so it cannot mark it ready.
             if let Some(PendingReshape::Split { cohort, .. }) =
                 state.pending_reshapes.get_mut(&source_shard)
             {
-                if let Some(seat) = cohort.get_mut(validator) {
+                if let Some(seat) = cohort.get_mut(validator)
+                    && seat.child == *child
+                {
                     seat.ready = true;
                 }
                 return None;
@@ -556,6 +562,7 @@ pub(super) fn apply_shard_payload(
                 .and_then(|parent| state.pending_reshapes.get_mut(&parent))
                 && let Some(seat) = keepers.get_mut(validator)
                 && seat.child == source_shard
+                && seat.child == *child
             {
                 seat.ready = true;
             }
@@ -1832,7 +1839,11 @@ mod tests {
         let mut state = reshape_state(&[p, elsewhere], 4);
         apply_shard_payload(&mut state, p, &split_payload(p));
         let observer = *cohort_of(&state, p).keys().next().unwrap();
-        let ready = |v: ValidatorId| ShardWitnessPayload::ReshapeReady { validator: v };
+        let observer_child = cohort_of(&state, p)[&observer].child;
+        let ready = |v: ValidatorId| ShardWitnessPayload::ReshapeReady {
+            validator: v,
+            child: observer_child,
+        };
 
         // Wrong source shard: no seat marked.
         apply_shard_payload(&mut state, elsewhere, &ready(observer));

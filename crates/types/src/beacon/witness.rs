@@ -144,12 +144,18 @@ pub enum ShardWitnessPayload {
     /// of the source shard and is ready for the reshape to execute.
     /// Rides the source shard's chain like [`Self::Ready`]; the beacon
     /// folds it into the pending reshape's per-child readiness, which
-    /// gates execution. The target child is implied — reshapes never
-    /// overlap, so the source shard names the pending record and the
-    /// cohort seat names the child.
+    /// gates execution. The source shard names the pending record; the
+    /// attested `child` — carried up from the emitter's signed
+    /// [`ReadySignal`](crate::ReadySignal) — names which successor the
+    /// emitter synced. The fold credits the readiness only to a seat whose
+    /// target equals `child`, so a signal retained across a reshape lapse
+    /// cannot mark a seat the emitter re-staffed onto but never synced.
     ReshapeReady {
         /// Observer signalling sync completion.
         validator: ValidatorId,
+        /// Successor shard the emitter attests it synced (a split child,
+        /// or the child a merge keeper runs).
+        child: ShardId,
     },
 }
 
@@ -460,6 +466,7 @@ mod tests {
             },
             ShardWitnessPayload::ReshapeReady {
                 validator: ValidatorId::new(13),
+                child: ShardId::leaf(2, 0b01),
             },
             ShardWitnessPayload::ParamVote(sample_param_vote()),
         ];

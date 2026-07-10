@@ -872,6 +872,7 @@ where
         }
 
         Action::SignAndBroadcastReadySignal {
+            shard,
             wt_window_start,
             wt_window_end,
             recipients,
@@ -879,11 +880,12 @@ where
             let msg = ready_signal_message(
                 ctx.topology_snapshot.network(),
                 ctx.me,
+                shard,
                 wt_window_start,
                 wt_window_end,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let signal = ReadySignal::new(ctx.me, wt_window_start, wt_window_end, sig);
+            let signal = ReadySignal::new(ctx.me, shard, wt_window_start, wt_window_end, sig);
             // No local feedback: the sender is outside the consensus
             // subset, so it never proposes and its own pool entry would
             // never drain — only the recipients' pools matter.

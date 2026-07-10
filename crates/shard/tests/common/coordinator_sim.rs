@@ -603,11 +603,29 @@ impl ShardCoordinatorSim {
         wt_window_start: WeightedTimestamp,
         wt_window_end: WeightedTimestamp,
     ) {
+        self.emit_ready_signal_for_shard(signer_idx, self.shard, wt_window_start, wt_window_end);
+    }
+
+    /// Emit a ready signal attesting `shard` — the signer's own shard for an
+    /// ordinary member, or the synced child for a reshape observer.
+    pub fn emit_ready_signal_for_shard(
+        &mut self,
+        signer_idx: usize,
+        shard: ShardId,
+        wt_window_start: WeightedTimestamp,
+        wt_window_end: WeightedTimestamp,
+    ) {
         let validator = self.members[signer_idx].0;
         let sk = &self.sks[signer_idx];
-        let msg = ready_signal_message(&self.network, validator, wt_window_start, wt_window_end);
+        let msg = ready_signal_message(
+            &self.network,
+            validator,
+            shard,
+            wt_window_start,
+            wt_window_end,
+        );
         let sig = Bls12381G2Signature(sk.sign_v1(&msg).0);
-        let signal = ReadySignal::new(validator, wt_window_start, wt_window_end, sig);
+        let signal = ReadySignal::new(validator, shard, wt_window_start, wt_window_end, sig);
         for idx in 0..self.n() {
             self.coordinators[idx]
                 .on_ready_signal_received(&self.topology_schedule, signal.clone());

@@ -216,6 +216,7 @@ pub fn derive_leaves(
             shard,
             topology_snapshot,
             signal.validator_id(),
+            signal.shard(),
         ));
     }
     out.extend(reshape);
@@ -226,6 +227,9 @@ pub fn derive_leaves(
 /// of this shard, or a merge keeper running it, emits `ReshapeReady`;
 /// everyone else emits a plain `Ready`.
 ///
+/// `attested` is the shard the emitter signed readiness for — carried into
+/// `ReshapeReady` so the fold can match it against the seat's target child.
+///
 /// Shared by [`derive_leaves`] and the proposer's per-window dedup, so the
 /// leaf a proposer skips as already-committed is byte-identical to the one
 /// the fold would apply.
@@ -234,13 +238,17 @@ pub fn ready_leaf_payload(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     id: ValidatorId,
+    attested: ShardId,
 ) -> ShardWitnessPayload {
     let reshaping = topology_snapshot
         .reshape_observer_child(shard, id)
         .is_some()
         || topology_snapshot.reshape_keeper_parent(shard, id).is_some();
     if reshaping {
-        ShardWitnessPayload::ReshapeReady { validator: id }
+        ShardWitnessPayload::ReshapeReady {
+            validator: id,
+            child: attested,
+        }
     } else {
         ShardWitnessPayload::Ready { id }
     }
@@ -561,20 +569,22 @@ mod tests {
 
         let shard = ShardId::ROOT;
         let observer = ValidatorId::new(0);
+        let child = ShardId::leaf(1, 0);
         let signals = vec![ReadySignal::new(
             observer,
+            child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
             zero_bls_signature(),
         )];
         let leaf = ShardWitnessPayload::ReshapeReady {
             validator: observer,
+            child,
         }
         .leaf_hash();
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
 
-        let seated =
-            snapshot_with_observers(shard, 0, BTreeMap::from([(observer, ShardId::leaf(1, 0))]));
+        let seated = snapshot_with_observers(shard, 0, BTreeMap::from([(observer, child)]));
         let mut ctx = context_with(&seated, shard, 0, Vec::new(), 1);
         ctx.ready_signals = &signals;
         assert!(expected_root.verify(&ctx).is_ok());
@@ -602,11 +612,16 @@ mod tests {
         let keeper = ValidatorId::new(0);
         let signals = vec![ReadySignal::new(
             keeper,
+            child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
             zero_bls_signature(),
         )];
-        let leaf = ShardWitnessPayload::ReshapeReady { validator: keeper }.leaf_hash();
+        let leaf = ShardWitnessPayload::ReshapeReady {
+            validator: keeper,
+            child,
+        }
+        .leaf_hash();
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
 
         let seated = snapshot_with_keepers(child, 0, BTreeMap::from([(keeper, parent)]));

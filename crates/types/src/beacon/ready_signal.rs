@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{Bls12381G2Signature, ValidatorId, WeightedTimestamp};
+use crate::{Bls12381G2Signature, ShardId, ValidatorId, WeightedTimestamp};
 
 /// The weighted-time span a [`ReadySignal`]'s `[start, end]` validity
 /// window covers, scaled to the running network's `epoch_duration_ms`.
@@ -36,17 +36,24 @@ pub const fn ready_signal_window(epoch_duration_ms: u64) -> Duration {
 }
 
 /// Validator-emitted attestation that they're synced and ready to sign
-/// on their shard.
+/// on a specific shard.
 ///
-/// The signed message binds `(network.id, validator_id, wt_window)` so
-/// the signal can't be replayed across networks and can't be hoarded
-/// past its `[start, end]` weighted-time window. Window enforcement is
-/// the proposer/voter's job; the type itself just carries the
-/// parameters.
+/// The signed message binds `(network.id, validator_id, shard, wt_window)`
+/// so the signal can't be replayed across networks and can't be hoarded
+/// past its `[start, end]` weighted-time window. The `shard` binding names
+/// the shard whose state the emitter attests it has synced — its own shard
+/// for an ordinary member, the pending child for a split observer, the
+/// child it runs for a merge keeper. The beacon fold credits the readiness
+/// only to a seat whose target matches `shard`, so a signal retained across
+/// a reshape lapse cannot mark a seat the emitter never synced. Window
+/// enforcement is the proposer/voter's job; the type itself just carries
+/// the parameters.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ReadySignal {
     /// Validator emitting the signal.
     validator_id: ValidatorId,
+    /// Shard whose synced state the signal attests readiness for.
+    shard: ShardId,
     /// First weighted timestamp at which the signal is eligible for
     /// inclusion — a block whose parent-QC `weighted_timestamp` falls in
     /// `[start, end]` may carry it.
@@ -65,12 +72,14 @@ impl ReadySignal {
     #[must_use]
     pub const fn new(
         validator_id: ValidatorId,
+        shard: ShardId,
         wt_window_start: WeightedTimestamp,
         wt_window_end: WeightedTimestamp,
         sig: Bls12381G2Signature,
     ) -> Self {
         Self {
             validator_id,
+            shard,
             wt_window_start,
             wt_window_end,
             sig,
@@ -81,6 +90,12 @@ impl ReadySignal {
     #[must_use]
     pub const fn validator_id(&self) -> ValidatorId {
         self.validator_id
+    }
+
+    /// Shard whose synced state the signal attests readiness for.
+    #[must_use]
+    pub const fn shard(&self) -> ShardId {
+        self.shard
     }
 
     /// First eligible inclusion weighted timestamp.
@@ -112,6 +127,7 @@ mod tests {
     fn sbor_round_trip() {
         let signal = ReadySignal::new(
             ValidatorId::new(7),
+            ShardId::ROOT,
             WeightedTimestamp::from_millis(100),
             WeightedTimestamp::from_millis(228),
             Bls12381G2Signature([0xAB; 96]),
@@ -123,13 +139,16 @@ mod tests {
 
     #[test]
     fn accessors_return_constructor_values() {
+        let shard = ShardId::ROOT.children().0;
         let signal = ReadySignal::new(
             ValidatorId::new(3),
+            shard,
             WeightedTimestamp::from_millis(50),
             WeightedTimestamp::from_millis(99),
             Bls12381G2Signature([0xCD; 96]),
         );
         assert_eq!(signal.validator_id(), ValidatorId::new(3));
+        assert_eq!(signal.shard(), shard);
         assert_eq!(signal.wt_window_start(), WeightedTimestamp::from_millis(50));
         assert_eq!(signal.wt_window_end(), WeightedTimestamp::from_millis(99));
         assert_eq!(signal.sig(), Bls12381G2Signature([0xCD; 96]));

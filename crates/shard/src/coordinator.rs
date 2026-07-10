@@ -909,6 +909,7 @@ impl ShardCoordinator {
             "Synced to tip while not yet ready — broadcasting ReadySignal"
         );
         Some(Action::SignAndBroadcastReadySignal {
+            shard: self.local_shard,
             wt_window_start,
             wt_window_end,
             recipients,
@@ -1507,8 +1508,12 @@ impl ShardCoordinator {
         // same window. The re-emission that landed it here is absorbed: the
         // pool already dropped it on drain.
         ready_signals.retain(|signal| {
-            let leaf =
-                ready_leaf_payload(self.local_shard, topology_snapshot, signal.validator_id());
+            let leaf = ready_leaf_payload(
+                self.local_shard,
+                topology_snapshot,
+                signal.validator_id(),
+                signal.shard(),
+            );
             !parent_leaves.contains(&leaf.leaf_hash())
         });
 
@@ -7710,6 +7715,7 @@ mod tests {
                     wt_window_start,
                     wt_window_end,
                     recipients,
+                    ..
                 } => Some((wt_window_start, wt_window_end, recipients)),
                 _ => None,
             })

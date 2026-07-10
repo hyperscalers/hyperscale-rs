@@ -197,9 +197,10 @@ impl ShardSupervisor {
             } => self.reshape_apply(shard, height, receipts),
             ReshapeRequest::BroadcastReady {
                 validator,
+                child,
                 anchor,
                 recipients,
-            } => self.reshape_broadcast(validator, anchor, &recipients),
+            } => self.reshape_broadcast(validator, child, anchor, &recipients),
             ReshapeRequest::Adopt {
                 shard,
                 kind,
@@ -466,12 +467,14 @@ impl ShardSupervisor {
         });
     }
 
-    /// Sign `validator`'s ready signal anchored at `anchor` and notify the
-    /// reshape committee `recipients`. No response — the orchestrator
-    /// re-asserts each step until the gate fires.
+    /// Sign `validator`'s ready signal attesting the sync of `child`,
+    /// anchored at `anchor`, and notify the reshape committee `recipients`.
+    /// No response — the orchestrator re-asserts each step until the gate
+    /// fires.
     fn reshape_broadcast(
         &self,
         validator: ValidatorId,
+        child: ShardId,
         anchor: ShardAnchor,
         recipients: &[ValidatorId],
     ) {
@@ -485,6 +488,7 @@ impl ShardSupervisor {
         let signal = observer_ready_signal(
             &self.beacon_network,
             validator,
+            child,
             signing_key,
             anchor,
             self.epoch_duration_ms,
