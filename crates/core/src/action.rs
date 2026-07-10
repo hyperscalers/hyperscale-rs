@@ -223,6 +223,9 @@ pub enum Action {
     /// their pools hold the signal until a proposer drains it into a block
     /// manifest and the beacon's `Ready` witness flips `ready: true`.
     SignAndBroadcastReadySignal {
+        /// Shard whose synced state the signal attests readiness for — the
+        /// emitting member's own shard. Bound into the signed message.
+        shard: ShardId,
         /// First weighted timestamp at which the signal is eligible for
         /// inclusion.
         wt_window_start: WeightedTimestamp,

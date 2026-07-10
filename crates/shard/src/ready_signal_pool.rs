@@ -179,13 +179,14 @@ impl ReadySignalPool {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::Bls12381G2Signature;
+    use hyperscale_types::{Bls12381G2Signature, ShardId};
 
     use super::*;
 
     fn signal(validator: u64, start: u64, end: u64) -> ReadySignal {
         ReadySignal::new(
             ValidatorId::new(validator),
+            ShardId::ROOT,
             WeightedTimestamp::from_millis(start),
             WeightedTimestamp::from_millis(end),
             Bls12381G2Signature([0xAB; 96]),

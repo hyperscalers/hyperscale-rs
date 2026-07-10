@@ -143,6 +143,7 @@ impl SimulationRunner {
             }
             ReshapeRequest::BroadcastReady {
                 validator,
+                child,
                 anchor,
                 recipients,
             } => {
@@ -157,6 +158,7 @@ impl SimulationRunner {
                     let signal = observer_ready_signal(
                         &self.beacon_network,
                         validator,
+                        child,
                         &self.signing_keys
                             [usize::try_from(validator.inner()).expect("id fits usize")],
                         anchor,

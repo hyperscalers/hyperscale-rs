@@ -440,6 +440,7 @@ where
                     let msg = ready_signal_message(
                         topo.network(),
                         sender,
+                        signal.shard(),
                         signal.wt_window_start(),
                         signal.wt_window_end(),
                     );

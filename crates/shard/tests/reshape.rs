@@ -126,8 +126,9 @@ fn observer_ready_signal_commits_as_reshape_ready_leaf() {
     );
     sim.topology_schedule = TopologySchedule::single(Arc::new(snapshot));
 
-    sim.emit_ready_signal(
+    sim.emit_ready_signal_for_shard(
         3,
+        left,
         WeightedTimestamp::from_millis(0),
         WeightedTimestamp::from_millis(u64::MAX),
     );
@@ -146,9 +147,10 @@ fn observer_ready_signal_commits_as_reshape_ready_leaf() {
         assert!(
             leaves.iter().any(|l| matches!(
                 l,
-                ShardWitnessPayload::ReshapeReady { validator } if *validator == observer
+                ShardWitnessPayload::ReshapeReady { validator, child }
+                    if *validator == observer && *child == left
             )),
-            "replica {replica}: observer signal never committed as ReshapeReady",
+            "replica {replica}: observer signal never committed as ReshapeReady for its child",
         );
         assert!(
             !leaves

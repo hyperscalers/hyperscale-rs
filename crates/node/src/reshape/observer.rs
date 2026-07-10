@@ -47,14 +47,15 @@ use crate::bootstrap::{BootstrapOutcome, BootstrapRequest, SPLIT_BITS, STATE_CHU
 pub fn observer_ready_signal(
     network: &NetworkDefinition,
     validator: ValidatorId,
+    child: ShardId,
     signing_key: &Bls12381G1PrivateKey,
     anchor: ShardAnchor,
     epoch_duration_ms: u64,
 ) -> ReadySignal {
     let start = anchor.weighted_timestamp;
     let end = start.plus(ready_signal_window(epoch_duration_ms));
-    let msg = ready_signal_message(network, validator, start, end);
-    ReadySignal::new(validator, start, end, signing_key.sign_v1(&msg))
+    let msg = ready_signal_message(network, validator, child, start, end);
+    ReadySignal::new(validator, child, start, end, signing_key.sign_v1(&msg))
 }
 
 enum Phase {

@@ -117,11 +117,17 @@ pub enum ReshapeRequest {
         /// The block's certified receipts.
         receipts: Vec<StoredReceipt>,
     },
-    /// Sign a ready signal for `validator` anchored at `anchor` and notify
-    /// `recipients` — the target committee minus the signer. No response.
+    /// Sign a ready signal for `validator` attesting the sync of `child`,
+    /// anchored at `anchor`, and notify `recipients` — the target committee
+    /// minus the signer. No response.
     BroadcastReady {
         /// The seat holder signing the signal.
         validator: ValidatorId,
+        /// The successor shard the signer attests it synced — the split
+        /// child an observer bootstrapped, or the child a merge keeper runs.
+        /// Bound into the signed signal so the fold credits it only to a
+        /// matching seat.
+        child: ShardId,
         /// The attested anchor the signal windows from.
         anchor: ShardAnchor,
         /// The committee the signal is broadcast to.
@@ -764,6 +770,7 @@ impl ReshapeOrchestrator {
                     for &validator in &duty.validators {
                         out.push(ReshapeRequest::BroadcastReady {
                             validator,
+                            child: duty.child,
                             anchor,
                             recipients: recipients_for(view, duty.parent, validator),
                         });
@@ -898,6 +905,7 @@ impl ReshapeOrchestrator {
                     if let Some(anchor) = view.boundary(member.own_child) {
                         out.push(ReshapeRequest::BroadcastReady {
                             validator: member.validator,
+                            child: member.own_child,
                             anchor,
                             recipients: recipients_for(view, member.own_child, member.validator),
                         });

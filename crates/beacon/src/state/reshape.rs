@@ -582,11 +582,13 @@ mod tests {
     }
 
     fn mark_ready(state: &mut BeaconState, target: ShardId, observer: ValidatorId) {
+        let child = cohort_of(state, target)[&observer].child;
         apply_shard_payload(
             state,
             target,
             &ShardWitnessPayload::ReshapeReady {
                 validator: observer,
+                child,
             },
         );
     }
@@ -860,15 +862,14 @@ mod tests {
         let mut state = grow_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         apply_witness_chunk(&mut state, 0, vec![split]);
-        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
-        let effects = apply_witness_chunk(
-            &mut state,
-            0,
-            observers
-                .iter()
-                .map(|v| ShardWitnessPayload::ReshapeReady { validator: *v })
-                .collect(),
-        );
+        let ready_leaves: Vec<ShardWitnessPayload> = cohort_of(&state, p)
+            .iter()
+            .map(|(v, seat)| ShardWitnessPayload::ReshapeReady {
+                validator: *v,
+                child: seat.child,
+            })
+            .collect();
+        let effects = apply_witness_chunk(&mut state, 0, ready_leaves);
         assert!(state.pending_reshapes.is_empty(), "the gate must fire");
         assert!(effects.observers_released.is_empty());
         let (left, right) = p.children();
@@ -926,15 +927,14 @@ mod tests {
         // The next epoch folds every observer's ReshapeReady; the gate
         // fires inside the same apply and the children ride this
         // fold's lookahead.
-        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
-        apply_witness_chunk(
-            &mut state,
-            0,
-            observers
-                .iter()
-                .map(|v| ShardWitnessPayload::ReshapeReady { validator: *v })
-                .collect(),
-        );
+        let ready_leaves: Vec<ShardWitnessPayload> = cohort_of(&state, p)
+            .iter()
+            .map(|(v, seat)| ShardWitnessPayload::ReshapeReady {
+                validator: *v,
+                child: seat.child,
+            })
+            .collect();
+        apply_witness_chunk(&mut state, 0, ready_leaves);
         assert!(state.pending_reshapes.is_empty());
 
         let active = state.derive_topology_snapshot(net());
@@ -1205,7 +1205,10 @@ mod tests {
             .find(|(_, seat)| seat.child == left)
             .map(|(id, _)| id)
             .expect("left contributes keepers");
-        let ready = ShardWitnessPayload::ReshapeReady { validator: keeper };
+        let ready = ShardWitnessPayload::ReshapeReady {
+            validator: keeper,
+            child: left,
+        };
 
         // Wrong chain: a left keeper's signal arriving on the right is
         // ignored.
@@ -1326,7 +1329,10 @@ mod tests {
             apply_shard_payload(
                 &mut state,
                 child,
-                &ShardWitnessPayload::ReshapeReady { validator: *id },
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: *id,
+                    child,
+                },
             );
         }
         execute_ready_merges(&mut state);
@@ -1339,7 +1345,10 @@ mod tests {
         apply_shard_payload(
             &mut state,
             keepers[&third].child,
-            &ShardWitnessPayload::ReshapeReady { validator: third },
+            &ShardWitnessPayload::ReshapeReady {
+                validator: third,
+                child: keepers[&third].child,
+            },
         );
         execute_ready_merges(&mut state);
 
@@ -1397,7 +1406,10 @@ mod tests {
                 apply_shard_payload(
                     state,
                     seat.child,
-                    &ShardWitnessPayload::ReshapeReady { validator: id },
+                    &ShardWitnessPayload::ReshapeReady {
+                        validator: id,
+                        child: seat.child,
+                    },
                 );
             }
             execute_ready_merges(state);
@@ -1455,7 +1467,10 @@ mod tests {
             apply_shard_payload(
                 &mut state,
                 seat.child,
-                &ShardWitnessPayload::ReshapeReady { validator: id },
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: id,
+                    child: seat.child,
+                },
             );
         }
         execute_ready_merges(&mut state);
@@ -1555,7 +1570,10 @@ mod tests {
             apply_shard_payload(
                 &mut state,
                 seat.child,
-                &ShardWitnessPayload::ReshapeReady { validator: id },
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: id,
+                    child: seat.child,
+                },
             );
         }
         execute_ready_merges(&mut state);
