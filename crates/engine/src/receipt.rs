@@ -17,7 +17,8 @@ use std::collections::{HashMap, HashSet};
 use hyperscale_types::{
     ApplicationEvent, BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, EventData,
     EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, GlobalReceiptHash, Hash, LogLevel,
-    NodeId, RoutableTransaction, ShardId, ShardTrie, TxHash, compute_merkle_root, system_action,
+    NodeId, RoutableTransaction, ShardId, ShardTrie, TxHash, compute_merkle_root,
+    has_partition_reset, system_action,
 };
 use radix_engine::transaction::{
     CommitResult, TransactionOutcome, TransactionReceipt, TransactionResult,
@@ -228,6 +229,12 @@ pub fn compute_vm_output(
 ///
 /// `ownership` is per-vnode and not held in the cache — see
 /// [`crate::sharding::build_cross_shard_ownership`].
+///
+/// # Panics
+///
+/// Panics if a partition Reset survives shard filtering — receipt
+/// updates must be Delta-only (see
+/// [`has_partition_reset`](hyperscale_types::has_partition_reset)).
 #[allow(clippy::implicit_hasher)]
 #[must_use]
 pub fn project_to_shard(
@@ -254,6 +261,14 @@ pub fn project_to_shard(
                 shard_trie,
                 declared_set,
                 ownership,
+            );
+            // Receipt updates must be Delta-only: storage applies them
+            // without enumerating pre-existing partition keys, so a Reset
+            // surviving shard filtering would silently diverge the live and
+            // sync JMT roots (see `hyperscale_types::has_partition_reset`).
+            assert!(
+                !has_partition_reset(&database_updates),
+                "partition Reset survived shard filtering for tx {tx_hash:?} — receipt updates must be Delta-only",
             );
             // Canonicalise key order so `ConsensusReceipt::local_receipt_hash`
             // (which SBOR-encodes the IndexMap directly) is order-stable

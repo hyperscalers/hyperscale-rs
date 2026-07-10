@@ -748,6 +748,11 @@ fn apply_database_updates(overlay: &mut OverlayEntries, updates: &DatabaseUpdate
                 PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
+                    // Receipt updates are Delta-only (enforced at receipt
+                    // decode), so block receipts never reach this arm. The
+                    // overlay cannot tombstone a whole partition — clearing
+                    // overlay entries leaves base-store keys visible — so a
+                    // Reset over pre-existing base keys would not hide them.
                     overlay.retain(|(epk, _), _| epk != &pk);
                     for (sort_key, value) in new_substate_values {
                         overlay.insert((pk.clone(), sort_key.clone()), Some(value.clone()));

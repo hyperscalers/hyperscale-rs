@@ -114,7 +114,7 @@ pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVeri
 pub use provisioning::substate::SubstateEntry;
 pub use radix_common::network::NetworkDefinition;
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
-pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH};
+pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, has_partition_reset};
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ApplicationEvent, EventData, ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;

@@ -13,6 +13,7 @@
 
 use std::sync::LazyLock;
 
+use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
 use sbor::prelude::basic_encode;
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
@@ -100,6 +101,28 @@ pub enum ConsensusReceipt {
     Failed,
 }
 
+/// True if any partition update in `updates` is a
+/// [`PartitionDatabaseUpdates::Reset`].
+///
+/// Receipt updates are Delta-only. The engine's sole runtime Reset
+/// producer — the transaction-tracker partition cycle — targets a system
+/// entity that shard filtering drops, and genesis flash (which does carry
+/// Resets) never flows through receipts. Storage relies on the invariant:
+/// the JMT commit paths and the pending-chain overlay apply receipt
+/// updates without enumerating a partition's pre-existing keys, which a
+/// Reset over a non-empty partition would require to stay consistent
+/// across the live and sync paths. [`ConsensusReceipt`] decode enforces
+/// it on every receipt taken off the wire;
+/// `hyperscale_engine::project_to_shard` asserts it at receipt build.
+#[must_use]
+pub fn has_partition_reset(updates: &DatabaseUpdates) -> bool {
+    updates.node_updates.values().any(|node| {
+        node.partition_updates
+            .values()
+            .any(|p| matches!(p, PartitionDatabaseUpdates::Reset { .. }))
+    })
+}
+
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for ConsensusReceipt {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
         encoder.write_value_kind(ValueKind::Enum)
@@ -149,6 +172,11 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ConsensusRe
                 }
                 let receipt_hash: GlobalReceiptHash = decoder.decode()?;
                 let database_updates: DatabaseUpdates = decoder.decode()?;
+                // Receipt updates are Delta-only (see `has_partition_reset`);
+                // a Reset here is a corrupt peer or a forged receipt.
+                if has_partition_reset(&database_updates) {
+                    return Err(DecodeError::InvalidCustomValue);
+                }
                 let owned_nodes: BoundedVec<(NodeId, NodeId), MAX_OWNED_NODES_PER_TX> =
                     decoder.decode()?;
                 let application_events = decode_bounded_vec::<_, ApplicationEvent>(
@@ -390,6 +418,38 @@ mod tests {
                 actual,
             } if actual == MAX_BEACON_WITNESS_EVENTS_PER_TX + 1
         ));
+    }
+
+    /// A `Succeeded` receipt whose `database_updates` carries a partition
+    /// Reset encodes (the encoder is symmetric) but must not decode —
+    /// storage applies receipt updates without enumerating pre-existing
+    /// keys, so a Reset would silently diverge the live and sync JMT roots.
+    #[test]
+    fn decode_rejects_partition_reset_updates() {
+        use radix_substate_store_interface::interface::NodeDatabaseUpdates;
+        use sbor::prelude::index_map_new;
+
+        let mut node = NodeDatabaseUpdates::default();
+        node.partition_updates.insert(
+            0u8,
+            PartitionDatabaseUpdates::Reset {
+                new_substate_values: index_map_new(),
+            },
+        );
+        let mut database_updates = DatabaseUpdates::default();
+        database_updates.node_updates.insert(vec![1u8; 50], node);
+        assert!(has_partition_reset(&database_updates));
+
+        let receipt = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
+            database_updates,
+            owned_nodes: BoundedVec::new(),
+            application_events: Vec::new(),
+            beacon_witness_events: Vec::new(),
+        };
+        let bytes = basic_encode(&receipt).unwrap();
+        let err = basic_decode::<ConsensusReceipt>(&bytes).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidCustomValue));
     }
 
     #[test]

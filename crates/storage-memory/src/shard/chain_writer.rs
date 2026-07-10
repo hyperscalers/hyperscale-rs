@@ -65,6 +65,10 @@ impl ShardChainWriter for SimShardStorage {
             jmt_parent_height(parent_block_height, parent_state_root).map(BlockHeight::inner);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
+        //
+        // Receipt updates are Delta-only (enforced at receipt decode and in
+        // project_to_shard), so no Reset partition needs old-key JMT deletes
+        // and the empty reset_old_keys map below is exact.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
             .filter_map(|r| r.consensus.database_updates())

@@ -130,6 +130,9 @@ pub fn apply_state_writes(
 
     let parent_version =
         jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
+    // Receipt updates are Delta-only (enforced at receipt decode and in
+    // project_to_shard), so no Reset partition needs old-key JMT deletes
+    // and the empty reset_old_keys map is exact.
     let (new_root, collected) = put_at_version(
         &s.tree_store,
         parent_version,

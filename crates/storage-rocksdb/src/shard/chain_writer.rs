@@ -66,6 +66,10 @@ impl ShardChainWriter for RocksDbShardStorage {
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
         // put_at_version can flatten them directly into JMT work items.
+        //
+        // Receipt updates are Delta-only (enforced at receipt decode and in
+        // project_to_shard), so no Reset partition needs old-key JMT deletes
+        // and the empty reset_old_keys map below is exact.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
             .filter_map(|r| r.consensus.database_updates())
