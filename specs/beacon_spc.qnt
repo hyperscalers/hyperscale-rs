@@ -1,9 +1,11 @@
 // Model E (register: specs/README.md) — beacon consensus, checked for
 // INV-BEACON-1 (one block per epoch): the inner prefix-consensus (PC)
-// value algebra, the pool-ratified commit path, and the two-path twin
-// whose dual commit shows why both outcomes must ride one pool quorum.
+// value algebra, the SPC view layer above it (entry certificates,
+// indirect skips, the commit walk), the pool-ratified commit path, and
+// the two-path twin whose dual commit shows why both outcomes must
+// ride one pool quorum.
 //
-// Three modules:
+// Four modules:
 //
 //   `beacon_pc` — the three-round PC value pipeline: the Prefix Consensus
 //   protocol of Xiang/Tonkikh/Spiegelman, "Prefix Consensus For Censorship
@@ -21,7 +23,33 @@
 //   pooled somewhere; the collapse violates none of the paper's properties
 //   — Validity is vacuous on divergent inputs — which is why the shipped
 //   feed gate demands full coverage, whose non-collapse property the
-//   `beacon_pc_full` instance pins).
+//   `beacon_pc_full` instance pins). A third twin re-casts an honest
+//   round-2/3 vote from the since-grown pool — the re-aggregating
+//   retransmission the heartbeat's emission-recorded QCs
+//   (`PcInstance::sent_vote2/3`, `replay_sign_intents`) exist to make
+//   impossible; one signer with two payloads per round forks the
+//   decisions (`beacon_pc_replay`).
+//
+//   `spc_views` — the SPC view layer, Algorithm 3, with each view's PC
+//   instance as an oracle constrained by the properties verified on
+//   `beacon_pc_ok`. Checks SPC Agreement: every completed commit walk
+//   resolves the same view-1 high — the "at most one Normal block
+//   value" premise the epoch modules consume. The mechanism is three
+//   gates: parent resolution reads only a value's first non-bottom
+//   element (unique chain, the paper's Lemma A.7 premise); honest
+//   empty-view attestations require an own decided parentless high, so
+//   by Upper Bound a committed view can never be honestly attested
+//   empty (Lemmas A.3-A.4's role); and the indirect cert targets the
+//   max reported triple at >= f+1 distinct signers (Lemma A.5). One
+//   twin per gate: `spc_views_eager_empty` attests on timeout alone
+//   and a committed view gets skipped; `spc_views_byz_skip` runs the
+//   threshold at f and an all-Byzantine skip cert does the same;
+//   `spc_views_walk_fallthrough` resolves through a replica-local
+//   table, falling through missing preimages — the pre-2026-07 walk
+//   deviation — and two replicas fork on one committed value with zero
+//   Byzantine action. View-1 unskippability (no timeout exists at
+//   view 1; every skip bottoms out in a view-1 QC3) is a checked
+//   invariant, not an argument.
 //
 //   `beacon_epoch` — the two-path twin: SPC cert and pool skip cert as
 //   independent commits. Its quorums need not intersect, and
@@ -62,6 +90,15 @@
 //     `on_spc_input_dwell_timer` / `feed_view_one_input` — the positional
 //     proposal-hash vector, fed at full coverage with a bounded dwell
 //     fallback to partial.
+//   - View layer: crates/beacon/src/spc.rs — `resolve_parent` (first
+//     non-bottom element only; Missing defers), `on_vpc_output_high`
+//     (parented advance vs the empty-view else-branch),
+//     `process_empty_view` (w > reported view; f+1 threshold),
+//     `enter_view` / `update_max_high`, `commit` (the walk);
+//     crates/types/src/beacon/spc.rs — `verify_direct_cert`
+//     (value == x_pe), `verify_indirect_cert` / `build_indirect_cert`
+//     (target = max reported triple, value hash-bound to a max
+//     reporter, per-signer skip-target signatures).
 //   - Ratification: crates/beacon/src/ratify.rs (`RatifyTracker` —
 //     registers, polka detection, locks, cert assembly);
 //     crates/types/src/beacon/ratify.rs (`RatifyVote`, `RatifyCert`,
@@ -115,15 +152,24 @@
 //     outcome at one tip shares one signer base, which is the model's
 //     POOL. Cross-epoch replay is out of scope: votes bind
 //     (anchor, epoch), and chained-epoch mechanization is deferred.
-//   - One PC instance. SPC view sequencing, indirect certificates
-//     (paper Lemmas A.3-A.5), and the commit-walk parent resolution are
-//     deferred to a revision, as is PC liveness. The implementation's
-//     walk (`resolve_parent`, crates/beacon/src/spc.rs) carries the
-//     paper's Parent semantics (Algorithm 3 line 1): only a value's
-//     FIRST non-bottom entry resolves, and a missing preimage defers
-//     the walk until the proposal object arrives — resolution is a
-//     function of the value, which is the unique-chain premise of the
-//     paper's Agreement argument (Lemma A.7) the revision mechanizes.
+//   - The view layer composes by abstraction: `spc_views` takes each
+//     view's PC instance as an oracle whose decision families satisfy
+//     exactly the invariants verified on `beacon_pc_ok` (every low a
+//     prefix of every high, lows and highs prefix-consistent) — any
+//     consistent family is reachable by the oracle, an
+//     over-approximation of the QC3s a real committee can certify.
+//     Proposal objects are content-addressed, so healthy parent
+//     resolution runs against the global cert table: defer-and-rescan
+//     (`rescan_pending`, crates/beacon/src/spc.rs) converges to that
+//     resolution, making deferral timing-only. Replica-local tables
+//     reappear only in the fall-through twin, where resolution stops
+//     being a function of the value.
+//   - PC liveness, view-timeout timing (heartbeat cadence, dwell,
+//     `MAX_PENDING_EMPTY_VIEW_AHEAD` bounds), and cross-epoch
+//     chaining remain deferred. The heartbeat's liveness purpose —
+//     restoring the reliable-channel assumption PC-round termination
+//     rests on — is a timing property outside bounded reachability;
+//     its safety side is the `beacon_pc_replay` twin.
 //
 // Run:
 //   quint typecheck specs/beacon_spc.qnt
@@ -139,6 +185,32 @@
 //   quint test   --main=beacon_pc_two_round --match=equivocationWindow specs/beacon_spc.qnt
 //   quint verify --main=beacon_pc_two_round --invariant=invDecisionsConsistent --max-steps=5 specs/beacon_spc.qnt
 //     (counterexample: round-1 equivocation forks the decided highs)
+//   quint test   --main=beacon_pc_replay --match=replayReaggregationForks specs/beacon_spc.qnt
+//   quint verify --main=beacon_pc_replay --invariant=invAll --max-steps=8 specs/beacon_spc.qnt
+//     (counterexample: one honest signer re-signing round 2 from the
+//      grown pool certifies inconsistent round-2 values)
+//   quint test   --main=spc_views_ok --match=skipConvergesHealthy specs/beacon_spc.qnt
+//   quint verify --main=spc_views_ok --invariant=invAgreement --max-steps=8 specs/beacon_spc.qnt
+//     (holds: every completed commit walk resolves the same view-1
+//      high, across direct chains and indirect skips — ~6h)
+//   quint verify --main=spc_views_ok --invariant=invOutputCertified --max-steps=7 specs/beacon_spc.qnt
+//     (holds at the depth the batched actions need: every
+//      phase-complete shape — two view-1 decisions, cert, commit,
+//      batched observe/attest, indirect cert, final decision — lands
+//      within 7 steps; ~8h, and each invariant needs its own JVM —
+//      checking all three as invAll in one run exhausts it)
+//   quint verify --main=spc_views_ok --invariant=invViewOneUnskippable --max-steps=8 specs/beacon_spc.qnt
+//     (holds: no reachable cert without a view-1 decision)
+//   quint test   --main=spc_views_eager_empty --match=eagerSkipFork specs/beacon_spc.qnt
+//   quint verify --main=spc_views_eager_empty --invariant=invAgreement --max-steps=8 specs/beacon_spc.qnt
+//     (counterexample: attest-on-timeout skips a committed view)
+//   quint test   --main=spc_views_byz_skip --match=byzSkipFork specs/beacon_spc.qnt
+//   quint verify --main=spc_views_byz_skip --invariant=invAgreement --max-steps=7 specs/beacon_spc.qnt
+//     (counterexample: an all-Byzantine skip cert at threshold f)
+//   quint test   --main=spc_views_walk_fallthrough --match=fallthroughFork specs/beacon_spc.qnt
+//   quint verify --main=spc_views_walk_fallthrough --invariant=invAgreementLocal --max-steps=8 specs/beacon_spc.qnt
+//     (counterexample: table-dependent resolution forks two replicas
+//      on one committed value, zero Byzantine action)
 //   quint test   --main=beacon_epoch_dual --match=dualPathFork specs/beacon_spc.qnt
 //   quint verify --main=beacon_epoch_dual --invariant=invOneBlock --max-steps=5 specs/beacon_spc.qnt
 //     (counterexample: Normal and Skip both commit for one epoch —
@@ -184,6 +256,14 @@ module beacon_pc {
   const THREE_ROUND: bool
   // Vectors an honest validator may hold as its view input.
   const INPUT_VECS: Set[List[int]]
+  // Twin switch: honest members may re-cast a round-2/3 vote with a
+  // different currently-certified value — what a retransmission that
+  // re-aggregates from the since-grown vote pool would sign. The
+  // shipped replay re-signs the QC recorded at emission
+  // (`PcInstance::sent_vote2/3`, `replay_sign_intents`,
+  // crates/beacon/src/pc.rs), which reproduces the original signature
+  // bit-for-bit and cannot take this action.
+  const REVOTE: bool
 
   pure val N = 3 * F + 1
   pure val QUORUM = 2 * F + 1
@@ -397,7 +477,47 @@ module beacon_pc {
     decide2As(q, m, hi)
   }
 
-  action step = any { formQc1, castVote2, formQc2, castVote3, formQc3, decide2 }
+  // The re-aggregating retransmission, round 2: a member that already
+  // voted re-signs a different certified round-1 value. The overwrite
+  // is enough state — the original vote's aggregations are already in
+  // `certified2`, so both payloads reach QCs across interleavings.
+  action reVote2As(vtr: int, x: Vec): bool = all {
+    REVOTE,
+    HONEST.contains(vtr),
+    voted2.contains(vtr),
+    certified1.contains(x),
+    x != x2.get(vtr),
+    x2' = COMMITTEE.mapBy(v => if (v == vtr) x else x2.get(v)),
+    inputs' = inputs, certified1' = certified1, voted2' = voted2,
+    certified2' = certified2, x3' = x3, voted3' = voted3,
+    decisions' = decisions,
+  }
+
+  action reVote2 = {
+    nondet vtr = HONEST.oneOf()
+    nondet x = ALL_VECS.oneOf()
+    reVote2As(vtr, x)
+  }
+
+  // Round-3 counterpart.
+  action reVote3As(vtr: int, x: Vec): bool = all {
+    REVOTE,
+    HONEST.contains(vtr),
+    voted3.contains(vtr),
+    certified2.contains(x),
+    x != x3.get(vtr),
+    x3' = COMMITTEE.mapBy(v => if (v == vtr) x else x3.get(v)),
+    inputs' = inputs, certified1' = certified1, x2' = x2, voted2' = voted2,
+    certified2' = certified2, voted3' = voted3, decisions' = decisions,
+  }
+
+  action reVote3 = {
+    nondet vtr = HONEST.oneOf()
+    nondet x = ALL_VECS.oneOf()
+    reVote3As(vtr, x)
+  }
+
+  action step = any { formQc1, castVote2, formQc2, castVote3, formQc3, decide2, reVote2, reVote3 }
 
   // The paper's Prefix Consensus properties, over all decisions from all
   // aggregators. Upper Bound (Definition 2.2): every decided low is a
@@ -466,6 +586,30 @@ module beacon_pc {
       .then(decide2As(Set(1, 3, 4), Map(1 -> [1, 2], 3 -> [1, 2], 4 -> [1, 2]), [1, 2]))
       .expect(not(invDecisionsConsistent))
   }
+
+  // The re-aggregating retransmission, scripted (REVOTE instances): a
+  // 2-1 honest input split certifies both [1,0] and [1,2] at round 1.
+  // One quorum decides through [1,0]; member 3's "retransmission"
+  // re-signs rounds 2 and 3 from the since-grown pool as [1,2], and a
+  // second quorum decides through [1,2]. One honest signer with two
+  // payloads per round is equivocation — first `certified2`
+  // consistency (Lemma 3.1's premise) falls, then the decisions fork.
+  run replayReaggregationForks = {
+    initWith(Map(1 -> [1, 2], 2 -> [1, 0], 3 -> [1, 0], 4 -> [1, 2]))
+      .then(formQc1As(Set(1, 2, 3), Map(1 -> [1, 0], 2 -> [1, 0], 3 -> [1, 0])))
+      .then(formQc1As(Set(1, 3, 4), Map(1 -> [1, 2], 3 -> [1, 0], 4 -> [1, 2])))
+      .then(castVote2As(Set(2, 3), Map(2 -> [1, 0], 3 -> [1, 0])))
+      .then(castVote2As(Set(4), Map(4 -> [1, 2])))
+      .then(formQc2As(Set(1, 2, 3), Map(1 -> [1, 0], 2 -> [1, 0], 3 -> [1, 0])))
+      .then(castVote3As(Set(2, 3), Map(2 -> [1, 0], 3 -> [1, 0])))
+      .then(formQc3As(Set(1, 2, 3), Map(1 -> [1, 0], 2 -> [1, 0], 3 -> [1, 0])))
+      .then(reVote2As(3, [1, 2]))
+      .then(formQc2As(Set(1, 3, 4), Map(1 -> [1, 2], 3 -> [1, 2], 4 -> [1, 2])))
+      .then(castVote3As(Set(4), Map(4 -> [1, 2])))
+      .then(reVote3As(3, [1, 2]))
+      .then(formQc3As(Set(1, 3, 4), Map(1 -> [1, 2], 3 -> [1, 2], 4 -> [1, 2])))
+      .expect(not(invDecisionsConsistent))
+  }
 }
 
 // Healthy: the shipped three-round pipeline under arbitrary honest
@@ -476,7 +620,8 @@ module beacon_pc_ok {
   import beacon_pc(
     F = 1,
     THREE_ROUND = true,
-    INPUT_VECS = Set([0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2], [2, 0], [2, 1], [2, 2])
+    INPUT_VECS = Set([0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2], [2, 0], [2, 1], [2, 2]),
+    REVOTE = false
   ).*
 }
 
@@ -484,7 +629,7 @@ module beacon_pc_ok {
 // vector (the gate `feed_view_one_input` waits for). Decisions collapse
 // to exactly the full vector.
 module beacon_pc_full {
-  import beacon_pc(F = 1, THREE_ROUND = true, INPUT_VECS = Set([1, 2])).*
+  import beacon_pc(F = 1, THREE_ROUND = true, INPUT_VECS = Set([1, 2]), REVOTE = false).*
 }
 
 // Eager feed: honest inputs may hold BOTTOM per slot (fed at quorum
@@ -494,7 +639,8 @@ module beacon_pc_eager {
   import beacon_pc(
     F = 1,
     THREE_ROUND = true,
-    INPUT_VECS = Set([1, 2], [1, 0], [0, 2], [0, 0])
+    INPUT_VECS = Set([1, 2], [1, 0], [0, 2], [0, 0]),
+    REVOTE = false
   ).*
 }
 
@@ -506,7 +652,562 @@ module beacon_pc_two_round {
   import beacon_pc(
     F = 1,
     THREE_ROUND = false,
-    INPUT_VECS = Set([1, 2], [1, 0], [0, 2], [0, 0])
+    INPUT_VECS = Set([1, 2], [1, 0], [0, 2], [0, 0]),
+    REVOTE = false
+  ).*
+}
+
+// Re-aggregating retransmission twin: an honest member's replay
+// re-signs rounds 2/3 from the since-grown vote pool instead of the
+// QC recorded at emission. One signer, two payloads per round —
+// certified-2 consistency falls first, then the decisions fork. The
+// heartbeat's replay is safe exactly because `sent_vote2/3` pin it to
+// the emission-recorded QC (crates/beacon/src/pc.rs).
+module beacon_pc_replay {
+  import beacon_pc(
+    F = 1,
+    THREE_ROUND = true,
+    INPUT_VECS = Set([1, 2], [1, 0], [0, 2], [0, 0]),
+    REVOTE = true
+  ).*
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+
+module spc_views {
+  // The SPC view layer (the paper's Algorithm 3), with each view's PC
+  // instance as an oracle: a view may accumulate any decision family
+  // that is pairwise consistent (every low a prefix of every high,
+  // lows and highs prefix-consistent among themselves) — exactly the
+  // properties `quint verify` establishes on `beacon_pc_ok`, which is
+  // what makes the over-approximation sound. No rounds, no votes.
+  //
+  // What this layer adds is checked here: view entry certificates
+  // (direct = the previous view's high output; indirect = f+1
+  // empty-view attestations targeting the max reported triple), the
+  // commit walk (parent resolution through first non-bottom elements,
+  // `resolve_parent`, crates/beacon/src/spc.rs), and the honest
+  // empty-view rule (attest only on an own decided parentless high,
+  // `on_vpc_output_high`). Agreement — every completed walk resolves
+  // the same view-1 high — is the "at most one Normal block value"
+  // oracle the ratification modules below consume.
+  //
+  // Values: view-1 vectors over the proposal alphabet {0,1,2} (as in
+  // `beacon_pc`); view >= 2 vectors over {0} ∪ cert references
+  // (element 10 + id), mirroring the proposal-object-hash input
+  // pipeline (`compute_view_input`). Proposal objects are
+  // content-addressed, so resolution is modeled against the global
+  // cert table: defer-and-rescan (`rescan_pending`) converges to
+  // exactly that resolution, making deferral timing-only — the
+  // WALK_FALLTHROUGH twin is where replica-local tables reappear.
+  const F: int
+  const MAX_VIEW: int
+  const MAX_CERTS: int
+  // Twin switches. EAGER_EMPTY: honest members attest a view empty on
+  // timeout alone, without the decided-parentless-high gate.
+  // SKIP_THRESHOLD: signers required for an indirect cert (healthy
+  // F+1; the byz twin runs F). WALK_FALLTHROUGH: parent resolution
+  // reads the first element resolvable in a replica-local table,
+  // falling through missing preimages — the pre-fix `parent_of`
+  // deviation `resolve_parent`'s Missing arm exists to prevent.
+  const EAGER_EMPTY: bool
+  const SKIP_THRESHOLD: int
+  const WALK_FALLTHROUGH: bool
+
+  pure val N = 3 * F + 1
+  pure val COMMITTEE = 1.to(N)
+  pure val BYZ = 1.to(F)
+  pure val HONEST = (F + 1).to(N)
+  pure val VIEWS = 1.to(MAX_VIEW)
+  pure val CERT_IDS = 1.to(MAX_CERTS)
+
+  type Vec = List[int]
+  type Cert = { forView: int, tView: int, tVal: Vec }
+
+  pure val P_ELEMS = Set(0, 1, 2)
+  pure def certElem(cid: int): int = 10 + cid
+  pure val ALL_ELEMS = P_ELEMS.union(CERT_IDS.map(certElem))
+  pure val ALL_VECS: Set[Vec] =
+    Set(List())
+      .union(ALL_ELEMS.map(a => [a]))
+      .union(tuples(ALL_ELEMS, ALL_ELEMS).map(t => [t._1, t._2]))
+
+  pure def isPrefix(p: Vec, v: Vec): bool =
+    p.length() <= v.length() and p.indices().forall(i => p[i] == v[i])
+
+  pure def consistent(a: Vec, b: Vec): bool =
+    isPrefix(a, b) or isPrefix(b, a)
+
+  // `Parent(value)`: the value's first non-bottom element, or 0 when
+  // the value pins no parent (`ParentResolution::Parentless`).
+  pure def firstCertId(v: Vec): int =
+    v.foldl(0, (acc, el) => if (acc != 0) acc else if (el >= 10) el - 10 else 0)
+
+  // Per-view decision families — the PC oracle's output surface.
+  var decided: int -> Set[{ lo: Vec, hi: Vec }]
+  // Content-addressed proposal-object table (`proposals_by_hash`):
+  // Direct's (prev_view, value) and Indirect's (target_view,
+  // target_value) collapse to one record, as `resolve_parent` treats
+  // them. Slots above certCount are unallocated.
+  var certs: int -> Cert
+  var certCount: int
+  // Per honest replica: the latest verifiable high triple
+  // (`max_high`; v = 0 while none). Updated by strictly-greater view
+  // only (`update_max_high`).
+  var maxHigh: int -> { v: int, x: Vec }
+  // Empty-view attestations (`SpcEmptyViewMsg`): signer reports its
+  // max_high while attesting view w empty.
+  var attests: Set[{ w: int, signer: int, repView: int, repVal: Vec }]
+  // WALK_FALLTHROUGH twin state: two replicas' local cert tables.
+  var tableA: Set[int]
+  var tableB: Set[int]
+
+  def certExistsFor(w: int): bool =
+    CERT_IDS.exists(c => c <= certCount and certs.get(c).forView == w)
+
+  // A vector is well-formed at view w when its elements come from the
+  // view's input alphabet: proposals at view 1, view-w proposal-object
+  // hashes at view >= 2 (a proposal object embeds its view, so its
+  // hash cannot appear in another view's input — `compute_view_input`
+  // fills slots from `views[w].proposal_objects` only).
+  def okVec(w: int, x: Vec): bool =
+    x.indices().forall(i =>
+      if (w == 1) P_ELEMS.contains(x[i])
+      else or {
+        x[i] == 0,
+        and {
+          x[i] >= 11,
+          x[i] - 10 <= certCount,
+          certs.get(x[i] - 10).forView == w,
+        },
+      })
+
+  action init = all {
+    decided' = VIEWS.mapBy(w => Set()),
+    certs' = CERT_IDS.mapBy(c => { forView: 0, tView: 0, tVal: List() }),
+    certCount' = 0,
+    maxHigh' = HONEST.mapBy(r => { v: 0, x: List() }),
+    attests' = Set(),
+    tableA' = Set(),
+    tableB' = Set(),
+  }
+
+  // The PC oracle: view w's instance certifies one more (low, high)
+  // decision, constrained to stay pairwise consistent with the view's
+  // existing family — `invDecisionsConsistent`, verified on
+  // `beacon_pc_ok`, taken as the axiom. Views >= 2 run only once
+  // entered (an entry cert exists — `enter_view` creates the
+  // `PcInstance` and feeds `compute_view_input`).
+  action decideAtAs(w: int, lo: Vec, hi: Vec): bool = all {
+    VIEWS.contains(w),
+    w == 1 or certExistsFor(w),
+    okVec(w, lo),
+    okVec(w, hi),
+    isPrefix(lo, hi),
+    decided.get(w).forall(d => all {
+      isPrefix(lo, d.hi),
+      isPrefix(d.lo, hi),
+      consistent(lo, d.lo),
+      consistent(hi, d.hi),
+    }),
+    decided' = decided.put(w, decided.get(w).union(Set({ lo: lo, hi: hi }))),
+    certs' = certs, certCount' = certCount, maxHigh' = maxHigh,
+    attests' = attests, tableA' = tableA, tableB' = tableB,
+  }
+
+  action decideAt = {
+    nondet w = VIEWS.oneOf()
+    nondet lo = ALL_VECS.oneOf()
+    nondet hi = ALL_VECS.oneOf()
+    decideAtAs(w, lo, hi)
+  }
+
+  // A direct entry cert: view v's decided high, authorising v+1
+  // (`SpcCert::Direct`; `verify_direct_cert` forces value == x_pe).
+  // The FSM admission gate drops certs whose value pins no parent
+  // (`on_new_view_verified`, ParentResolution::Parentless) for
+  // prev_view > 1; view-1 values anchor the genesis boundary instead.
+  action makeDirectCertAs(v: int, hi: Vec): bool = all {
+    VIEWS.contains(v),
+    v < MAX_VIEW,
+    certCount < MAX_CERTS,
+    decided.get(v).exists(d => d.hi == hi),
+    v == 1 or firstCertId(hi) != 0,
+    val c = { forView: v + 1, tView: v, tVal: hi }
+    all {
+      not(CERT_IDS.exists(i => i <= certCount and certs.get(i) == c)),
+      certs' = certs.put(certCount + 1, c),
+    },
+    certCount' = certCount + 1,
+    decided' = decided, maxHigh' = maxHigh, attests' = attests,
+    tableA' = tableA, tableB' = tableB,
+  }
+
+  action makeDirectCert = {
+    nondet v = VIEWS.oneOf()
+    nondet hi = ALL_VECS.oneOf()
+    makeDirectCertAs(v, hi)
+  }
+
+  // An indirect entry cert from SKIP_THRESHOLD distinct signers'
+  // attestations at empty view w, targeting (tv, tval)
+  // (`build_indirect_cert` / `verify_indirect_cert`): the target view
+  // must be the maximum reported across the bundled statements, and
+  // the target value must be one a max-reporting signer attested —
+  // the aggregator may exclude a signer but can never lower a signed
+  // report.
+  action makeIndirectCertAs(w: int, sig: Set[int], tv: int, tval: Vec): bool = all {
+    VIEWS.contains(w),
+    w < MAX_VIEW,
+    certCount < MAX_CERTS,
+    sig.subseteq(COMMITTEE),
+    sig.size() >= SKIP_THRESHOLD,
+    sig.forall(s => attests.exists(a => a.w == w and a.signer == s and a.repView <= tv)),
+    attests.exists(a => a.w == w and sig.contains(a.signer) and a.repView == tv and a.repVal == tval),
+    val c = { forView: w + 1, tView: tv, tVal: tval }
+    all {
+      not(CERT_IDS.exists(i => i <= certCount and certs.get(i) == c)),
+      certs' = certs.put(certCount + 1, c),
+    },
+    certCount' = certCount + 1,
+    decided' = decided, maxHigh' = maxHigh, attests' = attests,
+    tableA' = tableA, tableB' = tableB,
+  }
+
+  action makeIndirectCert = {
+    nondet w = VIEWS.oneOf()
+    nondet sig = COMMITTEE.powerset().oneOf()
+    nondet tv = VIEWS.oneOf()
+    nondet tval = ALL_VECS.oneOf()
+    makeIndirectCertAs(w, sig, tv, tval)
+  }
+
+  // Triples an honest replica can verifiably observe: view-1 decided
+  // highs, parented decided highs (`from_verified_proof` on the
+  // parented advance), and cert targets (`from_verified_cert` on
+  // every entry).
+  def tripleAvailable(v: int, x: Vec): bool = or {
+    and {
+      VIEWS.contains(v),
+      decided.get(v).exists(d => d.hi == x),
+      v == 1 or firstCertId(x) != 0,
+    },
+    CERT_IDS.exists(c => c <= certCount and certs.get(c).tView == v and certs.get(c).tVal == x),
+  }
+
+  // Batched: any subset observes the same triple in one step — the
+  // observes write disjoint per-replica registers, so each singleton
+  // batch is an interleaving and batching loses no reachable
+  // assignment (the `castVote2As` argument).
+  action observeTripleAs(ss: Set[int], v: int, x: Vec): bool = all {
+    ss.subseteq(HONEST),
+    ss.size() > 0,
+    tripleAvailable(v, x),
+    ss.forall(s => v > maxHigh.get(s).v),
+    maxHigh' = HONEST.mapBy(s => if (ss.contains(s)) { v: v, x: x } else maxHigh.get(s)),
+    decided' = decided, certs' = certs, certCount' = certCount,
+    attests' = attests, tableA' = tableA, tableB' = tableB,
+  }
+
+  action observeTriple = {
+    nondet ss = HONEST.powerset().oneOf()
+    nondet v = VIEWS.oneOf()
+    nondet x = ALL_VECS.oneOf()
+    observeTripleAs(ss, v, x)
+  }
+
+  // An honest empty-view attestation for view w, reporting the
+  // signer's max_high. The gate is the FSM's: the signer's view-w PC
+  // concluded with a high pinning no parent (`on_vpc_output_high`'s
+  // else-branch; a Missing parent defers instead — attesting there
+  // would claim parentless for a view that has a parent). By the
+  // oracle's cross-decision prefix property, a decided parentless
+  // high forces every decided low at w parentless: nothing committed
+  // through w, which is what makes the skip lose nothing. The
+  // EAGER_EMPTY twin attests on timeout alone (view entered, nothing
+  // decided required). The verifier's w > reported-view check
+  // (`process_empty_view`) rides on maxHigh.
+  // Batched over signers: each reports its own max_high, latches are
+  // per (view, signer) — the attests commute, so batching loses no
+  // reachable assignment.
+  action attestHonestAs(ss: Set[int], w: int): bool = all {
+    ss.subseteq(HONEST),
+    ss.size() > 0,
+    VIEWS.contains(w),
+    w >= 2,
+    ss.forall(s => all {
+      not(attests.exists(a => a.w == w and a.signer == s)),
+      maxHigh.get(s).v >= 1,
+      maxHigh.get(s).v < w,
+    }),
+    if (EAGER_EMPTY) certExistsFor(w)
+    else decided.get(w).exists(d => firstCertId(d.hi) == 0),
+    attests' = attests.union(ss.map(s => { w: w, signer: s, repView: maxHigh.get(s).v, repVal: maxHigh.get(s).x })),
+    decided' = decided, certs' = certs, certCount' = certCount,
+    maxHigh' = maxHigh, tableA' = tableA, tableB' = tableB,
+  }
+
+  action attestHonest = {
+    nondet ss = HONEST.powerset().oneOf()
+    nondet w = VIEWS.oneOf()
+    attestHonestAs(ss, w)
+  }
+
+  // Byzantine attestations: anything the verifier accepts
+  // (`verify_empty_view_msg`) — the reported triple must be a real
+  // certified high at its view (the embedded QC3 check) and sit below
+  // the attested view. No latch, any content, any number of times.
+  action attestByzAs(s: int, w: int, rv: int, rval: Vec): bool = all {
+    BYZ.contains(s),
+    VIEWS.contains(w),
+    VIEWS.contains(rv),
+    w >= 2,
+    rv < w,
+    decided.get(rv).exists(d => d.hi == rval),
+    attests' = attests.union(Set({ w: w, signer: s, repView: rv, repVal: rval })),
+    decided' = decided, certs' = certs, certCount' = certCount,
+    maxHigh' = maxHigh, tableA' = tableA, tableB' = tableB,
+  }
+
+  action attestByz = {
+    nondet s = BYZ.oneOf()
+    nondet w = VIEWS.oneOf()
+    nondet rv = VIEWS.oneOf()
+    nondet rval = ALL_VECS.oneOf()
+    attestByzAs(s, w, rv, rval)
+  }
+
+  // WALK_FALLTHROUGH twin: replicas learn proposal objects
+  // independently.
+  action growTableAAs(c: int): bool = all {
+    WALK_FALLTHROUGH,
+    CERT_IDS.contains(c),
+    c <= certCount,
+    tableA' = tableA.union(Set(c)),
+    decided' = decided, certs' = certs, certCount' = certCount,
+    maxHigh' = maxHigh, attests' = attests, tableB' = tableB,
+  }
+
+  action growTableBAs(c: int): bool = all {
+    WALK_FALLTHROUGH,
+    CERT_IDS.contains(c),
+    c <= certCount,
+    tableB' = tableB.union(Set(c)),
+    decided' = decided, certs' = certs, certCount' = certCount,
+    maxHigh' = maxHigh, attests' = attests, tableA' = tableA,
+  }
+
+  action growTableA = {
+    nondet c = CERT_IDS.oneOf()
+    growTableAAs(c)
+  }
+
+  action growTableB = {
+    nondet c = CERT_IDS.oneOf()
+    growTableBAs(c)
+  }
+
+  action step = any {
+    decideAt, makeDirectCert, makeIndirectCert, observeTriple,
+    attestHonest, attestByz, growTableA, growTableB,
+  }
+
+  // The commit walk (`commit` + `resolve_parent`): from a committed
+  // low, resolve the first non-bottom element's cert; at target view
+  // 1 the target value is the epoch's high output, otherwise continue
+  // from the target value. Cert targets strictly descend (a view-w
+  // reference pins a target below w), so MAX_VIEW steps exhaust any
+  // chain. A parentless value ends the walk without output.
+  def walkFrom(startVal: Vec): { hit: bool, out: Vec } = {
+    val end = 1.to(MAX_VIEW).fold(
+      { cur: startVal, hit: false, out: List() },
+      (st, i) =>
+        if (st.hit) st
+        else {
+          val c = firstCertId(st.cur)
+          if (c == 0 or c > certCount) { cur: List(), hit: st.hit, out: st.out }
+          else {
+            val ct = certs.get(c)
+            if (ct.tView == 1) { cur: List(), hit: true, out: ct.tVal }
+            else { cur: ct.tVal, hit: false, out: List() }
+          }
+        }
+    )
+    { hit: end.hit, out: end.out }
+  }
+
+  // Every decided low at view >= 2 is broadcast as a new-commit and
+  // walked (`on_vpc_output_low` / `on_new_commit_verified`); view 1's
+  // low is computed but never acted on.
+  def commitLows: Set[Vec] =
+    VIEWS.filter(w => w >= 2).map(w => decided.get(w).map(d => d.lo)).flatten()
+
+  def outputs: Set[Vec] =
+    commitLows.map(l => walkFrom(l)).filter(r => r.hit).map(r => r.out)
+
+  // SPC Agreement: every completed walk resolves the same view-1
+  // high — INV-BEACON-1's "at most one Normal block value" premise.
+  val invAgreement = outputs.forall(a => outputs.forall(b => a == b))
+
+  // Outputs are certified view-1 highs (a walk cannot fabricate).
+  val invOutputCertified = outputs.forall(o => decided.get(1).exists(d => d.hi == o))
+
+  // View 1 is structurally unskippable: any entry cert existing means
+  // view 1 concluded — there is no timeout or indirect path around it
+  // (`verify_indirect_cert` rejects entering below view 2; an
+  // attestation needs a triple, and every triple bottoms out in a
+  // view-1 QC3).
+  val invViewOneUnskippable = certCount > 0 implies decided.get(1).size() > 0
+
+  val invAll = invAgreement and invOutputCertified and invViewOneUnskippable
+
+  // The fall-through walk: first element resolvable in a
+  // replica-local table, skipping missing preimages — resolution is a
+  // function of (value, table), no longer of the value alone.
+  pure def firstResolvable(table: Set[int], v: Vec): int =
+    v.foldl(0, (acc, el) =>
+      if (acc != 0) acc
+      else if (el >= 10 and table.contains(el - 10)) el - 10
+      else 0)
+
+  def walkFallthrough(table: Set[int], startVal: Vec): { hit: bool, out: Vec } = {
+    val end = 1.to(MAX_VIEW).fold(
+      { cur: startVal, hit: false, out: List() },
+      (st, i) =>
+        if (st.hit) st
+        else {
+          val c = firstResolvable(table, st.cur)
+          if (c == 0) { cur: List(), hit: st.hit, out: st.out }
+          else {
+            val ct = certs.get(c)
+            if (ct.tView == 1) { cur: List(), hit: true, out: ct.tVal }
+            else { cur: ct.tVal, hit: false, out: List() }
+          }
+        }
+    )
+    { hit: end.hit, out: end.out }
+  }
+
+  def outputsWith(table: Set[int]): Set[Vec] =
+    commitLows.map(l => walkFallthrough(table, l)).filter(r => r.hit).map(r => r.out)
+
+  // Agreement across the two replicas' fall-through walks. Trivial
+  // while tables stay empty (healthy instances); the twin refutes it
+  // with zero Byzantine action — the walk deviation alone forks.
+  val invAgreementLocal = {
+    val o = outputsWith(tableA).union(outputsWith(tableB))
+    o.forall(a => o.forall(b => a == b))
+  }
+
+  // Healthy witness: a genuinely parentless view 2 (decided empty) is
+  // skipped by two honest attestations; view 3 commits through the
+  // indirect target and the single output is the view-1 high. The
+  // skip machinery is exercised, agreement holds.
+  run skipConvergesHealthy = {
+    init
+      .then(decideAtAs(1, [1], [1]))
+      .then(makeDirectCertAs(1, [1]))
+      .then(decideAtAs(2, List(), List()))
+      .then(observeTripleAs(Set(2, 3), 1, [1]))
+      .then(attestHonestAs(Set(2, 3), 2))
+      .then(makeIndirectCertAs(2, Set(2, 3), 1, [1]))
+      .then(decideAtAs(3, [12], [12]))
+      .expect(outputs == Set([1]) and invAll)
+  }
+
+  // The eager-empty fork (EAGER_EMPTY instances): view 1 certifies
+  // two consistent highs of different length; view 2 commits through
+  // the shorter one's cert while two laggards — whose max_high is the
+  // longer view-1 triple and who never saw view 2 conclude — attest
+  // it empty on timeout. The indirect cert targets (1, [1,2]), view 3
+  // commits through it, and the two completed walks disagree. The
+  // shipped gate (attest only on an own decided parentless high)
+  // makes the laggards' attestation impossible: view 2's committed
+  // low forces every decided high at view 2 non-parentless.
+  run eagerSkipFork = {
+    init
+      .then(decideAtAs(1, [1], [1]))
+      .then(decideAtAs(1, [1], [1, 2]))
+      .then(makeDirectCertAs(1, [1]))
+      .then(decideAtAs(2, [11], [11]))
+      .then(observeTripleAs(Set(3, 4), 1, [1, 2]))
+      .then(attestHonestAs(Set(3, 4), 2))
+      .then(makeIndirectCertAs(2, Set(3, 4), 1, [1, 2]))
+      .then(decideAtAs(3, [12], [12]))
+      .expect(not(invAgreement))
+  }
+
+  // The sub-honest skip quorum (SKIP_THRESHOLD = F instances): one
+  // Byzantine attestation alone assembles the indirect cert — no
+  // honest member ever attested — and the same fork lands. Why the
+  // threshold is f+1: at least one attestor must be bound by the
+  // parentless-high gate.
+  run byzSkipFork = {
+    init
+      .then(decideAtAs(1, [1], [1]))
+      .then(decideAtAs(1, [1], [1, 2]))
+      .then(makeDirectCertAs(1, [1]))
+      .then(decideAtAs(2, [11], [11]))
+      .then(attestByzAs(1, 2, 1, [1, 2]))
+      .then(makeIndirectCertAs(2, Set(1), 1, [1, 2]))
+      .then(decideAtAs(3, [12], [12]))
+      .expect(not(invAgreement))
+  }
+
+  // The fall-through fork (WALK_FALLTHROUGH instances): view 2's
+  // committed low references two certs; replica A holds both
+  // preimages and resolves the first, replica B misses it and falls
+  // through to the second. Same committed value, different parents,
+  // different view-1 outputs — zero Byzantine action. `Missing`
+  // defers precisely so that resolution stays a function of the
+  // value.
+  run fallthroughFork = {
+    init
+      .then(decideAtAs(1, [1], [1]))
+      .then(decideAtAs(1, [1], [1, 2]))
+      .then(makeDirectCertAs(1, [1]))
+      .then(makeDirectCertAs(1, [1, 2]))
+      .then(decideAtAs(2, [11, 12], [11, 12]))
+      .then(growTableAAs(1))
+      .then(growTableAAs(2))
+      .then(growTableBAs(2))
+      .expect(not(invAgreementLocal))
+  }
+}
+
+// Healthy view layer: the shipped gates — parentless-high-gated
+// honest attestations, f+1 skip threshold, value-function parent
+// resolution.
+module spc_views_ok {
+  import spc_views(
+    F = 1, MAX_VIEW = 3, MAX_CERTS = 3,
+    EAGER_EMPTY = false, SKIP_THRESHOLD = 2, WALK_FALLTHROUGH = false
+  ).*
+}
+
+// Attest-on-timeout twin: the empty-view claim decouples from the
+// attestor's own decided output, and a committed view gets skipped.
+module spc_views_eager_empty {
+  import spc_views(
+    F = 1, MAX_VIEW = 3, MAX_CERTS = 3,
+    EAGER_EMPTY = true, SKIP_THRESHOLD = 2, WALK_FALLTHROUGH = false
+  ).*
+}
+
+// Skip threshold f instead of f+1: an all-Byzantine indirect cert.
+module spc_views_byz_skip {
+  import spc_views(
+    F = 1, MAX_VIEW = 3, MAX_CERTS = 3,
+    EAGER_EMPTY = false, SKIP_THRESHOLD = 1, WALK_FALLTHROUGH = false
+  ).*
+}
+
+// The pre-fix walk deviation: resolution falls through missing
+// preimages to whatever the local table holds.
+module spc_views_walk_fallthrough {
+  import spc_views(
+    F = 1, MAX_VIEW = 3, MAX_CERTS = 3,
+    EAGER_EMPTY = false, SKIP_THRESHOLD = 2, WALK_FALLTHROUGH = true
   ).*
 }
 
