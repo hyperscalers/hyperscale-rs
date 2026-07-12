@@ -12,7 +12,7 @@ The consolidated register of the system's safety and liveness properties, with s
 
 | ID | Class | Property |
 |---|---|---|
-| **INV-SEC-1** | Assumption | Every committee (shard, beacon, execution) contains fewer than ⅓ Byzantine members: n ≥ 3f+1, quorum 2f+1 (strict >⅔ by seat count). Maintained statistically by seeded sampling from beacon randomness, trickled shuffling, and expulsion, given a <⅓-corrupt global pool. All safety properties below are conditional on it. [05 §1](05-byzantine-safety.md) |
+| **INV-SEC-1** | Assumption | Every committee (shard, beacon, execution) contains fewer than ⅓ Byzantine members: n ≥ 3f+1, quorum 2f+1 (strict >⅔ by seat count). Maintained statistically by seeded sampling from beacon randomness, trickled shuffling, and expulsion, given a <⅓-corrupt global pool. Premise carries an open caveat: the epoch seed is grindable by a last-revealer, so the draw an adversary sees is steerable rather than the unsteered draw the sampling tables price. Its two thresholds are defended apart: reaching f+1 is a recoverable *liveness* halt (a beacon-detected full-committee re-draw undoes it), while reaching 2f+1 is *terminal* and so is *prevented* — a small beacon committee, FIFO eviction, jailing for withholding, a recency-weighted resample, and pool hygiene hold a targeted shard below 2f+1 across the tolerated band; priced and dispositioned in [committee_security.md](../specs/committee_security.md) §10. All safety properties below are conditional on it. [05 §1](05-byzantine-safety.md) |
 
 ## Shard consensus (HotStuff-2) — [01 §1](01-consensus-layers.md)
 
