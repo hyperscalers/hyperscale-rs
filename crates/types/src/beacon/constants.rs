@@ -123,6 +123,24 @@ pub const SHUFFLE_INTERVAL_EPOCHS: u64 = 16;
 /// actually synced.
 pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 
+/// How many epochs a live shard's boundary watermark may stall before
+/// the beacon flags the shard as halted.
+///
+/// A shard committing normally refreshes its boundary record's
+/// `last_live_epoch` most epochs; a watermark stalled past this bound
+/// means the shard has stopped committing entirely — e.g. `f + 1` of
+/// its committee withholding votes, leaving the honest remainder short
+/// of a `2f + 1` quorum. Shards involved in a pending reshape or
+/// coasting to a scheduled terminal are legitimately quiet and exempt
+/// from the check; this bound therefore only needs to sit above
+/// [`RESHAPE_HANDOFF_TTL_EPOCHS`] (a successor's post-execution seating
+/// lag) and the occasional skipped epoch.
+///
+/// Starting value provisional — calibrate against the measured
+/// skip/reshape cadence like the miss-counter thresholds: too low flags
+/// a healthy-but-slow shard, too high delays detection of a real halt.
+pub const HALT_THRESHOLD_EPOCHS: u64 = 16;
+
 // ─── Penalties ─────────────────────────────────────────────────────────────
 
 /// How long a fault-cause jail must elapse before an `Unjail` lift can
