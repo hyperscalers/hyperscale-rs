@@ -12,7 +12,7 @@ threshold at which both safety and liveness arguments lapse.
 Run: python3 specs/committee_security.py
 """
 
-from math import exp, lgamma
+from math import comb, exp, lgamma, log
 
 # ── Deployment parameters (defaults mirror intent, not the dev constants) ──
 EPOCH_SECONDS = 300             # production target (BeaconChainConfig default); dev sim uses 2s
@@ -76,6 +76,212 @@ def crossing_rate(N: int, M: int, n: int) -> float:
     """
     f = f_of(n)
     return hyper_pmf(N, M, n, f) * p_up(N, M, n, f)
+
+
+# ── Randomness grinding: the last-revealer grind on the epoch seed ─────────
+# The next-epoch beacon randomness is BLAKE3(prev || VRF outputs of the
+# COMMITTED beacon-committee proposals). Each VRF output is key-fixed
+# (deterministic in (key, epoch)), so a Byzantine beacon member cannot choose
+# its value — only whether it joins the fold: reveal early => folded, withhold
+# => BOTTOM, not folded. The dense-vector PC input commits interior BOTTOMs
+# without shortening the prefix, so the toggle is independent per member. With
+# t strategically-releasable Byzantine proposals the adversary enumerates
+# 2^t candidate seeds (ChaCha20 is a PRF: distinct seed => independent uniform
+# draw), computes each one's committee, and steers the commit to the best.
+# Best-of-2^t on one global seed per epoch, one-epoch lookahead (not
+# retroactive, not compounding beyond the per-epoch redraw). t is bounded by
+# the Byzantine beacon-committee count ~ beta*n; the realized value is set by
+# how many of those proposals synchrony lets the adversary hold back and
+# release late-but-included.
+
+def grind_shard_march_days(
+    n: int, beta: float, t: int, interval: int = SHUFFLE_INTERVAL_EPOCHS
+) -> float:
+    """Expected days to march ONE targeted shard from beta*n to f+1 corrupt
+    seats under a best-of-2^t grind of the trickle shuffle. Each event the
+    adversary grinds for an honest victim AND a corrupt entrant — single-seed
+    p_gain(c) = ((n-c)/n) * beta — and best-of-2^t drives the per-event
+    success to 1-(1-p_gain)^(2^t). Corrupt count is monotone: the grind also
+    steers away from corrupt-losing rotations, so a no-gain event holds rather
+    than loses. Converges to the deterministic floor (f+1-beta*n events) as
+    2^t * p_gain >> 1."""
+    f = f_of(n)
+    c0 = round(beta * n)
+    k = 2 ** t
+    intervals = 0.0
+    c = c0
+    while c < f + 1:
+        p_gain = ((n - c) / n) * beta
+        p = 1 - (1 - p_gain) ** k
+        if p <= 0.0:
+            return float("inf")
+        intervals += 1 / p
+        c += 1
+    return intervals * interval * EPOCH_SECONDS / 86400
+
+
+def grind_resample_year(n: int, beta: float, t: int, shards: int = 100) -> float:
+    """Best-of-2^t amplification of the beacon committee's per-epoch resample
+    tail, expressed per network-year. Eligible ~ shards * n (one committee
+    network-wide, redrawn every epoch); the single-draw tail P[>=f+1] is
+    amplified to 1-(1-p)^(2^t) and scaled by draws/year. Epoch-commit safety
+    rides pool ratification (INV-BEACON-1), so this prices liveness and
+    randomness-bias exposure, not a fork."""
+    N = shards * n
+    f = f_of(n)
+    p = hyper_tail(N, round(N * beta), n, f + 1)
+    return (1 - (1 - p) ** (2 ** t)) * EPOCHS_PER_YEAR
+
+
+def fmt_duration(days):
+    """Compact days / years / never for the residual-march tables."""
+    if days == float("inf"):
+        return "never"
+    if days < 90:
+        return f"{days:.1f}d"
+    yr = days / 365.25
+    return f"{yr:.0f}y" if yr < 1000 else f"{yr:.0e}y"
+
+
+# ── Network-wide grind: the finite shared pool the single-shard march ignores ─
+# The single-shard march (table M) models one targeted shard drawing from an
+# inexhaustible pool at a fixed corrupt fraction beta. That is the exchangeable
+# regime, where §7's mean-field pool is exact. A *concentrating* grind breaks
+# exchangeability: the corrupt population is conserved (M = beta*N seats
+# network-wide), the pool is finite and SHARED, and every shard shuffles from
+# it — so the target competes with the whole network for a limited corrupt
+# supply, and any deterministic-longest (FIFO) eviction forces the seats it does
+# win to age out on a fixed n-event clock back into that contested pool.
+#
+# Under all-shard FIFO the target's corrupt count is a stable equilibrium, not a
+# monotone march: with pool corrupt fraction x, the grind seats a corrupt
+# entrant at rate p = 1-(1-x)^width and FIFO evicts corrupt at rate c_T/n, so
+# c_T = n*(1-(1-x)^width). Conserving corrupt over the target, the (shards-1)
+# random-draw shards (each at fraction x), and the pool P closes the system:
+#   M = c_T + (shards-1)*x*n + x*P .
+# One scalar root x in (0, beta]. Three regimes: supply FLOOR (M <= f, can't
+# seat f+1 at all — the note's structural bound), FIFO CAP (M > f but the
+# equilibrium c_T < f+1, so a fork is only a rare crossing of the equilibrium,
+# reverting to the un-steered tail), or FORK (c_T >= f+1). The CURRENT scheme
+# grinds the victim too — it evicts an honest seat to protect its corrupt ones,
+# so there is no aging-out and it forks whenever supply permits (M > f). FIFO is
+# what turns the supply floor into a dynamic cap.
+
+# Unseated buffer for the NETWORK model: a small shared pool of Pooled spares
+# (jail/exit refill stock + reshape cohorts), unlike §1's POOL_FACTOR=20, which
+# is the eligible population a SINGLE committee draws from. Here most validators
+# are seated on shards and the pool is a couple of committees the whole network
+# shuffles through.
+NET_POOL_FACTOR = 2
+
+
+def grind_network_equilibrium(n, beta, shards, pool_factor, width):
+    """Mean-field target-shard corrupt equilibrium c_T under all-shard FIFO
+    eviction with a conserved corrupt population and a finite shared pool.
+    Returns (c_T, pool_fraction). Validated against a Monte Carlo below."""
+    pool = round(pool_factor * n)
+    total = shards * n + pool
+    corrupt = beta * total
+    rest = (shards - 1) * n + pool
+    lo, hi = 0.0, beta
+    for _ in range(200):
+        x = 0.5 * (lo + hi)
+        if n * (1 - (1 - x) ** width) + x * rest - corrupt > 0:
+            hi = x
+        else:
+            lo = x
+    x = 0.5 * (lo + hi)
+    return n * (1 - (1 - x) ** width), x
+
+
+def grind_network_regime(n, beta, shards, pool_factor, width):
+    """'floor' (supply M <= f), 'fork' (equilibrium c_T >= f+1), or the capped
+    c_T as a float (a dynamic FIFO cap strictly below f+1)."""
+    f = f_of(n)
+    if beta * (shards * n + round(pool_factor * n)) <= f:
+        return "floor"
+    c_t, _ = grind_network_equilibrium(n, beta, shards, pool_factor, width)
+    return "fork" if c_t >= f + 1 else c_t
+
+
+def _grind_network_sim(n, beta, shards, pool_factor, width, intervals, seed, fifo):
+    """Seeded Monte Carlo of the conserved-population network grind — validation
+    for the mean field, not a table generator. `fifo` picks the eviction rule on
+    the target: True = deterministic longest-seated; False = the current
+    victim-grind (evict an honest seat to protect corrupt). One corrupt entrant
+    is ground onto the target per event at effective width `width`; the other
+    shards draw uniformly. Returns the fraction of events the target held f+1."""
+    from random import Random
+
+    rng = Random(seed)
+    pool = round(pool_factor * n)
+    total = shards * n + pool
+    corrupt = round(beta * total)
+    f = f_of(n)
+    seats = [True] * corrupt + [False] * (total - corrupt)
+    rng.shuffle(seats)
+    committees = [seats[s * n:(s + 1) * n] for s in range(shards)]
+    cp = sum(seats[shards * n:])
+    hp = pool - cp
+    forks = 0
+    for _ in range(intervals):
+        for s in range(shards):
+            c = committees[s]
+            if s == 0 and fifo:
+                ev = c.pop(0)
+            elif s == 0:
+                idx = next((i for i, v in enumerate(c) if not v), 0)
+                ev = c.pop(idx)
+            else:
+                idx = rng.randrange(len(c))
+                ev = c.pop(idx)
+            if ev:
+                cp += 1
+            else:
+                hp += 1
+        tot = cp + hp
+        p_grind = 1 - (1 - cp / tot) ** width if tot else 0.0
+        if tot and rng.random() < p_grind and cp > 0:
+            committees[0].append(True)
+            cp -= 1
+        elif hp > 0:
+            committees[0].append(False)
+            hp -= 1
+        elif cp > 0:
+            committees[0].append(True)
+            cp -= 1
+        else:
+            committees[0].append(False)
+        for s in range(1, shards):
+            tot = cp + hp
+            if not tot:
+                committees[s].append(False)
+                continue
+            if rng.random() < cp / tot:
+                committees[s].append(True)
+                cp -= 1
+            else:
+                committees[s].append(False)
+                hp -= 1
+        if sum(committees[0]) >= f + 1:
+            forks += 1
+    return forks / intervals
+
+
+def check_grind_network() -> None:
+    """The mean field and the Monte Carlo must agree on the fork/cap verdict at a
+    small tractable instance (n=32, so the 20000-event sim runs fast)."""
+    n, shards, pf = 32, 12, 2.0
+    for beta, width in ((0.03, 4), (0.12, 64)):
+        regime = grind_network_regime(n, beta, shards, pf, width)
+        forks = _grind_network_sim(n, beta, shards, pf, width, 8000, 5, fifo=True)
+        mf_forks = regime == "fork"
+        # A capped equilibrium far below f+1 must (almost) never cross; a
+        # fork equilibrium must cross often.
+        if mf_forks and forks < 0.2:
+            raise AssertionError(f"mean field forks but sim rarely does (beta={beta})")
+        if not mf_forks and regime != "floor" and forks > 0.05:
+            raise AssertionError(f"mean field caps but sim forks (beta={beta})")
 
 
 # ── The adaptive adversary, computed exactly (tables J/K/L) ─────────────────
@@ -223,6 +429,345 @@ def adversary_value_iteration(
     return (start, policy) if want_policy else start
 
 
+# ── The grind, set jointly by the tunable parameters (table T) ───────────────
+# The march is not a fixed threat: three protocol knobs move it, and they turn
+# out to decouple, so the disposition is a parameter choice rather than a new
+# mechanism (§10 Finding 11).
+#
+#   beacon committee size b  — the grind WIDTH lever. Width = 2^t, t = corrupt
+#     beacon proposers ~ Binomial(b, beta). A small committee means most epochs
+#     the adversary holds 0-1 seats and the toggle cannot sway the draw at all,
+#     so the FIFO equilibrium c_T = n * E[1-(1-beta)^(2^t)] caps below f+1. This
+#     is the only lever that bites at the design point (beta>=0.05); the others
+#     close only beta<=~0.04. The natural (un-boosted) foothold is the operative
+#     one because jail-on-first for withholding kills the resample-grind boost:
+#     to boost, the adversary must self-omit every epoch, which jails it.
+#   withholding penalty  — jail-on-first, made SAFE by SPC censorship
+#     resistance. The committed value is the f+1-shared prefix (qc1_certify), so
+#     an honest proposal reaching a supermajority is committed and cannot be
+#     excluded by delay under synchrony; a grinder is absent only by SELF-
+#     omission. So jail-on-first catches the grinder and (partial synchrony:
+#     honest excludable only in bounded async windows, not the persistent f/n
+#     Finding 7 assumed) barely touches honest — and a small committee shrinks
+#     the residual purge rate to f_beacon, tiny.
+#   shuffle interval I  — FREED to serve adaptive corruption once the beacon
+#     size caps the grind. Grind cap is time-independent (a seat fraction), so
+#     small I costs the grind nothing and buys adaptive-corruption survival
+#     (1-1/n)^(tau/I) and fast detect-and-rotate recovery.
+
+def grind_width_cap(n, beta, beacon_size):
+    """FIFO target-shard corrupt equilibrium under a beacon committee of
+    `beacon_size`, natural (jail-on-first-suppressed) foothold: the grind seats
+    corrupt at rate E over T~Binomial(beacon_size, beta) of 1-(1-beta)^(2^T),
+    FIFO evicts at c/n, so c_T = n * that expectation. Caps below f+1 for a
+    small enough committee."""
+    e_p = sum(
+        exp(log_comb(beacon_size, k)) * beta**k * (1 - beta) ** (beacon_size - k)
+        * (1 - (1 - beta) ** (2 ** min(k, 30)))
+        for k in range(beacon_size + 1)
+    )
+    return n * e_p
+
+
+def beacon_compromise(beta, beacon_size):
+    """P[a fresh beacon committee draw is itself >= f+1 corrupt]. Rides pool
+    ratification (INV-BEACON-1), so this prices beacon liveness/bias, not a
+    fork — the cost of shrinking the committee to cap the grind width."""
+    return sum(
+        exp(log_comb(beacon_size, k)) * beta**k * (1 - beta) ** (beacon_size - k)
+        for k in range(f_of(beacon_size) + 1, beacon_size + 1)
+    )
+
+
+def purge_beta_eff(n, beta, beacon_size, cooldown, shards=100, pool_factor=2):
+    """Worst-case effective beta among the active set under jail-on-first, if the
+    adversary could force f_beacon honest absent per epoch and hold them jailed
+    for `cooldown` epochs. SPC censorship resistance (partial synchrony) confines
+    real exclusion to bounded async windows, so this is a ceiling, not the
+    expected value — and it stays near beta because a small committee has few
+    honest to purge."""
+    total = shards * n + pool_factor * n
+    corrupt = beta * total
+    honest = total - corrupt
+    jailed = min(f_of(beacon_size) * cooldown, honest - 1)
+    return corrupt / (corrupt + honest - jailed)
+
+
+# ── The resample boost, coupled to the withholding penalty (the width cap the
+# ── mean field assumes, tested against the pool it actually draws from) ──────
+# grind_width_cap prices the target-shard equilibrium off the NATURAL beacon
+# foothold T ~ Binomial(beacon_size, beta) — the width the adversary gets if the
+# resample grind (steering this epoch's seed to over-represent itself in NEXT
+# epoch's committee draw) is fully suppressed. Whether jail-on-first for
+# withholding achieves that suppression is not a closed-form question: the
+# beacon committee is redrawn every epoch from beacon_eligible() = every
+# OnShard{ready} validator network-wide (~shards*n seats), so the corrupt supply
+# the resample draws from is ~beta*shards*n, and jail-on-first only removes the
+# members the winning grind pattern actually omits (~T/2 per epoch) for a
+# cooldown. The two rates — supply and drain — decide whether the boost
+# collapses to the natural foothold or sustains above it. This Monte Carlo
+# couples them.
+
+_WIDTH_CAP = 1 << 60   # beyond this the best-of saturates; keeps ints bounded
+
+
+def _omit_width(T, s):
+    """Grind width from omitting up to `s` of `T` seated corrupt beacon
+    proposals: the number of distinct include/omit patterns (candidate seeds)
+    the adversary can try, sum_{i<=s} C(T,i). s>=T gives the full 2^T; s=0
+    gives 1 (no grind)."""
+    if s >= T:
+        return _WIDTH_CAP if T >= 60 else (1 << T)
+    return min(sum(comb(T, i) for i in range(s + 1)), _WIDTH_CAP)
+
+
+def _binom_pmf(k, b, x):
+    if x <= 0.0:
+        return 1.0 if k == 0 else 0.0
+    if x >= 1.0:
+        return 1.0 if k == b else 0.0
+    return exp(log_comb(b, k) + k * log(x) + (b - k) * log(1 - x))
+
+
+def _sample_best_of(rng, w, b, x):
+    """Sample T = max over `w` i.i.d. Binomial(b, x) committee corrupt counts —
+    the resample grind's best-of-w over candidate committee draws. Drawn from
+    the max-CDF so `w` may be astronomically large (no per-candidate loop)."""
+    cum, c = [], 0.0
+    for k in range(b + 1):
+        c += _binom_pmf(k, b, x)
+        cum.append(min(c, 1.0))
+    u = rng.random()
+    for k in range(b + 1):
+        if cum[k] ** w >= u:   # P[max <= k] = cum[k]^w
+            return k
+    return b
+
+
+def sim_resample_boost(n, beta, beacon_size, omit_frac, jail, cooldown,
+                       epochs, seed, shards=100, pool_factor=NET_POOL_FACTOR,
+                       boost=True, eligible=None):
+    """Couple the resample-grind boost to the withholding penalty. Each epoch
+    the beacon committee is a best-of-w_prev draw off the grindable seed (the
+    boost the last grind bought); the adversary omits `omit_frac` of its
+    foothold to grind width w = sum_{i<=s} C(T,i), steering next epoch's
+    committee and, on shuffle epochs, a corrupt entrant onto the FIFO target
+    shard. Under `jail`, every omitted member jails on the first absence and
+    leaves the eligible pool for `cooldown` epochs. `boost=False` disables the
+    carryover (plain single draw) — the fully-suppressed reference that must
+    reproduce grind_width_cap. Returns realized foothold, width, and c_T."""
+    from random import Random
+
+    rng = Random(seed)
+    f = f_of(n)
+    E_tot = eligible if eligible is not None else shards * n + round(pool_factor * n)
+    A_c = round(beta * E_tot)          # corrupt eligible, not jailed, not on target
+    ring = [0] * max(cooldown, 1)      # jail-return ring buffer
+    jailed = 0
+
+    committee = [False] * n            # target shard, FIFO (oldest at index 0)
+    for i in rng.sample(range(n), round(beta * n)):
+        committee[i] = True
+    c = sum(committee)
+    A_c -= c
+
+    w_prev, sum_w, sum_T, max_c, fork_events, shuffle_events = 1, 0.0, 0.0, c, 0, 0
+    for t in range(epochs):
+        slot = t % len(ring)
+        A_c += ring[slot]
+        jailed -= ring[slot]
+        ring[slot] = 0
+
+        active = E_tot - jailed
+        x = min(max(A_c / active, 0.0), 1.0) if active > 0 else 0.0
+        T = _sample_best_of(rng, min(w_prev, _WIDTH_CAP) if boost else 1, beacon_size, x)
+        s = round(omit_frac * T)
+        w = _omit_width(T, s)
+
+        if jail and s > 0:
+            take = min(s, A_c)
+            A_c -= take
+            jailed += take
+            ring[(t + cooldown) % len(ring)] += take
+
+        if t % SHUFFLE_INTERVAL_EPOCHS == 0:
+            shuffle_events += 1
+            if committee.pop(0):
+                A_c += 1
+            if rng.random() < 1 - (1 - x) ** min(w, _WIDTH_CAP) and A_c > 0:
+                committee.append(True)
+                A_c -= 1
+            else:
+                committee.append(False)
+            c = sum(committee)
+            max_c = max(max_c, c)
+            fork_events += c >= f + 1
+
+        sum_w += min(w, 1 << 30)
+        sum_T += T
+        w_prev = w
+
+    return {
+        "mean_T": sum_T / epochs,
+        "mean_width": sum_w / epochs,
+        "final_c": c,
+        "max_c": max_c,
+        "fork_frac": fork_events / max(shuffle_events, 1),
+        "x": x,
+    }
+
+
+def sim_async_purge(n, beta, beacon_size, p_async, cooldown, epochs, seed,
+                    shards=100, pool_factor=NET_POOL_FACTOR):
+    """Realized honest purge under jail-on-first vs the purge_beta_eff ceiling.
+    Each epoch is synchronous w.p. 1-p_async (an honest proposal reaching f+1 of
+    the committee is committed by qc1_certify, so NObody is forced absent) or
+    async w.p. p_async (the adversary excludes up to f_beacon honest committee
+    members, who jail for `cooldown`). Returns the realized effective beta among
+    the active (non-jailed) population — the ceiling holds only if p_async=1."""
+    from random import Random
+
+    rng = Random(seed)
+    total = shards * n + round(pool_factor * n)
+    corrupt = round(beta * total)
+    honest = total - corrupt
+    f_b = f_of(beacon_size)
+    ring = [0] * max(cooldown, 1)
+    jailed_honest = 0
+    sum_beta_eff, max_jailed = 0.0, 0
+    for t in range(epochs):
+        slot = t % len(ring)
+        jailed_honest -= ring[slot]
+        ring[slot] = 0
+        if rng.random() < p_async:
+            excl = max(0, min(f_b, honest - jailed_honest))
+            jailed_honest += excl
+            ring[(t + cooldown) % len(ring)] += excl
+        active_honest = honest - jailed_honest
+        sum_beta_eff += corrupt / (corrupt + active_honest)
+        max_jailed = max(max_jailed, jailed_honest)
+    return {"mean_beta_eff": sum_beta_eff / epochs, "max_jailed": max_jailed}
+
+
+def check_resample_boost() -> None:
+    """The coupled sim must (1) reproduce grind_width_cap when the boost is
+    suppressed, and (2) show the boost SURVIVING jail-on-first at the true
+    eligible-pool size — the two claims table T's narrative turns on."""
+    n, beta = 128, 0.10
+    f = f_of(n)
+    # (1) boost off -> the mean-field natural foothold (Binomial mean), not the
+    # runaway. A loose band: the sim's realized foothold tracks Binomial(b,beta).
+    off = sim_resample_boost(n, beta, 16, 0.5, True, 64, 12000, 901, boost=False)
+    if not 1.0 <= off["mean_T"] <= 2.5:   # Binomial(16, 0.10) mean 1.6
+        raise AssertionError(f"boost-off foothold off-model: {off['mean_T']:.2f}")
+    # (2) jail-on-first at the real eligible pool does NOT cap below f+1.
+    on = sim_resample_boost(n, beta, 16, 1.0, True, 64, 12000, 902)
+    if on["final_c"] < f + 1:
+        raise AssertionError(
+            f"jail-on-first unexpectedly capped below f+1 at eligible=all "
+            f"(c_T={on['final_c']}) — re-check the boost model")
+    # a small eligible pool WOULD let the drain collapse it (the mechanism).
+    small = sim_resample_boost(n, beta, 20, 0.5, True, 64, 12000, 903, eligible=800)
+    if small["max_c"] >= f + 1:
+        raise AssertionError(
+            f"small-pool boost not collapsed (max_c={small['max_c']})")
+    # the full prevention stack (recency + jail + FIFO) holds the design-point
+    # shard well below the terminal 2f+1 line, where the decided stack is thin.
+    full = sim_recency(n, beta, 16, 12000, 904)
+    if full["max_c"] >= 2 * f_of(n) + 1:
+        raise AssertionError(
+            f"full stack reached 2f+1 at design point (max_c={full['max_c']})")
+
+
+# ── The recency-weighted resample: capping the boost by service rate ─────────
+# The boost sustains a high foothold by re-seating corrupt every epoch; the
+# withholding penalty could not drain the network-wide eligible pool. A recency
+# weight instead caps the SERVICE RATE: weight 0 right after serving, recovering
+# additively (+1/cooldown per epoch) to 1 over cooldown = eligible/b epochs. So
+# each corrupt seat depletes its own weight, pinning the SUSTAINED foothold near
+# natural (beta*b) — a rate limit the huge supply does not defeat. Stacked
+# additively with jail-on-first (which plugs the ramp leak when its cooldown
+# matches the recency period) and FIFO shard eviction (which stops bursts from
+# accumulating), it holds the target shard's sustained corrupt below the terminal
+# 2f+1 line and pushes the first 2f+1 crossing from beta~0.12 to ~0.14. Mean
+# field over recency buckets (exact depletion feedback). The ramp sharpness and
+# jail-cooldown coupling are tuning knobs (a sharper ramp caps tighter but makes
+# the committee more predictable — the §4 trade); pinned during implementation.
+
+def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
+                omit_frac=0.5, with_fifo=True):
+    """Full prevention stack: recency-weighted resample + jail-on-first + FIFO.
+    Returns the sustained foothold, the burst peak, and the target shard's
+    corrupt equilibrium/peak — the margin below the terminal 2f+1 line."""
+    from random import Random
+
+    rng = Random(seed)
+    f = f_of(n)
+    E = shards * n
+    cooldown = max(1, E // b)                 # additive recovery period
+    jail_cd = cooldown if jail_cd is None else jail_cd
+    Cn = round(beta * E)
+    Hn = E - Cn
+    jail_ring = [0] * max(jail_cd, 1)
+    W = [min(1.0, s / cooldown) for s in range(cooldown + 1)]   # additive ramp
+    corr = [0] * (cooldown + 1); corr[cooldown] = Cn
+    hon = [0] * (cooldown + 1); hon[cooldown] = Hn
+
+    committee = [False] * n
+    for i in rng.sample(range(n), round(beta * n)):
+        committee[i] = True
+    c = sum(committee)
+    w_prev, sum_T, peak_T, max_c = 1, 0.0, 0, c
+
+    for t in range(epochs):
+        due = jail_ring[t % len(jail_ring)] if jail else 0
+        if jail:
+            jail_ring[t % len(jail_ring)] = 0
+        # age one epoch (shift toward the fully-cooled absorbing bucket)
+        corr[cooldown] += corr[cooldown - 1]
+        hon[cooldown] += hon[cooldown - 1]
+        for s in range(cooldown - 1, 0, -1):
+            corr[s] = corr[s - 1]
+            hon[s] = hon[s - 1]
+        corr[0] = hon[0] = 0
+        corr[min(jail_cd, cooldown)] += due   # jailed return at their true recency
+
+        Wc = sum(corr[s] * W[s] for s in range(cooldown + 1))
+        Wh = sum(hon[s] * W[s] for s in range(cooldown + 1))
+        p = Wc / (Wc + Wh) if (Wc + Wh) > 0 else 0.0
+
+        T = _sample_best_of(rng, min(w_prev, _WIDTH_CAP), b, p)
+        T = min(T, b, sum(corr))
+        # seat T corrupt (highest weight first) + b-T honest; reset to bucket 0
+        for pool, need in ((corr, T), (hon, b - T)):
+            for s in range(cooldown, -1, -1):
+                if need <= 0:
+                    break
+                take = min(pool[s], need)
+                pool[s] -= take
+                pool[0] += take
+                need -= take
+        if jail and T > 0:                    # omitters withhold to grind -> jail
+            s_omit = min(round(omit_frac * T), corr[0])
+            corr[0] -= s_omit
+            jail_ring[(t + jail_cd) % len(jail_ring)] += s_omit
+
+        w_prev = 1 << min(T, 60)
+        sum_T += T
+        peak_T = max(peak_T, T)
+        if t % SHUFFLE_INTERVAL_EPOCHS == 0:
+            if with_fifo:
+                committee.pop(0)
+            else:
+                committee.pop(next((i for i, v in enumerate(committee) if not v), 0))
+            committee.append(rng.random() < 1 - (1 - beta) ** min(w_prev, _WIDTH_CAP))
+            c = sum(committee)
+            max_c = max(max_c, c)
+    half = epochs // 2
+    return {"steady_T": sum_T / epochs, "peak_T": peak_T,
+            "final_c": c, "max_c": max_c}
+
+
 def fmt(x: float) -> str:
     if x == 0.0:
         return "   ~0    "
@@ -244,6 +789,8 @@ def table(title: str, row_hdr: str, rows, cols, cell) -> None:
 def main() -> None:
     for n in N_SWEEP:
         check_detailed_balance(POOL_FACTOR * n, int(POOL_FACTOR * n * 0.25), n)
+    check_grind_network()
+    check_resample_boost()
 
     # A: per-draw failure probability (genesis, split cohorts, merge keepers)
     table(
@@ -516,6 +1063,268 @@ def main() -> None:
     print(f"    t=0 optimal launches by k (0..f={f}, full budget): {row}")
     print("    conserve-then-spend: budget is held until a lucky rotation "
           "lifts k toward the boundary")
+
+    # M: randomness grinding — the last-revealer grind on the epoch seed.
+    # Best-of-2^t steering of the trickle shuffle marches a TARGETED shard
+    # from beta*n to f+1 corrupt (an INV-SHARD-1 fork on that shard). t is
+    # bounded by the Byzantine beacon foothold ~ beta*n (~13 at n=128,
+    # beta=0.10; ceiling f=42); materiality bites well under that.
+    n = 128
+    beta = 0.10
+    f = f_of(n)
+    c0 = round(beta * n)
+    floor_days = (f + 1 - c0) * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 86400
+    print(f"\nM. Randomness grind: days to march one targeted shard from "
+          f"beta*n={c0} to f+1={f + 1} corrupt")
+    print(f"   (n={n}, beta={beta}, shuffle every {SHUFFLE_INTERVAL_EPOCHS} "
+          f"epochs; best-of-2^t steering, foothold ceiling t<=f={f})")
+    print("    grind t | candidate seeds 2^t | days to fork the shard")
+    print("  " + "-" * 56)
+    for t in (1, 2, 3, 4, 6, 8, 13):
+        print(f"    {t:>7} | {2 ** t:>19} | {grind_shard_march_days(n, beta, t):>10.1f}")
+    print(f"   (deterministic floor as 2^t*p_gain >> 1: {floor_days:.1f} days; "
+          "materiality threshold t ~ 3-4)")
+
+    # Operating-point levers: the march counts shuffle EVENTS and flips f+1-c0
+    # SEATS, so days-to-fork are linear in both the shuffle interval and the
+    # committee size. Both are free-ish dials that trade grind resistance
+    # against their other costs (I: adaptive-corruption flush, §6 Rider 1;
+    # n: message complexity, §6). The width cannot be capped at the input
+    # (Finding 11); for f+1 that is moot (detect-and-rotate recovers, Finding
+    # 10), but for the TERMINAL 2f+1 these levers ARE the defense — prevention,
+    # not recovery (Finding 9).
+    print("   Cheap levers (t=4, days to fork one shard):")
+    intervals = (2, 4, 8, 16, 32, 64)
+    print("    shuffle interval I | "
+          + " ".join(f"{i:>5}" for i in intervals) + "   (n=128)")
+    print("                       | "
+          + " ".join(f"{grind_shard_march_days(n, beta, 4, i):>5.1f}" for i in intervals))
+    sizes = (64, 96, 128, 192, 256)
+    print("    committee size n   | "
+          + " ".join(f"{s:>5}" for s in sizes) + "   (I=16)")
+    print("                       | "
+          + " ".join(f"{grind_shard_march_days(s, beta, 4):>5.1f}" for s in sizes))
+    print("   (I=2 — the §6 Rider 1 adaptive-corruption optimum — is the grind's "
+          "WORST case, ~8x the I=16")
+    print("    march; the two threats pull opposite ways on I. n is capped at 128 "
+          "by message complexity.)")
+
+    # N: the beacon resample under the same grind — best-of-2^t amplification
+    # of the per-epoch redraw tail. Not the sharp target (safety rides pool
+    # ratification), so this prices liveness + bias exposure, not a fork.
+    shards = 100
+    N_elig = shards * n
+    p_single = hyper_tail(N_elig, round(N_elig * beta), n, f + 1)
+    print(f"\nN. Randomness grind: beacon resample tail under best-of-2^t "
+          f"(eligible={N_elig}, single-draw P[>=f+1]={p_single:.2e})")
+    print("    grind t | candidate seeds 2^t | amplified P[>=f+1]/network-year")
+    print("  " + "-" * 60)
+    for t in (0, 2, 4, 6, 8, 10, 13):
+        print(f"    {t:>7} | {2 ** t:>19} | {grind_resample_year(n, beta, t):>18.2e}")
+    print("   (epoch-commit safety rides pool ratification INV-BEACON-1; "
+          "prices liveness + bias, not a fork)")
+
+    # R: the network-wide grind under all-shard FIFO eviction. The single-shard
+    # march (table M) ignores the finite shared pool; conserving corrupt and
+    # letting every shard shuffle from one pool turns the target into a stable
+    # equilibrium. FIFO caps it below f+1 for low beta; the current victim-grind
+    # scheme forks whenever supply permits. Width 2^t, t=round(beta*n).
+    n = 128
+    f = f_of(n)
+    print(f"\nR. Network-wide grind under all-shard FIFO eviction (finite shared "
+          f"pool, n={n}, f+1={f + 1})")
+    print("   Target-shard corrupt equilibrium c_T by shard count and beta "
+          "(grind width 2^t, t=round(beta*n)):")
+    betas = (0.02, 0.025, 0.03, 0.04, 0.05, 0.10)
+    print("    shards | " + " ".join(f"b={b:<5}" for b in betas))
+    print("  " + "-" * (9 + 8 * len(betas)))
+    for shards in (4, 10, 25, 100, 1000):
+        cells = []
+        for b in betas:
+            t = max(1, round(b * n))
+            r = grind_network_regime(n, b, shards, NET_POOL_FACTOR, 2 ** t)
+            cells.append("flr" if r == "floor" else ("FORK" if r == "fork" else f"{r:.0f}"))
+        print(f"    {shards:>6} | " + " ".join(f"{c:>7}" for c in cells))
+    print("   (flr = supply floor M<=f, can't seat f+1; number = FIFO-capped "
+          "c_T < f+1; FORK = c_T>=f+1)")
+
+    # The closed band each scheme buys, on a large network (supply ample, so the
+    # difference is the DYNAMICS, not the floor). Current forks whenever M>f;
+    # FIFO caps at width 2^t; FIFO+strikes caps at the strike-limited width t+1.
+    shards = 100
+    print(f"\n   Fork verdict on a {shards}-shard network — what each eviction "
+          "rule closes:")
+    print("    beta  | current (victim-grind) | FIFO (width 2^t) | FIFO + strikes (width t+1)")
+    print("  " + "-" * 74)
+    for b in (0.02, 0.03, 0.04, 0.05, 0.07, 0.10):
+        t = max(1, round(b * n))
+        m_gt_f = b * (shards * n + NET_POOL_FACTOR * n) > f
+        cur = "fork" if m_gt_f else "floor"
+        fifo = grind_network_regime(n, b, shards, NET_POOL_FACTOR, 2 ** t)
+        strk = grind_network_regime(n, b, shards, NET_POOL_FACTOR, t + 1)
+        fifo_s = "FORK" if fifo == "fork" else ("flr" if fifo == "floor" else f"cap {fifo:.0f}")
+        strk_s = "FORK" if strk == "fork" else ("flr" if strk == "floor" else f"cap {strk:.0f}")
+        print(f"    {b:5.2f} | {cur:>22} | {fifo_s:>16} | {strk_s:>26}")
+    print("   (current forks across the whole band once supply permits; FIFO "
+          "closes beta<=~0.025, FIFO+strikes")
+    print("    closes beta<=~0.04; neither closes the design point — see "
+          "committee_security.md §10 Finding 8. Validated")
+    print("    against a conserved-population Monte Carlo (check_grind_network).)")
+
+    # S: detect-and-rotate recovery for the f+1 LIVENESS halt (the 2f+1 march is
+    # terminal, prevention not recovery — Finding 9). The f+1 halt is detectable;
+    # on a stalled shard boundary the beacon re-draws the WHOLE committee. A full fresh draw
+    # is grind-resistant where the trickle is not: reaching f+1 in one
+    # hypergeometric draw is a ~1e-13 tail that best-of-2^t barely lifts, versus
+    # the trickle where best-of-2^t drives each single-seat STEP to ~1. So the
+    # foothold the grind spent days building is flushed the moment it halts.
+    n = 128
+    f = f_of(n)
+    pool = POOL_FACTOR * n
+    halt_epochs = 20   # HALT_THRESHOLD placeholder: above RESHAPE_HANDOFF_TTL, tunable
+    print(f"\nS. Detect-and-rotate: a full committee re-draw the grind cannot "
+          f"steer (n={n}, f+1={f + 1})")
+    print("   Grind resistance — P[the recovery re-draw itself seats >= f+1 "
+          "corrupt], best-of-2^t:")
+    print("    beta  | one fresh draw | best-of-2^t (t=round(beta*n)) | trickle "
+          "per-STEP best-of-2^t")
+    print("  " + "-" * 76)
+    for beta in (0.10, 0.13, 0.15):
+        t = round(beta * n)
+        single = hyper_tail(pool, round(pool * beta), n, f + 1)
+        redraw = 1 - (1 - single) ** (2 ** t)
+        c0 = round(beta * n)
+        step = 1 - (1 - ((n - c0) / n) * beta) ** (2 ** t)
+        print(f"    {beta:5.2f} | {single:>14.1e} | {redraw:>28.1e} | {step:>21.3f}")
+    print("   (the re-draw is a single event the grind can't march; the trickle "
+          "step is ~certain -> it marches)")
+    print("   Attacker duty cycle — days of grinding to f+1, then flushed on the "
+          f"halt ({halt_epochs}-epoch window):")
+    print("    beta  | march to f+1 | halt window | sustained downtime on ONE shard")
+    print("  " + "-" * 70)
+    halt_days = halt_epochs * EPOCH_SECONDS / 86400
+    for beta in (0.07, 0.10, 0.13):
+        march = grind_shard_march_days(n, beta, round(beta * n))
+        downtime = halt_days / (march + halt_days)
+        print(f"    {beta:5.2f} | {march:>10.1f}d | {halt_days * 24:>8.1f}h | "
+              f"{downtime:>28.1%}")
+    print("   (continuous grinding buys a few-percent downtime on one shard, "
+          "flushed each cycle — this recovers")
+    print("    the f+1 LIVENESS halt only; the 2f+1 safety march is terminal and "
+          "prevention-only, §10 Finding 9.)")
+
+    # T: the small-beacon width cap, tested against the pool it actually draws
+    # from (§10 Finding 11). grind_width_cap prices the target equilibrium
+    # off the NATURAL foothold — the width if jail-on-first fully suppresses the
+    # resample boost. The coupled Monte Carlo (sim_resample_boost) plays the boost
+    # out against the real eligible pool: the boost SURVIVES jail-on-first at the
+    # design point, because the committee redraws from ~shards*n seats and the
+    # jail drain cannot deplete that corrupt supply. So the width cap is not a
+    # design-point close — it is a bar-raise that closes only the low-beta band.
+    n = 128
+    f = f_of(n)
+    ep = 12000
+
+    def realized_c(beta, b, cd):
+        """Worst-of-omit-policy realized target corrupt under jail-on-first."""
+        best = None
+        for i, phi in enumerate((0.5, 1.0)):
+            r = sim_resample_boost(n, beta, b, phi, True, cd, ep, 40 + i + int(beta * 100) + cd)
+            if best is None or r["max_c"] > best["max_c"]:
+                best = r
+        return best
+
+    print(f"\nT. Small-beacon width cap vs the coupled resample boost "
+          f"(n={n}, beta=0.10, f+1={f + 1}, 2f+1={2 * f + 1})")
+    print("   'assumed cap' = grind_width_cap (boost fully suppressed); "
+          "'realized' = coupled sim, jail-on-first cd=64.")
+    print("    beacon b | assumed cap c_T | realized c_T (max) | reaches       | "
+          "beacon compromise")
+    print("  " + "-" * 78)
+    for b in (16, 20, 24, 32, 128):
+        assumed = grind_width_cap(n, 0.10, b)
+        r = realized_c(0.10, b, 64)
+        c_t = r["final_c"]
+        reaches = ("safety (2f+1)" if r["max_c"] >= 2 * f + 1
+                   else "liveness (f+1)" if r["max_c"] >= f + 1 else "CAPPED (neither)")
+        print(f"    {b:>8} | {assumed:>15.0f} | {c_t:>8d} ({r['max_c']:>3d})    | "
+              f"{reaches:<13} | {beacon_compromise(0.10, b):>10.1e}")
+    print("   (the boost survives: realized c_T far exceeds the assumed cap. "
+          "b=16 holds the sustained")
+    print("    foothold below the TERMINAL 2f+1 line; b=20 reaches it — so b=16 "
+          "is non-negotiable.)")
+
+    print("\n   Margin below 2f+1 (TERMINAL) vs beta — where the shard first "
+          "crosses the doom line")
+    print("   (decided stack: b + FIFO + jail-on-first, realized c_T (max), cd=64; "
+          "2f+1=85, f+1=43):")
+    print("    beta  | b=16 c_T(max) reaches | b=20 c_T(max) reaches")
+    print("  " + "-" * 58)
+
+    def reach(r):
+        return ("2f+1!" if r["max_c"] >= 2 * f + 1
+                else "f+1" if r["max_c"] >= f + 1 else "<f+1")
+
+    for beta in (0.05, 0.07, 0.10, 0.12, 0.13, 0.15):
+        r16, r20 = realized_c(beta, 16, 64), realized_c(beta, 20, 64)
+        print(f"    {beta:.2f}  | {r16['final_c']:>3d}({r16['max_c']:>3d}) {reach(r16):>6} "
+              f"     | {r20['final_c']:>3d}({r20['max_c']:>3d}) {reach(r20):>6}")
+    print("   (2f+1 is TERMINAL — no recovery. b=16 holds the shard below it to "
+          "beta~0.12, thin against")
+    print("    the ~0.13 the sampling budget tolerates; b=20 reaches 2f+1 already "
+          "at the design point.")
+    print("    Pool hygiene keeping beta low is the primary means of widening the "
+          "margin.)")
+
+    print("\n   Full stack (+ recency-weighted resample) — how much it widens the "
+          "2f+1 margin (b=16):")
+    print("   (recency caps the SUSTAINED foothold near natural beta*b; sim_recency, "
+          "sustained T then c_T(max)):")
+    print("    beta  | decided c_T(max) reaches | full-stack c_T(max) reaches")
+    print("  " + "-" * 60)
+    for beta in (0.10, 0.12, 0.13, 0.15):
+        d = realized_c(beta, 16, 64)
+        fu = sim_recency(n, beta, 16, 12000, 400 + int(beta * 100))
+        print(f"    {beta:.2f}  | {d['final_c']:>3d}({d['max_c']:>3d}) {reach(d):>6}      "
+              f" | {fu['final_c']:>3d}({fu['max_c']:>3d}) {reach(fu):>6}")
+    print("   (recency pushes the first 2f+1 crossing from beta~0.12 to ~0.14 — "
+          "outside the ~0.13 the budget")
+    print("    tolerates — and leaves a wide margin at the design point. Ramp "
+          "sharpness + jail-cooldown are")
+    print("    tuning knobs pinned in implementation; a sharper ramp caps tighter "
+          "but is more predictable (§4).)")
+
+    print("\n   Jail-on-first honest purge: worst-case ceiling vs realized under "
+          "partial synchrony (b=20):")
+    print("   (purge_beta_eff assumes EVERY epoch purges f_beacon; realized only "
+          "in async windows, sim_async_purge)")
+    print("    p_async | realized beta_eff (cd=64 / cd=256) | worst-case ceiling")
+    print("  " + "-" * 62)
+    wc = f"{purge_beta_eff(n, 0.10, 20, 64):.3f}/{purge_beta_eff(n, 0.10, 20, 256):.3f}"
+    for pa in (0.02, 0.05, 0.20):
+        a64 = sim_async_purge(n, 0.10, 20, pa, 64, ep, 11 + int(pa * 100))
+        a256 = sim_async_purge(n, 0.10, 20, pa, 256, ep, 12 + int(pa * 100))
+        print(f"    {pa:.2f}    | {a64['mean_beta_eff']:.4f} / "
+              f"{a256['mean_beta_eff']:.4f}                | {wc} (p_async=1)")
+    print("   (realized purge is a rounding error — jail-on-first is clean; qc1_certify "
+          "makes honest")
+    print("    un-excludable outside async windows. It is safe, but for the same "
+          "reason too weak to close.)")
+
+    print("\n   Recommendation: the two thresholds get opposite defenses (§10 "
+          "Finding 9).")
+    print("   f+1 (liveness) is recoverable -> detect-and-rotate (§10 Finding 10).")
+    print("   2f+1 (safety) is TERMINAL — unilateral control mints stake and "
+          "cascades; no recovery,")
+    print("   so the defense is PREVENTION: hold the sustained foothold below 2f+1. "
+          "Load-bearing levers")
+    print("   are all input-side: b=16 (non-negotiable; b=20 reaches 2f+1), FIFO "
+          "(Finding 8), jail-on-first")
+    print("   (Finding 7), and pool hygiene (beta low) the deepest. The decided "
+          "stack holds below 2f+1")
+    print("   only to beta~0.12 -> widening that margin is the open work. I is NOT "
+          "shrunk (boost survives).")
+    print("   See §10 Finding 11 + Disposition.")
 
 
 if __name__ == "__main__":

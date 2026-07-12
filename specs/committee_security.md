@@ -256,10 +256,18 @@ with probability 0.4% — sustaining pressure against that flush costs
 thousands of targeted corruptions per day. Properly stated, fast rotation
 does not make corruption impossible — it forces the adversary off cheap
 slow corruption onto fast expensive corruption, a harder threat class.
-**Recommendation: I=2 at n=128** (≈21h tenure; the 5-minute epoch puts the
-old sub-5h tenure targets out of reach — even I=1 leaves 10.7h — so the
-1-epoch floor genuinely binds: the I ∝ 1/n scaling puts n=256 exactly at
-it).
+**Recommendation: a genuine two-way trade, not a free choice of I=2.** Adaptive
+corruption wants `I` small (I=2 flushes a ~5-day pipeline to 0.4% survival,
+≈21h tenure, and the 5-minute epoch puts the old sub-5h targets out of reach —
+even I=1 leaves 10.7h). But the randomness grind wants `I` *large*: the fork
+march is linear in `I` (§10 table M), and a small beacon committee does **not**
+cap the grind width — the coupled simulation of §10 Finding 11 shows the
+resample boost survives jail-on-first, so the interval keeps its grind duty and
+a small `I` is the grind's *worst* case. The two pull opposite ways and neither
+dominates (the adaptive gain is exponential in `1/I`, the grind cost linear in
+`I`), so `I` is not settled to a single number here: it balances the τ of the
+realistic adaptive threat against the design-point march time, and the balance
+eases as pool hygiene (§10 Disposition) shrinks the grind side.
 
 The mechanism is the shorter interval, *not* rotating k seats per batch,
 for three reasons: a k-batch guarantees a synchronized dip of k unready
@@ -312,10 +320,14 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   needs the consensus-checked reshape predicate to genuinely hold).
 - **Mean-field pool** — the replacement probability (M−k)/(N−n) ignores
   depletion by concurrent committees. Measured to be exact, not
-  approximate: under exchangeability the unseated fraction cancels from the
-  replacement probability, and the cell built to break it — four committees
-  seating *half* the population — still fits the single-committee formulas
-  (occupancy TV ≤ 0.007).
+  approximate *for unsteered draws*: under exchangeability the unseated
+  fraction cancels from the replacement probability, and the cell built to
+  break it — four committees seating *half* the population — still fits the
+  single-committee formulas (occupancy TV ≤ 0.007). Exchangeability is what a
+  *concentrating* grind breaks: an adversary steering corrupt seats onto one
+  targeted shard depletes the shared pool the other shards draw from, so the
+  fixed-β single-shard march (§10 Finding 5) *overstates* the grind on a real
+  finite network — §10 Finding 8 prices the correction.
 - **Corruption unit coarser than the seat.** Conditional on M corrupt seats
   the fold treats validators exchangeably, so clustering is invisible to
   every *seat-count* table here — an M-subset is an M-subset,
@@ -349,9 +361,11 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   rotation cannot help either. Only the *buying* adversary is
   concentration-neutral: `min_stake` is charged per seat regardless, so §1–3
   hold in seats.
-- **Crossing = compromise** stays conservative by choice, and **unbiased
-  randomness** stays an assumption — the randomness pipeline's grinding
-  surface is its own analysis, out of scope here.
+- **Crossing = compromise** stays conservative by choice. **Unbiased
+  randomness** does *not* hold: the epoch seed is grindable by a
+  last-revealer, and §10 prices the resulting steered attack. Every table in
+  §1–§8 assumes an unsteered draw and is a floor once §10's grind is
+  available — the grind is what turns those tails into a directed march.
 
 ## 8. Adversary synthesis — the computed worst case
 
@@ -389,3 +403,315 @@ the probability that axiom fails, so system-level claims compose as:
 P[safety violation] ≤ P[some committee ever ≥ f+1 corrupt] (this note) +
 P[violation | all committees honest-majority] (the models, = 0 for verified
 properties within their bounds).
+
+## 10. The randomness is grindable — a last-revealer steers the draw
+
+Every table above assumes the draw is unsteered. It is not. The next-epoch
+seed is `BLAKE3(prev_randomness ‖ VRF outputs of the committed
+beacon-committee proposals)`, rolled immediately before the shuffle victim,
+the shuffle entrant, the beacon resample, and pool draws all read it
+(`filter_and_roll_randomness`, crates/beacon/src/state/vrf.rs). A Byzantine
+beacon member cannot *choose* its VRF output — it is a fixed function of
+`(key, epoch)` — but it can choose whether that output joins the fold:
+reveal early and it is folded; withhold and its slot commits as `BOTTOM`,
+unfolded. Because the PC input vector is dense and commits interior
+`BOTTOM`s without truncating (`compute_view_input`, `qc1_certify`), the
+include/omit toggle is **independent per member and does not shorten the
+committed prefix**. With `t` such proposals held for late-but-included
+release, the adversary observes the honest reveals, enumerates the `2^t`
+candidate seeds, computes the committee each yields (ChaCha20 is a PRF, so
+distinct seeds are independent uniform draws), and steers the commit to the
+best one. **Grind width = 2^t**, one global best-of-`2^t` draw per epoch,
+one-epoch lookahead.
+
+Committee size does not dilute this. The seed is a hash: flipping one folded
+input swaps the entire output for a fresh uniform value, and the honest
+majority's reveals sit identically inside every candidate seed — a shared
+constant that does not distinguish the adversary's options. The defect is
+**move-order, not entropy quantity**: honest contributors reveal first, then
+the adversary chooses which of its own contributions count, so it moves last.
+The intuition "one honest unpredictable contribution randomizes the seed"
+holds only for a beacon where contributors commit *before* any reveal; this
+one reveals first.
+
+`t` is bounded by the Byzantine beacon-committee count ≈ β·n (≈13 at n=128,
+β=0.10; ceiling f=42). The realized value is how many of those proposals the
+adversary can hold back and release late-but-included — a synchrony question
+the code alone does not settle, and the one soft input here. Withholding is
+not accountable today: an omitted proposal is indistinguishable from network
+delay, and INV-SEC-3 catches only equivocation, not silence.
+
+**Finding 5 — the trickle shuffle is the sharp target, and the grind marches
+it to a fork.** On one targeted shard, a single seed gives
+P[honest victim ∧ corrupt entrant] ≈ (1−β)·β ≈ 0.09 per event. Best-of-`2^t`
+drives that to 0.78 at t=4 and ≈1 by t≥6, and the adversary simultaneously
+grinds *away* from any corrupt-losing rotation, so the shard's corrupt count
+climbs monotonically toward f+1 — an INV-SHARD-1 fork on that shard. Script
+table M, at n=128, β=0.10:
+
+| grind width t | candidate seeds 2^t | days to march β·n → f+1 |
+|---|---|---|
+| 2 | 4 | ~6.0 |
+| 3 | 8 | ~3.5 |
+| 4 | 16 | ~2.3 |
+| ≥6 | ≥64 | ~1.7 (deterministic floor) |
+
+Materiality threshold **t ≈ 3–4**, well under the ≈13 foothold ceiling at
+baseline β. The corrupt pool (β·20n ≈ 256 seats) covers one shard's 43 seats;
+the beacon foothold self-sustains via the resample grind below; and because
+withholding is unaccountable, the march costs the adversary nothing it can be
+jailed for.
+
+**Finding 6 — the beacon resample amplifies but does not fork.** The
+per-epoch resample tail is `P[≥f+1] ≈ 2.5e-13` (eligible ≈ shards·n =
+12,800); best-of-`2^t` amplifies it, but even at t=13 it lands at
+~2e-4/network-year (script table N). Epoch-commit safety rides pool
+ratification (INV-BEACON-1) regardless, so this prices liveness degradation
+and bias exposure — and the positive feedback that a grind-seated beacon
+committee grinds the next epoch harder — not a fork.
+
+**Severity is sharply β-sensitive.** Width is `2^t` and `t` tracks the
+foothold ≈ β·n, so the grind is potent at β ≈ 0.05–0.10, marginal near
+β ≈ 0.03, and largely defeated below ≈ 0.01. The system is *designed* to
+tolerate β up to ≈0.10–0.13 (§6), so at the design point the grind bites. It
+does not relax INV-SEC-1's honest-pool premise — it means the premise no
+longer implies honest committees, because the draw an adversary sees is not
+the draw the tables price.
+
+**Finding 7 — the grind's lever is omission, so charge it, and the clean
+charge is jail-on-first.** A member absent from the committed set is
+attributable: the expected proposer set is the beacon committee the previous
+fold seated, so absence is a strike against a consensus-known set
+(`filter_and_roll_randomness`, crates/beacon/src/state/vrf.rs), riding beside the
+fold with no wire field (the VRF output is already a commitment) and inert under
+full participation. The subtlety is that absence is ambiguous — a withheld
+proposal and one delayed past view formation are byte-identical — and the threat
+model grants message-timing control. A naive reading concludes the penalty must
+tolerate honest absence up to `f/n ≈ 1/3` (the SPC view forms on a `2f+1`
+quorum, so the adversary can delay the slowest `f`), which would leave a
+strike-aware grinder — rotating which single proposal it withholds — sitting
+under any honest-safe threshold while still steering. That reading is wrong: it
+reads a *leader-based* censorship model onto a *leaderless* protocol. The
+committed value is the deepest prefix shared by `f+1` of the `2f+1` votes
+([`qc1_certify`](../crates/types/src/beacon/prefix_ops.rs)), so an honest proposal
+reaching a supermajority is committed whoever formed their input before it
+arrived; to make an honest member absent the adversary must keep its proposal
+from `f+1` members — a broad, sustained censorship possible only inside bounded
+async windows (docs/05 partial synchrony), not the one-off delay the bound
+assumes. A grinder, by contrast, is absent by *self-omission* — always. So the
+penalty can be **jail-on-first for withholding**, which jails the self-omitting
+grinder while sparing honest proposers (`sim_async_purge` confirms the residual
+async-window purge is a rounding error, Finding 11). Whether jail-on-first
+*closes* the grind or merely raises the bar is a quantitative question Finding 11
+settles with a coupled simulation.
+
+**Finding 8 — the single-shard march overstates the grind; the shared pool is
+finite, and deterministic eviction caps the low-β band.** The march (Finding 5,
+table M) prices one targeted shard drawing from an inexhaustible pool. Two facts
+it omits both cut the adversary's way (script table R, on a conserved population
+M = β·N shuffling through one shared finite pool). The pool is **finite and
+contested** — forking one shard concentrates f+1 ≈ n/3 corrupt there, most of a
+small network's total, fought over by every other shard's draws, so M ≤ f is a
+structural floor plus a competition drag (the exchangeability §7 relied on,
+broken by the concentration). And **deterministic-longest (FIFO) eviction**
+removes the foothold's protection: where the current shuffle grinds the *victim*
+too (steering honest seats out to keep corrupt ones, so the count marches
+monotonically to f+1 whenever supply permits), FIFO gives every seat a fixed
+n-event tenure, so freshly-seated corrupt age out on a clock the adversary can't
+stop and the target settles at a stable equilibrium `c_T = n·(1−(1−x)^W)`
+(x = pool corrupt fraction, W = grind width) instead of marching, forking only
+if that equilibrium clears f+1. FIFO caps below f+1 for **β ≲ 0.025** alone, and
+stacked with jail-on-first (which holds the effective foothold near its natural
+distribution) the closed band reaches **β ≲ 0.05**, matching Finding 11. Neither
+closes the design point: at β ≈ 0.10 the foothold makes the per-event
+reliability `p = 1−(1−x)^W ≈ 1`, so `c_T ≈ n ≫ f+1` and the shard still forks
+(validated against the conserved-population Monte Carlo `check_grind_network`).
+FIFO's cost is a mild adaptive-corruption concession — deterministic tenure
+makes the rotation schedule predictable, a bite a shorter interval blunts (the
+same interval that speeds the grind, §6 Rider 1). So it is a **defense-in-depth**
+layer that widens the closed band, not a design-point close.
+
+**Finding 9 — liveness (f+1) and safety (2f+1) are different outcomes with
+opposite defenses: f+1 is recoverable, 2f+1 is terminal.** Reaching f+1 corrupt
+on a shard is where BFT guarantees lapse, but the two thresholds are not
+symmetric. The **liveness** attack — f+1 corrupt withhold, leaving ≤ 2f honest,
+short of the 2f+1 quorum — halts the shard: a non-cascading nuisance (other
+shards keep committing; only cross-shard 2PC transactions touching the halted
+shard stall or deadline-abort), recoverable, and not monetizable (griefing, not
+theft). It is what **detect-and-rotate** (Finding 10) recovers, with at most a
+bounded finality-latency residual — an external consumer that acts on the halted
+branch before the evidence propagates, one-shot and defused by waiting for
+finality.
+
+The **safety** threshold is a different animal. The equivocation route (f+1
+double-signing two conflicting commits) is self-proving, so INV-SHARD-1's quorum
+intersection catches the sibling commits and INV-SEC-3 revokes the keys — it
+cannot produce a silent fork. But **2f+1** corrupt is *unilateral control*: it
+commits a false state with a valid QC and **no** equivocation, so INV-SHARD-1
+never fires, and no in-protocol verifier re-executes a committee it is supposed
+to trust (INV-STATE-5 governs a node's own sync-vs-consensus consistency, not a
+cross-committee check; a valid QC over a self-consistent false state passes every
+soundness check downstream). It is an **unrecoverable** compromise: unilateral
+control of one shard lets the adversary mint stake — the network-wide admission
+gate — and cascade to every other shard. There is no recovery from 2f+1 and no
+after-the-fact containment the design leans on; the entire defense is
+**preventing the march from reaching it**. detect-and-rotate does not help — the
+committee stays *live* while it lies (the corrupt vote for the false branch), so
+a 2f+1 march never trips the halt detector.
+
+So the two thresholds demand opposite defenses: f+1 a **recovery**
+(detect-and-rotate), 2f+1 a **prevention** — keep the grind's sustained foothold
+far below 2f+1 (Finding 11). And the prevention has to be real: the march to
+2f+1 is reachable by grinding, ~4–6 days at β ≈ 0.10 with a large committee
+(~2.5× the f+1 march), and with the input-side levers it is the *margin below
+2f+1*, not any backstop, that stands between the design point and an
+unrecoverable network compromise.
+
+**Finding 10 — detect the halt and re-draw the whole committee: the recovery
+for the f+1 liveness halt.** The f+1 liveness attack's outcome *is* a
+*detectable* halt (Finding 9), so it can be defused at the outcome rather than
+the input — the 2f+1 march is a different, terminal outcome this does not touch
+(the committee stays live while it lies), which is prevention's job (Finding
+11). The beacon already tracks each shard's
+`last_live_epoch` — the epoch it last contributed a committed boundary
+([`ShardBoundary`](../crates/beacon/src/state/reshape.rs)) — so a shard whose
+watermark stalls for `HALT_THRESHOLD` epochs is, deterministically, halted. The
+recovery is a **full re-draw** of that shard's committee: resample all n seats
+fresh from the pool, not the one-seat trickle. That single move flushes the
+concentrated f+1 foothold the grind spent days building.
+
+The re-draw is grind-resistant exactly where the trickle is not. A fresh full
+draw reaching f+1 is one hypergeometric event with a ~4.5e-14 tail at the
+design point; best-of-`2^t` amplifies it only to ~3.7e-10 (t=13) — against the
+trickle, where best-of-`2^t` drives each single-seat step to ~1 and the shard
+marches. The grind's whole power is *incremental* accumulation across many
+grind-certain steps; a full re-draw is a single event it cannot steer to f+1
+(script table S). So the recovery restores an honest-majority committee with
+overwhelming probability, even against a grinder timing the re-draw seed. It is
+**outcome-triggered, not behavior-triggered**, which is why it succeeds where
+the strike (Finding 7) fails: the strike must distinguish a grinder's
+withholding from honest delay — the ambiguity that pins its crossover at ~1/3 —
+while the rotation reacts only to the observable halt and asks nothing about
+intent. The attacker economics collapse: ~1.7 days of grinding to reach f+1
+buys a halt of at most `HALT_THRESHOLD` epochs plus a sync gap, then the
+foothold flushes and the march restarts from ~β·n — a few-percent downtime on
+*one* shard (the finite corrupt supply, Finding 8, bounds it to roughly one at
+a time), for continuous grinding. No rational adversary runs it.
+
+Design constraints, on the spec's terms:
+
+- **Full re-draw, never a trickle** — the load-bearing choice. A trickle
+  re-seed is grindable to a march; only a full fresh draw carries the ~1e-10
+  resistance.
+- **The trigger is deterministic and reshape-exempt** —
+  `current_epoch − last_live_epoch > HALT_THRESHOLD`, with reshaping shards
+  excluded (they are legitimately quiet). `HALT_THRESHOLD` sits above
+  `RESHAPE_HANDOFF_TTL_EPOCHS` and the normal skip cadence — calibrated like
+  the miss-counter thresholds, not guessed.
+- **The recovery has a sync gap** — the fresh committee syncs the
+  last-committed state (from the halted committee's honest 2f, or historical
+  JMT), reusing the reshape make-before-break machinery. That gap is the
+  residual outage.
+- **It rides beacon liveness** — the rotation is a fold of the committed beacon
+  block (INV-BEACON-2), firing as long as the beacon commits (pool ratification,
+  Finding 6). An adversary would have to halt the beacon itself, a separate,
+  network-wide, far harder foothold.
+- **No new authority** — trigger and re-draw are pure functions of
+  `BeaconState`; rotation only reshuffles, never seats or grants, so it cannot
+  become a grind lever. The re-draw is only as safe as a fresh draw at β (§1),
+  so pool hygiene stays the underlying lever.
+
+**Finding 11 — the grind width is set by tunable parameters, but a coupled
+simulation shows they cap it only in the low-β band, not at the design point.**
+Three knobs move the grind — beacon committee size `b` (which sets the width
+`2^T`, `T ~ Binomial(b, β)`), the withholding penalty, and the shuffle interval
+`I` — and it is tempting to read them as a parameter-choice *close*: shrink `b`
+so most epochs the adversary holds 0–1 seats, jail-on-first for withholding to
+hold the foothold at its natural (un-boosted) distribution, and free `I` for
+adaptive corruption. The natural-foothold FIFO equilibrium
+`c_T = n·E[1−(1−β)^{2^T}]` would then cap below f+1 (`grind_width_cap`:
+`b=16 → 40 < 43`). But that reading assumes jail-on-first fully suppresses the
+*resample boost* — the self-sustaining grind that steers the seed to
+over-represent corrupt in the next epoch's committee draw, lifting `T` above its
+Binomial mean. A coupled Monte Carlo (`sim_resample_boost`, script table T)
+plays the boost out against the pool it actually draws from, and refutes the
+close:
+
+- **The boost survives jail-on-first at the design point.** The beacon committee
+  redraws every epoch from `beacon_eligible()` — every `OnShard{ready}` validator
+  network-wide, ~`shards·n` seats — so the corrupt supply is ~`β·shards·n` ≈ 1,300
+  at the design point, and jail-on-first removes only the ~`T/2` members the
+  winning grind pattern actually omits per epoch, for a cooldown. That drain
+  cannot deplete a 1,300-seat supply: the eligible corrupt fraction stays near β,
+  `best-of-2^T` still lifts `T` to ~3–4 even at `b=16`, and the realized `c_T` is
+  **61 (b=16, liveness band) / 86 (b=20, safety band)** — far above the assumed
+  40/49 (table T). Shrinking the *eligible pool* would restore the drain (at
+  eligible ≈ 800 the boost collapses to `c_T` < f+1), but that is an
+  architectural change with its own beacon-compromise cost, not the parameter
+  tweak this finding tested.
+
+- **Jail-on-first is clean but, for the same reason, weak.** The honest-purge
+  fear is not realized: `sim_async_purge` (table T) holds the realized effective
+  β at ~0.100 even at `p_async = 0.20`, against the `purge_beta_eff` worst-case
+  ceiling of 0.10–0.11 — the `f+1`-shared commit
+  ([`qc1_certify`](../crates/types/src/beacon/prefix_ops.rs)) makes an honest
+  proposal un-excludable outside bounded async windows (Finding 7 correction).
+  But the same large pool that makes jailing harmless to honest makes it too
+  shallow a drain to catch enough grinders: it shaves the boosted foothold ~30%
+  (`c_T` 88 → 61 at `b=16`) and closes the band **β ≲ 0.05**, but it is a
+  bar-raise, not a design-point close.
+
+- **The shuffle interval is not freed.** The "free `I`" argument rested on the
+  width being capped; since the boost survives, `I` is a grind dial again — the
+  march is linear in `I` (table M), so a small `I` is the grind's *worst* case
+  and the §6 Rider 1 tension stands. Do not shrink `I` at the design point on
+  grind grounds.
+
+So the parameters do not *close* the grind at the design point — but what that
+costs splits by threshold (Finding 9). For **f+1** (liveness) it is moot:
+detect-and-rotate recovers the halt regardless. For **2f+1** (terminal,
+unrecoverable) there is no recovery, so these input-side levers *are* the
+defense, and their job is to hold the sustained foothold as far below 2f+1 = 85
+as possible. That makes `b=16` **non-negotiable**, not merely preferable: at
+`b=20` the sustained foothold reaches 86 ≥ 2f+1 — over the doom line — where
+`b=16` holds it at 61. And the margin is thin: with the decided stack (b=16 +
+FIFO + jail-on-first) the shard first crosses 2f+1 at β ≈ 0.12 (script table T),
+*inside* the ≈0.13 the sampling budget tolerates, and at the design point β=0.10
+the peak sits only ~3 seats under 85.
+
+**Disposition.** The two thresholds are defended differently (Finding 9), with no
+new cryptography. **f+1 (liveness)** is a recoverable halt: **detect-and-rotate**
+re-draws the committee and flushes the foothold — the primary defense there, and
+what makes the f+1 march a nuisance rather than a loss. **2f+1 (safety) is
+terminal** — unilateral control of one shard is an unrecoverable network
+compromise (mint stake, cascade) — so there is no recovery to lean on, and the
+defense is entirely **prevention**: hold the grind's sustained foothold below
+2f+1. The load-bearing levers are all input-side and stack additively: **`b=16`**
+(non-negotiable — `b=20`'s sustained foothold reaches the 2f+1 line), **FIFO
+eviction** (Finding 8, caps the shard equilibrium), **jail-on-first for
+withholding** (Finding 7, clean under partial synchrony), a **recency-weighted
+resample** (weight 0 right after serving, recovering additively over
+`eligible/b` epochs — it caps the *sustained* foothold near natural `β·b` by
+rate-limiting service, the single biggest margin-widener), and above all **pool
+hygiene** (β low, §3, §6 Rider 2) — the deepest lever, since concentrating 2f+1
+corrupt on one shard needs that many in play. Together they push the first 2f+1
+crossing from β ≈ 0.12 (decided stack, without recency) to **β ≈ 0.14** (table
+T) — outside the ≈0.13 the sampling budget tolerates — and leave a wide margin at
+the design point where the decided stack had only ~3 seats. The recency ramp
+sharpness and its jail-cooldown coupling are tuning knobs pinned during
+implementation (a sharper ramp caps tighter but makes the committee more
+predictable — the §4 adaptive-corruption trade — and the synergy with jail-on-first
+needs the jail cooldown near the recency period). The shuffle interval is **not**
+shrunk on grind grounds (the boost survives, so small `I` is grind-worst). Residuals: the beacon-committee
+compromise rate (liveness/bias, rides pool ratification), the f+1
+finality-latency window (consumer-side, bounded), and the thin design-point
+margin below the terminal 2f+1 line.
+
+**Both open items are resolved by the coupled simulations (Finding 11).** The
+strike-limited resample boost was modelled directly (`sim_resample_boost`): it
+survives jail-on-first at the true eligible-pool size, so `b` is not pinned by a
+natural cap that does not hold — `b = 16` is chosen to keep the sustained
+foothold below the terminal 2f+1 line, where `b = 20` reaches it. The
+async-window purge was modelled against realized
+synchrony (`sim_async_purge`): the realized honest purge is a rounding error for
+any plausible `p_async`, well under the worst-case ceiling.
