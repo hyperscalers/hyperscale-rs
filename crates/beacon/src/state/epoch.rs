@@ -264,6 +264,17 @@ pub fn apply_epoch(
             .extend(members);
     }
 
+    // Halt detection reads the fold's settled state: a shard whose reshape
+    // executed this epoch is already terminal-marked or placeholder-fresh,
+    // so it reads as legitimately quiet.
+    let halted_shards = state.halted_shards();
+    for shard in &halted_shards {
+        tracing::error!(
+            ?shard,
+            "shard halted: no boundary crossing within the halt threshold"
+        );
+    }
+
     SlotEffects {
         registered: witness.registered,
         deactivated,
@@ -280,6 +291,7 @@ pub fn apply_epoch(
         observers_released,
         keepers_drawn,
         keepers_released,
+        halted_shards,
     }
 }
 
@@ -931,7 +943,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::state::test_fixtures::{net, single_pool_state};
+    use crate::state::test_fixtures::{
+        apply_next_epoch, apply_witness_chunk, net, single_pool_state,
+    };
 
     // ─── boundary fold ──────────────────────────────────────────────────────
 
@@ -1415,6 +1429,47 @@ mod tests {
         );
         assert_eq!(after_2.block_hash, b.hash());
         assert_eq!(after_2.consecutive_misses, 0);
+    }
+
+    // ─── halt detection ──────────────────────────────────────────────────
+
+    /// The fold surfaces the halted-shard set on `SlotEffects`: a live
+    /// shard whose boundary watermark stalls flags on the first epoch
+    /// past `HALT_THRESHOLD_EPOCHS` — never before — and a fresh
+    /// crossing refreshes the watermark and clears the flag.
+    #[test]
+    fn apply_epoch_flags_a_stalled_shard_and_a_crossing_clears_it() {
+        use hyperscale_types::HALT_THRESHOLD_EPOCHS;
+
+        let shard = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let deposit = ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(200),
+            amount: Stake::from_whole_tokens(1),
+        };
+
+        // Epoch 1 folds a real crossing: the watermark is fresh.
+        let effects = apply_witness_chunk(&mut state, 0, vec![deposit.clone()]);
+        assert!(effects.halted_shards.is_empty());
+
+        // Quiet epochs up to the threshold: not flagged.
+        for _ in 0..HALT_THRESHOLD_EPOCHS {
+            let effects = apply_next_epoch(&mut state, &[]);
+            assert!(
+                effects.halted_shards.is_empty(),
+                "flagged early at epoch {}",
+                state.current_epoch,
+            );
+        }
+
+        // The first epoch past the threshold flags the shard.
+        let effects = apply_next_epoch(&mut state, &[]);
+        assert_eq!(effects.halted_shards, BTreeSet::from([shard]));
+
+        // A fresh crossing clears it.
+        let effects = apply_witness_chunk(&mut state, 0, vec![deposit]);
+        assert!(effects.halted_shards.is_empty());
     }
 
     /// A Ready witness folding in epoch E flips the validator's status

@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use radix_common::network::NetworkDefinition;
 use sbor::prelude::*;
 
-use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
+use crate::beacon::constants::{HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
@@ -689,6 +689,12 @@ pub struct SlotEffects {
     /// elapsed). Seats a merge consumed land on the parent and surface
     /// through the committee transitions instead.
     pub keepers_released: Vec<KeptSeat>,
+    /// Live shards flagged as halted at this fold — their boundary
+    /// watermark stalled past [`HALT_THRESHOLD_EPOCHS`]
+    /// ([`BeaconState::halted_shards`]). Reshaping and terminal shards
+    /// are legitimately quiet and never land here. Surfaced so the
+    /// runner can raise the alarm and tests can assert the detection.
+    pub halted_shards: BTreeSet<ShardId>,
 }
 
 // ─── derived queries ────────────────────────────────────────────────────────
@@ -845,6 +851,41 @@ impl BeaconState {
             Some(PendingReshape::Merge { keepers, .. })
                 if keepers.get(&validator).is_some_and(|seat| seat.child == child)
         )
+    }
+
+    /// Shards whose chains have halted: live shards whose boundary
+    /// watermark ([`ShardBoundary::last_live_epoch`]) has stalled for
+    /// more than [`HALT_THRESHOLD_EPOCHS`] epochs.
+    ///
+    /// A stalled watermark means the shard has stopped committing
+    /// boundary crossings — the signature of a liveness halt, e.g.
+    /// `f + 1` corrupt members withholding votes so the honest remainder
+    /// can't form a `2f + 1` quorum. Legitimately quiet chains never
+    /// flag: shards involved in a pending reshape
+    /// ([`Self::reshape_involves`]), terminal records coasting to a
+    /// scheduled end, and reshape-pending placeholders that have no
+    /// chain to advance until their genesis seeds. A genesis-born shard
+    /// (pending record created at `Epoch::GENESIS`) is *not* exempt —
+    /// nothing gates its start, so never producing is a halt.
+    ///
+    /// A pure function of `self`, so every replica flags the identical
+    /// set at the identical fold.
+    #[must_use]
+    pub fn halted_shards(&self) -> BTreeSet<ShardId> {
+        self.boundaries
+            .iter()
+            .filter(|(shard, b)| {
+                b.terminal_epoch.is_none()
+                    && !(b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS)
+                    && !self.reshape_involves(**shard)
+                    && self
+                        .current_epoch
+                        .inner()
+                        .saturating_sub(b.last_live_epoch.inner())
+                        > HALT_THRESHOLD_EPOCHS
+            })
+            .map(|(shard, _)| *shard)
+            .collect()
     }
 
     /// Validators eligible to serve on the beacon committee: status is
@@ -1477,6 +1518,103 @@ mod tests {
         assert_eq!(
             state.beacon_eligible(),
             vec![observer, parent_half, genesis_member],
+        );
+    }
+
+    // ─── halted_shards ────────────────────────────────────────────────
+
+    /// Only a live shard whose watermark stalled past the threshold
+    /// flags: a fresh watermark, a stall exactly at the threshold, a
+    /// pending reshape (split target or merge child), a terminal coast,
+    /// and a reshape placeholder all read as healthy or legitimately
+    /// quiet. A genesis-born record that never produced is a halt.
+    #[test]
+    fn halted_shards_flags_stalled_live_shards_only() {
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 2);
+        let stale = Epoch::new(1);
+        let boundary = |last_live: Epoch| ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+            height: BlockHeight::new(5),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: last_live,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            terminal_qc_wt: None,
+            settled_waves_root: None,
+            reshape_admitted_epoch: None,
+        };
+
+        let stalled = ShardId::leaf(3, 0);
+        state.boundaries.insert(stalled, boundary(stale));
+
+        let healthy = ShardId::leaf(3, 1);
+        state
+            .boundaries
+            .insert(healthy, boundary(state.current_epoch));
+
+        let at_threshold = ShardId::leaf(3, 2);
+        state
+            .boundaries
+            .insert(at_threshold, boundary(Epoch::new(2)));
+
+        let splitting = ShardId::leaf(3, 3);
+        state.boundaries.insert(splitting, boundary(stale));
+        state.pending_reshapes.insert(
+            splitting,
+            PendingReshape::Split {
+                last_asserted: stale,
+                admitted_at: stale,
+                cohort: BTreeMap::new(),
+                cohort_seed: Randomness::ZERO,
+            },
+        );
+
+        let terminal = ShardId::leaf(3, 4);
+        state.boundaries.insert(
+            terminal,
+            ShardBoundary {
+                terminal_epoch: Some(Epoch::new(2)),
+                ..boundary(stale)
+            },
+        );
+
+        let placeholder = ShardId::leaf(3, 5);
+        state.boundaries.insert(
+            placeholder,
+            ShardBoundary {
+                block_hash: BlockHash::ZERO,
+                ..boundary(stale)
+            },
+        );
+
+        let genesis_born = ShardId::leaf(3, 6);
+        state.boundaries.insert(
+            genesis_born,
+            ShardBoundary {
+                block_hash: BlockHash::ZERO,
+                ..boundary(Epoch::GENESIS)
+            },
+        );
+
+        let merge_parent = ShardId::leaf(3, 7);
+        let (left, right) = merge_parent.children();
+        state.boundaries.insert(left, boundary(stale));
+        state.boundaries.insert(right, boundary(stale));
+        state.pending_reshapes.insert(
+            merge_parent,
+            PendingReshape::Merge {
+                halves: BTreeMap::new(),
+                keepers: BTreeMap::new(),
+                admitted_at: None,
+            },
+        );
+
+        assert_eq!(
+            state.halted_shards(),
+            BTreeSet::from([stalled, genesis_born]),
         );
     }
 
