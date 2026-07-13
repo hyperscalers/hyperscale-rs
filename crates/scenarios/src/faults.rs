@@ -266,13 +266,21 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 
     // The fresh committee syncs the halted tip from the retained members,
     // bridges the halt gap, and resumes committing past the frozen height.
+    // The pool the recovery draws from holds exactly `shard_size` spares,
+    // so the fresh committee is whatever the tenure shuffle rotated into
+    // the pool — here one of the withholding hosts, cycled off the halted
+    // shard before the flag and redrawn (the recovery is only as clean as
+    // a fresh draw at the pool's corrupt fraction). The fresh committee
+    // keeps its honest majority and recovers, but a lone isolated member
+    // dropping a quarter of the views stretches the resume, so the budget
+    // is generous — a ceiling on the wait, not the expected latency.
     assert!(
-        await_height(c, left, during + 3, epochs(12)),
+        await_height(c, left, during + 3, epochs(40)),
         "the recovered shard must resume committing under its fresh committee \
          (frozen at {during})",
     );
     // The first crossing under the fresh committee completes the recovery.
-    let cleared = c.run_until(epochs(6), |c| {
+    let cleared = c.run_until(epochs(20), |c| {
         c.beacon_state()
             .is_some_and(|state| !state.pending_recoveries.contains_key(&left))
     });

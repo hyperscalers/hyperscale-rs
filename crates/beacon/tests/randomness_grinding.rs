@@ -1,5 +1,5 @@
-//! Executable model of the beacon randomness grind and its
-//! jail-on-first defence (`specs/committee_security.md` §10).
+//! Executable model of the beacon randomness grind and its defences
+//! (`specs/committee_security.md` §10).
 //!
 //! The next-epoch beacon seed is `BLAKE3(prev ‖ VRF outputs of the
 //! committed beacon-committee proposals)`, rolled and then consumed —
@@ -9,26 +9,36 @@
 //! reveal early ⇒ folded, withhold ⇒ absent, unfolded. With `t` such
 //! members the adversary enumerates the `2^t` include/omit seeds and
 //! commits the one whose shuffle best advances a targeted shard's
-//! corrupt-seat count. Best-of-`2^t` on one global seed per event
-//! marches the shard from `β·n` toward `f+1`.
+//! corrupt-seat count.
+//!
+//! A shuffle victim drawn from that seed hands the grind both ends of
+//! the swap — steer the victim onto honest seats and the entrant onto
+//! corrupt ones and the count marches monotonically from `β·n` to
+//! `f+1`. That attack lives here as a harness-local baseline
+//! ([`seeded_victim_march_events`]). The fold instead evicts by tenure
+//! — deterministic-longest, ungrindable — so only the entrant draw
+//! amplifies and the count settles at the capped equilibrium
+//! `n·(1−(1−x)^{2^t})`. Jail-on-first then burns the width itself: any
+//! withheld proposal jails its proposer on the first absence, so the
+//! grind spends its own foothold.
 //!
 //! This harness drives the real fold with per-validator VRF keypairs so
 //! each grinder's output is distinct and independently toggleable, and an
 //! explicit adversary driver that clones the state, applies
 //! [`apply_epoch`] under each candidate subset, scores the target shard,
-//! and commits the best. It reproduces the analytic model's per-event
-//! march probability, then exhibits the raw fork with the jail inert and
-//! the jail-on-first cap: any withheld proposal jails its proposer on the
-//! first absence, so the grind burns its own foothold and the width
-//! collapses.
+//! and commits the best. It reproduces the entrant-only per-event gain,
+//! exhibits the baseline fork and the real fold's equilibrium cap, and
+//! shows the jail collapsing the width.
 //!
 //! The grinders sit on a *sibling* shard, not the targeted one, so a
 //! jailed grinder's exit never confounds the target's corrupt-seat count
 //! — the target moves only through its own shuffle, steered by the seed
-//! the grinders fold. `t` is held fixed while the grinders survive: the
-//! beacon committee is forced to the ready grinders each event, exactly
-//! as the model idealises `t` as a given. Folding the seating dilution
-//! and resample feedback back in is out of scope here.
+//! the grinders fold. `t` is held fixed while the grinders survive the
+//! defence under test: the beacon committee is forced to the ready
+//! grinders each event, and a grinder the *sibling's* own tenure
+//! rotation evicts is re-seated, exactly as the model idealises `t` as
+//! a given. Folding the seating dilution and resample feedback back in
+//! is out of scope here.
 
 #![allow(clippy::cast_precision_loss)] // statistical tallies: every count ≪ 2^52
 #![allow(clippy::cast_possible_truncation)] // counts and masks are small by construction
@@ -50,10 +60,10 @@ const fn f_of(n: u32) -> u32 {
     (n - 1) / 3
 }
 
-/// Single-seed per-event gain probability: the shuffle victim (uniform
-/// over the `n` seats, `c` corrupt) is honest *and* the pool entrant
-/// (corrupt fraction `pool_beta`) is corrupt. The two draws are
-/// domain-separated, hence independent.
+/// Single-seed per-event gain probability under the baseline's *seeded*
+/// victim: the victim (uniform over the `n` seats, `c` corrupt) is
+/// honest *and* the pool entrant (corrupt fraction `pool_beta`) is
+/// corrupt. The two draws are domain-separated, hence independent.
 fn p_gain(n: u32, c: u32, pool_beta: f64) -> f64 {
     (f64::from(n - c) / f64::from(n)) * pool_beta
 }
@@ -63,9 +73,9 @@ fn best_of(p_single: f64, t: u32) -> f64 {
     1.0 - (1.0 - p_single).powi(1 << t)
 }
 
-/// Expected shuffle events to march the targeted shard from `c0` to
-/// `f+1` under best-of-`2^t`, holding `pool_beta` fixed — the
-/// march-horizon sum in units of events.
+/// Expected shuffle events for the seeded-victim baseline to march the
+/// targeted shard from `c0` to `f+1` under best-of-`2^t`, holding
+/// `pool_beta` fixed — the baseline fork horizon in units of events.
 fn model_march_events(n: u32, pool_beta: f64, t: u32, c0: u32) -> f64 {
     let mut events = 0.0;
     let mut c = c0;
@@ -74,6 +84,68 @@ fn model_march_events(n: u32, pool_beta: f64, t: u32, c0: u32) -> f64 {
         c += 1;
     }
     events
+}
+
+/// Steady-state corrupt seats under tenure eviction: the committee is
+/// the trailing `n` entrants, each corrupt iff any of the `2^t`
+/// candidate seeds drew a corrupt entrant — `n·(1−(1−x)^{2^t})`. The
+/// victim leaves on the tenure clock whatever seed commits, so only
+/// the entrant draw amplifies.
+fn fifo_equilibrium(n: u32, x: f64, t: u32) -> f64 {
+    f64::from(n) * best_of(x, t)
+}
+
+/// splitmix64 — the harness-local PRNG for the baseline march, which
+/// needs determinism, not cryptographic quality.
+struct SplitMix(u64);
+
+impl SplitMix {
+    const fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Harness-local baseline: the march under a victim draw *seeded from
+/// the folded randomness* — the grind-worst victim rule the fold's
+/// tenure eviction exists to deny. Every candidate seed re-rolls both
+/// the victim (uniform over the `n` seats) and the entrant
+/// (Bernoulli(`x`)), and the adversary commits the best of its `2^t`
+/// candidates, so the corrupt count is monotone: some candidate almost
+/// always holds it level, and each gain sticks. Returns the events
+/// until the count reaches `f+1`, or `None` if `max_events` pass first.
+fn seeded_victim_march_events(
+    n: u32,
+    x: f64,
+    t: u32,
+    c0: u32,
+    seed: u64,
+    max_events: u64,
+) -> Option<u64> {
+    let f_plus_1 = f_of(n) + 1;
+    let mut rng = SplitMix(seed);
+    let mut c = c0;
+    for event in 1..=max_events {
+        let mut best = 0u32;
+        for _ in 0..(1u32 << t) {
+            let victim_corrupt = rng.next_f64() < f64::from(c) / f64::from(n);
+            let entrant_corrupt = rng.next_f64() < x;
+            let candidate = c - u32::from(victim_corrupt) + u32::from(entrant_corrupt);
+            best = best.max(candidate);
+        }
+        c = best;
+        if c >= f_plus_1 {
+            return Some(event);
+        }
+    }
+    None
 }
 
 // ─── State construction ──────────────────────────────────────────────────────
@@ -104,24 +176,30 @@ const fn grinder_shard() -> ShardId {
     ShardId::leaf(1, 1)
 }
 
-/// The corrupt-validator marking: the first `seated_corrupt` seats of the
-/// **target** shard (ids `0..seated_corrupt`), every grinder on the
-/// sibling (ids `[n, n+grinders)`), plus a `pool_beta` fraction of the
-/// free pool spread evenly so no region is starved.
+/// The corrupt-validator marking: the last `seated_corrupt` seats of the
+/// **target** shard (ids `[n − seated_corrupt, n)` — the genesis cohort
+/// drains in id order under tenure eviction, so seating them high keeps
+/// them off the victim slot while the measurement runs), every grinder
+/// on the sibling (ids `[n, n+grinders)`), plus a `pool_beta` fraction
+/// of the free pool spread evenly so no region is starved. The sibling's
+/// honest cohort (ids `[n+grinders, n+grinders+honest)`) is never marked
+/// corrupt — it supplies the honest proposers whose presence makes a
+/// withheld grinder read as absent.
 fn build_corrupt(
     n: u32,
     grinders: u32,
+    honest: u32,
     population: u64,
     seated_corrupt: u32,
     pool_beta: f64,
 ) -> BTreeSet<ValidatorId> {
-    let mut corrupt: BTreeSet<ValidatorId> = (0..u64::from(seated_corrupt))
+    let mut corrupt: BTreeSet<ValidatorId> = (u64::from(n - seated_corrupt)..u64::from(n))
         .map(ValidatorId::new)
         .collect();
     for j in 0..u64::from(grinders) {
         corrupt.insert(ValidatorId::new(u64::from(n) + j));
     }
-    let seated = u64::from(n) + u64::from(grinders);
+    let seated = u64::from(n) + u64::from(grinders) + u64::from(honest);
     let pool_size = population - seated;
     let pool_corrupt = (pool_beta * pool_size as f64).round() as u64;
     if pool_corrupt > 0 {
@@ -132,14 +210,18 @@ fn build_corrupt(
     corrupt
 }
 
-/// A targeted shard of `n` ready seats (ids `0..n`), a sibling of
-/// `grinders` ready seats carrying the beacon grinders (ids
-/// `[n, n+grinders)`), the rest pooled, one generously funded stake pool,
-/// per-id pubkeys. The beacon committee is left empty — the adversary
-/// forces it to the grinders each event.
+/// A targeted shard of `n` ready seats (ids `0..n`), a sibling carrying
+/// `grinders` beacon grinders (ids `[n, n+grinders)`) and `honest`
+/// honest members (ids `[n+grinders, n+grinders+honest)`), the rest
+/// pooled, one generously funded stake pool, per-id pubkeys. The sibling
+/// membership is fixed: [`renormalize`] restores it after each event, so
+/// the pool never drains and `β` stays put while the target evolves. The
+/// beacon committee is left empty — the adversary forces it to the
+/// sibling seats each event.
 fn build_state(
     n: u32,
     grinders: u32,
+    honest: u32,
     population: u64,
     keys: &[Bls12381G1PrivateKey],
     randomness: [u8; 32],
@@ -147,7 +229,7 @@ fn build_state(
     let pool_id = StakePoolId::new(0);
     let target = target_shard();
     let sibling = grinder_shard();
-    let seated = u64::from(n) + u64::from(grinders);
+    let seated = u64::from(n) + u64::from(grinders) + u64::from(honest);
 
     let mut validators = BTreeMap::new();
     let mut pool_validators = BTreeSet::new();
@@ -246,12 +328,84 @@ fn build_state(
 // ─── The grinding adversary ──────────────────────────────────────────────────
 
 /// Immutable per-run context threaded through the grind driver: the
-/// corrupt marking, one signing key per validator, and the network the
-/// VRF binds to.
+/// corrupt marking, one signing key per validator, the network the VRF
+/// binds to, and the shard sizes that fix the sibling's canonical
+/// membership ([`renormalize`]).
 struct Ctx {
     corrupt: BTreeSet<ValidatorId>,
     keys: Vec<Bls12381G1PrivateKey>,
     net: NetworkDefinition,
+    n: u32,
+    grinders: u32,
+    honest: u32,
+}
+
+impl Ctx {
+    /// Canonical grinder ids `[n, n+grinders)`.
+    fn grinder_ids(&self) -> impl Iterator<Item = ValidatorId> + '_ {
+        (u64::from(self.n)..u64::from(self.n) + u64::from(self.grinders)).map(ValidatorId::new)
+    }
+
+    /// Canonical honest sibling ids `[n+grinders, n+grinders+honest)`.
+    fn honest_ids(&self) -> impl Iterator<Item = ValidatorId> + '_ {
+        let base = u64::from(self.n) + u64::from(self.grinders);
+        (base..base + u64::from(self.honest)).map(ValidatorId::new)
+    }
+}
+
+/// Restore the sibling to its canonical membership and return everything
+/// off the target and the seated sibling to the pool, so the pool never
+/// drains and `β` stays fixed while only the target shard evolves.
+///
+/// A canonical grinder that a standing jail removed (`jail_on_first`) is
+/// left jailed — that is the defence burning the foothold. Every other
+/// canonical grinder and every honest sibling member is re-seated ready.
+fn renormalize(state: &mut BeaconState, ctx: &Ctx, jail_on_first: bool) {
+    let mut sibling_members = Vec::new();
+    for id in ctx.grinder_ids() {
+        let jailed = matches!(
+            state.validators.get(&id).map(|r| r.status),
+            Some(ValidatorStatus::Jailed { .. })
+        );
+        if jail_on_first && jailed {
+            continue;
+        }
+        seat_ready_on_sibling(state, id);
+        sibling_members.push(id);
+    }
+    for id in ctx.honest_ids() {
+        seat_ready_on_sibling(state, id);
+        sibling_members.push(id);
+    }
+    let seated: BTreeSet<ValidatorId> = state.next_shard_committees[&target_shard()]
+        .members
+        .iter()
+        .copied()
+        .chain(sibling_members.iter().copied())
+        .collect();
+    for (id, rec) in &mut state.validators {
+        // Pool everything off the target and the seated sibling — except
+        // a standing jail, which must not be recycled back into the draw.
+        if !seated.contains(id) && !matches!(rec.status, ValidatorStatus::Jailed { .. }) {
+            rec.status = ValidatorStatus::Pooled;
+        }
+    }
+    state
+        .next_shard_committees
+        .get_mut(&grinder_shard())
+        .expect("sibling committee present")
+        .members = sibling_members;
+}
+
+/// Seat `id` ready on the sibling at genesis tenure.
+fn seat_ready_on_sibling(state: &mut BeaconState, id: ValidatorId) {
+    if let Some(rec) = state.validators.get_mut(&id) {
+        rec.status = ValidatorStatus::OnShard {
+            shard: grinder_shard(),
+            ready: true,
+            placed_at_epoch: Epoch::GENESIS,
+        };
+    }
 }
 
 /// Ready seats on `shard` of the requested corruption class, in
@@ -444,52 +598,33 @@ fn grind_event(
             shard_contributions: &BTreeMap::new(),
         },
     );
-    let grinder_jails: Vec<ValidatorId> = effects
-        .jailed
-        .iter()
-        .copied()
-        .filter(|id| grinders.contains(id))
-        .collect();
-    // In jail-inert mode the fold still runs its (unconditional) absence
-    // pass, so restore any grinder it jailed — the raw march measures the
-    // shuffle alone. The recorded `jailed` reflects only the jails that
-    // *stand*, so the baseline reads as strike-free.
-    let stood = if jail_on_first {
-        grinder_jails
+    // The jails that stand: under `jail_on_first` a withheld grinder's
+    // absence jail sticks (the defence burning the foothold); jail-inert,
+    // the absence pass still runs, so the recorded jails read empty and
+    // `renormalize` re-seats those grinders below — the raw march
+    // measures the shuffle alone.
+    let stood: Vec<ValidatorId> = if jail_on_first {
+        effects
+            .jailed
+            .iter()
+            .copied()
+            .filter(|id| grinders.contains(id))
+            .collect()
     } else {
-        for &id in &grinder_jails {
-            restore_grinder(state, id);
-        }
         Vec::new()
     };
+    let after = target_corrupt(state, &ctx.corrupt);
+    // Restore the sibling to its canonical membership and drain the
+    // event's pool churn back, so `β` stays fixed and only the target
+    // shard carries state between events. A standing jail is respected —
+    // that grinder stays out and the width falls.
+    renormalize(state, ctx, jail_on_first);
 
     EventOutcome {
         before,
-        after: target_corrupt(state, &ctx.corrupt),
+        after,
         grind_width: grinder_props.len(),
         jailed: stood,
-    }
-}
-
-/// Undo an absence jail: re-seat `id` on the sibling as a ready member,
-/// so the next event's grind still has it. The pool-draw refill the jail
-/// triggered is left in place — a benign committee over-count on the
-/// sibling, which the harness never measures.
-fn restore_grinder(state: &mut BeaconState, id: ValidatorId) {
-    if let Some(rec) = state.validators.get_mut(&id) {
-        rec.status = ValidatorStatus::OnShard {
-            shard: grinder_shard(),
-            ready: true,
-            placed_at_epoch: Epoch::GENESIS,
-        };
-    }
-    let members = &mut state
-        .next_shard_committees
-        .get_mut(&grinder_shard())
-        .expect("sibling committee present")
-        .members;
-    if !members.contains(&id) {
-        members.push(id);
     }
 }
 
@@ -509,20 +644,43 @@ struct GrindParams {
 /// advances by [`SHUFFLE_INTERVAL_EPOCHS`], so each [`apply_epoch`] lands
 /// on a shuffle boundary). Returns the final state, the run context, and
 /// the per-event outcomes.
+/// Build the run context and initial state for a grind configuration.
+fn build_run(p: GrindParams, seed: u64) -> (Ctx, BeaconState) {
+    let population = p.pool_factor * u64::from(p.n);
+    let c0 = (p.pool_beta * f64::from(p.n)).round() as u32;
+    let ctx = Ctx {
+        corrupt: build_corrupt(
+            p.n,
+            p.grinders,
+            p.honest_committee,
+            population,
+            c0,
+            p.pool_beta,
+        ),
+        keys: signing_keys(population),
+        net: NetworkDefinition::simulator(),
+        n: p.n,
+        grinders: p.grinders,
+        honest: p.honest_committee,
+    };
+    let state = build_state(
+        p.n,
+        p.grinders,
+        p.honest_committee,
+        population,
+        &ctx.keys,
+        seed_bytes(seed),
+    );
+    (ctx, state)
+}
+
 fn run_march(
     p: GrindParams,
     seed: u64,
     jail_on_first: bool,
     max_events: u64,
 ) -> (BeaconState, Ctx, Vec<EventOutcome>) {
-    let population = p.pool_factor * u64::from(p.n);
-    let c0 = (p.pool_beta * f64::from(p.n)).round() as u32;
-    let ctx = Ctx {
-        corrupt: build_corrupt(p.n, p.grinders, population, c0, p.pool_beta),
-        keys: signing_keys(population),
-        net: NetworkDefinition::simulator(),
-    };
-    let mut state = build_state(p.n, p.grinders, population, &ctx.keys, seed_bytes(seed));
+    let (ctx, mut state) = build_run(p, seed);
 
     let f_plus_1 = f_of(p.n) + 1;
     let mut outcomes = Vec::new();
@@ -552,14 +710,16 @@ fn run_march(
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-/// The best-of-`2^t` per-event gain probability the grind achieves
-/// against the real fold matches the analytic `1-(1-p_gain)^(2^t)` — and
-/// the `t=0` (single-seed, no grind) rate matches the bare `p_gain`, so
-/// the amplification is measured, not assumed. Grinders sit on the
-/// sibling, so the absence jail never confounds the target gain; the run
-/// keeps the jail inert regardless.
+/// Only the entrant draw amplifies against the real fold: the victim is
+/// fixed by tenure whatever seed commits (here the target's oldest seat,
+/// an honest one), so the per-event gain probability is best-of-`2^t`
+/// on the entrant alone — `1-(1-x)^(2^t)` — and the `t=0` (single-seed,
+/// no grind) rate matches the bare pool fraction, so the amplification
+/// is measured, not assumed. Grinders sit on the sibling, so the
+/// absence jail never confounds the target gain; the run keeps the jail
+/// inert regardless.
 #[test]
-fn grind_gain_probability_matches_best_of_2t_model() {
+fn grind_gain_probability_matches_best_of_2t_entrant_model() {
     let n = 32u32;
     let grinders = 8u32;
     let pool_factor = 8u64;
@@ -568,17 +728,22 @@ fn grind_gain_probability_matches_best_of_2t_model() {
     let honest = 3u32;
     let population = pool_factor * u64::from(n);
     let ctx = Ctx {
-        corrupt: build_corrupt(n, grinders, population, seated, pool_beta),
+        corrupt: build_corrupt(n, grinders, honest, population, seated, pool_beta),
         keys: signing_keys(population),
         net: NetworkDefinition::simulator(),
+        n,
+        grinders,
+        honest,
     };
-    let template = build_state(n, grinders, population, &ctx.keys, seed_bytes(0));
+    let template = build_state(n, grinders, honest, population, &ctx.keys, seed_bytes(0));
 
-    // The exact single-seed gain probability for this state.
+    // The exact single-seed gain probability for this state: the tenure
+    // victim is honest by construction, so a gain is exactly "the
+    // entrant is corrupt".
     let pooled = template.pooled_validators();
     let pooled_corrupt = pooled.iter().filter(|id| ctx.corrupt.contains(id)).count();
     let realized_beta = pooled_corrupt as f64 / pooled.len() as f64;
-    let p_single = p_gain(n, seated, realized_beta);
+    let p_single = realized_beta;
 
     let k = 300u64;
     for t in [0u32, 4] {
@@ -610,11 +775,85 @@ fn grind_gain_probability_matches_best_of_2t_model() {
     }
 }
 
-/// Jail inert, the grind marches the targeted shard from `β·n` to `f+1`
-/// — the raw fork — within a bound on the analytic march horizon,
-/// confirming the finding end to end.
+/// The attack and the defence, same grind. A victim draw seeded from
+/// the folded randomness lets the grind steer both ends of the swap and
+/// the corrupt count marches monotonically to the `f+1` fork — the
+/// harness-local baseline. Against the real fold the victim rides the
+/// tenure clock, so the same withholding grind only amplifies the
+/// entrant and the count settles at the `n·(1−(1−x)^{2^t})` equilibrium,
+/// held below the fork across three full tenure cycles with the jail
+/// inert.
 #[test]
-fn jail_inert_grind_marches_a_targeted_shard_to_a_fork() {
+fn fifo_eviction_caps_the_march_at_an_equilibrium() {
+    let n = 64u32;
+    let pool_beta = 0.05;
+    let t = 2u32;
+    let c0 = (pool_beta * f64::from(n)).round() as u32;
+    let f_plus_1 = f_of(n) + 1;
+
+    // The baseline forks within a bound on its analytic march horizon.
+    let model = model_march_events(n, pool_beta, t, c0);
+    let horizon = (4.0 * model) as u64;
+    let forked_at = seeded_victim_march_events(n, pool_beta, t, c0, 0x5EED_F00D, horizon);
+    assert!(
+        forked_at.is_some(),
+        "the seeded-victim baseline must fork within {horizon} events",
+    );
+
+    // The real fold, same grind: three full tenure cycles (one seat
+    // rotates per event, so a seat's tenure is n events).
+    let params = GrindParams {
+        n,
+        grinders: t,
+        pool_factor: 8,
+        pool_beta,
+        t,
+        honest_committee: 3,
+        adv: Adversary::WITHHOLDING,
+    };
+    let events = 3 * u64::from(n);
+    let (_, _, outcomes) = run_march(params, 0x00C0_FFEE, false, events);
+    assert_eq!(
+        outcomes.len() as u64,
+        events,
+        "the capped march must run the full horizon without forking",
+    );
+    assert!(
+        outcomes.iter().all(|o| o.jailed.is_empty()),
+        "jail inert, no grinder is jailed",
+    );
+    let peak = outcomes.iter().map(|o| o.after).max().expect("non-empty");
+    assert!(
+        peak < f_plus_1,
+        "tenure eviction must hold the shard below the fork: peak {peak}/{f_plus_1}",
+    );
+
+    // Past the first tenure cycle the count settles at the entrant-draw
+    // equilibrium. It is elevated above the grind-free natural β·n (the
+    // entrant amplification is real, not absent) yet capped well under
+    // the model `n·(1−(1−x)^{2^t})` — itself an upper bound, since a
+    // corrupt-enriched committee thins the finite pool and lowers the
+    // realized entrant rate.
+    let model_ct = fifo_equilibrium(n, pool_beta, t);
+    let steady = &outcomes[n as usize..];
+    let mean = steady.iter().map(|o| f64::from(o.after)).sum::<f64>() / steady.len() as f64;
+    assert!(
+        mean > f64::from(c0) + 2.0,
+        "steady-state mean {mean:.1} is not elevated above the natural β·n = {c0}",
+    );
+    assert!(
+        mean <= model_ct + 4.0,
+        "steady-state mean {mean:.1} exceeds the entrant equilibrium model {model_ct:.1}",
+    );
+}
+
+/// Jail-on-first, the withholding grind burns its own foothold: to
+/// grind it must omit a grinder, and any omission jails that grinder on
+/// the first absence. The grind width collapses within a handful of
+/// events, and across the horizon in which the seeded-victim baseline
+/// forks, the target shard never reaches `f+1`.
+#[test]
+fn jail_on_first_burns_the_withholding_grind() {
     let n = 64u32;
     let pool_beta = 0.10;
     let t = 4u32;
@@ -629,55 +868,10 @@ fn jail_inert_grind_marches_a_targeted_shard_to_a_fork() {
         honest_committee: 3,
         adv: Adversary::WITHHOLDING,
     };
-    let (state, ctx, outcomes) = run_march(params, 0x00C0_FFEE, false, 400);
 
-    let final_corrupt = target_corrupt(&state, &ctx.corrupt);
-    assert!(
-        final_corrupt >= f_plus_1,
-        "jail-inert grind must fork the shard: reached {final_corrupt}/{f_plus_1} corrupt",
-    );
-    assert!(
-        outcomes.iter().all(|o| o.jailed.is_empty()),
-        "jail inert, no grinder is jailed",
-    );
-    let model = model_march_events(n, pool_beta, t, c0);
-    assert!(
-        (outcomes.len() as f64) <= 4.0 * model,
-        "march took {} events vs ~{model:.0} expected",
-        outcomes.len(),
-    );
-}
+    // The horizon in which the baseline's steered march forks.
+    let horizon = (4.0 * model_march_events(n, pool_beta, t, c0)) as u64;
 
-/// Jail-on-first, the same withholding grind burns its own foothold: to
-/// grind it must omit a grinder, and any omission jails that grinder on
-/// the first absence. The grind width collapses within a handful of
-/// events, and across the whole horizon in which the jail-inert grind
-/// forked, the target shard never reaches `f+1`.
-#[test]
-fn jail_on_first_burns_the_withholding_grind() {
-    let n = 64u32;
-    let pool_beta = 0.10;
-    let t = 4u32;
-    let f_plus_1 = f_of(n) + 1;
-    let params = GrindParams {
-        n,
-        grinders: t,
-        pool_factor: 8,
-        pool_beta,
-        t,
-        honest_committee: 3,
-        adv: Adversary::WITHHOLDING,
-    };
-
-    // The jail-inert run establishes the fork and its horizon.
-    let (off_state, ctx, off) = run_march(params, 0x00C0_FFEE, false, 400);
-    assert!(
-        target_corrupt(&off_state, &ctx.corrupt) >= f_plus_1,
-        "baseline jail-inert run must fork",
-    );
-    let horizon = off.len().max(20) as u64;
-
-    // Jail-on-first, matched seed.
     let (on_state, on_ctx, on) = run_march(params, 0x00C0_FFEE, true, horizon);
 
     let jailed: BTreeSet<ValidatorId> = on.iter().flat_map(|o| o.jailed.iter().copied()).collect();
@@ -710,7 +904,7 @@ fn jail_on_first_burns_the_withholding_grind() {
 #[test]
 fn jail_on_first_closes_the_rotate_one_evader() {
     let n = 64u32;
-    let pool_beta = 0.10;
+    let pool_beta = 0.05;
     let t = 8u32;
     let f_plus_1 = f_of(n) + 1;
     let params = GrindParams {
