@@ -71,8 +71,9 @@ use hyperscale_storage_rocksdb::{
     RocksDbShardStorage,
 };
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisValidators, ShardId, ValidatorId,
-    ValidatorInfo, ValidatorSet, bls_keypair_from_seed, generate_bls_keypair, shard_prefix_path,
+    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisValidators, ShardId,
+    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, generate_bls_keypair,
+    shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -1218,7 +1219,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     .mempool_snapshot(rpc_mempool_snapshot.clone())
     .sync_status(rpc_sync_status.clone())
     .mempool_config(config.mempool.clone())
-    .provision_config(config.provisions);
+    .provision_config(config.provisions)
+    .beacon_chain_config(BeaconChainConfig::production());
 
     if !config.genesis.xrd_balances.is_empty() {
         let engine_genesis = build_engine_genesis_config(&config.genesis)

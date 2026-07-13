@@ -402,7 +402,7 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 mod tests {
     use hyperscale_types::{
         BeaconChainConfig, Bls12381G1PublicKey, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
-        NetworkDefinition, Randomness, bls_keypair_from_seed,
+        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, bls_keypair_from_seed,
     };
 
     use super::*;
@@ -445,6 +445,30 @@ mod tests {
             initial_shard_committee: shard_members,
             initial_randomness: Randomness::new([0xAB; 32]),
         }
+    }
+
+    /// The production sizing seats its full beacon committee: a genesis
+    /// with 16 eligible validators and the production chain config draws a
+    /// 16-member beacon committee, confirming `build_genesis` is
+    /// size-agnostic up to the production cap.
+    #[test]
+    fn production_config_seats_a_full_sixteen_member_committee() {
+        let n = u64::try_from(PRODUCTION_BEACON_COMMITTEE_SIZE).unwrap();
+        let mut cfg = sample_config(n, 4, n);
+        cfg.chain_config = BeaconChainConfig::production();
+        let state = build_genesis_beacon_state(&cfg);
+        assert_eq!(state.committee.len(), PRODUCTION_BEACON_COMMITTEE_SIZE);
+    }
+
+    /// A network smaller than the cap runs a smaller committee — the cap
+    /// is a ceiling, not a requirement, so `build_genesis` seats
+    /// `min(eligible, b)`.
+    #[test]
+    fn production_config_seats_min_of_eligible_and_cap() {
+        let mut cfg = sample_config(8, 4, 8);
+        cfg.chain_config = BeaconChainConfig::production();
+        let state = build_genesis_beacon_state(&cfg);
+        assert_eq!(state.committee.len(), 8);
     }
 
     // ─── happy path ──────────────────────────────────────────────────────
