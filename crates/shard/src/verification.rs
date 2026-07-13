@@ -739,6 +739,14 @@ impl VerificationPipeline {
         }
     }
 
+    /// The whole verified-certified cache, for the beacon-witness
+    /// ancestor walk's fallback over sync-admitted uncommitted blocks.
+    pub(crate) const fn verified_certified_blocks(
+        &self,
+    ) -> &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>> {
+        &self.verified_certified_blocks
+    }
+
     /// Borrow the assembled `Verified<CertifiedBlock>` for `block_hash`,
     /// if assembly has completed. The commit path Arc-clones from this
     /// borrow to thread the typed handle through
@@ -977,11 +985,13 @@ impl VerificationPipeline {
     /// freshly at drain time to avoid stale-snapshot races where an entry
     /// deferred before its parent committed would dispatch with the wrong
     /// base state.
+    #[allow(clippy::too_many_arguments)] // block identity + per-window verdict bits
     pub fn initiate_state_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
         parent_block_height: BlockHeight,
+        recovery_bridge: bool,
         split_child_roots_required: bool,
         settled_waves_root_required: bool,
         settled_waves_window_floor: Option<WeightedTimestamp>,
@@ -1009,7 +1019,23 @@ impl VerificationPipeline {
         let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.is_state_root_verified(&parent_block_hash);
 
-        if parent_tree_available {
+        // Across a recovery bridge, a sync-admitted parent is QC-attested
+        // but never locally verified, and its tree materializes only at
+        // commit — which needs the successor QC this very verification
+        // gates. A bridge block is wave-less, so its replay applies no
+        // updates and the attested parent root alone decides it; the
+        // parent's inline commit lands first in height order, so the
+        // prepared successor never applies over a missing tree version.
+        // Scoped to the bridge: on a live chain an adopted-but-unverified
+        // certified parent must keep deferring its children, or their
+        // prepared snapshots chain to versions the tree never persisted.
+        let parent_qc_attested = recovery_bridge
+            && block.certificates().is_empty()
+            && self
+                .verified_certified_blocks
+                .contains_key(&parent_block_hash);
+
+        if parent_tree_available || parent_qc_attested {
             self.enqueue_ready_state_root(ready);
         } else {
             debug!(
@@ -1245,6 +1271,7 @@ impl VerificationPipeline {
             committed_hash,
             header.parent_block_hash(),
             pending_blocks,
+            &self.verified_certified_blocks,
             local_shard,
             schedule,
         ) {
@@ -1489,10 +1516,19 @@ impl VerificationPipeline {
             let parent_block_height = h.parent_qc().height();
             let settled_waves_window_floor =
                 schedule.settled_window_floor(local_shard, h.parent_qc().weighted_timestamp());
+            // Whether this block rides an in-flight halt recovery's bridge:
+            // anchored below the bridge epoch while the recovery pends. Only
+            // there may the state-root deferral trust a QC-attested parent —
+            // the halted tip arrives by sync, unverifiable locally until a
+            // commit that needs this very block's QC.
+            let recovery_bridge = schedule.recovery_bridge(local_shard).is_some_and(|bridge| {
+                schedule.epoch_for(h.parent_qc().weighted_timestamp()) < bridge
+            });
             self.initiate_state_root_verification(
                 block_hash,
                 block,
                 parent_block_height,
+                recovery_bridge,
                 split_child_roots_required,
                 settled_waves_root_required,
                 settled_waves_window_floor,
@@ -1563,13 +1599,15 @@ impl VerificationPipeline {
     // In-flight count verification (synchronous)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Classify a vote-path block against the in-flight count tolerance,
-    /// resolving parent-in-flight from the chain view and finalized-tx count
-    /// from the pending block. Callers use the returned [`InFlightCheck`] to
-    /// decide between voting, running verifications only, or aborting.
+    /// Classify a vote-path block against the in-flight count tolerance.
+    /// The caller pre-resolves `parent_in_flight` from its chain view
+    /// (`None` = parent pruned) and the finalized-tx count from the pending
+    /// block, then uses the returned [`InFlightCheck`] to decide between
+    /// voting, running verifications only, or aborting.
     pub(crate) fn classify_vote_in_flight(
         &mut self,
-        chain: &ChainView<'_>,
+        parent_in_flight: Option<InFlightCount>,
+        finalized_tx_count: u32,
         block_hash: BlockHash,
         block: &Block,
         safe_vote_declined: bool,
@@ -1578,24 +1616,13 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         }
 
-        let parent_in_flight = if block.header().parent_qc().is_genesis() {
-            InFlightCount::ZERO
-        } else if let Some(h) = chain.get_header(block.header().parent_block_hash()) {
-            h.in_flight()
-        } else {
+        let Some(parent_in_flight) = parent_in_flight else {
             trace!(
                 block_hash = ?block_hash,
                 "Skipping vote — parent pruned, still verifying for PreparedCommit"
             );
             return InFlightCheck::SkipVote;
         };
-
-        let finalized_tx_count: u32 = chain.get_pending(block_hash).map_or(0, |p| {
-            p.finalized_waves()
-                .iter()
-                .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
-                .sum()
-        });
 
         if self.verify_in_flight(block_hash, block, parent_in_flight, finalized_tx_count) {
             InFlightCheck::Proceed
@@ -1659,49 +1686,53 @@ impl VerificationPipeline {
     /// deferred before its parent committed would still hold the
     /// pre-commit `parent_state_root`, causing the dispatched verification
     /// to compute against the grandparent's base state.
-    pub(crate) fn drain_ready_state_root_verifications(
+    pub(crate) fn take_ready_state_root_verifications(
         &mut self,
-        chain: &ChainView<'_>,
-    ) -> Vec<ReadyStateRootVerification> {
+    ) -> Vec<PendingStateRootVerification> {
         std::mem::take(&mut self.ready_state_root_verifications)
-            .into_iter()
-            .filter_map(|pending| {
-                // The pending block can be removed between queue-up and drain
-                // (a sibling verification fails, view change, etc.); the next
-                // `cleanup_old_state` evicts the stale entry but the drain may
-                // run first. Dispatching with empty `finalized_waves` would
-                // recompute the wrong state root against ghost inputs — skip.
-                let block = chain
-                    .get_pending(pending.block_hash)
-                    .and_then(PendingBlock::block)
-                    .or_else(|| {
-                        debug!(
-                            block_hash = ?pending.block_hash,
-                            "Skipping state root verification — pending block no longer present"
-                        );
-                        None
-                    })?;
-                let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
-                let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
-                    block.certificates().iter().cloned().collect();
-                Some(ReadyStateRootVerification {
-                    block_hash: pending.block_hash,
-                    parent_block_hash: pending.parent_block_hash,
-                    parent_state_root,
-                    parent_block_height: pending.parent_block_height,
-                    expected_root: pending.expected_root,
-                    expected_local_receipt_root: pending.expected_local_receipt_root,
-                    finalized_waves,
-                    block_height: pending.block_height,
-                    claimed_split_child_roots: pending.claimed_split_child_roots,
-                    split_child_roots_required: pending.split_child_roots_required,
-                    settled_waves_root_required: pending.settled_waves_root_required,
-                    claimed_settled_waves_root: pending.claimed_settled_waves_root,
-                    parent_weighted_timestamp: pending.parent_weighted_timestamp,
-                    settled_waves_window_floor: pending.settled_waves_window_floor,
-                })
-            })
-            .collect()
+    }
+
+    /// Resolve one taken entry's dispatch inputs against the caller's chain
+    /// view — `parent_state_root` and `finalized_waves` freshly at drain
+    /// time, avoiding stale-snapshot races where an entry deferred before
+    /// its parent committed would dispatch with the wrong base state.
+    /// `None` when the pending block was removed between queue-up and drain
+    /// (a sibling verification fails, view change, etc.) — dispatching with
+    /// empty `finalized_waves` would recompute the wrong state root against
+    /// ghost inputs.
+    pub(crate) fn resolve_ready_state_root_verification(
+        pending: &PendingStateRootVerification,
+        chain: &ChainView<'_>,
+    ) -> Option<ReadyStateRootVerification> {
+        let block = chain
+            .get_pending(pending.block_hash)
+            .and_then(PendingBlock::block)
+            .or_else(|| {
+                debug!(
+                    block_hash = ?pending.block_hash,
+                    "Skipping state root verification — pending block no longer present"
+                );
+                None
+            })?;
+        let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
+        let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+            block.certificates().iter().cloned().collect();
+        Some(ReadyStateRootVerification {
+            block_hash: pending.block_hash,
+            parent_block_hash: pending.parent_block_hash,
+            parent_state_root,
+            parent_block_height: pending.parent_block_height,
+            expected_root: pending.expected_root,
+            expected_local_receipt_root: pending.expected_local_receipt_root,
+            finalized_waves,
+            block_height: pending.block_height,
+            claimed_split_child_roots: pending.claimed_split_child_roots,
+            split_child_roots_required: pending.split_child_roots_required,
+            settled_waves_root_required: pending.settled_waves_root_required,
+            claimed_settled_waves_root: pending.claimed_settled_waves_root,
+            parent_weighted_timestamp: pending.parent_weighted_timestamp,
+            settled_waves_window_floor: pending.settled_waves_window_floor,
+        })
     }
 
     /// Check whether a deferred proposal was unblocked and should be retried.
@@ -1992,37 +2023,6 @@ mod tests {
         )
     }
 
-    fn header_with_parent_qc(
-        height: BlockHeight,
-        parent_block_hash: BlockHash,
-        in_flight: u32,
-        parent_qc: QuorumCertificate,
-    ) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
-            height,
-            parent_block_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            InFlightCount::new(in_flight),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            None,
-            None,
-        )
-    }
-
     fn block_with(
         height: BlockHeight,
         parent_block_hash: BlockHash,
@@ -2039,6 +2039,12 @@ mod tests {
         }
     }
 
+    fn empty_certified() -> &'static HashMap<BlockHash, Arc<Verified<CertifiedBlock>>> {
+        static EMPTY: std::sync::OnceLock<HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     fn chain_view<'a>(
         committed_height: BlockHeight,
         committed_hash: BlockHash,
@@ -2053,6 +2059,7 @@ mod tests {
             StateRoot::ZERO,
             latest_qc,
             pending,
+            empty_certified(),
         )
     }
 
@@ -2067,43 +2074,21 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let pending = PendingBlocks::new();
-        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
-        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, true);
+        let out =
+            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, true);
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
     #[test]
     fn classify_vote_in_flight_skips_vote_when_parent_pruned() {
-        // Non-genesis parent QC that isn't in the chain view: parent is
-        // effectively pruned, so we skip voting but still keep verifying.
+        // A pruned parent resolves no in-flight count: skip voting but
+        // still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let parent = bh(b"parent");
-        let parent_qc = QuorumCertificate::new(
-            parent,
-            ShardId::ROOT,
-            BlockHeight::new(4),
-            BlockHash::ZERO,
-            Round::INITIAL,
-            SignerBitfield::empty(),
-            zero_bls_signature(),
-            WeightedTimestamp::ZERO,
-        );
-        let h = header_with_parent_qc(BlockHeight::new(5), parent, 0, parent_qc);
-        let block = Block::Live {
-            header: h,
-            transactions: Arc::new(BoundedVec::new()),
-            certificates: Arc::new(BoundedVec::new()),
-            provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-        };
+        let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
         let block_hash = block.hash();
-        let pending = PendingBlocks::new();
-        let chain = chain_view(BlockHeight::new(3), BlockHash::ZERO, None, &pending);
 
-        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        let out = vp.classify_vote_in_flight(None, 0, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
@@ -2112,10 +2097,9 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let pending = PendingBlocks::new();
-        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
-        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        let out =
+            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Proceed));
     }
 
@@ -2126,10 +2110,9 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
-        let pending = PendingBlocks::new();
-        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
-        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        let out =
+            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Abort));
     }
 
@@ -2138,11 +2121,8 @@ mod tests {
     #[test]
     fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let pending = PendingBlocks::new();
-        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
-        let out = vp.drain_ready_state_root_verifications(&chain);
-        assert!(out.is_empty());
+        assert!(vp.take_ready_state_root_verifications().is_empty());
     }
 
     #[test]
@@ -2158,6 +2138,7 @@ mod tests {
             block_hash,
             &block,
             BlockHeight::GENESIS,
+            false,
             false,
             false,
             None,
@@ -2182,16 +2163,20 @@ mod tests {
             &pending_with_block,
         );
 
-        let out = vp.drain_ready_state_root_verifications(&chain);
+        let taken = vp.take_ready_state_root_verifications();
+        let out: Vec<_> = taken
+            .into_iter()
+            .filter_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+            })
+            .collect();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].block_hash, block_hash);
         assert_eq!(out[0].parent_block_hash, parent_block_hash);
         assert_eq!(out[0].parent_block_height, BlockHeight::GENESIS);
 
-        // Draining again without another initiate yields nothing.
-        let empty_pending = PendingBlocks::new();
-        let chain2 = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
-        assert!(vp.drain_ready_state_root_verifications(&chain2).is_empty());
+        // Taking again without another initiate yields nothing.
+        assert!(vp.take_ready_state_root_verifications().is_empty());
     }
 
     #[test]
@@ -2210,15 +2195,22 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
         );
 
         let empty_pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
 
-        let out = vp.drain_ready_state_root_verifications(&chain);
-        assert!(
-            out.is_empty(),
+        let resolved = vp
+            .take_ready_state_root_verifications()
+            .into_iter()
+            .filter_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+            })
+            .count();
+        assert_eq!(
+            resolved, 0,
             "entry must be skipped when its pending block was removed"
         );
     }

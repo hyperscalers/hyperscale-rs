@@ -32,7 +32,7 @@ impl ShardParticipation {
         // Check if we're behind and need to catch up via sync. Handles the
         // case where latest_qc > committed_height — the network progressed
         // but we're stuck.
-        actions.extend(self.shard_coordinator.check_sync_health());
+        actions.extend(self.shard_coordinator.check_sync_health(sched));
 
         actions.extend(self.recover_stalled_fallback_fetches(sched));
 

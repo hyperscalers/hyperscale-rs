@@ -52,7 +52,7 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
+use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage};
 use hyperscale_types::{
     Block, CertifiedBlock, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
     Verified,
@@ -586,6 +586,28 @@ where
         )));
 
         self.seed_genesis_substate_frontier(genesis);
+        std::mem::take(&mut self.pending_timer_ops)
+    }
+
+    /// Resume a runtime-seated shard's consensus from its recovered
+    /// committed state — the non-genesis counterpart of
+    /// [`Self::install_genesis`]. Feeds every vnode the committed-state
+    /// restore, which arms the pacemaker and cleanup timers and latches a
+    /// proposal attempt. A joiner seated onto a live shard would pick
+    /// those up from the committee's gossip, but a committee seated onto
+    /// a quiet chain — a halt recovery's fresh committee — hears nothing,
+    /// so without this its vnodes never propose or time out.
+    ///
+    /// Returns the timer ops under the same caller contract as
+    /// [`Self::install_genesis`].
+    pub fn resume_committed(&mut self, recovered: &RecoveredState) -> Vec<TimerOp> {
+        self.step(ShardScopedInput::Protocol(Box::new(
+            ProtocolEvent::CommittedStateRestored {
+                height: recovered.committed_height,
+                hash: recovered.committed_hash,
+                qc: recovered.latest_qc.clone(),
+            },
+        )));
         std::mem::take(&mut self.pending_timer_ops)
     }
 

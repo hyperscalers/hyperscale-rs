@@ -10,10 +10,11 @@
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
 //! on `ShardCoordinator` / `PendingBlock` just as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, ChainOrigin, InFlightCount, ProvisionHash,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, InFlightCount, ProvisionHash,
     QuorumCertificate, ShardId, StateRoot, TxHash, Verified, WaveId,
 };
 use tracing::warn;
@@ -28,9 +29,11 @@ pub struct ChainView<'a> {
     committed_state_root: StateRoot,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
     pending: &'a PendingBlocks,
+    certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
 }
 
 impl<'a> ChainView<'a> {
+    #[allow(clippy::too_many_arguments)] // a borrow-bundle over the coordinator's chain fields
     pub const fn new(
         local_shard: ShardId,
         chain_origin: ChainOrigin,
@@ -39,6 +42,7 @@ impl<'a> ChainView<'a> {
         committed_state_root: StateRoot,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
         pending: &'a PendingBlocks,
+        certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
     ) -> Self {
         Self {
             local_shard,
@@ -48,6 +52,7 @@ impl<'a> ChainView<'a> {
             committed_state_root,
             latest_qc,
             pending,
+            certified,
         }
     }
 
@@ -60,9 +65,19 @@ impl<'a> ChainView<'a> {
 
     /// Header-only lookup. Pending blocks always carry their header even
     /// before full assembly, so this succeeds even when the body hasn't been
-    /// constructed yet.
+    /// constructed yet. A block absent from `pending` resolves through the
+    /// verified-certified cache — the home of a sync-admitted block whose
+    /// round-contiguous commit is still pending, which a halt recovery's
+    /// fresh committee extends as its proposal parent.
     pub fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
-        self.pending.get(block_hash).map(PendingBlock::header)
+        self.pending
+            .get(block_hash)
+            .map(PendingBlock::header)
+            .or_else(|| {
+                self.certified
+                    .get(&block_hash)
+                    .map(|certified| certified.block().header())
+            })
     }
 
     /// State root of the parent block. Returns the committed-tip state root
@@ -212,6 +227,7 @@ mod tests {
         latest_qc: Option<&Verified<QuorumCertificate>>,
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
+        let certified = HashMap::new();
         let view = ChainView {
             local_shard: ShardId::ROOT,
             chain_origin: ChainOrigin::ROOT,
@@ -220,6 +236,7 @@ mod tests {
             committed_state_root,
             latest_qc,
             pending,
+            certified: &certified,
         };
         f(&view)
     }
