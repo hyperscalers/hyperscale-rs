@@ -14,8 +14,8 @@ use sbor::prelude::*;
 
 use crate::{
     BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash,
-    Hash, NetworkDefinition, Randomness, ReshapeThresholds, SHARD_CAPACITY, Stake, StakePoolId,
-    ValidatorId,
+    Hash, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, ReshapeThresholds,
+    SHARD_CAPACITY, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -58,6 +58,20 @@ pub struct BeaconChainConfig {
 }
 
 impl BeaconChainConfig {
+    /// The production sizing: [`Self::default`] with the beacon committee
+    /// capped at [`PRODUCTION_BEACON_COMMITTEE_SIZE`] rather than the small
+    /// dev/sim [`BEACON_SIGNER_COUNT`]. The validator binary seats this so a
+    /// live network runs the grind-hardened committee while simulations keep
+    /// the small default.
+    #[must_use]
+    pub fn production() -> Self {
+        Self {
+            beacon_committee_size: u32::try_from(PRODUCTION_BEACON_COMMITTEE_SIZE)
+                .unwrap_or(u32::MAX),
+            ..Self::default()
+        }
+    }
+
     /// `epoch_duration_ms` typed as a [`Duration`].
     #[must_use]
     pub const fn epoch_duration(&self) -> Duration {
@@ -219,6 +233,26 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: BeaconGenesisConfig = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    /// The production config differs from the dev/sim default in exactly
+    /// the beacon committee size: `PRODUCTION_BEACON_COMMITTEE_SIZE`, with
+    /// every other sizing knob unchanged.
+    #[test]
+    fn production_caps_only_the_beacon_committee() {
+        let prod = BeaconChainConfig::production();
+        let dev = BeaconChainConfig::default();
+        assert_eq!(
+            prod.beacon_committee_size,
+            u32::try_from(PRODUCTION_BEACON_COMMITTEE_SIZE).unwrap(),
+        );
+        assert_eq!(
+            prod,
+            BeaconChainConfig {
+                beacon_committee_size: prod.beacon_committee_size,
+                ..dev
+            },
+        );
     }
 
     fn net() -> NetworkDefinition {

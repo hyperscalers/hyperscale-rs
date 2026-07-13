@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use common::{PcSim, SpcSim, Trace};
 use hyperscale_types::{
-    Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc3, PcValueElement, PcVector, SpcCert,
-    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, build_indirect_cert,
-    sign_empty_view_msg, spc_context, verify_block_cert, verify_cert, verify_empty_view_msg,
-    verify_proposal_object,
+    Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PRODUCTION_BEACON_COMMITTEE_SIZE, PcQc3,
+    PcValueElement, PcVector, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView,
+    ValidatorId, build_indirect_cert, sign_empty_view_msg, spc_context, verify_block_cert,
+    verify_cert, verify_empty_view_msg, verify_proposal_object,
 };
 
 const fn elem(byte: u8) -> PcValueElement {
@@ -222,6 +222,30 @@ fn sim_n7_honest_path_converges_on_high() {
     assert!(sim.all_decided());
     let baseline = sim.output(0).unwrap().clone();
     for i in 1..7 {
+        assert_eq!(*sim.output(i).unwrap(), baseline);
+    }
+}
+
+/// Same at the production beacon committee size (n=16, q=11, f=5) — the
+/// grind-hardened committee runs PC/SPC to a decided high with no sizing
+/// assumption baked into the smaller n. The input vector spans all 16
+/// positions, one proposal per member, so the full-coverage feed the
+/// coordinator gives is exercised end to end.
+#[test]
+fn sim_n16_honest_path_converges_on_high() {
+    let n = PRODUCTION_BEACON_COMMITTEE_SIZE;
+    let mut sim = SpcSim::new(n, 0xA2, Epoch::new(3), Duration::from_mins(1));
+    let v = PcVector::new((0..n).map(|i| elem(u8::try_from(i).unwrap())));
+    for i in 0..n {
+        sim.input(i, v.clone());
+    }
+    sim.run_until_quiescent(40_000);
+    assert!(
+        sim.all_decided(),
+        "all {n} parties should latch OutputHigh at the production committee size",
+    );
+    let baseline = sim.output(0).unwrap().clone();
+    for i in 1..n {
         assert_eq!(*sim.output(i).unwrap(), baseline);
     }
 }

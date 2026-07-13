@@ -60,8 +60,30 @@ pub const SPC_INPUT_DWELL: Duration = Duration::from_millis(500);
 
 // ─── Committee sizing ──────────────────────────────────────────────────────
 
-/// Target signer count for the global (beacon) committee.
+/// Target signer count for the global (beacon) committee — the dev/sim
+/// default.
+///
+/// Small so simulations run at low validator counts; production caps the
+/// committee at [`PRODUCTION_BEACON_COMMITTEE_SIZE`] instead.
 pub const BEACON_SIGNER_COUNT: usize = 4;
+
+/// Beacon committee size cap for a production chain.
+///
+/// A Byzantine beacon member steers next-epoch committee placement only by
+/// including or omitting its own randomness proposal, so the space it can
+/// grind over grows with the committee size — the width is exponential in
+/// the number of such members, `~ Binomial(b, β)`. Holding `b` small caps
+/// that width. The floor is the other side of the trade: a smaller
+/// committee crosses its own Byzantine threshold (`≥ f+1` corrupt) more
+/// often, which degrades beacon liveness and randomness bias — bounded by
+/// pool ratification — rather than a safety break. `b = 16` balances the
+/// two; the dev/sim default stays at [`BEACON_SIGNER_COUNT`]. Seated by
+/// [`BeaconChainConfig::production`](crate::BeaconChainConfig::production).
+///
+/// A cap, not a floor: genesis seats `min(eligible, b)`, so a small
+/// network runs a smaller committee that grows toward `b` as validators
+/// join.
+pub const PRODUCTION_BEACON_COMMITTEE_SIZE: usize = 16;
 
 /// Smallest beacon committee that can run PC/SPC consensus.
 ///
