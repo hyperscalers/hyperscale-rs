@@ -340,7 +340,7 @@ pub(super) fn resample_beacon_committee(
         .filter(|id| !excluded.contains(id))
         .collect();
     let committee_size = state.chain_config.beacon_committee_size as usize;
-    let cooldown = (eligible.len() / committee_size.max(1)).max(1) as u64;
+    let cooldown = state.beacon_recency_period();
     let now = state.current_epoch.inner();
     let weighted: Vec<(ValidatorId, u64)> = eligible
         .iter()

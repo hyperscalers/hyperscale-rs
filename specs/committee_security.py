@@ -1289,10 +1289,12 @@ def main() -> None:
               f" | {fu['final_c']:>3d}({fu['max_c']:>3d}) {reach(fu):>6}")
     print("   (recency pushes the first 2f+1 crossing from beta~0.12 to ~0.14 — "
           "outside the ~0.13 the budget")
-    print("    tolerates — and leaves a wide margin at the design point. Ramp "
-          "sharpness + jail-cooldown are")
-    print("    tuning knobs pinned in implementation; a sharper ramp caps tighter "
-          "but is more predictable (§4).)")
+    print("    tolerates — and leaves a wide margin at the design point. As built: "
+          "a linear-additive ramp over")
+    print("    eligible/b, and the jail-on-first synergy is realized by holding the "
+          "withholding jail for a full")
+    print("    recency period (jail_cd = cooldown here) — the ramp alone lands at "
+          "~0.12; the long jail reaches ~0.14.)")
 
     print("\n   Jail-on-first honest purge: worst-case ceiling vs realized under "
           "partial synchrony (b=20):")

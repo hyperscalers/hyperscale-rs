@@ -119,11 +119,12 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // value is the f+1-shared prefix (`qc1_certify`), so under synchrony
     // an honest proposal reaching a supermajority cannot be forced
     // absent; a member with no entry chose silence. One absence jails —
-    // no counter — and the jail cooldown is the recovery knob. Rests on
-    // that synchrony assumption: a member cut off for a whole epoch
-    // reads as absent and jails, a recoverable performance fault. An
-    // epoch with no committed proposals at all carries no absence
-    // signal and is skipped.
+    // no counter — under `JailReason::Withholding`, held out for a full
+    // recency period so a grinder cannot cycle its foothold back inside
+    // one committee turnover. Rests on that synchrony assumption: a
+    // member cut off for a whole epoch reads as absent and jails, a
+    // recoverable fault. An epoch with no committed proposals at all
+    // carries no absence signal and is skipped.
     if !committed.is_empty() {
         let present: BTreeSet<ValidatorId> = committed.iter().map(|(party, _)| *party).collect();
         let absent: Vec<ValidatorId> = state
@@ -137,7 +138,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
             if !matches!(prior_status, Some(ValidatorStatus::OnShard { .. })) {
                 continue;
             }
-            jail_validator(state, party, JailReason::Performance, since_epoch);
+            jail_validator(state, party, JailReason::Withholding, since_epoch);
             jailed.push(party);
         }
     }
@@ -354,7 +355,7 @@ mod tests {
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::Jailed {
                 since_epoch: state.current_epoch,
-                reason: JailReason::Performance,
+                reason: JailReason::Withholding,
             },
         );
         let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
@@ -364,9 +365,12 @@ mod tests {
     }
 
     /// An honest member cut off for one epoch — the async-window case —
-    /// jails under `Performance`, the recoverable reason, so the penalty
-    /// is graceful: after the cooldown an `Unjail` returns it to the pool
-    /// (and thence back into placement), not a permanent ejection.
+    /// jails under `Withholding`, a recoverable reason, so the penalty is
+    /// graceful: after the recency-period cooldown an `Unjail` returns it
+    /// to the pool (and thence back into placement), not a permanent
+    /// ejection. This four-member fixture's recency period is one epoch,
+    /// so the cooldown here is short; the production coupling holds it far
+    /// longer (`withholding_jail_holds_for_the_recency_period`).
     #[test]
     fn async_absence_jail_is_recoverable_after_cooldown() {
         use hyperscale_types::{JAIL_COOLDOWN_EPOCHS, ShardWitnessPayload};
@@ -399,7 +403,7 @@ mod tests {
         assert!(matches!(
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::Jailed {
-                reason: JailReason::Performance,
+                reason: JailReason::Withholding,
                 ..
             },
         ));

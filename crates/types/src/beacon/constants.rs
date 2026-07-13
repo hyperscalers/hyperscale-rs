@@ -159,18 +159,25 @@ pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 /// sit above [`RESHAPE_HANDOFF_TTL_EPOCHS`] (a successor's
 /// post-execution seating lag) and the occasional missed fold.
 ///
-/// Starting value provisional — calibrate against the measured
-/// skip/reshape cadence like the miss-counter thresholds: too low flags
-/// a healthy-but-slow shard, too high delays detection of a real halt.
+/// Set to `16` — comfortably above the 12-epoch handoff TTL (the longest
+/// legitimate quiet spell for a non-reshaping shard, and reshaping shards
+/// are exempt outright), so a healthy shard never false-flags, while
+/// holding detection latency to one shuffle interval. The scenario sims
+/// exercise the halt-and-recover path at this value with no spurious
+/// flags.
 pub const HALT_THRESHOLD_EPOCHS: u64 = 16;
 
 // ─── Penalties ─────────────────────────────────────────────────────────────
 
-/// How long a fault-cause jail must elapse before an `Unjail` lift can
-/// return the validator to `Pooled`.
+/// How long a `JailReason::Performance` jail must elapse before an
+/// `Unjail` lift can return the validator to `Pooled`.
 ///
-/// Applies to the performance jail reason; equivocation jail is
-/// permanent regardless of this value.
+/// A `JailReason::Withholding` jail (a beacon-committee member absent
+/// from the committed set) instead holds for a full
+/// [`BeaconState::beacon_recency_period`](crate::BeaconState::beacon_recency_period)
+/// — far longer at production scale — so a grinder cannot return inside
+/// the window its resample weight would still suppress it. Equivocation
+/// jail is permanent regardless of either value.
 pub const JAIL_COOLDOWN_EPOCHS: u64 = 16;
 
 /// How many quiet epochs cancel a pending shard reshape.

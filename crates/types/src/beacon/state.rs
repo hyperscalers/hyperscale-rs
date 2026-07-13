@@ -101,8 +101,18 @@ pub enum JailReason {
     /// beacon-side `MissedProposal` counter crossing the jail
     /// threshold, or from a malformed VRF reveal in the validator's
     /// own proposal (self-inflicted cryptographic fault, jailed on
-    /// first sighting). Unjails after cooldown.
+    /// first sighting). Unjails after `JAIL_COOLDOWN_EPOCHS`.
     Performance,
+    /// A beacon-committee member was absent from the committed proposal
+    /// set — the include-or-omit lever the randomness grind steers.
+    /// Jailed on first absence like a performance fault, but held out
+    /// for a full recency period ([`BeaconState::beacon_recency_period`])
+    /// rather than the short performance cooldown: a shorter jail would
+    /// let a grinder cycle its foothold back inside one committee
+    /// turnover, defeating the recency weighting that rate-limits its
+    /// service. Recoverable — an honest member cut off for a whole epoch
+    /// unjails once the period elapses.
+    Withholding,
     /// Cryptographic proof of byzantine signing. Permanent — the key is
     /// provably hostile, no cooldown unjails it.
     Equivocation,
@@ -994,6 +1004,24 @@ impl BeaconState {
             .collect()
     }
 
+    /// The recency period — `beacon_eligible / beacon_committee_size`
+    /// epochs, at least one — over which a served member's resample
+    /// weight recovers additively, and the cooldown a
+    /// [`JailReason::Withholding`] jail holds for.
+    ///
+    /// One period is one full committee turnover: on average every
+    /// eligible member serves once per period, so weighting service down
+    /// for a period caps a grinder's sustained beacon-committee foothold
+    /// near the natural `β · committee_size`. The withholding jail and
+    /// the resample weight read the same period so a jailed grinder
+    /// cannot return inside the window its recency weight would still
+    /// suppress it.
+    #[must_use]
+    pub fn beacon_recency_period(&self) -> u64 {
+        let b = u64::from(self.chain_config.beacon_committee_size.max(1));
+        (self.beacon_eligible().len() as u64 / b).max(1)
+    }
+
     /// Resolve the beacon committee into `(validator_id, pubkey)` pairs
     /// in committee-declaration order.
     ///
@@ -1517,6 +1545,21 @@ mod tests {
     }
 
     // ─── beacon_eligible ──────────────────────────────────────────────
+
+    /// The recency period is `beacon_eligible / beacon_committee_size`,
+    /// floored at one — the committee-turnover horizon the resample
+    /// weight and the withholding jail both key off.
+    #[test]
+    fn beacon_recency_period_is_eligible_over_committee_size() {
+        // Default committee size is BEACON_SIGNER_COUNT = 4.
+        let mut state = single_pool_state(20);
+        assert_eq!(state.beacon_eligible().len(), 20);
+        assert_eq!(state.beacon_recency_period(), 5);
+
+        // Fewer eligible than a committee still floors at one epoch.
+        state = single_pool_state(2);
+        assert_eq!(state.beacon_recency_period(), 1);
+    }
 
     /// The pending-anchor exclusion: a member placed at a runtime-born
     /// child record's creation (an unflipped split observer) is not

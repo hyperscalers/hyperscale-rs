@@ -697,11 +697,19 @@ hygiene** (β low, §3, §6 Rider 2) — the deepest lever, since concentrating 
 corrupt on one shard needs that many in play. Together they push the first 2f+1
 crossing from β ≈ 0.12 (decided stack, without recency) to **β ≈ 0.14** (table
 T) — outside the ≈0.13 the sampling budget tolerates — and leave a wide margin at
-the design point where the decided stack had only ~3 seats. The recency ramp
-sharpness and its jail-cooldown coupling are tuning knobs pinned during
-implementation (a sharper ramp caps tighter but makes the committee more
-predictable — the §4 adaptive-corruption trade — and the synergy with jail-on-first
-needs the jail cooldown near the recency period). The shuffle interval is **not**
+the design point where the decided stack had only ~3 seats. As implemented, the
+recency ramp is **linear-additive** — a member's draw weight recovers by one step
+per epoch over `eligible / committee_size` epochs, a full committee turnover —
+chosen over a sharper cutoff because a sharper ramp makes the committee more
+predictable (the §4 adaptive-corruption trade). Its jail-on-first synergy is
+**realized by holding the withholding jail (`JailReason::Withholding`) for that
+same recency period** rather than the short performance cooldown: the ramp alone
+lands the first crossing at β ≈ 0.12, and the long jail — which removes the
+omitting grinders from the eligible pool for a full turnover — is what depletes the
+corrupt supply enough to reach β ≈ 0.14 (table T). Its cost is an aggressive
+per-validator penalty (an honest member caught in a bounded async window is out for
+a recency period), but the realized honest purge stays a rounding error (β_eff ≤
+~0.11 even at `p_async = 0.20`, `sim_async_purge`). The shuffle interval is **not**
 shrunk on grind grounds (the boost survives, so small `I` is grind-worst). Residuals: the beacon-committee
 compromise rate (liveness/bias, rides pool ratification), the f+1
 finality-latency window (consumer-side, bounded), and the thin design-point
