@@ -263,12 +263,31 @@ pub fn apply_witness_chunk(
         zero_bls_signature(),
         WeightedTimestamp::from_millis(dur + 1),
     );
-    let proposal = BeaconProposal::new(
-        std::iter::once((shard, Some(qc))).collect(),
-        Vec::new(),
-        vrf_sign(&keypair(0), &net(), state.current_epoch.next()),
-    );
-    let committed = vec![(ValidatorId::new(0), proposal)];
+    // Every beacon committee member proposes (each with its own valid
+    // VRF), so the absence pass reads full participation and the fold
+    // under test is the witness chunk alone. An empty committee (the
+    // bare fixtures) falls back to a single stand-in proposer.
+    let boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>> =
+        std::iter::once((shard, Some(qc))).collect();
+    let next_epoch = state.current_epoch.next();
+    let proposers: Vec<ValidatorId> = if state.committee.is_empty() {
+        vec![ValidatorId::new(0)]
+    } else {
+        state.committee.clone()
+    };
+    let committed: Vec<(ValidatorId, BeaconProposal)> = proposers
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                BeaconProposal::new(
+                    boundary_qcs.clone(),
+                    Vec::new(),
+                    vrf_sign(&keypair(id.inner()), &net(), next_epoch),
+                ),
+            )
+        })
+        .collect();
     let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
         shard,
         ShardEpochContribution {

@@ -38,7 +38,8 @@ pub(super) struct VrfStageOutcome<'a> {
 /// Filter `committed` to proposals whose proposer is in
 /// `state.committee` and whose VRF reveal verifies under their
 /// pubkey, roll `state.randomness` over the accepted VRF outputs, and
-/// jail proposers whose reveals were rejected.
+/// jail proposers whose reveals were rejected — or whose proposals
+/// never reached the committed set at all.
 ///
 /// `state.randomness` advances *always* — even when no proposal is
 /// accepted, the BLAKE3 mix runs against the prior randomness alone.
@@ -46,8 +47,8 @@ pub(super) struct VrfStageOutcome<'a> {
 /// deterministic function of `prev_randomness`. An adversary who can
 /// suppress every VRF reveal can therefore predict the next epoch's
 /// randomness from the previous one; the mitigation is the
-/// jail-on-first-sighting cascade here plus committee resampling at
-/// epoch boundaries.
+/// jail-on-first-sighting cascades here (malformed reveals and absent
+/// proposals alike) plus committee resampling at epoch boundaries.
 ///
 /// A malformed VRF reveal under the proposer's own key is a
 /// self-inflicted cryptographic fault — an unmodified honest binary
@@ -112,6 +113,35 @@ pub(super) fn filter_and_roll_randomness<'a>(
         jailed.push(*party);
     }
 
+    // Jail committee members with no committed proposal at all — the
+    // withholding lever of the randomness grind (include-or-omit is the
+    // only control a member has over the roll above). The committed
+    // value is the f+1-shared prefix (`qc1_certify`), so under synchrony
+    // an honest proposal reaching a supermajority cannot be forced
+    // absent; a member with no entry chose silence. One absence jails —
+    // no counter — and the jail cooldown is the recovery knob. Rests on
+    // that synchrony assumption: a member cut off for a whole epoch
+    // reads as absent and jails, a recoverable performance fault. An
+    // epoch with no committed proposals at all carries no absence
+    // signal and is skipped.
+    if !committed.is_empty() {
+        let present: BTreeSet<ValidatorId> = committed.iter().map(|(party, _)| *party).collect();
+        let absent: Vec<ValidatorId> = state
+            .committee
+            .iter()
+            .filter(|party| !present.contains(party))
+            .copied()
+            .collect();
+        for party in absent {
+            let prior_status = state.validators.get(&party).map(|r| r.status);
+            if !matches!(prior_status, Some(ValidatorStatus::OnShard { .. })) {
+                continue;
+            }
+            jail_validator(state, party, JailReason::Performance, since_epoch);
+            jailed.push(party);
+        }
+    }
+
     VrfStageOutcome {
         accepted,
         rejected_reveals,
@@ -149,7 +179,8 @@ pub(super) fn jail_validator(
 mod tests {
 
     use hyperscale_types::{
-        JailReason, MIN_STAKE_FLOOR, ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
+        Epoch, JailReason, MIN_STAKE_FLOOR, ShardId, Stake, StakePoolId, ValidatorId,
+        ValidatorStatus,
     };
 
     use crate::state::test_fixtures::{
@@ -172,6 +203,8 @@ mod tests {
     /// A proposal from a non-committee party is silently dropped — no
     /// jail, no randomness contribution, no `rejected_reveals` entry.
     /// Defends against runner-level bugs that pass a stray proposal in.
+    /// The committee itself is fully present so the stray is the only
+    /// anomaly under test.
     #[test]
     fn non_committee_proposal_is_silently_dropped() {
         let mut state = single_pool_state(4);
@@ -182,34 +215,29 @@ mod tests {
             validator_record(5, 0, ValidatorStatus::Pooled),
         );
         let prior = state.randomness;
-        let bad = vec![(
-            ValidatorId::new(5),
-            vrf_proposal(5, state.current_epoch.next()),
-        )];
-        let effects = apply_next_epoch(&mut state, &bad);
-        // Randomness rolled (over prev alone), but no contribution
-        // from the dropped proposal — and no rejected_reveals entry.
+        let target = state.current_epoch.next();
+        let mut committed: Vec<_> = (0u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        committed.push((ValidatorId::new(5), vrf_proposal(5, target)));
+        let effects = apply_next_epoch(&mut state, &committed);
+        // Randomness rolled, but no contribution from the dropped
+        // proposal — and no rejected_reveals entry.
         assert_ne!(state.randomness, prior);
         assert!(effects.rejected_reveals.is_empty());
         assert!(effects.jailed.is_empty());
     }
 
-    /// Honest VRF reveal verifies and contributes to randomness;
+    /// Honest VRF reveals verify and contribute to randomness;
     /// `rejected_reveals` stays empty.
     #[test]
     fn honest_proposal_advances_randomness_without_rejection() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let committed = vec![
-            (
-                ValidatorId::new(0),
-                vrf_proposal(0, state.current_epoch.next()),
-            ),
-            (
-                ValidatorId::new(1),
-                vrf_proposal(1, state.current_epoch.next()),
-            ),
-        ];
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (0u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
         let prior = state.randomness;
         let effects = apply_next_epoch(&mut state, &committed);
         assert_ne!(state.randomness, prior);
@@ -259,10 +287,11 @@ mod tests {
             validator_record(4, 0, ValidatorStatus::Pooled),
         );
 
-        let committed = vec![(
-            ValidatorId::new(0),
-            malformed_vrf_proposal(0, state.current_epoch.next()),
-        )];
+        // The rest of the committee is present, so the malformed cascade
+        // is the only jail path exercised.
+        let target = state.current_epoch.next();
+        let mut committed = vec![(ValidatorId::new(0), malformed_vrf_proposal(0, target))];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target))));
         let effects = apply_next_epoch(&mut state, &committed);
 
         // Proposer 0 in rejected_reveals AND jailed.
@@ -288,6 +317,168 @@ mod tests {
             refill_status,
             ValidatorStatus::OnShard { shard, ready: false, .. } if shard == ShardId::leaf(1, 0),
         ));
+    }
+
+    /// A committee member with no committed proposal at all jails on the
+    /// first absence — the withholding lever of the randomness grind —
+    /// and its freed seat refills from the pool.
+    #[test]
+    fn absent_committee_member_jails_on_first_absence() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        // Members 1..=3 propose; member 0 withholds.
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (1u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert_eq!(effects.jailed, vec![ValidatorId::new(0)]);
+        // Absence is not a malformed reveal — nothing to reject.
+        assert!(effects.rejected_reveals.is_empty());
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(0)).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: state.current_epoch,
+                reason: JailReason::Performance,
+            },
+        );
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
+        assert_eq!(members.len(), 4);
+        assert!(!members.contains(&ValidatorId::new(0)));
+        assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    /// An honest member cut off for one epoch — the async-window case —
+    /// jails under `Performance`, the recoverable reason, so the penalty
+    /// is graceful: after the cooldown an `Unjail` returns it to the pool
+    /// (and thence back into placement), not a permanent ejection.
+    #[test]
+    fn async_absence_jail_is_recoverable_after_cooldown() {
+        use hyperscale_types::{JAIL_COOLDOWN_EPOCHS, ShardWitnessPayload};
+
+        use crate::state::test_fixtures::apply_witness_chunk;
+
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        // Member 0 is transiently unreachable for one epoch.
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (1u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        apply_next_epoch(&mut state, &committed);
+        let jailed_at = state.current_epoch;
+        assert!(matches!(
+            state.validators.get(&ValidatorId::new(0)).unwrap().status,
+            ValidatorStatus::Jailed {
+                reason: JailReason::Performance,
+                ..
+            },
+        ));
+
+        // Once the cooldown elapses, an Unjail lifts it back to the pool.
+        state.current_epoch = Epoch::new(jailed_at.inner() + JAIL_COOLDOWN_EPOCHS);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::Unjail {
+                id: ValidatorId::new(0),
+            }],
+        );
+        assert_eq!(effects.unjailed, vec![ValidatorId::new(0)]);
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(0)).unwrap().status,
+            ValidatorStatus::Pooled,
+        );
+    }
+
+    /// An epoch that committed no proposals at all carries no absence
+    /// signal — nobody jails. The Skip fold and the empty-Normal fold
+    /// both take this shape.
+    #[test]
+    fn empty_committed_set_jails_nobody() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let effects = apply_next_epoch(&mut state, &[]);
+        assert!(effects.jailed.is_empty());
+        for i in 0u64..4 {
+            assert!(matches!(
+                state.validators.get(&ValidatorId::new(i)).unwrap().status,
+                ValidatorStatus::OnShard { .. },
+            ));
+        }
+    }
+
+    /// Every member present means nobody jails, epoch after epoch — the
+    /// synchronous honest fixture the clean-purge property rests on.
+    #[test]
+    fn fully_present_committee_never_jails() {
+        let mut state = single_pool_state(4);
+        for _ in 0..8 {
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            let target = state.current_epoch.next();
+            let committed: Vec<_> = (0u64..4)
+                .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+                .collect();
+            let effects = apply_next_epoch(&mut state, &committed);
+            assert!(effects.jailed.is_empty());
+        }
+    }
+
+    /// A member both absent and no longer `OnShard` (jailed by an
+    /// earlier fold, still riding the promoted committee list) is left
+    /// alone — the cascade gate keeps the pass idempotent.
+    #[test]
+    fn absence_pass_skips_members_no_longer_on_shard() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let jailed_earlier = ValidatorId::new(0);
+        state.validators.get_mut(&jailed_earlier).unwrap().status = ValidatorStatus::Jailed {
+            since_epoch: state.current_epoch,
+            reason: JailReason::Performance,
+        };
+        let earlier_status = state.validators.get(&jailed_earlier).unwrap().status;
+
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (1u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert!(effects.jailed.is_empty());
+        assert_eq!(
+            state.validators.get(&jailed_earlier).unwrap().status,
+            earlier_status,
+            "an already-jailed member must not be re-jailed by the absence pass",
+        );
     }
 
     /// Malformed VRF still rejects the proposal's randomness

@@ -700,7 +700,7 @@ mod tests {
     use crate::rules::contribution_chunk_valid;
     use crate::state::test_fixtures::{
         applied_count, apply_next_epoch, apply_witness_chunk, boundary_chunk, keypair,
-        malformed_vrf_proposal, net, pubkey, single_pool_state, validator_record,
+        malformed_vrf_proposal, net, pubkey, single_pool_state, validator_record, vrf_proposal,
         vrf_proposal_with_equivocations,
     };
 
@@ -1617,10 +1617,12 @@ mod tests {
 
         let target = ValidatorId::new(1);
         let w = vote_equivocation_witness(target.inner(), Epoch::new(5), SpcView::new(0));
-        let committed = vec![(
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, target_epoch, vec![w]),
         )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert_eq!(effects.jailed, vec![target]);
@@ -1649,10 +1651,12 @@ mod tests {
         );
 
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
-        let committed = vec![(
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, target_epoch, vec![w]),
         )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert_eq!(effects.jailed, vec![ValidatorId::new(10)]);
@@ -1684,10 +1688,12 @@ mod tests {
         );
 
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
-        let committed = vec![(
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, target_epoch, vec![w]),
         )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert_eq!(effects.jailed, vec![ValidatorId::new(10)]);
@@ -1720,10 +1726,12 @@ mod tests {
         );
 
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
-        let committed = vec![(
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, target_epoch, vec![w]),
         )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert!(effects.jailed.is_empty());
