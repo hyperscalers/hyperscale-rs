@@ -136,6 +136,25 @@ pub fn witness_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
     )]
 }
 
+/// Genesis funding for the halted-shard recovery scenario.
+///
+/// Both children of the root are bulk-funded into the stable band — above
+/// the derived merge floor, below the split threshold, summing over it —
+/// so the root splits exactly once and the grown pair holds: neither
+/// child re-splits or asserts a merge half while the halt and its
+/// recovery play out (a pending reshape would exempt the halted shard
+/// from detection).
+#[must_use]
+pub fn halt_recovery_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
+    let mut balances = vec![(
+        account_from_seed(MERGE_VOTE_PAYER_SEED),
+        Decimal::from(100_000),
+    )];
+    bulk_fund_into(ShardId::leaf(1, 0), 2, STRADDLER_BULK, &mut balances);
+    bulk_fund_into(ShardId::leaf(1, 1), 2, STRADDLER_BULK, &mut balances);
+    balances
+}
+
 /// The genesis funding and straddler transfers for the merge-straddler scenario.
 ///
 /// Mirrors [`SplitStraddlerSetup`] but for a four-shard topology: the surviving

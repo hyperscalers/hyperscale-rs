@@ -3,19 +3,21 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Epoch, ShardId, StateRoot, TransactionDecision, TransactionStatus,
+    BlockHeight, Epoch, HALT_THRESHOLD_EPOCHS, ShardId, StateRoot, TransactionDecision,
+    TransactionStatus,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
-use crate::support::epochs;
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::beacon_epoch;
 use crate::support::tx::{
-    account_from_seed, build_faucet_tx, build_transfer_tx, signer_from_seed, validity_around,
+    account_from_seed, build_faucet_tx, build_transfer_tx, merge_vote_payer, signer_from_seed,
+    validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
+use crate::support::{epochs, vote_reshape_threshold};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -142,6 +144,132 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "the transfer must complete despite an isolated validator; status = {status:?}",
+    );
+}
+
+/// A shard halts when f+1 of its committee withhold their consensus
+/// messages, and the beacon recovers it by re-drawing the whole committee
+/// from the pool.
+///
+/// After the root grows, two members of the left child's four-member
+/// committee go silent at the consensus layer only: their outbound
+/// proposals, votes, and timeouts are dropped, while every other channel —
+/// beacon participation, pool ratification, block serving — stays
+/// connected. The honest remainder is short of the 2f+1 quorum, so the
+/// shard freezes while its sibling and the beacon keep committing. Once
+/// the boundary watermark stalls past the halt threshold the beacon flags
+/// the shard, seats a fresh committee from the pool spares, and retains
+/// the replaced members in the routing view; the incomers sync the halted
+/// tip from them, bridge the halt gap, and the shard resumes committing.
+/// The first crossing under the fresh committee clears the recovery
+/// record.
+///
+/// Requires [`halt_recovery_genesis_balances`] at genesis, a dedicated
+/// host per validator, and two committees' worth of pool surplus — one
+/// grow cohort, one recovery committee.
+///
+/// [`halt_recovery_genesis_balances`]: crate::tx::halt_recovery_genesis_balances
+///
+/// # Panics
+///
+/// Panics if the shard fails to halt, the beacon or the sibling shard
+/// stops committing through the halt, the recovery never fires, the shard
+/// fails to resume under its fresh committee, or the recovery record
+/// never clears.
+pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) {
+    let (left, right) = ShardId::ROOT.children();
+    split_lifecycle(c);
+    // Disarm the reshape trigger for the rest of the scenario: the halt
+    // detector exempts a shard with a pending reshape, and the reshape
+    // predicate's substate walk cannot resolve across a recovery's synced
+    // tip, so the recovery is exercised on a quiet topology.
+    vote_reshape_threshold(c, &merge_vote_payer(), u64::MAX);
+
+    let committee = c.committee_hosts(left);
+    assert_eq!(
+        committee.len(),
+        4,
+        "this scenario needs the left child served by a four-member committee",
+    );
+    let withholding = &committee[..2];
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !withholding.contains(host))
+        .collect();
+
+    // f+1 of the left committee withhold: their outbound consensus
+    // messages stop reaching everyone else. The honest remainder is 2f,
+    // short of quorum, so the shard halts; nothing else is cut.
+    let votes_withheld = c.drop_type_between(withholding, &others, "block.vote");
+    c.drop_type_between(withholding, &others, "block.header");
+    c.drop_type_between(withholding, &others, "shard.timeout");
+
+    // In-flight rounds drain, then the shard freezes.
+    c.run_until(epochs(1), |_| false);
+    let frozen = c
+        .committed_height(left)
+        .expect("the left child committed during the grow")
+        .inner();
+    let epoch_at_halt = beacon_epoch(c).expect("a committed beacon epoch").inner();
+    let right_at_halt = c
+        .committed_height(right)
+        .expect("the right child serves")
+        .inner();
+    c.run_until(epochs(2), |_| false);
+    let during = c
+        .committed_height(left)
+        .expect("a committed height during the halt")
+        .inner();
+    assert!(
+        during <= frozen + 2,
+        "two of four withholding leaves no quorum, so the shard must halt: \
+         frozen={frozen}, during={during}",
+    );
+    assert!(
+        votes_withheld.fired() >= 1,
+        "the withheld votes must actually be dropped",
+    );
+
+    // The boundary watermark stalls past the threshold; the beacon flags
+    // the shard and re-draws its committee from the pool spares.
+    let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
+    let recovered = c.run_until(epochs(threshold + 10), |c| {
+        c.beacon_state()
+            .is_some_and(|state| state.pending_recoveries.contains_key(&left))
+    });
+    assert!(
+        recovered,
+        "the beacon must flag the halted shard and seat a fresh committee",
+    );
+    // Only the shard halted: the beacon and the sibling kept committing.
+    let epoch_now = beacon_epoch(c).expect("a committed beacon epoch").inner();
+    assert!(
+        epoch_now > epoch_at_halt,
+        "the beacon must keep producing epochs through the halt \
+         ({epoch_at_halt} -> {epoch_now})",
+    );
+    assert!(
+        c.committed_height(right)
+            .expect("the right child serves")
+            .inner()
+            > right_at_halt,
+        "the sibling shard must keep committing through the halt",
+    );
+
+    // The fresh committee syncs the halted tip from the retained members,
+    // bridges the halt gap, and resumes committing past the frozen height.
+    assert!(
+        await_height(c, left, during + 3, epochs(12)),
+        "the recovered shard must resume committing under its fresh committee \
+         (frozen at {during})",
+    );
+    // The first crossing under the fresh committee completes the recovery.
+    let cleared = c.run_until(epochs(6), |c| {
+        c.beacon_state()
+            .is_some_and(|state| !state.pending_recoveries.contains_key(&left))
+    });
+    assert!(
+        cleared,
+        "the shard's next boundary crossing must clear the recovery record",
     );
 }
 

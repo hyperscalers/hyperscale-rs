@@ -128,6 +128,7 @@ fn initial_state() -> BeaconState {
         boundaries: BTreeMap::new(),
         advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
+        pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);

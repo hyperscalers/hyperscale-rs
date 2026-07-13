@@ -361,6 +361,31 @@ pub enum PendingReshape {
     },
 }
 
+/// One in-flight halted-shard recovery: the shard's stalled committee
+/// has been replaced by a fresh pool draw, and the shard has not yet
+/// committed a boundary crossing under the new one.
+///
+/// Written when the fold re-draws a halted shard's committee — which
+/// also resets the boundary's miss count, so the fresh committee gets a
+/// full threshold of observed folds to produce before the shard
+/// re-flags — and cleared by the shard's next observed crossing. While
+/// it stands, the replaced members stay in the shard's routing view so
+/// incomers can fetch the halted chain's tip from nodes that hold it,
+/// the shard's members sit out beacon eligibility (seated on trust,
+/// they prove themselves serving only at that first crossing), and
+/// [`rotated_at`](Self::rotated_at) anchors the recovery bridge that
+/// binds blocks extending the halted tip to the fresh committee.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct HaltRecovery {
+    /// Epoch the fresh committee was seated.
+    pub rotated_at: Epoch,
+    /// The replaced committee, retained for routing until the shard
+    /// commits again. A recovery that itself stalls folds its own fresh
+    /// committee into the successor recovery's retention, so every
+    /// member that might hold the tip stays reachable.
+    pub retained: Vec<ValidatorId>,
+}
+
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
 ///
 /// Cross-validator agreement on every field at every epoch follows from
@@ -539,6 +564,11 @@ pub struct BeaconState {
     /// fold's trigger admission; pruned by the per-epoch staleness
     /// sweep when assertions go quiet.
     pub pending_reshapes: BTreeMap<ShardId, PendingReshape>,
+    /// In-flight halted-shard recoveries, keyed by the recovered shard.
+    /// Written when the fold re-draws a halted committee; an entry
+    /// drops on the shard's next observed crossing (the fresh committee
+    /// produced) and is GC'd with the shard's boundary record.
+    pub pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -853,20 +883,28 @@ impl BeaconState {
         )
     }
 
-    /// Shards whose chains have halted: live shards whose boundary
-    /// watermark ([`ShardBoundary::last_live_epoch`]) has stalled for
-    /// more than [`HALT_THRESHOLD_EPOCHS`] epochs.
+    /// Shards whose chains have halted: live shards the boundary fold
+    /// has observed missing for more than [`HALT_THRESHOLD_EPOCHS`]
+    /// consecutive folds ([`ShardBoundary::consecutive_misses`]).
     ///
-    /// A stalled watermark means the shard has stopped committing
+    /// That many missed folds means the shard has stopped committing
     /// boundary crossings — the signature of a liveness halt, e.g.
     /// `f + 1` corrupt members withholding votes so the honest remainder
-    /// can't form a `2f + 1` quorum. Legitimately quiet chains never
-    /// flag: shards involved in a pending reshape
-    /// ([`Self::reshape_involves`]), terminal records coasting to a
-    /// scheduled end, and reshape-pending placeholders that have no
-    /// chain to advance until their genesis seeds. A genesis-born shard
-    /// (pending record created at `Epoch::GENESIS`) is *not* exempt —
-    /// nothing gates its start, so never producing is a halt.
+    /// can't form a `2f + 1` quorum. The count advances only on epochs
+    /// the beacon folded boundaries at all, so a beacon-side commit
+    /// drought (a run of skip epochs) never reads as a shard halt — a
+    /// wall-clock watermark would false-flag every shard at once there,
+    /// and a false flag costs a needless full committee reset.
+    ///
+    /// Legitimately quiet chains never flag: shards involved in a
+    /// pending reshape ([`Self::reshape_involves`]), terminal records
+    /// coasting to a scheduled end, and reshape-pending placeholders
+    /// that have no chain to advance until their genesis seeds. A
+    /// genesis-born shard (pending record created at `Epoch::GENESIS`)
+    /// is *not* exempt — nothing gates its start, so never producing is
+    /// a halt. A recovery resets the count, so the fresh committee gets
+    /// a full threshold of observed folds to produce before the shard
+    /// re-flags (and re-draws).
     ///
     /// A pure function of `self`, so every replica flags the identical
     /// set at the identical fold.
@@ -878,11 +916,7 @@ impl BeaconState {
                 b.terminal_epoch.is_none()
                     && !(b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS)
                     && !self.reshape_involves(**shard)
-                    && self
-                        .current_epoch
-                        .inner()
-                        .saturating_sub(b.last_live_epoch.inner())
-                        > HALT_THRESHOLD_EPOCHS
+                    && u64::from(b.consecutive_misses) > HALT_THRESHOLD_EPOCHS
             })
             .map(|(shard, _)| *shard)
             .collect()
@@ -914,6 +948,14 @@ impl BeaconState {
     /// epoch) start unconditionally — no flip gates them, so their
     /// members are eligible from the first fold.
     ///
+    /// A recovering shard's fresh committee is excluded under the same
+    /// principle: it is seated `ready: true` on trust (the halted chain
+    /// can fold no readiness witness) and proves itself serving only at
+    /// the shard's first crossing, which clears the recovery. Drafting
+    /// an unproven recovery seat into the beacon committee — or the
+    /// ratification pool this set derives — could cost the beacon its
+    /// quorum on nodes that are still syncing the halted chain.
+    ///
     /// Returned sorted by `ValidatorId` (`BTreeMap` iteration order) for
     /// deterministic Fisher–Yates input downstream.
     #[must_use]
@@ -925,11 +967,14 @@ impl BeaconState {
                     shard,
                     ready: true,
                     placed_at_epoch,
-                } => !self.boundaries.get(&shard).is_some_and(|b| {
-                    b.block_hash == BlockHash::ZERO
-                        && b.last_live_epoch > Epoch::GENESIS
-                        && placed_at_epoch >= b.last_live_epoch
-                }),
+                } => {
+                    !self.pending_recoveries.contains_key(&shard)
+                        && !self.boundaries.get(&shard).is_some_and(|b| {
+                            b.block_hash == BlockHash::ZERO
+                                && b.last_live_epoch > Epoch::GENESIS
+                                && placed_at_epoch >= b.last_live_epoch
+                        })
+                }
                 _ => false,
             })
             .map(|(id, _)| *id)
@@ -1227,6 +1272,7 @@ impl BeaconState {
         .with_params(params)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
+        .with_pending_recoveries(self.pending_recoveries.clone())
     }
 
     /// Active-duty validator pool: the [`Self::beacon_eligible`] serving
@@ -1408,6 +1454,7 @@ mod tests {
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             pending_reshapes: BTreeMap::new(),
+            pending_recoveries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }
     }
@@ -1523,50 +1570,46 @@ mod tests {
 
     // ─── halted_shards ────────────────────────────────────────────────
 
-    /// Only a live shard whose watermark stalled past the threshold
-    /// flags: a fresh watermark, a stall exactly at the threshold, a
-    /// pending reshape (split target or merge child), a terminal coast,
-    /// and a reshape placeholder all read as healthy or legitimately
-    /// quiet. A genesis-born record that never produced is a halt.
+    /// Only a live shard whose miss count crossed the threshold flags:
+    /// a fresh record, a count exactly at the threshold, a pending
+    /// reshape (split target or merge child), a terminal coast, and a
+    /// reshape placeholder all read as healthy or legitimately quiet.
+    /// A genesis-born record that never produced is a halt.
     #[test]
-    fn halted_shards_flags_stalled_live_shards_only() {
+    fn halted_shards_flags_persistently_missing_live_shards_only() {
         let mut state = empty_state();
-        state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 2);
-        let stale = Epoch::new(1);
-        let boundary = |last_live: Epoch| ShardBoundary {
+        state.current_epoch = Epoch::new(40);
+        let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
+        let boundary = |misses: u32| ShardBoundary {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
             height: BlockHeight::new(5),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            last_live_epoch: last_live,
-            consecutive_misses: 0,
+            last_live_epoch: Epoch::new(1),
+            consecutive_misses: misses,
             terminal_epoch: None,
             terminal_qc_wt: None,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
         };
 
-        let stalled = ShardId::leaf(3, 0);
-        state.boundaries.insert(stalled, boundary(stale));
+        let halted = ShardId::leaf(3, 0);
+        state.boundaries.insert(halted, boundary(over));
 
         let healthy = ShardId::leaf(3, 1);
-        state
-            .boundaries
-            .insert(healthy, boundary(state.current_epoch));
+        state.boundaries.insert(healthy, boundary(0));
 
         let at_threshold = ShardId::leaf(3, 2);
-        state
-            .boundaries
-            .insert(at_threshold, boundary(Epoch::new(2)));
+        state.boundaries.insert(at_threshold, boundary(over - 1));
 
         let splitting = ShardId::leaf(3, 3);
-        state.boundaries.insert(splitting, boundary(stale));
+        state.boundaries.insert(splitting, boundary(over));
         state.pending_reshapes.insert(
             splitting,
             PendingReshape::Split {
-                last_asserted: stale,
-                admitted_at: stale,
+                last_asserted: Epoch::new(1),
+                admitted_at: Epoch::new(1),
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
             },
@@ -1577,7 +1620,7 @@ mod tests {
             terminal,
             ShardBoundary {
                 terminal_epoch: Some(Epoch::new(2)),
-                ..boundary(stale)
+                ..boundary(over)
             },
         );
 
@@ -1586,7 +1629,7 @@ mod tests {
             placeholder,
             ShardBoundary {
                 block_hash: BlockHash::ZERO,
-                ..boundary(stale)
+                ..boundary(over)
             },
         );
 
@@ -1595,14 +1638,15 @@ mod tests {
             genesis_born,
             ShardBoundary {
                 block_hash: BlockHash::ZERO,
-                ..boundary(Epoch::GENESIS)
+                last_live_epoch: Epoch::GENESIS,
+                ..boundary(over)
             },
         );
 
         let merge_parent = ShardId::leaf(3, 7);
         let (left, right) = merge_parent.children();
-        state.boundaries.insert(left, boundary(stale));
-        state.boundaries.insert(right, boundary(stale));
+        state.boundaries.insert(left, boundary(over));
+        state.boundaries.insert(right, boundary(over));
         state.pending_reshapes.insert(
             merge_parent,
             PendingReshape::Merge {
@@ -1614,7 +1658,7 @@ mod tests {
 
         assert_eq!(
             state.halted_shards(),
-            BTreeSet::from([stalled, genesis_born]),
+            BTreeSet::from([halted, genesis_born]),
         );
     }
 

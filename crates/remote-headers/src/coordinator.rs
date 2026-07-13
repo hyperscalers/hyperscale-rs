@@ -281,10 +281,14 @@ impl RemoteHeaderCoordinator {
         // shard's terminal committee. The beacon's crossing tracker reads
         // the terminal block's canonical QC off the first coast header, so
         // dropping these would blind the fold to the crossing.
+        // Recovery-bridged: a halt recovery's bridge header is anchored
+        // below the bridge window but certified at or past it, and
+        // verifies against the fresh committee.
         let committee = match topology_schedule
-            .lookup_for_shard(
+            .lookup_for_shard_certified(
                 shard,
                 certified_header.header().parent_qc().weighted_timestamp(),
+                certified_header.qc().weighted_timestamp(),
             )
             .0
         {
@@ -381,7 +385,11 @@ impl RemoteHeaderCoordinator {
                         return vec![];
                     };
                     let anchor = next_header.header().parent_qc().weighted_timestamp();
-                    match topology_schedule.lookup_for_shard(shard, anchor).0 {
+                    let qc_wt = next_header.qc().weighted_timestamp();
+                    match topology_schedule
+                        .lookup_for_shard_certified(shard, anchor, qc_wt)
+                        .0
+                    {
                         ScheduleLookup::Committee(committee) => {
                             return Self::emit_verify_qc(
                                 committee,

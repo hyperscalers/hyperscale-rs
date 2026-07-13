@@ -88,6 +88,7 @@ pub fn empty_state() -> BeaconState {
         boundaries: BTreeMap::new(),
         advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
+        pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     }
 }

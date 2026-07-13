@@ -15,7 +15,8 @@ use hyperscale_types::{
 
 use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
 use crate::state::committee::{
-    diff_shard_committees, resample_beacon_committee, run_shuffle_step, top_up_committees,
+    diff_shard_committees, recover_halted_committees, resample_beacon_committee, run_shuffle_step,
+    top_up_committees,
 };
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
@@ -236,6 +237,20 @@ pub fn apply_epoch(
     // Merges fold the same way, inverted: two children collapse into
     // their parent once the keeper committee is ready.
     execute_ready_merges(state);
+    // Halt detection reads the settled reshape state: a shard whose reshape
+    // executed this epoch is already terminal-marked or placeholder-fresh,
+    // so it reads as legitimately quiet. Recovery runs before the top-up
+    // and the beacon resample, so replaced members return to the pool in
+    // time to backfill other short committees and the resample reads
+    // post-recovery placements.
+    let halted_shards = state.halted_shards();
+    for shard in &halted_shards {
+        tracing::error!(
+            ?shard,
+            "shard halted: no boundary crossing within the halt threshold"
+        );
+    }
+    recover_halted_committees(state, &halted_shards);
     // Grow any committee a short cohort draw left under `shard_size` back to
     // full strength, now that dissolved predecessors have freed their members.
     top_up_committees(state);
@@ -262,17 +277,6 @@ pub fn apply_epoch(
             .entry(child)
             .or_default()
             .extend(members);
-    }
-
-    // Halt detection reads the fold's settled state: a shard whose reshape
-    // executed this epoch is already terminal-marked or placeholder-fresh,
-    // so it reads as legitimately quiet.
-    let halted_shards = state.halted_shards();
-    for shard in &halted_shards {
-        tracing::error!(
-            ?shard,
-            "shard halted: no boundary crossing within the halt threshold"
-        );
     }
 
     SlotEffects {
@@ -628,6 +632,10 @@ fn record_boundaries(
         // genesis (a seed is never itself a contribution). Mark it produced;
         // the reshape handoff reads this as "successor live".
         state.advanced.insert(*shard);
+        // A crossing under an in-flight halt recovery means the fresh
+        // committee produced: the recovery is complete, so release the
+        // retained replaced committee from the routing view.
+        state.pending_recoveries.remove(shard);
 
         // A terminal shard's contribution crossing its final cut is the
         // chain's terminal block. A split parent seeds its pending
@@ -662,26 +670,32 @@ fn record_boundaries(
     // anchor starts clean.
     compose_merge_parents(state, epoch, windows, &terminal_recorded);
 
-    // Drop terminal records past their retention horizon. A terminated
-    // shard's record lingers only to project its `settled_waves_root` to
-    // surviving counterparts; past `terminal_wt + RETENTION_HORIZON` the
-    // split-boundary fence rejects any wave naming it regardless, so the
-    // record is dead weight. Bounded so a terminated shard can't
-    // accumulate forever.
-    //
-    // A terminal record whose reshape successors aren't live yet is exempt: it
-    // is what `seed_split_children` folds the children from (or what a merge
-    // parent composes from), and that fold can only land on an epoch the beacon
-    // commits a proposal carrying the terminal QC. The beacon can commit empty
-    // for several epochs across the reshape's committee transition, so the
-    // horizon alone would drop the record first — stranding the children on
-    // their placeholders, or the merge parent uncomposed. It is also the anchor
-    // a coasting predecessor's observers snap-sync against while they finish
-    // adopting; under make-before-break the predecessor keeps coasting until its
-    // successors are live, so the record must outlive the horizon until then,
-    // not merely until they seed. Holding it until the successors have produced
-    // past genesis (`BeaconState.advanced`) covers both, and frees the record
-    // for the next horizon sweep once the handoff has demonstrably completed.
+    gc_terminal_boundaries(state, epoch, windows);
+
+    outcome
+}
+
+/// Drop terminal records past their retention horizon. A terminated
+/// shard's record lingers only to project its `settled_waves_root` to
+/// surviving counterparts; past `terminal_wt + RETENTION_HORIZON` the
+/// split-boundary fence rejects any wave naming it regardless, so the
+/// record is dead weight. Bounded so a terminated shard can't
+/// accumulate forever.
+///
+/// A terminal record whose reshape successors aren't live yet is exempt: it
+/// is what `seed_split_children` folds the children from (or what a merge
+/// parent composes from), and that fold can only land on an epoch the beacon
+/// commits a proposal carrying the terminal QC. The beacon can commit empty
+/// for several epochs across the reshape's committee transition, so the
+/// horizon alone would drop the record first — stranding the children on
+/// their placeholders, or the merge parent uncomposed. It is also the anchor
+/// a coasting predecessor's observers snap-sync against while they finish
+/// adopting; under make-before-break the predecessor keeps coasting until its
+/// successors are live, so the record must outlive the horizon until then,
+/// not merely until they seed. Holding it until the successors have produced
+/// past genesis (`BeaconState.advanced`) covers both, and frees the record
+/// for the next horizon sweep once the handoff has demonstrably completed.
+fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochWindows) {
     let now = windows.window_of(epoch).start;
     let pending_fold: BTreeMap<ShardId, Epoch> = state
         .boundaries
@@ -711,12 +725,14 @@ fn record_boundaries(
                 || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
         })
     });
-    // A shard that left `boundaries` is gone; drop its produced mark too.
+    // A shard that left `boundaries` is gone; drop its produced mark and
+    // any in-flight recovery record too.
     state
         .advanced
         .retain(|shard| state.boundaries.contains_key(shard));
-
-    outcome
+    state
+        .pending_recoveries
+        .retain(|shard, _| state.boundaries.contains_key(shard));
 }
 
 /// Whether a terminal `shard`'s reshape successors are live — both split

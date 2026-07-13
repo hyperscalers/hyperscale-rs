@@ -191,9 +191,10 @@ pub fn prospective_parent_witness_leaves(
         // schedule entry at its `parent_qc.weighted_timestamp()`. Resolving
         // it per ancestor (rather than under the walk's tip committee) keeps
         // a boundary-straddling pending chain byte-identical to what each
-        // block committed.
+        // block committed. Recovery-bridged: a halt recovery's bridge block
+        // derives its leaves against the fresh committee that proposed it.
         let Some((committee, _)) =
-            schedule.at_for_shard(local_shard, header.parent_qc().weighted_timestamp())
+            schedule.at_for_shard_live(local_shard, header.parent_qc().weighted_timestamp())
         else {
             return Err(current);
         };

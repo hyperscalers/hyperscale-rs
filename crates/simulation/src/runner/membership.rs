@@ -236,7 +236,22 @@ impl SimulationRunner {
                     && !committee
                         .iter()
                         .any(|&validator| self.homes_validator(host, validator));
-                if ex_member {
+                // A halt recovery retains the replaced committee in the
+                // routing view until the shard commits under its fresh one —
+                // the members it replaced hold the halted tip the incomers
+                // sync from. Mirror the production supervisor's `in_routing`
+                // half of the retired check.
+                let recovery_retained =
+                    snapshot
+                        .pending_recoveries()
+                        .get(&shard)
+                        .is_some_and(|recovery| {
+                            recovery
+                                .retained
+                                .iter()
+                                .any(|&validator| self.homes_validator(host, validator))
+                        });
+                if ex_member && !recovery_retained {
                     let storage = self.leave_shard(host, shard);
                     self.retained_storages.insert((host, shard), storage);
                 }

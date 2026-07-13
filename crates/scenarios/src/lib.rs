@@ -31,9 +31,9 @@ pub use faults::{
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, gossip_drop_engages_fetch_fallback,
-    inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
-    minority_fragment_rejoins_after_partition, partition_halts_and_heals,
-    partition_heals_at_exact_quorum,
+    halted_shard_recovers_by_committee_redraw, inter_shard_partition_aborts_waves_at_deadline,
+    isolated_validator_still_settles, minority_fragment_rejoins_after_partition,
+    partition_halts_and_heals, partition_heals_at_exact_quorum,
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;

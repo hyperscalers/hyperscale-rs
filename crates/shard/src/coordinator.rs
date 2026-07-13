@@ -472,15 +472,23 @@ impl ShardCoordinator {
     /// Weighted timestamp selecting `block_hash`'s committee — its parent QC's
     /// weighted timestamp. Reads the header from `pending_blocks`; the
     /// committed tip (pruned from pending) uses the `committed_anchor_ts`
-    /// scalar. `None` when the block is neither pending nor the committed tip,
-    /// so its committee can't be resolved (caller stalls).
+    /// scalar, and an applied-but-uncommitted synced block reads its cached
+    /// certified handle — such a tip exists only via block-sync (its header
+    /// was never gossiped here), so without the cache read a live proposal
+    /// extending it would defer on "parent not held" while every re-fetch
+    /// of the parent is deduplicated as already applied. `None` when the
+    /// block is unknown by every route, so its committee can't be resolved
+    /// (caller stalls).
     fn committee_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
         if block_hash == self.committed_hash {
             return Some(self.committed_anchor_ts);
         }
-        self.pending_blocks
-            .get_header(block_hash)
-            .map(|h| h.parent_qc().weighted_timestamp())
+        if let Some(header) = self.pending_blocks.get_header(block_hash) {
+            return Some(header.parent_qc().weighted_timestamp());
+        }
+        self.verification
+            .cached_verified_certified_block(block_hash)
+            .map(|certified| certified.block().header().parent_qc().weighted_timestamp())
     }
 
     /// Weighted timestamp selecting the committee for the height in progress /
@@ -500,28 +508,95 @@ impl ShardCoordinator {
     /// is unknown, or this node's beacon hasn't synced the block's epoch.
     /// Resolution clamps to this shard's terminal window, so the coast
     /// blocks past a split's cut still resolve the committee that signs
-    /// them (the shard's final-epoch committee).
+    /// them (the shard's final-epoch committee) — and bridges an in-flight
+    /// halt recovery, so a block extending the halted tip resolves the
+    /// fresh committee (the halted one resolves itself out of authority at
+    /// the same fold).
     fn committee_of_block<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
         block_hash: BlockHash,
     ) -> Option<&'t TopologySnapshot> {
         topology_schedule
-            .at_for_shard(self.local_shard, self.committee_anchor(block_hash)?)
+            .at_for_shard_live(self.local_shard, self.committee_anchor(block_hash)?)
+            .map(|(snapshot, _)| snapshot.as_ref())
+    }
+
+    /// Committee that signed `qc` — the certified binding. Unlike
+    /// [`Self::committee_of_block`] this resolves with the QC's own
+    /// timestamp in hand, so a halt recovery's bridge applies exactly to
+    /// blocks certified at or past the bridge window: the halted suffix
+    /// keeps verifying against the windows that produced it, while a
+    /// recovery bridge block verifies against the fresh committee.
+    fn committee_of_qc<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> Option<&'t TopologySnapshot> {
+        topology_schedule
+            .at_for_shard_certified(
+                self.local_shard,
+                self.committee_anchor(qc.block_hash())?,
+                qc.weighted_timestamp(),
+            )
             .map(|(snapshot, _)| snapshot.as_ref())
     }
 
     /// Committee for the height in progress / our next proposal (extends
-    /// `high_qc`). `None` to stall when the beacon lacks that epoch.
-    /// Terminal-clamped like [`Self::committee_of_block`], so the
-    /// final-epoch committee can still coast the chain to its crossing.
+    /// `high_qc`). `None` to stall when the beacon lacks that epoch — or
+    /// while an in-flight recovery quiesces the chain (see
+    /// [`Self::recovery_quiesced`]). Terminal-clamped and recovery-bridged
+    /// like [`Self::committee_of_block`], so the final-epoch committee can
+    /// still coast the chain to its crossing and a fresh recovery
+    /// committee can extend the halted tip.
     fn tip_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t TopologySnapshot> {
+        if self.recovery_quiesced(topology_schedule, self.tip_anchor_ts()) {
+            return None;
+        }
         topology_schedule
-            .at_for_shard(self.local_shard, self.tip_anchor_ts())
+            .at_for_shard_live(self.local_shard, self.tip_anchor_ts())
             .map(|(snapshot, _)| snapshot.as_ref())
+    }
+
+    /// Whether work anchored at `wt` rides an in-flight halt recovery's
+    /// bridge: the anchor predates the window the fresh committee governs
+    /// from. Bridge blocks must be empty — the anchored-committee
+    /// resolution downstream (execution votes, wave fencing) never sees a
+    /// stale-anchored block carry content — mirroring the coast blocks
+    /// past a terminal cut.
+    fn recovery_bridging(
+        &self,
+        topology_schedule: &TopologySchedule,
+        wt: WeightedTimestamp,
+    ) -> bool {
+        topology_schedule
+            .recovery_bridge(self.local_shard)
+            .is_some_and(|bridge| topology_schedule.epoch_for(wt) < bridge)
+    }
+
+    /// Whether work anchored at `wt` is quiesced by an in-flight recovery:
+    /// the fresh committee is seated but its first governed window hasn't
+    /// opened on the local clock. Nothing may propose, vote, or time out
+    /// across the seating window — a QC aggregated there would carry a
+    /// timestamp below the bridge and bake a certificate no verifier can
+    /// bind into the chain. Every vote is gated by the same clock that
+    /// stamps it, so every QC the fresh committee forms lands at or past
+    /// its window.
+    fn recovery_quiesced(
+        &self,
+        topology_schedule: &TopologySchedule,
+        wt: WeightedTimestamp,
+    ) -> bool {
+        topology_schedule
+            .recovery_bridge(self.local_shard)
+            .is_some_and(|bridge| {
+                let window_start = topology_schedule.windows().window_of(bridge).start;
+                topology_schedule.epoch_for(wt) < bridge
+                    && self.now.as_millis() < window_start.as_millis()
+            })
     }
 
     /// Record a terminated shard's settled-wave set for the
@@ -1243,8 +1318,14 @@ impl ShardCoordinator {
         // parent QC's weighted timestamp has crossed the split's cut, so
         // this block exists solely to certify the crossing. It must be
         // empty — state stays frozen at the crossing's root — and the
-        // chain stops once the crossing's canonical QC commits.
-        if self.past_terminal_window(topology_schedule, parent_qc.weighted_timestamp()) {
+        // chain stops once the crossing's canonical QC commits. A halt
+        // recovery's bridge block is empty under the same discipline: it
+        // exists solely to carry the chain's clock across the halt gap, so
+        // the anchored-committee resolution downstream never sees a
+        // stale-anchored block carry content.
+        if self.past_terminal_window(topology_schedule, parent_qc.weighted_timestamp())
+            || self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
+        {
             return self.build_and_dispatch_proposal(
                 topology_schedule,
                 next_height,
@@ -1559,9 +1640,10 @@ impl ShardCoordinator {
         // proposer schedule (missed-proposal leaves) and beacon-witness preview
         // resolve against that committee. Stall if the beacon lacks it.
         // Terminal-clamped: coast blocks past a split's cut resolve the
-        // shard's final-epoch committee.
+        // shard's final-epoch committee. Recovery-bridged: a block extending
+        // a halted tip resolves the fresh committee.
         let Some((committee, _)) =
-            topology_schedule.at_for_shard(self.local_shard, parent_qc.weighted_timestamp())
+            topology_schedule.at_for_shard_live(self.local_shard, parent_qc.weighted_timestamp())
         else {
             return vec![];
         };
@@ -1979,9 +2061,10 @@ impl ShardCoordinator {
     ) -> bool {
         // Proposer of `h` is drawn from `committee(h) == at(parent_qc weighted
         // ts)`, terminal-clamped so a coast header past a split's cut
-        // resolves the shard's final-epoch committee.
+        // resolves the shard's final-epoch committee, and recovery-bridged
+        // so a header extending a halted tip resolves the fresh committee.
         let proposer_committee = match topology_schedule
-            .lookup_for_shard(self.local_shard, header.parent_qc().weighted_timestamp())
+            .lookup_for_shard_live(self.local_shard, header.parent_qc().weighted_timestamp())
             .0
         {
             ScheduleLookup::Committee(committee) => committee.as_ref(),
@@ -2008,7 +2091,7 @@ impl ShardCoordinator {
         // once `h-1` lands. Substituting `committee(h)` here would run the
         // pre-check against the wrong committee at an epoch boundary.
         let parent_committee = (!header.parent_qc().is_genesis())
-            .then(|| self.committee_of_block(topology_schedule, header.parent_qc().block_hash()))
+            .then(|| self.committee_of_qc(topology_schedule, header.parent_qc()))
             .flatten();
         if let Err(e) = validate_header(
             proposer_committee,
@@ -2256,7 +2339,7 @@ impl ShardCoordinator {
             // epoch at or below `committee(h)`, which `reject_invalid_header`
             // already resolved.
             let Some(parent_committee) =
-                self.committee_of_block(topology_schedule, header.parent_qc().block_hash())
+                self.committee_of_qc(topology_schedule, header.parent_qc())
             else {
                 trace!(
                     validator = ?self.me,
@@ -2371,6 +2454,21 @@ impl ShardCoordinator {
             return vec![];
         }
 
+        // A recovery's seating window quiesces the vote: a QC aggregated
+        // from votes stamped before the fresh committee's first window
+        // would bind below the recovery bridge and be unverifiable. The
+        // pacemaker re-drives the proposal once the window opens.
+        if let Some(anchor) = self.committee_anchor(block_hash)
+            && self.recovery_quiesced(topology_schedule, anchor)
+        {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                "Recovery seating window open on this anchor — deferring the vote"
+            );
+            return vec![];
+        }
+
         // If the block is assembled, run validation + verification.
         // Otherwise fall through to the voting path directly — reachable only
         // from test fixtures; production always assembles before reaching
@@ -2382,10 +2480,11 @@ impl ShardCoordinator {
             let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
                 return vec![];
             };
-            let coasting = self.past_terminal_window(
-                topology_schedule,
-                block.header().parent_qc().weighted_timestamp(),
-            );
+            // Coast blocks past a terminal cut and recovery bridge blocks
+            // across a halt gap are both required empty.
+            let anchor_wt = block.header().parent_qc().weighted_timestamp();
+            let coasting = self.past_terminal_window(topology_schedule, anchor_wt)
+                || self.recovery_bridging(topology_schedule, anchor_wt);
             if self.reject_invalid_block_contents(committee, block_hash, block, coasting) {
                 return vec![];
             }
@@ -4072,11 +4171,14 @@ impl ShardCoordinator {
         // every epoch the local chain can still verify against, so a synced
         // block keyed below it carries a forged weighted timestamp (it
         // rides outside the signed message) or sits on a stale fork — no
-        // amount of retrying resolves it.
+        // amount of retrying resolves it. Certified resolution: a halt
+        // recovery's bridge block — anchored below the bridge, certified
+        // at or past it — verifies against the fresh committee.
         let committee = match topology_schedule
-            .lookup_for_shard(
+            .lookup_for_shard_certified(
                 self.local_shard,
                 certified.block().header().parent_qc().weighted_timestamp(),
+                certified.qc().weighted_timestamp(),
             )
             .0
         {
@@ -4731,7 +4833,7 @@ impl ShardCoordinator {
         // it from that block's anchor. `None` (block unknown, or beacon behind)
         // means we can't verify this candidate — skip it, as a failed pairing
         // would.
-        let committee = self.committee_of_block(topology_schedule, qc.block_hash())?;
+        let committee = self.committee_of_qc(topology_schedule, qc)?;
         let public_keys = committee_public_keys(committee, self.local_shard);
         let ctx = QcContext {
             network: committee.network(),

@@ -123,18 +123,19 @@ pub const SHUFFLE_INTERVAL_EPOCHS: u64 = 16;
 /// actually synced.
 pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 
-/// How many epochs a live shard's boundary watermark may stall before
-/// the beacon flags the shard as halted.
+/// How many consecutive boundary folds may observe a live shard missing
+/// before the beacon flags it as halted.
 ///
-/// A shard committing normally refreshes its boundary record's
-/// `last_live_epoch` most epochs; a watermark stalled past this bound
-/// means the shard has stopped committing entirely — e.g. `f + 1` of
-/// its committee withholding votes, leaving the honest remainder short
-/// of a `2f + 1` quorum. Shards involved in a pending reshape or
-/// coasting to a scheduled terminal are legitimately quiet and exempt
-/// from the check; this bound therefore only needs to sit above
-/// [`RESHAPE_HANDOFF_TTL_EPOCHS`] (a successor's post-execution seating
-/// lag) and the occasional skipped epoch.
+/// A shard committing normally contributes a crossing to most folds; a
+/// miss count past this bound means the shard has stopped committing
+/// entirely — e.g. `f + 1` of its committee withholding votes, leaving
+/// the honest remainder short of a `2f + 1` quorum. The count advances
+/// only on epochs the beacon folded boundaries at all, so a beacon-side
+/// commit drought never reads as a shard halt. Shards involved in a
+/// pending reshape or coasting to a scheduled terminal are legitimately
+/// quiet and exempt from the check; this bound therefore only needs to
+/// sit above [`RESHAPE_HANDOFF_TTL_EPOCHS`] (a successor's
+/// post-execution seating lag) and the occasional missed fold.
 ///
 /// Starting value provisional — calibrate against the measured
 /// skip/reshape cadence like the miss-counter thresholds: too low flags
