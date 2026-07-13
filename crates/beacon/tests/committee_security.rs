@@ -250,6 +250,7 @@ fn mc_state(cell: &Cell) -> BeaconState {
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
+        last_beacon_service: BTreeMap::new(),
     };
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
     state
@@ -685,10 +686,14 @@ fn beacon_resample_tables() {
 
 // ─── Structural CI cells ─────────────────────────────────────────────────────
 
-/// The per-epoch beacon-committee resample is a fresh hypergeometric
-/// draw over the eligible set: within each corrupt-eligible bin `m`,
-/// the drawn corrupt count matches the hypergeometric mean. Seeded and
-/// deterministic.
+/// The per-epoch beacon-committee resample is recency-weighted — a
+/// member drawn recently is down-weighted for a cooldown — yet its
+/// corrupt-count mean still matches the uniform hypergeometric draw:
+/// within each corrupt-eligible bin `m`, `E[k]` matches the
+/// hypergeometric mean. A member's corruptness is independent of how
+/// recently it served (service is seed-driven, not corruptness-driven),
+/// so the weighting reshapes *which* members sit but leaves the corrupt
+/// fraction unbiased. Seeded and deterministic.
 #[test]
 fn beacon_resample_matches_hypergeometric() {
     let cell = Cell {

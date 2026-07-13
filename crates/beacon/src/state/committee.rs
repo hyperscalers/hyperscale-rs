@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE, PendingReshape,
-    SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
+    BeaconState, CommitteeTransition, Epoch, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE,
+    PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
     ValidatorStatus,
 };
 
-use crate::sampling::sample_committee;
+use crate::sampling::{sample_committee, sample_committee_weighted};
 use crate::state::pool::pool_draw;
 
 /// Domain tag for the halted-shard recovery draw seed. Distinct from
@@ -316,6 +316,18 @@ pub(super) fn top_up_committees(state: &mut BeaconState) {
 /// want to exclude additional validators (e.g. operator-driven
 /// quarantine) have a single seam to plumb through. `cause` tags the
 /// resulting transition.
+///
+/// The draw is recency-weighted: each eligible member's weight ramps
+/// from low right after it serves to full over `cooldown = eligible /
+/// committee_size` epochs — one full committee turnover — recovering by
+/// one per epoch. A grinder steering the seed can bias which committee
+/// forms, but a corrupt member it just seated is down-weighted for the
+/// cooldown, so it cannot keep re-seating the same set; the sustained
+/// foothold caps near the natural `β · committee_size`. A never-served
+/// member's baseline is its `registered_at_epoch`, so a fresh registrant
+/// ramps in from low weight — the register-to-reset dodge buys nothing,
+/// and ids are never reused. After the draw the drawn members'
+/// [`BeaconState::last_beacon_service`] is stamped to this epoch.
 pub(super) fn resample_beacon_committee(
     state: &mut BeaconState,
     excluded: &BTreeSet<ValidatorId>,
@@ -328,7 +340,26 @@ pub(super) fn resample_beacon_committee(
         .filter(|id| !excluded.contains(id))
         .collect();
     let committee_size = state.chain_config.beacon_committee_size as usize;
-    state.committee = sample_committee(&eligible, state.randomness.as_bytes(), committee_size);
+    let cooldown = (eligible.len() / committee_size.max(1)).max(1) as u64;
+    let now = state.current_epoch.inner();
+    let weighted: Vec<(ValidatorId, u64)> = eligible
+        .iter()
+        .map(|id| {
+            let baseline = state
+                .last_beacon_service
+                .get(id)
+                .copied()
+                .or_else(|| state.validators.get(id).map(|r| r.registered_at_epoch))
+                .unwrap_or(Epoch::GENESIS)
+                .inner();
+            (*id, now.saturating_sub(baseline).min(cooldown))
+        })
+        .collect();
+    state.committee =
+        sample_committee_weighted(&weighted, state.randomness.as_bytes(), committee_size);
+    for id in &state.committee {
+        state.last_beacon_service.insert(*id, state.current_epoch);
+    }
     CommitteeTransition {
         from: prior,
         to: state.committee.clone(),
@@ -404,7 +435,7 @@ mod tests {
         WeightedTimestamp,
     };
 
-    use super::recover_halted_committees;
+    use super::{recover_halted_committees, resample_beacon_committee};
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, single_pool_state, validator_record,
     };
@@ -1133,6 +1164,201 @@ mod tests {
                 ValidatorId::new(3),
             ]
         );
+    }
+
+    // ─── recency-weighted resample ───────────────────────────────────────
+
+    /// After a resample, every drawn member's `last_beacon_service` is
+    /// stamped to the current epoch, and members not drawn keep their
+    /// prior stamp — the record the next resample down-weights against.
+    #[test]
+    fn resample_stamps_service_epoch_on_drawn_members() {
+        let mut state = multi_shard_state(2, 8, 0);
+        state.current_epoch = Epoch::new(50);
+        // Pre-stamp an idle member at an old epoch to prove non-members
+        // keep their stamp.
+        let idle = ValidatorId::new(15);
+        state.last_beacon_service.insert(idle, Epoch::new(3));
+
+        resample_beacon_committee(
+            &mut state,
+            &BTreeSet::new(),
+            TransitionCause::NaturalShuffle,
+        );
+
+        assert_eq!(state.committee.len(), BEACON_SIGNER_COUNT);
+        for id in &state.committee {
+            assert_eq!(
+                state.last_beacon_service.get(id),
+                Some(&Epoch::new(50)),
+                "a drawn member is stamped at the current epoch",
+            );
+        }
+        if !state.committee.contains(&idle) {
+            assert_eq!(
+                state.last_beacon_service.get(&idle),
+                Some(&Epoch::new(3)),
+                "an undrawn member keeps its prior stamp",
+            );
+        }
+    }
+
+    /// A member that served this epoch has weight zero and is excluded
+    /// from the draw as long as enough recovered members remain to fill
+    /// the committee — the rate limit that denies a grinder a repeat
+    /// seat.
+    #[test]
+    fn recency_excludes_just_served_members() {
+        let mut state = multi_shard_state(2, 8, 0);
+        state.current_epoch = Epoch::new(100);
+        // Four members "served" this very epoch — weight zero. The other
+        // twelve are genesis-registered and long idle — full weight.
+        let just_served: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
+        for id in &just_served {
+            state.last_beacon_service.insert(*id, Epoch::new(100));
+        }
+
+        resample_beacon_committee(
+            &mut state,
+            &BTreeSet::new(),
+            TransitionCause::NaturalShuffle,
+        );
+
+        assert_eq!(state.committee.len(), BEACON_SIGNER_COUNT);
+        for id in &just_served {
+            assert!(
+                !state.committee.contains(id),
+                "a zero-weight just-served member must not be drawn while idle members remain",
+            );
+        }
+    }
+
+    /// A freshly registered validator (registration epoch = now, never
+    /// served) enters at zero weight, ramping in like a just-served
+    /// member — so the register-to-reset dodge buys no immediate seat.
+    #[test]
+    fn recency_excludes_fresh_registrants() {
+        let mut state = multi_shard_state(2, 8, 0);
+        state.current_epoch = Epoch::new(100);
+        // Mark four members as freshly registered this epoch.
+        let fresh: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
+        for id in &fresh {
+            state.validators.get_mut(id).unwrap().registered_at_epoch = Epoch::new(100);
+        }
+
+        resample_beacon_committee(
+            &mut state,
+            &BTreeSet::new(),
+            TransitionCause::NaturalShuffle,
+        );
+
+        for id in &fresh {
+            assert!(
+                !state.committee.contains(id),
+                "a fresh registrant enters at zero weight and is not drawn while idle members remain",
+            );
+        }
+    }
+
+    /// A member recovers its full weight once a cooldown has elapsed
+    /// since it served: with only recovered members carrying weight, the
+    /// draw fills from them and skips the still-cooling ones.
+    #[test]
+    fn recency_recovers_over_the_cooldown() {
+        let mut state = multi_shard_state(2, 8, 0);
+        state.current_epoch = Epoch::new(100);
+        // cooldown = eligible / committee = 16 / 4 = 4. Four members
+        // served five epochs ago — past the cooldown, fully recovered.
+        let recovered: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
+        for id in &recovered {
+            state.last_beacon_service.insert(*id, Epoch::new(95));
+        }
+        // The other twelve served this epoch — weight zero.
+        for id in (4u64..16).map(ValidatorId::new) {
+            state.last_beacon_service.insert(id, Epoch::new(100));
+        }
+
+        resample_beacon_committee(
+            &mut state,
+            &BTreeSet::new(),
+            TransitionCause::NaturalShuffle,
+        );
+
+        let drawn: BTreeSet<ValidatorId> = state.committee.iter().copied().collect();
+        assert_eq!(
+            drawn,
+            recovered.iter().copied().collect::<BTreeSet<_>>(),
+            "the committee fills from the recovered members, skipping the cooling ones",
+        );
+    }
+
+    /// Two replicas with byte-identical state — including the recency map
+    /// — resample byte-identical committees and stamp the same service
+    /// epochs. The recency-weighted draw is a pure function of state.
+    #[test]
+    fn recency_resample_is_deterministic_across_replicas() {
+        let build = || {
+            let mut state = multi_shard_state(2, 8, 0);
+            state.current_epoch = Epoch::new(100);
+            state.randomness = Randomness::new([0x5A; 32]);
+            for id in (0u64..6).map(ValidatorId::new) {
+                state.last_beacon_service.insert(id, Epoch::new(98));
+            }
+            state
+        };
+        let mut a = build();
+        let mut b = build();
+
+        resample_beacon_committee(&mut a, &BTreeSet::new(), TransitionCause::NaturalShuffle);
+        resample_beacon_committee(&mut b, &BTreeSet::new(), TransitionCause::NaturalShuffle);
+
+        assert_eq!(a.committee, b.committee);
+        assert_eq!(a.last_beacon_service, b.last_beacon_service);
+    }
+
+    /// The recency map rides validator churn deterministically: two
+    /// replicas that register a new validator and then fold several
+    /// epochs land on byte-identical state, recency map included. The
+    /// register-to-reset dodge cannot fork consensus.
+    #[test]
+    fn recency_survives_registration_churn() {
+        let build = || {
+            let mut state = single_pool_state(4);
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            state
+        };
+        let run = |state: &mut BeaconState| {
+            // A stake deposit funds a pool, then a registration adds a
+            // fresh validator id mid-run.
+            apply_witness_chunk(
+                state,
+                0,
+                vec![ShardWitnessPayload::StakeDeposit {
+                    pool_id: StakePoolId::new(0),
+                    amount: Stake::from_whole_tokens(1_000),
+                }],
+            );
+            apply_witness_chunk(
+                state,
+                0,
+                vec![ShardWitnessPayload::RegisterValidator {
+                    pool_id: StakePoolId::new(0),
+                    validator_id: ValidatorId::new(77),
+                    pubkey: state.validators[&ValidatorId::new(0)].pubkey,
+                }],
+            );
+            for _ in 0..4 {
+                apply_next_epoch(state, &[]);
+            }
+        };
+
+        let mut a = build();
+        let mut b = build();
+        run(&mut a);
+        run(&mut b);
+
+        assert_eq!(a, b, "churn must leave two replicas byte-identical");
+        assert_eq!(a.last_beacon_service, b.last_beacon_service);
     }
 
     // ─── halted-shard recovery ───────────────────────────────────────────

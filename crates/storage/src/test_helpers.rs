@@ -313,6 +313,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
+        last_beacon_service: BTreeMap::new(),
     })
 }
 
