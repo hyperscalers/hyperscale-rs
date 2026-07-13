@@ -210,13 +210,16 @@ fn boundary_header_for(
 /// it catch up), a below-floor one marks a crossing every consumer frontier
 /// has passed.
 ///
-/// Resolution is terminal-clamped (`lookup_for_shard`): a splitting
-/// shard's terminal crossing can be anchored exactly on (or past) its
-/// cut — `is_boundary_crossing` is parent-inclusive at the cut — and the
-/// anchor's half-open window no longer carries the shard. The block is
-/// still proposed and signed by the shard's final-epoch committee, the
-/// same resolution its own replicas applied when voting it, so the QC
-/// must verify against that committee.
+/// Resolution is terminal-clamped and recovery-bridged
+/// (`lookup_for_shard_certified`): a splitting shard's terminal crossing
+/// can be anchored exactly on (or past) its cut — `is_boundary_crossing`
+/// is parent-inclusive at the cut — and the anchor's half-open window no
+/// longer carries the shard; the block is still proposed and signed by
+/// the shard's final-epoch committee, the same resolution its own
+/// replicas applied when voting it, so the QC must verify against that
+/// committee. A halt recovery's bridge block — the crossing that
+/// completes the recovery — is anchored below the bridge window but
+/// certified at or past it, and verifies against the fresh committee.
 fn boundary_qc_authentic(
     shard: ShardId,
     boundary_header: &BlockHeader,
@@ -227,9 +230,11 @@ fn boundary_qc_authentic(
     if qc.block_hash() != boundary_header.hash() {
         return false;
     }
-    let snapshot = match topology_schedule
-        .lookup_for_shard(shard, boundary_header.parent_qc().weighted_timestamp())
-    {
+    let snapshot = match topology_schedule.lookup_for_shard_certified(
+        shard,
+        boundary_header.parent_qc().weighted_timestamp(),
+        qc.weighted_timestamp(),
+    ) {
         (ScheduleLookup::Committee(snapshot), _) => snapshot,
         (ScheduleLookup::NotYetCommitted, _) => {
             debug!(
@@ -241,6 +246,10 @@ fn boundary_qc_authentic(
         (ScheduleLookup::Evicted, _) => {
             warn!(
                 shard = shard.inner(),
+                anchor_epoch = topology_schedule
+                    .epoch_for(boundary_header.parent_qc().weighted_timestamp())
+                    .inner(),
+                qc_epoch = topology_schedule.epoch_for(qc.weighted_timestamp()).inner(),
                 "Boundary QC's committee epoch is below the schedule floor — abstaining"
             );
             return false;

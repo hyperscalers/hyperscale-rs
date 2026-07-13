@@ -11,9 +11,10 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, NetworkDefinition,
-    NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction, SettledWavesRoot,
-    ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, HaltRecovery,
+    NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
+    SettledWavesRoot, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
+    WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -158,6 +159,15 @@ pub struct TopologySnapshot {
     /// reach the attested settled-waves window back to the point
     /// counterpart fences began holding straddlers.
     settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
+    /// Each recovering shard's in-flight halt recovery, projected live
+    /// from `BeaconState.pending_recoveries`. Carries the replaced
+    /// committee — kept in the shard's routing view so fetches keep
+    /// reaching the nodes that hold the halted tip, and their hosts keep
+    /// serving — and the epoch the fresh committee was seated, which the
+    /// schedule's recovery bridge resolves committee bindings across.
+    /// Cleared when the shard commits again and the beacon drops the
+    /// record. Like `advanced`, a live head value.
+    pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
     /// Governable network parameters in force for this window, projected
     /// from `BeaconState.params` (head) or `next_params` (lookahead).
     /// Frozen one epoch ahead like the committee, so every member resolves
@@ -207,6 +217,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
+            pending_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -251,6 +262,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
+            pending_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -304,6 +316,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
+            pending_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -393,6 +406,7 @@ impl TopologySnapshot {
             split_pending,
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            pending_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -417,6 +431,19 @@ impl TopologySnapshot {
     #[must_use]
     pub fn with_advanced(mut self, advanced: BTreeSet<ShardId>) -> Self {
         self.advanced = advanced;
+        self
+    }
+
+    /// Set each recovering shard's in-flight halt recovery (see
+    /// [`Self::pending_recoveries`]). Defaults empty; the beacon
+    /// projection supplies the live `BeaconState.pending_recoveries`
+    /// value. Builder-set under the [`Self::with_advanced`] rationale.
+    #[must_use]
+    pub fn with_pending_recoveries(
+        mut self,
+        pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
+    ) -> Self {
+        self.pending_recoveries = pending_recoveries;
         self
     }
 
@@ -585,6 +612,19 @@ impl TopologySnapshot {
         &self,
     ) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
         &self.reshape_parent_halves
+    }
+
+    /// Each recovering shard's in-flight halt recovery.
+    /// [`TopologySchedule::routing_committees`] unions the retained
+    /// replaced committee into the shard's routing entry so fetches keep
+    /// reaching the members that hold the halted tip (and their hosts
+    /// keep serving), and the schedule's recovery bridge reads the
+    /// seating epoch to resolve committee bindings across the halt gap.
+    ///
+    /// [`TopologySchedule::routing_committees`]: crate::TopologySchedule::routing_committees
+    #[must_use]
+    pub const fn pending_recoveries(&self) -> &BTreeMap<ShardId, HaltRecovery> {
+        &self.pending_recoveries
     }
 
     /// Get the ordered committee members for a shard — full membership,

@@ -166,6 +166,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         boundaries,
         advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
+        pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     };
     // Genesis placements are `ready: true` by construction, so the frozen

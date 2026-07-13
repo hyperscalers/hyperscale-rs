@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardId,
-    TransitionCause, ValidatorId, ValidatorStatus,
+    BeaconState, CommitteeTransition, HaltRecovery, PendingReshape, SHUFFLE_INTERVAL_EPOCHS,
+    ShardCommittee, ShardId, TransitionCause, ValidatorId, ValidatorStatus,
 };
 use rand::RngExt;
 
@@ -17,6 +17,12 @@ use crate::state::pool::pool_draw;
 /// from [`crate::sampling`]'s pool-draw tag so the two PRNG streams
 /// never collide on the same `(randomness, epoch, shard)` input.
 const DOMAIN_SHUFFLE_EXIT: &[u8] = b"hyperscale-shuffle-exit-v1";
+
+/// Domain tag for the halted-shard recovery draw seed. Distinct from the
+/// shuffle-exit and pool-draw tags so the full-committee re-draw never
+/// shares a PRNG stream with the trickle on the same
+/// `(randomness, epoch, shard)` input.
+const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
 
 /// Trickled committee rotation. When `state.current_epoch` lands on a
 /// [`SHUFFLE_INTERVAL_EPOCHS`] boundary (and `epoch > 0`), each shard
@@ -63,6 +69,15 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
             state.pending_reshapes.get(&shard),
             Some(PendingReshape::Split { .. })
         ) {
+            continue;
+        }
+        // A recovering shard's fresh committee is pinned the same way: it
+        // hasn't produced yet, so a rotated-in draw could never fold its
+        // Ready witness — each rotation would shrink the consensus subset
+        // toward a quorum the remaining members can't reach, re-wedging
+        // the shard the recovery just re-seated. Rotation resumes once
+        // the first crossing clears the recovery.
+        if state.pending_recoveries.contains_key(&shard) {
             continue;
         }
         // Bind the candidate set to validators whose status records
@@ -127,6 +142,115 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
             .expect("victim is in state.validators")
             .status = ValidatorStatus::Pooled;
     }
+}
+
+/// Re-draw the entire committee of every halted shard from the free
+/// pool — the f+1 liveness recovery.
+///
+/// A shard marches to a halt only by concentrating corrupt members; a
+/// **full** fresh draw flushes that foothold, and unlike the one-seat
+/// trickle it cannot be steered — reaching f+1 corrupt in one
+/// hypergeometric draw is a negligible tail even against a seed grinder.
+/// A partial re-seed would reopen the incremental march, so the re-draw
+/// is all-or-nothing: a pool short of a full committee defers the
+/// recovery (the shard stays flagged and retries each fold as the pool
+/// refills).
+///
+/// The fresh members seat `OnShard { ready: true }` directly. The normal
+/// readiness attestation rides the joined shard's own chain, and a
+/// halted chain folds nothing — gating the cutover on a witness that can
+/// never arrive would wedge the recovery. Seating ready extends the same
+/// trust as the ready timeout, all at once: the lookahead epoch is the
+/// sync window, and once the shard produces again its miss counters
+/// catch any member that never caught up. The replaced committee returns
+/// to the pool, excluded from its own replacement draw (its members are
+/// still `OnShard` when the pool derives), and is retained in the
+/// shard's routing view via [`HaltRecovery`] so the incomers can fetch
+/// the halted tip from nodes that hold it.
+pub(super) fn recover_halted_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
+    for &shard in halted {
+        recover_halted_committee(state, shard);
+    }
+}
+
+fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
+    let size = state.chain_config.shard_size as usize;
+    let pool = state.pooled_validators();
+    if pool.len() < size {
+        tracing::warn!(
+            ?shard,
+            pooled = pool.len(),
+            committee_size = size,
+            "halted shard awaits recovery: free pool below a full committee"
+        );
+        return;
+    }
+    let mut h = Hasher::new();
+    h.update(DOMAIN_HALT_RECOVERY);
+    h.update(state.randomness.as_bytes());
+    h.update(&state.current_epoch.inner().to_le_bytes());
+    h.update(&shard.inner().to_le_bytes());
+    let fresh = sample_committee(&pool, h.finalize().as_bytes(), size);
+
+    let replaced = state
+        .next_shard_committees
+        .insert(
+            shard,
+            ShardCommittee {
+                members: fresh.clone(),
+            },
+        )
+        .map(|committee| committee.members)
+        .unwrap_or_default();
+    for id in &fresh {
+        state
+            .validators
+            .get_mut(id)
+            .expect("drawn from the derived pool, must be in validators")
+            .status = ValidatorStatus::OnShard {
+            shard,
+            ready: true,
+            placed_at_epoch: state.current_epoch,
+        };
+        state.miss_counters.remove(id);
+    }
+    for id in &replaced {
+        if let Some(rec) = state.validators.get_mut(id)
+            && matches!(rec.status, ValidatorStatus::OnShard { shard: s, .. } if s == shard)
+        {
+            rec.status = ValidatorStatus::Pooled;
+        }
+        state.miss_counters.remove(id);
+    }
+
+    // The recovery resets the shard's miss count: the fresh committee
+    // gets a full threshold of observed folds to sync and produce before
+    // the shard re-flags and re-draws.
+    if let Some(boundary) = state.boundaries.get_mut(&shard) {
+        boundary.consecutive_misses = 0;
+    }
+
+    // A recovery that itself stalled folds its retention into the new
+    // record: every committee that might hold the halted tip stays
+    // routable until the shard commits again.
+    let mut retained = replaced;
+    if let Some(prior) = state.pending_recoveries.remove(&shard) {
+        retained.extend(prior.retained);
+    }
+    retained.sort_unstable();
+    retained.dedup();
+    tracing::info!(
+        ?shard,
+        fresh = ?fresh,
+        "halted shard recovered: committee fully re-drawn from the pool"
+    );
+    state.pending_recoveries.insert(
+        shard,
+        HaltRecovery {
+            rotated_at: state.current_epoch,
+            retained,
+        },
+    );
 }
 
 /// Fill any live shard committee below `shard_size` from the pool.
@@ -270,13 +394,16 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::{
-        BEACON_SIGNER_COUNT, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, PendingReshape,
-        Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool,
-        StakePoolId, TransitionCause, ValidatorId, ValidatorStatus,
+        BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
+        HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR, PendingReshape, Randomness,
+        SHUFFLE_INTERVAL_EPOCHS, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload,
+        Stake, StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
+        WeightedTimestamp,
     };
 
+    use super::recover_halted_committees;
     use crate::state::test_fixtures::{
-        apply_next_epoch, empty_state, single_pool_state, validator_record,
+        apply_next_epoch, apply_witness_chunk, empty_state, single_pool_state, validator_record,
     };
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
 
@@ -878,5 +1005,225 @@ mod tests {
                 ValidatorId::new(3),
             ]
         );
+    }
+
+    // ─── halted-shard recovery ───────────────────────────────────────────
+
+    /// A live boundary record the fold has observed missing for
+    /// `misses` consecutive folds.
+    fn live_boundary(misses: u32) -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+            height: BlockHeight::new(5),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: Epoch::new(1),
+            consecutive_misses: misses,
+            terminal_epoch: None,
+            terminal_qc_wt: None,
+            settled_waves_root: None,
+            reshape_admitted_epoch: None,
+        }
+    }
+
+    /// One more miss than the halt threshold tolerates.
+    fn over_threshold() -> u32 {
+        u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1
+    }
+
+    /// A halted shard's committee is re-drawn whole from the pool: the
+    /// fresh members seat ready at the fold's epoch, the replaced members
+    /// return to the pool, the recovery record retains them for routing,
+    /// and the healthy sibling is untouched. The full swap surfaces as a
+    /// committee transition for the runner.
+    #[test]
+    fn halted_committee_is_redrawn_whole_from_the_pool() {
+        let s0 = ShardId::leaf(1, 0);
+        let s1 = ShardId::leaf(1, 1);
+        let mut state = multi_shard_state(2, 4, 4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 1);
+        state.boundaries.insert(s0, live_boundary(over_threshold()));
+        state.boundaries.insert(s1, live_boundary(0));
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+        let pooled: BTreeSet<ValidatorId> = state.pooled_validators().into_iter().collect();
+
+        let effects = apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(effects.halted_shards, BTreeSet::from([s0]));
+        let fresh: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            fresh, pooled,
+            "the four pooled spares seat the fresh committee"
+        );
+        assert!(fresh.is_disjoint(&old), "the foothold is flushed");
+        for id in &fresh {
+            assert_eq!(
+                state.validators[id].status,
+                ValidatorStatus::OnShard {
+                    shard: s0,
+                    ready: true,
+                    placed_at_epoch: state.current_epoch,
+                },
+            );
+        }
+        for id in &old {
+            assert_eq!(state.validators[id].status, ValidatorStatus::Pooled);
+        }
+        let recovery = &state.pending_recoveries[&s0];
+        assert_eq!(recovery.rotated_at, state.current_epoch);
+        assert_eq!(
+            recovery.retained.iter().copied().collect::<BTreeSet<_>>(),
+            old,
+        );
+        assert_eq!(
+            state.boundaries[&s0].consecutive_misses, 0,
+            "the recovery resets the miss count for a fresh threshold",
+        );
+        // The unproven fresh committee sits out beacon eligibility until
+        // the shard's first crossing clears the recovery.
+        for id in &fresh {
+            assert!(!state.beacon_eligible().contains(id));
+        }
+        assert!(effects.shard_committee_transitions.contains_key(&s0));
+        assert!(!state.pending_recoveries.contains_key(&s1));
+        assert!(!effects.shard_committee_transitions.contains_key(&s1));
+    }
+
+    /// A pool short of a full committee defers the recovery — a partial
+    /// re-seed would reopen the incremental march — and the shard stays
+    /// flagged until the pool refills, then recovers.
+    #[test]
+    fn recovery_defers_until_the_pool_holds_a_full_committee() {
+        let s0 = ShardId::leaf(1, 0);
+        let s1 = ShardId::leaf(1, 1);
+        let mut state = multi_shard_state(2, 4, 2);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 1);
+        state.boundaries.insert(s0, live_boundary(over_threshold()));
+        state.boundaries.insert(s1, live_boundary(0));
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        let effects = apply_next_epoch(&mut state, &[]);
+        assert_eq!(effects.halted_shards, BTreeSet::from([s0]), "flagged");
+        assert_eq!(
+            state.next_shard_committees[&s0]
+                .members
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            old,
+            "two pooled spares cannot seat a committee of four",
+        );
+        assert!(state.pending_recoveries.is_empty());
+
+        // The pool refills; the still-flagged shard recovers on the next fold.
+        for i in 100..102u64 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        let effects = apply_next_epoch(&mut state, &[]);
+        assert_eq!(effects.halted_shards, BTreeSet::from([s0]));
+        assert!(state.pending_recoveries.contains_key(&s0));
+        let fresh: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+        assert!(fresh.is_disjoint(&old));
+    }
+
+    /// A recovery whose fresh committee also stalls re-draws, and the
+    /// successor record folds the prior retention forward: every committee
+    /// that might hold the halted tip stays routable.
+    #[test]
+    fn stalled_recovery_folds_retention_forward() {
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 4);
+        state.current_epoch = Epoch::new(20);
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        recover_halted_committees(&mut state, &BTreeSet::from([s0]));
+        let fresh1: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+        assert!(fresh1.is_disjoint(&old));
+
+        state.current_epoch = Epoch::new(40);
+        recover_halted_committees(&mut state, &BTreeSet::from([s0]));
+        let recovery = &state.pending_recoveries[&s0];
+        assert_eq!(recovery.rotated_at, Epoch::new(40));
+        assert_eq!(
+            recovery.retained.iter().copied().collect::<BTreeSet<_>>(),
+            old.union(&fresh1).copied().collect::<BTreeSet<_>>(),
+        );
+        assert_eq!(recovery.retained.len(), 8, "retention holds no duplicates");
+    }
+
+    /// The shard's next observed crossing completes the recovery: the
+    /// retained committee is released from the routing view.
+    #[test]
+    fn recovery_clears_when_the_shard_commits_again() {
+        use hyperscale_types::HaltRecovery;
+
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.pending_recoveries.insert(
+            ShardId::leaf(1, 0),
+            HaltRecovery {
+                rotated_at: Epoch::GENESIS,
+                retained: vec![ValidatorId::new(9)],
+            },
+        );
+
+        apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::StakeDeposit {
+                pool_id: StakePoolId::new(200),
+                amount: Stake::from_whole_tokens(1),
+            }],
+        );
+
+        assert!(state.pending_recoveries.is_empty());
+    }
+
+    /// Two replicas with byte-identical state recover byte-identically —
+    /// the fresh draw is seeded, not incidental.
+    #[test]
+    fn recovery_is_deterministic_across_replicas() {
+        let s0 = ShardId::leaf(1, 0);
+        let s1 = ShardId::leaf(1, 1);
+        let mut a = multi_shard_state(2, 4, 4);
+        let mut b = multi_shard_state(2, 4, 4);
+        for state in [&mut a, &mut b] {
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 1);
+            state.boundaries.insert(s0, live_boundary(over_threshold()));
+            state.boundaries.insert(s1, live_boundary(0));
+            apply_next_epoch(state, &[]);
+        }
+        assert_eq!(a, b);
     }
 }
