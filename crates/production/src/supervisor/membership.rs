@@ -260,10 +260,14 @@ impl ShardSupervisor {
             callback_tx,
         );
         shard_loop.set_time(consensus_clock(self.genesis_offset_ms));
-        // The genesis commit arms the pacemaker; capture its timer ops so the
-        // spawned loop arms them as its initial ops rather than dropping them.
-        let initial_timer_ops =
-            genesis.map_or_else(Vec::new, |genesis| shard_loop.install_genesis(genesis));
+        // The genesis commit — or, for a non-genesis seat, the
+        // committed-state resume — arms the pacemaker; capture its timer
+        // ops so the spawned loop arms them as its initial ops rather than
+        // dropping them.
+        let initial_timer_ops = match genesis {
+            Some(genesis) => shard_loop.install_genesis(genesis),
+            None => shard_loop.resume_committed(recovered),
+        };
 
         self.storages
             .lock()

@@ -599,6 +599,19 @@ fn record_boundaries(
             continue;
         }
         let (_, chunk_end) = chunk_bounds(prior, boundary_count);
+        // A committed re-fold of the recorded crossing with no witness
+        // progress is not a fresh observation — the chain has not moved
+        // past the recorded anchor. Refreshing on it would reset the miss
+        // counter (and release a pending recovery's retention) from data
+        // already consumed, so a halted shard whose stale crossing keeps
+        // riding proposals would never flag. Terminal records still
+        // re-fold: a merge child's terminal marks the compose set until
+        // its parent composes.
+        if state.boundaries.get(shard).is_some_and(|b| {
+            b.terminal_epoch.is_none() && b.block_hash == block_hash && chunk_end == prior
+        }) {
+            continue;
+        }
         if !apply_contribution_witnesses(
             state,
             header,
@@ -1181,6 +1194,72 @@ mod tests {
         // Folding the shard's own crossing marks it produced past genesis —
         // the successor-liveness signal the reshape handoff reads.
         assert!(state.advanced.contains(&shard));
+    }
+
+    /// A committed re-fold of the recorded crossing with no witness
+    /// progress is a miss, not a refresh: the counter keeps accumulating,
+    /// `last_live_epoch` stays at the original fold, and a pending
+    /// recovery's retention record survives. Without this a halted shard
+    /// whose stale crossing keeps riding proposals resets its counter
+    /// every epoch and never flags.
+    #[test]
+    fn record_boundaries_ignores_a_no_progress_refold() {
+        use hyperscale_types::HaltRecovery;
+
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
+        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let fresh: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b.clone(),
+                witnesses: witnesses.into(),
+            },
+        ))
+        .collect();
+        record_boundaries(&mut state, Epoch::new(1), &committed, &fresh);
+        assert_eq!(state.boundaries[&shard].consecutive_misses, 0);
+
+        state.pending_recoveries.insert(
+            shard,
+            HaltRecovery {
+                rotated_at: Epoch::new(1),
+                retained: Vec::new(),
+            },
+        );
+
+        // The same crossing rides a later epoch's proposals; its chunk is
+        // already drained, so the re-fold carries no progress.
+        let refold: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: BoundedVec::new(),
+            },
+        ))
+        .collect();
+        record_boundaries(&mut state, Epoch::new(2), &committed, &refold);
+
+        let recorded = &state.boundaries[&shard];
+        assert_eq!(
+            recorded.consecutive_misses, 1,
+            "a no-progress re-fold must read as a miss",
+        );
+        assert_eq!(recorded.last_live_epoch, Epoch::new(1));
+        assert!(
+            state.pending_recoveries.contains_key(&shard),
+            "a stale re-fold must not release the recovery's retention",
+        );
     }
 
     /// The witness window base frozen at promotion is byte-identical to

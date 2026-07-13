@@ -12,13 +12,16 @@
 //! per-block-flow wiring; this module's job is to define the rules
 //! and let proposer + verifier share them verbatim.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, Hash, ShardId, ShardWitnessPayload,
-    StoredReceipt, TopologySchedule, compute_merkle_root, derive_leaves,
-    missed_proposals_since_prev_commit,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Hash, ShardId,
+    ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, compute_merkle_root,
+    derive_leaves, missed_proposals_since_prev_commit,
 };
 
-use crate::pending::PendingBlocks;
+use crate::pending::{PendingBlock, PendingBlocks};
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
@@ -153,10 +156,19 @@ impl BeaconWitnessAccumulator {
 /// missed-proposal leaves under the tip's committee. The result is the
 /// input the verifier applies the block's own new leaves to.
 ///
+/// An ancestor absent from `pending_blocks` falls back to
+/// `certified_blocks` — the verified-certified cache where a
+/// sync-admitted block sits while its round-contiguous commit is still
+/// pending. A halt recovery's fresh committee extends exactly such a
+/// tip: the halted suffix arrives by block sync, never as pending
+/// gossip, so without the fallback every vote on the first bridge block
+/// would park on an ancestor that only that bridge block's own commit
+/// could release.
+///
 /// Returns `Err(blocking_hash)` when the walk hits an ancestor that is
-/// absent from `pending_blocks`, present but not yet assembled, or whose
-/// committee the local beacon schedule can't yet resolve — the snapshot
-/// is meaningless until that ancestor's data (or the beacon epoch behind
+/// held nowhere, present but not yet assembled, or whose committee the
+/// local beacon schedule can't yet resolve — the snapshot is
+/// meaningless until that ancestor's data (or the beacon epoch behind
 /// it) arrives. Callers defer the verification keyed on `blocking_hash`
 /// and retry once it becomes available.
 ///
@@ -164,11 +176,12 @@ impl BeaconWitnessAccumulator {
 ///
 /// `Err(blocking_hash)` for a missing or unassembled ancestor, or one
 /// whose committee is unresolvable in `schedule`.
-pub fn prospective_parent_witness_leaves(
+pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
     parent_block_hash: BlockHash,
     pending_blocks: &PendingBlocks,
+    certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>, S>,
     local_shard: ShardId,
     schedule: &TopologySchedule,
 ) -> Result<(BeaconWitnessLeafCount, Vec<Hash>), BlockHash> {
@@ -180,11 +193,15 @@ pub fn prospective_parent_witness_leaves(
     let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
     let mut current = parent_block_hash;
     while current != committed_hash {
-        let Some(pending) = pending_blocks.get(current) else {
-            return Err(current);
-        };
-        let Some(block) = pending.block() else {
-            return Err(current);
+        let block: &Block = match pending_blocks.get(current).map(PendingBlock::block) {
+            Some(Some(block)) => block,
+            // Present but unassembled — the content is on its way through
+            // the pending pipeline; wait for it rather than shadow it.
+            Some(None) => return Err(current),
+            None => match certified_blocks.get(&current) {
+                Some(certified) => certified.block(),
+                None => return Err(current),
+            },
         };
         let header = block.header();
         // This ancestor's leaves committed under its own committee — the
@@ -216,9 +233,8 @@ pub fn prospective_parent_witness_leaves(
             committee,
             &receipts,
             &missed,
-            pending.manifest().ready_signals().as_slice(),
-            pending
-                .manifest()
+            block.ready_signals().as_slice(),
+            block
                 .reshape_trigger()
                 .and_then(|t| t.to_payload(local_shard)),
         );

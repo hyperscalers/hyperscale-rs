@@ -153,10 +153,12 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 ///
 /// After the root grows, two members of the left child's four-member
 /// committee go silent at the consensus layer only: their outbound
-/// proposals, votes, and timeouts are dropped, while every other channel —
-/// beacon participation, pool ratification, block serving — stays
-/// connected. The honest remainder is short of the 2f+1 quorum, so the
-/// shard freezes while its sibling and the beacon keep committing. Once
+/// proposals, votes, and timeouts are dropped, and vote delivery to them
+/// is cut (a silent member aggregates no QCs of its own), while every
+/// other channel — beacon participation, pool ratification, block
+/// serving — stays connected. The honest remainder is short of the 2f+1
+/// quorum, so the shard freezes while its sibling and the beacon keep
+/// committing. Once
 /// the boundary watermark stalls past the halt threshold the beacon flags
 /// the shard, seats a fresh committee from the pool spares, and retains
 /// the replaced members in the routing view; the incomers sync the halted
@@ -198,10 +200,17 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 
     // f+1 of the left committee withhold: their outbound consensus
     // messages stop reaching everyone else. The honest remainder is 2f,
-    // short of quorum, so the shard halts; nothing else is cut.
+    // short of quorum, so the shard halts; nothing else is cut. Vote
+    // delivery TO the withholding pair is cut too — a silent member
+    // collects no votes — else the pair keeps aggregating QCs only it
+    // holds and privately commits a suffix the recovery must orphan,
+    // and the faulted hosts (honest code under a network fault) would
+    // panic on the commit-linkage break instead of modeling adversaries
+    // that simply stop.
     let votes_withheld = c.drop_type_between(withholding, &others, "block.vote");
     c.drop_type_between(withholding, &others, "block.header");
     c.drop_type_between(withholding, &others, "shard.timeout");
+    c.drop_type_between(&others, withholding, "block.vote");
 
     // In-flight rounds drain, then the shard freezes.
     c.run_until(epochs(1), |_| false);

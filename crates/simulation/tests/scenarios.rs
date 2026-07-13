@@ -201,8 +201,6 @@ const fn halt_recovery_config() -> ScenarioConfig {
 }
 
 #[test]
-#[ignore = "the recovery's fresh committee seats and syncs but does not yet enter consensus; \
-            the runtime participation handoff for recovery-seated vnodes is still open"]
 fn halted_shard_recovers_by_committee_redraw_sim() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(
         &halt_recovery_config(),

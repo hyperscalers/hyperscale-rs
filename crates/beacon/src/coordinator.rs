@@ -2823,6 +2823,66 @@ mod tests {
         assert_eq!(built[&shard].witnesses.len(), 3);
     }
 
+    /// The proposer stops sourcing a live shard's crossing once the fold
+    /// has consumed it — anchor recorded, chunk drained. Re-sourcing it
+    /// masks a halted shard as live (the re-fold keeps resetting its miss
+    /// counter) and, once the crossing's window ages below the schedule
+    /// floor, forces every verifier to abstain on any proposal carrying
+    /// it. A partially drained chunk keeps sourcing — the backlog still
+    /// has leaves to deliver.
+    #[test]
+    fn source_boundary_qcs_skips_a_folded_live_crossing() {
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"folded-anchor"));
+        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        coord.state.shard_committees.insert(
+            shard,
+            ShardCommittee {
+                members: vec![ValidatorId::new(0)],
+            },
+        );
+        // A `(B, C)` pair whose successor QC lands past the epoch cut, so
+        // the tracker records `b` as a genuine crossing.
+        let c = linked_block_header(shard, 6, b.block_hash(), 301_000, 3);
+        coord.on_verified_source_header(&b);
+        coord.on_verified_source_header(&c);
+        coord.on_shard_witnesses_received(shard, witnesses.iter().cloned().map(Arc::new).collect());
+        let boundary = |applied: u64| ShardBoundary {
+            state_root: anchor,
+            block_hash: b.block_hash(),
+            height: BlockHeight::new(5),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::new(applied),
+            last_live_epoch: Epoch::new(1),
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            terminal_qc_wt: None,
+            settled_waves_root: None,
+            reshape_admitted_epoch: None,
+        };
+
+        // Unfolded: the crossing is fresh news, so it sources.
+        let sourced = boundary::source_boundary_qcs(&coord.state, &coord.shard_source);
+        assert!(sourced.contains_key(&shard), "a fresh crossing sources");
+
+        // Folded with a partially drained chunk: keep sourcing the rest.
+        coord.state.boundaries.insert(shard, boundary(1));
+        let sourced = boundary::source_boundary_qcs(&coord.state, &coord.shard_source);
+        assert!(
+            sourced.contains_key(&shard),
+            "a partially drained chunk keeps sourcing",
+        );
+
+        // Fully folded: nothing new to report, so the shard is absent.
+        coord.state.boundaries.insert(shard, boundary(3));
+        let sourced = boundary::source_boundary_qcs(&coord.state, &coord.shard_source);
+        assert!(
+            !sourced.contains_key(&shard),
+            "a fully folded live crossing must stop sourcing",
+        );
+    }
+
     /// `contributions_well_formed` accepts the canonical projection of the
     /// committed boundary QCs and rejects an incomplete, extra, or unbound
     /// contribution set — the Byzantine-variant gate on received blocks.

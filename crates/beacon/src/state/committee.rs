@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, HaltRecovery, PendingReshape, SHUFFLE_INTERVAL_EPOCHS,
-    ShardCommittee, ShardId, TransitionCause, ValidatorId, ValidatorStatus,
+    BeaconState, CommitteeTransition, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE, PendingReshape,
+    SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
+    ValidatorStatus,
 };
 use rand::RngExt;
 
@@ -118,6 +119,15 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // later shard (the legitimate cross-shard reassignment).
         if state.pooled_validators().is_empty() {
             continue;
+        }
+        // Rotation also thins `beacon_eligible` by one until the drawn
+        // joiner's Ready folds — the victim pools, the draw seats unready.
+        // At the BFT minimum that dip parks the beacon on the skip path,
+        // and a skip epoch folds no Ready witness, so the dip sustains
+        // itself until the ready timeout clears it. Hold rotation until
+        // the eligible set has slack to give.
+        if state.beacon_eligible().len() <= MIN_BEACON_COMMITTEE_SIZE {
+            break;
         }
         let mut h = Hasher::new();
         h.update(DOMAIN_SHUFFLE_EXIT);
@@ -407,6 +417,27 @@ mod tests {
     };
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
 
+    /// Seat four ready validators on an untracked sibling shard so
+    /// `beacon_eligible` has slack past the rotation guard. The sibling
+    /// carries no committee entry, so the shuffle itself never touches
+    /// them and every per-shard assertion stays undisturbed.
+    fn add_eligible_slack(state: &mut BeaconState) {
+        for i in 500u64..504 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(
+                    i,
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard: ShardId::leaf(1, 1),
+                        ready: true,
+                        placed_at_epoch: Epoch::GENESIS,
+                    },
+                ),
+            );
+        }
+    }
+
     /// Two shards, `per_shard` ready members each, `pool_extras`
     /// `Pooled` validators kept in reserve so refills have stock.
     /// Pool stake is sized generously to keep `min_stake` at the floor.
@@ -622,6 +653,7 @@ mod tests {
     fn shuffle_picks_only_from_ready_members() {
         let shard = ShardId::leaf(1, 0);
         let mut state = single_pool_state(4);
+        add_eligible_slack(&mut state);
         // Mark validators 2 and 3 as not-yet-ready.
         for id in [2u64, 3] {
             state
@@ -674,6 +706,7 @@ mod tests {
     fn shuffle_avoids_self_replacement() {
         let shard = ShardId::leaf(1, 0);
         let mut state = single_pool_state(4);
+        add_eligible_slack(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let spare = ValidatorId::new(99);
         state
@@ -724,6 +757,34 @@ mod tests {
         );
         assert!(state.pooled_validators().is_empty());
         assert!(effects.shard_committee_transitions.is_empty());
+    }
+
+    /// With `beacon_eligible` at the BFT minimum, rotation is held: the
+    /// victim pools and the draw seats unready, so the swap would thin
+    /// the eligible set below what SPC bootstrap requires — and a skip
+    /// epoch folds no Ready witness to recover it.
+    #[test]
+    fn shuffle_holds_rotation_at_the_beacon_eligible_floor() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.validators.insert(
+            ValidatorId::new(99),
+            validator_record(99, 0, ValidatorStatus::Pooled),
+        );
+        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        pool.validators.insert(ValidatorId::new(99));
+        pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
+        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        assert_eq!(state.beacon_eligible().len(), 4);
+
+        let initial_members = state.next_shard_committees[&shard].members.clone();
+        apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(
+            state.next_shard_committees[&shard].members, initial_members,
+            "rotation at the eligible floor must hold",
+        );
     }
 
     /// A shard mid-split is exempt from rotation. Its members all carry
@@ -778,6 +839,7 @@ mod tests {
     #[test]
     fn shuffle_emits_shard_committee_transition_with_natural_shuffle_cause() {
         let mut state = single_pool_state(4);
+        add_eligible_slack(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         // Pool extra so the rotation swaps in a fresh validator
         // rather than just shrinking the shard.

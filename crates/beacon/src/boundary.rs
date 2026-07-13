@@ -118,6 +118,21 @@ pub fn source_boundary_qcs(
             }
             let (prior, chunk_end) =
                 rules::witness_chunk_bounds(state, shard, crossing.boundary_header());
+            // A live shard's fully folded crossing carries nothing new:
+            // its anchor is recorded and its chunk drained, so the fold
+            // reads a re-fold as a no-progress refresh. Re-sourcing it
+            // masks a halted shard as live — its miss counter keeps
+            // resetting — and once the crossing's window ages below the
+            // schedule floor it forces every verifier to abstain on any
+            // proposal carrying it, parking the beacon on the skip path.
+            // Terminal records are exempt as above: a merge child's folded
+            // terminal keeps sourcing until its parent composes.
+            let drained = state.boundaries.get(&shard).is_some_and(|b| {
+                b.terminal_epoch.is_none() && b.block_hash == qc.block_hash() && prior == chunk_end
+            });
+            if drained {
+                return None;
+            }
             // Coupling: only report a shard whose chunk we can supply.
             shard_source
                 .has_witness_chunk(shard, qc.block_hash(), prior, chunk_end)

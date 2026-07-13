@@ -14,7 +14,7 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    BlockHash, Hash, InFlightCount, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, QuiesceCut,
     RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
     SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt, WaveId,
@@ -453,6 +453,7 @@ impl ShardCoordinator {
             self.committed_state_root,
             self.latest_qc.as_ref(),
             &self.pending_blocks,
+            self.verification.verified_certified_blocks(),
         )
     }
 
@@ -1556,6 +1557,7 @@ impl ShardCoordinator {
             self.committed_hash,
             parent_block_hash,
             &self.pending_blocks,
+            self.verification.verified_certified_blocks(),
             self.local_shard,
             topology_schedule,
         )
@@ -2492,19 +2494,30 @@ impl ShardCoordinator {
             // Blocks the safe-vote rule declines must still run verification to
             // produce PreparedCommit. Parent-pruned blocks likewise run
             // verification but can't contribute in-flight accounting.
-            let chain = ChainView::new(
-                self.local_shard,
-                self.chain_origin,
-                self.committed_height,
-                self.committed_hash,
-                self.committed_state_root,
-                self.latest_qc.as_ref(),
-                &self.pending_blocks,
-            );
-            let skip_vote = match self
-                .verification
-                .classify_vote_in_flight(&chain, block_hash, block, !safe)
-            {
+            let (parent_in_flight, finalized_tx_count) = {
+                let chain = self.chain_view();
+                let parent_in_flight = if block.header().parent_qc().is_genesis() {
+                    Some(InFlightCount::ZERO)
+                } else {
+                    chain
+                        .get_header(block.header().parent_block_hash())
+                        .map(BlockHeader::in_flight)
+                };
+                let finalized_tx_count: u32 = chain.get_pending(block_hash).map_or(0, |p| {
+                    p.finalized_waves()
+                        .iter()
+                        .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
+                        .sum()
+                });
+                (parent_in_flight, finalized_tx_count)
+            };
+            let skip_vote = match self.verification.classify_vote_in_flight(
+                parent_in_flight,
+                finalized_tx_count,
+                block_hash,
+                block,
+                !safe,
+            ) {
                 InFlightCheck::Proceed => false,
                 InFlightCheck::SkipVote => true,
                 InFlightCheck::Abort => return vec![],
@@ -4652,6 +4665,14 @@ impl ShardCoordinator {
             .committee_timeout_power(committee, timeout.voter())
             .is_none()
         {
+            // A pending recovery's retained ex-member is the one line back
+            // to the halted tip: its share can't tally, but its carried
+            // `high_qc` names the certified frontier the fresh committee
+            // must extend, and a halted chain gossips nothing else. Harvest
+            // the tip from it instead of dropping outright.
+            if let Some(actions) = self.harvest_retained_tip(topology_schedule, timeout) {
+                return actions;
+            }
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         }
@@ -4680,6 +4701,63 @@ impl ShardCoordinator {
             timeout: timeout.clone(),
             voter_public_key,
         }]
+    }
+
+    /// Harvest the halted tip from a retained ex-member's timeout while a
+    /// recovery is pending on this shard, or `None` when the sender holds
+    /// no retained seat (the ordinary outsider drop applies).
+    ///
+    /// The recovery seats the fresh committee from a snap-synced anchor
+    /// with no QC past it, and the halted chain gossips nothing, so the
+    /// old committee's timeout retransmissions — resolved onto the fresh
+    /// committee by the recovery bridge — are the only signal carrying the
+    /// certified frontier. The share itself is never tallied. The carried
+    /// QC is adopted only if it verifies against the committee that signed
+    /// it (its block's header in hand); otherwise it serves as a fetch
+    /// target — sync admits the real certified blocks through the normal
+    /// verified pipeline, so a fabricated height costs a bounded fetch
+    /// round, never state.
+    fn harvest_retained_tip(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        timeout: &Timeout,
+    ) -> Option<Vec<Action>> {
+        topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .filter(|recovery| recovery.retained.contains(&timeout.voter()))?;
+        let carried = timeout.high_qc();
+        if carried.height() <= self.committed_height
+            || qc_weighted_timestamp_too_far_ahead(carried, self.now)
+        {
+            return Some(Vec::new());
+        }
+        info!(
+            validator = ?self.me,
+            voter = ?timeout.voter(),
+            carried_height = carried.height().inner(),
+            committed_height = self.committed_height.inner(),
+            "Harvesting the halted tip from a retained ex-member's timeout"
+        );
+        if carried.round() > self.high_qc_round()
+            && let Some(verified) = self.verify_qc_sync(topology_schedule, carried)
+        {
+            return Some(self.try_adopt_verified_qc(&verified));
+        }
+        // Sync to the committable prefix, not the certified tip: the tip
+        // block commits only under a successor QC, and on a halted chain
+        // none exists yet — a sync targeted at it never completes, and a
+        // committee parked in sync mode never drives the view changes
+        // that would produce that successor. A prefix within the applied
+        // frontier is already fetched and processed; its trailing block
+        // commits under the successor this committee must produce live,
+        // so re-syncing toward it would only park the pacemaker again.
+        let prefix = BlockHeight::new(carried.height().inner().saturating_sub(1));
+        if prefix <= self.committed_height || self.block_sync.sync_applied_height() >= prefix {
+            return Some(Vec::new());
+        }
+        Some(self.start_block_sync(prefix))
     }
 
     /// Tally a verified timeout: amplify at f+1 (Bracha), advance at 2f+1.
@@ -5027,7 +5105,7 @@ impl ShardCoordinator {
     /// periodically by the cleanup timer. Delegates the decision to
     /// [`BlockSyncManager::health_check`] and translates a trigger into a
     /// `start_sync`.
-    pub fn check_sync_health(&mut self) -> Vec<Action> {
+    pub fn check_sync_health(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
 
@@ -5042,6 +5120,20 @@ impl ShardCoordinator {
         ) {
             BlockSyncHealthDecision::Idle => vec![],
             BlockSyncHealthDecision::TriggerSync { target_height } => {
+                // While a halt recovery pends, a certified tip within the
+                // applied frontier commits only under the successor QC this
+                // committee must produce live — a sync toward it waits on
+                // deliveries that never come, with view changes suppressed
+                // the whole while. On a live chain the same re-entry stays
+                // legitimate: it re-fetches a certified sibling a peer
+                // served that never committed.
+                if topology_schedule
+                    .recovery_bridge(self.local_shard)
+                    .is_some()
+                    && self.block_sync.sync_applied_height() >= target_height
+                {
+                    return vec![];
+                }
                 self.start_block_sync(target_height)
             }
         }
@@ -5058,6 +5150,10 @@ impl ShardCoordinator {
         &mut self,
         local_shard: ShardId,
     ) -> Vec<ReadyStateRootVerification> {
+        let taken = self.verification.take_ready_state_root_verifications();
+        if taken.is_empty() {
+            return Vec::new();
+        }
         let chain = ChainView::new(
             local_shard,
             self.chain_origin,
@@ -5066,9 +5162,14 @@ impl ShardCoordinator {
             self.committed_state_root,
             self.latest_qc.as_ref(),
             &self.pending_blocks,
+            self.verification.verified_certified_blocks(),
         );
-        self.verification
-            .drain_ready_state_root_verifications(&chain)
+        taken
+            .into_iter()
+            .filter_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+            })
+            .collect()
     }
 
     /// Latch a proposal-retry attempt for after the current dispatch.
@@ -8210,7 +8311,7 @@ mod tests {
     fn test_start_sync_sets_syncing_flag() {
         // check_sync_health triggers StartBlockSync when the gap to latest_qc is
         // large (>3) without a pending commit.
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         assert!(!state.is_block_syncing());
 
@@ -8231,7 +8332,7 @@ mod tests {
                 WeightedTimestamp::from_millis(1000),
             ))
         });
-        let actions = state.check_sync_health();
+        let actions = state.check_sync_health(&topology);
 
         assert!(state.is_block_syncing());
         assert!(
