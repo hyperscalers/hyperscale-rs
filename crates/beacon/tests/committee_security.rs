@@ -9,15 +9,25 @@
 //! committee, replacement uniform over the unseated remainder, and the
 //! hypergeometric stationary law those rates imply.
 //!
+//! The shipped shuffle evicts the *longest-tenured* member, not a
+//! uniform one, yet its per-`k` transition rates match this chain: the
+//! committee is a FIFO queue of the last `shard_size` entrants, and a
+//! seat's corruptness is independent of its arrival order, so
+//! conditioned on `k` corrupt seats the oldest is corrupt with
+//! probability `k / shard_size` — the uniform victim's rate. These
+//! tests drive the fold with an *unsteered* seed (empty committed set),
+//! so the match is the natural kernel, the baseline the grind defence
+//! ([`randomness_grinding`]) departs from.
+//!
 //! At production parameters the compromise tail (~1e-10/event) is
 //! unobservable by simulation. These tests validate the *kernel* —
 //! measurable at every occupied corrupt count — and the note's chain
 //! arithmetic extrapolates the tail from it.
 //!
-//! The seeded cells run in CI as a regression net over
-//! victim-selection and pool-draw uniformity; the `#[ignore]`d
-//! generator prints the note's comparison tables (run with `--ignored`
-//! and `--no-capture`).
+//! The seeded cells run in CI as a regression net over the tenure
+//! victim's kernel and pool-draw uniformity; the `#[ignore]`d generator
+//! prints the note's comparison tables (run with `--ignored` and
+//! `--no-capture`).
 
 #![allow(clippy::cast_precision_loss)] // statistical tallies: every count ≪ 2^52
 
@@ -411,11 +421,13 @@ fn occupancy_tv(cell: &Cell, tally: &KernelTally) -> f64 {
 // ─── CI cells ────────────────────────────────────────────────────────────────
 
 /// The shipped shuffle's transition kernel matches the analysis note's
-/// birth–death chain at every well-visited corrupt count: victim
-/// uniform over the committee, replacement uniform over the pool.
-/// Instant-ready flips emulate prompt `Ready` witnesses so the victim
-/// set is the full committee — the note's idealization; the ready-lag
-/// deviation is measured separately. Seeded and deterministic.
+/// birth–death chain at every well-visited corrupt count. The note
+/// models a uniform victim; the fold evicts the longest-tenured, whose
+/// corruptness — being independent of tenure order — is corrupt with
+/// the same `k / seats` probability, so the per-`k` up/down rates agree.
+/// Instant-ready flips emulate prompt `Ready` witnesses so the whole
+/// committee is tenure-eligible; the ready-lag deviation is measured
+/// separately. Seeded and deterministic.
 #[test]
 fn shuffle_kernel_matches_birth_death_chain() {
     let cell = Cell {

@@ -9,19 +9,13 @@ use hyperscale_types::{
     SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
     ValidatorStatus,
 };
-use rand::RngExt;
 
-use crate::sampling::{prng_from, sample_committee};
+use crate::sampling::sample_committee;
 use crate::state::pool::pool_draw;
 
-/// Domain tag for [`run_shuffle_step`]'s victim-selection seed. Distinct
-/// from [`crate::sampling`]'s pool-draw tag so the two PRNG streams
-/// never collide on the same `(randomness, epoch, shard)` input.
-const DOMAIN_SHUFFLE_EXIT: &[u8] = b"hyperscale-shuffle-exit-v1";
-
-/// Domain tag for the halted-shard recovery draw seed. Distinct from the
-/// shuffle-exit and pool-draw tags so the full-committee re-draw never
-/// shares a PRNG stream with the trickle on the same
+/// Domain tag for the halted-shard recovery draw seed. Distinct from
+/// [`crate::sampling`]'s pool-draw tag so the full-committee re-draw
+/// never shares a PRNG stream with a same-epoch pool refill on the same
 /// `(randomness, epoch, shard)` input.
 const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
 
@@ -33,11 +27,18 @@ const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
 /// [`SHUFFLE_INTERVAL_EPOCHS`] epochs, keeping per-shard composition
 /// churn uniform and bounded.
 ///
-/// Shards iterate in sorted [`ShardId`] order; the victim within
-/// each shard is picked deterministically by hashing
-/// `(state.randomness, current_epoch, shard)` under a domain tag
-/// distinct from [`pool_draw`]'s. Shards whose `OnShard { ready: true }`
-/// member set is empty are skipped.
+/// Shards iterate in sorted [`ShardId`] order; the victim within each
+/// shard is its longest-tenured ready member — the smallest
+/// `(placed_at_epoch, ValidatorId)`, the id breaking ties within a
+/// cohort placed together. The fixed tenure is load-bearing: a victim
+/// drawn from `state.randomness` hands a randomness grinder a lever to
+/// steer eviction away from corrupt seats every interval, marching a
+/// targeted shard's corrupt count monotonically; on a tenure clock
+/// every seat ages out on schedule, so the count settles at the entrant
+/// draw's equilibrium instead. The entrant stays a seeded [`pool_draw`]
+/// — a deterministic entrant would make each shard's next placement
+/// predictable far ahead, handing an adaptive adversary a cheap target.
+/// Shards with no eligible victim are skipped.
 ///
 /// Ordering invariant — pinned by `shuffle_avoids_self_replacement`:
 ///
@@ -88,27 +89,28 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // stale `members` entry pointing at a different shard) fails
         // to a skipped shuffle rather than picking from the wrong
         // shard.
-        let ready_members: Vec<ValidatorId> = state
+        let victim = state
             .next_shard_committees
             .get(&shard)
             .expect("just iterated")
             .members
             .iter()
-            .copied()
-            .filter(|id| {
-                matches!(
-                    state.validators.get(id).map(|r| &r.status),
-                    Some(ValidatorStatus::OnShard { shard: s, ready: true, .. }) if *s == shard
-                )
+            .filter_map(|id| match state.validators.get(id).map(|r| r.status) {
+                Some(ValidatorStatus::OnShard {
+                    shard: s,
+                    ready: true,
+                    placed_at_epoch,
+                }) if s == shard => Some((placed_at_epoch, *id)),
+                _ => None,
             })
             // A pending merge's keepers must hold their child until they
             // sync the sibling half, so rotation skips them — their
             // departure would strand the merged committee below quorum.
-            .filter(|id| !state.is_merge_keeper(shard, *id))
-            .collect();
-        if ready_members.is_empty() {
+            .filter(|(_, id)| !state.is_merge_keeper(shard, *id))
+            .min();
+        let Some((_, victim)) = victim else {
             continue;
-        }
+        };
         // Rotation must never shrink a committee: with nobody `Pooled` to
         // refill the freed slot, removing the victim would permanently drop
         // the committee below `shard_size` — and below the BFT minimum at
@@ -129,15 +131,6 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         if state.beacon_eligible().len() <= MIN_BEACON_COMMITTEE_SIZE {
             break;
         }
-        let mut h = Hasher::new();
-        h.update(DOMAIN_SHUFFLE_EXIT);
-        h.update(state.randomness.as_bytes());
-        h.update(&epoch.inner().to_le_bytes());
-        h.update(&shard.inner().to_le_bytes());
-        let seed = *h.finalize().as_bytes();
-        let mut prng = prng_from(&seed);
-        let idx = prng.random_range(0..ready_members.len());
-        let victim = ready_members[idx];
 
         state
             .next_shard_committees
@@ -645,6 +638,16 @@ mod tests {
             .count();
         assert!(shard_0_diff <= 1, "shard 0 churned by {shard_0_diff}");
         assert!(shard_1_diff <= 1, "shard 1 churned by {shard_1_diff}");
+        // The genesis cohorts share a placement epoch, so tenure ties
+        // break by id: each shard rotates out its smallest member id.
+        assert!(
+            !final_shard_0.contains(&ValidatorId::new(0)),
+            "shard 0 evicts its longest-tenured member",
+        );
+        assert!(
+            !final_shard_1.contains(&ValidatorId::new(4)),
+            "shard 1 evicts its longest-tenured member",
+        );
     }
 
     /// Not-ready members are ineligible to be rotated out — only
@@ -690,12 +693,19 @@ mod tests {
                 "not-ready validator {not_ready_id} got shuffled out"
             );
         }
-        // Exactly one of the ready members (0 or 1) was rotated out.
+        // Exactly one of the ready members (0 or 1) was rotated out —
+        // the longer-tenured 0 (equal epochs, id breaks the tie).
         let rotated = initial_members
             .iter()
             .filter(|id| !state.next_shard_committees[&shard].members.contains(id))
             .count();
         assert_eq!(rotated, 1, "exactly one ready member rotates out");
+        assert!(
+            !state.next_shard_committees[&shard]
+                .members
+                .contains(&ValidatorId::new(0)),
+            "the longest-tenured ready member is the victim",
+        );
     }
 
     /// The per-shard `pool_draw` must not pick the just-rotated victim
@@ -728,10 +738,66 @@ mod tests {
         let pool_now = state.pooled_validators();
         assert_eq!(pool_now.len(), 1);
         let victim = pool_now[0];
+        assert_eq!(
+            victim,
+            ValidatorId::new(0),
+            "tenure picks the victim: equal epochs fall to the smallest id",
+        );
         assert!(initial_members.contains(&victim));
         assert!(!members.contains(&victim), "victim must not be re-drawn");
         assert!(matches!(
             state.validators[&victim].status,
+            ValidatorStatus::Pooled,
+        ));
+    }
+
+    /// The victim is the longest-tenured ready member — the smallest
+    /// `(placed_at_epoch, ValidatorId)` — so eviction rides a tenure
+    /// clock the folded randomness cannot steer, and members placed
+    /// together drain in id order.
+    #[test]
+    fn shuffle_evicts_the_longest_tenured_ready_member() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        add_eligible_slack(&mut state);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Distinct tenures, with ids 1 and 3 sharing the oldest epoch:
+        // the smaller id breaks the tie.
+        for (id, placed) in [(0u64, 9u64), (1, 3), (2, 7), (3, 3)] {
+            state
+                .validators
+                .get_mut(&ValidatorId::new(id))
+                .unwrap()
+                .status = ValidatorStatus::OnShard {
+                shard,
+                ready: true,
+                placed_at_epoch: Epoch::new(placed),
+            };
+        }
+        let spare = ValidatorId::new(99);
+        state
+            .validators
+            .insert(spare, validator_record(99, 0, ValidatorStatus::Pooled));
+        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        pool.validators.insert(spare);
+        pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
+        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+
+        apply_next_epoch(&mut state, &[]);
+
+        let members = &state.next_shard_committees[&shard].members;
+        assert!(
+            !members.contains(&ValidatorId::new(1)),
+            "the oldest tenure with the smallest id is evicted",
+        );
+        for kept in [0u64, 2, 3] {
+            assert!(
+                members.contains(&ValidatorId::new(kept)),
+                "member {kept} outranks the victim's tenure order",
+            );
+        }
+        assert!(matches!(
+            state.validators[&ValidatorId::new(1)].status,
             ValidatorStatus::Pooled,
         ));
     }
