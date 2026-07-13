@@ -283,7 +283,11 @@ pub(super) fn apply_shard_payload(
             // that over-committed while the validator was jailed
             // strands them — operator recourse is to deactivate
             // another validator or deposit more stake before lifting.
-            // Equivocation jails are permanent regardless.
+            // Equivocation jails are permanent regardless. A withholding
+            // jail holds for a full recency period — long enough that a
+            // grinder cannot return inside the window its resample weight
+            // would still suppress it — where a plain performance jail
+            // lifts after the short fixed cooldown.
             let rec = state.validators.get(id)?;
             let ValidatorStatus::Jailed {
                 since_epoch,
@@ -292,12 +296,12 @@ pub(super) fn apply_shard_payload(
             else {
                 return None;
             };
-            if reason == JailReason::Equivocation {
-                return None;
-            }
-            if state.current_epoch.inner()
-                < since_epoch.inner().saturating_add(JAIL_COOLDOWN_EPOCHS)
-            {
+            let cooldown = match reason {
+                JailReason::Equivocation => return None,
+                JailReason::Withholding => state.beacon_recency_period(),
+                JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
+            };
+            if state.current_epoch.inner() < since_epoch.inner().saturating_add(cooldown) {
                 return None;
             }
             let pool_id = rec.pool;
@@ -1163,6 +1167,110 @@ mod tests {
                 reason: JailReason::Performance,
             },
         );
+    }
+
+    /// A state seating `ready` `OnShard{ready}` validators (ids
+    /// `0..ready`) plus a validator (`jailed_id`) jailed under `reason`
+    /// since `since`. `ready / beacon_committee_size` is the recency
+    /// period the withholding cooldown reads.
+    fn state_with_ready_and_jailed(
+        ready: u64,
+        jailed_id: u64,
+        since: Epoch,
+        reason: JailReason,
+    ) -> BeaconState {
+        let mut state = single_pool_state(1);
+        let shard = ShardId::leaf(1, 0);
+        let pool_id = StakePoolId::new(0);
+        let mut members = Vec::new();
+        for i in 0..ready {
+            let id = ValidatorId::new(i);
+            members.push(id);
+            state.validators.insert(
+                id,
+                validator_record(
+                    i,
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard,
+                        ready: true,
+                        placed_at_epoch: Epoch::GENESIS,
+                    },
+                ),
+            );
+        }
+        state.next_shard_committees.insert(
+            shard,
+            ShardCommittee {
+                members: members.clone(),
+            },
+        );
+        state
+            .shard_committees
+            .insert(shard, ShardCommittee { members });
+        state.validators.insert(
+            ValidatorId::new(jailed_id),
+            validator_record(
+                jailed_id,
+                0,
+                ValidatorStatus::Jailed {
+                    since_epoch: since,
+                    reason,
+                },
+            ),
+        );
+        let pool = state.pools.get_mut(&pool_id).unwrap();
+        pool.validators = (0..ready)
+            .chain(std::iter::once(jailed_id))
+            .map(ValidatorId::new)
+            .collect();
+        pool.total_stake = Stake::from_attos(u128::from(ready + 1) * MIN_STAKE_FLOOR.attos());
+        state
+    }
+
+    /// A withholding jail is held for the recency period, longer than the
+    /// short performance cooldown: at a beacon size where `eligible/b`
+    /// exceeds `JAIL_COOLDOWN_EPOCHS`, an unjail attempted at the
+    /// performance cooldown — where a performance jail would lift — is
+    /// refused, so a jailed grinder cannot return while its resample
+    /// weight would still suppress it. Recovery once the full period
+    /// elapses is covered by `async_absence_jail_is_recoverable_after_cooldown`;
+    /// the performance-cooldown lift by `unjail_after_cooldown_returns_to_pooled`.
+    #[test]
+    fn withholding_jail_outlasts_the_performance_cooldown() {
+        let since = Epoch::new(5);
+        // 68 ready / b=4 → recency period 17, one past JAIL_COOLDOWN_EPOCHS.
+        let mut state = state_with_ready_and_jailed(68, 500, since, JailReason::Withholding);
+        let period = state.beacon_recency_period();
+        assert!(
+            period > JAIL_COOLDOWN_EPOCHS,
+            "fixture must make the recency period exceed the performance cooldown: \
+             period={period}, jail_cooldown={JAIL_COOLDOWN_EPOCHS}",
+        );
+
+        // `apply_witness_chunk` folds at `current_epoch + 1`, so the gate
+        // evaluates at the performance-cooldown boundary here — where a
+        // performance jail lifts. The refusal is decided at the cooldown
+        // check, before any pool-capacity gate.
+        state.current_epoch = Epoch::new(since.inner() + JAIL_COOLDOWN_EPOCHS - 1);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::Unjail {
+                id: ValidatorId::new(500),
+            }],
+        );
+        assert!(
+            effects.unjailed.is_empty(),
+            "a withholding jail must not lift at the short performance cooldown",
+        );
+        assert!(matches!(
+            state.validators.get(&ValidatorId::new(500)).unwrap().status,
+            ValidatorStatus::Jailed {
+                reason: JailReason::Withholding,
+                ..
+            },
+        ));
     }
 
     /// Equivocation jails never unjail, even past the cooldown.
