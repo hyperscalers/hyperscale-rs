@@ -108,9 +108,9 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 
     // ─── beacon committee sorted ──────────────────────────────────────────
     //
-    // Subsequent committees come from `sample_committee` which returns
-    // sorted ids; matching that at genesis keeps the field's contract
-    // uniform across the chain's lifetime.
+    // Subsequent committees come from the recency-weighted resample, which
+    // returns sorted ids; matching that at genesis keeps the field's
+    // contract uniform across the chain's lifetime.
     let mut committee = config.initial_beacon_committee.clone();
     committee.sort();
 
@@ -168,6 +168,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
+        last_beacon_service: BTreeMap::new(),
     };
     // Genesis placements are `ready: true` by construction, so the frozen
     // consensus subset starts as full membership; the witness window

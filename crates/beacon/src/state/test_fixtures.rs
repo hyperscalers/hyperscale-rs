@@ -90,6 +90,7 @@ pub fn empty_state() -> BeaconState {
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
+        last_beacon_service: BTreeMap::new(),
     }
 }
 

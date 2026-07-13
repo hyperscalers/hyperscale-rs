@@ -320,6 +320,7 @@ fn build_state(
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
+        last_beacon_service: BTreeMap::new(),
     };
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
     state

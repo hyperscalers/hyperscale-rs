@@ -577,6 +577,19 @@ pub struct BeaconState {
     /// `OnShard { shard }`. Crossing the jail threshold jails the
     /// validator under `JailReason::Performance` in the same epoch.
     pub miss_counters: BTreeMap<ValidatorId, u32>,
+    /// Epoch of each validator's most recent beacon-committee service,
+    /// stamped after every resample for the drawn members. The
+    /// recency-weighted resample reads it: a member's draw weight starts
+    /// low right after it serves and recovers additively over one full
+    /// committee turnover, rate-limiting how often any one validator sits
+    /// on the beacon committee so a grinder steering the draw cannot
+    /// over-seat its corrupt set. A validator absent here has never
+    /// served, and its baseline is `registered_at_epoch` — a fresh
+    /// registrant ramps in from low weight like a just-served member.
+    /// Never cleared: validator records persist for the chain's life
+    /// (ids are never reused), so the map needs no GC and a
+    /// deregister-then-reregister cannot reset the penalty.
+    pub last_beacon_service: BTreeMap<ValidatorId, Epoch>,
 }
 
 // ─── epoch effects ───────────────────────────────────────────────────────────
@@ -1456,6 +1469,7 @@ mod tests {
             pending_reshapes: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
+            last_beacon_service: BTreeMap::new(),
         }
     }
 

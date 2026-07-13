@@ -63,6 +63,61 @@ pub fn sample_committee(
     shuffled
 }
 
+/// Sample a beacon committee of up to `committee_size` from `weighted`,
+/// seeded by `randomness`, drawing each seat with probability
+/// proportional to the member's weight.
+///
+/// `weighted` pairs each eligible validator with a non-negative recency
+/// weight, sorted by `ValidatorId` so the draw is a pure function of the
+/// input. Higher-weight members — those that have not served the beacon
+/// committee recently — are preferred, so the draw rate-limits any one
+/// validator's service. When the eligible set fits the committee the
+/// weights are moot and all are returned sorted, matching
+/// [`sample_committee`].
+///
+/// Integer-only: the cumulative-weight draw uses `u64` arithmetic and the
+/// same `ChaCha20` stream as the uniform sampler, so the result is
+/// byte-identical across replicas (no floating point to diverge on).
+/// Draws seats one at a time without replacement; a member's weight is
+/// removed once it is picked. If every remaining weight is zero the seat
+/// falls back to a uniform draw, so the committee always fills.
+#[must_use]
+pub fn sample_committee_weighted(
+    weighted: &[(ValidatorId, u64)],
+    randomness: &[u8; 32],
+    committee_size: usize,
+) -> Vec<ValidatorId> {
+    if weighted.len() <= committee_size {
+        let mut out: Vec<ValidatorId> = weighted.iter().map(|(id, _)| *id).collect();
+        out.sort();
+        return out;
+    }
+
+    let mut prng = prng_from(randomness);
+    let mut pool = weighted.to_vec();
+    let mut chosen = Vec::with_capacity(committee_size);
+    for _ in 0..committee_size {
+        let total: u64 = pool.iter().map(|(_, w)| *w).sum();
+        let pick = if total == 0 {
+            prng.random_range(0..pool.len())
+        } else {
+            let mut r = prng.random_range(0..total);
+            let mut idx = pool.len() - 1;
+            for (i, (_, w)) in pool.iter().enumerate() {
+                if r < *w {
+                    idx = i;
+                    break;
+                }
+                r -= *w;
+            }
+            idx
+        };
+        chosen.push(pool.swap_remove(pick).0);
+    }
+    chosen.sort();
+    chosen
+}
+
 /// Pick one validator from `pool` for placement on `shard` at `epoch`.
 ///
 /// Uses `randomness` blended with `(epoch, shard)` so draws across
@@ -143,6 +198,79 @@ mod tests {
         let mut sorted = out.clone();
         sorted.sort();
         assert_eq!(out, sorted);
+    }
+
+    fn weighted(pairs: &[(u64, u64)]) -> Vec<(ValidatorId, u64)> {
+        pairs
+            .iter()
+            .map(|(id, w)| (ValidatorId::new(*id), *w))
+            .collect()
+    }
+
+    #[test]
+    fn weighted_returns_all_when_eligible_fits() {
+        let w = weighted(&[(3, 5), (1, 0), (2, 100)]);
+        let out = sample_committee_weighted(&w, &[0u8; 32], 8);
+        assert_eq!(out, ids(1..4)); // sorted, weights ignored
+    }
+
+    #[test]
+    fn weighted_is_deterministic_for_same_seed() {
+        let w = weighted(&[(0, 3), (1, 3), (2, 3), (3, 3), (4, 3), (5, 3)]);
+        let a = sample_committee_weighted(&w, &[0xDE; 32], 3);
+        let b = sample_committee_weighted(&w, &[0xDE; 32], 3);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 3);
+    }
+
+    #[test]
+    fn weighted_output_is_sorted_and_distinct() {
+        let w = weighted(&[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+        let out = sample_committee_weighted(&w, &[0x42; 32], 4);
+        let mut sorted = out.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(out, sorted, "output is sorted with no repeats");
+        assert_eq!(out.len(), 4);
+    }
+
+    /// High-weight members dominate the draw: two heavy members among many
+    /// light ones fill nearly every committee across seeds.
+    #[test]
+    fn weighted_prefers_high_weight_members() {
+        // ids 0,1 weigh 200; ids 2..10 weigh 1.
+        let mut pairs: Vec<(u64, u64)> = vec![(0, 200), (1, 200)];
+        pairs.extend((2..10).map(|i| (i, 1)));
+        let w = weighted(&pairs);
+
+        let heavy = [ValidatorId::new(0), ValidatorId::new(1)];
+        let mut both_heavy = 0;
+        let trials = 200u32;
+        for s in 0..trials {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&s.to_le_bytes());
+            let out = sample_committee_weighted(&w, &seed, 2);
+            if out.iter().all(|id| heavy.contains(id)) {
+                both_heavy += 1;
+            }
+        }
+        // Each seat picks a heavy member with prob 400/408; both seats
+        // heavy is ~0.96, so the vast majority of trials are all-heavy.
+        assert!(
+            both_heavy >= 180,
+            "high-weight members should dominate: {both_heavy}/{trials} all-heavy",
+        );
+    }
+
+    /// All-zero weights fall back to a uniform draw so the committee still
+    /// fills to `committee_size` with distinct members.
+    #[test]
+    fn weighted_fills_committee_when_all_weights_zero() {
+        let w = weighted(&[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+        let out = sample_committee_weighted(&w, &[0x7C; 32], 3);
+        assert_eq!(out.len(), 3);
+        let distinct: std::collections::BTreeSet<_> = out.iter().copied().collect();
+        assert_eq!(distinct.len(), 3, "the fallback draws distinct members");
     }
 
     #[test]
