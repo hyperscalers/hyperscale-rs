@@ -646,7 +646,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use super::*;
-    use crate::{HaltRecovery, NetworkDefinition, ValidatorSet};
+    use crate::{BlockHeight, HaltRecovery, NetworkDefinition, ValidatorSet};
 
     fn snapshot() -> Arc<TopologySnapshot> {
         Arc::new(TopologySnapshot::new(
@@ -1052,6 +1052,7 @@ mod tests {
                     HaltRecovery {
                         rotated_at: Epoch::new(2),
                         retained: retained.clone(),
+                        attested_frontier: BlockHeight::GENESIS,
                     },
                 ))
                 .collect(),
@@ -1110,6 +1111,7 @@ mod tests {
                     HaltRecovery {
                         rotated_at: Epoch::new(20),
                         retained: old.clone(),
+                        attested_frontier: BlockHeight::GENESIS,
                     },
                 ))
                 .collect(),
