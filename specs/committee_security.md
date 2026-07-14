@@ -532,16 +532,60 @@ same interval that speeds the grind, §6 Rider 1). So it is a **defense-in-depth
 layer that widens the closed band, not a design-point close.
 
 **Finding 9 — liveness (f+1) and safety (2f+1) are different outcomes with
-opposite defenses: f+1 is recoverable, 2f+1 is terminal.** Reaching f+1 corrupt
-on a shard is where BFT guarantees lapse, but the two thresholds are not
-symmetric. The **liveness** attack — f+1 corrupt withhold, leaving ≤ 2f honest,
-short of the 2f+1 quorum — halts the shard: a non-cascading nuisance (other
-shards keep committing; only cross-shard 2PC transactions touching the halted
-shard stall or deadline-abort), recoverable, and not monetizable (griefing, not
-theft). It is what **detect-and-rotate** (Finding 10) recovers, with at most a
-bounded finality-latency residual — an external consumer that acts on the halted
-branch before the evidence propagates, one-shot and defused by waiting for
-finality.
+opposite defenses: f+1 is recoverable, 2f+1 is terminal — but f+1 carries a
+bounded cross-shard exposure the recovery must fence, not a clean nuisance.**
+Reaching f+1 corrupt on a shard is where BFT guarantees lapse, but the two
+thresholds are not symmetric. The **liveness** attack — f+1 corrupt withhold,
+leaving ≤ 2f honest, short of the 2f+1 quorum — halts the shard: other shards
+keep committing, and the local chain simply stops. It is what
+**detect-and-rotate** (Finding 10) recovers.
+
+But "non-cascading" was too strong, and the correction is load-bearing (Model G,
+`recovery_bridge` and `cross_shard_freeze`, finding G-1). Two facts. First, the
+halted committee is beyond f *by construction* — that is why it halted — so with
+one lagging honest member (an unfolded beacon, reachable under partition) the
+corrupt f+1..2f can still form a quorum and extend the halted tip on an orphan
+branch. Its QC weighted timestamp is the clamped **mean** of wall-clock vote
+stamps ([`vote_set.rs`](../crates/shard/src/vote_set.rs)), and a beyond-f
+committee is an honest *minority* in its own quorum, so the corrupt drag that
+mean arbitrarily below wall-clock — past the one-window tolerance the recovery
+bridge's certified re-bind is calibrated for (that tolerance assumes an
+adversarial *minority*, the ≤ f case). The orphan resolves the *old* committee at
+a folded replica and its signatures verify: a stale two-chain commit past the
+tip. Second, and worse, that orphan **exports cross-shard**: a consuming shard
+resolves the source committee for an execution certificate by its anchor window
+([`lookup(ec.vote_anchor_ts())`](../crates/execution/src/coordinator.rs), the
+plain lookup, no recovery bridge), so a stale-anchored forged EC resolves the old
+committee and finalizes a wave — an INV-EXEC-1 break that **cascades**. So the
+f+1 halt is not the clean, non-monetizable nuisance the first cut claimed; during
+the recovery window it is a cross-shard cascade vector, the very thing this
+finding reserved for 2f+1.
+
+What bounds it is a **beacon-mandated freeze** (Finding 10, and the
+[beacon-detected-shard-halt-recovery plan](../.plans/beacon-shard-halt-recovery.md)):
+at the detection fold the beacon stamps a cutoff, folded network-wide, past which
+no shard accepts a new old-committee cross-shard artifact from the halted shard
+above the beacon-attested frontier. The beacon is the only actor honest-majority
+(pool ratification), globally observed, and unforgeable by the halted committee,
+so the cutoff is authenticated, not a per-consumer guess; structurally it is a
+shard termination (the frozen committee is a cut, in-flight waves abort
+— abort-dominant, so safe — attested finalizations carry, the fresh committee is
+the successor), reusing the reshape/straddler machinery. `cross_shard_freeze`
+checks it: with the fence, no new forgery crosses the cut and the residual is
+bounded to the pre-fold detection-latency window; without it (the shipped state),
+the leak is unbounded. The residual is genuinely irreducible — pre-freeze exports
+are already finalized on honest shards and cannot be un-finalized, and the
+attested frontier the fresh committee inherits is itself poisonable (a consumer
+cannot distinguish a forged S-EC from a legitimate one). It is contained only in
+that at f+1..2f the honest S co-signers recompute results (INV-DET), so what leaks
+is *chain choice* between two internally-correct chains, not a forged execution
+result: the stake-minting cascade still needs 2f+1 or tricked validators. So f+1
+is a **recoverable liveness halt plus a bounded cross-shard exposure window the
+freeze closes**, with the residual carried by prevention — which makes
+`HALT_THRESHOLD` a safety parameter (a shorter window is a smaller exposure), not
+only a liveness-latency knob, and makes the grind-hardening stack (b=16, FIFO,
+jail-on-first, recency, pool hygiene) load-bearing for *safety* in this regime,
+not merely defense-in-depth.
 
 The **safety** threshold is a different animal. The equivocation route (f+1
 double-signing two conflicting commits) is self-proving, so INV-SHARD-1's quorum
@@ -612,6 +656,17 @@ Design constraints, on the spec's terms:
   last-committed state (from the halted committee's honest 2f, or historical
   JMT), reusing the reshape make-before-break machinery. That gap is the
   residual outage.
+- **The re-draw carries a cross-shard freeze** — the same detection fold that
+  re-draws the committee revokes the old committee's cross-shard authority
+  network-wide (Finding 9): past the freeze, no shard accepts a new
+  old-committee execution certificate from the halted shard above the
+  beacon-attested frontier. Without it the orphan a beyond-f committee can still
+  certify (Finding 9) exports a forged wave finalization and cascades. The
+  freeze is authenticated (a fold of the committed block, INV-BEACON-2) and
+  structured as a shard termination — in-flight waves abort (abort-dominant, so
+  safe), attested finalizations carry to the fresh committee — reusing the
+  reshape/straddler machinery. It closes the leak *forward*; pre-freeze exports
+  are irreversible, so the residual is the detection-latency window.
 - **It rides beacon liveness** — the rotation is a fold of the committed beacon
   block (INV-BEACON-2), firing as long as the beacon commits (pool ratification,
   Finding 6). An adversary would have to halt the beacon itself, a separate,
