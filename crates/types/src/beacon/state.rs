@@ -394,6 +394,16 @@ pub struct HaltRecovery {
     /// committee into the successor recovery's retention, so every
     /// member that might hold the tip stays reachable.
     pub retained: Vec<ValidatorId>,
+    /// The last boundary height the beacon had folded for the shard when
+    /// the recovery was stamped — the beacon-authenticated frontier below
+    /// which the retained committee's certified history is legitimate.
+    /// Above it, an old-committee artifact is one the beyond-f committee
+    /// could only have forged after the halt, so the local bridge and
+    /// cross-shard consumers reject it once they fold this record. It is
+    /// unforgeable by the halted committee: a pure function of the
+    /// committed beacon boundaries, not a claim the retained committee
+    /// makes about its own tip.
+    pub attested_frontier: BlockHeight,
 }
 
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.

@@ -1235,6 +1235,7 @@ mod tests {
             HaltRecovery {
                 rotated_at: Epoch::new(1),
                 retained: Vec::new(),
+                attested_frontier: BlockHeight::GENESIS,
             },
         );
 

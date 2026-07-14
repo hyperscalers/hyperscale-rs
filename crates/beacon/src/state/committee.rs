@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, CommitteeTransition, Epoch, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE,
+    BeaconState, BlockHeight, CommitteeTransition, Epoch, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE,
     PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
     ValidatorStatus,
 };
@@ -178,6 +178,15 @@ pub(super) fn recover_halted_committees(state: &mut BeaconState, halted: &BTreeS
 
 fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
     let size = state.chain_config.shard_size as usize;
+    // The beacon-authenticated frontier: the last boundary height folded
+    // for the shard. A halted shard folds no new crossing, so this is
+    // fixed for the halt's duration and equal across a stalled recovery's
+    // successors. A shard reaching recovery always has a boundary record
+    // (detection reads it); the default only guards a logically dead path.
+    let attested_frontier = state
+        .boundaries
+        .get(&shard)
+        .map_or(BlockHeight::GENESIS, |b| b.height);
     let pool = state.pooled_validators();
     if pool.len() < size {
         tracing::warn!(
@@ -252,6 +261,7 @@ fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
         HaltRecovery {
             rotated_at: state.current_epoch,
             retained,
+            attested_frontier,
         },
     );
 }
@@ -1440,6 +1450,12 @@ mod tests {
             old,
         );
         assert_eq!(
+            recovery.attested_frontier,
+            BlockHeight::new(5),
+            "the freeze records the last folded boundary height as the \
+             frontier below which the old committee's history is legitimate",
+        );
+        assert_eq!(
             state.boundaries[&s0].consecutive_misses, 0,
             "the recovery resets the miss count for a fresh threshold",
         );
@@ -1548,6 +1564,7 @@ mod tests {
             HaltRecovery {
                 rotated_at: Epoch::GENESIS,
                 retained: vec![ValidatorId::new(9)],
+                attested_frontier: BlockHeight::GENESIS,
             },
         );
 
