@@ -5146,27 +5146,17 @@ impl ShardCoordinator {
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Drain state root verifications that are ready to dispatch. Thin
-    /// wrapper over [`VerificationPipeline::drain_ready_state_root_verifications`]
-    /// that supplies the chain view and pending-block map.
-    pub fn drain_ready_state_root_verifications(
-        &mut self,
-        local_shard: ShardId,
-    ) -> Vec<ReadyStateRootVerification> {
+    /// Drain state root verifications that are ready to dispatch: takes the
+    /// pipeline's ready set via
+    /// [`VerificationPipeline::take_ready_state_root_verifications`] and
+    /// resolves each against the chain view via
+    /// [`VerificationPipeline::resolve_ready_state_root_verification`].
+    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
         let taken = self.verification.take_ready_state_root_verifications();
         if taken.is_empty() {
             return Vec::new();
         }
-        let chain = ChainView::new(
-            local_shard,
-            self.chain_origin,
-            self.committed_height,
-            self.committed_hash,
-            self.committed_state_root,
-            self.latest_qc.as_ref(),
-            &self.pending_blocks,
-            self.verification.verified_certified_blocks(),
-        );
+        let chain = self.chain_view();
         taken
             .into_iter()
             .filter_map(|pending| {
