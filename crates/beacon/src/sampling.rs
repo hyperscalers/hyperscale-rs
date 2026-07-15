@@ -96,8 +96,11 @@ pub fn sample_committee_weighted(
     let mut prng = prng_from(randomness);
     let mut pool = weighted.to_vec();
     let mut chosen = Vec::with_capacity(committee_size);
+    // Maintained across draws — subtracting the picked weight is exact
+    // `u64` bookkeeping, so each seat sees the same total a fresh sum
+    // over the remaining pool would.
+    let mut total: u64 = pool.iter().map(|(_, w)| *w).sum();
     for _ in 0..committee_size {
-        let total: u64 = pool.iter().map(|(_, w)| *w).sum();
         let pick = if total == 0 {
             prng.random_range(0..pool.len())
         } else {
@@ -112,7 +115,9 @@ pub fn sample_committee_weighted(
             }
             idx
         };
-        chosen.push(pool.swap_remove(pick).0);
+        let (id, weight) = pool.swap_remove(pick);
+        total -= weight;
+        chosen.push(id);
     }
     chosen.sort();
     chosen

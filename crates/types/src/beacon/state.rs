@@ -952,16 +952,37 @@ impl BeaconState {
     /// set at the identical fold.
     #[must_use]
     pub fn halted_shards(&self) -> BTreeSet<ShardId> {
+        let reshape_involved = self.reshape_involved_shards();
         self.boundaries
             .iter()
             .filter(|(shard, b)| {
                 b.terminal_epoch.is_none()
                     && !(b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS)
-                    && !self.reshape_involves(**shard)
+                    && !reshape_involved.contains(*shard)
                     && u64::from(b.consecutive_misses) > HALT_THRESHOLD_EPOCHS
             })
             .map(|(shard, _)| *shard)
             .collect()
+    }
+
+    /// Every shard a pending reshape involves — [`Self::reshape_involves`]
+    /// as a set, for callers testing many shards against one fold's
+    /// pending reshapes.
+    fn reshape_involved_shards(&self) -> BTreeSet<ShardId> {
+        let mut involved = BTreeSet::new();
+        for (target, reshape) in &self.pending_reshapes {
+            match reshape {
+                PendingReshape::Split { .. } => {
+                    involved.insert(*target);
+                }
+                PendingReshape::Merge { .. } => {
+                    let (left, right) = target.children();
+                    involved.insert(left);
+                    involved.insert(right);
+                }
+            }
+        }
+        involved
     }
 
     /// Validators eligible to serve on the beacon committee: status is
@@ -1002,6 +1023,20 @@ impl BeaconState {
     /// deterministic Fisher–Yates input downstream.
     #[must_use]
     pub fn beacon_eligible(&self) -> Vec<ValidatorId> {
+        self.beacon_eligible_ids().collect()
+    }
+
+    /// [`Self::beacon_eligible`]'s size without materializing the set,
+    /// for the per-shard shuffle floor and the recency period — both
+    /// consume only the count.
+    #[must_use]
+    pub fn beacon_eligible_count(&self) -> usize {
+        self.beacon_eligible_ids().count()
+    }
+
+    /// The eligibility predicate behind [`Self::beacon_eligible`], in
+    /// `ValidatorId` order.
+    fn beacon_eligible_ids(&self) -> impl Iterator<Item = ValidatorId> + '_ {
         self.validators
             .iter()
             .filter(|(_, r)| match r.status {
@@ -1020,7 +1055,6 @@ impl BeaconState {
                 _ => false,
             })
             .map(|(id, _)| *id)
-            .collect()
     }
 
     /// The recency period — `beacon_eligible / beacon_committee_size`
@@ -1037,8 +1071,16 @@ impl BeaconState {
     /// suppress it.
     #[must_use]
     pub fn beacon_recency_period(&self) -> u64 {
+        self.recency_period_for(self.beacon_eligible_count())
+    }
+
+    /// [`Self::beacon_recency_period`] for a pre-computed eligible count,
+    /// so a caller that already materialized the eligible set derives the
+    /// period without a second scan.
+    #[must_use]
+    pub fn recency_period_for(&self, eligible_count: usize) -> u64 {
         let b = u64::from(self.chain_config.beacon_committee_size.max(1));
-        (self.beacon_eligible().len() as u64 / b).max(1)
+        (eligible_count as u64 / b).max(1)
     }
 
     /// Resolve the beacon committee into `(validator_id, pubkey)` pairs

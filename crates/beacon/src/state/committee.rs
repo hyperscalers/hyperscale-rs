@@ -59,6 +59,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         return;
     }
     let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
+    let mut eligible_count = state.beacon_eligible_count();
     for shard in shard_ids {
         // A pending split's parent members all carry over to its children
         // as parent halves, ready by construction — the readiness the
@@ -127,8 +128,10 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // At the BFT minimum that dip parks the beacon on the skip path,
         // and a skip epoch folds no Ready witness, so the dip sustains
         // itself until the ready timeout clears it. Hold rotation until
-        // the eligible set has slack to give.
-        if state.beacon_eligible().len() <= MIN_BEACON_COMMITTEE_SIZE {
+        // the eligible set has slack to give. The count is cached across
+        // shards — only a completed rotation mutates eligibility — and
+        // recomputed after each one.
+        if eligible_count <= MIN_BEACON_COMMITTEE_SIZE {
             break;
         }
 
@@ -144,6 +147,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
             .get_mut(&victim)
             .expect("victim is in state.validators")
             .status = ValidatorStatus::Pooled;
+        eligible_count = state.beacon_eligible_count();
     }
 }
 
@@ -361,13 +365,15 @@ pub(super) fn resample_beacon_committee(
     cause: TransitionCause,
 ) -> CommitteeTransition {
     let prior = std::mem::take(&mut state.committee);
-    let eligible: Vec<ValidatorId> = state
-        .beacon_eligible()
+    let all_eligible = state.beacon_eligible();
+    // The period counts the full eligible set, not the excluded-filtered
+    // draw pool.
+    let cooldown = state.recency_period_for(all_eligible.len());
+    let eligible: Vec<ValidatorId> = all_eligible
         .into_iter()
         .filter(|id| !excluded.contains(id))
         .collect();
     let committee_size = state.chain_config.beacon_committee_size as usize;
-    let cooldown = state.beacon_recency_period();
     let now = state.current_epoch.inner();
     let weighted: Vec<(ValidatorId, u64)> = eligible
         .iter()
