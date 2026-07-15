@@ -283,7 +283,23 @@ impl RemoteHeaderCoordinator {
         // dropping these would blind the fold to the crossing.
         // Recovery-bridged: a halt recovery's bridge header is anchored
         // below the bridge window but certified at or past it, and
-        // verifies against the fresh committee.
+        // verifies against the fresh committee. A header that instead
+        // resolves the retained committee through the suffix band is the
+        // orphan a beyond-f cohort forged extending the halted tip; drop it
+        // rather than admit a forged header into the routing view.
+        if topology_schedule.recovery_resolves_retained(
+            shard,
+            certified_header.header().parent_qc().weighted_timestamp(),
+            certified_header.qc().weighted_timestamp(),
+        ) {
+            warn!(
+                shard = shard.inner(),
+                height = height.inner(),
+                sender = sender.inner(),
+                "Dropping remote header that resolves the retained committee during a halt recovery"
+            );
+            return vec![];
+        }
         let committee = match topology_schedule
             .lookup_for_shard_certified(
                 shard,
@@ -386,6 +402,22 @@ impl RemoteHeaderCoordinator {
                     };
                     let anchor = next_header.header().parent_qc().weighted_timestamp();
                     let qc_wt = next_header.qc().weighted_timestamp();
+                    // A recovery folded (or advanced) after this header
+                    // buffered can turn it into a suffix-band orphan; drop it
+                    // and drain the next candidate.
+                    if topology_schedule.recovery_resolves_retained(shard, anchor, qc_wt) {
+                        warn!(
+                            shard = shard.inner(),
+                            height = height.inner(),
+                            sender = next_sender.inner(),
+                            "Dropping buffered remote header that resolves the retained \
+                             committee during a halt recovery"
+                        );
+                        if let Some(sender_map) = self.pending.get_mut(&key) {
+                            sender_map.remove(&next_sender);
+                        }
+                        continue;
+                    }
                     match topology_schedule
                         .lookup_for_shard_certified(shard, anchor, qc_wt)
                         .0

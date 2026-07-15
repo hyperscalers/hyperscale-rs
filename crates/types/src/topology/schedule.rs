@@ -355,6 +355,34 @@ impl TopologySchedule {
             .is_some_and(|recovery| height > recovery.attested_frontier)
     }
 
+    /// During a pending recovery, whether a certified artifact resolves the
+    /// **retained** (old) committee through the suffix band: a stale anchor
+    /// (below the bridge) whose QC timestamp also sits below the bridge, so
+    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) does
+    /// not re-bind it to the fresh committee.
+    ///
+    /// The fresh committee's own artifacts either re-bind (a bridge block,
+    /// anchored below the bridge but certified at or past it) or anchor at a
+    /// current window (resolving the fresh committee directly), so both are
+    /// false here. What is true here is exactly a stale-anchored,
+    /// suffix-band-stamped artifact — the halted suffix, or an orphan the
+    /// beyond-f retained committee forged extending the halted tip. Callers
+    /// that only ever see *new* production during a recovery (the beacon's
+    /// boundary fold — the suffix has no epoch crossing of its own) use this
+    /// to reject the orphan, since the only legitimate new crossing is the
+    /// fresh committee's. False when no recovery is pending for the shard.
+    #[must_use]
+    pub fn recovery_resolves_retained(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> bool {
+        self.recovery_bridge(shard).is_some_and(|bridge| {
+            self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
+        })
+    }
+
     /// The committee of the newest retained window that carries `shard` —
     /// for a live shard, the lookahead entry. What the recovery bridge
     /// resolves: the fresh committee is finalized into the lookahead at
@@ -371,12 +399,16 @@ impl TopologySchedule {
     /// [`lookup_for_shard`](Self::lookup_for_shard) for **live** consensus
     /// work — proposals, votes, and the tip committee. A recovering
     /// shard's stale anchor resolves the fresh committee via the recovery
-    /// bridge (see [`recovery_bridge`](Self::recovery_bridge)); the old
-    /// committee resolves itself out of authority at the same fold, which
-    /// is what stops a halted cohort from certifying a competing chain
-    /// once the recovery lands. Never used to verify certified history —
-    /// the halted suffix still verifies against its own windows via
-    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified).
+    /// bridge (see [`recovery_bridge`](Self::recovery_bridge)), so an
+    /// honest folded member proposes and votes only on the fresh chain and
+    /// never on a competing extension the retained cohort gossips. This
+    /// binds the *honest* side; it does not disarm the retained committee,
+    /// which is beyond f by construction (that is why the shard halted) and
+    /// can still certify a competing chain from its own members plus any
+    /// lagging honest one. That orphan is caught on the verifier side, not
+    /// here — see [`lookup_for_shard_certified`](Self::lookup_for_shard_certified).
+    /// Never used to verify certified history — the halted suffix verifies
+    /// against its own windows via the certified path.
     #[must_use]
     pub fn lookup_for_shard_live(
         &self,
@@ -411,15 +443,26 @@ impl TopologySchedule {
     /// or after it, and resolves the fresh committee; the halted suffix —
     /// certified while the old committee still governed, so its QC
     /// timestamps sit a full halt gap below the bridge — resolves by its
-    /// anchor as ever. The QC bound tolerates one window below the
-    /// bridge: the seating-window quiesce gates each vote by its voter's
-    /// own clock, but a skewed or adversarial minority stamp can drag the
-    /// aggregated QC timestamp marginally under the window it opened in,
-    /// and the halt gap keeps the tolerance unambiguous. A replica that
-    /// has not yet folded the recovery resolves a bridge block's anchor
-    /// window instead and drops it as unverifiable; its fetch retries
-    /// succeed once its beacon catches up, the same self-healing as any
-    /// beacon lag.
+    /// anchor as ever. The QC bound tolerates one window below the bridge
+    /// because the seating-window quiesce holds each honest vote at or
+    /// past the bridge window, so an honest-majority quorum's mean stamp
+    /// cannot fall more than a skew window under it.
+    ///
+    /// That tolerance is calibrated for an adversarial *minority* in the
+    /// quorum, and the retained committee is beyond f — an honest minority
+    /// in its own quorum — so it can drag the aggregated (mean) timestamp
+    /// arbitrarily below the bridge and land an orphan extending the
+    /// halted tip back in the suffix band, where this resolves the old
+    /// committee and its signatures verify. The re-bind narrows the local
+    /// orphan but does not close it. The safety-critical leak — a forged
+    /// wave finalization exporting cross-shard — is closed at the height
+    /// gate [`recovery_fences`](Self::recovery_fences); a purely local
+    /// orphan fork surfaces as an INV-STATE-5 commit-linkage divergence
+    /// and self-halts (a re-fired recovery, a liveness cost), rather than
+    /// forking silently. A replica that has not yet folded the recovery
+    /// resolves a bridge block's anchor window instead and drops it as
+    /// unverifiable; its fetch retries succeed once its beacon catches up,
+    /// the same self-healing as any beacon lag.
     #[must_use]
     pub fn lookup_for_shard_certified(
         &self,
@@ -1187,13 +1230,25 @@ mod tests {
             fresh,
         );
 
-        // Without the recovery record, the live path is the plain lookup.
+        // `recovery_resolves_retained` isolates the orphan shape — a stale
+        // anchor whose QC also sits in the suffix band, which the beacon
+        // boundary fold and remote-header verify reject. The suffix/orphan
+        // shape is true; a bridge block (re-bound) and a current anchor are
+        // false.
+        assert!(sched.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
+        assert!(!sched.recovery_resolves_retained(shard, stale_anchor, bridge_qc));
+        assert!(!sched.recovery_resolves_retained(shard, stale_anchor, edge_qc));
+        assert!(!sched.recovery_resolves_retained(shard, bridge_qc, bridge_qc));
+
+        // Without the recovery record, the live path is the plain lookup
+        // and the retained-resolution predicate is inert.
         let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
         plain.insert(Epoch::new(21), snap(&fresh));
         assert_eq!(
             committee_of(plain.lookup_for_shard_live(shard, stale_anchor).0),
             old,
         );
+        assert!(!plain.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
     }
 
     #[test]

@@ -245,6 +245,25 @@ fn boundary_qc_authentic(
     if qc.block_hash() != boundary_header.hash() {
         return false;
     }
+    // The only legitimate boundary crossing during a halt recovery is the
+    // fresh committee's — the one that completes the recovery, which
+    // re-binds (a stale anchor certified at or past the bridge) or anchors
+    // at a current window. The halted suffix has no epoch crossing of its
+    // own, so a crossing that resolves the retained committee through the
+    // suffix band is the orphan a beyond-f cohort forged extending the
+    // halted tip. Folding it would clear the recovery and drop the
+    // cross-shard freeze, so reject it here.
+    if topology_schedule.recovery_resolves_retained(
+        shard,
+        boundary_header.parent_qc().weighted_timestamp(),
+        qc.weighted_timestamp(),
+    ) {
+        warn!(
+            shard = shard.inner(),
+            "Rejecting boundary QC that resolves the retained committee during a halt recovery"
+        );
+        return false;
+    }
     let snapshot = match topology_schedule.lookup_for_shard_certified(
         shard,
         boundary_header.parent_qc().weighted_timestamp(),
