@@ -1,5 +1,4 @@
-//! Executable model of the beacon randomness grind and its defences
-//! (`specs/committee_security.md` §10).
+//! Executable model of the beacon randomness grind and its defences.
 //!
 //! The next-epoch beacon seed is `BLAKE3(prev ‖ VRF outputs of the
 //! committed beacon-committee proposals)`, rolled and then consumed —
@@ -488,8 +487,8 @@ impl EventOutcome {
 struct Adversary {
     /// Cap on grinders omitted from any committed subset. `u32::MAX`
     /// leaves the full `2^t` grind open; a small cap models a grinder
-    /// that reveals all but a rotating few, the leaky-bucket evader —
-    /// which jail-on-first no longer spares (any absence jails).
+    /// that reveals all but a rotating few, spreading its absence thin —
+    /// jail-on-first spares no absence, however sparse.
     omit_cap: u32,
     /// Tie-break among equal-gain subsets. `false` prefers *fewer*
     /// includes — a grinder that withholds by default. `true` prefers
@@ -505,8 +504,8 @@ impl Adversary {
         minimize_absence: false,
     };
     /// Omit at most one rotating grinder and minimise absence — the
-    /// leaky-bucket evader. Under jail-on-first the single omit still
-    /// jails its proposer, so the evasion no longer holds.
+    /// thinnest possible grind. The single omit still jails its
+    /// proposer on the first absence.
     const ROTATE_ONE: Self = Self {
         omit_cap: 1,
         minimize_absence: true,
@@ -898,11 +897,11 @@ fn jail_on_first_burns_the_withholding_grind() {
     );
 }
 
-/// The leaky-bucket evader is closed too. A grinder that omits at most
-/// one *rotating* proposal per event held its per-grinder absence near
-/// `1/t` — below the old strike crossover — but jail-on-first has no
-/// crossover: the single omitted proposal jails its proposer on the
-/// first absence, so even the rotating grind burns out.
+/// The thinnest grind is closed too. A grinder that omits at most one
+/// *rotating* proposal per event holds its per-grinder absence near
+/// `1/t`, but jail-on-first offers no absence rate low enough to hide
+/// under: the single omitted proposal jails its proposer on the first
+/// absence, so even the rotating grind burns out.
 #[test]
 fn jail_on_first_closes_the_rotate_one_evader() {
     let n = 64u32;
@@ -927,7 +926,7 @@ fn jail_on_first_closes_the_rotate_one_evader() {
         .collect();
     assert!(
         !jailed.is_empty(),
-        "the rotating single omit still jails its proposer — no crossover to hide under",
+        "the rotating single omit still jails its proposer — sparse absence is still absence",
     );
     assert!(
         jailed.iter().all(|v| ctx.corrupt.contains(v)),
@@ -941,7 +940,7 @@ fn jail_on_first_closes_the_rotate_one_evader() {
 }
 
 /// The grind is a pure function of its seed: two runs with the same seed
-/// land on byte-identical committees and randomness (INV-DET-4).
+/// land on byte-identical committees and randomness.
 #[test]
 fn grind_is_deterministic_for_a_fixed_seed() {
     let params = GrindParams {

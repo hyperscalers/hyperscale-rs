@@ -491,9 +491,9 @@ impl TopologySchedule {
     /// orphan but does not close it. The safety-critical leak — a forged
     /// wave finalization exporting cross-shard — is closed at the height
     /// gate [`recovery_fences`](Self::recovery_fences); a purely local
-    /// orphan fork surfaces as an INV-STATE-5 commit-linkage divergence
-    /// and self-halts (a re-fired recovery, a liveness cost), rather than
-    /// forking silently. A replica that has not yet folded the recovery
+    /// orphan fork surfaces as a commit-linkage divergence and self-halts
+    /// (a re-fired recovery, a liveness cost), rather than forking
+    /// silently. A replica that has not yet folded the recovery
     /// resolves a bridge block's anchor window instead and drops it as
     /// unverifiable; its fetch retries succeed once its beacon catches up,
     /// the same self-healing as any beacon lag.

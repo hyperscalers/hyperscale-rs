@@ -164,11 +164,9 @@ pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 /// `RESHAPE_HANDOFF_TTL_EPOCHS` (12; reshaping shards are also exempt
 /// outright) plus the occasional missed fold. But it also caps a *safety*
 /// exposure: until the freeze fires at detection, a beyond-f committee can
-/// export forged cross-shard artifacts (the `committee_security` §10
-/// Finding 9 disposition), so the detection latency is the window that
-/// exposure runs, and a
-/// lower threshold is a smaller window. So the value wants to be as low as
-/// the false-trigger floor allows.
+/// export forged cross-shard artifacts, so the detection latency is the
+/// window that exposure runs, and a lower threshold is a smaller window.
+/// So the value wants to be as low as the false-trigger floor allows.
 ///
 /// Set to `16` — just above the 12-epoch floor, so a healthy shard never
 /// false-flags while the exposure window stays near its minimum (one
