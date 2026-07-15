@@ -20,12 +20,11 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{ParticipationChange, ProtocolEvent};
+use hyperscale_core::ParticipationChange;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap, replicate_engine_bootstrap};
-use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
     SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
     serve_state_range_request, serve_witness_history_request,
@@ -162,14 +161,7 @@ impl SimulationRunner {
         // production supervisor does pre-spawn: this arms the pacemaker and
         // cleanup timers, so a committee seated onto a quiet chain (a halt
         // recovery's fresh committee) still enters consensus.
-        let output = self.hosts[host as usize].step(HostEvent::protocol(
-            shard,
-            ProtocolEvent::CommittedStateRestored {
-                height: recovered.committed_height,
-                hash: recovered.committed_hash,
-                qc: recovered.latest_qc,
-            },
-        ));
+        let output = self.hosts[host as usize].resume_shard_committed(shard, &recovered);
         self.process_step_output(host, output);
         self.drain_host_io(host);
         kind

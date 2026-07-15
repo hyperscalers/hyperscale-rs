@@ -602,11 +602,7 @@ where
     /// [`Self::install_genesis`].
     pub fn resume_committed(&mut self, recovered: &RecoveredState) -> Vec<TimerOp> {
         self.step(ShardScopedInput::Protocol(Box::new(
-            ProtocolEvent::CommittedStateRestored {
-                height: recovered.committed_height,
-                hash: recovered.committed_hash,
-                qc: recovered.latest_qc.clone(),
-            },
+            committed_state_restored(recovered),
         )));
         std::mem::take(&mut self.pending_timer_ops)
     }
@@ -727,5 +723,19 @@ where
         )
         .flatten()
         .min()
+    }
+}
+
+/// The committed-state restore for a recovered store — the one event both
+/// resume paths feed ([`ShardLoop::resume_committed`] pre-spawn on the
+/// pinned loop, [`NodeHost::resume_shard_committed`] through the host
+/// step), so what "resuming from recovered state" means is written once.
+///
+/// [`NodeHost::resume_shard_committed`]: crate::host::NodeHost::resume_shard_committed
+pub(crate) fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEvent {
+    ProtocolEvent::CommittedStateRestored {
+        height: recovered.committed_height,
+        hash: recovered.committed_hash,
+        qc: recovered.latest_qc.clone(),
     }
 }
