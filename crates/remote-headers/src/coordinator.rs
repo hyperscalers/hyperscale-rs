@@ -283,37 +283,31 @@ impl RemoteHeaderCoordinator {
         // dropping these would blind the fold to the crossing.
         // Recovery-bridged: a halt recovery's bridge header is anchored
         // below the bridge window but certified at or past it, and
-        // verifies against the fresh committee. A header that instead
-        // resolves the retained committee through the suffix band is the
-        // orphan a beyond-f cohort forged extending the halted tip; drop it
-        // rather than admit a forged header into the routing view.
-        if topology_schedule.recovery_resolves_retained(
+        // verifies against the fresh committee. A header the fenced lookup
+        // rejects instead resolves the retained committee through the
+        // suffix band — the orphan a beyond-f cohort forged extending the
+        // halted tip; drop it rather than admit a forged header into the
+        // routing view.
+        let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
             certified_header.header().parent_qc().weighted_timestamp(),
             certified_header.qc().weighted_timestamp(),
         ) {
-            warn!(
-                shard = shard.inner(),
-                height = height.inner(),
-                sender = sender.inner(),
-                "Dropping remote header that resolves the retained committee during a halt recovery"
-            );
-            return vec![];
-        }
-        let committee = match topology_schedule
-            .lookup_for_shard_certified(
-                shard,
-                certified_header.header().parent_qc().weighted_timestamp(),
-                certified_header.qc().weighted_timestamp(),
-            )
-            .0
-        {
-            ScheduleLookup::Committee(committee) => committee,
-            ScheduleLookup::NotYetCommitted => {
+            None => {
+                warn!(
+                    shard = shard.inner(),
+                    height = height.inner(),
+                    sender = sender.inner(),
+                    "Dropping remote header that resolves the retained committee during a halt recovery"
+                );
+                return vec![];
+            }
+            Some((ScheduleLookup::Committee(committee), _)) => committee,
+            Some((ScheduleLookup::NotYetCommitted, _)) => {
                 self.awaiting.push(shard, (sender, certified_header));
                 return vec![];
             }
-            ScheduleLookup::Evicted => {
+            Some((ScheduleLookup::Evicted, _)) => {
                 warn!(
                     shard = shard.inner(),
                     height = height.inner(),
@@ -403,26 +397,26 @@ impl RemoteHeaderCoordinator {
                     let anchor = next_header.header().parent_qc().weighted_timestamp();
                     let qc_wt = next_header.qc().weighted_timestamp();
                     // A recovery folded (or advanced) after this header
-                    // buffered can turn it into a suffix-band orphan; drop it
-                    // and drain the next candidate.
-                    if topology_schedule.recovery_resolves_retained(shard, anchor, qc_wt) {
-                        warn!(
-                            shard = shard.inner(),
-                            height = height.inner(),
-                            sender = next_sender.inner(),
-                            "Dropping buffered remote header that resolves the retained \
-                             committee during a halt recovery"
-                        );
-                        if let Some(sender_map) = self.pending.get_mut(&key) {
-                            sender_map.remove(&next_sender);
-                        }
-                        continue;
-                    }
+                    // buffered can turn it into a suffix-band orphan the
+                    // fenced lookup rejects; drop it and drain the next
+                    // candidate.
                     match topology_schedule
-                        .lookup_for_shard_certified(shard, anchor, qc_wt)
-                        .0
+                        .lookup_for_shard_certified_fenced(shard, anchor, qc_wt)
+                        .map(|(lookup, _)| lookup)
                     {
-                        ScheduleLookup::Committee(committee) => {
+                        None => {
+                            warn!(
+                                shard = shard.inner(),
+                                height = height.inner(),
+                                sender = next_sender.inner(),
+                                "Dropping buffered remote header that resolves the retained \
+                                 committee during a halt recovery"
+                            );
+                            if let Some(sender_map) = self.pending.get_mut(&key) {
+                                sender_map.remove(&next_sender);
+                            }
+                        }
+                        Some(ScheduleLookup::Committee(committee)) => {
                             return Self::emit_verify_qc(
                                 committee,
                                 shard,
@@ -431,13 +425,13 @@ impl RemoteHeaderCoordinator {
                                 next_header,
                             );
                         }
-                        ScheduleLookup::NotYetCommitted => {
+                        Some(ScheduleLookup::NotYetCommitted) => {
                             if let Some(sender_map) = self.pending.get_mut(&key) {
                                 sender_map.remove(&next_sender);
                             }
                             self.awaiting.push(shard, (next_sender, next_header));
                         }
-                        ScheduleLookup::Evicted => {
+                        Some(ScheduleLookup::Evicted) => {
                             warn!(
                                 shard = shard.inner(),
                                 height = height.inner(),

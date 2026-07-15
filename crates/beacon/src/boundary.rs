@@ -249,35 +249,30 @@ fn boundary_qc_authentic(
     // fresh committee's — the one that completes the recovery, which
     // re-binds (a stale anchor certified at or past the bridge) or anchors
     // at a current window. The halted suffix has no epoch crossing of its
-    // own, so a crossing that resolves the retained committee through the
-    // suffix band is the orphan a beyond-f cohort forged extending the
-    // halted tip. Folding it would clear the recovery and drop the
-    // cross-shard freeze, so reject it here.
-    if topology_schedule.recovery_resolves_retained(
+    // own, so a crossing the fenced lookup rejects is the orphan a
+    // beyond-f cohort forged extending the halted tip. Folding it would
+    // clear the recovery and drop the cross-shard freeze.
+    let snapshot = match topology_schedule.lookup_for_shard_certified_fenced(
         shard,
         boundary_header.parent_qc().weighted_timestamp(),
         qc.weighted_timestamp(),
     ) {
-        warn!(
-            shard = shard.inner(),
-            "Rejecting boundary QC that resolves the retained committee during a halt recovery"
-        );
-        return false;
-    }
-    let snapshot = match topology_schedule.lookup_for_shard_certified(
-        shard,
-        boundary_header.parent_qc().weighted_timestamp(),
-        qc.weighted_timestamp(),
-    ) {
-        (ScheduleLookup::Committee(snapshot), _) => snapshot,
-        (ScheduleLookup::NotYetCommitted, _) => {
+        None => {
+            warn!(
+                shard = shard.inner(),
+                "Rejecting boundary QC that resolves the retained committee during a halt recovery"
+            );
+            return false;
+        }
+        Some((ScheduleLookup::Committee(snapshot), _)) => snapshot,
+        Some((ScheduleLookup::NotYetCommitted, _)) => {
             debug!(
                 shard = shard.inner(),
                 "Boundary QC's committee epoch not committed yet — abstaining"
             );
             return false;
         }
-        (ScheduleLookup::Evicted, _) => {
+        Some((ScheduleLookup::Evicted, _)) => {
             warn!(
                 shard = shard.inner(),
                 anchor_epoch = topology_schedule
