@@ -12,12 +12,12 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR,
-    NetworkDefinition, NetworkParams, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardCommittee, ShardEpochContribution,
-    ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects,
-    Stake, StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord,
-    ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
-    compute_merkle_root_with_proof, vrf_sign, zero_bls_signature,
+    NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool,
+    StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus,
+    VrfProof, WeightedTimestamp, bls_keypair_from_seed, compute_merkle_root_with_proof, vrf_sign,
+    zero_bls_signature,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -66,33 +66,7 @@ pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> Validato
 }
 
 pub fn empty_state() -> BeaconState {
-    BeaconState {
-        chain_config: BeaconChainConfig::default(),
-        params: NetworkParams::default(),
-        next_params: NetworkParams::default(),
-        param_votes: BTreeMap::new(),
-        current_epoch: Epoch::GENESIS,
-        validators: BTreeMap::new(),
-        pools: BTreeMap::new(),
-        randomness: Randomness::ZERO,
-        committee: Vec::new(),
-        shard_committees: BTreeMap::new(),
-        next_shard_committees: BTreeMap::new(),
-        shard_consensus_members: BTreeMap::new(),
-        witness_window_bases: BTreeMap::new(),
-        split_pending_window: BTreeSet::new(),
-        settled_window_floors: BTreeMap::new(),
-        reshape_observers_window: BTreeMap::new(),
-        reshape_keepers_window: BTreeMap::new(),
-        reshape_parent_halves: BTreeMap::new(),
-        boundaries: BTreeMap::new(),
-        advanced: BTreeSet::new(),
-        pending_reshapes: BTreeMap::new(),
-        pending_recoveries: BTreeMap::new(),
-        completed_recoveries: BTreeMap::new(),
-        miss_counters: BTreeMap::new(),
-        last_beacon_service: BTreeMap::new(),
-    }
+    BeaconState::empty(BeaconChainConfig::default())
 }
 
 /// Build a state with one shard, one pool, and `n_active` validators
