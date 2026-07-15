@@ -573,9 +573,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         wt: WeightedTimestamp,
     ) -> bool {
-        topology_schedule
-            .recovery_bridge(self.local_shard)
-            .is_some_and(|bridge| topology_schedule.epoch_for(wt) < bridge)
+        topology_schedule.recovery_bridging(self.local_shard, wt)
     }
 
     /// Whether work anchored at `wt` is quiesced by an in-flight recovery:
@@ -591,13 +589,12 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         wt: WeightedTimestamp,
     ) -> bool {
-        topology_schedule
-            .recovery_bridge(self.local_shard)
-            .is_some_and(|bridge| {
-                let window_start = topology_schedule.windows().window_of(bridge).start;
-                topology_schedule.epoch_for(wt) < bridge
-                    && self.now.as_millis() < window_start.as_millis()
-            })
+        let Some(bridge) = topology_schedule.recovery_bridge(self.local_shard) else {
+            return false;
+        };
+        let window_start = topology_schedule.windows().window_of(bridge).start;
+        topology_schedule.recovery_bridging(self.local_shard, wt)
+            && self.now.as_millis() < window_start.as_millis()
     }
 
     /// Record a terminated shard's settled-wave set for the
