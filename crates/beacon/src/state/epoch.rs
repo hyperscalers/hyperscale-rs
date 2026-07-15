@@ -13,7 +13,9 @@ use hyperscale_types::{
     ValidatorId, ValidatorStatus, WeightedTimestamp,
 };
 
-use crate::rules::{canonical_boundary_qcs, chunk_bounds, is_boundary_crossing};
+use crate::rules::{
+    canonical_boundary_qcs, chunk_bounds, crossing_already_recorded, is_boundary_crossing,
+};
 use crate::state::committee::{
     diff_shard_committees, recover_halted_committees, resample_beacon_committee, run_shuffle_step,
     top_up_committees,
@@ -607,13 +609,8 @@ fn record_boundaries(
         // large witness backlog, and treating each drain chunk as a fresh
         // observation would defer halt detection until the backlog ran dry.
         // A re-fold with no witness progress carries nothing at all; one
-        // with progress drains the backlog watermark-only below. Terminal
-        // records still re-fold in full: a merge child's terminal marks the
-        // compose set until its parent composes.
-        let drain_refold = state
-            .boundaries
-            .get(shard)
-            .is_some_and(|b| b.terminal_epoch.is_none() && b.block_hash == block_hash);
+        // with progress drains the backlog watermark-only below.
+        let drain_refold = crossing_already_recorded(state, *shard, block_hash);
         if drain_refold && chunk_end == prior {
             continue;
         }

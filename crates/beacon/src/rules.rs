@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, BlockHeader, EpochWindows, MAX_WITNESSES_PER_SHARD,
-    QuorumCertificate, ShardId, ShardWitness, Verifiable,
+    BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, EpochWindows,
+    MAX_WITNESSES_PER_SHARD, QuorumCertificate, ShardId, ShardWitness, Verifiable,
 };
 
 /// Witness chunk bounds for one shard's boundary: `prior` is the applied
@@ -46,6 +46,41 @@ pub(crate) fn witness_chunk_bounds(
         .get(&shard)
         .map_or(0, |b| b.witness_leaf_count.inner());
     chunk_bounds(prior, boundary_header.beacon_witness_leaf_count().inner())
+}
+
+/// Whether `shard`'s recorded boundary is a live (non-terminal) record
+/// already pinned to `block_hash`: the crossing is folded, so a committed
+/// re-fold of it is a backlog drain, not a fresh liveness observation —
+/// it must not reset the miss counter, refresh the live epoch, or release
+/// a pending recovery. Terminal records are exempt: a merge child's
+/// folded terminal keeps re-folding (and re-sourcing) until its parent
+/// composes.
+#[must_use]
+pub(crate) fn crossing_already_recorded(
+    state: &BeaconState,
+    shard: ShardId,
+    block_hash: BlockHash,
+) -> bool {
+    state
+        .boundaries
+        .get(&shard)
+        .is_some_and(|b| b.terminal_epoch.is_none() && b.block_hash == block_hash)
+}
+
+/// Whether the recorded live crossing is fully folded — recorded per
+/// [`crossing_already_recorded`] with its witness chunk drained
+/// (`prior == chunk_end`). The proposer stops sourcing exactly what the
+/// fold would read as a carried-nothing re-fold, so both sides read this
+/// one rule: sourcing past it would keep re-folding data already
+/// consumed, and stopping short of it would park the witness backlog.
+#[must_use]
+pub(crate) fn crossing_fully_folded(
+    state: &BeaconState,
+    shard: ShardId,
+    boundary_header: &BlockHeader,
+) -> bool {
+    let (prior, chunk_end) = witness_chunk_bounds(state, shard, boundary_header);
+    crossing_already_recorded(state, shard, boundary_header.hash()) && prior == chunk_end
 }
 
 /// Whether `witnesses` are exactly the contiguous, ascending 0-based leaf
