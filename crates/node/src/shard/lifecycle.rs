@@ -21,12 +21,13 @@ use hyperscale_engine::sharding::{
 };
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
-use hyperscale_storage::{GenesisCommit, ShardStorage};
+use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
 use hyperscale_types::{
     Block, CertifiedBlock, ChainOrigin, NodeId, ShardId, StateRoot, ValidatorId, Verified,
 };
 
 use crate::host::{NodeHost, ShardGenesis};
+use crate::shard::{HostEvent, StepOutput, committed_state_restored};
 
 impl<S, N, D> NodeHost<S, N, D>
 where
@@ -51,6 +52,27 @@ where
         }
         self.shard_loop_mut(shard)
             .seed_genesis_substate_frontier(genesis_block);
+    }
+
+    /// Resume a runtime-seated shard's consensus from its recovered
+    /// committed state — [`ShardLoop::resume_committed`]'s counterpart for
+    /// the simulation runner, which routes the restore through the host
+    /// step so the resulting sends and timer arms flow through its
+    /// scheduler (production seats the pinned loop pre-spawn and captures
+    /// the timer ops directly). A committee seated onto a quiet chain — a
+    /// halt recovery's fresh committee — hears nothing from gossip, so
+    /// without the restore its vnodes never propose or time out.
+    ///
+    /// [`ShardLoop::resume_committed`]: crate::shard::ShardLoop::resume_committed
+    pub fn resume_shard_committed(
+        &mut self,
+        shard: ShardId,
+        recovered: &RecoveredState,
+    ) -> StepOutput {
+        self.step(HostEvent::protocol(
+            shard,
+            committed_state_restored(recovered),
+        ))
     }
 
     /// Run the deterministic part of one shard's genesis ceremony: install
