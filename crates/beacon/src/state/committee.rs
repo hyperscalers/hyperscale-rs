@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, BlockHeight, CommitteeTransition, Epoch, HaltRecovery, MIN_BEACON_COMMITTEE_SIZE,
-    PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, TransitionCause, ValidatorId,
-    ValidatorStatus,
+    BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, HaltRecovery,
+    MIN_BEACON_COMMITTEE_SIZE, PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId,
+    TransitionCause, ValidatorId, ValidatorStatus,
 };
 
 use crate::sampling::{sample_committee, sample_committee_weighted};
@@ -178,6 +178,23 @@ pub(super) fn recover_halted_committees(state: &mut BeaconState, halted: &BTreeS
 
 fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
     let size = state.chain_config.shard_size as usize;
+    // A genesis-born shard that never produced still carries its ZERO
+    // placeholder, which the topology snapshot omits — so a fresh committee
+    // would have no attested anchor to seat against and the chain would
+    // stay dead. Skip the redraw: it could only churn the pool. The halt
+    // flag keeps standing, and a shard that never launched needs an
+    // operator, not a rotation.
+    if state
+        .boundaries
+        .get(&shard)
+        .is_some_and(|b| b.block_hash == BlockHash::ZERO)
+    {
+        tracing::warn!(
+            ?shard,
+            "halted shard never produced: no attested anchor to recover against, redraw skipped"
+        );
+        return;
+    }
     // The beacon-authenticated frontier: the last boundary height folded
     // for the shard. A halted shard folds no new crossing, so this is
     // fixed for the halt's duration and equal across a stalled recovery's
@@ -1396,6 +1413,23 @@ mod tests {
         u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1
     }
 
+    /// A genesis-born placeholder the fold has never observed producing.
+    fn never_produced_boundary(misses: u32) -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: Epoch::GENESIS,
+            consecutive_misses: misses,
+            terminal_epoch: None,
+            terminal_qc_wt: None,
+            settled_waves_root: None,
+            reshape_admitted_epoch: None,
+        }
+    }
+
     /// A halted shard's committee is re-drawn whole from the pool: the
     /// fresh members seat ready at the fold's epoch, the replaced members
     /// return to the pool, the recovery record retains them for routing,
@@ -1467,6 +1501,50 @@ mod tests {
         assert!(effects.shard_committee_transitions.contains_key(&s0));
         assert!(!state.pending_recoveries.contains_key(&s1));
         assert!(!effects.shard_committee_transitions.contains_key(&s1));
+    }
+
+    /// A genesis-born shard that never produced has no attested anchor for
+    /// a fresh committee to seat against: the redraw is skipped — no pool
+    /// churn, no retention record, seated members untouched — while the
+    /// halt flag keeps standing for the operator, fold after fold.
+    #[test]
+    fn never_produced_shard_is_flagged_but_not_redrawn() {
+        let s0 = ShardId::leaf(1, 0);
+        let s1 = ShardId::leaf(1, 1);
+        let mut state = multi_shard_state(2, 4, 4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(HALT_THRESHOLD_EPOCHS + 1);
+        state
+            .boundaries
+            .insert(s0, never_produced_boundary(over_threshold()));
+        state.boundaries.insert(s1, live_boundary(0));
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        for _ in 0..2 {
+            let effects = apply_next_epoch(&mut state, &[]);
+            assert_eq!(effects.halted_shards, BTreeSet::from([s0]), "flagged");
+            assert_eq!(
+                state.next_shard_committees[&s0]
+                    .members
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                old,
+                "no redraw without an attested anchor",
+            );
+            assert!(state.pending_recoveries.is_empty());
+            assert!(!effects.shard_committee_transitions.contains_key(&s0));
+            for id in &old {
+                assert!(matches!(
+                    state.validators[id].status,
+                    ValidatorStatus::OnShard { shard, .. } if shard == s0,
+                ));
+            }
+        }
     }
 
     /// A pool short of a full committee defers the recovery — a partial
