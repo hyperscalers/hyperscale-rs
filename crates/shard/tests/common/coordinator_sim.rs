@@ -910,8 +910,7 @@ impl ShardCoordinatorSim {
         // drain ready state-root verifications into
         // `VerifyStateRoot` actions, then re-enter `try_propose`
         // once if any path latched a retry.
-        let shard = self.shard;
-        for ready in self.coordinators[to_idx].drain_ready_state_root_verifications(shard) {
+        for ready in self.coordinators[to_idx].drain_ready_state_root_verifications() {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_block_hash: ready.parent_block_hash,
