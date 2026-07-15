@@ -11,7 +11,7 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, HaltRecovery,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, HaltRecovery,
     NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
     SettledWavesRoot, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
     WeightedTimestamp,
@@ -168,6 +168,13 @@ pub struct TopologySnapshot {
     /// Cleared when the shard commits again and the beacon drops the
     /// record. Like `advanced`, a live head value.
     pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
+    /// The epoch each shard's most recent completed halt recovery seated
+    /// its fresh committee, projected from
+    /// `BeaconState.completed_recoveries`. Permanent, unlike
+    /// `pending_recoveries`: the schedule's certified resolution reads it
+    /// so the recovery's bridge band keeps resolving the fresh committee
+    /// after the pending record clears.
+    completed_recoveries: BTreeMap<ShardId, Epoch>,
     /// Governable network parameters in force for this window, projected
     /// from `BeaconState.params` (head) or `next_params` (lookahead).
     /// Frozen one epoch ahead like the committee, so every member resolves
@@ -218,6 +225,7 @@ impl TopologySnapshot {
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -263,6 +271,7 @@ impl TopologySnapshot {
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -317,6 +326,7 @@ impl TopologySnapshot {
             split_pending: BTreeSet::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -407,6 +417,7 @@ impl TopologySnapshot {
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -444,6 +455,19 @@ impl TopologySnapshot {
         pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
     ) -> Self {
         self.pending_recoveries = pending_recoveries;
+        self
+    }
+
+    /// Set each shard's most recent completed halt recovery epoch (see
+    /// [`Self::completed_recoveries`]). Defaults empty; the beacon
+    /// projection supplies the `BeaconState.completed_recoveries` value.
+    /// Builder-set under the [`Self::with_advanced`] rationale.
+    #[must_use]
+    pub fn with_completed_recoveries(
+        mut self,
+        completed_recoveries: BTreeMap<ShardId, Epoch>,
+    ) -> Self {
+        self.completed_recoveries = completed_recoveries;
         self
     }
 
@@ -625,6 +649,15 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn pending_recoveries(&self) -> &BTreeMap<ShardId, HaltRecovery> {
         &self.pending_recoveries
+    }
+
+    /// The epoch each shard's most recent completed halt recovery seated
+    /// its fresh committee. Read by the schedule's certified resolution so
+    /// the recovery's bridge band binds stably after the pending record
+    /// clears.
+    #[must_use]
+    pub const fn completed_recoveries(&self) -> &BTreeMap<ShardId, Epoch> {
+        &self.completed_recoveries
     }
 
     /// Get the ordered committee members for a shard — full membership,

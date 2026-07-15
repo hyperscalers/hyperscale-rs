@@ -249,6 +249,7 @@ fn mc_state(cell: &Cell) -> BeaconState {
         advanced: BTreeSet::new(),
         pending_reshapes: BTreeMap::new(),
         pending_recoveries: BTreeMap::new(),
+        completed_recoveries: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
         last_beacon_service: BTreeMap::new(),
     };

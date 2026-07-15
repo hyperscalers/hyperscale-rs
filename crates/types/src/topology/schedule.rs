@@ -383,17 +383,29 @@ impl TopologySchedule {
         })
     }
 
-    /// The committee of the newest retained window that carries `shard` —
-    /// for a live shard, the lookahead entry. What the recovery bridge
-    /// resolves: the fresh committee is finalized into the lookahead at
-    /// the fold that seats it, so every replica that has folded the
-    /// recovery resolves the same snapshot.
-    fn newest_for_shard(&self, shard: ShardId) -> ScheduleLookup<'_> {
-        self.by_epoch
-            .values()
-            .rev()
-            .find(|s| s.shard_trie().contains(shard))
-            .map_or(ScheduleLookup::Evicted, ScheduleLookup::Committee)
+    /// The first epoch whose committee bridges `shard`'s halt gap —
+    /// pending or completed. Certified resolution reads this rather than
+    /// [`recovery_bridge`](Self::recovery_bridge): a bridge block's
+    /// committee binding must not change when the pending record clears
+    /// on the shard's first crossing, so the completed recovery keeps
+    /// answering for the band below it, permanently.
+    fn certified_recovery_bridge(&self, shard: ShardId) -> Option<Epoch> {
+        self.recovery_bridge(shard).or_else(|| {
+            self.head
+                .completed_recoveries()
+                .get(&shard)
+                .map(|rotated_at| rotated_at.next())
+        })
+    }
+
+    /// The committee entry the recovery bridge resolves: the bridge
+    /// epoch's own window, where the fold seated the fresh committee.
+    /// Pinned to that entry — rather than the newest retained window —
+    /// so the binding is one value for every replica at every later
+    /// fold: a mid-recovery top-up or a post-recovery shuffle lands in
+    /// later entries and never re-binds work anchored below the bridge.
+    fn bridged_for_shard(&self, shard: ShardId, bridge: Epoch) -> (ScheduleLookup<'_>, bool) {
+        self.lookup_for_shard(shard, self.windows().window_of(bridge).start)
     }
 
     /// [`lookup_for_shard`](Self::lookup_for_shard) for **live** consensus
@@ -418,7 +430,7 @@ impl TopologySchedule {
         if let Some(bridge) = self.recovery_bridge(shard)
             && self.epoch_for(wt) < bridge
         {
-            return (self.newest_for_shard(shard), false);
+            return self.bridged_for_shard(shard, bridge);
         }
         self.lookup_for_shard(shard, wt)
     }
@@ -443,10 +455,15 @@ impl TopologySchedule {
     /// or after it, and resolves the fresh committee; the halted suffix —
     /// certified while the old committee still governed, so its QC
     /// timestamps sit a full halt gap below the bridge — resolves by its
-    /// anchor as ever. The QC bound tolerates one window below the bridge
-    /// because the seating-window quiesce holds each honest vote at or
-    /// past the bridge window, so an honest-majority quorum's mean stamp
-    /// cannot fall more than a skew window under it.
+    /// anchor as ever. The bridge outlives the pending record: once the
+    /// recovery completes, the completed-recovery epoch keeps the band
+    /// re-binding, so a replica that verifies or commits a bridge block
+    /// after the shard's first crossing binds it to the same committee as
+    /// one that processed it during the recovery. The QC bound tolerates
+    /// one window below the bridge because the seating-window quiesce
+    /// holds each honest vote at or past the bridge window, so an
+    /// honest-majority quorum's mean stamp cannot fall more than a skew
+    /// window under it.
     ///
     /// That tolerance is calibrated for an adversarial *minority* in the
     /// quorum, and the retained committee is beyond f — an honest minority
@@ -470,11 +487,11 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> (ScheduleLookup<'_>, bool) {
-        if let Some(bridge) = self.recovery_bridge(shard)
+        if let Some(bridge) = self.certified_recovery_bridge(shard)
             && self.epoch_for(anchor_wt) < bridge
             && self.epoch_for(qc_wt).next() >= bridge
         {
-            return (self.newest_for_shard(shard), false);
+            return self.bridged_for_shard(shard, bridge);
         }
         self.lookup_for_shard(shard, anchor_wt)
     }
@@ -1249,6 +1266,90 @@ mod tests {
             old,
         );
         assert!(!plain.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
+    }
+
+    /// The bridge binding outlives the pending record: once the recovery
+    /// completes (pending record cleared, seating epoch in the completed
+    /// map), certified resolution still re-binds the bridge band to the
+    /// fresh committee — pinned to the bridge window's own entry, so a
+    /// post-recovery shuffle landing in a later entry never re-binds it —
+    /// while the suffix keeps its old committee, live resolution returns
+    /// to the plain anchor lookup, and the pending-scoped fences go inert.
+    #[test]
+    fn recovery_bridge_binding_survives_the_pending_records_clear() {
+        use crate::{ValidatorInfo, generate_bls_keypair};
+
+        let validators: Vec<ValidatorInfo> = (0..12)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: generate_bls_keypair().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        let shard = ShardId::leaf(1, 0);
+        let old: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let fresh: Vec<ValidatorId> = (4..8).map(ValidatorId::new).collect();
+        let shuffled: Vec<ValidatorId> = (8..12).map(ValidatorId::new).collect();
+        let snap = |committee: &[ValidatorId]| {
+            Arc::new(TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                2,
+                &set,
+                std::iter::once((shard, committee.to_vec())).collect(),
+            ))
+        };
+        let completed = |committee: &[ValidatorId]| {
+            Arc::new(
+                snap(committee)
+                    .as_ref()
+                    .clone()
+                    .with_completed_recoveries(std::iter::once((shard, Epoch::new(20))).collect()),
+            )
+        };
+
+        // The recovery seated the fresh committee at epoch 20 (bridge 21);
+        // its first crossing cleared the pending record, and a later fold
+        // rotated the committee again in a newer entry.
+        let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
+        sched.insert(Epoch::new(21), completed(&fresh));
+        sched.insert(Epoch::new(23), completed(&shuffled));
+        sched.set_head(completed(&shuffled));
+
+        let committee_of = |lookup: ScheduleLookup<'_>| match lookup {
+            ScheduleLookup::Committee(snapshot) => snapshot.committee_for_shard(shard).to_vec(),
+            _ => panic!("expected a resolved committee"),
+        };
+        let stale_anchor = WeightedTimestamp::from_millis(2_500);
+        let suffix_qc = WeightedTimestamp::from_millis(2_900);
+        let bridge_qc = WeightedTimestamp::from_millis(21_100);
+
+        // The bridge band still re-binds to the fresh committee — the
+        // bridge window's own entry, not the shuffled head.
+        assert_eq!(
+            committee_of(
+                sched
+                    .lookup_for_shard_certified(shard, stale_anchor, bridge_qc)
+                    .0
+            ),
+            fresh,
+        );
+        // The suffix keeps resolving the committee that produced it.
+        assert_eq!(
+            committee_of(
+                sched
+                    .lookup_for_shard_certified(shard, stale_anchor, suffix_qc)
+                    .0
+            ),
+            old,
+        );
+        // Live resolution is ordinary again once no recovery is pending.
+        assert_eq!(
+            committee_of(sched.lookup_for_shard_live(shard, stale_anchor).0),
+            old,
+        );
+        // The pending-scoped fences do not outlive the recovery.
+        assert!(!sched.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
+        assert!(!sched.recovery_fences(shard, BlockHeight::new(1_000)));
     }
 
     #[test]

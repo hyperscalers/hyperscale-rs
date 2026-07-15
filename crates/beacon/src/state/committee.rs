@@ -1630,17 +1630,20 @@ mod tests {
     }
 
     /// The shard's next observed crossing completes the recovery: the
-    /// retained committee is released from the routing view.
+    /// retained committee is released from the routing view, and the
+    /// seating epoch moves to the permanent completed record so the
+    /// bridge band keeps resolving the fresh committee.
     #[test]
     fn recovery_clears_when_the_shard_commits_again() {
         use hyperscale_types::HaltRecovery;
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let rotated_at = Epoch::GENESIS;
         state.pending_recoveries.insert(
             ShardId::leaf(1, 0),
             HaltRecovery {
-                rotated_at: Epoch::GENESIS,
+                rotated_at,
                 retained: vec![ValidatorId::new(9)],
                 attested_frontier: BlockHeight::GENESIS,
             },
@@ -1656,6 +1659,10 @@ mod tests {
         );
 
         assert!(state.pending_recoveries.is_empty());
+        assert_eq!(
+            state.completed_recoveries.get(&ShardId::leaf(1, 0)),
+            Some(&rotated_at),
+        );
     }
 
     /// Two replicas with byte-identical state recover byte-identically —

@@ -658,8 +658,16 @@ fn record_boundaries(
         state.advanced.insert(*shard);
         // A crossing under an in-flight halt recovery means the fresh
         // committee produced: the recovery is complete, so release the
-        // retained replaced committee from the routing view.
-        state.pending_recoveries.remove(shard);
+        // retained replaced committee from the routing view. The seating
+        // epoch moves to the permanent record — certified resolution of
+        // the recovery's bridge band reads it so blocks anchored below
+        // the bridge keep binding to the fresh committee that produced
+        // them, no matter when a replica processes them.
+        if let Some(recovery) = state.pending_recoveries.remove(shard) {
+            state
+                .completed_recoveries
+                .insert(*shard, recovery.rotated_at);
+        }
 
         // A terminal shard's contribution crossing its final cut is the
         // chain's terminal block. A split parent seeds its pending
