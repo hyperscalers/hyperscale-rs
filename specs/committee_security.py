@@ -702,7 +702,6 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
     from random import Random
 
     rng = Random(seed)
-    f = f_of(n)
     E = shards * n
     cooldown = max(1, E // b)                 # additive recovery period
     jail_cd = cooldown if jail_cd is None else jail_cd
@@ -763,7 +762,6 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
             committee.append(rng.random() < 1 - (1 - beta) ** min(w_prev, _WIDTH_CAP))
             c = sum(committee)
             max_c = max(max_c, c)
-    half = epochs // 2
     return {"steady_T": sum_T / epochs, "peak_T": peak_T,
             "final_c": c, "max_c": max_c}
 
