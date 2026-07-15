@@ -1212,6 +1212,26 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
+        // The halt-recovery freeze: an EC from a recovering shard above the
+        // beacon-attested frontier is one the retained beyond-f committee
+        // could only have produced after the halt. It resolves the old
+        // committee at its stale anchor and its signatures verify, so
+        // without this fence a forged wave finalization would export
+        // cross-shard. Drop it — the fence is the same authenticated cutoff
+        // every consumer folds.
+        if topology_schedule.recovery_fences(shard, cert.block_height()) {
+            tracing::warn!(
+                shard = shard.inner(),
+                wave = %cert.wave_id(),
+                height = cert.block_height().inner(),
+                "Dropping EC from a recovering shard past the freeze frontier"
+            );
+            self.pending_ec_verifications.remove(&wire_hash);
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![cert.wave_id().clone()],
+            })];
+        }
+
         let committee = match topology_schedule.lookup(cert.vote_anchor_ts()) {
             ScheduleLookup::Committee(committee) => committee,
             ScheduleLookup::NotYetCommitted => {
@@ -1317,6 +1337,22 @@ impl ExecutionCoordinator {
                 shard = ec_arc.shard_id().inner(),
                 wave = %ec_arc.wave_id(),
                 "Discarding sub-quorum execution certificate"
+            );
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![ec_arc.wave_id().clone()],
+            })];
+        }
+        // The recovery freeze, re-checked here: an EC dispatched before the
+        // beacon folded a source-shard halt recovery reaches this point with
+        // a valid signature and quorum, but if the freeze has since landed
+        // and the EC sits past the attested frontier it is a forged orphan
+        // the fence must still drop before it mutates any wave state.
+        if topology_schedule.recovery_fences(ec_arc.shard_id(), ec_arc.block_height()) {
+            tracing::warn!(
+                shard = ec_arc.shard_id().inner(),
+                wave = %ec_arc.wave_id(),
+                height = ec_arc.block_height().inner(),
+                "Discarding verified EC from a recovering shard past the freeze frontier"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
                 ids: vec![ec_arc.wave_id().clone()],
@@ -2140,6 +2176,24 @@ impl ExecutionCoordinator {
         let mut beacon_behind = false;
         for ec in ecs {
             let shard = ec.shard_id();
+            // The recovery freeze fences a contained EC from a recovering
+            // source shard past its attested frontier — a forged orphan the
+            // beyond-f retained committee produced after the halt, which would
+            // otherwise resolve the old committee and carry a false wave
+            // finalization into this consumer's state.
+            if topology_schedule.recovery_fences(shard, ec.block_height()) {
+                tracing::warn!(
+                    wave = %wave.wave_id(),
+                    shard = shard.inner(),
+                    height = ec.block_height().inner(),
+                    "Rejecting fetched FinalizedWave: contained EC from a recovering \
+                     shard past the freeze frontier"
+                );
+                self.pending_finalized_wave_verifications.remove(&wave_id);
+                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                    ids: vec![wave_id],
+                })];
+            }
             // Each contained EC is verified against the committee seated at its
             // own anchor on its own shard. A not-yet-committed epoch (our
             // beacon behind) defers the whole wave for replay once the beacon
@@ -2504,13 +2558,16 @@ impl std::fmt::Debug for ExecutionCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_types::test_utils::{
         certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
     use hyperscale_types::{
         Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, Epoch,
-        ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
-        SignerBitfield, ValidatorInfo, ValidatorSet, generate_bls_keypair, zero_bls_signature,
+        ExecutionOutcome, GlobalReceiptHash, HaltRecovery, Hash, NetworkDefinition,
+        QuorumCertificate, SignerBitfield, ValidatorInfo, ValidatorSet, generate_bls_keypair,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -2533,6 +2590,38 @@ mod tests {
             1,
             validator_set,
         )))
+    }
+
+    /// A topology whose `shard` is under a halt recovery frozen at
+    /// `frontier`: an old-committee EC from that shard above the frontier is
+    /// the orphan the cross-shard freeze must fence.
+    fn make_test_topology_recovering(shard: ShardId, frontier: BlockHeight) -> TopologySchedule {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let mut recoveries = BTreeMap::new();
+        recoveries.insert(
+            shard,
+            HaltRecovery {
+                rotated_at: Epoch::GENESIS,
+                retained: vec![ValidatorId::new(0)],
+                attested_frontier: frontier,
+            },
+        );
+        TopologySchedule::single(Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators),
+            )
+            .with_pending_recoveries(recoveries),
+        ))
     }
 
     fn make_test_state() -> ExecutionCoordinator {
@@ -3293,6 +3382,79 @@ mod tests {
         // verify.
         let second = state.on_wave_certificate(&topo, cert.into());
         assert!(second.is_empty());
+    }
+
+    /// The cross-shard freeze: an EC from a recovering shard above its
+    /// attested frontier is dropped without dispatching verification — the
+    /// forged orphan a beyond-f retained committee would otherwise export.
+    /// One at or below the frontier is legitimate pre-halt history and still
+    /// dispatches.
+    #[test]
+    fn on_wave_certificate_fences_ec_past_recovery_frontier() {
+        let recovering = ShardId::ROOT;
+        let topo = make_test_topology_recovering(recovering, BlockHeight::new(5));
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let ec_at = |height: u64| {
+            ExecutionCertificate::new(
+                WaveId::new(recovering, BlockHeight::new(height), BTreeSet::new()),
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                vec![],
+                zero_bls_signature(),
+                signers.clone(),
+            )
+        };
+
+        // Above the frontier — the orphan. Fenced.
+        let mut state = make_test_state();
+        let orphan = state.on_wave_certificate(&topo, ec_at(6).into());
+        assert!(
+            matches!(
+                orphan.as_slice(),
+                [Action::AbandonFetch(FetchAbandon::ExecutionCerts { .. })]
+            ),
+            "an EC past the freeze frontier is dropped, got {orphan:?}"
+        );
+
+        // At the frontier — legitimate suffix, still dispatches to verify.
+        let mut state = make_test_state();
+        let suffix = state.on_wave_certificate(&topo, ec_at(5).into());
+        assert!(
+            matches!(
+                suffix.as_slice(),
+                [Action::VerifyExecutionCertificateSignature { .. }]
+            ),
+            "an EC within the frontier dispatches, got {suffix:?}"
+        );
+    }
+
+    /// No pending recovery for the shard: the fence is inert, an EC at any
+    /// height dispatches as usual.
+    #[test]
+    fn on_wave_certificate_fence_inert_without_recovery() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = ExecutionCertificate::new(
+            WaveId::new(ShardId::ROOT, BlockHeight::new(99), BTreeSet::new()),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        );
+        let actions = state.on_wave_certificate(&topo, cert.into());
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::VerifyExecutionCertificateSignature { .. }]
+        ));
     }
 
     /// Once verification completes (success or failure), the in-flight

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Epoch, EpochWindows, ReshapeThresholds, ShardId, TopologySnapshot, ValidatorId,
+    BlockHeight, Epoch, EpochWindows, ReshapeThresholds, ShardId, TopologySnapshot, ValidatorId,
     WeightedTimestamp,
 };
 
@@ -335,6 +335,24 @@ impl TopologySchedule {
             .pending_recoveries()
             .get(&shard)
             .map(|recovery| recovery.rotated_at.next())
+    }
+
+    /// Whether a cross-shard artifact from `shard` at `height` is fenced by
+    /// an in-flight halt recovery: past the beacon-attested frontier the
+    /// recovery froze, the retained (beyond-f) committee could only have
+    /// produced it after the halt, so no consumer that has folded the
+    /// recovery trusts it. False when no recovery is pending for the shard
+    /// (the ordinary case) or when `height` is within the frontier
+    /// (legitimate pre-halt history, still verifiable against the old
+    /// committee). A replica whose beacon has not folded the recovery has
+    /// no record here and does not fence — the residual bounded to freeze
+    /// propagation.
+    #[must_use]
+    pub fn recovery_fences(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.head
+            .pending_recoveries()
+            .get(&shard)
+            .is_some_and(|recovery| height > recovery.attested_frontier)
     }
 
     /// The committee of the newest retained window that carries `shard` —
