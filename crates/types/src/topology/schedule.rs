@@ -511,6 +511,30 @@ impl TopologySchedule {
         }
     }
 
+    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) for
+    /// verifiers that must reject the pending-recovery orphan: `None` for a
+    /// stale-anchored, suffix-band-stamped artifact — the shape only the
+    /// retained (beyond-f) committee produces as *new* work during a halt
+    /// recovery (see
+    /// [`recovery_resolves_retained`](Self::recovery_resolves_retained)) —
+    /// otherwise the certified resolution. The reject and the lookup are
+    /// order-sensitive (the plain certified lookup would resolve the orphan
+    /// to the old committee, whose signatures verify), so consumers that
+    /// only ever see new production during a recovery call this instead of
+    /// pairing the two by hand.
+    #[must_use]
+    pub fn lookup_for_shard_certified_fenced(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> Option<(ScheduleLookup<'_>, bool)> {
+        if self.recovery_resolves_retained(shard, anchor_wt, qc_wt) {
+            return None;
+        }
+        Some(self.lookup_for_shard_certified(shard, anchor_wt, qc_wt))
+    }
+
     /// The weighted timestamp at which `shard` terminated — the end of the
     /// newest retained window that still carried it — or `None` when the
     /// shard is live in the head or absent from every retained window.
@@ -1256,6 +1280,23 @@ mod tests {
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, bridge_qc));
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, edge_qc));
         assert!(!sched.recovery_resolves_retained(shard, bridge_qc, bridge_qc));
+
+        // The fenced lookup folds the reject and the resolution into one
+        // call: the orphan shape is `None`, everything else resolves.
+        assert!(
+            sched
+                .lookup_for_shard_certified_fenced(shard, stale_anchor, suffix_qc)
+                .is_none()
+        );
+        assert_eq!(
+            committee_of(
+                sched
+                    .lookup_for_shard_certified_fenced(shard, stale_anchor, bridge_qc)
+                    .expect("bridge block passes the fence")
+                    .0
+            ),
+            fresh,
+        );
 
         // Without the recovery record, the live path is the plain lookup
         // and the retained-resolution predicate is inert.
