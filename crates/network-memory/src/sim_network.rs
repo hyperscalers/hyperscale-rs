@@ -17,7 +17,7 @@ use hyperscale_network::{
     ResponseVerdict, compression,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkMessage, Request, ShardId, ValidatorId,
+    GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, ValidatorId,
 };
 use sbor::{basic_decode, basic_encode};
 
@@ -94,6 +94,11 @@ pub struct SimNetworkAdapter {
     /// Shared handler registry — written by `register_*_handler`,
     /// read by `SimulatedNetwork::accept_requests`, `flush_notifications`, and `flush_gossip`.
     pub(crate) registry: Arc<HandlerRegistry>,
+    /// Latest terminal-clamped routing view pushed by
+    /// [`Network::update_routing_committees`], mirroring the production
+    /// adapter — so the sim runner's teardown reads the same routing
+    /// projection the production supervisor does.
+    routing_committees: Mutex<Arc<RoutingCommittees>>,
 }
 
 impl SimNetworkAdapter {
@@ -102,13 +107,25 @@ impl SimNetworkAdapter {
     /// Use [`SimulatedNetwork::create_adapter`](crate::SimulatedNetwork::create_adapter)
     /// to create adapters with shared registries for request fulfillment and gossip delivery.
     #[must_use]
-    pub const fn new(registry: Arc<HandlerRegistry>) -> Self {
+    pub fn new(registry: Arc<HandlerRegistry>) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),
             pending_notifications: Mutex::new(Vec::new()),
             registry,
+            routing_committees: Mutex::new(Arc::new(RoutingCommittees::new())),
         }
+    }
+
+    /// The routing view most recently pushed through
+    /// [`Network::update_routing_committees`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
+    pub fn routing_committees(&self) -> Arc<RoutingCommittees> {
+        Arc::clone(&self.routing_committees.lock().unwrap())
     }
 
     /// Drain all buffered outgoing messages.
@@ -155,6 +172,10 @@ impl Default for SimNetworkAdapter {
 }
 
 impl Network for SimNetworkAdapter {
+    fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
+        *self.routing_committees.lock().unwrap() = committees;
+    }
+
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         // Tee to in-process subscribers — the harness's `accept_gossip`
         // skips the publisher's own node (matching gossipsub's no-loop

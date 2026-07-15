@@ -215,6 +215,10 @@ impl SimulationRunner {
             let Some(snapshot) = self.host_topology(host) else {
                 continue;
             };
+            let routing = self.hosts[host as usize]
+                .process()
+                .network()
+                .routing_committees();
             let leaves: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
             let hosted: Vec<ShardId> = self.hosted_shards_of(host);
 
@@ -251,22 +255,19 @@ impl SimulationRunner {
                     && !committee
                         .iter()
                         .any(|&validator| self.homes_validator(host, validator));
-                // A halt recovery retains the replaced committee in the
-                // routing view until the shard commits under its fresh one —
-                // the members it replaced hold the halted tip the incomers
-                // sync from. Mirror the production supervisor's `in_routing`
-                // half of the retired check.
-                let recovery_retained =
-                    snapshot
-                        .pending_recoveries()
-                        .get(&shard)
-                        .is_some_and(|recovery| {
-                            recovery
-                                .retained
-                                .iter()
-                                .any(|&validator| self.homes_validator(host, validator))
-                        });
-                if ex_member && !recovery_retained {
+                // A host the routing view still resolves keeps serving: a
+                // halt recovery retains the replaced committee in the
+                // shard's routing entry until the shard commits under its
+                // fresh one — the members it replaced hold the halted tip
+                // the incomers sync from. This is the same projection the
+                // production supervisor's retired check reads, so a change
+                // to routing retention lands on both harnesses.
+                let in_routing = routing.get(&shard).is_some_and(|entry| {
+                    entry
+                        .iter()
+                        .any(|&validator| self.homes_validator(host, validator))
+                });
+                if ex_member && !in_routing {
                     let storage = self.leave_shard(host, shard);
                     self.retained_storages.insert((host, shard), storage);
                 }
