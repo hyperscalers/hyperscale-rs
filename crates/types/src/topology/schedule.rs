@@ -288,8 +288,19 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        match self.lookup_for_shard(shard, wt) {
-            (ScheduleLookup::Committee(snapshot), past_terminal) => Some((snapshot, past_terminal)),
+        Self::resolved(self.lookup_for_shard(shard, wt))
+    }
+
+    /// Collapse a lookup tuple to its resolved committee — `None` for
+    /// [`NotYetCommitted`](ScheduleLookup::NotYetCommitted) and
+    /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind
+    /// every `at_*` wrapper, so a new `ScheduleLookup` variant is handled
+    /// in one place.
+    const fn resolved(
+        (lookup, past_terminal): (ScheduleLookup<'_>, bool),
+    ) -> Option<(&Arc<TopologySnapshot>, bool)> {
+        match lookup {
+            ScheduleLookup::Committee(snapshot) => Some((snapshot, past_terminal)),
             _ => None,
         }
     }
@@ -460,10 +471,7 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        match self.lookup_for_shard_live(shard, wt) {
-            (ScheduleLookup::Committee(snapshot), past_terminal) => Some((snapshot, past_terminal)),
-            _ => None,
-        }
+        Self::resolved(self.lookup_for_shard_live(shard, wt))
     }
 
     /// [`lookup_for_shard`](Self::lookup_for_shard) for a **certified**
@@ -522,10 +530,7 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        match self.lookup_for_shard_certified(shard, anchor_wt, qc_wt) {
-            (ScheduleLookup::Committee(snapshot), past_terminal) => Some((snapshot, past_terminal)),
-            _ => None,
-        }
+        Self::resolved(self.lookup_for_shard_certified(shard, anchor_wt, qc_wt))
     }
 
     /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) for
