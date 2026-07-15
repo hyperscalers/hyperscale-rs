@@ -599,17 +599,22 @@ fn record_boundaries(
             continue;
         }
         let (_, chunk_end) = chunk_bounds(prior, boundary_count);
-        // A committed re-fold of the recorded crossing with no witness
-        // progress is not a fresh observation — the chain has not moved
-        // past the recorded anchor. Refreshing on it would reset the miss
-        // counter (and release a pending recovery's retention) from data
-        // already consumed, so a halted shard whose stale crossing keeps
-        // riding proposals would never flag. Terminal records still
-        // re-fold: a merge child's terminal marks the compose set until
-        // its parent composes.
-        if state.boundaries.get(shard).is_some_and(|b| {
-            b.terminal_epoch.is_none() && b.block_hash == block_hash && chunk_end == prior
-        }) {
+        // Only a new crossing is a liveness observation. A committed re-fold
+        // of the recorded crossing means the chain has not moved past the
+        // recorded anchor: it must not reset the miss counter, refresh the
+        // live epoch, or release a pending recovery's retention — a halting
+        // committee can leave one final crossing carrying an arbitrarily
+        // large witness backlog, and treating each drain chunk as a fresh
+        // observation would defer halt detection until the backlog ran dry.
+        // A re-fold with no witness progress carries nothing at all; one
+        // with progress drains the backlog watermark-only below. Terminal
+        // records still re-fold in full: a merge child's terminal marks the
+        // compose set until its parent composes.
+        let drain_refold = state
+            .boundaries
+            .get(shard)
+            .is_some_and(|b| b.terminal_epoch.is_none() && b.block_hash == block_hash);
+        if drain_refold && chunk_end == prior {
             continue;
         }
         if !apply_contribution_witnesses(
@@ -620,6 +625,12 @@ fn record_boundaries(
             chunk_end,
             &mut outcome,
         ) {
+            continue;
+        }
+        if drain_refold {
+            if let Some(boundary) = state.boundaries.get_mut(shard) {
+                boundary.witness_leaf_count = BeaconWitnessLeafCount::new(chunk_end);
+            }
             continue;
         }
         let (marks, is_terminal_contribution) =
@@ -1458,15 +1469,22 @@ mod tests {
     /// until the watermark reaches that count. The contribution for each
     /// epoch carries only that epoch's chunk, all proving against the one
     /// boundary block's accumulator root.
+    ///
+    /// Draining is not liveness: each re-fold of the same crossing bumps
+    /// the miss counter, keeps the recorded live epoch, and holds a
+    /// pending recovery's retention, so a halting committee cannot defer
+    /// halt detection behind a pre-loaded backlog.
     #[test]
     fn record_boundaries_drains_a_backlog_over_multiple_epochs() {
+        use hyperscale_types::HaltRecovery;
+
         let mut state = single_pool_state(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         let cap = MAX_WITNESSES_PER_SHARD;
-        // One full chunk plus a small remainder, so the drain spans two
-        // epochs: `[0, cap)` then `[cap, total)`.
-        let total = cap + 3;
+        // Two full chunks plus a small remainder, so the drain spans three
+        // epochs: `[0, cap)`, `[cap, 2 * cap)`, then `[2 * cap, total)`.
+        let total = 2 * cap + 3;
 
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"backlog-anchor"));
         let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, total as u64);
@@ -1490,8 +1508,9 @@ mod tests {
                 .collect()
             };
 
-        // Epoch 1: the watermark is cap-gated — it advances to exactly the
-        // cap even though the boundary commits `total > cap` leaves.
+        // Epoch 1: the fresh crossing records the anchor; the watermark is
+        // cap-gated — it advances to exactly the cap even though the
+        // boundary commits `total > cap` leaves.
         record_boundaries(
             &mut state,
             Epoch::new(1),
@@ -1506,14 +1525,27 @@ mod tests {
         assert_eq!(after_1.block_hash, b.hash());
         assert_eq!(after_1.state_root, anchor);
         assert_eq!(after_1.consecutive_misses, 0);
+        assert_eq!(after_1.last_live_epoch, Epoch::new(1));
 
-        // Epoch 2: the remainder `[cap, total)` drains against the same
-        // crossing; the watermark reaches the boundary's full leaf count.
+        // A recovery stamped mid-drain: only a fresh crossing may release
+        // its retention.
+        state.pending_recoveries.insert(
+            shard,
+            HaltRecovery {
+                rotated_at: Epoch::new(1),
+                retained: Vec::new(),
+                attested_frontier: after_1.height,
+            },
+        );
+
+        // Epoch 2: the second chunk drains against the same crossing — the
+        // watermark advances, but the re-fold is a miss, not a refresh, and
+        // the pending recovery survives.
         record_boundaries(
             &mut state,
             Epoch::new(2),
             &committed,
-            &contribution_with(&witnesses[cap..]),
+            &contribution_with(&witnesses[cap..2 * cap]),
         );
         let after_2 = state
             .boundaries
@@ -1521,10 +1553,33 @@ mod tests {
             .expect("boundary still recorded");
         assert_eq!(
             after_2.witness_leaf_count,
-            BeaconWitnessLeafCount::new(total as u64)
+            BeaconWitnessLeafCount::new(2 * cap as u64)
         );
         assert_eq!(after_2.block_hash, b.hash());
-        assert_eq!(after_2.consecutive_misses, 0);
+        assert_eq!(after_2.consecutive_misses, 1);
+        assert_eq!(after_2.last_live_epoch, Epoch::new(1));
+        assert!(state.pending_recoveries.contains_key(&shard));
+
+        // Epoch 3: the remainder drains; the watermark reaches the
+        // boundary's full leaf count while the miss counter keeps climbing.
+        record_boundaries(
+            &mut state,
+            Epoch::new(3),
+            &committed,
+            &contribution_with(&witnesses[2 * cap..]),
+        );
+        let after_3 = state
+            .boundaries
+            .get(&shard)
+            .expect("boundary still recorded");
+        assert_eq!(
+            after_3.witness_leaf_count,
+            BeaconWitnessLeafCount::new(total as u64)
+        );
+        assert_eq!(after_3.block_hash, b.hash());
+        assert_eq!(after_3.consecutive_misses, 2);
+        assert_eq!(after_3.last_live_epoch, Epoch::new(1));
+        assert!(state.pending_recoveries.contains_key(&shard));
     }
 
     // ─── halt detection ──────────────────────────────────────────────────
