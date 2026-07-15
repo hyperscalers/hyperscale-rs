@@ -15,13 +15,12 @@ use hyperscale_types::{
     BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBlock, ChainOrigin, ConsensusReceipt, Epoch, EventData, ExecutionCertificate,
     ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash,
-    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NetworkParams, NodeId,
-    PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, compute_merkle_root,
-    zero_bls_signature,
+    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3,
+    PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+    Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root, compute_merkle_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -285,37 +284,13 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
 /// verification.
 #[must_use]
 pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
-    use std::collections::BTreeMap;
     let mut randomness = [0u8; 32];
     let copy_len = tag.len().min(32);
     randomness[..copy_len].copy_from_slice(&tag[..copy_len]);
-    Arc::new(BeaconState {
-        chain_config: BeaconChainConfig::default(),
-        params: NetworkParams::default(),
-        next_params: NetworkParams::default(),
-        param_votes: BTreeMap::new(),
-        current_epoch: Epoch::new(epoch),
-        validators: BTreeMap::new(),
-        pools: BTreeMap::new(),
-        randomness: Randomness::new(randomness),
-        committee: Vec::new(),
-        shard_committees: BTreeMap::new(),
-        next_shard_committees: BTreeMap::new(),
-        shard_consensus_members: BTreeMap::new(),
-        witness_window_bases: BTreeMap::new(),
-        split_pending_window: BTreeSet::new(),
-        settled_window_floors: BTreeMap::new(),
-        reshape_observers_window: BTreeMap::new(),
-        reshape_keepers_window: BTreeMap::new(),
-        reshape_parent_halves: BTreeMap::new(),
-        boundaries: BTreeMap::new(),
-        advanced: BTreeSet::new(),
-        pending_reshapes: BTreeMap::new(),
-        pending_recoveries: BTreeMap::new(),
-        completed_recoveries: BTreeMap::new(),
-        miss_counters: BTreeMap::new(),
-        last_beacon_service: BTreeMap::new(),
-    })
+    let mut state = BeaconState::empty(BeaconChainConfig::default());
+    state.current_epoch = Epoch::new(epoch);
+    state.randomness = Randomness::new(randomness);
+    Arc::new(state)
 }
 
 /// Build a `(block, state)` pair for storage round-trip tests.

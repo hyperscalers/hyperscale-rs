@@ -37,9 +37,9 @@ use std::time::Instant;
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, NetworkParams,
-    PendingReshape, Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool,
-    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
+    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -224,35 +224,15 @@ fn mc_state(cell: &Cell) -> BeaconState {
     }
     let beacon_committee_size = chain_config.beacon_committee_size;
 
-    let mut state = BeaconState {
-        chain_config,
-        params: NetworkParams::default(),
-        next_params: NetworkParams::default(),
-        param_votes: BTreeMap::new(),
-        current_epoch: Epoch::GENESIS,
-        validators,
-        pools,
-        randomness: Randomness::new([cell.seed; 32]),
-        committee: (0..u64::from(beacon_committee_size))
-            .map(ValidatorId::new)
-            .collect(),
-        shard_committees: committees.clone(),
-        next_shard_committees: committees,
-        shard_consensus_members: BTreeMap::new(),
-        witness_window_bases: BTreeMap::new(),
-        split_pending_window: BTreeSet::new(),
-        settled_window_floors: BTreeMap::new(),
-        reshape_observers_window: BTreeMap::new(),
-        reshape_keepers_window: BTreeMap::new(),
-        reshape_parent_halves: BTreeMap::new(),
-        boundaries: BTreeMap::new(),
-        advanced: BTreeSet::new(),
-        pending_reshapes: BTreeMap::new(),
-        pending_recoveries: BTreeMap::new(),
-        completed_recoveries: BTreeMap::new(),
-        miss_counters: BTreeMap::new(),
-        last_beacon_service: BTreeMap::new(),
-    };
+    let mut state = BeaconState::empty(chain_config);
+    state.validators = validators;
+    state.pools = pools;
+    state.randomness = Randomness::new([cell.seed; 32]);
+    state.committee = (0..u64::from(beacon_committee_size))
+        .map(ValidatorId::new)
+        .collect();
+    state.shard_committees = committees.clone();
+    state.next_shard_committees = committees;
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
     state
 }

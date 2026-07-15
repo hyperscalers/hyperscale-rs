@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Bls12381G1PublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    NetworkParams, Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool,
-    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 const V: usize = 3;
@@ -106,33 +106,13 @@ fn initial_state() -> BeaconState {
         },
     );
 
-    let mut state = BeaconState {
-        chain_config: BeaconChainConfig::default(),
-        params: NetworkParams::default(),
-        next_params: NetworkParams::default(),
-        param_votes: BTreeMap::new(),
-        current_epoch: Epoch::GENESIS,
-        validators,
-        pools,
-        randomness: Randomness::new([0x42; 32]),
-        committee: (0u64..4).map(ValidatorId::new).collect(),
-        shard_committees: shard_committees.clone(),
-        next_shard_committees: shard_committees,
-        shard_consensus_members: BTreeMap::new(),
-        witness_window_bases: BTreeMap::new(),
-        split_pending_window: BTreeSet::new(),
-        settled_window_floors: BTreeMap::new(),
-        reshape_observers_window: BTreeMap::new(),
-        reshape_keepers_window: BTreeMap::new(),
-        reshape_parent_halves: BTreeMap::new(),
-        boundaries: BTreeMap::new(),
-        advanced: BTreeSet::new(),
-        pending_reshapes: BTreeMap::new(),
-        pending_recoveries: BTreeMap::new(),
-        completed_recoveries: BTreeMap::new(),
-        miss_counters: BTreeMap::new(),
-        last_beacon_service: BTreeMap::new(),
-    };
+    let mut state = BeaconState::empty(BeaconChainConfig::default());
+    state.validators = validators;
+    state.pools = pools;
+    state.randomness = Randomness::new([0x42; 32]);
+    state.committee = (0u64..4).map(ValidatorId::new).collect();
+    state.shard_committees = shard_committees.clone();
+    state.next_shard_committees = shard_committees;
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
     state
 }

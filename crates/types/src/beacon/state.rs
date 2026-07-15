@@ -872,6 +872,43 @@ struct WindowProjection {
 }
 
 impl BeaconState {
+    /// An empty state under `chain_config`: no validators, pools,
+    /// committees, or boundaries; genesis epoch; zero randomness; default
+    /// network params. The base every construction site builds on —
+    /// genesis seeds its validators and committees into it, fixtures seat
+    /// what a scenario needs — so a new field is defaulted in exactly one
+    /// place.
+    #[must_use]
+    pub fn empty(chain_config: BeaconChainConfig) -> Self {
+        Self {
+            chain_config,
+            params: NetworkParams::default(),
+            next_params: NetworkParams::default(),
+            param_votes: BTreeMap::new(),
+            current_epoch: Epoch::GENESIS,
+            validators: BTreeMap::new(),
+            pools: BTreeMap::new(),
+            randomness: Randomness::ZERO,
+            committee: Vec::new(),
+            shard_committees: BTreeMap::new(),
+            next_shard_committees: BTreeMap::new(),
+            shard_consensus_members: BTreeMap::new(),
+            witness_window_bases: BTreeMap::new(),
+            split_pending_window: BTreeSet::new(),
+            settled_window_floors: BTreeMap::new(),
+            reshape_observers_window: BTreeMap::new(),
+            reshape_keepers_window: BTreeMap::new(),
+            reshape_parent_halves: BTreeMap::new(),
+            boundaries: BTreeMap::new(),
+            advanced: BTreeSet::new(),
+            pending_reshapes: BTreeMap::new(),
+            pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
+            miss_counters: BTreeMap::new(),
+            last_beacon_service: BTreeMap::new(),
+        }
+    }
+
     /// Validators currently waiting in the global pool.
     ///
     /// Derived from `validators` rather than stored as a separate
@@ -1535,33 +1572,7 @@ mod tests {
     }
 
     fn empty_state() -> BeaconState {
-        BeaconState {
-            chain_config: BeaconChainConfig::default(),
-            params: NetworkParams::default(),
-            next_params: NetworkParams::default(),
-            param_votes: BTreeMap::new(),
-            current_epoch: Epoch::GENESIS,
-            validators: BTreeMap::new(),
-            pools: BTreeMap::new(),
-            randomness: Randomness::ZERO,
-            committee: Vec::new(),
-            shard_committees: BTreeMap::new(),
-            next_shard_committees: BTreeMap::new(),
-            shard_consensus_members: BTreeMap::new(),
-            witness_window_bases: BTreeMap::new(),
-            split_pending_window: BTreeSet::new(),
-            settled_window_floors: BTreeMap::new(),
-            reshape_observers_window: BTreeMap::new(),
-            reshape_keepers_window: BTreeMap::new(),
-            reshape_parent_halves: BTreeMap::new(),
-            boundaries: BTreeMap::new(),
-            advanced: BTreeSet::new(),
-            pending_reshapes: BTreeMap::new(),
-            pending_recoveries: BTreeMap::new(),
-            completed_recoveries: BTreeMap::new(),
-            miss_counters: BTreeMap::new(),
-            last_beacon_service: BTreeMap::new(),
-        }
+        BeaconState::empty(BeaconChainConfig::default())
     }
 
     /// Build a state with one shard, one pool, and `n_active` validators

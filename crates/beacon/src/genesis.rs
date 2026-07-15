@@ -140,37 +140,20 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         })
         .collect();
 
-    let mut state = BeaconState {
-        chain_config: config.chain_config,
-        params: NetworkParams::from_genesis(&config.chain_config),
-        next_params: NetworkParams::from_genesis(&config.chain_config),
-        param_votes: BTreeMap::new(),
-        current_epoch: Epoch::GENESIS,
-        validators,
-        pools,
-        randomness: config.initial_randomness,
-        committee,
-        // Genesis fixes both windows to the configured committee: the
-        // first apply_epoch promotes `next_shard_committees`, so epoch 0
-        // and epoch 1 are both governed by the initial set until the
-        // pipeline first rotates it.
-        shard_committees: next_shard_committees.clone(),
-        next_shard_committees,
-        shard_consensus_members: BTreeMap::new(),
-        witness_window_bases: BTreeMap::new(),
-        split_pending_window: BTreeSet::new(),
-        settled_window_floors: BTreeMap::new(),
-        reshape_observers_window: BTreeMap::new(),
-        reshape_keepers_window: BTreeMap::new(),
-        reshape_parent_halves: BTreeMap::new(),
-        boundaries,
-        advanced: BTreeSet::new(),
-        pending_reshapes: BTreeMap::new(),
-        pending_recoveries: BTreeMap::new(),
-        completed_recoveries: BTreeMap::new(),
-        miss_counters: BTreeMap::new(),
-        last_beacon_service: BTreeMap::new(),
-    };
+    let mut state = BeaconState::empty(config.chain_config);
+    state.params = NetworkParams::from_genesis(&state.chain_config);
+    state.next_params = NetworkParams::from_genesis(&state.chain_config);
+    state.validators = validators;
+    state.pools = pools;
+    state.randomness = config.initial_randomness;
+    state.committee = committee;
+    // Genesis fixes both windows to the configured committee: the
+    // first apply_epoch promotes `next_shard_committees`, so epoch 0
+    // and epoch 1 are both governed by the initial set until the
+    // pipeline first rotates it.
+    state.shard_committees = next_shard_committees.clone();
+    state.next_shard_committees = next_shard_committees;
+    state.boundaries = boundaries;
     // Genesis placements are `ready: true` by construction, so the frozen
     // consensus subset starts as full membership; the witness window
     // bases start at the zeroed genesis watermarks.
