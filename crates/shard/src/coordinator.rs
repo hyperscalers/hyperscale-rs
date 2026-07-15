@@ -471,25 +471,22 @@ impl ShardCoordinator {
     // weighted timestamp, since that is the tip we extend.
 
     /// Weighted timestamp selecting `block_hash`'s committee — its parent QC's
-    /// weighted timestamp. Reads the header from `pending_blocks`; the
-    /// committed tip (pruned from pending) uses the `committed_anchor_ts`
-    /// scalar, and an applied-but-uncommitted synced block reads its cached
-    /// certified handle — such a tip exists only via block-sync (its header
-    /// was never gossiped here), so without the cache read a live proposal
-    /// extending it would defer on "parent not held" while every re-fetch
-    /// of the parent is deduplicated as already applied. `None` when the
-    /// block is unknown by every route, so its committee can't be resolved
-    /// (caller stalls).
+    /// weighted timestamp. The committed tip (pruned from pending and the
+    /// certified cache alike) uses the `committed_anchor_ts` scalar; every
+    /// other block resolves through [`ChainView::get_header`], whose
+    /// certified-cache fallback covers an applied-but-uncommitted synced
+    /// block — such a tip exists only via block-sync (its header was never
+    /// gossiped here), so without it a live proposal extending it would
+    /// defer on "parent not held" while every re-fetch of the parent is
+    /// deduplicated as already applied. `None` when the block is unknown by
+    /// every route, so its committee can't be resolved (caller stalls).
     fn committee_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
         if block_hash == self.committed_hash {
             return Some(self.committed_anchor_ts);
         }
-        if let Some(header) = self.pending_blocks.get_header(block_hash) {
-            return Some(header.parent_qc().weighted_timestamp());
-        }
-        self.verification
-            .cached_verified_certified_block(block_hash)
-            .map(|certified| certified.block().header().parent_qc().weighted_timestamp())
+        self.chain_view()
+            .get_header(block_hash)
+            .map(|header| header.parent_qc().weighted_timestamp())
     }
 
     /// Weighted timestamp selecting the committee for the height in progress /
