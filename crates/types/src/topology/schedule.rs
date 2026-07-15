@@ -337,6 +337,25 @@ impl TopologySchedule {
             .map(|recovery| recovery.rotated_at.next())
     }
 
+    /// The bridge epoch when live work anchored at `wt` rides `shard`'s
+    /// pending halt recovery: a recovery is in flight and `wt`'s epoch
+    /// sits below the bridge.
+    fn live_bridge(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<Epoch> {
+        self.recovery_bridge(shard)
+            .filter(|&bridge| self.epoch_for(wt) < bridge)
+    }
+
+    /// Whether live work anchored at `wt` rides `shard`'s pending halt
+    /// recovery bridge — the band
+    /// [`lookup_for_shard_live`](Self::lookup_for_shard_live) re-binds to
+    /// the fresh committee. The one predicate every consumer reads
+    /// (proposer gating, state-root deferral, the live lookup itself), so
+    /// the bridge band cannot drift between them.
+    #[must_use]
+    pub fn recovery_bridging(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        self.live_bridge(shard, wt).is_some()
+    }
+
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
     /// an in-flight halt recovery: past the beacon-attested frontier the
     /// recovery froze, the retained (beyond-f) committee could only have
@@ -427,9 +446,7 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> (ScheduleLookup<'_>, bool) {
-        if let Some(bridge) = self.recovery_bridge(shard)
-            && self.epoch_for(wt) < bridge
-        {
+        if let Some(bridge) = self.live_bridge(shard, wt) {
             return self.bridged_for_shard(shard, bridge);
         }
         self.lookup_for_shard(shard, wt)

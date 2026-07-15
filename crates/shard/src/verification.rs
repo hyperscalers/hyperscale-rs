@@ -1522,9 +1522,8 @@ impl VerificationPipeline {
             // there may the state-root deferral trust a QC-attested parent —
             // the halted tip arrives by sync, unverifiable locally until a
             // commit that needs this very block's QC.
-            let recovery_bridge = schedule.recovery_bridge(local_shard).is_some_and(|bridge| {
-                schedule.epoch_for(h.parent_qc().weighted_timestamp()) < bridge
-            });
+            let recovery_bridge =
+                schedule.recovery_bridging(local_shard, h.parent_qc().weighted_timestamp());
             self.initiate_state_root_verification(
                 block_hash,
                 block,
