@@ -1556,6 +1556,7 @@ impl ShardCoordinator {
             &self.beacon_witness_accumulator,
             self.committed_hash,
             parent_block_hash,
+            proposal_wt,
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
             self.local_shard,
@@ -3854,6 +3855,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         block: &Block,
         block_hash: BlockHash,
+        certifying_qc: &QuorumCertificate,
         commit_ts: WeightedTimestamp,
     ) -> (Vec<Action>, BeaconWitnessCommit) {
         let height = block.height();
@@ -3930,18 +3932,21 @@ impl ShardCoordinator {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        // The committed block's missed-proposal leaves resolve against its own
-        // committee. Every path that reaches commit first verified the block
-        // against that committee — consensus voting resolves it in
-        // `try_vote_on_block`, and the sync path drops a block whose committee
-        // is unresolved in `submit_synced_block_for_verification` — and the
-        // beacon only advances, so it cannot evict the epoch within the
-        // verify-to-commit window. The committee therefore always resolves
-        // here. If it ever doesn't, local state is corrupt: deriving leaves
-        // under a stale committee would fork the beacon-witness accumulator
-        // across the committee, so fail fast rather than fork, mirroring the
-        // commit-linkage assert above.
-        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
+        // The committed block's missed-proposal leaves resolve against the
+        // committee that produced it — the certified binding of its anchor
+        // and certifying QC. That binding is a pure function of folded
+        // chain content: a halt recovery's sync-admitted suffix keeps
+        // deriving under the old committee its headers committed, a bridge
+        // block under the fresh committee that proposed it, and every
+        // replica derives the same leaves however late it commits (the
+        // completed recovery keeps the bridge answering after the pending
+        // record clears). Every path that reaches commit first verified
+        // the block against this committee, so it always resolves here.
+        // If it ever doesn't, local state is corrupt: deriving leaves
+        // under a different committee would fork the beacon-witness
+        // accumulator across the committee, so fail fast rather than
+        // fork, mirroring the commit-linkage assert above.
+        let Some(committee) = self.committee_of_qc(topology_schedule, certifying_qc) else {
             panic!(
                 "commit-time committee unresolved at height {} for block {block_hash:?} \
                  (anchor {:?}) — beacon-witness accumulator would diverge",
@@ -4095,6 +4100,7 @@ impl ShardCoordinator {
             topology_schedule,
             certified.block(),
             block_hash,
+            certified.qc(),
             weighted_ts,
         );
         actions.extend(abandon);
@@ -8459,10 +8465,13 @@ mod tests {
             reshape_trigger: None,
         };
         let block_hash = block.hash();
+        // The linkage assert fires before the committee resolves, so a
+        // placeholder QC suffices.
         let _ = state.record_block_committed(
             &topology_schedule,
             &block,
             block_hash,
+            &QuorumCertificate::genesis(block.header().shard_id(), ChainOrigin::ROOT),
             WeightedTimestamp::from_millis(1000),
         );
     }

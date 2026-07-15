@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Hash, ShardId,
-    ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, compute_merkle_root,
-    derive_leaves, missed_proposals_since_prev_commit,
+    ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, WeightedTimestamp,
+    compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit,
 };
 
 use crate::pending::{PendingBlock, PendingBlocks};
@@ -148,13 +148,18 @@ impl BeaconWitnessAccumulator {
 /// the committed tip, re-deriving each ancestor's witness-leaf delta
 /// from its receipts + manifest's `ready_signals` + missed-round scan,
 /// then prepends the committed accumulator's retained window. Each
-/// ancestor's leaves resolve against *its own* committee — the schedule
-/// entry at the ancestor's `parent_qc.weighted_timestamp()`, matching the
-/// commit-time derivation (`committee_of_block`). A pending chain that
-/// straddles an epoch boundary therefore reproduces exactly what each
-/// block committed, rather than re-deriving an older epoch's
-/// missed-proposal leaves under the tip's committee. The result is the
-/// input the verifier applies the block's own new leaves to.
+/// ancestor's leaves resolve against *its own* committee — the certified
+/// binding of its anchor (`parent_qc.weighted_timestamp()`) and its
+/// certifying QC (`parent_qc_wt` for the first ancestor, then each
+/// successor's `parent_qc` down the chain), matching the commit-time
+/// derivation. A pending chain that straddles an epoch boundary
+/// therefore reproduces exactly what each block committed, rather than
+/// re-deriving an older epoch's missed-proposal leaves under the tip's
+/// committee — and a halt recovery's sync-admitted suffix keeps deriving
+/// under the old committee its headers committed, while the bridge
+/// blocks derive under the fresh committee that proposed them. The
+/// result is the input the verifier applies the block's own new leaves
+/// to.
 ///
 /// An ancestor absent from `pending_blocks` falls back to
 /// `certified_blocks` — the verified-certified cache where a
@@ -176,10 +181,12 @@ impl BeaconWitnessAccumulator {
 ///
 /// `Err(blocking_hash)` for a missing or unassembled ancestor, or one
 /// whose committee is unresolvable in `schedule`.
+#[allow(clippy::too_many_arguments)] // the walk threads the caller's full chain-prefix context
 pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
     parent_block_hash: BlockHash,
+    parent_qc_wt: WeightedTimestamp,
     pending_blocks: &PendingBlocks,
     certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>, S>,
     local_shard: ShardId,
@@ -192,6 +199,9 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     }
     let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
     let mut current = parent_block_hash;
+    // The QC certifying `current` — the caller's `parent_qc` for the first
+    // ancestor, then each block's own `parent_qc` as the walk descends.
+    let mut certifying_wt = parent_qc_wt;
     while current != committed_hash {
         let block: &Block = match pending_blocks.get(current).map(PendingBlock::block) {
             Some(Some(block)) => block,
@@ -205,14 +215,18 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
         };
         let header = block.header();
         // This ancestor's leaves committed under its own committee — the
-        // schedule entry at its `parent_qc.weighted_timestamp()`. Resolving
-        // it per ancestor (rather than under the walk's tip committee) keeps
+        // certified binding of its anchor and certifying QC. Resolving it
+        // per ancestor (rather than under the walk's tip committee) keeps
         // a boundary-straddling pending chain byte-identical to what each
-        // block committed. Recovery-bridged: a halt recovery's bridge block
-        // derives its leaves against the fresh committee that proposed it.
-        let Some((committee, _)) =
-            schedule.at_for_shard_live(local_shard, header.parent_qc().weighted_timestamp())
-        else {
+        // block committed; the certified binding keeps a halt recovery's
+        // sync-admitted suffix on the old committee its headers committed
+        // while a bridge block resolves the fresh committee that proposed
+        // it — stable across replicas however late they walk it.
+        let Some((committee, _)) = schedule.at_for_shard_certified(
+            local_shard,
+            header.parent_qc().weighted_timestamp(),
+            certifying_wt,
+        ) else {
             return Err(current);
         };
         let committee = committee.as_ref();
@@ -244,6 +258,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
                 .map(ShardWitnessPayload::leaf_hash)
                 .collect(),
         );
+        certifying_wt = header.parent_qc().weighted_timestamp();
         current = header.parent_block_hash();
     }
     let mut leaves = committed_leaves.to_vec();

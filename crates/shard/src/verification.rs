@@ -1270,6 +1270,7 @@ impl VerificationPipeline {
             accumulator,
             committed_hash,
             header.parent_block_hash(),
+            header.parent_qc().weighted_timestamp(),
             pending_blocks,
             &self.verified_certified_blocks,
             local_shard,

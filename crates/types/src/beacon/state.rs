@@ -589,6 +589,15 @@ pub struct BeaconState {
     /// drops on the shard's next observed crossing (the fresh committee
     /// produced) and is GC'd with the shard's boundary record.
     pub pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
+    /// The epoch each shard's most recent completed halt recovery seated
+    /// its fresh committee (`rotated_at`), stamped when the pending record
+    /// clears on the shard's first crossing. Permanent — one entry per
+    /// recovered shard, overwritten by a later recovery — so certified
+    /// resolution of the recovery's bridge band stays a pure function of
+    /// folded chain content: a bridge block re-derived after the pending
+    /// record clears still resolves the fresh committee it was produced
+    /// under, no matter when a replica commits it.
+    pub completed_recoveries: BTreeMap<ShardId, Epoch>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -1324,6 +1333,7 @@ impl BeaconState {
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
         .with_pending_recoveries(self.pending_recoveries.clone())
+        .with_completed_recoveries(self.completed_recoveries.clone())
     }
 
     /// Active-duty validator pool: the [`Self::beacon_eligible`] serving
@@ -1506,6 +1516,7 @@ mod tests {
             advanced: BTreeSet::new(),
             pending_reshapes: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
+            completed_recoveries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
             last_beacon_service: BTreeMap::new(),
         }
