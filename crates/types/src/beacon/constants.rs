@@ -159,12 +159,21 @@ pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 /// sit above [`RESHAPE_HANDOFF_TTL_EPOCHS`] (a successor's
 /// post-execution seating lag) and the occasional missed fold.
 ///
-/// Set to `16` — comfortably above the 12-epoch handoff TTL (the longest
-/// legitimate quiet spell for a non-reshaping shard, and reshaping shards
-/// are exempt outright), so a healthy shard never false-flags, while
-/// holding detection latency to one shuffle interval. The scenario sims
-/// exercise the halt-and-recover path at this value with no spurious
-/// flags.
+/// The bound is two-sided. It must sit *above* the longest legitimate
+/// quiet spell so a healthy shard never false-flags — a hard floor of
+/// `RESHAPE_HANDOFF_TTL_EPOCHS` (12; reshaping shards are also exempt
+/// outright) plus the occasional missed fold. But it also caps a *safety*
+/// exposure: until the freeze fires at detection, a beyond-f committee can
+/// export forged cross-shard artifacts (the `committee_security` §10
+/// Finding 9 disposition), so the detection latency is the window that
+/// exposure runs, and a
+/// lower threshold is a smaller window. So the value wants to be as low as
+/// the false-trigger floor allows.
+///
+/// Set to `16` — just above the 12-epoch floor, so a healthy shard never
+/// false-flags while the exposure window stays near its minimum (one
+/// shuffle interval of detection latency). The scenario sims exercise the
+/// halt-and-recover path at this value with no spurious flags.
 pub const HALT_THRESHOLD_EPOCHS: u64 = 16;
 
 // ─── Penalties ─────────────────────────────────────────────────────────────
