@@ -110,7 +110,7 @@ mod tests {
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
-        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VrfProof,
         WaveCertificate, WaveId, WeightedTimestamp, settled_waves_root_from_ids,
     };
 
@@ -193,6 +193,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let hash = block.hash();
         storage.commit_block(

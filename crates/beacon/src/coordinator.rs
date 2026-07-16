@@ -1697,8 +1697,13 @@ impl BeaconCoordinator {
     /// re-issue — next observation, fetch response, or commit — picking up
     /// the next gap.
     fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
+        let watermark = self
+            .state
+            .boundaries
+            .get(&shard)
+            .map_or(0, |b| b.witness_leaf_count.inner());
         let (anchor, block_height, prior, chunk_end) = {
-            let Some(crossing) = self.shard_source.latest_crossing(shard) else {
+            let Some(crossing) = self.shard_source.next_crossing_to_source(shard, watermark) else {
                 return Vec::new();
             };
             let boundary_header = crossing.boundary_header();
@@ -1720,10 +1725,11 @@ impl BeaconCoordinator {
         if leaves_to_fetch.is_empty() {
             return Vec::new();
         }
-        // Re-send even leaves already marked in flight: a response that
-        // never landed leaves a leaf pinned, and a chunk only folds once
-        // every leaf is held. The batch advances as held leaves drop out
-        // of `missing_chunk_leaves` on each re-issue.
+        // The request names every missing leaf regardless of in-flight
+        // status: the runner's fetch dedups ids it already tracks, so a
+        // re-issue only revives leaves whose earlier fetch was fulfilled
+        // without admission or abandoned. The batch advances as held
+        // leaves drop out of `missing_chunk_leaves` on each re-issue.
         for &leaf in &leaves_to_fetch {
             self.shard_source
                 .register_pending_fetch(shard, block_height, anchor, leaf);
@@ -2854,6 +2860,7 @@ mod tests {
             height: BlockHeight::new(5),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::new(applied),
+            witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: Epoch::new(1),
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -5179,6 +5186,7 @@ mod tests {
             height: BlockHeight::GENESIS,
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: Epoch::new(epoch),
             consecutive_misses: 0,
             terminal_epoch: None,

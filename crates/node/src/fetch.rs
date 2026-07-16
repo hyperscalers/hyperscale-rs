@@ -592,6 +592,36 @@ mod tests {
         assert_eq!(ids.len(), 30);
     }
 
+    /// An id stuck at the global cap dispatches as soon as an in-flight
+    /// id is admitted — the freed slot is filled in the same call, not
+    /// deferred to a later tick.
+    #[test]
+    fn admitted_frees_slot_for_queued_id() {
+        let mut p = Fetch::<TxHash>::new(
+            "test",
+            FetchConfig {
+                max_in_flight: 1,
+                max_ids_per_request: 10,
+                parallel_chunks_per_tick: 4,
+            },
+        );
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(1), tx(2)],
+            shard: SHARD,
+            preferred: None,
+            class: None,
+        });
+        assert_eq!(out.len(), 1);
+        let FetchOutput::Send { ids, .. } = &out[0];
+        assert_eq!(ids, &vec![tx(1)]);
+
+        let out = p.handle(FetchInput::Admitted { ids: vec![tx(1)] });
+        assert_eq!(out.len(), 1);
+        let FetchOutput::Send { ids, .. } = &out[0];
+        assert_eq!(ids, &vec![tx(2)]);
+        assert_eq!(p.pending_count(), 1);
+    }
+
     #[test]
     fn global_in_flight_cap_bounds_emissions() {
         let mut p = Fetch::<TxHash>::new(

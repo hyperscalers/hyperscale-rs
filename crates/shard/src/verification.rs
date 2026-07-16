@@ -1353,6 +1353,7 @@ impl VerificationPipeline {
             substate_bytes,
             thresholds,
             finalized_waves,
+            randomness_reveal: *block.randomness_reveal(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -1984,7 +1985,8 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Epoch, Hash, LocalReceiptRoot,
         LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardId,
-        SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+        SignerBitfield, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -2036,6 +2038,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -2482,6 +2485,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let block_hash = block.hash();
         vp.track_pending_assembly(Arc::new(block));

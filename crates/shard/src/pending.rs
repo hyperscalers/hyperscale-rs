@@ -576,6 +576,7 @@ impl PendingBlock {
             provision_hashes,
             ready_signals,
             reshape_trigger,
+            *block.randomness_reveal(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
             BTreeMap::new();
@@ -757,6 +758,7 @@ impl PendingBlock {
             provisions: Arc::new(provisions.into()),
             ready_signals: Arc::new(self.manifest.ready_signals().clone()),
             reshape_trigger: self.manifest.reshape_trigger(),
+            randomness_reveal: *self.manifest.randomness_reveal(),
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -811,7 +813,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, BoundedVec, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, ValidatorId, Verified,
-        WaveCertificate, WaveId,
+        VrfProof, WaveCertificate, WaveId,
     };
 
     use super::*;
@@ -921,7 +923,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1, tx2], vec![], vec![], vec![], None),
+            BlockManifest::new(vec![tx1, tx2], vec![], vec![], vec![], None, VrfProof::ZERO),
             LocalTimestamp::ZERO,
         );
 
@@ -956,6 +958,7 @@ mod tests {
                 vec![],
                 vec![],
                 None,
+                VrfProof::ZERO,
             ),
             LocalTimestamp::ZERO,
         );
@@ -974,7 +977,14 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![], vec![wave_id.clone()], vec![], vec![], None),
+            BlockManifest::new(
+                vec![],
+                vec![wave_id.clone()],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -1004,7 +1014,14 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx_hash], vec![wave_id.clone()], vec![], vec![], None),
+            BlockManifest::new(
+                vec![tx_hash],
+                vec![wave_id.clone()],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -1043,6 +1060,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1068,7 +1086,14 @@ mod tests {
 
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
-            BlockManifest::new(vec![], vec![], vec![prov_a, prov_b], vec![], None),
+            BlockManifest::new(
+                vec![],
+                vec![],
+                vec![prov_a, prov_b],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(
@@ -1111,12 +1136,19 @@ mod tests {
 
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
-            BlockManifest::new(vec![], vec![], vec![shared, only_stale], vec![], None),
+            BlockManifest::new(
+                vec![],
+                vec![],
+                vec![shared, only_stale],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(
             make_header(BlockHeight::new(10)),
-            BlockManifest::new(vec![], vec![], vec![shared], vec![], None),
+            BlockManifest::new(vec![], vec![], vec![shared], vec![], None, VrfProof::ZERO),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(stale);
@@ -1138,13 +1170,20 @@ mod tests {
 
         let dropped = PendingBlock::from_manifest(
             make_header(BlockHeight::new(7)),
-            BlockManifest::new(vec![shared, only_dropped], vec![], vec![], vec![], None),
+            BlockManifest::new(
+                vec![shared, only_dropped],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
         let dropped_hash = dropped.header().hash();
         let other = PendingBlock::from_manifest(
             make_header(BlockHeight::new(8)),
-            BlockManifest::new(vec![shared], vec![], vec![], vec![], None),
+            BlockManifest::new(vec![shared], vec![], vec![], vec![], None, VrfProof::ZERO),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(dropped);

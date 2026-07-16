@@ -14,11 +14,11 @@ use hyperscale_types::{
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
-    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, SharedCertificates,
-    SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp,
+    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, ShardWitnessPayload,
+    SharedCertificates, SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VoteCount, VrfProof, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -648,6 +648,10 @@ pub enum Action {
         /// Finalized waves whose receipts contribute receipt-sourced
         /// witness events.
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        /// The block's randomness reveal (leaf 0). Its digest is checked
+        /// against the recomputed root; the proof's BLS validity against the
+        /// proposer's key is verified in the handler.
+        randomness_reveal: VrfProof,
         /// Topology snapshot for `proposer_for` lookups in the
         /// missed-round walk.
         topology_snapshot: TopologySnapshot,
@@ -776,14 +780,17 @@ pub enum Action {
         /// from the load predicate over the parent state's substate
         /// count.
         reshape_trigger: Option<ReshapeTrigger>,
-        /// Pre-derived beacon-witness accumulator root after this block's
-        /// witnesses are appended. The coordinator owns the accumulator
-        /// and computes both this and `beacon_witness_leaf_count` before
-        /// emitting the action.
-        beacon_witness_root: BeaconWitnessRoot,
-        /// Pre-derived total accumulator leaf count after this block's
-        /// witnesses are appended.
-        beacon_witness_leaf_count: BeaconWitnessLeafCount,
+        /// The trimmed parent-window accumulator leaves this block's new
+        /// witnesses append onto, resolved by the coordinator (which owns the
+        /// accumulator and does the ancestor walk). The handler signs the
+        /// block's randomness reveal (leaf 0) on the dispatch pool, derives the
+        /// block's new leaves over these, and finalizes `beacon_witness_root`
+        /// and the leaf count.
+        parent_witness_leaves: Vec<Hash>,
+        /// The block's `MissedProposal` witness leaves, derived by the
+        /// coordinator over `(parent_round, round)` against the block's
+        /// committee. Threaded so the handler's leaf derivation matches.
+        missed: Vec<ShardWitnessPayload>,
         /// The witness window base of the block's window, resolved by the
         /// coordinator from the same schedule entry as the block's
         /// committee. Stamped verbatim into the header.

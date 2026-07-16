@@ -477,8 +477,14 @@ where
             ShardScopedInput::ShardWitnessesFetchFailed { ids } => {
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Failed { ids });
             }
+            ShardScopedInput::ShardWitnessesFetchFulfilled { ids } => {
+                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Admitted { ids });
+            }
             ShardScopedInput::BeaconProposalFetchFailed { ids } => {
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Failed { ids });
+            }
+            ShardScopedInput::BeaconProposalFetchFulfilled { ids } => {
+                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Admitted { ids });
             }
 
             // ── Certified header (gossip → BLS verify → state machine) ──

@@ -1271,7 +1271,7 @@ mod tests {
     }
     use hyperscale_types::{
         Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardId, ValidatorId,
+        ShardId, ValidatorId, VrfProof,
     };
 
     use super::*;
@@ -1342,6 +1342,7 @@ mod tests {
                 provisions: Arc::new(vec![Arc::new(provision.into())].into()),
                 ready_signals: Arc::new(BoundedVec::new()),
                 reshape_trigger: None,
+                randomness_reveal: VrfProof::ZERO,
             },
             sealed @ Block::Sealed { .. } => sealed,
         };

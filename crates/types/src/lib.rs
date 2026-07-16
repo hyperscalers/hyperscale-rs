@@ -140,9 +140,9 @@ pub use shard::roots::{
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, ProvisionsRootContext, SplitChildRoots, StateRootContext,
     StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
-    certificate_root_from_receipt_hashes, derive_leaves, derive_reshape_trigger,
-    local_settled_wave_ids, missed_proposals_since_prev_commit, ready_leaf_payload,
-    settled_waves_root_from_ids,
+    certificate_root_from_receipt_hashes, commit_witness_window, derive_leaves,
+    derive_reshape_trigger, local_settled_wave_ids, missed_proposals_since_prev_commit,
+    ready_leaf_payload, settled_waves_root_from_ids,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

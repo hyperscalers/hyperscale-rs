@@ -361,11 +361,32 @@ pub enum ShardScopedInput {
         ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
     },
 
+    /// A shard-witness fetch response delivered its payload: release the
+    /// fetch slot so the next queued leaf can dispatch. Keyed by the
+    /// *request* ids, not the response contents, so a peer's payload can't
+    /// leave the slot pinned; if the delivered witness fails admission,
+    /// the beacon coordinator's chunk re-drive re-requests the leaf. The
+    /// payload itself rides the accompanying
+    /// `ProtocolEvent::ShardWitnessesReceived`.
+    ShardWitnessesFetchFulfilled {
+        /// Per-leaf identities the response fulfilled.
+        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
+    },
+
     /// A beacon-proposal fetch failed (network error, or the peer
     /// didn't have the proposal pooled). Per-id so multiple parallel
     /// missing-proposal fetches can fail independently.
     BeaconProposalFetchFailed {
         /// `(epoch, validator)` pairs whose fetch failed.
+        ids: Vec<(Epoch, ValidatorId)>,
+    },
+
+    /// A beacon-proposal fetch response delivered a proposal: release the
+    /// fetch slot. Keyed by the request ids — same contract as
+    /// [`Self::ShardWitnessesFetchFulfilled`]. The payload rides the
+    /// accompanying `ProtocolEvent::BeaconProposalFetched`.
+    BeaconProposalFetchFulfilled {
+        /// `(epoch, validator)` pairs the response fulfilled.
         ids: Vec<(Epoch, ValidatorId)>,
     },
 
@@ -455,7 +476,9 @@ impl ShardScopedInput {
             | Self::LocalProvisionsFetchFailed { .. }
             | Self::FinalizedWavesFetchFailed { .. }
             | Self::ShardWitnessesFetchFailed { .. }
+            | Self::ShardWitnessesFetchFulfilled { .. }
             | Self::BeaconProposalFetchFailed { .. }
+            | Self::BeaconProposalFetchFulfilled { .. }
             | Self::QcOnlyCommitPrepared { .. }
             | Self::QcOnlyCommitDiverged { .. } => EventPriority::Internal,
         }

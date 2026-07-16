@@ -247,6 +247,11 @@ pub struct ShardBoundary {
     pub weighted_timestamp: WeightedTimestamp,
     /// Beacon-witness accumulator high-water mark at the boundary.
     pub witness_leaf_count: BeaconWitnessLeafCount,
+    /// The boundary header's own witness window base — the low edge of
+    /// the leaf range its `beacon_witness_root` commits. Serving
+    /// committee members retain persisted witness payloads down to this
+    /// index so a snap-syncing joiner can assemble the anchor's window.
+    pub witness_base: BeaconWitnessLeafCount,
     /// Epoch in which this boundary was last refreshed by an observed
     /// crossing — the anchor's freshness.
     pub last_live_epoch: Epoch,
@@ -1382,6 +1387,7 @@ impl BeaconState {
                         block_hash: b.block_hash,
                         height: b.height,
                         weighted_timestamp: b.weighted_timestamp,
+                        witness_base: b.witness_base,
                         settled_waves_root: b.settled_waves_root,
                     },
                 )
@@ -1652,6 +1658,7 @@ mod tests {
             height: BlockHeight::GENESIS,
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: creation,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -1717,6 +1724,7 @@ mod tests {
             height: BlockHeight::new(5),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: Epoch::new(1),
             consecutive_misses: misses,
             terminal_epoch: None,
@@ -2008,6 +2016,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,

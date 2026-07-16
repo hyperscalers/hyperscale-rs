@@ -45,8 +45,8 @@ use hyperscale_types::{
     QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId,
     ShardWitnessPayload, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
     TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp,
-    local_settled_wave_ids, ready_signal_message,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, vrf_output_from_proof,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -1240,8 +1240,8 @@ impl ShardCoordinatorSim {
                 finalized_tx_count,
                 ready_signals,
                 reshape_trigger,
-                beacon_witness_root,
-                beacon_witness_leaf_count,
+                parent_witness_leaves,
+                missed,
                 beacon_witness_base,
                 carry_split_child_roots,
                 carry_settled_waves_root,
@@ -1320,8 +1320,9 @@ impl ShardCoordinatorSim {
                     finalized_tx_count,
                     ready_signals,
                     reshape_trigger,
-                    beacon_witness_root,
-                    beacon_witness_leaf_count,
+                    VrfProof::ZERO,
+                    &parent_witness_leaves,
+                    &missed,
                     beacon_witness_base,
                     carry_split_child_roots,
                     settled_waves_root,
@@ -1485,6 +1486,7 @@ impl ShardCoordinatorSim {
                 substate_bytes,
                 thresholds,
                 finalized_waves,
+                randomness_reveal,
                 topology_snapshot,
             } => {
                 let receipts: Vec<StoredReceipt> = finalized_waves
@@ -1502,6 +1504,7 @@ impl ShardCoordinatorSim {
                     round,
                     receipts: &receipts,
                     ready_signals: &ready_signals,
+                    reveal_output: vrf_output_from_proof(&randomness_reveal),
                     reshape_trigger,
                     substate_bytes,
                     thresholds,

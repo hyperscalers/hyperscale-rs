@@ -15,17 +15,20 @@ use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertificateRootContext, CertifiedBlockHeader, CertifiedHeaderVerifyError, ConsensusReceipt,
-    FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
-    NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot,
-    ShardId, SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
-    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verify, VoteCount, WeightedTimestamp, block_header_message, block_vote_message,
-    certified_block_header_message, compute_waves, local_settled_wave_ids, ready_signal_message,
+    BeaconWitnessLeafCount, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    CertificateRoot, CertificateRootContext, CertifiedBlockHeader, CertifiedHeaderVerifyError,
+    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
+    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Round,
+    RoutableTransaction, SettledWavesRoot, ShardId, ShardWitnessPayload, SplitChildRoots,
+    StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
+    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
+    certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
+    local_settled_wave_ids, ready_signal_message, shard_reveal_sign, shard_reveal_verify,
+    vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -207,8 +210,9 @@ pub fn build_proposal<S: ShardChainWriter>(
     finalized_tx_count: u32,
     ready_signals: Vec<ReadySignal>,
     reshape_trigger: Option<ReshapeTrigger>,
-    beacon_witness_root: BeaconWitnessRoot,
-    beacon_witness_leaf_count: BeaconWitnessLeafCount,
+    randomness_reveal: VrfProof,
+    parent_witness_leaves: &[Hash],
+    missed: &[ShardWitnessPayload],
     beacon_witness_base: BeaconWitnessLeafCount,
     carry_split_child_roots: bool,
     settled_waves_root: Option<SettledWavesRoot>,
@@ -223,26 +227,9 @@ pub fn build_proposal<S: ShardChainWriter>(
         None,
     );
 
-    // Final-epoch headers of a splitting shard carry the root node's two
-    // child hashes, read from the same JMT computation that produced
-    // `state_root`. A leaf root (≤1-key tree) yields no pair; replicas
-    // then reject the header, which can only arise if a shard drained to
-    // nearly nothing while its split stayed pending.
-    let split_child_roots = if carry_split_child_roots {
-        let pair = jmt_snapshot
-            .root_child_hashes()
-            .map(|(left, right)| SplitChildRoots { left, right });
-        if pair.is_none() {
-            tracing::error!(
-                shard = ?local_shard,
-                height = height.inner(),
-                "split-pending final epoch but the state root has no internal root node"
-            );
-        }
-        pair
-    } else {
-        None
-    };
+    let split_child_roots = carry_split_child_roots
+        .then(|| split_child_roots_for_header(&jmt_snapshot, local_shard, height))
+        .flatten();
 
     // Lift each `Verified<RoutableTransaction>` into `Verifiable` so block
     // construction and per-root compute calls see the form that
@@ -256,6 +243,25 @@ pub fn build_proposal<S: ShardChainWriter>(
         .iter()
         .flat_map(|fw| fw.receipts().iter().cloned())
         .collect();
+
+    // Finalize the beacon-witness commitment: the reveal (leaf 0) plus the
+    // content leaves append onto the coordinator-resolved parent window. The
+    // reveal was signed above on the dispatch pool; the same derivation the
+    // verifier runs (`derive_leaves`) fixes the leaf order.
+    let new_witness_leaves = derive_leaves(
+        local_shard,
+        topology_snapshot,
+        vrf_output_from_proof(&randomness_reveal),
+        &receipts,
+        missed,
+        &ready_signals,
+        reshape_trigger.and_then(|t| t.to_payload(local_shard)),
+    );
+    let (beacon_witness_root, beacon_witness_leaf_count) = commit_witness_window(
+        parent_witness_leaves,
+        &new_witness_leaves,
+        beacon_witness_base,
+    );
 
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
@@ -273,9 +279,8 @@ pub fn build_proposal<S: ShardChainWriter>(
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
-    let new_tx_count = u32::try_from(transactions.len()).unwrap_or(u32::MAX);
     let in_flight = parent_in_flight
-        .saturating_add(new_tx_count)
+        .saturating_add(u32::try_from(transactions.len()).unwrap_or(u32::MAX))
         .saturating_sub(finalized_tx_count);
 
     let header = BlockHeader::new(
@@ -302,6 +307,8 @@ pub fn build_proposal<S: ShardChainWriter>(
         settled_waves_root,
     );
 
+    let tx_hashes: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
+    let cert_ids: Vec<_> = certificates.iter().map(|c| c.wave_id().clone()).collect();
     let block = Block::Live {
         header,
         transactions: Arc::new(transactions.into()),
@@ -309,20 +316,16 @@ pub fn build_proposal<S: ShardChainWriter>(
         provisions: Arc::new(provisions.into()),
         ready_signals: Arc::new(ready_signals.clone().into()),
         reshape_trigger,
+        randomness_reveal,
     };
 
-    let tx_hashes: Vec<_> = block.transactions().iter().map(|tx| tx.hash()).collect();
-    let cert_ids: Vec<_> = block
-        .certificates()
-        .iter()
-        .map(|c| c.wave_id().clone())
-        .collect();
     let manifest = BlockManifest::new(
         tx_hashes,
         cert_ids,
         provision_hashes,
         ready_signals,
         reshape_trigger,
+        randomness_reveal,
     );
 
     let block_hash = block.hash();
@@ -334,6 +337,29 @@ pub fn build_proposal<S: ShardChainWriter>(
         prepared_commit: prepared,
         jmt_snapshot,
     }
+}
+
+/// Final-epoch headers of a splitting shard carry the root node's two
+/// child hashes, read from the same JMT computation that produced the
+/// header's state root. A leaf root (≤1-key tree) yields no pair;
+/// replicas then reject the header, which can only arise if a shard
+/// drained to nearly nothing while its split stayed pending.
+fn split_child_roots_for_header(
+    jmt_snapshot: &JmtSnapshot,
+    local_shard: ShardId,
+    height: BlockHeight,
+) -> Option<SplitChildRoots> {
+    let pair = jmt_snapshot
+        .root_child_hashes()
+        .map(|(left, right)| SplitChildRoots { left, right });
+    if pair.is_none() {
+        tracing::error!(
+            shard = ?local_shard,
+            height = height.inner(),
+            "split-pending final epoch but the state root has no internal root node"
+        );
+    }
+    pair
 }
 
 fn collect_finalized_receipts(
@@ -554,6 +580,7 @@ where
             substate_bytes,
             thresholds,
             finalized_waves,
+            randomness_reveal,
             topology_snapshot,
         } => {
             let start = std::time::Instant::now();
@@ -572,12 +599,32 @@ where
                 round,
                 receipts: &receipts,
                 ready_signals: &ready_signals,
+                reveal_output: vrf_output_from_proof(&randomness_reveal),
                 reshape_trigger,
                 substate_bytes,
                 thresholds,
                 topology_snapshot: &topology_snapshot,
             };
-            let result = expected_root.verify(&bw_ctx);
+            // The recompute binds leaf 0 to the reveal proof's digest; the
+            // proof must also be a valid VRF by the block's proposer, or the
+            // proposer could commit any output and grind. Gate the verified
+            // result on that BLS check, off the main loop on the dispatch pool.
+            let proposer = topology_snapshot.proposer_for(ctx.shard, round);
+            let reveal_ok = topology_snapshot.public_key(proposer).is_some_and(|pk| {
+                shard_reveal_verify(
+                    &pk,
+                    topology_snapshot.network(),
+                    ctx.shard,
+                    height,
+                    &randomness_reveal,
+                )
+            });
+            let result = if reveal_ok {
+                expected_root.verify(&bw_ctx)
+            } else {
+                tracing::warn!(?block_hash, "Randomness reveal BLS verification FAILED");
+                Err(BeaconWitnessRootVerifyError::RevealInvalid)
+            };
             record_signature_verification_latency(
                 "beacon_witness_root",
                 start.elapsed().as_secs_f64(),
@@ -718,14 +765,24 @@ where
             finalized_tx_count,
             ready_signals,
             reshape_trigger,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
+            parent_witness_leaves,
+            missed,
             beacon_witness_base,
             carry_split_child_roots,
             carry_settled_waves_root,
             settled_waves_window_floor,
             classification_topology_snapshot: classification_topology,
         } => {
+            // Sign the block's randomness reveal here — off the main loop, on
+            // the dispatch pool — so the sans-io coordinator holds no key. Its
+            // digest is leaf 0 of the block's beacon-witness leaves; the proof
+            // rides the block body and manifest for the verifier's re-check.
+            let randomness_reveal = shard_reveal_sign(
+                ctx.signing_key,
+                ctx.topology_snapshot.network(),
+                shard_id,
+                height,
+            );
             let view = ctx
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
@@ -764,8 +821,9 @@ where
                 finalized_tx_count,
                 ready_signals,
                 reshape_trigger,
-                beacon_witness_root,
-                beacon_witness_leaf_count,
+                randomness_reveal,
+                &parent_witness_leaves,
+                &missed,
                 beacon_witness_base,
                 carry_split_child_roots,
                 settled_waves_root,

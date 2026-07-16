@@ -17,7 +17,7 @@ use crate::{
     MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
     ReshapeTrigger, RoutableTransaction, ShardId, StateRoot, TransactionRoot, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp,
+    Verifiable, Verified, VrfProof, WeightedTimestamp,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -123,6 +123,13 @@ pub enum Block {
         /// `beacon_witness_root`; carried here for the same reason as
         /// `ready_signals`.
         reshape_trigger: Option<ReshapeTrigger>,
+        /// The proposer's per-block randomness reveal — the VRF proof over
+        /// `(network, shard, height)`. Its digest is leaf 0 of the block's
+        /// beacon-witness contribution, so `beacon_witness_root` (hence the
+        /// block hash) binds the reveal *output*; the proof rides the body
+        /// like `ready_signals` so validators re-verify it against the
+        /// proposer's key. Genesis blocks carry [`VrfProof::ZERO`].
+        randomness_reveal: VrfProof,
     },
     /// Block past its execution window — provision bodies dropped, but
     /// the original `ProvisionHash` list is retained so sync-serving glue
@@ -147,6 +154,10 @@ pub enum Block {
         /// The block's reshape assertion, if any. Retained through
         /// sealing for the same reason as `ready_signals`.
         reshape_trigger: Option<ReshapeTrigger>,
+        /// The proposer's per-block randomness reveal — retained through
+        /// sealing for the same reason as `ready_signals`: a synced block is
+        /// re-verified from its stored form. See `Block::Live::randomness_reveal`.
+        randomness_reveal: VrfProof,
     },
 }
 
@@ -206,6 +217,7 @@ impl Block {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -232,6 +244,7 @@ impl Block {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -261,6 +274,7 @@ impl Block {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -348,6 +362,21 @@ impl Block {
         }
     }
 
+    /// The proposer's per-block randomness reveal — present in both variants.
+    /// Its digest is leaf 0 of the block's beacon-witness contribution; the
+    /// proof is re-verified against the proposer's key during block validation.
+    #[must_use]
+    pub const fn randomness_reveal(&self) -> &VrfProof {
+        match self {
+            Self::Live {
+                randomness_reveal, ..
+            }
+            | Self::Sealed {
+                randomness_reveal, ..
+            } => randomness_reveal,
+        }
+    }
+
     /// True if this block is still in its `Live` variant.
     #[must_use]
     pub const fn is_live(&self) -> bool {
@@ -368,6 +397,7 @@ impl Block {
                 provisions,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             } => {
                 let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
                 Self::Sealed {
@@ -377,6 +407,7 @@ impl Block {
                     provision_hashes: Arc::new(hashes.into()),
                     ready_signals,
                     reshape_trigger,
+                    randomness_reveal,
                 }
             }
             sealed @ Self::Sealed { .. } => sealed,
@@ -400,6 +431,7 @@ impl Block {
                 certificates,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
                 ..
             } => Self::Live {
                 header,
@@ -408,6 +440,7 @@ impl Block {
                 provisions,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             },
             Self::Live { .. } => {
                 panic!("into_live called on an already-Live block")

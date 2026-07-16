@@ -1118,7 +1118,7 @@ mod tests {
         Block, Bls12381G2Signature, BoundedVec, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, Round, RoutableTransaction, SignerBitfield, TxHash, TxOutcome,
-        WaveCertificate, WaveId,
+        VrfProof, WaveCertificate, WaveId,
     };
     use indexmap::IndexMap;
     use radix_substate_store_interface::interface::{DatabaseUpdates, PartitionDatabaseUpdates};
@@ -1834,6 +1834,7 @@ mod tests {
             provisions,
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         // The certifying QC carries a deliberately divergent timestamp (a
         // higher-round re-certification past the crossing). The floor must

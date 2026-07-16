@@ -175,7 +175,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
         CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield, TransactionRoot,
-        ValidatorId, Verifiable, WeightedTimestamp, test_utils, zero_bls_signature,
+        ValidatorId, Verifiable, VrfProof, WeightedTimestamp, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -214,6 +214,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -301,7 +302,14 @@ mod tests {
             BlockHeight::new(2),
             std::collections::BTreeSet::new(),
         );
-        let manifest = BlockManifest::new(vec![], vec![wave.clone()], vec![], vec![], None);
+        let manifest = BlockManifest::new(
+            vec![],
+            vec![wave.clone()],
+            vec![],
+            vec![],
+            None,
+            VrfProof::ZERO,
+        );
         let pending_block = PendingBlock::from_manifest(header, manifest, LocalTimestamp::ZERO);
         let mut pending = PendingBlocks::new();
         pending.insert(pending_block);
@@ -344,6 +352,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let low_pending = pending_from_block(&low);
         let low_hash = low_pending.header().hash();
