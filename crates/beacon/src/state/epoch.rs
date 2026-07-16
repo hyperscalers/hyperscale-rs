@@ -7,10 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-    CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
-    PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
-    ShardBoundary, ShardEpochContribution, ShardId, SlotEffects, SplitChildRoots, TransitionCause,
-    ValidatorId, ValidatorStatus, WeightedTimestamp,
+    BlockHeight, CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
+    ObserverSeat, PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
+    ShardBoundary, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, SlotEffects,
+    SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -23,7 +23,7 @@ use crate::state::committee::{
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
-use crate::state::vrf::filter_and_roll_randomness;
+use crate::state::vrf::{RevealChunk, filter_and_roll_randomness};
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
@@ -184,19 +184,21 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => (&[], TransitionCause::Skip),
     };
 
+    let frontiers = recovery_frontier_snapshot(state);
+
     // Fold this epoch's per-shard boundaries and apply their witness
     // chunks. A `Skip` carries every prior boundary forward untouched (no
     // record, no miss bump, no witnesses); a Normal epoch records fresh
     // boundaries, applies each chunk, and bumps the miss counter for any
     // active shard with no qualifying contribution.
-    let mut witness = if let ApplyEpochInput::Normal {
+    let (mut witness, reveals) = if let ApplyEpochInput::Normal {
         committed,
         shard_contributions,
     } = input
     {
         record_boundaries(state, epoch, committed, shard_contributions)
     } else {
-        WitnessOutcome::default()
+        (WitnessOutcome::default(), BTreeMap::new())
     };
 
     // The boundary fold above advanced each shard's anchor and witness
@@ -221,7 +223,7 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
 
-    let vrf = filter_and_roll_randomness(state, network, epoch, committed);
+    let vrf = filter_and_roll_randomness(state, network, epoch, committed, &reveals, &frontiers);
     // Equivocation evidence rides committed proposals; shard-witness lifts
     // ride the boundary contributions applied above.
     witness.extend(ingest_equivocations(state, network, &vrf.accepted));
@@ -550,12 +552,36 @@ fn carried_terminal_marks(
     )
 }
 
+/// The pending halt recoveries' attested frontiers, keyed by shard.
+/// Snapshotted before the boundary fold: the crossing that completes a
+/// recovery removes its record inside [`record_boundaries`], and it is
+/// exactly that crossing's reveal chunk the randomness fence judges.
+fn recovery_frontier_snapshot(state: &BeaconState) -> BTreeMap<ShardId, BlockHeight> {
+    state
+        .pending_recoveries
+        .iter()
+        .map(|(shard, recovery)| (*shard, recovery.attested_frontier))
+        .collect()
+}
+
+/// The `RandomnessReveal` outputs of an applied witness chunk, in leaf
+/// order — one reveal per block, so ascending block height.
+fn reveal_outputs(witnesses: &[ShardWitness]) -> Vec<VrfOutput> {
+    witnesses
+        .iter()
+        .filter_map(|w| match &w.payload {
+            ShardWitnessPayload::RandomnessReveal { output } => Some(*output),
+            _ => None,
+        })
+        .collect()
+}
+
 fn record_boundaries(
     state: &mut BeaconState,
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
-) -> WitnessOutcome {
+) -> (WitnessOutcome, BTreeMap<ShardId, RevealChunk>) {
     let windows = state.chain_config.epoch_windows();
     // Bind each contribution to its shard's canonical committed QC — the
     // same selection the receiver's `contributions_well_formed` gate
@@ -564,6 +590,7 @@ fn record_boundaries(
     let canonical = canonical_boundary_qcs(committed.iter().map(|(_, p)| p));
 
     let mut outcome = WitnessOutcome::default();
+    let mut reveals: BTreeMap<ShardId, RevealChunk> = BTreeMap::new();
     let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
     // Merge children whose terminal contribution — the coast block past
     // their cut, carrying their frozen terminal root — landed this fold.
@@ -623,6 +650,20 @@ fn record_boundaries(
             &mut outcome,
         ) {
             continue;
+        }
+        // Collect the chunk's reveal-leaf outputs for the randomness
+        // fold — exactly the leaves the application above accepted.
+        // Drain re-folds contribute too: their leaves apply this epoch
+        // like any other chunk's.
+        let outputs = reveal_outputs(&contribution.witnesses);
+        if !outputs.is_empty() {
+            reveals.insert(
+                *shard,
+                RevealChunk {
+                    boundary_height: header.height(),
+                    outputs,
+                },
+            );
         }
         if drain_refold {
             if let Some(boundary) = state.boundaries.get_mut(shard) {
@@ -702,7 +743,7 @@ fn record_boundaries(
 
     gc_terminal_boundaries(state, epoch, windows);
 
-    outcome
+    (outcome, reveals)
 }
 
 /// Drop terminal records past their retention horizon. A terminated
@@ -1219,6 +1260,55 @@ mod tests {
         // Folding the shard's own crossing marks it produced past genesis —
         // the successor-liveness signal the reshape handoff reads.
         assert!(state.advanced.contains(&shard));
+    }
+
+    /// The boundary fold hands the epoch's reveal-leaf outputs to the
+    /// randomness roll: exactly the applied chunk's `RandomnessReveal`
+    /// payloads, in leaf order, keyed by shard and carrying the
+    /// crossing's boundary height for the recovery fence.
+    #[test]
+    fn record_boundaries_collects_reveal_outputs_in_leaf_order() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+
+        let payloads = vec![
+            ShardWitnessPayload::RandomnessReveal {
+                output: VrfOutput::new([7; 32]),
+            },
+            ShardWitnessPayload::StakeDeposit {
+                pool_id: StakePoolId::new(200),
+                amount: Stake::from_whole_tokens(1),
+            },
+            ShardWitnessPayload::RandomnessReveal {
+                output: VrfOutput::new([9; 32]),
+            },
+        ];
+        let (b, witnesses) = boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, payloads);
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: witnesses.into(),
+            },
+        ))
+        .collect();
+
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+
+        let chunk = reveals.get(&shard).expect("reveals collected");
+        assert_eq!(chunk.boundary_height, BlockHeight::new(5));
+        assert_eq!(
+            chunk.outputs,
+            vec![VrfOutput::new([7; 32]), VrfOutput::new([9; 32])],
+        );
     }
 
     /// A committed re-fold of the recorded crossing with no witness
