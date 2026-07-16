@@ -17,7 +17,7 @@ Start with the overview; it tells the whole story in five pages and links down.
 | [02-dynamic-sharding.md](02-dynamic-sharding.md) | Split and merge lifecycles, deterministic genesis derivation, and straddler settlement (atomicity across a vanishing shard) |
 | [03-state-and-sync.md](03-state-and-sync.md) | The binary JMT, owner-prefixed keying, the storage stack, checkpointing, snap-sync, block/remote-header sync, divergence recovery |
 | [04-atomic-commitment.md](04-atomic-commitment.md) | Deterministic atomic commitment end to end: declared access, the provision–execute–certify pipeline, deterministic aborts, data availability |
-| [05-byzantine-safety.md](05-byzantine-safety.md) | Threat model, committee sampling and shuffling, jailing and witnesses, cryptography, cross-shard trust, resource bounds |
+| [05-byzantine-safety.md](05-byzantine-safety.md) | Threat model and the committee security model behind INV-SEC-1 (the two failure thresholds and their opposite defenses, corruption bands, randomness integrity), committee sampling and shuffling, jailing and witnesses, cryptography, cross-shard trust, resource bounds |
 | [06-resource-economics.md](06-resource-economics.md) | The self-regulating validator supply: the market-clearing minimum stake, the pool/lifecycle gates it drives, and vnodes as hardware amortization |
 | [07-determinism-and-testing.md](07-determinism-and-testing.md) | The sans-io state-machine architecture, the two harnesses, portable scenarios, and why determinism underwrites everything else |
 | [08-invariants.md](08-invariants.md) | The consolidated register of safety/liveness properties with stable IDs (INV-*) — the formal-verification starting point |
