@@ -766,6 +766,229 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
             "final_c": c, "max_c": max_c}
 
 
+# ── The witness-reveal fold ──────────────────────────────────────────────
+#
+# Candidate replacement for the reveal ceremony: every shard block carries a
+# mandatory reveal leaf — a deterministic per-proposer VRF over (shard,
+# height), unchooseable and unforgeable — appended to the beacon-witness
+# accumulator, and the epoch seed folds each shard's watermark-to-boundary
+# leaf range. The include/omit lever is structurally gone (the folded set is
+# a consensus-derived range, not a per-member choice) and interior leaves are
+# committed before later leaves exist, so interior choices are blind without
+# any network assumption. What remains is the WINDOW EDGE: the proposers who
+# close the last epoch windows to settle can (a) rush or sandbag the boundary
+# within the ~32s timestamp validity window, choosing among a handful of
+# KNOWN candidate folds, or (b) forfeit the slot for a blind redraw by an
+# unknown successor. The model prices exactly that edge.
+
+
+def witness_edge_p_event(beta, p, sight=1.0, edge_windows=2, run_cap=16):
+    """Per-event grind success of the witness-reveal fold, against a target
+    predicate with single-seed success `p`.
+
+    Only the last epoch windows still open when the rest of the fold has
+    settled carry a sighted choice; `edge_windows` = m is how many windows an
+    adversary can stretch into that position (the ~32s timestamp wiggle lets
+    it hold a cut open briefly, so m is small — 1-4). Each of the m cut slots
+    is adversary-held w.p. `beta` (placement is a random draw; slots cannot be
+    concentrated) and sighted w.p. `sight` (1.0 grants a zero-latency
+    full-sight network — the structural worst case; the scheme is priced to
+    stand even there). A held, sighted slot yields cbar = 2 + E[run]
+    candidates: close-at-me plus one sandbag step per consecutive corrupt
+    successor (run ~ Geometric(beta), clamped by the timestamp window to
+    `run_cap`), plus one blind forfeit counted as a full extra draw
+    (conservative — it lands at base rate, and the count also absorbs the
+    sibling-certificate and backlog-shift wiggles, which substitute for
+    rather than multiply the close-position choice). j held slots compound:
+    menu = cbar^j. So
+
+        p_event = E_{j ~ Bin(m, beta*sight)} [ 1 - (1-p)^(cbar^j) ].
+
+    Structurally this is the reveals-only formula with the always-present
+    beacon committee b replaced by the m cut-racing slots held only
+    beta-fractionally: the expected width exponent falls from beta*b to
+    beta*m."""
+    run = sum((beta ** k) * (1.0 - beta) * k for k in range(run_cap))
+    run += (1.0 - sum((beta ** k) * (1.0 - beta) for k in range(run_cap))) * run_cap
+    cbar = 2.0 + run
+    q = beta * sight
+    p_event = 0.0
+    for j in range(edge_windows + 1):
+        pj = comb(edge_windows, j) * (q ** j) * ((1.0 - q) ** (edge_windows - j))
+        p_event += pj * (1.0 - (1.0 - p) ** (cbar ** j))
+    return p_event
+
+
+def reveal_ceremony_p_event(beta, p, beacon_size=16):
+    """Per-event grind of the shipped reveals-only fold: t ~ beta*b committee
+    members toggle their own reveals with full sight of the fold — a clean
+    best-of-2^t. This is the NATURAL-foothold width; the coupled resample
+    boost lifts realized t further (table T), so it is a floor for the
+    baseline, making the comparison conservative."""
+    return 1.0 - (1.0 - p) ** (2 ** round(beta * beacon_size))
+
+
+def witness_march_days(n, beta, sight=1.0, edge_windows=2,
+                       interval=SHUFFLE_INTERVAL_EPOCHS):
+    """Days to march one targeted shard from beta*n to f+1 under the
+    witness-reveal fold — grind_shard_march_days with each step's best-of-2^t
+    replaced by the edge residual. Retains that model's monotone-hold grant
+    (no-gain events never lose seats), which the witness fold does NOT give
+    the adversary — unsighted epochs are natural mean-reverting rotations —
+    so this is a strict upper bound on the march speed."""
+    f = f_of(n)
+    c = round(beta * n)
+    intervals = 0.0
+    while c < f + 1:
+        p_gain = ((n - c) / n) * beta
+        pe = witness_edge_p_event(beta, p_gain, sight, edge_windows)
+        if pe <= 0.0:
+            return float("inf")
+        intervals += 1 / pe
+        c += 1
+    return intervals * interval * EPOCH_SECONDS / 86400
+
+
+def witness_network_equilibrium(n, beta, shards, pool_factor, sight=1.0,
+                                edge_windows=2):
+    """grind_network_equilibrium with the seat rate 1-(1-x)^width replaced by
+    the witness edge residual at pool fraction x (mean-field: cut-slot
+    holding, successor runs, and the entrant draw all read x). Returns
+    (c_T, x)."""
+    pool = round(pool_factor * n)
+    total = shards * n + pool
+    corrupt = beta * total
+    rest = (shards - 1) * n + pool
+    lo, hi = 0.0, beta
+    for _ in range(200):
+        x = 0.5 * (lo + hi)
+        seat = witness_edge_p_event(x, x, sight, edge_windows)
+        if n * seat + x * rest - corrupt > 0:
+            hi = x
+        else:
+            lo = x
+    x = 0.5 * (lo + hi)
+    return n * witness_edge_p_event(x, x, sight, edge_windows), x
+
+
+# ── The weighted-timestamp cutoff variant ────────────────────────────────
+#
+# Anchor the fold's upper edge to a FIXED schedule line T_cut = epoch_boundary
+# - Δ (Δ >= MAX_TIMESTAMP_DELAY) instead of the boundary block's own leaf count.
+# A leaf enters iff its 2f+1-aggregated block weighted timestamp is <= T_cut.
+# No proposer can shift a block's WT more than MAX_TIMESTAMP_RUSH early /
+# MAX_TIMESTAMP_DELAY late, and the aggregate damps even that to a corrupt-
+# weight fraction, so every leaf whose honest WT sits outside the drag band
+# around T_cut is PROVABLY in or out — the fold's bulk is pinned by the
+# timestamp-validity constants, not chosen. Two gains over the boundary edge:
+# (1) the line is fixed, so the single-proposer slide of chunk_end (its own
+# leaf count) is gone; (2) the residual is a CEILING independent of sight — the
+# adversary can see the whole chain and still not reach the pinned bulk.
+MAX_TIMESTAMP_DELAY_S = 30   # crates/types/src/time/limits.rs
+MAX_TIMESTAMP_RUSH_S = 2     # crates/types/src/time/limits.rs
+
+
+def wt_band_seconds(beta):
+    """Width (in weighted-timestamp seconds) of the contestable band around the
+    fixed cutoff line. A block WT is a 2f+1 aggregate; corrupt weight beta drags
+    it by at most beta*MAX_TIMESTAMP_DELAY late / beta*MAX_TIMESTAMP_RUSH early
+    (mean-field beyond-f drag, G-1), so only leaves whose honest WT lands within
+    that band of T_cut can be flipped across it."""
+    return beta * (MAX_TIMESTAMP_DELAY_S + MAX_TIMESTAMP_RUSH_S)
+
+
+def wt_pinned_fraction(beta, epoch_seconds=EPOCH_SECONDS):
+    """Fraction of an epoch's reveals that fall OUTSIDE the drag band — provably
+    un-contestable, sealed by the timestamp-validity constants regardless of how
+    much the adversary sees. Reveals are ~uniform in time, so this is
+    1 - band/epoch."""
+    return max(0.0, 1.0 - wt_band_seconds(beta) / epoch_seconds)
+
+
+def wt_edge_p_event(beta, p):
+    """Per-event grind of the WT-cutoff variant: a beta-gated best-of-2. The
+    band holds several leaves, but the adversary proposes them sequentially and
+    each commits before the next, so it is sighted only over the single last
+    leaf it controls at the seal — best-of-2 (its own leaf in or out, or forfeit
+    for a blind redraw). beta = it holds that sealing slot; the aggregate drag
+    succeeds w.p. ~1 at these Delta (30 s >> block spacing), so it is not
+    credited as extra protection. This is a CEILING: independent of sight,
+    because the pinned bulk is unreachable — where the boundary edge grows with
+    the number of cut-racing windows m, this does not."""
+    return (1.0 - beta) * p + beta * (1.0 - (1.0 - p) ** 2)
+
+
+def wt_march_days(n, beta, interval=SHUFFLE_INTERVAL_EPOCHS):
+    """Days to march one shard to f+1 under the WT-cutoff residual — the
+    grind_shard_march_days skeleton with the beta-gated best-of-2 per step."""
+    f = f_of(n)
+    c = round(beta * n)
+    intervals = 0.0
+    while c < f + 1:
+        pe = wt_edge_p_event(beta, ((n - c) / n) * beta)
+        if pe <= 0.0:
+            return float("inf")
+        intervals += 1 / pe
+        c += 1
+    return intervals * interval * EPOCH_SECONDS / 86400
+
+
+def check_witness_edge() -> None:
+    """Analytic limits + dominance for the witness-edge model."""
+    # WT-cutoff variant: beta=0 -> base rate; a sight-independent ceiling at or
+    # below the boundary edge (m=1) for every design point; pins ~all the fold.
+    for p in (0.02, 0.10, 0.30):
+        if abs(wt_edge_p_event(0.0, p) - p) > 1e-12:
+            raise AssertionError("wt edge beta=0 != base rate")
+    for beta in (0.05, 0.10, 0.15, 0.20, 0.25):
+        for p in (0.02, 0.05, 0.10, 0.20, 0.30):
+            wt = wt_edge_p_event(beta, p)
+            if wt > witness_edge_p_event(beta, p, 1.0, 1) + 1e-12:
+                raise AssertionError("wt edge above the boundary edge (m=1)")
+            if wt >= reveal_ceremony_p_event(beta, p):
+                raise AssertionError("wt edge not dominant vs the ceremony")
+        if wt_pinned_fraction(beta) < 0.9:
+            raise AssertionError("wt pinned fraction below 0.9 in the design band")
+    # beta=0 and sight=0 both collapse to the base rate exactly.
+    for p in (0.02, 0.10, 0.30):
+        if abs(witness_edge_p_event(0.0, p) - p) > 1e-12:
+            raise AssertionError("witness edge beta=0 != base rate")
+        if abs(witness_edge_p_event(0.10, p, sight=0.0) - p) > 1e-12:
+            raise AssertionError("witness edge sight=0 != base rate")
+    # Closed form at m=1, run_cap forced degenerate: one held slot, no run —
+    # keep-or-blind-redraw is best-of-2 on the held branch.
+    p, beta = 0.10, 0.10
+    direct = (1 - beta) * p + beta * (1.0 - (1.0 - p) ** 2)
+    if abs(witness_edge_p_event(beta, p, 1.0, 1, 0) - direct) > 1e-12:
+        raise AssertionError("witness edge m=1 closed form mismatch")
+    # Monotone in beta, sight, and edge_windows.
+    grid = [0.02, 0.05, 0.10, 0.15, 0.20, 0.25]
+    for lo, hi in zip(grid, grid[1:]):
+        if witness_edge_p_event(hi, 0.1) < witness_edge_p_event(lo, 0.1):
+            raise AssertionError("witness edge not monotone in beta")
+    for s_lo, s_hi in ((0.0, 0.5), (0.5, 1.0)):
+        if (witness_edge_p_event(0.1, 0.1, s_hi)
+                < witness_edge_p_event(0.1, 0.1, s_lo)):
+            raise AssertionError("witness edge not monotone in sight")
+    for m in (1, 2, 3):
+        if (witness_edge_p_event(0.1, 0.1, 1.0, m + 1)
+                < witness_edge_p_event(0.1, 0.1, 1.0, m)):
+            raise AssertionError("witness edge not monotone in edge_windows")
+    # Truncation insensitivity: the geometric run clamp is not load-bearing.
+    if abs(witness_edge_p_event(0.2, 0.1, 1.0, 2, 8)
+           - witness_edge_p_event(0.2, 0.1, 1.0, 2, 64)) > 1e-6:
+        raise AssertionError("witness edge sensitive to run_cap")
+    # Dominance: strictly below the reveals-only ceremony across the design
+    # band, even granting the adversary full sight and four edge windows.
+    for beta in (0.05, 0.10, 0.15, 0.20, 0.25):
+        for p in (0.02, 0.05, 0.10, 0.20, 0.30):
+            for m in (1, 2, 4):
+                if (witness_edge_p_event(beta, p, 1.0, m)
+                        >= reveal_ceremony_p_event(beta, p)):
+                    raise AssertionError(
+                        f"witness edge not dominant at beta={beta} p={p} m={m}")
+
+
 def fmt(x: float) -> str:
     if x == 0.0:
         return "   ~0    "
@@ -789,6 +1012,7 @@ def main() -> None:
         check_detailed_balance(POOL_FACTOR * n, int(POOL_FACTOR * n * 0.25), n)
     check_grind_network()
     check_resample_boost()
+    check_witness_edge()
 
     # A: per-draw failure probability (genesis, split cohorts, merge keepers)
     table(
@@ -1310,6 +1534,129 @@ def main() -> None:
           "makes honest")
     print("    un-excludable outside async windows. It is safe, but for the same "
           "reason too weak to close.)")
+
+    # W: the witness-reveal fold — move the reveal out of the beacon ceremony
+    # and into a mandatory, unchooseable, range-folded accumulator leaf. The
+    # include/omit lever is gone; the residual is the window edge. These tables
+    # price that residual against the shipped reveal ceremony (the baseline
+    # every prior finding measured) on the SAME march + FIFO-equilibrium
+    # machinery, so the comparison is apples to apples.
+    n = 128
+    f = f_of(n)
+    beta = 0.10
+
+    print(f"\nW1. Witness-reveal per-event grind vs the reveal ceremony "
+          f"(n={n}, single-seed p_gain at c=beta*n)")
+    print("    The ceremony is a certain best-of-2^t every epoch; the witness")
+    print("    edge is a beta-gated best-of-~2 only when the adversary holds a")
+    print("    cut slot. 'sight=1' grants a zero-latency full-sight network —")
+    print("    the structural worst case, no dilution credited.")
+    p_gain = ((n - round(beta * n)) / n) * beta
+    print(f"    (p_gain = {p_gain:.4f}, t=round(beta*b)={round(beta * 16)} at b=16)")
+    print("    scheme                              | p_event | width (candidate seeds)")
+    print("  " + "-" * 70)
+    rev = reveal_ceremony_p_event(beta, p_gain, 16)
+    print(f"    reveal ceremony (2^t, certain)      | {rev:.4f}  | {2 ** round(beta * 16):>6}  central, every epoch")
+    for m in (1, 2, 4):
+        we = witness_edge_p_event(beta, p_gain, 1.0, m)
+        print(f"    witness edge  m={m}  (sight=1, worst)  | {we:.4f}  | "
+              f"~2 one-sided, held w.p. beta on {m} slot(s)")
+    print("   (the witness edge is below the ceremony at every m even granting "
+          "full sight — the")
+    print("    exponent falls from beta*b to beta*m, and m<<b. Any real network "
+          "dilutes it further.)")
+
+    print(f"\nW2. Days to march one targeted shard to f+1 (n={n}, beta={beta}, "
+          f"I={SHUFFLE_INTERVAL_EPOCHS})")
+    print("    scheme                         | days to f+1")
+    print("  " + "-" * 48)
+    cer = grind_shard_march_days(n, beta, round(beta * 16))
+    print(f"    reveal ceremony (t={round(beta * 16)})            | {cer:>10.1f}")
+    for m in (1, 2, 4):
+        wd = witness_march_days(n, beta, 1.0, m)
+        print(f"    witness edge  m={m} (sight=1)      | {wd:>10.1f}")
+    floor_days = (f + 1 - round(beta * n)) * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 86400
+    print(f"   (deterministic floor {floor_days:.1f}d. The witness march is an "
+          "UPPER bound on speed —")
+    print("    it keeps the model's monotone-hold grant the witness fold does "
+          "not actually give.)")
+
+    print(f"\nW3. Network FIFO equilibrium c_T — witness edge vs ceremony width "
+          f"2^t (n={n}, f+1={f + 1}, 2f+1={2 * f + 1})")
+    print("    Same conserved-pool machinery as table R; the witness edge "
+          "replaces the seat rate.")
+    betas = (0.05, 0.10, 0.13, 0.15, 0.20)
+    print("    scheme                   | " + " ".join(f"b={b:<5}" for b in betas))
+    print("  " + "-" * (28 + 8 * len(betas)))
+
+    def creg(v):
+        return "FORK" if v == "fork" else ("flr" if v == "floor" else f"{v:.0f}")
+    cer_cells = []
+    for b in betas:
+        t = max(1, round(b * n))
+        cer_cells.append(creg(grind_network_regime(n, b, 100, NET_POOL_FACTOR, 2 ** t)))
+    print("    reveal ceremony (2^t)    | " + " ".join(f"{c:>7}" for c in cer_cells))
+    for m in (1, 2, 4):
+        cells = []
+        for b in betas:
+            f_b = f_of(n)
+            if b * (100 * n + round(NET_POOL_FACTOR * n)) <= f_b:
+                cells.append("flr")
+                continue
+            c_t, _ = witness_network_equilibrium(n, b, 100, NET_POOL_FACTOR, 1.0, m)
+            cells.append("FORK" if c_t >= f_b + 1 else f"{c_t:.0f}")
+        print(f"    witness edge m={m} (sight=1) | " + " ".join(f"{c:>7}" for c in cells))
+    print("   (the witness equilibrium sits far below f+1 across the band where "
+          "the ceremony forks;")
+    print("    2f+1 — the TERMINAL line — is never approached. Sight=1 is the "
+          "worst case; the")
+    print("    accumulator ordering blinds interior leaves unconditionally, so "
+          "real sight < 1.)")
+
+    print(f"\nW4. WT-cutoff variant — anchor the fold edge to a fixed schedule "
+          f"line")
+    print(f"    T_cut = boundary - Delta (Delta >= MAX_TIMESTAMP_DELAY="
+          f"{MAX_TIMESTAMP_DELAY_S}s) instead of the")
+    print("    boundary block's own leaf count. The timestamp-validity consts "
+          "pin everything")
+    print("    outside the drag band; the residual is a beta-gated best-of-2 "
+          "CEILING (sight-independent).")
+    print("    beta  | fold provably pinned | residual p_event  WT / boundary "
+          "m=1 / m=4 / ceremony")
+    print("  " + "-" * 84)
+    for beta in (0.05, 0.10, 0.13, 0.15, 0.20):
+        pg = ((n - round(beta * n)) / n) * beta
+        wt = wt_edge_p_event(beta, pg)
+        b1 = witness_edge_p_event(beta, pg, 1.0, 1)
+        b4 = witness_edge_p_event(beta, pg, 1.0, 4)
+        cer = reveal_ceremony_p_event(beta, pg)
+        print(f"    {beta:.2f}  | {wt_pinned_fraction(beta):>17.1%}    | "
+              f"{wt:.4f} / {b1:.4f} / {b4:.4f} / {cer:.4f}")
+    wtm = wt_march_days(n, 0.10)
+    b1m = witness_march_days(n, 0.10, 1.0, 1)
+    print(f"   Days to march one shard to f+1 (beta=0.10): WT {wtm:.1f}d vs "
+          f"boundary-edge m=1 {b1m:.1f}d.")
+    print(f"   (Delta = one MAX_TIMESTAMP_DELAY excludes the last ~beta*"
+          f"{MAX_TIMESTAMP_DELAY_S + MAX_TIMESTAMP_RUSH_S}s of reveals from each "
+          "fold — they fold one")
+    print("    epoch later, no entropy lost. The residual caps at beta-gated "
+          "best-of-2 regardless of")
+    print("    sight, where the boundary edge grows with m, and it removes the "
+          "single-proposer own-count")
+    print("    slide of chunk_end. Cost: the fold computes a WT->position cutoff, "
+          "not a leaf-count range —")
+    print("    more fork-critical arithmetic on the witness-window path.)")
+
+    print("   Witness-reveal disposition: the include/omit lever is removed "
+          "structurally (range fold),")
+    print("   interior leaves are blind without a network assumption "
+          "(accumulator ordering), and the")
+    print("   residual edge is below the ceremony at every shard count — so NO "
+          "shard-count threshold")
+    print("   and NO separate blinder are needed. The ceremony survives only as "
+          "the zero-crossing")
+    print("   bootstrap/fallback. See §10 Finding 12 + .plans/"
+          "randomness-witness-accumulator.md.")
 
     print("\n   Recommendation: the two thresholds get opposite defenses (§10 "
           "Finding 9).")

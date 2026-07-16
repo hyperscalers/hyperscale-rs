@@ -778,3 +778,87 @@ foothold below the terminal 2f+1 line, where `b = 20` reaches it. The
 async-window purge was modelled against realized
 synchrony (`sim_async_purge`): the realized honest purge is a rounding error for
 any plausible `p_async`, well under the worst-case ceiling.
+
+**Finding 12 — remove the move-order defect at its root: ride the reveal in the
+beacon-witness accumulator (candidate, supersedes the input-side stack as the
+primary defense).** Every lever above bounds the *width* `2^t` the last mover
+enjoys; none removes the last-mover position, because the reveal ceremony gives
+each Byzantine committee member a free include/omit toggle over its own reveal,
+exercised with full sight of the fold. This finding removes the toggle
+structurally. The per-epoch reveal ceremony is replaced by a **mandatory reveal
+leaf on every shard block**: the proposer's deterministic hash-based VRF over
+`(shard, height)` — unforgeable and unchooseable (fixed by key and slot before
+the epoch), verified by the shard committee at block validation — appended to the
+per-shard beacon-witness accumulator the chain already maintains. The epoch seed
+folds each crossing shard's watermark-to-boundary leaf range `[prior,
+chunk_end)`, the exact range the beacon already applies to mutate its own state,
+verified leaf-by-leaf against the 2f+1-certified `beacon_witness_root`.
+
+Two properties fall out with no new assumption. **The include/omit lever is
+gone:** the folded set is a consensus-derived range, not a per-member choice, and
+a block without its valid reveal leaf is invalid, so "propose or forfeit the
+slot" replaces "append or quietly omit." **Interior leaves are blind
+unconditionally:** a leaf at accumulator position `p` is chain-attested to
+precede everything after it, so when a proposer commits an interior reveal the
+later leaves that will join the fold *do not yet exist* — this is a fact about
+certified accumulator position, not a network-timing assumption, which is what
+distinguishes it from the header/aggregate blinder directions (which needed a
+partial-synchrony race and a shard-count threshold to make dilution
+load-bearing).
+
+The residual is the **window edge**. The proposers who close the last epoch
+windows still open when the rest of the fold has settled can rush or sandbag the
+boundary within the ~32 s timestamp-validity window — choosing among a handful of
+*known* candidate folds — or forfeit the slot for a blind redraw by an unknown
+successor. Priced on the same march and FIFO-equilibrium machinery as the
+findings above (`witness_edge_p_event`, tables W1–W3), granting the adversary a
+zero-latency full-sight network (no dilution credited — the structural worst
+case): the per-event grind is a **β-gated best-of-≈2** held only when the
+adversary occupies a cut slot, versus the ceremony's **certain best-of-`2^t`
+every epoch**. The width exponent falls from `β·b` to `β·m`, with `m` (the number
+of cut-racing windows) small and `m ≪ b`. It is strictly below the ceremony at
+every shard count (n = 128, β = 0.10: per-event 0.10–0.13 vs 0.31; march 15–19 d
+vs 6 d even at full sight; the network FIFO equilibrium sits far below f+1 across
+the whole band where the ceremony forks, and never approaches the terminal 2f+1).
+Because the residual is already sub-baseline without any dilution, the scheme is
+**complete on its own** — no shard-count threshold and no separate header /
+aggregate blinder — and the cross-shard closing race, if the network is not
+full-sight, is bonus dilution on top rather than the load-bearing defense.
+
+A hardening tightens the edge further (table W4). Anchoring the fold's upper cut
+to a *fixed schedule line* `T_cut = boundary − Δ` (`Δ ≥ MAX_TIMESTAMP_DELAY`),
+folding each reveal by its aggregated weighted timestamp rather than by the
+boundary block's own leaf count, lets the timestamp-validity constants
+(`MAX_TIMESTAMP_RUSH = 2 s`, `MAX_TIMESTAMP_DELAY = 30 s`) *prove* the bulk of
+the fold un-contestable: ~99 % of the reveals fall outside the `≈ β·32 s` drag
+band and are sealed regardless of the adversary's sight. The residual becomes a
+sight-independent β-gated best-of-2 ceiling (it does not grow with sight as the
+boundary-anchored edge does) and the single-proposer slide of `chunk_end`
+disappears — contesting the line now needs corrupt *weight* to drag an
+aggregated WT, not one slot. The width gain at the design point is marginal
+(best-of-2 either way); the value is robustness. The cost is a WT→position
+cutoff in place of a count range — more fork-critical window arithmetic — and a
+one-epoch lag on the last `≈ β·32 s` of reveals (which fold in the next epoch,
+no entropy lost). Adopt if the arithmetic proves tractable against the fold
+determinism tests; the boundary-anchored cut is the simpler, already-sub-baseline
+fallback.
+
+Consequences and costs. The beacon reveal ceremony (and its `JailReason::
+Withholding` jail-on-first) **survives only as the bootstrap / fallback path**,
+used when zero crossings fold in an epoch (genesis before the first crossing, or
+a total-suppression attack that spikes every shard's miss counter and trips the
+halt detector — loud and network-scale, never a quiet per-epoch toggle); the
+fallback is the current mitigated reveal mix, never a bare `BLAKE3(prev)`, which
+would be a predictable seed. The randomness fold reads the *same* verified chunk
+stream that already mutates `BeaconState`, so it introduces no new divergence
+source — but it **upgrades the blast radius** of the already-delicate witness
+window arithmetic (base freeze, chunk bounds, terminal re-fold exemptions) from
+witness-state corruption to a committee-selection fork, which is the real cost to
+weigh. Leaf-value uniqueness under adversarial key generation reduces to
+chain-hash collision resistance (already load-bearing across the PQ stack;
+harden with seed-derived signature masks at registration). This is a
+**candidate**, gated on the W-table pricing above, a decision on binding the
+reported boundary QC to the committed child for witness integrity generally, and
+a determinism model row for the fold through window / reshape / recovery churn;
+the as-shipped Disposition is unchanged. Plan:
+`.plans/randomness-witness-accumulator.md`.
