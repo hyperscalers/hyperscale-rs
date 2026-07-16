@@ -840,8 +840,8 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        zero_bls_signature,
+        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, VrfProof,
+        WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -880,6 +880,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = QuorumCertificate::new(
             block.hash(),

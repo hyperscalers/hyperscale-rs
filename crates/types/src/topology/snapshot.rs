@@ -50,6 +50,11 @@ pub struct ShardAnchor {
     /// the clock a freshly synced member or cohort observer opens its
     /// [`ReadySignal`](crate::ReadySignal) window from.
     pub weighted_timestamp: WeightedTimestamp,
+    /// The anchor window's base: a snap-syncing joiner assembles the
+    /// leaf-hash range `[witness_base, leaf_count)` against the boundary
+    /// header's `beacon_witness_root`. Serving shards retain persisted
+    /// witness payloads down to this index.
+    pub witness_base: BeaconWitnessLeafCount,
     /// The terminated shard's beacon-attested settled-waves commitment, set
     /// only on a terminal boundary record. A surviving counterpart reads it
     /// to resolve split-straddling waves against the terminated shard's
@@ -1317,6 +1322,7 @@ mod tests {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             height: BlockHeight::new(42),
             weighted_timestamp: WeightedTimestamp::from_millis(42),
+            witness_base: BeaconWitnessLeafCount::ZERO,
             settled_waves_root: None,
         };
         let mut boundaries = HashMap::new();

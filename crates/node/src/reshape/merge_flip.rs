@@ -160,6 +160,7 @@ mod tests {
             block_hash: expected.hash(),
             height: BlockHeight::new(10),
             weighted_timestamp: cut_wt,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             settled_waves_root: None,
         };
 
@@ -205,6 +206,7 @@ mod tests {
             block_hash: BlockHash::ZERO,
             height: BlockHeight::new(10),
             weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             settled_waves_root: None,
         };
         assert!(

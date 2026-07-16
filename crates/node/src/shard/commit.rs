@@ -1443,7 +1443,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, TransactionRoot,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, TransactionRoot, VrfProof,
     };
 
     /// Tag the pin hook pushes into the sink, distinguishing pins from
@@ -1510,6 +1510,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let hash = block.hash();
         // SAFETY: synthetic test fixture, no real signature.

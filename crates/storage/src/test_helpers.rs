@@ -19,8 +19,9 @@ use hyperscale_types::{
     PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
     Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, compute_global_receipt_root, compute_merkle_root, zero_bls_signature,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VrfProof,
+    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, compute_merkle_root,
+    zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -170,6 +171,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
+        randomness_reveal: VrfProof::ZERO,
     }
 }
 
@@ -403,6 +405,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
             provisions,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(fw);
@@ -413,6 +416,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
                 provisions,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             }
         }
         Block::Sealed {
@@ -422,6 +426,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
             provision_hashes,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(fw);
@@ -432,6 +437,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
                 provision_hashes,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             }
         }
     }
@@ -526,6 +532,7 @@ pub fn commit_block_with_witnesses(
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
+        randomness_reveal: VrfProof::ZERO,
     };
     let block_hash = block.hash();
     let witness = BeaconWitnessCommit {
@@ -594,6 +601,7 @@ pub fn commit_block_with_witness_window(
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
+        randomness_reveal: VrfProof::ZERO,
     };
     let block_hash = block.hash();
     let witness = BeaconWitnessCommit {
@@ -649,6 +657,7 @@ pub fn pin_snap_sync_replica(
         block_hash,
         height: anchor_height,
         weighted_timestamp: WeightedTimestamp::from_millis(anchor_height.inner()),
+        witness_base: BeaconWitnessLeafCount::ZERO,
         settled_waves_root: None,
     }
 }

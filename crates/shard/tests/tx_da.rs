@@ -121,8 +121,9 @@ fn ready_signal_below_min_dwell_excluded_from_proposal() {
     sim.kick_off();
     sim.run_until_committed(TARGET_COMMITS, MAX_STEPS);
 
-    // Zero beacon-witness leaf-count delta on every committed
-    // block — the accumulator hasn't grown.
+    // Every committed block carries exactly one beacon-witness leaf: the
+    // block's randomness reveal at leaf 0. The below-dwell ready signal
+    // contributes none, so a second leaf would mean it slipped in.
     for replica in 0..sim.n() {
         let leaf_count = sim.commits[replica][0]
             .certified
@@ -131,7 +132,7 @@ fn ready_signal_below_min_dwell_excluded_from_proposal() {
             .beacon_witness_leaf_count();
         assert_eq!(
             leaf_count.inner(),
-            0,
+            1,
             "replica {replica}: ready signal contributed a leaf despite dwell unmet \
              ({leaf_count:?})",
         );

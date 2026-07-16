@@ -144,8 +144,8 @@ mod tests {
         BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
         InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
-        StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
-        verify_merkle_inclusion, zero_bls_signature,
+        StateRoot, TransactionRoot, ValidatorId, Verified, VrfProof, WeightedTimestamp,
+        compute_merkle_root, verify_merkle_inclusion, zero_bls_signature,
     };
 
     use super::*;
@@ -223,6 +223,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = make_qc_for(&block);
         let block_hash = block.hash();

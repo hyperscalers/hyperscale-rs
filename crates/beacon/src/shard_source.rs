@@ -343,6 +343,35 @@ impl ShardSourceTracker {
         self.boundary_crossings.get(&shard)?.values().next_back()
     }
 
+    /// The crossing the beacon should source next for `shard`, given the
+    /// fold's current `watermark` (`boundaries[shard].witness_leaf_count`).
+    ///
+    /// The fold must advance one crossing at a time: each crossing's witness
+    /// chunk proves against *its own* boundary block's `beacon_witness_root`,
+    /// and with a witness leaf per shard block the per-epoch window is narrow,
+    /// so a chunk can only cover one crossing's leaves. This returns the
+    /// **oldest crossing whose leaves are not yet folded** (`count >
+    /// watermark`) — a fixed target that advances contiguously as the fold
+    /// drains it, rather than the moving latest crossing (which, once the fold
+    /// falls behind, names a window that no longer contains the backlog).
+    ///
+    /// When every retained crossing is folded (`count <= watermark`) it falls
+    /// back to the latest, so a terminated shard's folded terminal keeps being
+    /// sourced for merge composition — the caller's `crossing_fully_folded`
+    /// gate drops it for a live shard.
+    #[must_use]
+    pub fn next_crossing_to_source(
+        &self,
+        shard: ShardId,
+        watermark: u64,
+    ) -> Option<&ObservedCrossing> {
+        let per_shard = self.boundary_crossings.get(&shard)?;
+        per_shard
+            .values()
+            .find(|c| c.boundary_header().beacon_witness_leaf_count().inner() > watermark)
+            .or_else(|| per_shard.values().next_back())
+    }
+
     /// Called by the coordinator when a commit rotates the local
     /// validator off the beacon committee. Drops witness chunks and
     /// pending fetches — off-committee vnodes neither propose nor fetch —

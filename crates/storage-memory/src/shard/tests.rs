@@ -18,8 +18,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BoundedVec, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, StateRoot,
-    StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp,
+    StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, VrfProof, WaveCertificate,
+    WaveId, WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -149,6 +149,7 @@ fn commit_with(
                 provisions,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             } => {
                 let mut certificates = (*certificates).clone();
                 certificates.push(new_fw);
@@ -159,6 +160,7 @@ fn commit_with(
                     provisions,
                     ready_signals,
                     reshape_trigger,
+                    randomness_reveal,
                 }
             }
             Block::Sealed {
@@ -168,6 +170,7 @@ fn commit_with(
                 provision_hashes,
                 ready_signals,
                 reshape_trigger,
+                randomness_reveal,
             } => {
                 let mut certificates = (*certificates).clone();
                 certificates.push(new_fw);
@@ -178,6 +181,7 @@ fn commit_with(
                     provision_hashes,
                     ready_signals,
                     reshape_trigger,
+                    randomness_reveal,
                 }
             }
         }
@@ -479,6 +483,7 @@ fn test_transactions_batch_with_indexed_block() {
             provisions,
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         },
         Block::Sealed {
             header,
@@ -492,6 +497,7 @@ fn test_transactions_batch_with_indexed_block() {
             provision_hashes,
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         },
     };
 

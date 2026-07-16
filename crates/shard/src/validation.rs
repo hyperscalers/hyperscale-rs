@@ -455,7 +455,7 @@ mod tests {
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
         ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
         StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, WeightedTimestamp, bls_keypair_from_seed, compute_waves, test_utils,
+        Verifiable, VrfProof, WeightedTimestamp, bls_keypair_from_seed, compute_waves, test_utils,
         zero_bls_signature,
     };
 
@@ -569,6 +569,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -1020,6 +1021,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -1122,6 +1124,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -1190,6 +1193,7 @@ mod tests {
             provisions: Arc::new(wrapped.into()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 

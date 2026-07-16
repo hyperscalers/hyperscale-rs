@@ -23,7 +23,7 @@ use crate::{
     NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
     ShardId, SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WaveCertificate, WaveId, WeightedTimestamp, bls_keypair_from_seed,
+    Verified, VrfProof, WaveCertificate, WaveId, WeightedTimestamp, bls_keypair_from_seed,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -383,6 +383,7 @@ pub fn make_live_block(
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
+        randomness_reveal: VrfProof::ZERO,
     }
 }
 
@@ -487,6 +488,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provisions,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         } => Block::Live {
             header: restamp(header),
             transactions,
@@ -494,6 +496,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provisions,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         },
         Block::Sealed {
             header,
@@ -502,6 +505,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provision_hashes,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         } => Block::Sealed {
             header: restamp(header),
             transactions,
@@ -509,6 +513,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             provision_hashes,
             ready_signals,
             reshape_trigger,
+            randomness_reveal,
         },
     }
 }

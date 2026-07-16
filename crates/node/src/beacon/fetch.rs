@@ -143,6 +143,17 @@ impl FetchBinding for ShardWitnessBinding {
                     return ResponseVerdict::Reject;
                 }
                 let witnesses: Vec<Arc<ShardWitness>> = response.witnesses.into_inner();
+                // Release the fetch slot before delivering the payload:
+                // the coordinator's chunk re-drive runs while handling
+                // the delivery, and the next leaf it requests needs the
+                // slot this response just freed.
+                push_shard_input(
+                    &es,
+                    local_shard,
+                    ShardScopedInput::ShardWitnessesFetchFulfilled {
+                        ids: vec![(source_shard, block_height, committed_block_hash, leaf_index)],
+                    },
+                );
                 push_protocol_event(
                     &es,
                     local_shard,
@@ -206,6 +217,15 @@ impl FetchBinding for BeaconProposalBinding {
                     return ResponseVerdict::Accept;
                 };
                 let was_empty = response.proposal.is_none();
+                if !was_empty {
+                    push_shard_input(
+                        &es,
+                        local_shard,
+                        ShardScopedInput::BeaconProposalFetchFulfilled {
+                            ids: vec![(epoch, validator)],
+                        },
+                    );
+                }
                 push_protocol_event(
                     &es,
                     local_shard,

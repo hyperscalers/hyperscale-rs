@@ -86,11 +86,10 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters,
-    ShardWitnessPayload, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
-    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters, StateRoot,
+    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload, vrf_output_from_proof,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -171,13 +170,15 @@ const MAX_PENDING_PER_HEIGHT: usize = 64;
 const MAX_HEADER_HEIGHT_LOOKAHEAD: u64 = 256;
 
 /// What [`ShardCoordinator::preview_witness_commitment`] resolves for a
-/// proposal: the drained ready signals, the reshape assertion, and the
-/// beacon-witness commitment trio the header carries.
+/// proposal: the drained ready signals, the reshape assertion, the trimmed
+/// parent-window leaves the block's new leaves append onto, and the window
+/// base. The beacon-witness root is finalized in the `BuildProposal` handler,
+/// which signs the block's randomness reveal (leaf 0) on the dispatch pool and
+/// derives the block's leaves over `parent_window`.
 struct WitnessCommitmentPreview {
     ready_signals: Vec<ReadySignal>,
     reshape_trigger: Option<ReshapeTrigger>,
-    root: BeaconWitnessRoot,
-    leaf_count: BeaconWitnessLeafCount,
+    parent_window: Vec<Hash>,
     base: BeaconWitnessLeafCount,
 }
 
@@ -1537,8 +1538,6 @@ impl ShardCoordinator {
         proposal_wt: WeightedTimestamp,
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
-        receipts: &[StoredReceipt],
-        missed: &[ShardWitnessPayload],
     ) -> WitnessCommitmentPreview {
         let mut ready_signals = self.ready_signal_pool.drain_eligible(
             proposal_wt,
@@ -1597,21 +1596,16 @@ impl ShardCoordinator {
 
         let reshape_trigger =
             self.derive_proposal_reshape_trigger(topology_snapshot, substate_bytes, &parent_leaves);
-        let new_leaves = derive_leaves(
-            self.local_shard,
-            topology_snapshot,
-            receipts,
-            missed,
-            &ready_signals,
-            reshape_trigger.and_then(|t| t.to_payload(self.local_shard)),
-        );
-        let (root, leaf_count) =
-            BeaconWitnessAccumulator::from_leaves(base, parent_leaves).preview_append(&new_leaves);
+        // The block's new leaves — the randomness reveal (leaf 0) plus the
+        // content leaves — are derived and merkle-committed in the
+        // `BuildProposal` handler, where the reveal is signed off the main
+        // loop. The preview resolves only the inputs to that: the trimmed
+        // parent window the new leaves append onto, the deduped ready signals,
+        // the reshape assertion, and the window base.
         WitnessCommitmentPreview {
             ready_signals,
             reshape_trigger,
-            root,
-            leaf_count,
+            parent_window: parent_leaves,
             base,
         }
     }
@@ -1689,15 +1683,6 @@ impl ShardCoordinator {
                 return vec![];
             }
         };
-        let receipts: Vec<StoredReceipt> = match &kind {
-            ProposalKind::Normal {
-                finalized_waves, ..
-            } => finalized_waves
-                .iter()
-                .flat_map(|fw| fw.receipts().iter().cloned())
-                .collect(),
-            ProposalKind::Fallback | ProposalKind::Sync => Vec::new(),
-        };
         let missed = missed_proposals_since_prev_commit(
             self.local_shard,
             height,
@@ -1711,8 +1696,6 @@ impl ShardCoordinator {
             parent_qc.weighted_timestamp(),
             parent_block_hash,
             substate_bytes,
-            &receipts,
-            &missed,
         );
 
         let plan = assemble_build_action(
@@ -1725,8 +1708,8 @@ impl ShardCoordinator {
             kind,
             preview.ready_signals,
             preview.reshape_trigger,
-            preview.root,
-            preview.leaf_count,
+            preview.parent_window,
+            missed,
             preview.base,
             carry_split_child_roots,
             carry_settled_waves_root,
@@ -3958,6 +3941,7 @@ impl ShardCoordinator {
         let new_leaves = derive_leaves(
             self.local_shard,
             committee,
+            vrf_output_from_proof(block.randomness_reveal()),
             &receipts,
             &missed,
             manifest.ready_signals().as_slice(),
@@ -3971,12 +3955,22 @@ impl ShardCoordinator {
         // A committed block whose (QC-attested) window base advanced past
         // the accumulator's start moves both retention floors: the
         // in-memory window prunes to the new base, while the persisted
-        // payloads keep one window of hysteresis — they prune only to the
-        // *previous* window's base, so the previous window's trees stay
-        // provable for the beacon fold still consuming them.
+        // payloads retain everything two consumers can still ask for —
+        // the beacon fold draining below the current base (never below
+        // the attested anchor's own base), and snap-sync joiners
+        // assembling the attested anchor's window against its header
+        // root. Under a lagging fold the anchor sits several base
+        // advances behind the chain, so the floor clamps to the anchor's
+        // window base rather than assuming one window of hysteresis
+        // covers it.
         let prior_start = self.beacon_witness_accumulator.start_index();
         let block_base = block.header().beacon_witness_base();
-        let prune_persisted_below = (block_base > prior_start).then_some(prior_start);
+        let prune_persisted_below = (block_base > prior_start).then(|| {
+            topology_schedule
+                .head()
+                .boundary(self.local_shard)
+                .map_or(prior_start, |anchor| anchor.witness_base.min(prior_start))
+        });
         self.beacon_witness_accumulator.prune_to(block_base);
         let witness = BeaconWitnessCommit {
             starting_leaf_index,
@@ -5428,8 +5422,8 @@ mod tests {
         CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
         MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
         RoutableTransaction, ShardId, SignerBitfield, TopologySchedule, TopologySnapshot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        generate_bls_keypair, test_utils, zero_bls_signature,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
+        WeightedTimestamp, generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -5616,6 +5610,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -5731,6 +5726,7 @@ mod tests {
                 provisions: Arc::new(BoundedVec::new()),
                 ready_signals: Arc::new(BoundedVec::new()),
                 reshape_trigger: None,
+                randomness_reveal: VrfProof::ZERO,
             }
         };
 
@@ -5979,6 +5975,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -6471,6 +6468,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let parent_block_hash = parent_block.hash();
         state.committed_height = BlockHeight::new(1);
@@ -8373,6 +8371,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -8447,6 +8446,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -8500,6 +8500,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -8702,6 +8703,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -8741,6 +8743,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
 
         let result = {
@@ -8792,6 +8795,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -8829,6 +8833,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -9114,6 +9119,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 
@@ -9277,6 +9283,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         }
     }
 

@@ -238,7 +238,8 @@ mod tests {
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
         SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-        Verified, WaveCertificate, WaveId, WeightedTimestamp, settled_waves_root_from_ids,
+        Verified, VrfProof, WaveCertificate, WaveId, WeightedTimestamp,
+        settled_waves_root_from_ids,
     };
 
     use super::*;
@@ -316,6 +317,7 @@ mod tests {
                 provisions: Arc::new(BoundedVec::new()),
                 ready_signals: Arc::new(BoundedVec::new()),
                 reshape_trigger: None,
+                randomness_reveal: VrfProof::ZERO,
             };
             parent = block.hash();
             terminal = block.hash();

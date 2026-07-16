@@ -640,6 +640,7 @@ fn record_boundaries(
                 height: header.height(),
                 weighted_timestamp: header.parent_qc().weighted_timestamp(),
                 witness_leaf_count: BeaconWitnessLeafCount::new(chunk_end),
+                witness_base: header.beacon_witness_base(),
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: marks.terminal_epoch,
@@ -858,6 +859,7 @@ fn seed_split_children(
                 height: genesis.height(),
                 weighted_timestamp: genesis.parent_qc().weighted_timestamp(),
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -958,6 +960,7 @@ fn compose_merge_parent(
             height: genesis.height(),
             weighted_timestamp: genesis.parent_qc().weighted_timestamp(),
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: epoch,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -1205,6 +1208,12 @@ mod tests {
         assert_eq!(recorded.state_root, anchor);
         assert_eq!(recorded.height, BlockHeight::new(5));
         assert_eq!(recorded.witness_leaf_count, BeaconWitnessLeafCount::new(7));
+        // The record carries the boundary header's own window base — the
+        // retention floor serving members hold for snap-sync assembly.
+        assert_eq!(
+            recorded.witness_base,
+            contributions[&shard].boundary_header.beacon_witness_base(),
+        );
         assert_eq!(recorded.last_live_epoch, Epoch::new(1));
         assert_eq!(recorded.consecutive_misses, 0);
         // Folding the shard's own crossing marks it produced past genesis —
@@ -1298,6 +1307,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1375,6 +1385,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1436,6 +1447,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1893,6 +1905,7 @@ mod tests {
                 height: BlockHeight::new(8),
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: Some(Epoch::new(1)),
@@ -1910,6 +1923,7 @@ mod tests {
                     height: BlockHeight::GENESIS,
                     weighted_timestamp: WeightedTimestamp::ZERO,
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    witness_base: BeaconWitnessLeafCount::ZERO,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: None,
@@ -2238,6 +2252,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -2257,6 +2272,7 @@ mod tests {
                     height: BlockHeight::new(9),
                     weighted_timestamp: WeightedTimestamp::ZERO,
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    witness_base: BeaconWitnessLeafCount::ZERO,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
@@ -2369,6 +2385,7 @@ mod tests {
                     height: BlockHeight::new(height),
                     weighted_timestamp: WeightedTimestamp::ZERO,
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    witness_base: BeaconWitnessLeafCount::ZERO,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
@@ -2386,6 +2403,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -2713,6 +2731,7 @@ mod tests {
                 height: BlockHeight::GENESIS,
                 weighted_timestamp: WeightedTimestamp::ZERO,
                 witness_leaf_count: witness,
+                witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,

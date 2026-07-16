@@ -141,6 +141,7 @@ mod tests {
             block_hash: expected.hash(),
             height: BlockHeight::new(10),
             weighted_timestamp: canonical_wt,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             settled_waves_root: None,
         };
 

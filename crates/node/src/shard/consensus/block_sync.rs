@@ -429,7 +429,7 @@ mod tests {
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
+        TxOutcome, ValidatorId, Verifiable, VrfProof, WaveCertificate, WaveId, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -576,6 +576,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -591,6 +592,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -610,6 +612,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
@@ -633,6 +636,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -662,6 +666,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -687,6 +692,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -709,6 +715,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -765,6 +772,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -794,6 +802,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -843,6 +852,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);

@@ -1139,9 +1139,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_types::{
-        BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor, ShardId, StateRoot,
-        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
-        generate_bls_keypair,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor,
+        ShardId, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp, generate_bls_keypair,
     };
 
     use super::{
@@ -1162,6 +1162,7 @@ mod tests {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"seeded-boundary")),
             height: BlockHeight::new(8),
             weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
             settled_waves_root: None,
         }
     }
