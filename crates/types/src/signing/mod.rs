@@ -38,6 +38,7 @@ mod execution;
 mod provisions;
 mod ready_signal;
 mod shard;
+mod shard_reveal;
 mod validator_bind;
 
 pub use beacon_pc::{
@@ -58,5 +59,8 @@ pub use ready_signal::{DOMAIN_READY_SIGNAL, ready_signal_message};
 pub use shard::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_TIMEOUT,
     block_header_message, block_vote_message, certified_block_header_message, timeout_message,
+};
+pub use shard_reveal::{
+    DOMAIN_SHARD_REVEAL, shard_reveal_message, shard_reveal_sign, shard_reveal_verify,
 };
 pub use validator_bind::{DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, validator_bind_message};
