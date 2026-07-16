@@ -3,11 +3,20 @@
 
 Prices the premise every verified safety property is conditional on: that no
 committee ever seats >= f+1 corrupt members. Dependency-free; exact
-hypergeometric arithmetic via log-gamma.
+hypergeometric arithmetic via log-gamma, plus seeded Monte Carlo for the
+coupled dynamics no closed form covers.
 
-Units: seats (voting is per seat; stake is the admission gate). The failure
-event is a committee reaching k >= f+1 corrupt seats, f = (n-1)//3 — the
-threshold at which both safety and liveness arguments lapse.
+Units: seats (voting is per seat; stake is the admission gate). The primary
+failure event is a committee reaching k >= f+1 corrupt seats, f = (n-1)//3 —
+a recoverable halt; the terminal boundary 2f+1 is priced by table V.
+
+Table index (letter -> note section):
+  A fresh draws (S1)         I beacon redraw (S1)       B/C trickle chain (S2)
+  D1/D2 sizing (S3)          E/J/K adaptive (S4, S8)    F seats vs stake (S5)
+  G operating point (S6)     H interval sweep (S6)      L concentration (S7)
+  V terminal boundary (S10.1)             W1-W4 window edge (S10.3)
+  M/N fallback ceremony grind (S10.4)     R/T input-side stack (S10.5)
+  S detect-and-rotate (S10.6)
 
 Run: python3 specs/committee_security.py
 """
@@ -68,31 +77,33 @@ def check_detailed_balance(N: int, M: int, n: int) -> None:
             raise AssertionError(f"detailed balance broken at k={k}")
 
 
-def crossing_rate(N: int, M: int, n: int) -> float:
-    """Stationary frequency (per shuffle event) of the k = f -> f+1 crossing.
+def crossing_rate(N: int, M: int, n: int, boundary: int | None = None) -> float:
+    """Stationary frequency (per shuffle event) of the k = b-1 -> b crossing,
+    for boundary b (default f+1; pass 2f+1 for the terminal boundary).
 
     Conservative failure accounting: every boundary crossing counts as a
     committee compromise, whether or not an adversary exploits the interval.
     """
-    f = f_of(n)
-    return hyper_pmf(N, M, n, f) * p_up(N, M, n, f)
+    k = (f_of(n) if boundary is None else boundary - 1)
+    pi = hyper_pmf(N, M, n, k)
+    return pi * p_up(N, M, n, k) if pi > 0.0 else 0.0
 
 
-# ── Randomness grinding: the last-revealer grind on the epoch seed ─────────
-# The next-epoch beacon randomness is BLAKE3(prev || VRF outputs of the
-# COMMITTED beacon-committee proposals). Each VRF output is key-fixed
-# (deterministic in (key, epoch)), so a Byzantine beacon member cannot choose
-# its value — only whether it joins the fold: reveal early => folded, withhold
-# => BOTTOM, not folded. The dense-vector PC input commits interior BOTTOMs
-# without shortening the prefix, so the toggle is independent per member. With
-# t strategically-releasable Byzantine proposals the adversary enumerates
-# 2^t candidate seeds (ChaCha20 is a PRF: distinct seed => independent uniform
-# draw), computes each one's committee, and steers the commit to the best.
-# Best-of-2^t on one global seed per epoch, one-epoch lookahead (not
-# retroactive, not compounding beyond the per-epoch redraw). t is bounded by
-# the Byzantine beacon-committee count ~ beta*n; the realized value is set by
-# how many of those proposals synchrony lets the adversary hold back and
-# release late-but-included.
+# ── The fallback ceremony grind (tables M, N — §10.4) ───────────────────────
+# The epoch seed's primary source is the reveal-leaf fold (tables W); in an
+# epoch where no witness chunk folds, the seed falls back to the beacon
+# ceremony mix BLAKE3(prev || VRF outputs of the COMMITTED beacon-committee
+# proposals). Each VRF output is key-fixed (deterministic in (key, epoch)),
+# so a Byzantine beacon member cannot choose its value — only whether it
+# joins the fold: reveal early => folded, withhold => BOTTOM, not folded. The
+# dense-vector PC input commits interior BOTTOMs without shortening the
+# prefix, so the toggle is independent per member. With t strategically-
+# releasable Byzantine proposals the adversary enumerates 2^t candidate seeds
+# (ChaCha20 is a PRF: distinct seed => independent uniform draw), computes
+# each one's committee, and steers the commit to the best. Best-of-2^t on one
+# global seed per epoch, one-epoch lookahead (not retroactive, not
+# compounding beyond the per-epoch redraw). t's natural mean is beta*b over
+# the beacon committee; the resample boost lifts it above that (table T).
 
 def grind_shard_march_days(
     n: int, beta: float, t: int, interval: int = SHUFFLE_INTERVAL_EPOCHS
@@ -162,10 +173,10 @@ def fmt_duration(days):
 # One scalar root x in (0, beta]. Three regimes: supply FLOOR (M <= f, can't
 # seat f+1 at all — the note's structural bound), FIFO CAP (M > f but the
 # equilibrium c_T < f+1, so a fork is only a rare crossing of the equilibrium,
-# reverting to the un-steered tail), or FORK (c_T >= f+1). The CURRENT scheme
-# grinds the victim too — it evicts an honest seat to protect its corrupt ones,
-# so there is no aging-out and it forks whenever supply permits (M > f). FIFO is
-# what turns the supply floor into a dynamic cap.
+# reverting to the un-steered tail), or FORK (c_T >= f+1). A victim-grind
+# eviction rule — evict an honest seat to protect the corrupt ones — has no
+# aging-out and forks whenever supply permits (M > f); FIFO turning that
+# supply floor into a dynamic cap is why FIFO is the eviction rule.
 
 # Unseated buffer for the NETWORK model: a small shared pool of Pooled spares
 # (jail/exit refill stock + reshape cohorts), unlike §1's POOL_FACTOR=20, which
@@ -207,8 +218,8 @@ def grind_network_regime(n, beta, shards, pool_factor, width):
 def _grind_network_sim(n, beta, shards, pool_factor, width, intervals, seed, fifo):
     """Seeded Monte Carlo of the conserved-population network grind — validation
     for the mean field, not a table generator. `fifo` picks the eviction rule on
-    the target: True = deterministic longest-seated; False = the current
-    victim-grind (evict an honest seat to protect corrupt). One corrupt entrant
+    the target: True = deterministic longest-seated; False = victim-grind
+    (evict an honest seat to protect corrupt). One corrupt entrant
     is ground onto the target per event at effective width `width`; the other
     shards draw uniformly. Returns the fraction of events the target held f+1."""
     from random import Random
@@ -429,31 +440,32 @@ def adversary_value_iteration(
     return (start, policy) if want_policy else start
 
 
-# ── The grind, set jointly by the tunable parameters (table T) ───────────────
-# The march is not a fixed threat: three protocol knobs move it, and they turn
-# out to decouple, so the disposition is a parameter choice rather than a new
-# mechanism (§10 Finding 11).
+# ── The ceremony grind vs the tunable parameters (table T — §10.5) ───────────
+# Three knobs move the fallback ceremony grind; table T prices what each
+# actually closes:
 #
-#   beacon committee size b  — the grind WIDTH lever. Width = 2^t, t = corrupt
-#     beacon proposers ~ Binomial(b, beta). A small committee means most epochs
-#     the adversary holds 0-1 seats and the toggle cannot sway the draw at all,
-#     so the FIFO equilibrium c_T = n * E[1-(1-beta)^(2^t)] caps below f+1. This
-#     is the only lever that bites at the design point (beta>=0.05); the others
-#     close only beta<=~0.04. The natural (un-boosted) foothold is the operative
-#     one because jail-on-first for withholding kills the resample-grind boost:
-#     to boost, the adversary must self-omit every epoch, which jails it.
-#   withholding penalty  — jail-on-first, made SAFE by SPC censorship
-#     resistance. The committed value is the f+1-shared prefix (qc1_certify), so
-#     an honest proposal reaching a supermajority is committed and cannot be
-#     excluded by delay under synchrony; a grinder is absent only by SELF-
-#     omission. So jail-on-first catches the grinder and (partial synchrony:
-#     honest excludable only in bounded async windows, not the persistent f/n
-#     Finding 7 assumed) barely touches honest — and a small committee shrinks
-#     the residual purge rate to f_beacon, tiny.
-#   shuffle interval I  — FREED to serve adaptive corruption once the beacon
-#     size caps the grind. Grind cap is time-independent (a seat fraction), so
-#     small I costs the grind nothing and buys adaptive-corruption survival
-#     (1-1/n)^(tau/I) and fast detect-and-rotate recovery.
+#   beacon committee size b  — the grind WIDTH lever. Width = 2^t with t the
+#     corrupt beacon proposers; the NATURAL foothold is t ~ Binomial(b, beta),
+#     and grind_width_cap prices the FIFO target equilibrium off it. The
+#     natural cap is not what an adversary realizes: the resample boost
+#     (steering this epoch's seed to over-represent corrupt in the next
+#     epoch's beacon draw) lifts t above its Binomial mean, and the coupled
+#     sim shows it surviving jail-on-first at the true eligible-pool size —
+#     b=16 realizes c_T = 61 against the natural cap's 40; b=20 realizes 86,
+#     over the terminal 2f+1 line.
+#   withholding penalty  — jail-on-first, honest-safe because the protocol is
+#     leaderless: the committed value is the f+1-shared prefix (qc1_certify),
+#     so an honest proposal reaching a supermajority commits regardless of
+#     delay outside bounded async windows, while a grinder is absent by
+#     self-omission always. Clean (sim_async_purge: the realized honest purge
+#     is a rounding error) but shallow (the eligible pool is too large for the
+#     drain to deplete the corrupt supply) — a bar-raise, not a close. The
+#     recency-weighted resample is what caps the SUSTAINED foothold
+#     (sim_recency below).
+#   shuffle interval I  — a march is linear in I, but marches are confined to
+#     the fallback path (sustaining one needs self-announcing network-scale
+#     suppression) and the window-edge equilibrium is I-independent, so I
+#     trades chiefly against adaptive corruption (§6 Rider 1).
 
 def grind_width_cap(n, beta, beacon_size):
     """FIFO target-shard corrupt equilibrium under a beacon committee of
@@ -672,7 +684,7 @@ def check_resample_boost() -> None:
         raise AssertionError(
             f"small-pool boost not collapsed (max_c={small['max_c']})")
     # the full prevention stack (recency + jail + FIFO) holds the design-point
-    # shard well below the terminal 2f+1 line, where the decided stack is thin.
+    # shard well below the terminal 2f+1 line, where the no-recency stack is thin.
     full = sim_recency(n, beta, 16, 12000, 904)
     if full["max_c"] >= 2 * f_of(n) + 1:
         raise AssertionError(
@@ -691,8 +703,8 @@ def check_resample_boost() -> None:
 # accumulating), it holds the target shard's sustained corrupt below the terminal
 # 2f+1 line and pushes the first 2f+1 crossing from beta~0.12 to ~0.14. Mean
 # field over recency buckets (exact depletion feedback). The ramp sharpness and
-# jail-cooldown coupling are tuning knobs (a sharper ramp caps tighter but makes
-# the committee more predictable — the §4 trade); pinned during implementation.
+# jail-cooldown coupling are tuning knobs — a sharper ramp caps tighter but
+# makes the committee more predictable (the §4 trade).
 
 def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
                 omit_frac=0.5, with_fifo=True):
@@ -766,20 +778,20 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
             "final_c": c, "max_c": max_c}
 
 
-# ── The witness-reveal fold ──────────────────────────────────────────────
+# ── The epoch seed: the witness-reveal fold (tables W — §10.2–§10.3) ─────
 #
-# Candidate replacement for the reveal ceremony: every shard block carries a
-# mandatory reveal leaf — a deterministic per-proposer VRF over (shard,
-# height), unchooseable and unforgeable — appended to the beacon-witness
-# accumulator, and the epoch seed folds each shard's watermark-to-boundary
-# leaf range. The include/omit lever is structurally gone (the folded set is
-# a consensus-derived range, not a per-member choice) and interior leaves are
-# committed before later leaves exist, so interior choices are blind without
-# any network assumption. What remains is the WINDOW EDGE: the proposers who
-# close the last epoch windows to settle can (a) rush or sandbag the boundary
-# within the ~32s timestamp validity window, choosing among a handful of
-# KNOWN candidate folds, or (b) forfeit the slot for a blind redraw by an
-# unknown successor. The model prices exactly that edge.
+# Every shard block carries a mandatory reveal leaf — a deterministic
+# per-proposer VRF over (shard, height), unchooseable and unforgeable —
+# appended to the beacon-witness accumulator, and the epoch seed folds each
+# shard's watermark-to-boundary leaf range. The include/omit lever is
+# structurally gone (the folded set is a consensus-derived range, not a
+# per-member choice) and interior leaves are committed before later leaves
+# exist, so interior choices are blind without any network assumption. What
+# remains is the WINDOW EDGE: the proposers who close the last epoch windows
+# to settle can (a) rush or sandbag the boundary within the ~32s timestamp
+# validity window, choosing among a handful of KNOWN candidate folds, or (b)
+# forfeit the slot for a blind redraw by an unknown successor. The model
+# prices exactly that edge.
 
 
 def witness_edge_p_event(beta, p, sight=1.0, edge_windows=2, run_cap=16):
@@ -820,7 +832,7 @@ def witness_edge_p_event(beta, p, sight=1.0, edge_windows=2, run_cap=16):
 
 
 def reveal_ceremony_p_event(beta, p, beacon_size=16):
-    """Per-event grind of the shipped reveals-only fold: t ~ beta*b committee
+    """Per-event grind of the fallback reveal ceremony: t ~ beta*b committee
     members toggle their own reveals with full sight of the fold — a clean
     best-of-2^t. This is the NATURAL-foothold width; the coupled resample
     boost lifts realized t further (table T), so it is a floor for the
@@ -1286,20 +1298,20 @@ def main() -> None:
     print("    conserve-then-spend: budget is held until a lucky rotation "
           "lifts k toward the boundary")
 
-    # M: randomness grinding — the last-revealer grind on the epoch seed.
-    # Best-of-2^t steering of the trickle shuffle marches a TARGETED shard
-    # from beta*n to f+1 corrupt (an INV-SHARD-1 fork on that shard). t is
-    # bounded by the Byzantine beacon foothold ~ beta*n (~13 at n=128,
-    # beta=0.10; ceiling f=42); materiality bites well under that.
+    # M: the fallback ceremony grind — best-of-2^t steering of the trickle
+    # shuffle marches a TARGETED shard from beta*n to f+1 corrupt (and, at
+    # ~2.5x the time, to the terminal 2f+1). t's natural mean is beta*b
+    # (~1.6 at b=16); the resample boost lifts it to ~3-4 (table T) — exactly
+    # the materiality band.
     n = 128
     beta = 0.10
     f = f_of(n)
     c0 = round(beta * n)
     floor_days = (f + 1 - c0) * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 86400
-    print(f"\nM. Randomness grind: days to march one targeted shard from "
-          f"beta*n={c0} to f+1={f + 1} corrupt")
+    print(f"\nM. Fallback ceremony grind: days to march one targeted shard "
+          f"from beta*n={c0} to f+1={f + 1} corrupt")
     print(f"   (n={n}, beta={beta}, shuffle every {SHUFFLE_INTERVAL_EPOCHS} "
-          f"epochs; best-of-2^t steering, foothold ceiling t<=f={f})")
+          f"epochs; best-of-2^t steering of the ceremony mix)")
     print("    grind t | candidate seeds 2^t | days to fork the shard")
     print("  " + "-" * 56)
     for t in (1, 2, 3, 4, 6, 8, 13):
@@ -1309,12 +1321,11 @@ def main() -> None:
 
     # Operating-point levers: the march counts shuffle EVENTS and flips f+1-c0
     # SEATS, so days-to-fork are linear in both the shuffle interval and the
-    # committee size. Both are free-ish dials that trade grind resistance
-    # against their other costs (I: adaptive-corruption flush, §6 Rider 1;
-    # n: message complexity, §6). The width cannot be capped at the input
-    # (Finding 11); for f+1 that is moot (detect-and-rotate recovers, Finding
-    # 10), but for the TERMINAL 2f+1 these levers ARE the defense — prevention,
-    # not recovery (Finding 9).
+    # committee size. Both trade grind resistance against their other costs
+    # (I: adaptive-corruption flush, §6 Rider 1; n: message complexity, §6).
+    # The ceremony width cannot be capped at the input (§10.5); for f+1 that
+    # is moot (detect-and-rotate recovers, §10.6), but for the TERMINAL 2f+1
+    # the fallback-path defense is prevention, not recovery (§10.1).
     print("   Cheap levers (t=4, days to fork one shard):")
     intervals = (2, 4, 8, 16, 32, 64)
     print("    shuffle interval I | "
@@ -1326,14 +1337,16 @@ def main() -> None:
           + " ".join(f"{s:>5}" for s in sizes) + "   (I=16)")
     print("                       | "
           + " ".join(f"{grind_shard_march_days(s, beta, 4):>5.1f}" for s in sizes))
-    print("   (I=2 — the §6 Rider 1 adaptive-corruption optimum — is the grind's "
-          "WORST case, ~8x the I=16")
-    print("    march; the two threats pull opposite ways on I. n is capped at 128 "
-          "by message complexity.)")
+    print("   (a fallback-path march at I=2 runs ~8x the I=16 march — the "
+          "residual caution §6 Rider 1")
+    print("    weighs against adaptive corruption. n is capped at 128 by "
+          "message complexity.)")
 
     # N: the beacon resample under the same grind — best-of-2^t amplification
-    # of the per-epoch redraw tail. Not the sharp target (safety rides pool
-    # ratification), so this prices liveness + bias exposure, not a fork.
+    # of the per-epoch redraw tail, at a shard-sized beacon committee (the
+    # bounding case; b=16's per-draw rate is table T's last column). Not the
+    # sharp target (safety rides pool ratification), so this prices liveness
+    # + bias exposure, not a fork.
     shards = 100
     N_elig = shards * n
     p_single = hyper_tail(N_elig, round(N_elig * beta), n, f + 1)
@@ -1349,8 +1362,10 @@ def main() -> None:
     # R: the network-wide grind under all-shard FIFO eviction. The single-shard
     # march (table M) ignores the finite shared pool; conserving corrupt and
     # letting every shard shuffle from one pool turns the target into a stable
-    # equilibrium. FIFO caps it below f+1 for low beta; the current victim-grind
-    # scheme forks whenever supply permits. Width 2^t, t=round(beta*n).
+    # equilibrium. FIFO caps it below f+1 for low beta; a victim-grind eviction
+    # rule forks whenever supply permits. Width 2^t at the unconstrained
+    # foothold t=round(beta*n) — the no-width-lever worst case; table T carries
+    # the realized b=16 width.
     n = 128
     f = f_of(n)
     print(f"\nR. Network-wide grind under all-shard FIFO eviction (finite shared "
@@ -1376,7 +1391,7 @@ def main() -> None:
     shards = 100
     print(f"\n   Fork verdict on a {shards}-shard network — what each eviction "
           "rule closes:")
-    print("    beta  | current (victim-grind) | FIFO (width 2^t) | FIFO + strikes (width t+1)")
+    print("    beta  | victim-grind (no FIFO) | FIFO (width 2^t) | FIFO + strikes (width t+1)")
     print("  " + "-" * 74)
     for b in (0.02, 0.03, 0.04, 0.05, 0.07, 0.10):
         t = max(1, round(b * n))
@@ -1387,14 +1402,57 @@ def main() -> None:
         fifo_s = "FORK" if fifo == "fork" else ("flr" if fifo == "floor" else f"cap {fifo:.0f}")
         strk_s = "FORK" if strk == "fork" else ("flr" if strk == "floor" else f"cap {strk:.0f}")
         print(f"    {b:5.2f} | {cur:>22} | {fifo_s:>16} | {strk_s:>26}")
-    print("   (current forks across the whole band once supply permits; FIFO "
-          "closes beta<=~0.025, FIFO+strikes")
+    print("   (victim-grind forks across the whole band once supply permits; "
+          "FIFO closes beta<=~0.025, FIFO+strikes")
     print("    closes beta<=~0.04; neither closes the design point — see "
-          "committee_security.md §10 Finding 8. Validated")
+          "committee_security.md §10.5. Validated")
     print("    against a conserved-population Monte Carlo (check_grind_network).)")
 
+    # V: the TERMINAL boundary priced unsteered — the k = 2f -> 2f+1 crossing
+    # on the same chain (§10.1). The f+1 tables above price a RECOVERABLE
+    # liveness halt, i.e. availability; the unrecoverable event is 2f+1, and
+    # unsteered sampling essentially cannot produce it — its budget lines sit
+    # at beta ~ 0.36-0.45, far above pool-hygiene territory (and above the 1/3
+    # stake line an unsharded BFT chain fails at). Steering is the only route
+    # to 2f+1 at plausible beta (table M's march at ~2.5x the f+1 time), which
+    # is what the input-side stack (T) and the reveal-leaf fold (W) defend.
+    # Between the two lines the network degrades but stays sound: the f+1
+    # column shows halts becoming routine long before the terminal tail opens.
+    n = 128
+    N = POOL_FACTOR * n
+    f = f_of(n)
+    terminal = 2 * f + 1
+    shards = 100
+    print(f"\nV. Terminal boundary at n={n}: unsteered k = {terminal - 1} -> "
+          f"{terminal} (= 2f+1) crossings")
+    print("    beta   | terminal/shard-yr | 100-shard network | f+1 halts/shard-yr")
+    print("  " + "-" * 66)
+    for beta in (0.30, 0.35, 0.38, 0.40, 0.42, 0.45):
+        M = round(N * beta)
+        t_rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n, terminal)
+        h_rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n)
+        net = t_rate * shards
+        right = f"1 per {1 / net:,.0f} yr" if 0 < net < 1 else f"{net:8.2f} / yr"
+        print(f"    {beta:5.3f}  |     {t_rate:8.2e}  | {right:>17} | "
+              f"{fmt(h_rate)}")
+    print("    budget (terminal/shard-yr) | max beta")
+    print("  " + "-" * 40)
+    for budget in (1e-3, 1e-6, 1e-9):
+        best = 0
+        for M in range(0, round(N * 0.6)):
+            if SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n, terminal) > budget:
+                break
+            best = M
+        print(f"    {budget:26.0e} | {best / N:8.3f}")
+    print("   (two lines, not one: HEALTHY beta <~ 0.13 — the f+1 budget of D2 "
+          "holds and halts are")
+    print("    negligible; SOUND beta <~ 0.40 — halts and re-draws become "
+          "routine above ~0.13, at")
+    print(f"    beta=0.40 the stationary mean corrupt count beta*n = "
+          f"{0.40 * n:.0f} > f = {f}, but nothing mints)")
+
     # S: detect-and-rotate recovery for the f+1 LIVENESS halt (the 2f+1 march is
-    # terminal, prevention not recovery — Finding 9). The f+1 halt is detectable;
+    # terminal, prevention not recovery — §10.1). The f+1 halt is detectable;
     # on a stalled shard boundary the beacon re-draws the WHOLE committee. A full fresh draw
     # is grind-resistant where the trickle is not: reaching f+1 in one
     # hypergeometric draw is a ~1e-13 tail that best-of-2^t barely lifts, versus
@@ -1433,11 +1491,11 @@ def main() -> None:
     print("   (continuous grinding buys a few-percent downtime on one shard, "
           "flushed each cycle — this recovers")
     print("    the f+1 LIVENESS halt only; the 2f+1 safety march is terminal and "
-          "prevention-only, §10 Finding 9.)")
+          "prevention-only, §10.1.)")
 
     # T: the small-beacon width cap, tested against the pool it actually draws
-    # from (§10 Finding 11). grind_width_cap prices the target equilibrium
-    # off the NATURAL foothold — the width if jail-on-first fully suppresses the
+    # from (§10.5). grind_width_cap prices the target equilibrium off the
+    # NATURAL foothold — the width if jail-on-first fully suppresses the
     # resample boost. The coupled Monte Carlo (sim_resample_boost) plays the boost
     # out against the real eligible pool: the boost SURVIVES jail-on-first at the
     # design point, because the committee redraws from ~shards*n seats and the
@@ -1478,8 +1536,8 @@ def main() -> None:
 
     print("\n   Margin below 2f+1 (TERMINAL) vs beta — where the shard first "
           "crosses the doom line")
-    print("   (decided stack: b + FIFO + jail-on-first, realized c_T (max), cd=64; "
-          "2f+1=85, f+1=43):")
+    print("   (stack without recency: b + FIFO + jail-on-first, realized c_T (max), "
+          "cd=64; 2f+1=85, f+1=43):")
     print("    beta  | b=16 c_T(max) reaches | b=20 c_T(max) reaches")
     print("  " + "-" * 58)
 
@@ -1502,7 +1560,7 @@ def main() -> None:
           "2f+1 margin (b=16):")
     print("   (recency caps the SUSTAINED foothold near natural beta*b; sim_recency, "
           "sustained T then c_T(max)):")
-    print("    beta  | decided c_T(max) reaches | full-stack c_T(max) reaches")
+    print("    beta  | no-recency c_T(max) reaches | full-stack c_T(max) reaches")
     print("  " + "-" * 60)
     for beta in (0.10, 0.12, 0.13, 0.15):
         d = realized_c(beta, 16, 64)
@@ -1535,11 +1593,8 @@ def main() -> None:
     print("    un-excludable outside async windows. It is safe, but for the same "
           "reason too weak to close.)")
 
-    # W: the witness-reveal fold — move the reveal out of the beacon ceremony
-    # and into a mandatory, unchooseable, range-folded accumulator leaf. The
-    # include/omit lever is gone; the residual is the window edge. These tables
-    # price that residual against the shipped reveal ceremony (the baseline
-    # every prior finding measured) on the SAME march + FIFO-equilibrium
+    # W: the epoch seed's window-edge residual (§10.3), priced against the
+    # fallback ceremony baseline on the SAME march + FIFO-equilibrium
     # machinery, so the comparison is apples to apples.
     n = 128
     f = f_of(n)
@@ -1647,7 +1702,7 @@ def main() -> None:
           "not a leaf-count range —")
     print("    more fork-critical arithmetic on the witness-window path.)")
 
-    print("   Witness-reveal disposition: the include/omit lever is removed "
+    print("   The seed in one line: the include/omit lever is removed "
           "structurally (range fold),")
     print("   interior leaves are blind without a network assumption "
           "(accumulator ordering), and the")
@@ -1655,23 +1710,22 @@ def main() -> None:
           "shard-count threshold")
     print("   and NO separate blinder are needed. The ceremony survives only as "
           "the zero-crossing")
-    print("   bootstrap/fallback. See §10 Finding 12 + .plans/"
-          "randomness-witness-accumulator.md.")
+    print("   bootstrap/fallback. See §10.2-§10.3.")
 
-    print("\n   Recommendation: the two thresholds get opposite defenses (§10 "
-          "Finding 9).")
-    print("   f+1 (liveness) is recoverable -> detect-and-rotate (§10 Finding 10).")
-    print("   2f+1 (safety) is TERMINAL — unilateral control mints stake and "
-          "cascades; no recovery,")
-    print("   so the defense is PREVENTION: hold the sustained foothold below 2f+1. "
-          "Load-bearing levers")
-    print("   are all input-side: b=16 (non-negotiable; b=20 reaches 2f+1), FIFO "
-          "(Finding 8), jail-on-first")
-    print("   (Finding 7), and pool hygiene (beta low) the deepest. The decided "
-          "stack holds below 2f+1")
-    print("   only to beta~0.12 -> widening that margin is the open work. I is NOT "
-          "shrunk (boost survives).")
-    print("   See §10 Finding 11 + Disposition.")
+    print("\n   Disposition (§10.7): the two boundaries get opposite defenses "
+          "(§10.1).")
+    print("   f+1 (liveness) is recoverable -> detect-and-rotate (§10.6, table S).")
+    print("   2f+1 is TERMINAL — unilateral control mints stake and cascades; no "
+          "recovery, so the")
+    print("   defense is PREVENTION: the reveal-leaf seed removes the include/omit "
+          "lever (tables W),")
+    print("   the fallback ceremony is confined to zero-crossing epochs and bounded "
+          "by the input-side")
+    print("   stack — b=16 (b=20 reaches 2f+1), FIFO (table R), jail-on-first held "
+          "for a recency")
+    print("   period, recency-weighted resample -> first 2f+1 crossing beta~0.14 "
+          "(table T) — and pool")
+    print("   hygiene (beta low) is the deepest lever. See §10.5 + §10.7.")
 
 
 if __name__ == "__main__":
