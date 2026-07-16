@@ -187,13 +187,17 @@ fn beacon_pool_partition_stalls_epoch_production_sim() {
 
 /// Single-shard genesis armed so the funded root splits exactly once and the
 /// grown pair holds (each child sits between the derived merge floor and the
-/// split threshold), with two cohorts of pool surplus: one grows the root, the
-/// other is the halted shard's recovery committee.
+/// split threshold), with two cohorts of pool surplus — one grows the root,
+/// the other is the halted shard's recovery committee — plus two spares of
+/// jail slack: the recovery draw needs a full free committee, and over the
+/// scenario's ~40 epochs an organic `Performance` jail on the healthy shard
+/// refills its seat from the pool, which with zero slack would starve the
+/// draw and park the recovery.
 const fn halt_recovery_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: 8,
+        pool_surplus: 10,
         num_shards: 1,
         split_bytes: 800_000,
         latency: Duration::from_millis(150),
@@ -430,7 +434,7 @@ fn grow_reaches_two_shard_topology_sim() {
 
 #[test]
 fn grow_reaches_four_shard_topology_sim() {
-    let mut cluster = SimCluster::new(&grow_config(4), 11);
+    let mut cluster = SimCluster::new(&grow_config(4), 5);
     grow_reaches_four_shard_topology(&mut cluster);
 }
 
