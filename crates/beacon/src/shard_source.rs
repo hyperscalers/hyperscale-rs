@@ -346,14 +346,23 @@ impl ShardSourceTracker {
     /// The crossing the beacon should source next for `shard`, given the
     /// fold's current `watermark` (`boundaries[shard].witness_leaf_count`).
     ///
-    /// The fold must advance one crossing at a time: each crossing's witness
-    /// chunk proves against *its own* boundary block's `beacon_witness_root`,
-    /// and with a witness leaf per shard block the per-epoch window is narrow,
-    /// so a chunk can only cover one crossing's leaves. This returns the
-    /// **oldest crossing whose leaves are not yet folded** (`count >
-    /// watermark`) — a fixed target that advances contiguously as the fold
-    /// drains it, rather than the moving latest crossing (which, once the fold
-    /// falls behind, names a window that no longer contains the backlog).
+    /// Returns the **newest crossing with unfolded leaves** (`count >
+    /// watermark`). Anchoring the chunk at the newest crossing keeps the
+    /// fold live at any lag:
+    ///
+    /// - The chunk `[watermark, min(watermark + cap, count))` always proves
+    ///   into its root: a header's witness window base is the applied
+    ///   watermark frozen at its window's open, and the watermark is
+    ///   monotone, so a later crossing's window covers every unfolded leaf.
+    /// - Its QC always authenticates: verifiers resolve the boundary
+    ///   committee through the topology schedule, whose consumer-derived
+    ///   floor tracks the shard's `last_live_epoch` — a lagging crossing's
+    ///   committee ages below that floor and every verifier abstains,
+    ///   freezing the fold exactly when it most needs to advance.
+    /// - One chunk can span several lagging crossings' leaves, so a fold
+    ///   that fell behind a dense witness stream (a reveal leaf on every
+    ///   block) catches up at the chunk cap per epoch rather than one
+    ///   crossing per epoch — which can never outrun live production.
     ///
     /// When every retained crossing is folded (`count <= watermark`) it falls
     /// back to the latest, so a terminated shard's folded terminal keeps being
@@ -368,6 +377,7 @@ impl ShardSourceTracker {
         let per_shard = self.boundary_crossings.get(&shard)?;
         per_shard
             .values()
+            .rev()
             .find(|c| c.boundary_header().beacon_witness_leaf_count().inner() > watermark)
             .or_else(|| per_shard.values().next_back())
     }
