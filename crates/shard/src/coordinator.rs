@@ -1626,7 +1626,6 @@ impl ShardCoordinator {
         kind: ProposalKind,
     ) -> Vec<Action> {
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
-        let parent_round = parent_qc.round();
         // The block we build belongs to `at(parent_qc weighted ts)`; its
         // proposer schedule (missed-proposal leaves) and beacon-witness preview
         // resolve against that committee. Stall if the beacon lacks it.
@@ -1683,13 +1682,6 @@ impl ShardCoordinator {
                 return vec![];
             }
         };
-        let missed = missed_proposals_since_prev_commit(
-            self.local_shard,
-            height,
-            parent_round,
-            round,
-            committee,
-        );
         let preview = self.preview_witness_commitment(
             topology_schedule,
             committee,
@@ -1709,7 +1701,6 @@ impl ShardCoordinator {
             preview.ready_signals,
             preview.reshape_trigger,
             preview.parent_window,
-            missed,
             preview.base,
             carry_split_child_roots,
             carry_settled_waves_root,

@@ -113,23 +113,23 @@ pub(super) fn filter_and_roll_randomness<'a>(
         }
     }
 
-    // Roll randomness: reveal leaves when any folded this epoch, else
-    // the ceremony mix. Always runs — see the function-level doc for the
-    // source switch and the "all-rejected" semantics.
+    // Roll randomness: reveal leaves when any folded this epoch, else the
+    // ceremony mix over the accepted outputs. Always runs — see the
+    // function-level doc for the source switch and the "all-rejected"
+    // semantics. Both paths fold the same preimage shape — domain ‖ prior
+    // randomness ‖ each 32-byte output — differing only in the domain tag
+    // and the output source, so the fold lives in one place.
     let folded: Vec<&VrfOutput> = reveals.values().flatten().collect();
-    let mut h = Hasher::new();
-    if folded.is_empty() {
-        h.update(DOMAIN_BEACON_RANDOMNESS);
-        h.update(state.randomness.as_bytes());
-        for o in &accepted_outputs {
-            h.update(o.as_bytes());
-        }
+    let (domain, outputs): (&[u8], Vec<&VrfOutput>) = if folded.is_empty() {
+        (DOMAIN_BEACON_RANDOMNESS, accepted_outputs.iter().collect())
     } else {
-        h.update(DOMAIN_BEACON_RANDOMNESS_REVEALS);
-        h.update(state.randomness.as_bytes());
-        for o in folded {
-            h.update(o.as_bytes());
-        }
+        (DOMAIN_BEACON_RANDOMNESS_REVEALS, folded)
+    };
+    let mut h = Hasher::new();
+    h.update(domain);
+    h.update(state.randomness.as_bytes());
+    for o in outputs {
+        h.update(o.as_bytes());
     }
     state.randomness = Randomness::new(*h.finalize().as_bytes());
 

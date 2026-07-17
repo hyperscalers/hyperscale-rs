@@ -18,7 +18,7 @@ use crate::{
 ///
 /// Per-collection caps mirror [`Block`]'s caps one-to-one — a manifest is a
 /// hash-only projection of a `Block` and inherits its natural ceilings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
     tx_hashes: BoundedVec<TxHash, MAX_TXS_PER_BLOCK>,
     cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
@@ -30,6 +30,22 @@ pub struct BlockManifest {
     /// re-verifies the reveal against the proposer's key. See
     /// `Block::Live::randomness_reveal`.
     randomness_reveal: VrfProof,
+}
+
+impl Default for BlockManifest {
+    /// An empty manifest with the reveal sentinel. Hand-written rather than
+    /// derived so the sentinel stays confined to this projection and
+    /// `VrfProof` is never blanket-defaultable to an invalid proof.
+    fn default() -> Self {
+        Self {
+            tx_hashes: BoundedVec::new(),
+            cert_ids: BoundedVec::new(),
+            provision_hashes: BoundedVec::new(),
+            ready_signals: BoundedVec::new(),
+            reshape_trigger: None,
+            randomness_reveal: VrfProof::ZERO,
+        }
+    }
 }
 
 impl BlockManifest {

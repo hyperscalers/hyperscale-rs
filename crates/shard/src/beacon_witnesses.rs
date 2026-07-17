@@ -18,7 +18,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Hash, ShardId,
     ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, WeightedTimestamp,
-    compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit, vrf_output_from_proof,
+    commit_witness_window, compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit,
+    vrf_output_from_proof,
 };
 
 use crate::pending::{PendingBlock, PendingBlocks};
@@ -88,28 +89,16 @@ impl BeaconWitnessAccumulator {
     }
 
     /// Compute the `(root, leaf_count)` that would result from
-    /// appending `new_payloads` without mutating `self`.
-    ///
-    /// Proposer calls this at block-assembly time to fill the header's
-    /// `(beacon_witness_root, beacon_witness_leaf_count)` fields
-    /// without committing to the append — block construction may be
-    /// rolled back on view change before a successor commits.
+    /// appending `new_payloads` without mutating `self` — the read-only
+    /// counterpart to [`Self::commit_append`], deferring to the shared
+    /// [`commit_witness_window`] fold so a preview can never drift from
+    /// the proposer/verifier window arithmetic.
     #[must_use]
     pub fn preview_append(
         &self,
         new_payloads: &[ShardWitnessPayload],
     ) -> (BeaconWitnessRoot, BeaconWitnessLeafCount) {
-        if new_payloads.is_empty() {
-            return (self.root(), self.leaf_count());
-        }
-        let mut hashes = self.leaves.clone();
-        hashes.reserve(new_payloads.len());
-        for payload in new_payloads {
-            hashes.push(payload.leaf_hash());
-        }
-        let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&hashes));
-        let count = BeaconWitnessLeafCount::new(self.start_index.inner() + hashes.len() as u64);
-        (root, count)
+        commit_witness_window(&self.leaves, new_payloads, self.start_index)
     }
 
     /// Append `new_payloads` to the accumulator. Commit-time

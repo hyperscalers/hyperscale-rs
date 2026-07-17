@@ -1697,11 +1697,7 @@ impl BeaconCoordinator {
     /// re-issue — next observation, fetch response, or commit — picking up
     /// the next gap.
     fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
-        let watermark = self
-            .state
-            .boundaries
-            .get(&shard)
-            .map_or(0, |b| b.witness_leaf_count.inner());
+        let watermark = self.state.fold_watermark(shard);
         let (anchor, block_height, prior, chunk_end) = {
             let Some(crossing) = self.shard_source.next_crossing_to_source(shard, watermark) else {
                 return Vec::new();

@@ -650,10 +650,7 @@ fn record_boundaries(
         // watermark, `boundary_count` the boundary block's accumulator
         // count. A boundary whose count regressed below what we've already
         // applied is rejected (monotonicity).
-        let prior = state
-            .boundaries
-            .get(shard)
-            .map_or(0, |b| b.witness_leaf_count.inner());
+        let prior = state.fold_watermark(*shard);
         let boundary_count = header.beacon_witness_leaf_count().inner();
         if boundary_count < prior {
             continue;

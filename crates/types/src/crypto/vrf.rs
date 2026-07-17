@@ -95,14 +95,6 @@ impl VrfProof {
     }
 }
 
-impl Default for VrfProof {
-    /// The all-zero sentinel [`VrfProof::ZERO`]; lets container types that
-    /// carry a reveal (e.g. `BlockManifest`) keep deriving `Default`.
-    fn default() -> Self {
-        Self::ZERO
-    }
-}
-
 /// 32-byte beacon randomness.
 ///
 /// BLAKE3 digest of the prior randomness concatenated with each slot's
