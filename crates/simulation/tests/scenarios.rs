@@ -411,15 +411,19 @@ fn pool_capacity_caps_registrations_sim() {
     pool_capacity_caps_registrations(&mut cluster);
 }
 
-/// Single-shard genesis with the split armed (`split_bytes = 0`) and exactly
+/// Single-shard genesis with the split armed (`split_bytes = 0`) and
 /// `(target - 1)` cohorts of pool surplus to staff the split generations the
-/// grow walks through — no surplus left over, so the partition stabilizes at
-/// `target` leaves.
+/// grow walks through, plus two spares of jail slack: an organic
+/// `Performance` jail refills its committee seat from the pool, which with
+/// zero slack would leave a leaf short of full strength with nothing to
+/// refill from. The leftover stays below a committee's worth, so split
+/// admission's pool gate can't staff another cohort and the partition still
+/// stabilizes at `target` leaves.
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: (target_shards - 1) * 4,
+        pool_surplus: (target_shards - 1) * 4 + 2,
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(150),
@@ -434,7 +438,7 @@ fn grow_reaches_two_shard_topology_sim() {
 
 #[test]
 fn grow_reaches_four_shard_topology_sim() {
-    let mut cluster = SimCluster::new(&grow_config(4), 5);
+    let mut cluster = SimCluster::new(&grow_config(4), 11);
     grow_reaches_four_shard_topology(&mut cluster);
 }
 
