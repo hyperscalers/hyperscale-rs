@@ -155,6 +155,77 @@ pub fn halt_recovery_genesis_balances() -> Vec<(ComponentAddress, Decimal)> {
     balances
 }
 
+/// Probe pairs per submission batch of the halted-shard straddler scenario.
+///
+/// Two transfers sourced on the surviving sibling into the halting shard,
+/// one sourced on the halting shard itself, so both wave directions cross
+/// each phase of the freeze.
+pub const HALT_STRADDLER_BATCH: usize = 3;
+
+/// The genesis funding and probe transfers for the halted-shard straddler
+/// scenario.
+///
+/// The stable-band bulk of [`halt_recovery_genesis_balances`] plus three
+/// probe batches (submitted before the fault installs, at the freeze edge,
+/// and against the frozen shard) and a post-recovery transfer per
+/// direction. One definition the adaptors and the scenario body share, so
+/// the funded accounts cannot drift from the transfers spent against them.
+pub struct HaltStraddlerSetup {
+    /// Genesis XRD balances: the halt-recovery stable-band bulk plus every
+    /// probe account.
+    pub balances: Vec<(ComponentAddress, Decimal)>,
+    /// Probe transfers in submission order, [`HALT_STRADDLER_BATCH`] per
+    /// batch: `(payer key, payer account, recipient account)`.
+    pub straddlers: Vec<(Ed25519PrivateKey, ComponentAddress, ComponentAddress)>,
+    /// Transfers submitted after the recovery record clears, one per
+    /// direction — the recovered shard's cross-shard rail must serve both.
+    pub post_recovery: Vec<(Ed25519PrivateKey, ComponentAddress, ComponentAddress)>,
+}
+
+/// Build the halted-shard straddler genesis funding and probe transfers.
+///
+/// The halting `leaf(1, 0)` and surviving `leaf(1, 1)` keep the
+/// [`halt_recovery_genesis_balances`] stable-band bulk; the probe accounts
+/// ride on top, small enough to leave both children inside the band.
+#[must_use]
+pub fn halt_straddler_setup() -> HaltStraddlerSetup {
+    fn transfer_pair(
+        from: ShardId,
+        to: ShardId,
+        taken: &mut Vec<u8>,
+        balances: &mut Vec<(ComponentAddress, Decimal)>,
+    ) -> (Ed25519PrivateKey, ComponentAddress, ComponentAddress) {
+        let (payer_key, payer) = account_in(from, taken);
+        let (_, recipient) = account_in(to, taken);
+        balances.push((payer, Decimal::from(10_000)));
+        balances.push((recipient, Decimal::from(10_000)));
+        (payer_key, payer, recipient)
+    }
+
+    let halting = ShardId::leaf(1, 0);
+    let surviving = ShardId::leaf(1, 1);
+    // The vote payer's seed is excluded from the probe draw — it already
+    // carries the grow vote's nonce sequence.
+    let mut taken = vec![MERGE_VOTE_PAYER_SEED];
+    let mut balances = halt_recovery_genesis_balances();
+
+    let mut straddlers = Vec::new();
+    for _ in 0..3 {
+        straddlers.push(transfer_pair(surviving, halting, &mut taken, &mut balances));
+        straddlers.push(transfer_pair(surviving, halting, &mut taken, &mut balances));
+        straddlers.push(transfer_pair(halting, surviving, &mut taken, &mut balances));
+    }
+    let post_recovery = vec![
+        transfer_pair(surviving, halting, &mut taken, &mut balances),
+        transfer_pair(halting, surviving, &mut taken, &mut balances),
+    ];
+    HaltStraddlerSetup {
+        balances,
+        straddlers,
+        post_recovery,
+    }
+}
+
 /// The genesis funding and straddler transfers for the merge-straddler scenario.
 ///
 /// Mirrors [`SplitStraddlerSetup`] but for a four-shard topology: the surviving

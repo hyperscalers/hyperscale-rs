@@ -1,20 +1,23 @@
 //! Portable network-fault scenarios.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHeight, Epoch, HALT_THRESHOLD_EPOCHS, ShardId, StateRoot, TransactionDecision,
-    TransactionStatus,
+    TransactionStatus, TxHash,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
+use crate::straddler::{chain_settled, submit_straddler};
 use crate::support::epochs;
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::beacon_epoch;
 use crate::support::tx::{
-    account_from_seed, build_faucet_tx, build_transfer_tx, signer_from_seed, validity_around,
+    HALT_STRADDLER_BATCH, account_from_seed, build_faucet_tx, build_transfer_tx,
+    halt_straddler_setup, signer_from_seed, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 
@@ -189,40 +192,227 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) {
     let (left, right) = ShardId::ROOT.children();
     split_lifecycle(c);
+    let halt = freeze_shard(c, left, right, |_| {});
+    await_halt_recovery(c, &halt);
+}
 
-    let committee = c.committee_hosts(left);
+/// Cross-shard waves stay atomic across a shard halt and its
+/// committee-redraw recovery.
+///
+/// The grown left child freezes exactly as in
+/// [`halted_shard_recovers_by_committee_redraw`], but with cross-child
+/// transfers in flight at every phase of the cut: a settling batch
+/// finalized on both children before any fault installs, a racing batch
+/// submitted at the freeze edge — the last instant with any chance to
+/// commit on the halting shard — and a doomed batch submitted against the
+/// frozen shard. The surviving sibling must drive every in-flight wave to
+/// a terminal verdict on its own deadline clock during the halt, never
+/// hanging on the dead counterparty. After the recovery the two chains
+/// must agree probe by probe: no wave applied on one side that the other
+/// refused, with absence on the recovered chain counting as an abort (the
+/// fresh committee resolves pre-halt waves from certificates alone and
+/// commits no abort finalization of its own). Once the recovery record
+/// clears, a fresh transfer per direction must settle — the recovered
+/// shard's cross-shard rail serves again.
+///
+/// Requires [`halt_straddler_setup`] at genesis, a dedicated host per
+/// validator, and two committees' worth of pool surplus.
+///
+/// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
+///
+/// # Panics
+///
+/// Panics if the halt or recovery misses a lifecycle budget, an in-flight
+/// wave hangs, the chains disagree on any probe's fate, or the
+/// post-recovery transfers fail to settle.
+pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = halt_straddler_setup();
+    let network = NetworkDefinition::simulator();
+    split_lifecycle(c);
+
+    // Settling batch: finalized on both children before any fault
+    // installs, so each chain records the accept.
+    let mut probes: Vec<TxHash> = Vec::new();
+    for (i, (key, from, to)) in setup.straddlers[..HALT_STRADDLER_BATCH].iter().enumerate() {
+        let nonce = 100 + u32::try_from(i).unwrap_or(0);
+        probes.push(submit_straddler(c, &network, key, *from, *to, nonce));
+    }
+    assert!(
+        c.run_until(epochs(12), |c| {
+            probes
+                .iter()
+                .all(|h| chain_settled(c, halted, *h) && chain_settled(c, survivor, *h))
+        }),
+        "the settling batch must finalize on both children before the halt",
+    );
+
+    // Racing batch: submitted at the freeze edge, inside the staged cut —
+    // the shard commits at most a couple more heights, so each wave either
+    // squeezes through or is left in flight when it freezes. No per-batch
+    // assertion; each probe lands in whichever tally bucket it raced into.
+    let halt = freeze_shard(c, halted, survivor, |c| {
+        let racing = &setup.straddlers[HALT_STRADDLER_BATCH..2 * HALT_STRADDLER_BATCH];
+        for (i, (key, from, to)) in racing.iter().enumerate() {
+            let nonce = 200 + u32::try_from(i).unwrap_or(0);
+            probes.push(submit_straddler(c, &network, key, *from, *to, nonce));
+        }
+    });
+
+    // Doomed batch: submitted against the frozen shard. The survivor still
+    // provisions to it — the topology seats the frozen committee until the
+    // redraw — but nothing can commit there, so every wave is unsettleable.
+    for (i, (key, from, to)) in setup.straddlers[2 * HALT_STRADDLER_BATCH..]
+        .iter()
+        .enumerate()
+    {
+        let nonce = 300 + u32::try_from(i).unwrap_or(0);
+        probes.push(submit_straddler(c, &network, key, *from, *to, nonce));
+    }
+
+    // The survivor's deadline clock keeps running through the halt: every
+    // in-flight wave must reach a terminal verdict well inside the
+    // detection window, not hang on the dead counterparty.
+    for hash in &probes[HALT_STRADDLER_BATCH..] {
+        let status = await_tx_terminal(c, *hash, epochs(4));
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "an in-flight wave must reach a terminal verdict during the halt; status = {status:?}",
+        );
+    }
+
+    // The frozen chain's fates are canonical for pre-halt heights: the
+    // recovery bridges over the QC-attested tip, so nothing recorded here
+    // is orphaned, while a fresh member's synced view may not reach below
+    // its snap anchor.
+    let fates_at_freeze: Vec<_> = probes.iter().map(|h| c.chain_fate(halted, *h).1).collect();
+
+    await_halt_recovery(c, &halt);
+
+    let mut consistent = 0u32;
+    let mut aborted = 0u32;
+    let mut halted_only = 0u32;
+    let mut survivor_only = 0u32;
+    let mut report = String::new();
+    for (idx, hash) in probes.iter().enumerate() {
+        let frozen_fate = fates_at_freeze[idx];
+        let halted_now = c.chain_fate(halted, *hash).1;
+        let survivor_fate = c.chain_fate(survivor, *hash).1;
+        // An accept in either view of the halted chain is an apply: the
+        // at-freeze snapshot covers heights a fresh member never synced,
+        // the post-recovery walk covers anything finalized after resume.
+        let halted_accept = [frozen_fate, halted_now]
+            .iter()
+            .any(|f| matches!(f, Some((_, TransactionDecision::Accept))));
+        let survivor_accept = matches!(survivor_fate, Some((_, TransactionDecision::Accept)));
+        let _ = write!(
+            report,
+            "\n  #{idx}: halted at-freeze={frozen_fate:?} now={halted_now:?}; survivor={survivor_fate:?}",
+        );
+        match (halted_accept, survivor_accept) {
+            (true, true) => consistent += 1,
+            (false, false) => aborted += 1,
+            (true, false) => halted_only += 1,
+            (false, true) => survivor_only += 1,
+        }
+    }
+    assert_eq!(
+        survivor_only, 0,
+        "the survivor applied a wave the halted shard never did:{report}",
+    );
+    assert_eq!(
+        halted_only, 0,
+        "the halted chain holds an apply the survivor refused:{report}",
+    );
+    let batch = u32::try_from(HALT_STRADDLER_BATCH).unwrap_or(u32::MAX);
+    assert!(
+        consistent >= batch,
+        "every settling probe must land accepted on both chains:{report}",
+    );
+    assert!(
+        aborted >= batch,
+        "every doomed probe must resolve without an apply on either chain:{report}",
+    );
+
+    // The recovered shard's cross-shard rail serves again: a fresh
+    // transfer per direction settles on both chains.
+    let mut revived: Vec<TxHash> = Vec::new();
+    for (i, (key, from, to)) in setup.post_recovery.iter().enumerate() {
+        let nonce = 400 + u32::try_from(i).unwrap_or(0);
+        revived.push(submit_straddler(c, &network, key, *from, *to, nonce));
+    }
+    assert!(
+        c.run_until(epochs(16), |c| {
+            revived
+                .iter()
+                .all(|h| chain_settled(c, halted, *h) && chain_settled(c, survivor, *h))
+        }),
+        "a post-recovery transfer per direction must settle on both chains",
+    );
+}
+
+/// A staged shard freeze: the fault rules are installed and the shard has
+/// verifiably stopped committing. Carries the observations
+/// [`await_halt_recovery`] asserts against.
+struct StagedHalt {
+    /// The frozen shard.
+    shard: ShardId,
+    /// Its live sibling, asserted to keep committing through the halt.
+    sibling: ShardId,
+    /// The frozen shard's settled height once in-flight rounds drained.
+    frozen_at: u64,
+    /// The beacon epoch when the freeze settled.
+    epoch_at_halt: u64,
+    /// The sibling's committed height when the freeze settled.
+    sibling_at_halt: u64,
+}
+
+/// Freeze `shard` with a staged consensus cut against two of its four
+/// committee members.
+///
+/// f+1 of the committee withhold: their outbound consensus messages stop
+/// reaching everyone else. The honest remainder is 2f, short of quorum,
+/// so the shard halts; nothing else is cut. Vote delivery TO the
+/// withholding pair is cut too — a silent member collects no votes —
+/// else the pair keeps aggregating QCs only it holds and privately
+/// commits a suffix the recovery must orphan, and the faulted hosts
+/// (honest code under a network fault) would panic on the commit-linkage
+/// break instead of modeling adversaries that simply stop.
+///
+/// The cut is staged. Cutting everything at one instant leaves the same
+/// private-commit race in the in-flight window: a pair member due to
+/// aggregate the next rounds' votes can hold a QC no one else ever sees
+/// and commit one height past the beacon-attested frontier — a suffix the
+/// recovery orphans, and the linkage break kills the host. So first
+/// starve aggregation (votes toward the pair), then drain an epoch — any
+/// QC a pair member already holds is broadcast and becomes common
+/// knowledge in this window, while consensus keeps committing through the
+/// pair's timed-out leader rounds — and only then silence the pair's
+/// outbound channels.
+///
+/// `at_freeze_edge` runs between the drain and the silencing — the last
+/// instant new work enters the shard's pipeline with any chance to
+/// commit.
+fn freeze_shard<C: FaultableCluster>(
+    c: &mut C,
+    shard: ShardId,
+    sibling: ShardId,
+    at_freeze_edge: impl FnOnce(&mut C),
+) -> StagedHalt {
+    let committee = c.committee_hosts(shard);
     assert_eq!(
         committee.len(),
         4,
-        "this scenario needs the left child served by a four-member committee",
+        "the halting shard must be served by a four-member committee",
     );
     let withholding = &committee[..2];
     let others: Vec<usize> = (0..c.host_count())
         .filter(|host| !withholding.contains(host))
         .collect();
 
-    // f+1 of the left committee withhold: their outbound consensus
-    // messages stop reaching everyone else. The honest remainder is 2f,
-    // short of quorum, so the shard halts; nothing else is cut. Vote
-    // delivery TO the withholding pair is cut too — a silent member
-    // collects no votes — else the pair keeps aggregating QCs only it
-    // holds and privately commits a suffix the recovery must orphan,
-    // and the faulted hosts (honest code under a network fault) would
-    // panic on the commit-linkage break instead of modeling adversaries
-    // that simply stop.
-    //
-    // The cut is staged. Cutting everything at one instant leaves the
-    // same private-commit race in the in-flight window: a pair member
-    // due to aggregate the next rounds' votes can hold a QC no one else
-    // ever sees and commit one height past the beacon-attested frontier
-    // — a suffix the recovery orphans, and the linkage break kills the
-    // host. So first starve aggregation (votes toward the pair), then
-    // drain an epoch — any QC a pair member already holds is broadcast
-    // and becomes common knowledge in this window, while consensus keeps
-    // committing through the pair's timed-out leader rounds — and only
-    // then silence the pair's outbound channels.
     c.drop_type_between(&others, withholding, "block.vote");
     c.run_until(epochs(1), |_| false);
+    at_freeze_edge(c);
     let votes_withheld = c.drop_type_between(withholding, &others, "block.vote");
     c.drop_type_between(withholding, &others, "block.header");
     c.drop_type_between(withholding, &others, "shard.timeout");
@@ -230,17 +420,17 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     // In-flight rounds drain, then the shard freezes.
     c.run_until(epochs(1), |_| false);
     let frozen = c
-        .committed_height(left)
-        .expect("the left child committed during the grow")
+        .committed_height(shard)
+        .expect("the halting shard committed during the grow")
         .inner();
     let epoch_at_halt = beacon_epoch(c).expect("a committed beacon epoch").inner();
-    let right_at_halt = c
-        .committed_height(right)
-        .expect("the right child serves")
+    let sibling_at_halt = c
+        .committed_height(sibling)
+        .expect("the sibling shard serves")
         .inner();
     c.run_until(epochs(2), |_| false);
     let during = c
-        .committed_height(left)
+        .committed_height(shard)
         .expect("a committed height during the halt")
         .inner();
     assert!(
@@ -252,13 +442,27 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
         votes_withheld.fired() >= 1,
         "the withheld votes must actually be dropped",
     );
+    StagedHalt {
+        shard,
+        sibling,
+        frozen_at: during,
+        epoch_at_halt,
+        sibling_at_halt,
+    }
+}
+
+/// Drive a staged freeze through detection, committee redraw, resume, and
+/// record clear, asserting the beacon and the sibling shard stay live
+/// throughout.
+fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
+    let shard = halt.shard;
 
     // The boundary watermark stalls past the threshold; the beacon flags
     // the shard and re-draws its committee from the pool spares.
     let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
     let recovered = c.run_until(epochs(threshold + 10), |c| {
         c.beacon_state()
-            .is_some_and(|state| state.pending_recoveries.contains_key(&left))
+            .is_some_and(|state| state.pending_recoveries.contains_key(&shard))
     });
     assert!(
         recovered,
@@ -267,15 +471,16 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     // Only the shard halted: the beacon and the sibling kept committing.
     let epoch_now = beacon_epoch(c).expect("a committed beacon epoch").inner();
     assert!(
-        epoch_now > epoch_at_halt,
+        epoch_now > halt.epoch_at_halt,
         "the beacon must keep producing epochs through the halt \
-         ({epoch_at_halt} -> {epoch_now})",
+         ({} -> {epoch_now})",
+        halt.epoch_at_halt,
     );
     assert!(
-        c.committed_height(right)
-            .expect("the right child serves")
+        c.committed_height(halt.sibling)
+            .expect("the sibling shard serves")
             .inner()
-            > right_at_halt,
+            > halt.sibling_at_halt,
         "the sibling shard must keep committing through the halt",
     );
 
@@ -290,14 +495,15 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     // dropping a quarter of the views stretches the resume, so the budget
     // is generous — a ceiling on the wait, not the expected latency.
     assert!(
-        await_height(c, left, during + 3, epochs(40)),
+        await_height(c, shard, halt.frozen_at + 3, epochs(40)),
         "the recovered shard must resume committing under its fresh committee \
-         (frozen at {during})",
+         (frozen at {})",
+        halt.frozen_at,
     );
     // The first crossing under the fresh committee completes the recovery.
     let cleared = c.run_until(epochs(20), |c| {
         c.beacon_state()
-            .is_some_and(|state| !state.pending_recoveries.contains_key(&left))
+            .is_some_and(|state| !state.pending_recoveries.contains_key(&shard))
     });
     assert!(
         cleared,

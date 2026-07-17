@@ -8,8 +8,8 @@ mod support;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
-    halt_recovery_genesis_balances, intershard_partition_genesis_balances, merge_straddler_setup,
-    split_straddler_setup, witness_genesis_balances,
+    halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
+    merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
     ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
@@ -19,9 +19,10 @@ use hyperscale_scenarios::{
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
-    halted_shard_recovers_by_committee_redraw, inter_shard_partition_aborts_waves_at_deadline,
-    isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
-    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
+    halted_shard_recovers_by_committee_redraw, halted_shard_straddler_atomic,
+    inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
+    livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
+    merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
@@ -212,6 +213,16 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
         &halt_recovery_genesis_balances(),
     );
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
+}
+
+#[test]
+fn halted_shard_straddler_atomic_sim() {
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        11,
+        &halt_straddler_setup().balances,
+    );
+    cluster.run_faultable(halted_shard_straddler_atomic);
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's
