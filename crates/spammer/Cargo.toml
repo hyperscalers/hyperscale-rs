@@ -34,7 +34,7 @@ hex.workspace = true
 
 # CLI
 clap.workspace = true
-humantime = "2.3.0"
+humantime = "2.4.0"
 
 # Utils
 thiserror.workspace = true
