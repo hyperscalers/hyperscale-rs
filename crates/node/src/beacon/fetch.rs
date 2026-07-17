@@ -216,30 +216,39 @@ impl FetchBinding for BeaconProposalBinding {
                     push_failed();
                     return ResponseVerdict::Accept;
                 };
-                let was_empty = response.proposal.is_none();
-                if !was_empty {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::BeaconProposalFetchFulfilled {
-                            ids: vec![(epoch, validator)],
-                        },
-                    );
-                }
+                let Some(proposal) = response.proposal else {
+                    // The peer didn't hold the proposal. Release the slot
+                    // for retry against another committee member rather
+                    // than resolving the await — the coordinator keeps
+                    // awaiting this proposal, and `prune_stale` bounds the
+                    // rotation once the epoch commits. The witness binding
+                    // treats its empty response identically; both must
+                    // fetch what they're missing rather than give up after
+                    // one peer, and for proposals the beacon-block gossip
+                    // path is only the last-resort backstop.
+                    push_failed();
+                    return ResponseVerdict::Reject;
+                };
+                // Release the fetch slot before delivering the payload, so
+                // the freed slot is available if handling the delivery
+                // re-drives this fetch.
+                push_shard_input(
+                    &es,
+                    local_shard,
+                    ShardScopedInput::BeaconProposalFetchFulfilled {
+                        ids: vec![(epoch, validator)],
+                    },
+                );
                 push_protocol_event(
                     &es,
                     local_shard,
                     ProtocolEvent::BeaconProposalFetched {
                         epoch,
                         validator,
-                        proposal: response.proposal,
+                        proposal,
                     },
                 );
-                if was_empty {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
+                ResponseVerdict::Accept
             }),
         );
     }
