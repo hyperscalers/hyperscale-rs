@@ -291,6 +291,16 @@ pub struct ShardBoundary {
     /// to that point, not a fixed span behind the terminal. `None` for a
     /// live shard.
     pub reshape_admitted_epoch: Option<Epoch>,
+    /// Leaf index below which applied chunks' reveal outputs stay out of
+    /// the epoch randomness: the accumulator count of a crossing that
+    /// folded above a pending halt recovery's
+    /// [`attested_frontier`](HaltRecovery::attested_frontier). Everything
+    /// under that count is history the beyond-f retained committee could
+    /// have forged post-halt, so its reveals must not steer the seed — no
+    /// matter how many epochs (or record refreshes) the backlog takes to
+    /// drain. Carried forward on refresh and cleared once the applied
+    /// watermark reaches it; `None` when no fenced band is draining.
+    pub reveals_fenced_below: Option<BeaconWitnessLeafCount>,
 }
 
 /// One observer drawn into a pending split's cohort.
@@ -1666,6 +1676,7 @@ mod tests {
             terminal_qc_wt: None,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
+            reveals_fenced_below: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
         state
@@ -1732,6 +1743,7 @@ mod tests {
             terminal_qc_wt: None,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
+            reveals_fenced_below: None,
         };
 
         let halted = ShardId::leaf(3, 0);
@@ -2024,6 +2036,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);
 

@@ -32,12 +32,14 @@
 //     applied chunk's. Model G carries the detection side (the
 //     no-progress re-fold is a miss); here only the applied-leaf
 //     bookkeeping matters.
-//   - Fence: crates/beacon/src/state/epoch.rs `recovery_frontier_snapshot`
-//     (taken before the boundary fold) + `filter_and_roll_randomness`
-//     (crates/beacon/src/state/vrf.rs) — while a recovery pends, a
-//     crossing beyond the recovery's `attested_frontier` folds its chunk
-//     into state but contributes nothing to the seed. The frontier is the
-//     recorded crossing's position at stamp time
+//   - Fence: crates/beacon/src/state/epoch.rs `record_boundaries` — a
+//     crossing beyond a pending recovery's `attested_frontier` records
+//     `ShardBoundary::reveals_fenced_below = boundary_count` and folds its
+//     chunk into state contributing nothing to the seed. The fence
+//     persists on the boundary across drain epochs and record refreshes
+//     until the applied watermark passes it, so the whole backlog is held
+//     out — not just the epoch the recovery record clears. The frontier
+//     is the recorded crossing's position at stamp time
 //     (crates/beacon/src/state/committee.rs `recover_halted_committee`),
 //     so the halted chain's legitimate backlog — at or below it — seeds
 //     on recovery.
@@ -61,12 +63,16 @@
 //                     lets the reporter choose the chunk's start instead
 //                     of the local watermark and violates it: a re-sent
 //                     chunk re-folds leaves the fold already consumed.
-//   invFence        — while a recovery pends, no leaf beyond its attested
-//                     frontier enters the seed: the beyond-f retained
-//                     committee's post-halt production cannot steer the
-//                     draw. The `witness_fold_no_fence` twin folds the
-//                     completing crossing's chunk straight into the seed
-//                     and violates it.
+//   invFence        — no leaf a beyond-frontier crossing introduced ever
+//                     enters the seed: the beyond-f retained committee's
+//                     post-halt production cannot steer the draw, across
+//                     the completing epoch and every drain epoch after it.
+//                     The `witness_fold_no_fence` twin folds the completing
+//                     crossing's chunk straight into the seed; the
+//                     `witness_fold_transient_fence` twin fences only the
+//                     completing epoch (dropping the fence when the
+//                     recovery record clears) and leaks the backlog's drain
+//                     — both violate it.
 //   invCoverage     — every leaf below a generation's watermark is
 //                     accounted exactly once (seeded, or deterministically
 //                     fenced), and nothing at or above it is: the seed is
@@ -119,6 +125,9 @@
 //   quint verify --main=witness_fold_no_fence --invariant=invFence --max-steps=6 specs/witness_fold.qnt
 //     (the twin seeds a post-frontier chunk under a pending recovery;
 //      expect a counterexample)
+//   quint verify --main=witness_fold_transient_fence --invariant=invFence --max-steps=8 specs/witness_fold.qnt
+//     (the twin fences only the completing epoch and leaks the drain of a
+//      beyond-frontier backlog; expect a counterexample)
 //   quint verify --main=witness_window_ok --invariant=invWindowAgree --max-steps=8 specs/witness_fold.qnt
 //     (holds)
 //   quint verify --main=witness_window_live_base --invariant=invWindowAgree --max-steps=4 specs/witness_fold.qnt
@@ -136,8 +145,15 @@ module witness_fold {
   // Broken twin: the chunk's start comes from the reporter rather than
   // the local watermark. False is the shipped `chunk_bounds`.
   const REPORTER_RANGE: bool
-  // Broken twin: the recovery fence is off. False is the shipped fence.
+  // Broken twin: the recovery fence is off entirely. False is the
+  // shipped fence.
   const FENCE_OFF: bool
+  // Broken twin: the fence is transient — it holds only the epoch the
+  // recovery record is live (the crossing's completing fold), never
+  // persisted onto the boundary. True is the shipped persisted fence;
+  // false reproduces the drain-leak (a beyond-frontier crossing's
+  // backlog seeds from the second epoch on, after its record cleared).
+  const FENCE_PERSIST: bool
 
   // ── Current-generation accumulator ──
   // Reshape generation: 0 = the original shard, 1 = its successor.
@@ -154,12 +170,23 @@ module witness_fold {
   var oldActive: bool
   var oldWatermark: int
   var oldRecorded: int
+  // The predecessor's persisted fence, carried onto its terminal record:
+  // a beyond-frontier band still draining when the shard terminated stays
+  // out of the seed through the terminal drain (the fold reads
+  // `reveals_fenced_below` off the terminal record like any other).
+  var oldFenceBelow: int
 
   // ── Halt recovery fence ──
   var recoveryPending: bool
   // `HaltRecovery::attested_frontier`, in the collapsed height≈count
   // coordinates.
   var frontier: int
+  // `ShardBoundary::reveals_fenced_below`: the leaf count below which
+  // applied chunks stay out of the seed, persisted on the boundary
+  // record so a beyond-frontier crossing's backlog is held out across
+  // every drain epoch and record refresh — not just the epoch its
+  // recovery record clears. 0 = no fenced band draining.
+  var fenceBelow: int
 
   // ── Ghosts ──
   // Leaves whose reveal entered the seed, as (generation, leaf index).
@@ -168,8 +195,11 @@ module witness_fold {
   var fenced: Set[(int, int)]
   // A leaf was applied twice.
   var dupSeen: bool
-  // A beyond-frontier leaf entered the seed while its recovery pended.
-  var fenceLeak: bool
+  // Ground truth, independent of the fence bookkeeping: leaves a
+  // beyond-frontier crossing introduced — the beyond-f retained
+  // committee's post-halt production, which must never seed no matter
+  // how many epochs its backlog takes to drain.
+  var tainted: Set[(int, int)]
 
   pure def minInt(a: int, b: int): int = if (a < b) a else b
 
@@ -185,12 +215,14 @@ module witness_fold {
     oldActive' = false,
     oldWatermark' = 0,
     oldRecorded' = 0,
+    oldFenceBelow' = 0,
     recoveryPending' = false,
     frontier' = 0,
+    fenceBelow' = 0,
     seeded' = Set(),
     fenced' = Set(),
     dupSeen' = false,
-    fenceLeak' = false,
+    tainted' = Set(),
   }
 
   // The chain commits more blocks; every block appends its mandatory
@@ -202,18 +234,21 @@ module witness_fold {
       chainCount' = chainCount + n,
       gen' = gen, watermark' = watermark, recorded' = recorded,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded,
+      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
       recoveryPending' = recoveryPending, frontier' = frontier,
+      fenceBelow' = fenceBelow,
       seeded' = seeded, fenced' = fenced,
-      dupSeen' = dupSeen, fenceLeak' = fenceLeak,
+      dupSeen' = dupSeen, tainted' = tainted,
     }
   }
 
   // A fresh crossing at count c records the shard's new boundary, applies
   // the chunk `[watermark, min(watermark + CAP, c))`, and clears a
-  // pending recovery. The fence is judged against the pre-fold snapshot:
-  // the completing crossing's own chunk seeds only at or below the
-  // frontier.
+  // pending recovery. A beyond-frontier crossing raises the persisted
+  // fence to its own count, dominating any carried band (the accumulator
+  // is monotone along the chain); the fence holds every leaf below it out
+  // of the seed and is carried onto the record while unfolded leaves
+  // below it remain.
   action foldFresh = {
     nondet c = 0.to(MAX_LEAVES).oneOf()
     nondet s = 0.to(MAX_LEAVES).oneOf()
@@ -221,43 +256,55 @@ module witness_fold {
     val end = minInt(watermark + CAP, c)
     val newLeaves = leafBand(gen, start, end)
     val beyond = recoveryPending and c > frontier
-    val fenceApplies = beyond and not(FENCE_OFF)
+    // This fold's fence line: the beyond-frontier crossing's own count
+    // (fence on) raised over the carried band, else the carried band.
+    val own = if (beyond and not(FENCE_OFF)) c else 0
+    val fence = if (own > fenceBelow) own else fenceBelow
+    val fenced_now = fence > 0 and start < fence
     all {
       c > recorded,
       c <= chainCount,
       c >= watermark,
       s <= watermark,
-      seeded' = if (fenceApplies) seeded else seeded.union(newLeaves),
-      fenced' = if (fenceApplies) fenced.union(newLeaves) else fenced,
+      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
+      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
       dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
-      fenceLeak' = if (beyond and not(fenceApplies) and newLeaves != Set()) true else fenceLeak,
+      // A beyond-frontier crossing taints its whole applied band up to
+      // its count — ground truth the leak check reads regardless of how
+      // the fence variable evolves.
+      tainted' = if (beyond) tainted.union(leafBand(gen, start, c)) else tainted,
+      // Persist the fence while leaves below it are still unfolded; the
+      // transient twin drops it the moment the record clears.
+      fenceBelow' =
+        if (FENCE_PERSIST and fence > 0 and end < fence) fence else 0,
       watermark' = end,
       recorded' = c,
       recoveryPending' = false,
       gen' = gen, chainCount' = chainCount,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded,
+      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
       frontier' = frontier,
     }
   }
 
   // A drain re-fold of the recorded crossing: watermark-only progress, no
-  // record refresh, recovery untouched. The frontier is the recorded
-  // crossing's own position, so the fence always admits the drain — the
-  // halted chain's legitimate backlog seeds on recovery.
+  // record refresh, recovery untouched. The persisted fence still holds
+  // the beyond-frontier band out; it clears once the watermark passes it.
   action foldDrain = {
     val end = minInt(watermark + CAP, recorded)
     val newLeaves = leafBand(gen, watermark, end)
+    val fenced_now = fenceBelow > 0 and watermark < fenceBelow
     all {
       watermark < recorded,
-      seeded' = seeded.union(newLeaves),
-      fenced' = fenced,
+      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
+      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
       dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
-      fenceLeak' = fenceLeak,
+      tainted' = tainted,
+      fenceBelow' = if (fenceBelow > 0 and end < fenceBelow) fenceBelow else 0,
       watermark' = end,
       gen' = gen, chainCount' = chainCount, recorded' = recorded,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded,
+      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
       recoveryPending' = recoveryPending, frontier' = frontier,
     }
   }
@@ -272,9 +319,10 @@ module witness_fold {
     gen' = gen, chainCount' = chainCount, watermark' = watermark,
     recorded' = recorded,
     oldActive' = oldActive, oldWatermark' = oldWatermark,
-    oldRecorded' = oldRecorded,
+    oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
+    fenceBelow' = fenceBelow,
     seeded' = seeded, fenced' = fenced,
-    dupSeen' = dupSeen, fenceLeak' = fenceLeak,
+    dupSeen' = dupSeen, tainted' = tainted,
   }
 
   // The shard terminates at its recorded crossing and a successor seats
@@ -288,33 +336,39 @@ module witness_fold {
     oldActive' = watermark < recorded,
     oldWatermark' = watermark,
     oldRecorded' = recorded,
+    // The predecessor's persisted fence rides onto its terminal record.
+    oldFenceBelow' = fenceBelow,
     gen' = gen + 1,
     chainCount' = 0,
     watermark' = 0,
     recorded' = 0,
     recoveryPending' = false, frontier' = frontier,
+    fenceBelow' = 0,
     seeded' = seeded, fenced' = fenced,
-    dupSeen' = dupSeen, fenceLeak' = fenceLeak,
+    dupSeen' = dupSeen, tainted' = tainted,
   }
 
   // The predecessor's terminal record drains: re-sourced every fold until
-  // consumed, then dropped. Terminal records are halt-exempt, so no fence
-  // applies.
+  // consumed, then dropped. The fold reads `reveals_fenced_below` off the
+  // terminal record like any other, so a beyond-frontier band that was
+  // still draining when the shard terminated stays out of the seed.
   action foldOldDrain = {
     val end = minInt(oldWatermark + CAP, oldRecorded)
     val newLeaves = leafBand(gen - 1, oldWatermark, end)
+    val fenced_now = oldFenceBelow > 0 and oldWatermark < oldFenceBelow
     all {
       oldActive,
       oldWatermark < oldRecorded,
-      seeded' = seeded.union(newLeaves),
-      fenced' = fenced,
+      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
+      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
       dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
-      fenceLeak' = fenceLeak,
       oldWatermark' = end,
       oldActive' = end < oldRecorded,
+      oldFenceBelow' = if (oldFenceBelow > 0 and end < oldFenceBelow) oldFenceBelow else 0,
       gen' = gen, chainCount' = chainCount, watermark' = watermark,
       recorded' = recorded, oldRecorded' = oldRecorded,
       recoveryPending' = recoveryPending, frontier' = frontier,
+      fenceBelow' = fenceBelow, tainted' = tainted,
     }
   }
 
@@ -331,7 +385,11 @@ module witness_fold {
 
   val invNoDoubleFold = not(dupSeen)
 
-  val invFence = not(fenceLeak)
+  // No leaf a beyond-frontier crossing introduced ever enters the seed —
+  // checked against the ground-truth taint set, so it holds across the
+  // completing epoch, every drain epoch, and any record refresh, not
+  // only while the recovery record is live.
+  val invFence = seeded.intersect(tainted) == Set()
 
   // Exactly-once accounting: below a generation's watermark every leaf is
   // seeded xor fenced; at or above it, nothing is.
@@ -431,21 +489,28 @@ module witness_window {
 module witness_fold_ok {
   import witness_fold(
     CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = false, FENCE_OFF = false
+    REPORTER_RANGE = false, FENCE_OFF = false, FENCE_PERSIST = true
   ).*
 }
 
 module witness_fold_reporter_range {
   import witness_fold(
     CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = true, FENCE_OFF = false
+    REPORTER_RANGE = true, FENCE_OFF = false, FENCE_PERSIST = true
   ).*
 }
 
 module witness_fold_no_fence {
   import witness_fold(
     CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = false, FENCE_OFF = true
+    REPORTER_RANGE = false, FENCE_OFF = true, FENCE_PERSIST = true
+  ).*
+}
+
+module witness_fold_transient_fence {
+  import witness_fold(
+    CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
+    REPORTER_RANGE = false, FENCE_OFF = false, FENCE_PERSIST = false
   ).*
 }
 

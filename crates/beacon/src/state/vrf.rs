@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHeight, Epoch, JailReason, NetworkDefinition, Randomness,
-    ShardId, ValidatorId, ValidatorStatus, VrfOutput, vrf_verify,
+    BeaconProposal, BeaconState, Epoch, JailReason, NetworkDefinition, Randomness, ShardId,
+    ValidatorId, ValidatorStatus, VrfOutput, vrf_verify,
 };
 
 use crate::state::pool::exit_placement;
@@ -23,20 +23,6 @@ const DOMAIN_BEACON_RANDOMNESS: &[u8] = b"hyperscale-beacon-randomness-v1";
 /// shapes (both `prev ‖ 32-byte outputs…`) can never collide across
 /// the switch.
 const DOMAIN_BEACON_RANDOMNESS_REVEALS: &[u8] = b"hyperscale-beacon-randomness-reveals-v1";
-
-/// One shard's reveal contribution to an epoch's randomness fold: the
-/// `RandomnessReveal` outputs of the witness chunk the boundary fold
-/// applied this epoch, in leaf-index order — one reveal per block, so
-/// ascending block height — plus the crossing's boundary height for
-/// the halt-recovery fence.
-#[derive(Clone, Debug)]
-pub(super) struct RevealChunk {
-    /// Height of the crossing's boundary block, judged against a
-    /// pending recovery's attested frontier.
-    pub(super) boundary_height: BlockHeight,
-    /// Reveal outputs in leaf order.
-    pub(super) outputs: Vec<VrfOutput>,
-}
 
 /// Outcome of [`filter_and_roll_randomness`]. The borrowed `accepted`
 /// slice lets [`super::witness::ingest_equivocations`] iterate the
@@ -68,12 +54,10 @@ pub(super) struct VrfStageOutcome<'a> {
 /// later leaf existed, so the set is duplicate-free by construction
 /// and interior entries are blind to their own producers. The fold
 /// consumes them shard-sorted (the map's order) with each shard's
-/// outputs in leaf order. A shard under a pending halt recovery
-/// (`recovery_frontiers`, snapshotted before the boundary fold — the
-/// completing crossing clears its record in this same epoch)
-/// contributes only if its crossing sits at or below the recovery's
-/// attested frontier: above it, the chunk is the beyond-f retained
-/// committee's post-halt production, which must not steer the seed.
+/// outputs in leaf order. The boundary fold already held back any
+/// halt-recovery-fenced band (`ShardBoundary::reveals_fenced_below` —
+/// the beyond-f retained committee's possible post-halt production),
+/// so every output handed here seeds.
 ///
 /// Epochs where no reveal folded (bootstrap before the first
 /// crossings, a `Skip`, or total crossing suppression — a
@@ -101,8 +85,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
     network: &NetworkDefinition,
     epoch: Epoch,
     committed: &'a [(ValidatorId, BeaconProposal)],
-    reveals: &BTreeMap<ShardId, RevealChunk>,
-    recovery_frontiers: &BTreeMap<ShardId, BlockHeight>,
+    reveals: &BTreeMap<ShardId, Vec<VrfOutput>>,
 ) -> VrfStageOutcome<'a> {
     let committee_set: BTreeSet<ValidatorId> = state.committee.iter().copied().collect();
 
@@ -130,19 +113,10 @@ pub(super) fn filter_and_roll_randomness<'a>(
         }
     }
 
-    // Roll randomness: reveal leaves when any folded this epoch (behind
-    // the recovery fence), else the ceremony mix. Always runs — see the
-    // function-level doc for the source switch and the "all-rejected"
-    // semantics.
-    let folded: Vec<&VrfOutput> = reveals
-        .iter()
-        .filter(|(shard, chunk)| {
-            recovery_frontiers
-                .get(shard)
-                .is_none_or(|frontier| chunk.boundary_height <= *frontier)
-        })
-        .flat_map(|(_, chunk)| chunk.outputs.iter())
-        .collect();
+    // Roll randomness: reveal leaves when any folded this epoch, else
+    // the ceremony mix. Always runs — see the function-level doc for the
+    // source switch and the "all-rejected" semantics.
+    let folded: Vec<&VrfOutput> = reveals.values().flatten().collect();
     let mut h = Hasher::new();
     if folded.is_empty() {
         h.update(DOMAIN_BEACON_RANDOMNESS);
@@ -240,11 +214,11 @@ mod tests {
 
     use blake3::Hasher;
     use hyperscale_types::{
-        BeaconProposal, BeaconState, BlockHeight, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness,
-        ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus, VrfOutput,
+        BeaconProposal, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness, ShardId,
+        Stake, StakePoolId, ValidatorId, ValidatorStatus, VrfOutput,
     };
 
-    use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS, RevealChunk};
+    use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS};
     use crate::state::test_fixtures::{
         apply_next_epoch, malformed_vrf_proposal, net, single_pool_state, validator_record,
         vrf_proposal,
@@ -558,23 +532,16 @@ mod tests {
     }
 
     /// Roll `state` directly through the fold under test with a fully
-    /// present committee, supplying `reveals` and `frontiers`.
-    fn roll(
-        state: &mut BeaconState,
-        reveals: &BTreeMap<ShardId, RevealChunk>,
-        frontiers: &BTreeMap<ShardId, BlockHeight>,
-    ) {
+    /// present committee, supplying `reveals`.
+    fn roll(state: &mut BeaconState, reveals: &BTreeMap<ShardId, Vec<VrfOutput>>) {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let committed = full_committee_proposals(state);
         let target = state.current_epoch.next();
-        super::filter_and_roll_randomness(state, &net(), target, &committed, reveals, frontiers);
+        super::filter_and_roll_randomness(state, &net(), target, &committed, reveals);
     }
 
-    fn reveal_chunk(height: u64, seeds: &[u8]) -> RevealChunk {
-        RevealChunk {
-            boundary_height: BlockHeight::new(height),
-            outputs: seeds.iter().map(|s| VrfOutput::new([*s; 32])).collect(),
-        }
+    fn reveal_outputs(seeds: &[u8]) -> Vec<VrfOutput> {
+        seeds.iter().map(|s| VrfOutput::new([*s; 32])).collect()
     }
 
     /// Reveal leaves seed the roll byte-exactly: BLAKE3 over the reveal
@@ -589,9 +556,9 @@ mod tests {
         let mut state = single_pool_state(4);
         let prev = state.randomness;
         let mut reveals = BTreeMap::new();
-        reveals.insert(ShardId::leaf(1, 1), reveal_chunk(9, &[3, 4]));
-        reveals.insert(ShardId::leaf(1, 0), reveal_chunk(7, &[1, 2]));
-        roll(&mut state, &reveals, &BTreeMap::new());
+        reveals.insert(ShardId::leaf(1, 1), reveal_outputs(&[3, 4]));
+        reveals.insert(ShardId::leaf(1, 0), reveal_outputs(&[1, 2]));
+        roll(&mut state, &reveals);
 
         let mut h = Hasher::new();
         h.update(DOMAIN_BEACON_RANDOMNESS_REVEALS);
@@ -616,10 +583,9 @@ mod tests {
         let full = full_committee_proposals(&a);
         let partial: Vec<_> = full.iter().take(2).cloned().collect();
         let mut reveals = BTreeMap::new();
-        reveals.insert(ShardId::leaf(1, 0), reveal_chunk(7, &[1, 2]));
-        let none = BTreeMap::new();
-        super::filter_and_roll_randomness(&mut a, &net(), target, &full, &reveals, &none);
-        super::filter_and_roll_randomness(&mut b, &net(), target, &partial, &reveals, &none);
+        reveals.insert(ShardId::leaf(1, 0), reveal_outputs(&[1, 2]));
+        super::filter_and_roll_randomness(&mut a, &net(), target, &full, &reveals);
+        super::filter_and_roll_randomness(&mut b, &net(), target, &partial, &reveals);
         assert_eq!(a.randomness, b.randomness);
     }
 
@@ -633,15 +599,7 @@ mod tests {
         let prev = state.randomness;
         let committed = full_committee_proposals(&state);
         let target = state.current_epoch.next();
-        let none = BTreeMap::new();
-        super::filter_and_roll_randomness(
-            &mut state,
-            &net(),
-            target,
-            &committed,
-            &BTreeMap::new(),
-            &none,
-        );
+        super::filter_and_roll_randomness(&mut state, &net(), target, &committed, &BTreeMap::new());
 
         let mut h = Hasher::new();
         h.update(DOMAIN_BEACON_RANDOMNESS);
@@ -650,64 +608,6 @@ mod tests {
             h.update(prop.vrf_output().as_bytes());
         }
         assert_eq!(state.randomness, Randomness::new(*h.finalize().as_bytes()));
-    }
-
-    /// A pending halt recovery fences its shard's reveals: a crossing
-    /// above the attested frontier contributes nothing — the beyond-f
-    /// retained committee's post-halt production must not steer the seed
-    /// — while an unfenced shard's chunk still folds.
-    #[test]
-    fn recovery_fence_excludes_reveals_above_the_frontier() {
-        let fenced_shard = ShardId::leaf(1, 0);
-        let honest_shard = ShardId::leaf(1, 1);
-        let mut frontiers = BTreeMap::new();
-        frontiers.insert(fenced_shard, BlockHeight::new(5));
-
-        let mut with_fenced = single_pool_state(4);
-        let mut honest_only = single_pool_state(4);
-        let mut reveals = BTreeMap::new();
-        reveals.insert(honest_shard, reveal_chunk(9, &[3, 4]));
-        let mut both = reveals.clone();
-        both.insert(fenced_shard, reveal_chunk(6, &[1, 2]));
-        roll(&mut with_fenced, &both, &frontiers);
-        roll(&mut honest_only, &reveals, &frontiers);
-        assert_eq!(with_fenced.randomness, honest_only.randomness);
-    }
-
-    /// A recovering shard's crossing at (or below) the attested frontier
-    /// is legitimate retained history — its reveals fold. Same inputs
-    /// minus the recovery record land on the same randomness.
-    #[test]
-    fn recovery_fence_admits_reveals_at_the_frontier() {
-        let shard = ShardId::leaf(1, 0);
-        let mut frontiers = BTreeMap::new();
-        frontiers.insert(shard, BlockHeight::new(5));
-
-        let mut fenced = single_pool_state(4);
-        let mut unfenced = single_pool_state(4);
-        let mut reveals = BTreeMap::new();
-        reveals.insert(shard, reveal_chunk(5, &[1, 2]));
-        roll(&mut fenced, &reveals, &frontiers);
-        roll(&mut unfenced, &reveals, &BTreeMap::new());
-        assert_eq!(fenced.randomness, unfenced.randomness);
-    }
-
-    /// Every reveal fenced out reads as a zero-reveal epoch: the roll
-    /// takes the ceremony fallback rather than folding an empty set
-    /// under the reveal domain.
-    #[test]
-    fn all_fenced_reveals_take_the_ceremony_fallback() {
-        let shard = ShardId::leaf(1, 0);
-        let mut frontiers = BTreeMap::new();
-        frontiers.insert(shard, BlockHeight::new(5));
-
-        let mut all_fenced = single_pool_state(4);
-        let mut no_reveals = single_pool_state(4);
-        let mut reveals = BTreeMap::new();
-        reveals.insert(shard, reveal_chunk(6, &[1, 2]));
-        roll(&mut all_fenced, &reveals, &frontiers);
-        roll(&mut no_reveals, &BTreeMap::new(), &BTreeMap::new());
-        assert_eq!(all_fenced.randomness, no_reveals.randomness);
     }
 
     /// Malformed VRF still rejects the proposal's randomness

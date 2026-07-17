@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-    BlockHeight, CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
-    ObserverSeat, PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
+    CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
+    PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
     ShardBoundary, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, SlotEffects,
     SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus, VrfOutput, WeightedTimestamp,
 };
@@ -23,7 +23,7 @@ use crate::state::committee::{
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
-use crate::state::vrf::{RevealChunk, filter_and_roll_randomness};
+use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
@@ -184,8 +184,6 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => (&[], TransitionCause::Skip),
     };
 
-    let frontiers = recovery_frontier_snapshot(state);
-
     // Fold this epoch's per-shard boundaries and apply their witness
     // chunks. A `Skip` carries every prior boundary forward untouched (no
     // record, no miss bump, no witnesses); a Normal epoch records fresh
@@ -223,7 +221,7 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
 
-    let vrf = filter_and_roll_randomness(state, network, epoch, committed, &reveals, &frontiers);
+    let vrf = filter_and_roll_randomness(state, network, epoch, committed, &reveals);
     // Equivocation evidence rides committed proposals; shard-witness lifts
     // ride the boundary contributions applied above.
     witness.extend(ingest_equivocations(state, network, &vrf.accepted));
@@ -552,18 +550,6 @@ fn carried_terminal_marks(
     )
 }
 
-/// The pending halt recoveries' attested frontiers, keyed by shard.
-/// Snapshotted before the boundary fold: the crossing that completes a
-/// recovery removes its record inside [`record_boundaries`], and it is
-/// exactly that crossing's reveal chunk the randomness fence judges.
-fn recovery_frontier_snapshot(state: &BeaconState) -> BTreeMap<ShardId, BlockHeight> {
-    state
-        .pending_recoveries
-        .iter()
-        .map(|(shard, recovery)| (*shard, recovery.attested_frontier))
-        .collect()
-}
-
 /// The `RandomnessReveal` outputs of an applied witness chunk, in leaf
 /// order — one reveal per block, so ascending block height.
 fn reveal_outputs(witnesses: &[ShardWitness]) -> Vec<VrfOutput> {
@@ -576,12 +562,57 @@ fn reveal_outputs(witnesses: &[ShardWitness]) -> Vec<VrfOutput> {
         .collect()
 }
 
+/// The halt-recovery randomness fence line for a chunk about to fold: the
+/// leaf count below which its reveals stay out of the seed. A fresh
+/// crossing above a pending recovery's attested frontier fences its whole
+/// count (the beyond-f retained committee's possible post-halt
+/// production); its count dominates any carried band since the
+/// accumulator is monotone along the chain. A drain re-fold carries the
+/// band the recording crossing already fenced. `None` when nothing is
+/// fenced.
+fn reveal_fence_for(
+    state: &BeaconState,
+    shard: &ShardId,
+    header: &BlockHeader,
+    boundary_count: u64,
+    drain_refold: bool,
+) -> Option<BeaconWitnessLeafCount> {
+    let carried = state
+        .boundaries
+        .get(shard)
+        .and_then(|b| b.reveals_fenced_below);
+    if drain_refold {
+        return carried;
+    }
+    let own = state
+        .pending_recoveries
+        .get(shard)
+        .filter(|recovery| header.height() > recovery.attested_frontier)
+        .map(|_| BeaconWitnessLeafCount::new(boundary_count));
+    own.or(carried)
+}
+
+/// A drain re-fold of the recorded crossing: advance only the applied
+/// watermark, and clear the persisted reveal fence once the watermark
+/// reaches it (the fenced band is fully drained).
+fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: u64) {
+    if let Some(boundary) = state.boundaries.get_mut(shard) {
+        boundary.witness_leaf_count = BeaconWitnessLeafCount::new(chunk_end);
+        if boundary
+            .reveals_fenced_below
+            .is_some_and(|f| chunk_end >= f.inner())
+        {
+            boundary.reveals_fenced_below = None;
+        }
+    }
+}
+
 fn record_boundaries(
     state: &mut BeaconState,
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
-) -> (WitnessOutcome, BTreeMap<ShardId, RevealChunk>) {
+) -> (WitnessOutcome, BTreeMap<ShardId, Vec<VrfOutput>>) {
     let windows = state.chain_config.epoch_windows();
     // Bind each contribution to its shard's canonical committed QC — the
     // same selection the receiver's `contributions_well_formed` gate
@@ -590,7 +621,7 @@ fn record_boundaries(
     let canonical = canonical_boundary_qcs(committed.iter().map(|(_, p)| p));
 
     let mut outcome = WitnessOutcome::default();
-    let mut reveals: BTreeMap<ShardId, RevealChunk> = BTreeMap::new();
+    let mut reveals: BTreeMap<ShardId, Vec<VrfOutput>> = BTreeMap::new();
     let mut refreshed: BTreeSet<ShardId> = BTreeSet::new();
     // Merge children whose terminal contribution — the coast block past
     // their cut, carrying their frozen terminal root — landed this fold.
@@ -651,24 +682,28 @@ fn record_boundaries(
         ) {
             continue;
         }
+        // The halt-recovery randomness fence, judged here while the
+        // shard's recovery record (if any) is still live. A crossing above
+        // the recovery's attested frontier commits history the beyond-f
+        // retained committee could have forged post-halt, so the fence
+        // covers every leaf up to that crossing's count — persisted on the
+        // boundary record so the whole band stays out of the seed across
+        // drain epochs and later record refreshes, until the applied
+        // watermark passes it.
+        let fence = reveal_fence_for(state, shard, header, boundary_count, drain_refold);
+        let fenced = fence.is_some_and(|f| prior < f.inner());
         // Collect the chunk's reveal-leaf outputs for the randomness
         // fold — exactly the leaves the application above accepted.
-        // Drain re-folds contribute too: their leaves apply this epoch
-        // like any other chunk's.
-        let outputs = reveal_outputs(&contribution.witnesses);
-        if !outputs.is_empty() {
-            reveals.insert(
-                *shard,
-                RevealChunk {
-                    boundary_height: header.height(),
-                    outputs,
-                },
-            );
+        // Drain re-folds contribute like any other chunk's, unless the
+        // fence holds the band out of the seed.
+        if !fenced {
+            let outputs = reveal_outputs(&contribution.witnesses);
+            if !outputs.is_empty() {
+                reveals.insert(*shard, outputs);
+            }
         }
         if drain_refold {
-            if let Some(boundary) = state.boundaries.get_mut(shard) {
-                boundary.witness_leaf_count = BeaconWitnessLeafCount::new(chunk_end);
-            }
+            advance_drain_watermark(state, shard, chunk_end);
             continue;
         }
         let (marks, is_terminal_contribution) =
@@ -688,6 +723,7 @@ fn record_boundaries(
                 terminal_qc_wt: marks.terminal_qc_wt,
                 settled_waves_root: header.settled_waves_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
+                reveals_fenced_below: fence.filter(|f| chunk_end < f.inner()),
             },
         );
         refreshed.insert(*shard);
@@ -907,6 +943,7 @@ fn seed_split_children(
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
     }
@@ -1008,6 +1045,7 @@ fn compose_merge_parent(
             terminal_qc_wt: None,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
+            reveals_fenced_below: None,
         },
     );
     tracing::info!(
@@ -1304,10 +1342,9 @@ mod tests {
         let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
 
         let chunk = reveals.get(&shard).expect("reveals collected");
-        assert_eq!(chunk.boundary_height, BlockHeight::new(5));
         assert_eq!(
-            chunk.outputs,
-            vec![VrfOutput::new([7; 32]), VrfOutput::new([9; 32])],
+            chunk,
+            &vec![VrfOutput::new([7; 32]), VrfOutput::new([9; 32])],
         );
     }
 
@@ -1404,6 +1441,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         state.witness_window_bases = state.live_witness_bases();
@@ -1482,6 +1520,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         assert_eq!(
@@ -1544,6 +1583,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
 
@@ -1687,6 +1727,178 @@ mod tests {
         assert_eq!(after_3.consecutive_misses, 2);
         assert_eq!(after_3.last_live_epoch, Epoch::new(1));
         assert!(state.pending_recoveries.contains_key(&shard));
+    }
+
+    /// `n` `RandomnessReveal` payloads with per-index outputs, so a
+    /// chunk's folded reveals can be asserted exactly.
+    fn reveal_payloads(n: usize) -> Vec<ShardWitnessPayload> {
+        (0..n)
+            .map(|i| ShardWitnessPayload::RandomnessReveal {
+                output: reveal_output_at(i),
+            })
+            .collect()
+    }
+
+    fn reveal_output_at(i: usize) -> VrfOutput {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        VrfOutput::new(bytes)
+    }
+
+    fn stamp_recovery(state: &mut BeaconState, shard: ShardId, frontier: u64) {
+        use hyperscale_types::HaltRecovery;
+        state.pending_recoveries.insert(
+            shard,
+            HaltRecovery {
+                rotated_at: Epoch::new(1),
+                retained: Vec::new(),
+                attested_frontier: BlockHeight::new(frontier),
+            },
+        );
+    }
+
+    /// A crossing above a pending recovery's attested frontier holds its
+    /// reveals out of the seed for its entire backlog — the completing
+    /// epoch and every drain epoch after it — even though the completing
+    /// fold removed the recovery record. Without the persisted fence the
+    /// beyond-f retained committee's post-halt reveal backlog would seed
+    /// from the second epoch onward.
+    #[test]
+    fn fence_covers_a_beyond_frontier_crossings_entire_drain() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        let cap = MAX_WITNESSES_PER_SHARD;
+        let total = cap + 3;
+
+        stamp_recovery(&mut state, shard, 3);
+        let (b, witnesses) =
+            boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(total));
+
+        // Completing epoch: the crossing (height 5 > frontier 3) folds,
+        // clears the recovery, and contributes nothing to the seed; the
+        // fence over its full count persists on the record.
+        let (committed, contributions) =
+            contribution_for(shard, b.clone(), witnesses[..cap].to_vec(), 1_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        assert!(reveals.is_empty(), "completing chunk is fenced");
+        assert!(!state.pending_recoveries.contains_key(&shard));
+        let record = state.boundaries.get(&shard).expect("boundary recorded");
+        assert_eq!(
+            record.reveals_fenced_below,
+            Some(BeaconWitnessLeafCount::new(total as u64))
+        );
+
+        // Drain epoch: the backlog remainder applies but stays out of the
+        // seed; the fence clears once the watermark reaches it.
+        let (committed, contributions) =
+            contribution_for(shard, b, witnesses[cap..].to_vec(), 1_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        assert!(reveals.is_empty(), "drain chunk is fenced");
+        let record = state.boundaries.get(&shard).expect("boundary kept");
+        assert_eq!(
+            record.witness_leaf_count,
+            BeaconWitnessLeafCount::new(total as u64)
+        );
+        assert_eq!(record.reveals_fenced_below, None);
+
+        // The next crossing is post-recovery production: its chunk seeds.
+        let (b2, witnesses2) = boundary_block_with_payloads(
+            shard,
+            9,
+            1_900,
+            StateRoot::ZERO,
+            reveal_payloads(total + 2),
+        );
+        let (committed, contributions) =
+            contribution_for(shard, b2, witnesses2[total..].to_vec(), 2_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        assert_eq!(
+            reveals.get(&shard),
+            Some(&vec![reveal_output_at(total), reveal_output_at(total + 1)]),
+        );
+    }
+
+    /// A recovering shard's crossing at (or below) the attested frontier
+    /// is legitimate retained history: its reveals fold and no fence is
+    /// recorded.
+    #[test]
+    fn fence_admits_a_crossing_at_the_frontier() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+
+        stamp_recovery(&mut state, shard, 5);
+        let (b, witnesses) =
+            boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(2));
+        let (committed, contributions) = contribution_for(shard, b, witnesses, 1_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+
+        assert_eq!(
+            reveals.get(&shard),
+            Some(&vec![reveal_output_at(0), reveal_output_at(1)]),
+        );
+        let record = state.boundaries.get(&shard).expect("boundary recorded");
+        assert_eq!(record.reveals_fenced_below, None);
+    }
+
+    /// The fence survives a record refresh: when a newer crossing folds
+    /// while a fenced backlog is still draining, its chunk covers leaves
+    /// of the fenced band, so the carried fence keeps them out of the
+    /// seed; only content past the band seeds.
+    #[test]
+    fn fence_carries_across_a_record_refresh() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        let cap = MAX_WITNESSES_PER_SHARD;
+        let band = 2 * cap;
+
+        stamp_recovery(&mut state, shard, 3);
+        let (b, witnesses) =
+            boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(band));
+
+        // Completing epoch: first chunk of the beyond-frontier backlog.
+        let (committed, contributions) =
+            contribution_for(shard, b, witnesses[..cap].to_vec(), 1_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        assert!(reveals.is_empty());
+        assert_eq!(
+            state.boundaries.get(&shard).unwrap().reveals_fenced_below,
+            Some(BeaconWitnessLeafCount::new(band as u64))
+        );
+
+        // A newer crossing extends the same chain mid-drain (the shape a
+        // crossing eviction produces). Its chunk still sits inside the
+        // fenced band: no seeding, and the refreshed record keeps the
+        // fence only while leaves below it remain.
+        let (b2, witnesses2) = boundary_block_with_payloads(
+            shard,
+            9,
+            1_900,
+            StateRoot::ZERO,
+            reveal_payloads(band + 3),
+        );
+        let (committed, contributions) =
+            contribution_for(shard, b2.clone(), witnesses2[cap..band].to_vec(), 2_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        assert!(reveals.is_empty(), "carried fence covers the band");
+        let record = state.boundaries.get(&shard).expect("record refreshed");
+        assert_eq!(record.block_hash, b2.hash());
+        assert_eq!(record.reveals_fenced_below, None, "band fully drained");
+
+        // The newer crossing's own remainder is past the band: it seeds.
+        let (committed, contributions) =
+            contribution_for(shard, b2, witnesses2[band..].to_vec(), 2_500);
+        let (_, reveals) = record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        assert_eq!(
+            reveals.get(&shard),
+            Some(&vec![
+                reveal_output_at(band),
+                reveal_output_at(band + 1),
+                reveal_output_at(band + 2),
+            ]),
+        );
     }
 
     // ─── halt detection ──────────────────────────────────────────────────
@@ -2002,6 +2214,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         for child in <[ShardId; 2]>::from(parent.children()) {
@@ -2020,6 +2233,7 @@ mod tests {
                     terminal_qc_wt: None,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
                 },
             );
         }
@@ -2349,6 +2563,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         // Both children have folded their terminal contribution (a real
@@ -2369,6 +2584,7 @@ mod tests {
                     terminal_qc_wt: Some(WeightedTimestamp::from_millis(1_900)),
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
                 },
             );
         }
@@ -2482,6 +2698,7 @@ mod tests {
                     terminal_qc_wt: None,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
                 },
             );
         }
@@ -2500,6 +2717,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         (state, parent, left_root, right_root)
@@ -2828,6 +3046,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             }
         }
 
