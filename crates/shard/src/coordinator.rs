@@ -1625,6 +1625,12 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
+        let waveless = match &kind {
+            ProposalKind::Normal {
+                finalized_waves, ..
+            } => finalized_waves.is_empty(),
+            ProposalKind::Fallback | ProposalKind::Sync => true,
+        };
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         // The block we build belongs to `at(parent_qc weighted ts)`; its
         // proposer schedule (missed-proposal leaves) and beacon-witness preview
@@ -1720,14 +1726,24 @@ impl ShardCoordinator {
             self.record_leader_activity();
         }
 
+        // The build-side recovery-bridge escape, under the same conditions as
+        // the verifier's (`initiate_state_root_verification`): a wave-less
+        // block in the bridge band whose parent is a sync-admitted,
+        // QC-attested certified block dispatches without the parent tree.
+        let bridge_over_attested_parent = waveless
+            && self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
+            && self
+                .verification
+                .cached_verified_certified_block(plan.parent_block_hash)
+                .is_some();
+
         dispatch_or_defer(
             &mut self.proposal,
             &mut self.verification,
-            plan.parent_block_hash,
-            plan.parent_block_height,
+            plan,
             height,
             round,
-            plan.action,
+            bridge_over_attested_parent,
         )
     }
 
