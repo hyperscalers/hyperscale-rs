@@ -25,6 +25,9 @@ indexmap.workspace = true
 # Error derive
 thiserror.workspace = true
 
+# Diagnostics
+tracing.workspace = true
+
 [features]
 test-utils = ["hyperscale-types/test-utils"]
 

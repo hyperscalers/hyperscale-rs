@@ -339,6 +339,23 @@ impl RocksDbShardStorage {
         read_jmt_metadata(&*self.db)
     }
 
+    /// Append a single JMT node to a `WriteBatch` — the persist-time root
+    /// carry for a node-less no-op snapshot.
+    pub(crate) fn append_jmt_node_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        key: &JmtNodeKey,
+        node: &JmtNode,
+    ) {
+        let cf = self.cf();
+        batch_put::<JmtNodesCf>(
+            batch,
+            JmtNodesCf::handle(&cf),
+            &StoredNodeKey::from_jmt(key),
+            &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
+        );
+    }
+
     /// Append JMT data from a snapshot to a `WriteBatch`.
     ///
     /// Writes JMT nodes, stale tree parts (for deferred GC), historical

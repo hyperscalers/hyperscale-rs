@@ -109,10 +109,13 @@ impl JmtSnapshot {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_jmt::{Blake3Hasher, Hasher, Key, LeafValue, MemoryStore, ValueHash};
+    use hyperscale_jmt::{
+        Blake3Hasher, Hasher, Key, LeafValue, MemoryStore, TreeReader, ValueHash,
+    };
+    use hyperscale_types::Hash;
 
     use super::*;
-    use crate::tree::{Jmt, noop_jmt_snapshot};
+    use crate::tree::{Jmt, carry_noop_root, noop_jmt_snapshot, resolve_materialized_root};
 
     /// A 32-byte key with `b` as its leading byte.
     fn k(b: u8) -> Key {
@@ -204,5 +207,73 @@ mod tests {
         );
         assert_eq!(noop.root_child_hashes(), parent.root_child_hashes());
         assert!(noop.root_child_hashes().is_some());
+    }
+
+    /// A node-less no-op snapshot over `root` from `base` to `height` —
+    /// the shape a block prepared before its parent's tree existed leaves
+    /// behind (a recovery bridge and its immediate successors).
+    fn nodeless_noop(root: StateRoot, base: u64, height: u64) -> JmtSnapshot {
+        JmtSnapshot {
+            base_root: root,
+            base_height: BlockHeight::new(base),
+            result_root: root,
+            new_height: BlockHeight::new(height),
+            nodes: Vec::new(),
+            stale_node_keys: Vec::new(),
+            leaf_associations: Vec::new(),
+            bytes_delta: 0,
+        }
+    }
+
+    #[test]
+    fn noop_snapshot_resolves_through_nodeless_noop_ancestors() {
+        // v1 is materialized in the store; v2 and v3 are node-less no-ops.
+        // The block at v4 must still carry the root node forward, anchored
+        // on v1's copy resolved through the chain.
+        let (store, parent) = snapshot_of(&[(k(0x00), v(1)), (k(0x80), v(2))]);
+        let pending = [
+            Arc::new(nodeless_noop(parent.result_root, 1, 2)),
+            Arc::new(nodeless_noop(parent.result_root, 2, 3)),
+        ];
+        let noop = noop_jmt_snapshot(
+            &store,
+            &pending,
+            parent.result_root,
+            BlockHeight::new(3),
+            BlockHeight::new(4),
+        );
+        assert!(
+            !noop.nodes.is_empty(),
+            "the root must carry through the node-less chain",
+        );
+        assert_eq!(noop.root_child_hashes(), parent.root_child_hashes());
+    }
+
+    #[test]
+    fn resolve_materialized_root_dead_ends_without_an_ancestor() {
+        // Nothing materialized anywhere below the chain: the walk must
+        // report the dead end rather than fabricate a root.
+        let store = MemoryStore::new();
+        let root = StateRoot::from_raw(Hash::from_bytes(b"unmaterialized"));
+        let pending = [Arc::new(nodeless_noop(root, 1, 2))];
+        assert!(resolve_materialized_root(&store, &pending, 2).is_none());
+    }
+
+    #[test]
+    fn carry_noop_root_completes_the_copy_at_persist() {
+        // At persist the parent's root is durable; the carry returns the
+        // copy keyed at the snapshot's own version.
+        let (store, parent) = snapshot_of(&[(k(0x00), v(1)), (k(0x80), v(2))]);
+        let noop = nodeless_noop(parent.result_root, 1, 2);
+        let (key, node) = carry_noop_root(&store, &noop).expect("parent root is durable");
+        assert_eq!(key, NodeKey::new(2, store.root_path()));
+        assert_eq!(node.hash::<Blake3Hasher>(), *parent.result_root.as_bytes(),);
+    }
+
+    #[test]
+    fn carry_noop_root_ignores_content_snapshots() {
+        // A snapshot that carries nodes needs no persist-time repair.
+        let (store, parent) = snapshot_of(&[(k(0x00), v(1))]);
+        assert!(carry_noop_root(&store, &parent).is_none());
     }
 }

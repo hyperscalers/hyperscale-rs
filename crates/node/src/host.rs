@@ -702,6 +702,17 @@ fn build_shard_io<S: ShardStorage>(
 ) -> (ShardIo<S>, ShardDispatchHandles<S>) {
     let rep = inits.first().expect("shard group has at least one vnode");
     let initial_persisted_height = rep.state.shard_coordinator().committed_height();
+    // The block-commit gate keys persistence ordering off the store's tree
+    // version — the height its JMT actually holds — which neither the
+    // coordinator's committed height nor its own consensus tip reliably
+    // gives at seat time. A composed split or merge child installs genesis
+    // state before its coordinator folds it (coordinator height lags the
+    // tree); a snap-synced recovery member imports state at the anchor with
+    // no consensus blocks yet (consensus tip lags the tree). The tree
+    // version leads both, and it is exactly the parent a first post-seat
+    // block writes over, so seeding the gate below it would wedge the seat;
+    // the sync FSM and boundary memo still key off the coordinator height.
+    let tree_height = storage.jmt_height();
     let caches = SharedCaches::new(
         Arc::clone(rep.state.provisions_coordinator().store()),
         Arc::clone(rep.state.provisions_coordinator().verified_headers()),
@@ -711,7 +722,7 @@ fn build_shard_io<S: ShardStorage>(
     );
     let storage = Arc::new(storage);
     let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
-    let mut block_commit = BlockCommitCoordinator::new(shard, initial_persisted_height);
+    let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     {
         // Seed the boundary memo from the committed tip so the
         // first post-restart commit can adjudicate its parent.

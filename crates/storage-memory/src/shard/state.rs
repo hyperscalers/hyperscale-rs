@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hyperscale_jmt::Key;
 use hyperscale_storage::shard::keys;
-use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
+use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
 };
@@ -80,6 +80,13 @@ impl SharedState {
     /// the overlay may have computed from a base state ahead of the
     /// tree store, so `base_root` mismatches are expected and safe.
     pub(crate) fn apply_jmt_snapshot(&mut self, snapshot: JmtSnapshot) {
+        // A no-op snapshot prepared before its parent's tree existed (the
+        // recovery bridge over a sync-admitted parent) carries no nodes.
+        // Persistence is height-ordered, so the parent's root is durable
+        // now — complete the carry the prepare couldn't.
+        if let Some((key, node)) = carry_noop_root(&self.tree_store, &snapshot) {
+            self.tree_store.insert(key, node);
+        }
         for (jmt_key, jmt_node) in &snapshot.nodes {
             self.tree_store
                 .insert(jmt_key.clone(), Arc::clone(jmt_node));
