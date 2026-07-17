@@ -452,7 +452,7 @@ fn merged_genesis_height<C: Cluster>(c: &C, parent: ShardId) -> Option<BlockHeig
 
 /// Whether `hash` finalized a non-abort decision on `shard`'s committed chain —
 /// the source side of a cross-shard wave settling before a reshape terminal.
-fn chain_settled<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
+pub fn chain_settled<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
     matches!(
         c.chain_fate(shard, hash).1,
         Some((_, decision)) if decision != TransactionDecision::Aborted
@@ -461,7 +461,7 @@ fn chain_settled<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
 
 /// Build a straddler transfer (survivor payer → splitter recipient) bracketing
 /// the current clock, submit it, and return its hash.
-fn submit_straddler<C: Cluster>(
+pub fn submit_straddler<C: Cluster>(
     c: &mut C,
     network: &NetworkDefinition,
     key: &Ed25519PrivateKey,
