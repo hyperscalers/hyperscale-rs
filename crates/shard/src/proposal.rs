@@ -418,22 +418,35 @@ pub fn assemble_build_action(
 /// it to the new version so the overlay chain stays intact. Without that, a
 /// child block's `VerifyStateRoot` hits `ParentVersionMissing`.
 ///
+/// The one exception is `bridge_over_attested_parent` — the build-side
+/// mirror of the verifier's recovery-bridge escape (see
+/// `initiate_state_root_verification`): a wave-less block in the bridge
+/// band whose parent is a sync-admitted, QC-attested certified block
+/// dispatches without the parent tree. Its prepare applies no updates and
+/// inherits the attested parent root, and the parent's inline commit lands
+/// first in height order, so the prepared successor never applies over a
+/// missing tree version. Without the escape a fully redrawn recovery
+/// committee deadlocks: no member ever verified the halted tip through the
+/// live pipeline, the tip's tree materializes only at commit, and that
+/// commit needs the successor QC this very build produces.
+///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via the proposal-retry latch when the parent tree lands.
 pub fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
-    parent_block_hash: BlockHash,
-    parent_block_height: BlockHeight,
+    plan: BuildActionPlan,
     block_height: BlockHeight,
     round: Round,
-    action: Action,
+    bridge_over_attested_parent: bool,
 ) -> Vec<Action> {
-    if verification.parent_tree_available(parent_block_height, parent_block_hash) {
+    if bridge_over_attested_parent
+        || verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash)
+    {
         tracker.start(block_height, round);
-        vec![action]
+        vec![plan.action]
     } else {
-        verification.defer_proposal(parent_block_hash, parent_block_height);
+        verification.defer_proposal(plan.parent_block_hash, plan.parent_block_height);
         tracker.mark_deferred(block_height, round);
         vec![]
     }
