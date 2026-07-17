@@ -41,10 +41,7 @@ pub(crate) fn witness_chunk_bounds(
     shard: ShardId,
     boundary_header: &BlockHeader,
 ) -> (u64, u64) {
-    let prior = state
-        .boundaries
-        .get(&shard)
-        .map_or(0, |b| b.witness_leaf_count.inner());
+    let prior = state.fold_watermark(shard);
     chunk_bounds(prior, boundary_header.beacon_witness_leaf_count().inner())
 }
 

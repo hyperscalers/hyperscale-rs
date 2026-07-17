@@ -21,12 +21,13 @@ use hyperscale_types::{
     InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardWitnessPayload,
-    SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
-    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
+    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
+    StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
+    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
     certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
-    local_settled_wave_ids, ready_signal_message, shard_reveal_sign, vrf_output_from_proof,
+    local_settled_wave_ids, missed_proposals_since_prev_commit, ready_signal_message,
+    shard_reveal_sign, vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -188,6 +189,7 @@ pub struct ProposalResult {
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // one linear block-assembly pipeline
 pub fn build_proposal<S: ShardChainWriter>(
     storage: &Arc<S>,
     proposer: ValidatorId,
@@ -210,7 +212,6 @@ pub fn build_proposal<S: ShardChainWriter>(
     reshape_trigger: Option<ReshapeTrigger>,
     randomness_reveal: VrfProof,
     parent_witness_leaves: &[Hash],
-    missed: &[ShardWitnessPayload],
     beacon_witness_base: BeaconWitnessLeafCount,
     carry_split_child_roots: bool,
     settled_waves_root: Option<SettledWavesRoot>,
@@ -244,14 +245,22 @@ pub fn build_proposal<S: ShardChainWriter>(
 
     // Finalize the beacon-witness commitment: the reveal (leaf 0) plus the
     // content leaves append onto the coordinator-resolved parent window. The
-    // reveal was signed above on the dispatch pool; the same derivation the
-    // verifier runs (`derive_leaves`) fixes the leaf order.
+    // missed-round walk derives here from the same `(parent_round, round,
+    // topology)` the verifier reads, so proposer and verifier share the one
+    // helper and their leaf order can't drift.
+    let missed = missed_proposals_since_prev_commit(
+        local_shard,
+        height,
+        parent_qc.round(),
+        round,
+        topology_snapshot,
+    );
     let new_witness_leaves = derive_leaves(
         local_shard,
         topology_snapshot,
         vrf_output_from_proof(&randomness_reveal),
         &receipts,
-        missed,
+        &missed,
         &ready_signals,
         reshape_trigger.and_then(|t| t.to_payload(local_shard)),
     );
@@ -750,7 +759,6 @@ where
             ready_signals,
             reshape_trigger,
             parent_witness_leaves,
-            missed,
             beacon_witness_base,
             carry_split_child_roots,
             carry_settled_waves_root,
@@ -807,7 +815,6 @@ where
                 reshape_trigger,
                 randomness_reveal,
                 &parent_witness_leaves,
-                &missed,
                 beacon_witness_base,
                 carry_split_child_roots,
                 settled_waves_root,

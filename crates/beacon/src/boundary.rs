@@ -106,10 +106,7 @@ pub fn source_boundary_qcs(
     sourced
         .into_iter()
         .filter_map(|shard| {
-            let watermark = state
-                .boundaries
-                .get(&shard)
-                .map_or(0, |b| b.witness_leaf_count.inner());
+            let watermark = state.fold_watermark(shard);
             let crossing = shard_source.next_crossing_to_source(shard, watermark)?;
             let qc = crossing.canonical_qc();
             let split_parent_terminal = crossing.boundary_header().split_child_roots().is_some();
