@@ -567,15 +567,20 @@ fn pool_capacity_caps_registrations_prod() {
     pool_capacity_caps_registrations(&mut cluster);
 }
 
-/// Single-shard genesis with the split armed and exactly `(target - 1)` cohorts
-/// of pool surplus to staff the grow's split generations. One validator per host
-/// (each reshape seat needs its own store) and a paced inter-host latency so the
-/// loadless committees track wall-clock through the multi-epoch grow.
+/// Single-shard genesis with the split armed and `(target - 1)` cohorts of
+/// pool surplus to staff the grow's split generations, plus two spares of
+/// jail slack: an organic `Performance` jail refills its committee seat from
+/// the pool, which with zero slack would leave a leaf short of full strength
+/// with nothing to refill from. The leftover stays below a committee's
+/// worth, so split admission's pool gate can't staff another cohort and the
+/// partition still stabilizes at `target` leaves. One validator per host
+/// (each reshape seat needs its own store) and a paced inter-host latency so
+/// the loadless committees track wall-clock through the multi-epoch grow.
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 2,
-        pool_surplus: (target_shards - 1) * 4,
+        pool_surplus: (target_shards - 1) * 4 + 2,
         num_shards: 1,
         split_bytes: 0,
         latency: Duration::from_millis(60),
