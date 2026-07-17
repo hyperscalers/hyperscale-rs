@@ -28,13 +28,21 @@ pub const MAX_BEACON_COMMITTEE: usize = 128;
 pub const MAX_SHARDS: usize = 4096;
 
 /// Per-shard cap on the witnesses carried in one
-/// `ShardEpochContribution`.
+/// `ShardEpochContribution` — the fold's per-epoch drain budget.
 ///
-/// Must cover a catch-up fold spanning multiple epochs of a shard's
-/// witness accumulator (the beacon lagged a live, producing shard),
-/// not just one epoch, or the completeness check rejects a legitimate
-/// catch-up.
-pub const MAX_WITNESSES_PER_SHARD: usize = 1024;
+/// In steady state the fold drains a crossing's whole backlog each
+/// epoch and never touches this cap; it binds only on catch-up, when
+/// the beacon lagged a live, producing shard. With a mandatory
+/// randomness-reveal leaf on every block, a shard's leaf production is
+/// its block rate — freewheel proposing runs a committee near ~1,000
+/// blocks per five-minute epoch — so the cap must exceed worst-case
+/// per-epoch production by a healthy multiple: a fold capped below
+/// production can never catch up, and the reshape lifecycle (whose
+/// ready signals ride the same stream) livelocks on its readiness TTL.
+/// Four epochs of freewheel production also covers the deepest live
+/// backlog the crossing retention window can accumulate before the
+/// topology-schedule floor would park the fold.
+pub const MAX_WITNESSES_PER_SHARD: usize = 4096;
 
 /// Per-proposer cap on equivocation evidence in a single
 /// [`BeaconProposal`](crate::BeaconProposal).
