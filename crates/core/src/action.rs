@@ -641,8 +641,11 @@ pub enum Action {
         /// locally recomputed load predicate.
         reshape_trigger: Option<ReshapeTrigger>,
         /// Committed substate byte total behind the parent block's
-        /// post-state — the load the reshape predicate evaluates.
-        substate_bytes: u64,
+        /// post-state — the load the reshape predicate evaluates. `None`
+        /// takes the predicate out of play (reshaping disabled, or the
+        /// ancestry crosses a halt recovery's sync-admitted suffix); the
+        /// recomputed assertion must then be absent.
+        substate_bytes: Option<u64>,
         /// Reshape thresholds in force for this network.
         thresholds: ReshapeThresholds,
         /// Finalized waves whose receipts contribute receipt-sourced

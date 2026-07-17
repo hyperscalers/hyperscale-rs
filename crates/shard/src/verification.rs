@@ -1295,18 +1295,35 @@ impl VerificationPipeline {
         // can never fire, so the count is irrelevant and verification
         // proceeds without it — bit-identical to a network without the
         // feature. Enabled, a missing ancestor delta parks the
-        // verification exactly like a missing witness ancestor.
+        // verification exactly like a missing witness ancestor — except
+        // when the walk crosses a pending halt recovery's sync-admitted
+        // suffix: those blocks are QC-attested but never locally
+        // executed, so no delta can ever land, and the halted tip's
+        // commit needs the successor QC this very verification gates.
+        // There the predicate is out of play (`None`) and the required
+        // assertion is absent; every replica that can vote synced the
+        // same suffix, so the suppression is byte-agreed. Without a
+        // pending recovery a sync-admitted crossing is one lagging
+        // replica's local state — park as usual and let commits from the
+        // live quorum drain it.
         let thresholds = count_source.thresholds;
         let substate_bytes = if thresholds == ReshapeThresholds::DISABLED {
-            0
+            None
         } else {
             match count_source.count_behind(
                 committed_hash,
                 header.parent_block_hash(),
                 pending_blocks,
+                &self.verified_certified_blocks,
             ) {
-                Ok(count) => count,
-                Err(blocking_hash) => {
+                Ok(count) => Some(count),
+                Err(SubstateCountBlocked::SyncAdmitted(_))
+                    if schedule.recovery_bridge(local_shard).is_some() =>
+                {
+                    None
+                }
+                Err(blocked) => {
+                    let blocking_hash = blocked.blocking_hash();
                     debug!(
                         ?block_hash,
                         ?blocking_hash,
@@ -1444,33 +1461,67 @@ pub struct SubstateCountSource<'a> {
     pub deltas: &'a HashMap<BlockHash, i64>,
 }
 
+/// Why a substate-byte walk failed to resolve
+/// ([`SubstateCountSource::count_behind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubstateCountBlocked {
+    /// The named ancestor's content or execution delta is still in
+    /// flight — the caller parks on it; its completion (or its commit)
+    /// re-drives the walk.
+    Outstanding(BlockHash),
+    /// The walk crossed the named sync-admitted certified block:
+    /// QC-attested but never locally executed, so no byte delta can ever
+    /// land for it — only its commit (whose persistence reconciles the
+    /// frontier from storage) resolves the walk. During a pending halt
+    /// recovery, every replica that can vote synced the same suffix, so
+    /// suppressing the reshape assertion on this variant keeps proposer
+    /// and verifiers byte-agreed; without a recovery it is one lagging
+    /// replica's local state, and the caller parks as for
+    /// [`Self::Outstanding`].
+    SyncAdmitted(BlockHash),
+}
+
+impl SubstateCountBlocked {
+    /// The block whose progress unblocks the walk, whichever way it was
+    /// blocked — the hash callers park on.
+    pub const fn blocking_hash(self) -> BlockHash {
+        match self {
+            Self::Outstanding(hash) | Self::SyncAdmitted(hash) => hash,
+        }
+    }
+}
+
 impl SubstateCountSource<'_> {
     /// Substate count behind `parent_hash`'s post-state: the frontier
     /// count plus pending deltas along the chain from the committed tip
-    /// up to and including `parent_hash`. `Err` names the block whose
-    /// delta (or, for a frontier lagging the tip, the tip itself whose
-    /// persistence reconcile) is still outstanding — the caller parks
-    /// on it.
+    /// up to and including `parent_hash`. `Err` classifies the blocked
+    /// walk — an outstanding ancestor delta (or, for a frontier lagging
+    /// the tip, the tip's persistence reconcile), or a crossing of a
+    /// sync-admitted certified block whose delta can never land.
     pub fn count_behind(
         &self,
         committed_hash: BlockHash,
         parent_hash: BlockHash,
         pending_blocks: &PendingBlocks,
-    ) -> Result<u64, BlockHash> {
+        certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
+    ) -> Result<u64, SubstateCountBlocked> {
         let mut total: i64 = 0;
         let mut current = parent_hash;
         while current != committed_hash {
             let Some(pending) = pending_blocks.get(current) else {
-                return Err(current);
+                if certified_blocks.contains_key(&current) {
+                    return Err(SubstateCountBlocked::SyncAdmitted(current));
+                }
+                return Err(SubstateCountBlocked::Outstanding(current));
             };
             let Some(delta) = self.deltas.get(&current) else {
-                return Err(current);
+                return Err(SubstateCountBlocked::Outstanding(current));
             };
             total += delta;
             current = pending.header().parent_block_hash();
         }
         if self.frontier.0 != self.committed_height {
-            return Err(committed_hash);
+            return Err(SubstateCountBlocked::Outstanding(committed_hash));
         }
         Ok(self
             .frontier
@@ -2215,6 +2266,92 @@ mod tests {
         assert_eq!(
             resolved, 0,
             "entry must be skipped when its pending block was removed"
+        );
+    }
+
+    // ─── substate count walk ────────────────────────────────────────────
+
+    /// The walk classifies its blockers: an ancestor held nowhere (or a
+    /// pending ancestor missing its execution delta) is `Outstanding` —
+    /// the caller parks and the ancestor's completion re-drives the walk
+    /// — while an ancestor found only in the verified-certified cache is
+    /// `SyncAdmitted`: QC-attested, never locally executed, so no delta
+    /// ever lands for it. A fully delta'd pending chain resolves to the
+    /// frontier count plus the deltas.
+    #[test]
+    fn count_behind_classifies_walk_blockers() {
+        let committed_hash = bh(b"committed");
+
+        let block = block_with(BlockHeight::new(1), committed_hash, 0, vec![]);
+        let block_hash = block.hash();
+        let mut pb = PendingBlock::from_complete_block(
+            &block,
+            vec![],
+            None,
+            vec![],
+            vec![],
+            LocalTimestamp::ZERO,
+        );
+        pb.construct_block()
+            .expect("complete block constructs cleanly");
+        let mut pending = PendingBlocks::new();
+        pending.insert(pb);
+
+        let deltas = HashMap::from([(block_hash, 7i64)]);
+        let source = SubstateCountSource {
+            thresholds: ReshapeThresholds { split_bytes: 1_000 },
+            frontier: (BlockHeight::GENESIS, 100),
+            committed_height: BlockHeight::GENESIS,
+            deltas: &deltas,
+        };
+
+        assert_eq!(
+            source.count_behind(committed_hash, block_hash, &pending, empty_certified()),
+            Ok(107),
+        );
+
+        let missing = bh(b"missing");
+        assert_eq!(
+            source.count_behind(committed_hash, missing, &pending, empty_certified()),
+            Err(SubstateCountBlocked::Outstanding(missing)),
+        );
+
+        // The same chain shape, but with the ancestor held only in the
+        // verified-certified cache — a sync-admitted block awaiting its
+        // round-contiguous commit.
+        let synced = block_with(BlockHeight::new(1), committed_hash, 1, vec![]);
+        let synced_hash = synced.hash();
+        let qc = QuorumCertificate::new(
+            synced_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            committed_hash,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
+        let certified = HashMap::from([(
+            synced_hash,
+            Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(synced, qc),
+            )),
+        )]);
+        assert_eq!(
+            source.count_behind(committed_hash, synced_hash, &pending, &certified),
+            Err(SubstateCountBlocked::SyncAdmitted(synced_hash)),
+        );
+
+        // A pending ancestor whose delta hasn't landed is outstanding —
+        // its state-root verification is still in flight.
+        let empty_deltas = HashMap::new();
+        let undelta_source = SubstateCountSource {
+            deltas: &empty_deltas,
+            ..source
+        };
+        assert_eq!(
+            undelta_source.count_behind(committed_hash, block_hash, &pending, empty_certified()),
+            Err(SubstateCountBlocked::Outstanding(block_hash)),
         );
     }
 

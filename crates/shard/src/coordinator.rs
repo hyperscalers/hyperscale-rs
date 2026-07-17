@@ -116,8 +116,8 @@ use crate::validation::{
     validate_header,
 };
 use crate::verification::{
-    InFlightCheck, ReadyStateRootVerification, SubstateCountSource, VerificationKind,
-    VerificationPipeline,
+    InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
+    VerificationKind, VerificationPipeline,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -1472,14 +1472,20 @@ impl ShardCoordinator {
     }
 
     /// Substate count behind the proposal parent's post-state for the
-    /// reshape predicate, or `None` when reshaping is disabled (the
-    /// predicate can never fire, so the count is irrelevant). `Err` names
-    /// the ancestor whose delta — or, for a frontier lagging the committed
+    /// reshape predicate, or `None` when the predicate is out of play —
+    /// reshaping disabled (it can never fire), or the parent's ancestry
+    /// crosses a pending halt recovery's sync-admitted suffix, whose
+    /// byte total is unknowable until the suffix commits (a commit that
+    /// needs this very proposal's QC). Every replica that can vote
+    /// synced the same suffix and recomputes the same `None`, so the
+    /// header's absent assertion stays byte-agreed. `Err` names the
+    /// ancestor whose delta — or, for a frontier lagging the committed
     /// tip, the tip's persistence reconcile — is still outstanding; the
     /// caller defers the build and retries, mirroring the verifier's park
-    /// on a missing ancestor delta.
+    /// on the same gap.
     fn proposal_substate_bytes(
         &self,
+        topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
         parent_block_hash: BlockHash,
     ) -> Result<Option<u64>, BlockHash> {
@@ -1493,14 +1499,27 @@ impl ShardCoordinator {
             committed_height: self.committed_height,
             deltas: &self.pending_bytes_deltas,
         };
-        count_source
-            .count_behind(self.committed_hash, parent_block_hash, &self.pending_blocks)
-            .map(Some)
+        match count_source.count_behind(
+            self.committed_hash,
+            parent_block_hash,
+            &self.pending_blocks,
+            self.verification.verified_certified_blocks(),
+        ) {
+            Ok(count) => Ok(Some(count)),
+            Err(SubstateCountBlocked::SyncAdmitted(_))
+                if topology_schedule
+                    .recovery_bridge(self.local_shard)
+                    .is_some() =>
+            {
+                Ok(None)
+            }
+            Err(blocked) => Err(blocked.blocking_hash()),
+        }
     }
 
     /// The reshape assertion for a proposal: the load predicate over the
     /// resolved substate byte total, deduped against the same trimmed window
-    /// the witness root commits. A `None` count (reshaping disabled)
+    /// the witness root commits. A `None` count (predicate out of play)
     /// yields no assertion. Every replica recomputes this in verification;
     /// the count is resolved — or the build deferred — by
     /// [`Self::proposal_substate_bytes`] before the witness preview, so
@@ -1676,7 +1695,11 @@ impl ShardCoordinator {
         // build — the verifier parks on the same gap — rather than emitting
         // a header whose omitted assertion every replica recomputes as
         // required and rejects.
-        let substate_bytes = match self.proposal_substate_bytes(committee, parent_block_hash) {
+        let substate_bytes = match self.proposal_substate_bytes(
+            topology_schedule,
+            committee,
+            parent_block_hash,
+        ) {
             Ok(count) => count,
             Err(blocking) => {
                 trace!(

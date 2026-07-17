@@ -10,14 +10,13 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
+use crate::support::epochs;
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::beacon_epoch;
 use crate::support::tx::{
-    account_from_seed, build_faucet_tx, build_transfer_tx, merge_vote_payer, signer_from_seed,
-    validity_around,
+    account_from_seed, build_faucet_tx, build_transfer_tx, signer_from_seed, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
-use crate::support::{epochs, vote_reshape_threshold};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -166,6 +165,15 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 /// The first crossing under the fresh committee clears the recovery
 /// record.
 ///
+/// The reshape thresholds stay armed throughout — quiet (both children
+/// hold in the stable band between the derived merge floor and the split
+/// threshold), but forcing every proposal and vote through the reshape
+/// predicate's substate walk. Across the recovery that walk crosses the
+/// sync-admitted halted tip, whose byte total no fresh member can
+/// resolve; the bridge blocks build and verify only because both sides
+/// agree the assertion is out of play there, and that agreement is what
+/// this scenario exercises.
+///
 /// Requires [`halt_recovery_genesis_balances`] at genesis, a dedicated
 /// host per validator, and two committees' worth of pool surplus — one
 /// grow cohort, one recovery committee.
@@ -181,11 +189,6 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
 pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) {
     let (left, right) = ShardId::ROOT.children();
     split_lifecycle(c);
-    // Disarm the reshape trigger for the rest of the scenario: the halt
-    // detector exempts a shard with a pending reshape, and the reshape
-    // predicate's substate walk cannot resolve across a recovery's synced
-    // tip, so the recovery is exercised on a quiet topology.
-    vote_reshape_threshold(c, &merge_vote_payer(), u64::MAX);
 
     let committee = c.committee_hosts(left);
     assert_eq!(
@@ -207,10 +210,22 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     // and the faulted hosts (honest code under a network fault) would
     // panic on the commit-linkage break instead of modeling adversaries
     // that simply stop.
+    //
+    // The cut is staged. Cutting everything at one instant leaves the
+    // same private-commit race in the in-flight window: a pair member
+    // due to aggregate the next rounds' votes can hold a QC no one else
+    // ever sees and commit one height past the beacon-attested frontier
+    // — a suffix the recovery orphans, and the linkage break kills the
+    // host. So first starve aggregation (votes toward the pair), then
+    // drain an epoch — any QC a pair member already holds is broadcast
+    // and becomes common knowledge in this window, while consensus keeps
+    // committing through the pair's timed-out leader rounds — and only
+    // then silence the pair's outbound channels.
+    c.drop_type_between(&others, withholding, "block.vote");
+    c.run_until(epochs(1), |_| false);
     let votes_withheld = c.drop_type_between(withholding, &others, "block.vote");
     c.drop_type_between(withholding, &others, "block.header");
     c.drop_type_between(withholding, &others, "shard.timeout");
-    c.drop_type_between(&others, withholding, "block.vote");
 
     // In-flight rounds drain, then the shard freezes.
     c.run_until(epochs(1), |_| false);

@@ -61,8 +61,13 @@ pub struct BeaconWitnessRootContext<'a> {
     pub randomness_reveal: VrfProof,
     /// Committed substate byte total behind the parent block's post-state —
     /// the load the predicate evaluates. A function of the block's
-    /// ancestry, never of the local commit frontier.
-    pub substate_bytes: u64,
+    /// ancestry, never of the local commit frontier. `None` takes the
+    /// predicate out of play — reshaping disabled, or the ancestry
+    /// crosses a halt recovery's sync-admitted suffix, where the total
+    /// is unknowable until the suffix commits — and the required
+    /// assertion is absent: a manifest claiming a trigger anyway is
+    /// rejected.
+    pub substate_bytes: Option<u64>,
     /// Reshape thresholds in force for this network.
     pub thresholds: ReshapeThresholds,
     /// Topology snapshot anchoring the proposer-rotation rule the
@@ -389,13 +394,16 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
         // The manifest's reshape assertion must equal the locally
         // recomputed load predicate — including the once-per-window
         // dedup, which scans the same trimmed window the root commits.
-        let derived =
-            derive_reshape_trigger(ctx.shard, ctx.substate_bytes, &ctx.thresholds, window);
+        // A `None` byte total (predicate out of play) requires an absent
+        // assertion.
+        let derived = ctx
+            .substate_bytes
+            .and_then(|bytes| derive_reshape_trigger(ctx.shard, bytes, &ctx.thresholds, window));
         if derived != ctx.reshape_trigger {
             tracing::warn!(
                 claimed = ?ctx.reshape_trigger,
                 ?derived,
-                substate_bytes = ctx.substate_bytes,
+                substate_bytes = ?ctx.substate_bytes,
                 height = ctx.height.inner(),
                 "Reshape trigger verification FAILED"
             );
@@ -549,7 +557,7 @@ mod tests {
             ready_signals: &[],
             reshape_trigger: None,
             randomness_reveal: signed_reveal(shard),
-            substate_bytes: 0,
+            substate_bytes: None,
             thresholds: ReshapeThresholds::DISABLED,
             topology_snapshot,
         }
@@ -633,13 +641,35 @@ mod tests {
         let topology_snapshot = snapshot_with_base(shard, 0);
         let mut ctx = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
         ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
-        ctx.substate_bytes = 10;
+        ctx.substate_bytes = Some(10);
 
         assert_eq!(
             BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
             BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
                 claimed: None,
                 derived: Some(ReshapeTrigger::Split),
+            }
+        );
+    }
+
+    /// A byte total that is out of play — the ancestry crosses a halt
+    /// recovery's sync-admitted suffix — requires an absent assertion:
+    /// the same over-threshold claim that verifies with a resolved total
+    /// is rejected without one.
+    #[test]
+    fn out_of_play_byte_total_rejects_any_claimed_trigger() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        let mut ctx = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
+        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.substate_bytes = None;
+        ctx.reshape_trigger = Some(ReshapeTrigger::Split);
+
+        assert_eq!(
+            BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
+            BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
+                claimed: Some(ReshapeTrigger::Split),
+                derived: None,
             }
         );
     }
@@ -657,7 +687,7 @@ mod tests {
         let mut ctx = context_with(&topology_snapshot, shard, 2, Vec::new(), 4);
         ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
         ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
-        ctx.substate_bytes = 11;
+        ctx.substate_bytes = Some(11);
         ctx.reshape_trigger = Some(ReshapeTrigger::Split);
 
         assert!(expected_root.verify(&ctx).is_ok());
