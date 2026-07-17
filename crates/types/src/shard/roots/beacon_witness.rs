@@ -6,7 +6,8 @@ use thiserror::Error;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, Round, ShardId, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, ValidatorId, Verified, Verify, VrfOutput, compute_merkle_root,
+    TopologySnapshot, ValidatorId, Verified, Verify, VrfOutput, VrfProof, compute_merkle_root,
+    shard_reveal_verify, vrf_output_from_proof,
 };
 
 /// Inputs the [`BeaconWitnessRoot`] verifier reads against.
@@ -51,12 +52,13 @@ pub struct BeaconWitnessRootContext<'a> {
     /// the block when the claim diverges — a committed trigger
     /// therefore carries the committee's quorum behind the load fact.
     pub reshape_trigger: Option<ReshapeTrigger>,
-    /// Digest of the block's randomness reveal — leaf 0 of the block's new
-    /// witness payloads (`vrf_output_from_proof(block.randomness_reveal())`).
-    /// The root recompute binds this output to the reveal proof bytes; the
-    /// proof's BLS validity against the proposer's key is gated separately by
-    /// the verify handler, mirroring the proposer-signature check.
-    pub reveal_output: VrfOutput,
+    /// The block's randomness reveal — leaf 0 of the block's new witness
+    /// payloads. Verification checks it is a valid VRF by the block's
+    /// proposer over `(network, shard, height)` before folding its digest
+    /// ([`vrf_output_from_proof`]) into the recomputed root, so an
+    /// unverified proof can never reach the accumulator: without the check
+    /// a proposer could commit any output and grind the epoch seed.
+    pub randomness_reveal: VrfProof,
     /// Committed substate byte total behind the parent block's post-state —
     /// the load the predicate evaluates. A function of the block's
     /// ancestry, never of the local commit frontier.
@@ -320,6 +322,35 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
 
     fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let expected_root = *self;
+
+        // The reveal is leaf 0, and its digest is committed in the root
+        // below. Gate on the proof being a genuine VRF by the block's
+        // proposer first: an unverified proof would let the proposer
+        // choose leaf 0's output and grind the epoch seed. Checked here,
+        // inside the shared verifier, so no call site can fold an
+        // unverified reveal.
+        let proposer = ctx.topology_snapshot.proposer_for(ctx.shard, ctx.round);
+        let reveal_ok = ctx
+            .topology_snapshot
+            .public_key(proposer)
+            .is_some_and(|pk| {
+                shard_reveal_verify(
+                    &pk,
+                    ctx.topology_snapshot.network(),
+                    ctx.shard,
+                    ctx.height,
+                    &ctx.randomness_reveal,
+                )
+            });
+        if !reveal_ok {
+            tracing::warn!(
+                height = ctx.height.inner(),
+                round = ctx.round.inner(),
+                "Randomness reveal BLS verification FAILED"
+            );
+            return Err(BeaconWitnessRootVerifyError::RevealInvalid);
+        }
+
         let resolved_base = ctx.topology_snapshot.witness_base(ctx.shard);
         if ctx.claimed_base != resolved_base {
             tracing::warn!(
@@ -376,7 +407,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
         let new_leaves = derive_leaves(
             ctx.shard,
             ctx.topology_snapshot,
-            ctx.reveal_output,
+            vrf_output_from_proof(&ctx.randomness_reveal),
             ctx.receipts,
             &missed,
             ctx.ready_signals,
@@ -412,8 +443,30 @@ mod tests {
 
     use super::*;
     use crate::{
-        NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet, generate_bls_keypair,
+        Bls12381G1PrivateKey, NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet,
+        bls_keypair_from_seed, shard_reveal_sign,
     };
+
+    /// The single committee member's key. Deterministic so a test can both
+    /// seat its public key on the snapshot and sign a valid reveal with the
+    /// matching secret — the block's proposer (`proposer_for` over the
+    /// one-member committee) is always this validator.
+    fn proposer_sk() -> Bls12381G1PrivateKey {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&7u64.to_le_bytes());
+        bls_keypair_from_seed(&seed)
+    }
+
+    /// A valid reveal for `shard` at the height `context_with` verifies at,
+    /// signed by the proposer key seated on the test snapshots.
+    fn signed_reveal(shard: ShardId) -> VrfProof {
+        shard_reveal_sign(
+            &proposer_sk(),
+            &NetworkDefinition::simulator(),
+            shard,
+            BlockHeight::new(5),
+        )
+    }
 
     /// A snapshot whose `witness_base(shard)` answers `base` for one
     /// validator's single-shard committee, carrying `observers` as the
@@ -425,14 +478,14 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: generate_bls_keypair().public_key(),
+            public_key: proposer_sk().public_key(),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &vs,
             HashMap::from([(shard, vec![ValidatorId::new(0)])]),
-            HashMap::new(),
+            HashMap::from([(shard, vec![ValidatorId::new(0)])]),
             HashMap::new(),
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             BTreeMap::from([(shard, observers)]),
@@ -456,14 +509,14 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: generate_bls_keypair().public_key(),
+            public_key: proposer_sk().public_key(),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &vs,
             HashMap::from([(shard, vec![ValidatorId::new(0)])]),
-            HashMap::new(),
+            HashMap::from([(shard, vec![ValidatorId::new(0)])]),
             HashMap::new(),
             HashMap::from([(shard, BeaconWitnessLeafCount::new(base))]),
             BTreeMap::new(),
@@ -488,13 +541,14 @@ mod tests {
             parent_round: Round::INITIAL,
             shard,
             height: BlockHeight::new(5),
-            // parent_round.next() — no missed-proposal walk, so the
-            // empty committee in the snapshot is never consulted.
+            // parent_round.next() — no missed-proposal walk. The reveal
+            // check resolves the proposer as the snapshot's sole committee
+            // member (validator 0), whose key signs `signed_reveal`.
             round: Round::INITIAL.next(),
             receipts: &[],
             ready_signals: &[],
             reshape_trigger: None,
-            reveal_output: VrfOutput::ZERO,
+            randomness_reveal: signed_reveal(shard),
             substate_bytes: 0,
             thresholds: ReshapeThresholds::DISABLED,
             topology_snapshot,
@@ -502,11 +556,11 @@ mod tests {
     }
 
     /// Leaf 0 of every block's witness contribution: the digest of the
-    /// block's randomness reveal. `context_with` verifies against
-    /// `VrfOutput::ZERO`, so a test's expected leaves lead with this.
-    fn reveal_leaf() -> Hash {
+    /// block's randomness reveal. `context_with` verifies a valid reveal
+    /// for `shard`, so a test's expected leaves lead with this.
+    fn reveal_leaf(shard: ShardId) -> Hash {
         ShardWitnessPayload::RandomnessReveal {
-            output: VrfOutput::ZERO,
+            output: vrf_output_from_proof(&signed_reveal(shard)),
         }
         .leaf_hash()
     }
@@ -598,7 +652,7 @@ mod tests {
         let topology_snapshot = snapshot_with_base(shard, 2);
         let trigger_leaf = ReshapeTrigger::Split.to_payload(shard).unwrap().leaf_hash();
         let expected_root =
-            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(), trigger_leaf]));
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(shard), trigger_leaf]));
 
         let mut ctx = context_with(&topology_snapshot, shard, 2, Vec::new(), 4);
         ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
@@ -635,7 +689,7 @@ mod tests {
         }
         .leaf_hash();
         let expected_root =
-            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(), leaf]));
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(shard), leaf]));
 
         let seated = snapshot_with_observers(shard, 0, BTreeMap::from([(observer, child)]));
         let mut ctx = context_with(&seated, shard, 0, Vec::new(), 2);
@@ -676,7 +730,7 @@ mod tests {
         }
         .leaf_hash();
         let expected_root =
-            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(), leaf]));
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&[reveal_leaf(child), leaf]));
 
         let seated = snapshot_with_keepers(child, 0, BTreeMap::from([(keeper, parent)]));
         let mut ctx = context_with(&seated, child, 0, Vec::new(), 2);
@@ -692,6 +746,41 @@ mod tests {
             expected_root.verify(&ctx),
             Err(BeaconWitnessRootVerifyError::Mismatch { .. }),
         ));
+    }
+
+    /// A reveal that isn't a valid VRF by the block's proposer fails
+    /// before any root work — the digest is leaf 0, so an unverified
+    /// proof would let the proposer choose the output and grind the seed.
+    /// Both a zero sentinel and a reveal signed by the wrong key reject.
+    #[test]
+    fn invalid_reveal_is_rejected() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+
+        let mut zero = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
+        zero.randomness_reveal = VrfProof::ZERO;
+        assert_eq!(
+            BeaconWitnessRoot::ZERO.verify(&zero).unwrap_err(),
+            BeaconWitnessRootVerifyError::RevealInvalid,
+        );
+
+        // A well-formed reveal by a non-proposer key is rejected too — the
+        // check binds the proof to the block proposer's key, not merely to
+        // "some valid VRF".
+        let mut wrong_seed = [0u8; 32];
+        wrong_seed[..8].copy_from_slice(&99u64.to_le_bytes());
+        let impostor = bls_keypair_from_seed(&wrong_seed);
+        let mut wrong_key = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
+        wrong_key.randomness_reveal = shard_reveal_sign(
+            &impostor,
+            &NetworkDefinition::simulator(),
+            shard,
+            BlockHeight::new(5),
+        );
+        assert_eq!(
+            BeaconWitnessRoot::ZERO.verify(&wrong_key).unwrap_err(),
+            BeaconWitnessRootVerifyError::RevealInvalid,
+        );
     }
 
     /// A header whose claimed window base differs from the
@@ -721,7 +810,7 @@ mod tests {
         let topology_snapshot = snapshot_with_base(shard, 2);
         let leaves = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
         let mut expected_leaves = leaves.clone();
-        expected_leaves.push(reveal_leaf());
+        expected_leaves.push(reveal_leaf(shard));
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&expected_leaves));
         let mut ctx = context_with(&topology_snapshot, shard, 2, leaves, 5);
         ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
@@ -744,7 +833,7 @@ mod tests {
         // Window after the trim: absolute leaves 2 and 3, then the block's
         // own leaf 0 randomness reveal.
         let mut expected_leaves = parent_leaves[1..].to_vec();
-        expected_leaves.push(reveal_leaf());
+        expected_leaves.push(reveal_leaf(shard));
         let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&expected_leaves));
 
         let mut ctx = context_with(&topology_snapshot, shard, 2, parent_leaves, 5);
