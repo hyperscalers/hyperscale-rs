@@ -1185,11 +1185,17 @@ impl ShardCoordinator {
             self.committed_hash = h;
         }
         let has_qc = qc.is_some();
-        // Recover the safe-vote lock at the QC's round (conservative: never
-        // below the chain we already certified). See `Self::new`.
+        // Raise the safe-vote lock to the QC's round without ever lowering
+        // it: `Self::new` already floored both registers at the max of the
+        // durable record — every round this validator signed, persisted
+        // before the signature left the process — and the high QC's round.
+        // Assigning the QC round here would roll that floor back for a
+        // validator whose last vote or timeout outran its highest committed
+        // QC, letting it vote twice in one round. `max` keeps the durable
+        // floor.
         if let Some(qc_round) = qc.as_deref().map(QuorumCertificate::round) {
-            self.locked_round = qc_round;
-            self.last_voted_round = qc_round;
+            self.locked_round = self.locked_round.max(qc_round);
+            self.last_voted_round = self.last_voted_round.max(qc_round);
         }
         self.latest_qc = qc;
 
@@ -6780,6 +6786,47 @@ mod tests {
         // refused even with an otherwise-safe parent QC.
         state.last_voted_round = Round::new(5);
         assert!(!state.can_safe_vote(Round::new(5), Round::new(3)));
+    }
+
+    #[test]
+    fn committed_state_restore_never_lowers_the_safe_vote_registers() {
+        // A crash-restart restores committed state carrying the highest QC's
+        // round, which can trail the durable safe-vote registers when the
+        // validator's last vote or timeout outran its highest committed QC.
+        // The restore must not roll the registers back to the QC round, or
+        // the one-vote-per-round guard would admit a second vote at a round
+        // already signed.
+        let (mut state, _topology) = make_test_state();
+        state.last_voted_round = Round::new(7);
+        state.locked_round = Round::new(6);
+
+        let trailing_qc =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                BlockHash::ZERO,
+                ShardId::ROOT,
+                BlockHeight::new(4),
+                BlockHash::ZERO,
+                Round::new(5),
+                SignerBitfield::empty(),
+                zero_bls_signature(),
+                WeightedTimestamp::from_millis(100_000),
+            ));
+        state.on_committed_state_restored(
+            BlockHeight::new(4),
+            Some(BlockHash::ZERO),
+            Some(trailing_qc),
+        );
+
+        assert_eq!(
+            state.last_voted_round,
+            Round::new(7),
+            "the restore must not lower last_voted_round below the durable register",
+        );
+        assert_eq!(
+            state.locked_round,
+            Round::new(6),
+            "the restore must not lower locked_round below the durable register",
+        );
     }
 
     #[test]

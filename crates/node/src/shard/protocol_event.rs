@@ -30,7 +30,16 @@ where
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
-        let substate_bytes = self.io.storage.substate_bytes_at(height).unwrap_or(0);
+        // The byte total is written in the same crash-consistent batch as
+        // the block's JMT, and `height` is the tip we just persisted, so it
+        // is always present. A zero fallback here would silently corrupt the
+        // reshape count frontier the state machine reconciles from, so fail
+        // loud instead.
+        let substate_bytes = self
+            .io
+            .storage
+            .substate_bytes_at(height)
+            .expect("the just-persisted height must carry its committed byte total");
         self.dispatch_event(ProtocolEvent::BlockPersisted {
             height,
             substate_bytes,
