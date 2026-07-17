@@ -423,12 +423,13 @@ pub fn assemble_build_action(
 /// `initiate_state_root_verification`): a wave-less block in the bridge
 /// band whose parent is a sync-admitted, QC-attested certified block
 /// dispatches without the parent tree. Its prepare applies no updates and
-/// inherits the attested parent root, and the parent's inline commit lands
-/// first in height order, so the prepared successor never applies over a
-/// missing tree version. Without the escape a fully redrawn recovery
-/// committee deadlocks: no member ever verified the halted tip through the
-/// live pipeline, the tip's tree materializes only at commit, and that
-/// commit needs the successor QC this very build produces.
+/// inherits the attested parent root; the commit pipeline releases store
+/// persists strictly height contiguous, so by the time this block
+/// persists its parent's tree is durable and the no-op root carry
+/// completes. Without the escape a fully redrawn recovery committee
+/// deadlocks: no member ever verified the halted tip through the live
+/// pipeline, the tip's tree materializes only at commit, and that commit
+/// needs the successor QC this very build produces.
 ///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via the proposal-retry latch when the parent tree lands.

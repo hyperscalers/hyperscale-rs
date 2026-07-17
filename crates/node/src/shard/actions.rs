@@ -343,12 +343,12 @@ where
     /// reuse the consensus path's cached entry, and submits it to the
     /// single-slot FIFO.
     ///
-    /// The FIFO is the safety property — even `AlreadyPrepared` commits
-    /// must wait behind any in-flight `NeedsPrep` for an earlier
-    /// height, because the flush pipeline asserts strict height
-    /// contiguity at JMT commit time. `try_apply_verified_synced_blocks`
-    /// can emit a burst of these for consecutive heights in a single
-    /// shard step.
+    /// The FIFO keeps preps sequential — even `AlreadyPrepared` commits
+    /// wait behind any in-flight `NeedsPrep` for an earlier height, so
+    /// the flush pipeline's height-contiguity gate receives accepts in
+    /// commit order instead of holding the pipeline open across a
+    /// reordered burst. `try_apply_verified_synced_blocks` can emit a
+    /// burst of these for consecutive heights in a single shard step.
     fn accept_qc_only_commit(
         &mut self,
         certified: Arc<Verified<CertifiedBlock>>,
@@ -477,6 +477,12 @@ where
         if let Some(next) = self.io.block_commit.release_qc_only_slot() {
             self.process_qc_only(next);
         }
+        // This accept may be the height the contiguity gate is holding the
+        // flush open for. A `CommitBlock` accept reaches a drain-tail flush
+        // via its `BlockCommitted`, but a QC-only accept under persistence
+        // backpressure emits no such event, so drive the flush here or the
+        // gate stalls on a suffix the recovery bridge is waiting to follow.
+        self.flush_block_commits();
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its

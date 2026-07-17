@@ -170,13 +170,93 @@ pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<B
     }
 }
 
+/// Find the nearest version at or below `version` whose root node is
+/// actually reachable — in `pending_snapshots` or `store` — walking back
+/// through node-less no-op snapshots.
+///
+/// A block prepared before its parent's tree existed (the recovery bridge
+/// builds over a sync-admitted parent whose tree materializes only at
+/// commit) leaves a no-op snapshot that carries its parent's root without
+/// holding the node. The root is byte-identical along that chain, so a
+/// reader or applier can anchor on the nearest version that actually
+/// holds it. Returns `None` when the walk dead-ends with no materialized
+/// ancestor.
+#[must_use]
+pub fn resolve_materialized_root<S: TreeReader>(
+    store: &S,
+    pending_snapshots: &[Arc<JmtSnapshot>],
+    version: u64,
+) -> Option<(u64, Arc<JmtNode>)> {
+    let mut ver = version;
+    loop {
+        let root_key = NodeKey::new(ver, store.root_path());
+        let found = pending_snapshots
+            .iter()
+            .find_map(|s| {
+                s.nodes
+                    .iter()
+                    .find(|(k, _)| *k == root_key)
+                    .map(|(_, n)| Arc::clone(n))
+            })
+            .or_else(|| store.get_node(&root_key));
+        if let Some(node) = found {
+            return Some((ver, node));
+        }
+        // The version's snapshot is a node-less no-op: its tree IS its
+        // base's tree, so continue the search there. Terminates — a
+        // snapshot's base height is strictly below its own.
+        let noop = pending_snapshots.iter().find(|s| {
+            s.new_height.inner() == ver && s.nodes.is_empty() && s.result_root == s.base_root
+        })?;
+        ver = jmt_parent_height(noop.base_height, noop.base_root)?.inner();
+    }
+}
+
+/// The root-node copy a node-less no-op snapshot still needs at persist
+/// time.
+///
+/// Its prepare ran before the parent's tree existed (the recovery bridge
+/// over a sync-admitted parent), so the carry that keeps the version
+/// chain unbroken couldn't happen then. Persistence is height-ordered, so
+/// the parent's root is durable here; returns the node to write at the
+/// snapshot's version. `None` when the snapshot already carries nodes,
+/// applies a real delta, or descends from the zero root. A no-op
+/// snapshot whose parent root is genuinely absent warns: a silent hole
+/// surfaces later as a `ParentVersionMissing` panic on the next
+/// content-bearing block.
+#[must_use]
+pub fn carry_noop_root<S: TreeReader>(
+    store: &S,
+    snapshot: &JmtSnapshot,
+) -> Option<(NodeKey, Arc<JmtNode>)> {
+    if !snapshot.nodes.is_empty() || snapshot.result_root != snapshot.base_root {
+        return None;
+    }
+    let parent_ver = jmt_parent_height(snapshot.base_height, snapshot.base_root)?;
+    let root_key = NodeKey::new(parent_ver.inner(), store.root_path());
+    let Some(node) = store.get_node(&root_key) else {
+        tracing::warn!(
+            height = snapshot.new_height.inner(),
+            parent = parent_ver.inner(),
+            "no-op snapshot persisted without a durable parent root — JMT version chain hole",
+        );
+        return None;
+    };
+    Some((
+        NodeKey::new(snapshot.new_height.inner(), store.root_path()),
+        node,
+    ))
+}
+
 /// Build a no-op `JmtSnapshot` for a block with no state changes (empty receipts).
 ///
-/// The state root is unchanged (`parent_state_root`). We try to copy the
-/// parent's root node to the new version so the overlay chain stays intact.
-/// If the parent root node isn't available (e.g., after sync when the tree
-/// hasn't been persisted yet), the snapshot is created without it — the
-/// commit path resolves this when the parent IS in the store.
+/// The state root is unchanged (`parent_state_root`). We copy the nearest
+/// materialized root node — resolving through node-less no-op ancestors —
+/// to the new version so the overlay chain stays intact. If no
+/// materialized ancestor is reachable (the recovery bridge prepares
+/// before its sync-admitted parent's tree exists), the snapshot is
+/// created without it and the persist path completes the copy via
+/// [`carry_noop_root`] once the parent's tree is durable.
 ///
 /// # Safety assumption
 ///
@@ -195,24 +275,11 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
 ) -> JmtSnapshot {
     let mut nodes = Vec::new();
 
-    // Try to find the parent's root node so the version chain is unbroken.
-    if let Some(parent_ver) = jmt_parent_height(parent_block_height, parent_state_root) {
-        let root_key = NodeKey::new(parent_ver.inner(), store.root_path());
-
-        // Check pending snapshots first (overlay), then the base store.
-        let root_node = pending_snapshots
-            .iter()
-            .find_map(|s| {
-                s.nodes
-                    .iter()
-                    .find(|(k, _)| *k == root_key)
-                    .map(|(_, n)| Arc::clone(n))
-            })
-            .or_else(|| store.get_node(&root_key));
-
-        if let Some(node) = root_node {
-            nodes.push((NodeKey::new(block_height.inner(), store.root_path()), node));
-        }
+    if let Some(parent_ver) = jmt_parent_height(parent_block_height, parent_state_root)
+        && let Some((_, node)) =
+            resolve_materialized_root(store, pending_snapshots, parent_ver.inner())
+    {
+        nodes.push((NodeKey::new(block_height.inner(), store.root_path()), node));
     }
 
     JmtSnapshot {
@@ -328,7 +395,14 @@ pub fn put_at_version<S: TreeReader + Sync>(
         let root_hash = parent_version
             .and_then(|v| {
                 let root_key = NodeKey::new(v, store.root_path());
-                let root_node = store.get_node(&root_key)?;
+                let Some(root_node) = store.get_node(&root_key) else {
+                    tracing::warn!(
+                        version = new_version,
+                        parent = v,
+                        "empty update cannot carry its root — parent version unmaterialized",
+                    );
+                    return None;
+                };
                 let hash: [u8; 32] = root_node.hash::<Blake3Hasher>();
                 if hash == [0u8; 32] {
                     return None;

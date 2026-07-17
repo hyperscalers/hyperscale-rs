@@ -61,10 +61,10 @@ pub enum QcOnlyKind {
 
 /// A QC-only commit waiting on the single in-flight slot. Every
 /// `Action::CommitBlockByQcOnly` other than the already-persisted skip
-/// path enters the FIFO so commits drain in arrival order — the
-/// flush pipeline asserts strict height contiguity and any reordering
-/// (sync-burst sibling preps racing each other, an already-prepared
-/// child overtaking a queued parent) trips that assertion.
+/// path enters the FIFO so preps run one at a time in commit order —
+/// the flush pipeline releases store persists strictly height
+/// contiguous, so a prep racing ahead of its parent would only sit at
+/// the gate holding the pipeline's memory, never reordering a write.
 pub struct QcOnlyPending {
     /// Block + certifying QC, with the full
     /// [`Verified<CertifiedBlock>`] predicate established upstream.
@@ -378,6 +378,17 @@ pub struct BlockCommitCoordinator {
     /// `BlockCommitted` is deferred until the disk write completes.
     persisted_height: BlockHeight,
 
+    /// Highest block height handed to the store by [`flush`](Self::flush),
+    /// advanced synchronously as each batch spawns. Unlike
+    /// [`persisted_height`](Self::persisted_height), which lags behind the
+    /// `BlockPersisted` round-trip, this reflects the store's actual write
+    /// frontier — the gate that keeps successive flush batches height
+    /// contiguous reads it so a later block never writes over an
+    /// unmaterialized parent version. [`commit_in_flight`](Self::commit_in_flight)
+    /// serializes batches, so the value is durable before the next batch's
+    /// gate consults it.
+    flushed_height: BlockHeight,
+
     /// Set while an async commit task is running on the I/O pool. Bouncing
     /// this prevents spawning a second task (the I/O pool does not
     /// guarantee FIFO ordering across separate `spawn()` calls). The task
@@ -412,6 +423,7 @@ impl BlockCommitCoordinator {
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending: Vec::new(),
             persisted_height: initial_persisted_height,
+            flushed_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             qc_only_queue: VecDeque::new(),
             qc_only_in_flight: false,
@@ -668,33 +680,53 @@ impl BlockCommitCoordinator {
         // never fires and sync_awaiting_persistence_height is never satisfied.
         commits.sort_by_key(|c| c.certified.block().height().inner());
 
-        // Blocks committed via CommitBlock need the PreparedCommit produced
-        // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
-        // and defer all later blocks too to preserve height ordering. Blocks
-        // that came through CommitBlockByQcOnly already have their
-        // PreparedCommit cached inline so they don't hit this path.
+        // Release persists strictly height contiguous from the persisted
+        // tip: a block flushes only when every height below it is durable
+        // or ahead of it in this batch with its prep in hand. Commit
+        // *order* is height ordered, but the two commit variants accept at
+        // different latencies — a `CommitBlock` lands inline while a
+        // `CommitBlockByQcOnly` round-trips the prep pool — so arrival
+        // order at this queue can invert around a sync/live junction (a
+        // recovery bridge committing over a sync-admitted suffix). An
+        // out-of-order persist writes a no-op block's root carry over an
+        // unmaterialized parent version, holing the JMT version chain.
+        // Deferral also covers a block still awaiting the PreparedCommit
+        // that `VerifyStateRoot` produces asynchronously.
         let mut ready_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map: Vec<PreparedCommit> = Vec::with_capacity(commits.len());
         {
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
+            // Gate from the store's write frontier, not the `BlockPersisted`
+            // round-trip: a block just handed to the store isn't yet marked
+            // persisted but its tree version is materializing, so a
+            // contiguous successor is safe to follow it. Take the max so a
+            // sync path that persisted directly still advances the gate.
+            let mut next_expected = self.flushed_height.max(self.persisted_height).next();
             for commit in commits {
                 if !deferring {
-                    if let Some(prepared) = cache
-                        .remove(&commit.certified.block().hash())
-                        .map(|(_, p)| p)
+                    let height = commit.certified.block().height();
+                    if height == next_expected
+                        && let Some(prepared) = cache
+                            .remove(&commit.certified.block().hash())
+                            .map(|(_, p)| p)
                     {
                         prepared_map.push(prepared);
                         ready_commits.push(commit);
+                        next_expected = next_expected.next();
                         continue;
                     }
-                    // First miss — flip to deferring so all later blocks
-                    // defer too, preserving height ordering.
+                    // First gap — a missing height whose commit hasn't
+                    // arrived, or a block awaiting its prep. Defer it and
+                    // every later block to preserve the contiguity.
                     deferring = true;
                     tracing::debug!(
-                        height = commit.certified.block().height().inner(),
-                        certs = commit.certified.block().certificates().len(),
-                        "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
+                        shard = self.shard.inner(),
+                        height = height.inner(),
+                        expected = next_expected.inner(),
+                        flushed = self.flushed_height.inner(),
+                        persisted = self.persisted_height.inner(),
+                        "Deferring block commit — height gap or awaiting PreparedCommit"
                     );
                 }
                 self.pending.push(commit);
@@ -718,6 +750,15 @@ impl BlockCommitCoordinator {
 
         if ready_commits.is_empty() {
             return;
+        }
+
+        // The gate built `ready_commits` as a contiguous run above the
+        // write frontier, so its last height is the store's new frontier.
+        // Advancing here — before the spawn, under `commit_in_flight` —
+        // keeps the next batch's gate reading a frontier that this batch's
+        // writes will have reached by the time it runs.
+        if let Some(last) = ready_commits.last() {
+            self.flushed_height = last.certified.block().height();
         }
 
         // Use the actual notification decision recorded at accumulation time,
@@ -1198,6 +1239,69 @@ mod tests {
         let events = drain_protocol_events(&rx);
         assert_eq!(count_committed(&events), 0);
         assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(3)));
+    }
+
+    #[test]
+    fn flush_holds_a_commit_whose_predecessor_has_not_arrived() {
+        // A recovery bridge's live commit reaches this queue inline while
+        // its sync-admitted parents' qc-only accepts round-trip the prep
+        // pool, so arrival order inverts around the sync/live junction.
+        // The contiguity gate must hold the child until every height below
+        // it lands — an out-of-order persist holes the JMT version chain.
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::new(840));
+        let sink = empty_sink();
+        let (tx, rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(843),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(
+            committed_heights(&sink),
+            Vec::<u64>::new(),
+            "the gate must hold a commit above the persisted tip until its \
+             predecessors arrive",
+        );
+
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(841),
+            CommitSource::Sync,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(
+            committed_heights(&sink),
+            vec![841],
+            "the gate drains only the contiguous prefix, holding 843 behind the 842 gap",
+        );
+        let _ = drain_protocol_events(&rx);
+
+        // The last predecessor arrives; the gate releases 842 and the held
+        // 843 in one contiguous batch — driven by the store write frontier,
+        // not the `BlockPersisted` round-trip (never fired in this test).
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(842),
+            CommitSource::Sync,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(
+            committed_heights(&sink),
+            vec![841, 842, 843],
+            "the late predecessor releases the held commit in height order",
+        );
+        let events = drain_protocol_events(&rx);
+        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(843)));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
+    resolve_materialized_root,
 };
 use hyperscale_storage::{
     BaseReadCache, DatabaseUpdates, JmtSnapshot, ShardChainWriter, merge_owned_nodes,
@@ -61,8 +62,16 @@ impl ShardChainWriter for SimShardStorage {
         // Read lock: compute speculative JMT root.
         let s = read_or_recover(&self.state);
 
-        let parent_version =
-            jmt_parent_height(parent_block_height, parent_state_root).map(BlockHeight::inner);
+        // Anchor on the nearest materialized version: a node-less no-op
+        // ancestor (a block prepared before its parent's tree existed,
+        // across a recovery bridge) carries this same root without
+        // holding its node, and the JMT applier needs a version that does.
+        let parent_version = jmt_parent_height(parent_block_height, parent_state_root)
+            .map(BlockHeight::inner)
+            .map(|pv| {
+                resolve_materialized_root(&s.tree_store, pending_snapshots, pv)
+                    .map_or(pv, |(v, _)| v)
+            });
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         //

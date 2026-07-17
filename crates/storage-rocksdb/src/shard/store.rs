@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
+use hyperscale_storage::tree::carry_noop_root;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore, VersionedStore};
 use hyperscale_types::{
@@ -176,6 +177,17 @@ impl RocksDbShardStorage {
         let associations_count = jmt_snapshot.leaf_associations.len();
         let new_version = jmt_snapshot.new_height.inner();
         let new_root = jmt_snapshot.result_root;
+
+        // A no-op snapshot prepared before its parent's tree existed (the
+        // recovery bridge over a sync-admitted parent) carries no nodes;
+        // the parent's root is durable by this height-ordered write, so
+        // complete the carry the prepare couldn't.
+        if let Some((key, node)) = carry_noop_root(
+            &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
+            jmt_snapshot,
+        ) {
+            self.append_jmt_node_to_batch(&mut write_batch, &key, &node);
+        }
 
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
 
