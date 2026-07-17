@@ -46,7 +46,7 @@ use hyperscale_types::{
     ShardWitnessPayload, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
     TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, vrf_output_from_proof,
+    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -1320,7 +1320,16 @@ impl ShardCoordinatorSim {
                     finalized_tx_count,
                     ready_signals,
                     reshape_trigger,
-                    VrfProof::ZERO,
+                    // Sign a genuine reveal with the proposer's key so the
+                    // block's leaf 0 passes the BLS gate `verify` now runs;
+                    // `VrfProof::ZERO` would fail it. The proposer leads
+                    // this round, so it matches `proposer_for` at verify.
+                    shard_reveal_sign(
+                        &self.sks[self.idx_of(proposer)],
+                        &self.network,
+                        shard_id,
+                        height,
+                    ),
                     &parent_witness_leaves,
                     &missed,
                     beacon_witness_base,
@@ -1504,7 +1513,7 @@ impl ShardCoordinatorSim {
                     round,
                     receipts: &receipts,
                     ready_signals: &ready_signals,
-                    reveal_output: vrf_output_from_proof(&randomness_reveal),
+                    randomness_reveal,
                     reshape_trigger,
                     substate_bytes,
                     thresholds,

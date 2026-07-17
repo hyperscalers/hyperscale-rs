@@ -15,20 +15,18 @@ use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CertificateRoot, CertificateRootContext, CertifiedBlockHeader, CertifiedHeaderVerifyError,
-    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
-    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Round,
-    RoutableTransaction, SettledWavesRoot, ShardId, ShardWitnessPayload, SplitChildRoots,
-    StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
-    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
+    BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext,
+    CertifiedBlockHeader, CertifiedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
+    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
+    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardWitnessPayload,
+    SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
+    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
     certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
-    local_settled_wave_ids, ready_signal_message, shard_reveal_sign, shard_reveal_verify,
-    vrf_output_from_proof,
+    local_settled_wave_ids, ready_signal_message, shard_reveal_sign, vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -599,32 +597,18 @@ where
                 round,
                 receipts: &receipts,
                 ready_signals: &ready_signals,
-                reveal_output: vrf_output_from_proof(&randomness_reveal),
+                randomness_reveal,
                 reshape_trigger,
                 substate_bytes,
                 thresholds,
                 topology_snapshot: &topology_snapshot,
             };
-            // The recompute binds leaf 0 to the reveal proof's digest; the
-            // proof must also be a valid VRF by the block's proposer, or the
-            // proposer could commit any output and grind. Gate the verified
-            // result on that BLS check, off the main loop on the dispatch pool.
-            let proposer = topology_snapshot.proposer_for(ctx.shard, round);
-            let reveal_ok = topology_snapshot.public_key(proposer).is_some_and(|pk| {
-                shard_reveal_verify(
-                    &pk,
-                    topology_snapshot.network(),
-                    ctx.shard,
-                    height,
-                    &randomness_reveal,
-                )
-            });
-            let result = if reveal_ok {
-                expected_root.verify(&bw_ctx)
-            } else {
-                tracing::warn!(?block_hash, "Randomness reveal BLS verification FAILED");
-                Err(BeaconWitnessRootVerifyError::RevealInvalid)
-            };
+            // `verify` gates the reveal's BLS validity (leaf 0's proof by
+            // the block's proposer) before folding its digest, so an
+            // unverified reveal can never reach the root — the grind check
+            // lives inside the shared verifier, off the main loop on the
+            // dispatch pool.
+            let result = expected_root.verify(&bw_ctx);
             record_signature_verification_latency(
                 "beacon_witness_root",
                 start.elapsed().as_secs_f64(),
