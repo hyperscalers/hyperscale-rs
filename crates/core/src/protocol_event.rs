@@ -899,11 +899,12 @@ pub enum ProtocolEvent {
         witnesses: Vec<Arc<ShardWitness>>,
     },
 
-    /// Result of an [`Action::FetchBeaconProposal`] dispatch. `None`
-    /// means the responder didn't have the proposal pooled; the
-    /// coordinator may emit another fetch against a different peer.
-    /// Wire decode lands the wrapper as `Verifiable::Unverified`;
-    /// locally-dispatched serves preserve the `Verified` marker.
+    /// Result of an [`Action::FetchBeaconProposal`] dispatch — carries a
+    /// proposal the peer returned. A responder that didn't hold the
+    /// proposal yields no event: the fetch binding releases the slot for
+    /// retry against another peer instead. Wire decode lands the wrapper
+    /// as `Verifiable::Unverified`; locally-dispatched serves preserve the
+    /// `Verified` marker.
     ///
     /// [`Action::FetchBeaconProposal`]: crate::Action::FetchBeaconProposal
     BeaconProposalFetched {
@@ -911,8 +912,8 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// Validator whose proposal was requested.
         validator: ValidatorId,
-        /// Returned proposal, or `None` if the peer didn't hold it.
-        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+        /// The returned proposal.
+        proposal: Arc<Verifiable<BeaconProposal>>,
     },
 
     /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The

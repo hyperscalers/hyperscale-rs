@@ -112,7 +112,7 @@ enum SimEvent {
     BeaconProposalFetched {
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+        proposal: Arc<Verifiable<BeaconProposal>>,
     },
 }
 
@@ -1326,9 +1326,13 @@ impl CoordinatorSim {
                 class: _,
             }) => {
                 // Walk every other coordinator (with `preferred` first if
-                // set), look up the proposal directly in its
-                // `proposal_pool`, and queue the first non-empty response
-                // back to the emitter. Empty if no peer has it.
+                // set) and look up the proposal directly in its
+                // `proposal_pool`. Queue the first hit back to the emitter;
+                // if no peer holds it, queue nothing — production releases
+                // the fetch slot and retries another peer rather than
+                // delivering a "not found" event, and a committed proposal
+                // is held by at least f+1 honest peers, so a legitimately
+                // awaited one is always found here.
                 let mut peer_order: Vec<usize> = (0..self.coordinators.len())
                     .filter(|&i| i != emitter_idx)
                     .collect();
@@ -1344,14 +1348,16 @@ impl CoordinatorSim {
                     pool.get(validator)
                         .map(|verified| Arc::new(Verifiable::from((*verified).clone())))
                 });
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: SimEvent::BeaconProposalFetched {
-                        epoch,
-                        validator,
-                        proposal,
-                    },
-                });
+                if let Some(proposal) = proposal {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::BeaconProposalFetched {
+                            epoch,
+                            validator,
+                            proposal,
+                        },
+                    });
+                }
             }
             Action::Fetch(_)
             | Action::AbandonFetch(_)

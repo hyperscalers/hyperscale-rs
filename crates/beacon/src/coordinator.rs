@@ -2237,39 +2237,37 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+        proposal: Arc<Verifiable<BeaconProposal>>,
     ) -> Vec<Action> {
         if !self.commit_assembly.is_awaiting(epoch, validator) {
             return Vec::new();
         }
-        if let Some(proposal) = proposal {
-            if let Some(record) = self.state.validators.get(&validator) {
-                let ctx = BeaconProposalVerifyContext {
-                    network: &self.network,
-                    epoch,
-                    sender_pk: record.pubkey,
-                };
-                match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
-                    Ok(verified) => {
-                        let _ = self
-                            .proposal_pool
-                            .admit(validator, epoch, Arc::new(verified));
-                    }
-                    Err((_, err)) => {
-                        warn!(
-                            ?validator,
-                            epoch = epoch.inner(),
-                            ?err,
-                            "Fetched BeaconProposal failed VRF verification — dropping",
-                        );
-                    }
+        if let Some(record) = self.state.validators.get(&validator) {
+            let ctx = BeaconProposalVerifyContext {
+                network: &self.network,
+                epoch,
+                sender_pk: record.pubkey,
+            };
+            match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+                Ok(verified) => {
+                    let _ = self
+                        .proposal_pool
+                        .admit(validator, epoch, Arc::new(verified));
                 }
-            } else {
-                warn!(
-                    ?validator,
-                    "Fetched proposal's validator is not in BeaconState — dropping",
-                );
+                Err((_, err)) => {
+                    warn!(
+                        ?validator,
+                        epoch = epoch.inner(),
+                        ?err,
+                        "Fetched BeaconProposal failed VRF verification — dropping",
+                    );
+                }
             }
+        } else {
+            warn!(
+                ?validator,
+                "Fetched proposal's validator is not in BeaconState — dropping",
+            );
         }
         match self.commit_assembly.on_proposal_resolved(
             epoch,
