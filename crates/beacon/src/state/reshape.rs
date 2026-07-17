@@ -255,6 +255,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
         terminal_qc_wt: None,
         settled_waves_root: None,
         reshape_admitted_epoch: None,
+        reveals_fenced_below: None,
     }
 }
 
@@ -713,6 +714,7 @@ mod tests {
                 terminal_qc_wt: None,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
             },
         );
         apply_shard_payload(
@@ -1044,6 +1046,7 @@ mod tests {
                     terminal_qc_wt: None,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
                 },
             );
         }

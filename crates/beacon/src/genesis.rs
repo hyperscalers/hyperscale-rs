@@ -136,6 +136,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     terminal_qc_wt: None,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
                 },
             )
         })
