@@ -936,12 +936,12 @@ module recovery_bridge_honest_old {
 // finalized waves on); the retained beyond-f committee can forge NEW ECs
 // extending the halted tip, and a consuming shard resolves the source
 // committee for an EC by its anchor window
-// (`topology_schedule.lookup(ec.vote_anchor_ts())`,
-// execution/src/coordinator.rs:2149) — the PLAIN lookup, no recovery
-// bridge — so a stale-anchored orphan EC resolves the old committee and
-// its beyond-f signatures verify. Without a fence, the orphan exports a
-// forged finalization cross-shard: an f+1 liveness halt becomes an
-// INV-EXEC-1 cascade.
+// (`topology_schedule.lookup(cert.vote_anchor_ts())` in
+// `on_wave_certificate`, crates/execution/src/coordinator.rs) — the PLAIN
+// lookup, no recovery bridge — so a stale-anchored orphan EC resolves the
+// old committee and its beyond-f signatures verify. Without the fence, the
+// orphan exports a forged finalization cross-shard: an f+1 liveness halt
+// becomes an INV-EXEC-1 cascade.
 //
 // The fix is a beacon mandate. At the fold that flags the halt, the
 // beacon stamps a freeze: from that fold, folded network-wide, no shard
@@ -962,20 +962,28 @@ module recovery_bridge_honest_old {
 //
 // Code anchors:
 //   - Cross-shard EC committee resolution: crates/execution/src/coordinator.rs
-//     `verify_fetched_finalized_wave` / the live EC path
-//     (`topology_schedule.lookup(ec.vote_anchor_ts())`, :2149 and :1315);
-//     `ec_has_shard_quorum_power` (crates/execution/src/lookups.rs:51)
+//     `on_wave_certificate` / `admit_finalized_wave`
+//     (`topology_schedule.lookup(cert.vote_anchor_ts())`);
+//     `ec_has_shard_quorum_power` (crates/execution/src/lookups.rs)
 //     checks the signer power against that resolved committee.
-//   - The freeze is the beacon fold's mandate (to be built): a
-//     `frozen`/`freeze_epoch` marker on the halt-recovery record, folded
-//     by every shard, gating the EC committee resolution above.
+//   - The freeze is the `attested_frontier` on the beacon's `HaltRecovery`
+//     record (crates/types/src/beacon/state.rs) — the shard's boundary
+//     height as folded at detection, recorded by
+//     `recover_halted_committee` (crates/beacon/src/state/committee.rs).
+//     `TopologySchedule::recovery_fences` (crates/types/src/topology/schedule.rs)
+//     turns it into a height gate applied before the anchor lookup on
+//     every EC ingress path (`on_wave_certificate`,
+//     `on_certificate_verified`, `admit_finalized_wave`), and
+//     `lookup_for_shard_certified_fenced` applies the same cutoff to
+//     remote-header sync (crates/remote-headers/src/coordinator.rs) and
+//     the beacon boundary fold (crates/beacon/src/boundary.rs).
 //
 // Properties (INV-SEC-8, cross-shard half):
 //   invFenceHolds — once an honest consumer has folded the freeze, it
 //                      never finalizes on an old-committee EC above the
 //                      frontier attested at fold time: the fence stops the
 //                      leak at the cutoff. The `no_freeze` twin (the
-//                      shipped state) violates it.
+//                      unfenced counterfactual) violates it.
 //   invResidualBounded — any orphan (above the true halted tip) an
 //                      honest consumer finalized was finalized before it
 //                      folded the freeze: the residual is exactly the
@@ -992,6 +1000,10 @@ module recovery_bridge_honest_old {
 //     only NEW forgeries beyond what is already attested — the most any
 //     after-the-fact mechanism can do, since a beyond-f committee's
 //     exports cannot be un-finalized once honest consumers acted on them.
+//     (In the implementation the frontier is a pure fold of committed
+//     boundary crossings: a crossing the beyond-f committee lands before
+//     detection advances it, playing this poisoning role; the model folds
+//     that channel into pre-fold consumer attestation.)
 //   - Consumer fold lag is free (the freeze propagates per replica, like
 //     the recovery in the bridge module): an unfolded consumer still
 //     accepts old ECs, so the residual includes "at a consumer that has
@@ -1008,7 +1020,7 @@ module recovery_bridge_honest_old {
 //     (the fence holds: no new forgery crosses the cut, the residual is
 //      bounded to the pre-fold poisoning, and the fresh committee stays live)
 //   quint verify --main=cross_shard_no_freeze --invariant=invFenceHolds --max-steps=8 specs/halt_recovery.qnt
-//     (the shipped state, no fence; expect a counterexample — an orphan is
+//     (the unfenced counterfactual; expect a counterexample — an orphan is
 //      finalized after the halt is detected and the consumer folded)
 //   quint verify --main=cross_shard_no_freeze --invariant=invResidualBounded --max-steps=8 specs/halt_recovery.qnt
 //     (same twin; the residual is unbounded without the fence)
@@ -1025,9 +1037,9 @@ module cross_shard_freeze {
   const FREEZE_EPOCH: int
   const MAX_HEIGHT: int
   const MAX_TIME: int
-  // Broken twin: no beacon freeze (the shipped state). The consumer has no
-  // authenticated cutoff and keeps resolving the old committee for any
-  // stale-anchored EC. True is the fix.
+  // Broken twin: no beacon freeze (the unfenced counterfactual). The
+  // consumer has no authenticated cutoff and keeps resolving the old
+  // committee for any stale-anchored EC. True is the shipped fence.
   const FREEZE_FENCE: bool
 
   var now: int
@@ -1197,7 +1209,7 @@ module cross_shard_freeze {
       .expect(frontierAtFold == 3 and not(breached))
 }
 
-// The fix: the beacon freeze fence is on.
+// The shipped configuration: the freeze fence is on.
 module cross_shard_freeze_ok {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
@@ -1205,10 +1217,10 @@ module cross_shard_freeze_ok {
   ).*
 }
 
-// Broken twin: the shipped state — no beacon freeze. The consumer resolves
-// the old committee for any stale-anchored EC forever, so orphans keep
-// being finalized after the halt is detected and the consumer folded —
-// invFenceHolds fails.
+// Broken twin: the unfenced counterfactual — no beacon freeze. The
+// consumer resolves the old committee for any stale-anchored EC forever,
+// so orphans keep being finalized after the halt is detected and the
+// consumer folded — invFenceHolds fails.
 module cross_shard_no_freeze {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
