@@ -834,11 +834,21 @@ impl RemoteHeaderCoordinator {
     /// merge child — resolves the committee that served it, so its terminal
     /// crossing keeps syncing to the beacon fold until the schedule evicts
     /// it. A fully-evicted shard resolves nothing and is skipped.
+    ///
+    /// A zero `wt` is not a stale clock — it means no local block has
+    /// committed yet. A freshly seated member (a halt-recovery draw from the
+    /// pool, a merge keeper) opens on the beacon head fold that seated it,
+    /// so any shard the schedule still retains is fair to probe; resolving
+    /// the zero clock would land below every retained window (`Evicted`) and
+    /// suppress exactly the fetches that bootstrap the member.
     fn shard_routable(
         topology_schedule: &TopologySchedule,
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> bool {
+        if wt == WeightedTimestamp::ZERO {
+            return topology_schedule.routable_shards().contains(&shard);
+        }
         matches!(
             topology_schedule.lookup_for_shard(shard, wt).0,
             ScheduleLookup::Committee(snapshot) if !snapshot.committee_for_shard(shard).is_empty()
@@ -1086,6 +1096,46 @@ mod tests {
         assert!(
             !coord.expected.contains_key(&ShardId::ROOT),
             "a fully evicted shard is pruned from the expected set",
+        );
+    }
+
+    #[test]
+    fn fresh_member_flushes_retained_shards_before_first_commit() {
+        // A freshly seated member — a halt-recovery draw from the pool, a
+        // merge keeper — has no local commit, so its clock is still zero
+        // while the schedule head is many windows on. The zero clock
+        // resolves below every retained window; routability must fall back
+        // to schedule retention or the member never issues the probes that
+        // pull remote headers (and through them provisions and execution
+        // certificates) before its first commit.
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let sched = TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
+        );
+
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let actions = coord.flush_expected_headers(&sched);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartRemoteHeaderSync { source_shard, .. } if *source_shard == remote
+            )),
+            "a zero-clock member must probe the retained sibling shard",
+        );
+
+        // The fallback is strictly for the zero clock: a committed clock
+        // below every retained window still refuses to probe.
+        coord.local_committed_ts = WeightedTimestamp::from_millis(1);
+        let actions = coord.flush_expected_headers(&sched);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::StartRemoteHeaderSync { .. })),
+            "a stale committed clock below the retained windows must not probe",
         );
     }
 
