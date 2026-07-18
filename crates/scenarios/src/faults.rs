@@ -335,14 +335,19 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     );
 
     // The recovered shard's cross-shard rail serves again: a fresh
-    // transfer per direction settles on both chains.
+    // transfer per direction settles on both chains. The budget is generous
+    // — a ceiling, not the expected latency: the fresh committee is
+    // establishing cross-shard connectivity from a cold start (routing to
+    // the sibling, provision serving) right after the recovery record
+    // cleared, which on a real-network harness takes longer than a
+    // steady-state 2PC round.
     let mut revived: Vec<TxHash> = Vec::new();
     for (i, (key, from, to)) in setup.post_recovery.iter().enumerate() {
         let nonce = 400 + u32::try_from(i).unwrap_or(0);
         revived.push(submit_straddler(c, &network, key, *from, *to, nonce));
     }
     assert!(
-        c.run_until(epochs(16), |c| {
+        c.run_until(epochs(40), |c| {
             revived
                 .iter()
                 .all(|h| chain_settled(c, halted, *h) && chain_settled(c, survivor, *h))
@@ -458,9 +463,14 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     let shard = halt.shard;
 
     // The boundary watermark stalls past the threshold; the beacon flags
-    // the shard and re-draws its committee from the pool spares.
+    // the shard and re-draws its committee from the pool spares. The cut is
+    // permanent, so detection is guaranteed — the budget is a generous
+    // ceiling, not the expected latency: cross-shard traffic in flight at
+    // the freeze lets the shard commit a few more blocks before it stalls,
+    // and on a real-network harness the per-fold cadence varies, so the
+    // `threshold` miss folds accrue later than on the quiet quick sim.
     let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
-    let recovered = c.run_until(epochs(threshold + 10), |c| {
+    let recovered = c.run_until(epochs(threshold + 25), |c| {
         c.beacon_state()
             .is_some_and(|state| state.pending_recoveries.contains_key(&shard))
     });

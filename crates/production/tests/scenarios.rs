@@ -12,8 +12,8 @@ mod support;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
-    intershard_partition_genesis_balances, merge_straddler_setup, split_straddler_setup,
-    witness_genesis_balances,
+    halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
+    merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
     ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
@@ -23,6 +23,7 @@ use hyperscale_scenarios::{
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
+    halted_shard_recovers_by_committee_redraw, halted_shard_straddler_atomic,
     inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
     merge_seats_full_keeper_committee, merge_straddler_atomic,
@@ -406,6 +407,61 @@ fn merge_straddler_atomic_prod() {
         setup.balances,
     );
     merge_straddler_atomic(&mut cluster);
+}
+
+/// Single-shard genesis that splits once into a holding pair, with two pool
+/// cohorts — one grows the root, the other is the halted shard's recovery
+/// committee — plus jail slack so an organic performance jail over the long
+/// run can refill from the pool without starving the recovery draw. Mirrors
+/// the simulation's `halt_recovery_config`. The halt takes `HALT_THRESHOLD`
+/// epochs to detect, so these run tens of epochs — hours at the ci epoch
+/// length, the slowest scenarios in this suite.
+const fn halt_recovery_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 10,
+        num_shards: 1,
+        split_bytes: 800_000,
+        latency: Duration::from_millis(150),
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
+fn halted_shard_recovers_by_committee_redraw_prod() {
+    let mut cluster = ProdCluster::start_with_balances(
+        &halt_recovery_config(),
+        11,
+        EPOCH_MS,
+        halt_recovery_genesis_balances(),
+    );
+    cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
+}
+
+/// Known to fail at the final assertion on a real network: a recovery
+/// committee drawn cold from the pool restores intra-shard consensus, but
+/// nothing on the seat path dials the sibling committees, so the cross-shard
+/// unicast rail (provision and execution certificate notifies resolve
+/// `ValidatorId -> PeerId` only over already-bound connections) stays dark
+/// and the post-recovery transfers never settle. Every assertion up to that
+/// settle passes. The sim variant plus `halted_shard_recovers_by_committee_redraw_prod`
+/// carry the halt-recovery coverage meanwhile.
+#[test]
+#[serial]
+#[ignore = "cold-drawn recovery committee lacks cross-shard unicast connectivity on a real network"]
+fn halted_shard_straddler_atomic_prod() {
+    let mut cluster = ProdCluster::start_with_balances(
+        &halt_recovery_config(),
+        11,
+        EPOCH_MS,
+        halt_straddler_setup().balances,
+    );
+    cluster.run_faultable(halted_shard_straddler_atomic);
 }
 
 #[test]

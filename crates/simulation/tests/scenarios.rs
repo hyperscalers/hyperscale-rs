@@ -217,12 +217,14 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
 
 #[test]
 fn halted_shard_straddler_atomic_sim() {
-    let mut cluster = SimCluster::with_dedicated_pool_hosts(
-        &halt_recovery_config(),
-        11,
-        &halt_straddler_setup().balances,
-    );
-    cluster.run_faultable(halted_shard_straddler_atomic);
+    for seed in [7u64, 11, 42, 2026, 1337] {
+        let mut cluster = SimCluster::with_dedicated_pool_hosts(
+            &halt_recovery_config(),
+            seed,
+            &halt_straddler_setup().balances,
+        );
+        cluster.run_faultable(halted_shard_straddler_atomic);
+    }
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's
