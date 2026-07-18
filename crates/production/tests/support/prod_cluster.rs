@@ -29,7 +29,7 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 use super::harness::{ClusterSpec, Harness, HostSpec};
 
@@ -66,7 +66,14 @@ impl ProdCluster {
         epoch_ms: u64,
         balances: Vec<(ComponentAddress, Decimal)>,
     ) -> Self {
-        let _ = fmt().with_test_writer().try_init();
+        // `RUST_LOG` steers per-crate levels when set (diagnosing a long
+        // real-network run); the default stays plain info.
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_test_writer()
+            .try_init();
         let runtime = Builder::new_multi_thread()
             .worker_threads(16)
             .enable_all()
