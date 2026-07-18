@@ -157,13 +157,14 @@ pub use signing::{
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_RATIFY_VOTE,
     DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW,
-    DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_BIND, PcContext, SpcContext,
-    VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
+    DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_ADDRESS, DOMAIN_VALIDATOR_BIND,
+    PcContext, SpcContext, VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
     certified_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
     exec_vote_message, pc_context, pc_vote_signing_message, ratify_vote_message,
     ready_signal_message, shard_reveal_message, shard_reveal_sign, shard_reveal_verify,
     spc_context, spc_relay_signing_message, state_provisions_message, timeout_message,
-    validator_bind_message, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
+    validator_address_message, validator_bind_message, vrf_output_from_proof, vrf_reveal_message,
+    vrf_sign, vrf_verify,
 };
 pub use state_key::{MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN};
 pub use time::epoch_windows::EpochWindows;

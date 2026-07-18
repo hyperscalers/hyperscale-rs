@@ -13,9 +13,10 @@ use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::{
-    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, Topic, ValidatorKeyMap,
+    GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, ResponseVerdict, Topic, ValidatorKeyMap,
 };
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
     TopologySnapshot, ValidatorId,
@@ -27,6 +28,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adapter::Libp2pAdapter;
+use crate::address_book::IngestOutcome;
 use crate::inbound_router::{InboundRouterHandle, spawn_inbound_router};
 use crate::notify_pool::NotifyStreamPool;
 use crate::request_manager::RequestError as RmRequestError;
@@ -123,7 +125,7 @@ impl Libp2pNetwork {
             simulated_outbound_latency,
         );
 
-        Self {
+        let network = Self {
             adapter,
             request_manager,
             tokio_handle,
@@ -135,7 +137,30 @@ impl Libp2pNetwork {
             notify_pool,
             simulated_outbound_latency,
             inbound_router,
-        }
+        };
+
+        // The validator address book is a transport concern, so the network
+        // registers its own ingest handlers rather than the node layer: the
+        // gossip handler brings up the Global topic subscription and covers
+        // shard-hosting nodes; the host handler covers a shard-less pool
+        // follower, whose warm book is exactly what a later committee draw
+        // depends on. Ingest is idempotent, so the overlap on multi-shard
+        // hosts is harmless.
+        let ingest = Arc::clone(&network.adapter);
+        network.register_gossip_handler(move |gossip: ValidatorAddressGossip, _shard: ShardId| {
+            match ingest.ingest_validator_address(&gossip) {
+                IngestOutcome::Invalid => GossipVerdict::Reject,
+                IngestOutcome::Recorded
+                | IngestOutcome::Stale
+                | IngestOutcome::UnknownValidator => GossipVerdict::Accept,
+            }
+        });
+        let ingest = Arc::clone(&network.adapter);
+        network.register_host_gossip_handler(move |gossip: ValidatorAddressGossip| {
+            let _ = ingest.ingest_validator_address(&gossip);
+        });
+
+        network
     }
 
     fn validator_peer_id(&self, validator: ValidatorId) -> Option<PeerId> {

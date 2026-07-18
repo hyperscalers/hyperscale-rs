@@ -339,7 +339,7 @@ pub fn spawn_validator_bind_service(
     mut control: Control,
     network: NetworkDefinition,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
-    local_vnodes: Vec<LocalVnodeIdentity>,
+    local_vnodes: Arc<[LocalVnodeIdentity]>,
     local_peer_id: Libp2pPeerId,
     validator_keys: SharedValidatorKeys,
 ) -> ValidatorBindHandle {
@@ -357,7 +357,7 @@ pub fn spawn_validator_bind_service(
 
     let ctx = BindContext {
         network,
-        local_vnodes: Arc::from(local_vnodes),
+        local_vnodes,
         local_peer_id,
         validator_keys,
         validator_peers,
