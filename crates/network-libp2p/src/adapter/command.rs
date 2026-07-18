@@ -53,6 +53,15 @@ pub(super) enum SwarmCommand {
     /// Dial a peer.
     Dial { address: Multiaddr },
 
+    /// Dial a specific peer at known addresses. Unlike [`Self::Dial`], the
+    /// swarm knows which peer the attempt targets, so an already-connected
+    /// or already-dialing peer is skipped instead of growing a duplicate
+    /// connection.
+    DialPeer {
+        peer_id: Libp2pPeerId,
+        addresses: Vec<Multiaddr>,
+    },
+
     /// Query listen addresses.
     GetListenAddresses {
         response_tx: OneshotSender<Vec<Multiaddr>>,
@@ -155,6 +164,7 @@ impl ClassCommandChannels {
             SwarmCommand::Subscribe { .. }
             | SwarmCommand::Unsubscribe { .. }
             | SwarmCommand::Dial { .. }
+            | SwarmCommand::DialPeer { .. }
             | SwarmCommand::GetListenAddresses { .. }
             | SwarmCommand::GetConnectedPeers { .. } => MessageClass::Consensus,
         };

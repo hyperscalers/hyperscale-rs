@@ -7,10 +7,10 @@
 //! 4. Recovery (catch-up traffic)
 //! 5. Bulk (transaction gossip, fetch-fallback-backed)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -21,7 +21,8 @@ use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use libp2p::gossipsub::{IdentTopic, PublishError};
 use libp2p::identify::Event as IdentifyEvent;
 use libp2p::kad::{BootstrapOk, Event as KadEvent, QueryResult};
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::{DialError, SwarmEvent};
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId, Swarm};
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
@@ -31,6 +32,7 @@ use super::announce::announce_validator_addresses;
 use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{MAX_COMMANDS_PER_DRAIN, SwarmCommand};
 use super::gossipsub::ValidationReport;
+use crate::address_book::AddressBook;
 use crate::config::VersionInteroperabilityMode;
 use crate::fault_gate::FaultState;
 use crate::validator_bind::LocalVnodeIdentity;
@@ -47,6 +49,10 @@ const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 /// Interval between validator address announcements. Also the worst-case
 /// staleness a peer's book carries after this host changes addresses.
 const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum spacing between address-book dial attempts to the same peer, so
+/// the maintenance tick doesn't hammer an unreachable one.
+const ADDRESS_DIAL_RETRY: Duration = Duration::from_secs(30);
 
 /// Parse the hyperscale agent version format: `"hyperscale/<version>"`.
 ///
@@ -68,7 +74,7 @@ pub(super) async fn run(
     mut bulk_rx: mpsc::Receiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
-    local_shards: Arc<ArcSwap<std::collections::HashSet<ShardId>>>,
+    local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
     version_interop_mode: VersionInteroperabilityMode,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
@@ -79,6 +85,8 @@ pub(super) async fn run(
     fault_gate: Arc<FaultState>,
     network: NetworkDefinition,
     local_vnodes: Arc<[LocalVnodeIdentity]>,
+    wanted_validators: Arc<ArcSwap<HashSet<ValidatorId>>>,
+    address_book: Arc<AddressBook>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -92,14 +100,18 @@ pub(super) async fn run(
     announce_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Track last Kademlia refresh time
-    let mut last_kademlia_refresh = std::time::Instant::now();
+    let mut last_kademlia_refresh = Instant::now();
 
     // Track validators that need reconnection (peer_id -> scheduled_reconnect_time)
-    let mut pending_reconnects: HashMap<Libp2pPeerId, std::time::Instant> = HashMap::new();
+    let mut pending_reconnects: HashMap<Libp2pPeerId, Instant> = HashMap::new();
 
     // Track known validator addresses for reconnection
     // (peer_id -> last known address)
     let mut validator_addresses: HashMap<Libp2pPeerId, Multiaddr> = HashMap::new();
+
+    // Last address-book dial attempt per peer, so an unreachable wanted
+    // validator is retried at ADDRESS_DIAL_RETRY pace, not every tick.
+    let mut recent_dials: HashMap<Libp2pPeerId, Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -109,7 +121,7 @@ pub(super) async fn run(
             }
 
             _ = maintenance_interval.tick() => {
-                let now = std::time::Instant::now();
+                let now = Instant::now();
 
                 let reconnects_due: Vec<_> = pending_reconnects
                     .iter()
@@ -154,6 +166,20 @@ pub(super) async fn run(
                         }
                     }
                 }
+
+                // Establish links to wanted-but-unbound validators from the
+                // address book. The seat-triggered pass in
+                // `update_wanted_validators` covers the common case; this
+                // sweep heals its races — a committee seated before the
+                // target's announcement arrived, a failed dial — at
+                // maintenance pace.
+                dial_wanted_validators(
+                    &mut swarm,
+                    &wanted_validators.load(),
+                    &address_book,
+                    &validator_peers,
+                    &mut recent_dials,
+                );
 
                 // Periodic Kademlia random-walk to discover new peers.
                 if kademlia_bootstrapped && now.saturating_duration_since(last_kademlia_refresh) > KADEMLIA_REFRESH_INTERVAL {
@@ -352,7 +378,7 @@ pub(super) async fn run(
                         validator_peers.retain(|_vid, pid| *pid != *peer_id);
 
                         if validator_addresses.contains_key(peer_id) {
-                            let reconnect_time = std::time::Instant::now() + RECONNECT_DELAY;
+                            let reconnect_time = Instant::now() + RECONNECT_DELAY;
                             info!(
                                 peer = %peer_id,
                                 reconnect_in_secs = RECONNECT_DELAY.as_secs(),
@@ -470,6 +496,9 @@ fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
                 warn!("Failed to dial peer: {}", e);
             }
         }
+        SwarmCommand::DialPeer { peer_id, addresses } => {
+            dial_peer_at(swarm, peer_id, addresses);
+        }
         SwarmCommand::GetListenAddresses { response_tx } => {
             let addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
             let _ = response_tx.send(addrs);
@@ -478,6 +507,44 @@ fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
             let peers: Vec<Libp2pPeerId> = swarm.connected_peers().copied().collect();
             let _ = response_tx.send(peers);
         }
+    }
+}
+
+/// Dial `peer_id` at `addresses`. The peer-conditioned dial makes this
+/// idempotent: an already-connected or already-dialing peer resolves
+/// [`DialError::DialPeerConditionFalse`], logged at trace and otherwise a
+/// no-op, so callers can re-issue freely.
+fn dial_peer_at(swarm: &mut Swarm<Behaviour>, peer_id: Libp2pPeerId, addresses: Vec<Multiaddr>) {
+    let opts = DialOpts::peer_id(peer_id).addresses(addresses).build();
+    match swarm.dial(opts) {
+        Ok(()) => debug!(peer = %peer_id, "Dialing validator from address book"),
+        Err(DialError::DialPeerConditionFalse(_)) => {
+            trace!(peer = %peer_id, "Dial skipped: already connected or dialing");
+        }
+        Err(e) => debug!(peer = %peer_id, error = ?e, "Address-book dial failed"),
+    }
+}
+
+/// One pass of the wanted-validator dial loop: resolve every wanted,
+/// unbound validator through the address book and dial it, remembering
+/// each attempt so an unreachable peer is retried no more often than
+/// [`ADDRESS_DIAL_RETRY`]. Connected peers whose bind is still in flight
+/// are skipped — the bind service owns that hand-off.
+fn dial_wanted_validators(
+    swarm: &mut Swarm<Behaviour>,
+    wanted: &HashSet<ValidatorId>,
+    address_book: &AddressBook,
+    validator_peers: &DashMap<ValidatorId, Libp2pPeerId>,
+    recent_dials: &mut HashMap<Libp2pPeerId, Instant>,
+) {
+    let now = Instant::now();
+    recent_dials.retain(|_, attempted| now.duration_since(*attempted) < ADDRESS_DIAL_RETRY);
+    for record in address_book.dial_candidates(wanted, validator_peers) {
+        if swarm.is_connected(&record.peer_id) || recent_dials.contains_key(&record.peer_id) {
+            continue;
+        }
+        recent_dials.insert(record.peer_id, now);
+        dial_peer_at(swarm, record.peer_id, record.addresses);
     }
 }
 

@@ -340,7 +340,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     // establishing cross-shard connectivity from a cold start (routing to
     // the sibling, provision serving) right after the recovery record
     // cleared, which on a real-network harness takes longer than a
-    // steady-state 2PC round.
+    // steady-state cross-shard settlement round.
     let mut revived: Vec<TxHash> = Vec::new();
     for (i, (key, from, to)) in setup.post_recovery.iter().enumerate() {
         let nonce = 400 + u32::try_from(i).unwrap_or(0);
@@ -881,7 +881,7 @@ pub fn inter_shard_partition_aborts_waves_at_deadline(c: &mut impl FaultableClus
              wave deadline; status = {verdict:?}",
         );
         // Safety: no shard settled it Accept — the all-abort is deterministic,
-        // never a split 2PC decision — and where both shards recorded an on-chain
+        // never a decision split across the shards — and where both recorded an on-chain
         // fate, they agree.
         let left_fate = c.chain_fate(left, hash).1.map(|(_, decision)| decision);
         let right_fate = c.chain_fate(right, hash).1.map(|(_, decision)| decision);
@@ -1034,8 +1034,8 @@ pub fn beacon_pool_partition_stalls_epoch_production(c: &mut impl FaultableClust
 /// Grow to two shards, drop the `broadcast` message type, then run a cross-shard
 /// transfer that must recover via the `fetch_kind` fetch fallback.
 ///
-/// Works for any broadcast the cross-shard flow relies on — a unicast 2PC
-/// delivery (`provisions.broadcast`, `execution.cert.batch`) suppressed at the
+/// Works for any broadcast the cross-shard flow relies on — a unicast
+/// cross-shard delivery (`provisions.broadcast`, `execution.cert.batch`) suppressed at the
 /// sender's gate, or a gossip broadcast (`transaction.gossip`, `block.committed`)
 /// suppressed by the receiver's inbound filter. The transfer moves 500 XRD from
 /// account `31` (left child) to `30` (right child), both funded at genesis.

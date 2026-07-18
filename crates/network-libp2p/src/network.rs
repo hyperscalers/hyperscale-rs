@@ -229,7 +229,22 @@ impl Network for Libp2pNetwork {
     }
 
     fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
-        self.routing_committees.store(committees);
+        self.routing_committees.store(Arc::clone(&committees));
+        // Every routable committee is a potential cross-shard counterparty whose
+        // provisions and execution certificates arrive by unicast, so the
+        // whole union is wanted connectivity. The map already extends a
+        // recovering shard's entry with its retained cohort, and a freshly
+        // drawn committee appears here the moment the beacon fold seats it
+        // — this push is what turns those book entries into connections.
+        let self_ids: HashSet<ValidatorId> =
+            self.adapter.local_validator_ids().iter().copied().collect();
+        let wanted: HashSet<ValidatorId> = committees
+            .values()
+            .flatten()
+            .filter(|validator| !self_ids.contains(validator))
+            .copied()
+            .collect();
+        self.adapter.update_wanted_validators(wanted);
     }
 
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
