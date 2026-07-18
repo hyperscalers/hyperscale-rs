@@ -15,6 +15,8 @@
 //! the validator once announced; the per-validator sequence keeps the
 //! newest record and the next announce supersedes stragglers everywhere.
 
+use std::collections::HashSet;
+
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use hyperscale_network::ValidatorKeyMap;
@@ -128,6 +130,34 @@ impl AddressBook {
         self.records.get(&validator).map(|r| r.clone())
     }
 
+    /// Records to dial so every validator in `wanted` becomes reachable:
+    /// the wanted validators with no live bind entry in `bound` whose
+    /// address is known, deduplicated by peer id (a multi-vnode host
+    /// announces the same peer for each of its validators). A validator
+    /// that is wanted, unbound, and absent from the book resolves nothing —
+    /// the caller retries once its announcement arrives.
+    #[must_use]
+    pub fn dial_candidates(
+        &self,
+        wanted: &HashSet<ValidatorId>,
+        bound: &DashMap<ValidatorId, Libp2pPeerId>,
+    ) -> Vec<AddressRecord> {
+        let mut seen_peers: HashSet<Libp2pPeerId> = HashSet::new();
+        let mut candidates = Vec::new();
+        for &validator in wanted {
+            if bound.contains_key(&validator) {
+                continue;
+            }
+            let Some(record) = self.get(validator) else {
+                continue;
+            };
+            if seen_peers.insert(record.peer_id) {
+                candidates.push(record);
+            }
+        }
+        candidates
+    }
+
     /// Number of validators with a record.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -237,6 +267,47 @@ mod tests {
             IngestOutcome::UnknownValidator
         );
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn dial_candidates_skip_bound_and_dedup_by_peer() {
+        let book = AddressBook::default();
+        let bound_vid = ValidatorId::new(1);
+        let cohost_a = ValidatorId::new(2);
+        let cohost_b = ValidatorId::new(3);
+        let unknown_vid = ValidatorId::new(4);
+        let keys = {
+            let mut keys = ValidatorKeyMap::new();
+            for vid in [bound_vid, cohost_a, cohost_b] {
+                keys.insert(vid, keypair().public_key());
+            }
+            keys
+        };
+
+        let bound_peer = Libp2pPeerId::random();
+        let cohost_peer = Libp2pPeerId::random();
+        for (vid, peer) in [
+            (bound_vid, &bound_peer),
+            (cohost_a, &cohost_peer),
+            (cohost_b, &cohost_peer),
+        ] {
+            assert_eq!(
+                book.ingest(&net(), &keys, &announce(vid, peer, 1)),
+                IngestOutcome::Recorded
+            );
+        }
+
+        let bound = DashMap::new();
+        bound.insert(bound_vid, bound_peer);
+        let wanted: HashSet<ValidatorId> = [bound_vid, cohost_a, cohost_b, unknown_vid]
+            .into_iter()
+            .collect();
+
+        // The bound validator needs no dial, the co-hosted pair collapses
+        // to one peer, and the validator with no record resolves nothing.
+        let candidates = book.dial_candidates(&wanted, &bound);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].peer_id, cohost_peer);
     }
 
     #[test]

@@ -89,6 +89,11 @@ pub struct Libp2pAdapter {
     /// connected to.
     address_book: Arc<AddressBook>,
 
+    /// Validators this host must hold unicast connectivity to — the union
+    /// of the routing committees, pushed on every topology change. The
+    /// event loop's maintenance sweep keeps dialing the unbound ones.
+    wanted_validators: Arc<ArcSwap<HashSet<ValidatorId>>>,
+
     /// Fault gate consulted at the delivery seams, shared with the swarm event
     /// loop for the inbound gossip filter. A zero-sized no-op unless the
     /// `test-utils` feature is enabled.
@@ -280,6 +285,7 @@ impl Libp2pAdapter {
             validator_keys: shared_keys,
             network: network.clone(),
             address_book: Arc::new(AddressBook::default()),
+            wanted_validators: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             fault_gate: Arc::new(FaultState::new()),
         });
 
@@ -292,6 +298,8 @@ impl Libp2pAdapter {
         let bootstrap_peers = config.bootstrap_peers.clone();
         let announce_network = network;
         let announce_vnodes = vnodes;
+        let event_loop_wanted = Arc::clone(&adapter.wanted_validators);
+        let event_loop_address_book = Arc::clone(&adapter.address_book);
         spawn(async move {
             // Keep bind_handle alive for the lifetime of the event loop.
             let _bind_handle = bind_handle;
@@ -316,6 +324,8 @@ impl Libp2pAdapter {
                 event_loop_fault_gate,
                 announce_network,
                 announce_vnodes,
+                event_loop_wanted,
+                event_loop_address_book,
             ))
             .catch_unwind()
             .await;
@@ -572,6 +582,26 @@ impl Libp2pAdapter {
     pub fn ingest_validator_address(&self, gossip: &ValidatorAddressGossip) -> IngestOutcome {
         self.address_book
             .ingest(&self.network, &self.validator_keys.load(), gossip)
+    }
+
+    /// Replace the set of validators this host must hold unicast
+    /// connectivity to, and immediately dial the unbound ones whose
+    /// addresses the book already knows. A freshly seated committee's
+    /// members were announcing as pool followers, so this seat-time pass
+    /// usually connects them at once; the event loop's maintenance sweep
+    /// covers the ones whose announcements arrive later and any dial that
+    /// fails.
+    pub fn update_wanted_validators(&self, wanted: HashSet<ValidatorId>) {
+        let candidates = self
+            .address_book
+            .dial_candidates(&wanted, &self.validator_peers);
+        self.wanted_validators.store(Arc::new(wanted));
+        for record in candidates {
+            let _ = self.priority_channels.send(SwarmCommand::DialPeer {
+                peer_id: record.peer_id,
+                addresses: record.addresses,
+            });
+        }
     }
 
     /// The fault gate consulted at this adapter's delivery seams. A zero-sized
