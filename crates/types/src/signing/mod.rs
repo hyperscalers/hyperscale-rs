@@ -15,6 +15,7 @@
 //! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
 //! | `STATE_PROVISION_BATCH` | Cross-shard state provisions gossip |
 //! | `VALIDATOR_BIND` | Validator-bind `PeerId` authentication |
+//! | `VALIDATOR_ADDRESS` | Validator address announcement gossip |
 //! | `EXEC_VOTE` | Execution votes |
 //! | `EXEC_VOTE_BATCH` | Execution vote batch gossip |
 //! | `EXEC_CERT_BATCH` | Execution certificate batch gossip |
@@ -39,6 +40,7 @@ mod provisions;
 mod ready_signal;
 mod shard;
 mod shard_reveal;
+mod validator_address;
 mod validator_bind;
 
 pub use beacon_pc::{
@@ -63,4 +65,5 @@ pub use shard::{
 pub use shard_reveal::{
     DOMAIN_SHARD_REVEAL, shard_reveal_message, shard_reveal_sign, shard_reveal_verify,
 };
+pub use validator_address::{DOMAIN_VALIDATOR_ADDRESS, validator_address_message};
 pub use validator_bind::{DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, validator_bind_message};

@@ -11,6 +11,7 @@ use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 #[cfg(feature = "test-utils")]
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{MessageClass, NetworkDefinition, ShardId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
 use libp2p::gossipsub::{
@@ -30,6 +31,7 @@ use tracing::{info, trace};
 use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, request_protocol};
 use super::command::{ClassCommandChannels, SwarmCommand};
 use super::error::NetworkError;
+use crate::address_book::{AddressBook, IngestOutcome};
 use crate::config::Libp2pConfig;
 use crate::fault_gate::FaultState;
 use crate::validator_bind::{LocalVnodeIdentity, spawn_validator_bind_service};
@@ -77,6 +79,15 @@ pub struct Libp2pAdapter {
     /// Validator BLS public keys for identity verification.
     /// Shared with the validator-bind service; updated on topology changes.
     validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
+
+    /// Chain network identity, bound into every locally signed and verified
+    /// address announcement.
+    network: NetworkDefinition,
+
+    /// Signed `ValidatorId → (PeerId, addresses)` book built from gossiped
+    /// announcements — the dial source for validators this host has never
+    /// connected to.
+    address_book: Arc<AddressBook>,
 
     /// Fault gate consulted at the delivery seams, shared with the swarm event
     /// loop for the inbound gossip filter. A zero-sized no-op unless the
@@ -131,6 +142,9 @@ impl Libp2pAdapter {
             "Libp2pAdapter needs at least one hosted vnode"
         );
         let local_peer_id = Libp2pPeerId::from(keypair.public());
+        // Shared between the bind service (attests as every vnode) and the
+        // event loop (signs the periodic address announcements).
+        let vnodes: Arc<[LocalVnodeIdentity]> = Arc::from(vnodes);
         let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
 
         info!(
@@ -247,9 +261,9 @@ impl Libp2pAdapter {
         // ValidatorId ↔ PeerId binding via BLS signatures.
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
-            network,
+            network.clone(),
             validator_peers.clone(),
-            vnodes,
+            Arc::clone(&vnodes),
             local_peer_id,
             Arc::clone(&shared_keys),
         );
@@ -264,6 +278,8 @@ impl Libp2pAdapter {
             cached_peer_count: cached_peer_count.clone(),
             stream_control,
             validator_keys: shared_keys,
+            network: network.clone(),
+            address_book: Arc::new(AddressBook::default()),
             fault_gate: Arc::new(FaultState::new()),
         });
 
@@ -274,6 +290,8 @@ impl Libp2pAdapter {
         let event_loop_fault_gate = Arc::clone(&adapter.fault_gate);
         let bind_trigger_tx = bind_handle.bind_tx.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
+        let announce_network = network;
+        let announce_vnodes = vnodes;
         spawn(async move {
             // Keep bind_handle alive for the lifetime of the event loop.
             let _bind_handle = bind_handle;
@@ -296,6 +314,8 @@ impl Libp2pAdapter {
                 bind_trigger_tx,
                 bootstrap_peers,
                 event_loop_fault_gate,
+                announce_network,
+                announce_vnodes,
             ))
             .catch_unwind()
             .await;
@@ -537,6 +557,21 @@ impl Libp2pAdapter {
     #[must_use]
     pub fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
         self.validator_peers.get(&validator_id).map(|r| *r)
+    }
+
+    /// The signed validator address book built from gossiped announcements.
+    #[must_use]
+    pub const fn address_book(&self) -> &Arc<AddressBook> {
+        &self.address_book
+    }
+
+    /// Verify one gossiped address announcement against the current
+    /// validator keys and store it in the book if it is the newest for its
+    /// validator.
+    #[must_use]
+    pub fn ingest_validator_address(&self, gossip: &ValidatorAddressGossip) -> IngestOutcome {
+        self.address_book
+            .ingest(&self.network, &self.validator_keys.load(), gossip)
     }
 
     /// The fault gate consulted at this adapter's delivery seams. A zero-sized

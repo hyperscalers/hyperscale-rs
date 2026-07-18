@@ -6,6 +6,7 @@
 //! - Request-Response for sync block fetching
 //! - QUIC transport for reliable, encrypted connections
 
+mod announce;
 mod behaviour;
 mod command;
 mod core;

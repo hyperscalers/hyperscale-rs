@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use hyperscale_metrics::record_gossipsub_publish_failure;
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::{ShardId, ValidatorId};
+use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use libp2p::gossipsub::{IdentTopic, PublishError};
 use libp2p::identify::Event as IdentifyEvent;
 use libp2p::kad::{BootstrapOk, Event as KadEvent, QueryResult};
@@ -27,11 +27,13 @@ use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, trace, warn};
 
+use super::announce::announce_validator_addresses;
 use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{MAX_COMMANDS_PER_DRAIN, SwarmCommand};
 use super::gossipsub::ValidationReport;
 use crate::config::VersionInteroperabilityMode;
 use crate::fault_gate::FaultState;
+use crate::validator_bind::LocalVnodeIdentity;
 
 /// Interval for periodic maintenance tasks in the event loop.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -41,6 +43,10 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Interval for periodic Kademlia refresh to discover new peers.
 const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Interval between validator address announcements. Also the worst-case
+/// staleness a peer's book carries after this host changes addresses.
+const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Parse the hyperscale agent version format: `"hyperscale/<version>"`.
 ///
@@ -71,6 +77,8 @@ pub(super) async fn run(
     bind_trigger_tx: mpsc::UnboundedSender<Libp2pPeerId>,
     bootstrap_peers: Vec<Multiaddr>,
     fault_gate: Arc<FaultState>,
+    network: NetworkDefinition,
+    local_vnodes: Arc<[LocalVnodeIdentity]>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -78,6 +86,10 @@ pub(super) async fn run(
     // Maintenance timer for periodic tasks (reconnection, Kademlia refresh)
     let mut maintenance_interval = interval(MAINTENANCE_INTERVAL);
     maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Periodic self-announcement of this host's validator addresses.
+    let mut announce_interval = interval(ADDRESS_ANNOUNCE_INTERVAL);
+    announce_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Track last Kademlia refresh time
     let mut last_kademlia_refresh = std::time::Instant::now();
@@ -219,6 +231,14 @@ pub(super) async fn run(
                 drain_channel(&mut swarm, &mut bulk_rx);
             }
 
+            // Announce this host's validator addresses so every node's book
+            // can resolve us for by-identity dialing. The first tick fires
+            // immediately (usually before any listen address exists — a
+            // no-op); NewListenAddr below covers prompt startup announcement.
+            _ = announce_interval.tick() => {
+                announce_validator_addresses(&mut swarm, &network, &local_vnodes);
+            }
+
             // Drain gossipsub validation results and report to swarm.
             // This controls message forwarding (Accept) and peer scoring (Reject).
             Some(report) = validation_rx.recv() => {
@@ -346,6 +366,10 @@ pub(super) async fn run(
                 // Handle new listen address
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
                     info!("Listening on new address: {}", address);
+                    // Re-announce right away — usually still without mesh
+                    // peers at startup, but a runtime address change
+                    // propagates without waiting for the periodic tick.
+                    announce_validator_addresses(&mut swarm, &network, &local_vnodes);
                 }
 
                 // Handle Kademlia events for peer discovery
