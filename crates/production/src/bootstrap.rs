@@ -66,9 +66,9 @@ where
         let mut fruitless = 0u32;
         while !lock(&bootstrap).is_complete() {
             let import = lock(&bootstrap).take_import();
-            if let Some((height, leaves)) = import {
+            if let Some((height, leaves, witnesses)) = import {
                 let root = storage
-                    .import_boundary_state(height, leaves)
+                    .import_boundary_state(height, leaves, witnesses)
                     .map_err(|error| format!("boundary import failed: {error}"))?;
                 lock(&bootstrap).on_imported(root)?;
                 continue;
@@ -80,11 +80,13 @@ where
                 fruitless += 1;
                 if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
                     fruitless = 0;
-                    // Only the state assembly depends on peers still
-                    // pinning the targeted boundary (and only there is
-                    // a restart sound — nothing has been imported yet);
-                    // the witness history serves from the live chain.
-                    if lock(&bootstrap).is_assembling_state()
+                    // Restart is sound in either pre-import assembly —
+                    // nothing has been written into the store yet. The
+                    // state ranges depend on peers still pinning the
+                    // targeted boundary; the witness history binds to the
+                    // anchor header, which peers may equally have pruned
+                    // past.
+                    if lock(&bootstrap).pre_import()
                         && topology_snapshot
                             .load()
                             .boundary(shard)

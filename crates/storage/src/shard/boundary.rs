@@ -10,7 +10,10 @@
 //! identically in simulation and production.
 
 use hyperscale_jmt::{Key, TreeReader};
-use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
+use hyperscale_types::{
+    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardWitnessPayload, StateRoot,
+    StoredReceipt,
+};
 
 /// How many boundary pins a backend retains before evicting the oldest.
 pub const BOUNDARY_RETAIN: usize = 3;
@@ -25,6 +28,23 @@ pub trait ResolveLeaf {
     /// The raw `(storage key, value)` behind `leaf_key`, or `None` when
     /// the leaf is unknown at this boundary.
     fn resolve_leaf(&self, leaf_key: &Key) -> Option<(Vec<u8>, Vec<u8>)>;
+}
+
+/// The beacon-witness window a snap-synced import seeds alongside the
+/// state.
+///
+/// Payloads for `[base, base + payloads.len())`, already verified
+/// against the anchor header's witness commitment by the assembler.
+/// Restores what a store that committed through the boundary would hold
+/// in its witness column: the accumulator rebuilds from it on restart,
+/// and the beacon fold's witness fetches answer from it. Empty for an
+/// import with no witness history — a reshape successor's fresh domain.
+#[derive(Debug, Clone, Default)]
+pub struct WitnessSeed {
+    /// Absolute leaf index of `payloads[0]` — the anchor window's base.
+    pub base: BeaconWitnessLeafCount,
+    /// The window's payloads in leaf-index order.
+    pub payloads: Vec<ShardWitnessPayload>,
 }
 
 /// One verified snap-sync leaf ready for import: the hashed JMT key and
@@ -67,9 +87,10 @@ pub trait BoundaryStore {
 
     /// Install a snap-synced boundary state at `height` into this
     /// (empty) store: raw substates, the JMT rebuilt from the shipped
-    /// leaf keys, and the leaf associations — the state-level image of a
-    /// store that committed through the boundary. Chain metadata is not
-    /// touched; tail block-sync from `height + 1` layers on top.
+    /// leaf keys, the leaf associations, and the anchor window's witness
+    /// payloads — the state-level image of a store that committed through
+    /// the boundary. Chain metadata is not touched; tail block-sync from
+    /// `height + 1` layers on top.
     ///
     /// Returns the resulting state root, which the caller must compare
     /// against the beacon-attested anchor before trusting the store.
@@ -82,6 +103,7 @@ pub trait BoundaryStore {
         &self,
         height: BlockHeight,
         leaves: Vec<ImportLeaf>,
+        witnesses: WitnessSeed,
     ) -> Result<StateRoot, String>;
 
     /// Apply the subset of a followed chain's block writes that falls

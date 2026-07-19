@@ -3,15 +3,16 @@
 //! Composes the two snap-sync assemblers into the full bootstrap a
 //! joining vnode runs against its beacon-attested boundary anchor:
 //!
-//! 1. **State** — [`SnapSync`] reconstructs the shard's committed state
+//! 1. **Witness history** — [`WitnessHistorySync`] assembles the anchor
+//!    window's leaf payloads, bound to the anchor through the boundary
+//!    header;
+//! 2. **State** — [`SnapSync`] reconstructs the shard's committed state
 //!    from verified range chunks;
-//! 2. **Import** — the assembled leaves surface as data
-//!    ([`ShardBootstrap::take_import`]); the driver writes them through
-//!    `BoundaryStore::import_boundary_state` and feeds the resulting
-//!    root back, which the sequencer checks against the anchor;
-//! 3. **Witness history** — [`WitnessHistorySync`] seeds the
-//!    beacon-witness accumulator, bound to the anchor through the
-//!    boundary header;
+//! 3. **Import** — the assembled leaves and the witness window surface
+//!    as data ([`ShardBootstrap::take_import`]); the driver writes both
+//!    through `BoundaryStore::import_boundary_state` in one atomic
+//!    import and feeds the resulting root back, which the sequencer
+//!    checks against the anchor;
 //! 4. **Complete** — the verified pieces assemble into the
 //!    [`RecoveredState`] the shard's state machines boot from.
 //!
@@ -25,15 +26,16 @@ pub mod witness_history;
 pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
-use hyperscale_storage::{GenesisCommit, ImportLeaf, RecoveredState, ShardChainReader};
+use hyperscale_storage::{
+    GenesisCommit, ImportLeaf, RecoveredState, ShardChainReader, WitnessSeed,
+};
 use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
 use hyperscale_types::network::response::{
-    GetStateRangeResponse, GetWitnessHistoryResponse, MAX_HASHES_PER_WITNESS_HISTORY,
-    MAX_LEAVES_PER_STATE_RANGE,
+    GetStateRangeResponse, GetWitnessHistoryResponse, MAX_LEAVES_PER_STATE_RANGE,
 };
 use hyperscale_types::{
-    BlockHeader, BlockHeight, Hash, NetworkDefinition, ShardAnchor, ShardId, StateRoot,
-    shard_prefix_path,
+    BlockHeader, BlockHeight, Hash, MAX_WITNESSES_PER_FETCH, NetworkDefinition, ShardAnchor,
+    ShardId, ShardWitnessPayload, StateRoot, shard_prefix_path,
 };
 
 use self::snap_sync::SnapSync;
@@ -105,7 +107,7 @@ pub(crate) const SPLIT_BITS: u8 = 4;
 pub(crate) const STATE_CHUNK_LIMIT: u32 = MAX_LEAVES_PER_STATE_RANGE as u32;
 
 #[allow(clippy::cast_possible_truncation)] // compile-time cap, far below u32::MAX
-const WITNESS_PAGE_LIMIT: u32 = MAX_HASHES_PER_WITNESS_HISTORY as u32;
+const WITNESS_PAGE_LIMIT: u32 = MAX_WITNESSES_PER_FETCH as u32;
 
 /// One outbound request the bootstrap wants in flight. The driver
 /// routes it to the target shard's committee and feeds the response
@@ -132,23 +134,36 @@ pub enum BootstrapOutcome {
 }
 
 enum Phase {
+    /// Assembling the beacon-witness history.
+    Witness(Box<WitnessHistorySync>),
     /// Assembling the shard's committed state.
     State(SnapSync),
     /// Leaves assembled and chunk-verified, waiting for the driver to
-    /// take them for the store import.
+    /// take them (with the witness window) for the store import.
     ImportReady(Vec<ImportLeaf>),
-    /// Driver took the leaves; waiting for the imported root.
+    /// Driver took the import; waiting for the imported root.
     Importing,
-    /// Assembling the beacon-witness leaf-hash history.
-    Witness(Box<WitnessHistorySync>),
-    /// Everything verified: the boundary header and witness history.
-    Complete(Box<BlockHeader>, Vec<Hash>),
+    /// Everything verified against the anchor.
+    Complete,
+}
+
+/// The witness phase's verified output: the anchor-bound boundary
+/// header, the derived leaf hashes that seed the accumulator, and the
+/// payloads the store import seeds — taken by [`ShardBootstrap::take_import`].
+struct VerifiedWitnessWindow {
+    header: Box<BlockHeader>,
+    hashes: Vec<Hash>,
+    payloads: Vec<ShardWitnessPayload>,
 }
 
 /// Sequencing state for one shard bootstrap.
 pub struct ShardBootstrap {
+    shard: ShardId,
     anchor: ShardAnchor,
     phase: Phase,
+    /// The verified witness window; set when the witness phase
+    /// completes, its payloads move into the import.
+    witness: Option<VerifiedWitnessWindow>,
     /// Total value bytes across the leaves handed to the driver for the
     /// store import — the imported substate byte total, identical to the
     /// total the store seeds at the anchor height. Seeds the recovered
@@ -157,10 +172,31 @@ pub struct ShardBootstrap {
 }
 
 impl ShardBootstrap {
-    /// Start a bootstrap against `anchor` for `shard`.
+    /// Start a bootstrap against `anchor` for `shard`. The witness
+    /// history assembles first — it serves from the live chain and its
+    /// payloads ride the state import — then the state fan-out.
     #[must_use]
     pub fn new(shard: ShardId, anchor: ShardAnchor) -> Self {
         Self {
+            shard,
+            anchor,
+            phase: Phase::Witness(Box::new(WitnessHistorySync::new(
+                anchor,
+                WITNESS_PAGE_LIMIT,
+            ))),
+            witness: None,
+            imported_substate_bytes: 0,
+        }
+    }
+
+    /// Start a state-only assembly against `anchor` — no witness
+    /// history. A merge keeper collects a terminating child's span this
+    /// way: the reformed parent's witness domain starts fresh, so the
+    /// import seeds no window and [`Self::take_import`]'s seed is empty.
+    #[must_use]
+    pub fn state_only(shard: ShardId, anchor: ShardAnchor) -> Self {
+        Self {
+            shard,
             anchor,
             phase: Phase::State(SnapSync::new(
                 anchor,
@@ -168,6 +204,7 @@ impl ShardBootstrap {
                 SPLIT_BITS,
                 STATE_CHUNK_LIMIT,
             )),
+            witness: None,
             imported_substate_bytes: 0,
         }
     }
@@ -183,17 +220,17 @@ impl ShardBootstrap {
     /// is complete.
     pub fn next_requests(&mut self) -> Vec<BootstrapRequest> {
         match &mut self.phase {
-            Phase::State(snap) => snap
-                .next_requests()
-                .into_iter()
-                .map(|(id, request)| BootstrapRequest::StateRange(id, request))
-                .collect(),
             Phase::Witness(witness) => witness
                 .next_request()
                 .map(BootstrapRequest::WitnessHistory)
                 .into_iter()
                 .collect(),
-            Phase::ImportReady(_) | Phase::Importing | Phase::Complete(..) => Vec::new(),
+            Phase::State(snap) => snap
+                .next_requests()
+                .into_iter()
+                .map(|(id, request)| BootstrapRequest::StateRange(id, request))
+                .collect(),
+            Phase::ImportReady(_) | Phase::Importing | Phase::Complete => Vec::new(),
         }
     }
 
@@ -222,22 +259,31 @@ impl ShardBootstrap {
         }
     }
 
-    /// The fully assembled, chunk-verified leaves, ready for
-    /// `BoundaryStore::import_boundary_state` at the anchor height.
-    /// `Some` exactly once; the driver answers with the imported root
-    /// via [`Self::on_imported`].
-    pub fn take_import(&mut self) -> Option<(BlockHeight, Vec<ImportLeaf>)> {
+    /// The fully assembled, chunk-verified leaves plus the verified
+    /// witness window, ready for `BoundaryStore::import_boundary_state`
+    /// at the anchor height. `Some` exactly once; the driver answers
+    /// with the imported root via [`Self::on_imported`].
+    pub fn take_import(&mut self) -> Option<(BlockHeight, Vec<ImportLeaf>, WitnessSeed)> {
         let Phase::ImportReady(leaves) = &mut self.phase else {
             return None;
         };
         let leaves = std::mem::take(leaves);
         self.phase = Phase::Importing;
         self.imported_substate_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
-        Some((self.anchor.height, leaves))
+        // A full bootstrap seeds the verified window; a state-only one
+        // ([`Self::state_only`]) has none and seeds nothing.
+        let seed = self
+            .witness
+            .as_mut()
+            .map_or_else(WitnessSeed::default, |window| WitnessSeed {
+                base: window.header.beacon_witness_base(),
+                payloads: std::mem::take(&mut window.payloads),
+            });
+        Some((self.anchor.height, leaves, seed))
     }
 
-    /// Verify the imported root against the attested anchor and open
-    /// the witness phase.
+    /// Verify the imported root against the attested anchor and
+    /// complete the bootstrap.
     ///
     /// # Errors
     ///
@@ -259,22 +305,34 @@ impl ShardBootstrap {
                 self.anchor.state_root,
             ));
         }
-        self.phase = Phase::Witness(Box::new(WitnessHistorySync::new(
-            self.anchor,
-            WITNESS_PAGE_LIMIT,
-        )));
+        self.phase = Phase::Complete;
         Ok(())
     }
 
-    /// Feed one witness-history response.
+    /// Feed one witness-history response. After the final page the
+    /// verified window is held for the import and the state fan-out
+    /// opens.
     pub fn on_witness_history(&mut self, response: &GetWitnessHistoryResponse) -> BootstrapOutcome {
         let Phase::Witness(witness) = &mut self.phase else {
             return BootstrapOutcome::Rejected("witness response outside the witness phase");
         };
         let outcome = witness.on_response(response);
         if witness.is_complete() {
-            let (header, hashes) = witness.take_parts();
-            self.phase = Phase::Complete(Box::new(header), hashes);
+            let (header, payloads) = witness.take_parts();
+            self.witness = Some(VerifiedWitnessWindow {
+                hashes: payloads
+                    .iter()
+                    .map(ShardWitnessPayload::leaf_hash)
+                    .collect(),
+                header: Box::new(header),
+                payloads,
+            });
+            self.phase = Phase::State(SnapSync::new(
+                self.anchor,
+                shard_prefix_path(self.shard),
+                SPLIT_BITS,
+                STATE_CHUNK_LIMIT,
+            ));
         }
         outcome
     }
@@ -286,19 +344,18 @@ impl ShardBootstrap {
         }
     }
 
-    /// Whether the bootstrap is still assembling state — the only
-    /// phase that depends on serving peers retaining the targeted
-    /// boundary pin, and the last at which restarting against a newer
-    /// anchor is sound (nothing has been imported into the store yet).
+    /// Whether nothing has been imported into the store yet — the
+    /// witness and state assemblies — the phases at which restarting
+    /// against a newer anchor is sound.
     #[must_use]
-    pub const fn is_assembling_state(&self) -> bool {
-        matches!(self.phase, Phase::State(_))
+    pub const fn pre_import(&self) -> bool {
+        matches!(self.phase, Phase::Witness(_) | Phase::State(_))
     }
 
     /// Whether every phase has completed and verified.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Complete(..))
+        matches!(self.phase, Phase::Complete)
     }
 
     /// The [`RecoveredState`] a snap-synced joiner boots from: tip at
@@ -310,13 +367,17 @@ impl ShardBootstrap {
     /// Panics unless [`Self::is_complete`].
     #[must_use]
     pub fn into_recovered_state(self) -> RecoveredState {
-        let Phase::Complete(header, hashes) = self.phase else {
-            panic!("bootstrap recovery taken before completion");
-        };
+        assert!(
+            matches!(self.phase, Phase::Complete),
+            "bootstrap recovery taken before completion",
+        );
+        let window = self
+            .witness
+            .expect("a complete bootstrap holds its verified witness window");
         RecoveredState::from_snap_synced_boundary(
             &self.anchor,
-            &header,
-            hashes,
+            &window.header,
+            window.hashes,
             self.imported_substate_bytes,
         )
     }
@@ -376,8 +437,10 @@ mod tests {
                     }
                 }
             }
-            if let Some((height, leaves)) = bootstrap.take_import() {
-                let root = fresh.import_boundary_state(height, leaves).unwrap();
+            if let Some((height, leaves, witnesses)) = bootstrap.take_import() {
+                let root = fresh
+                    .import_boundary_state(height, leaves, witnesses)
+                    .unwrap();
                 bootstrap.on_imported(root).unwrap();
             }
         }
@@ -395,7 +458,7 @@ mod tests {
         let leaves = witness_leaves();
         let (serving, anchor) = replica(&leaves);
         let pending_chain = PendingChain::new(Arc::clone(&serving));
-        let fresh = SimShardStorage::default();
+        let fresh = Arc::new(SimShardStorage::default());
 
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
         drive(&mut bootstrap, &serving, &pending_chain, &fresh);
@@ -404,14 +467,24 @@ mod tests {
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
-        assert_eq!(
-            recovered.beacon_witness_leaf_hashes,
-            leaves
-                .iter()
-                .map(ShardWitnessPayload::leaf_hash)
-                .collect::<Vec<_>>(),
-        );
+        let expected_hashes: Vec<Hash> =
+            leaves.iter().map(ShardWitnessPayload::leaf_hash).collect();
+        assert_eq!(recovered.beacon_witness_leaf_hashes, expected_hashes);
         assert_eq!(fresh.state_root(), anchor.state_root);
+
+        // The import seeded the anchor window's payloads: the store
+        // rebuilds its accumulator across a restart and answers the
+        // beacon fold's witness fetches, without ever having executed
+        // the pre-anchor chain.
+        assert_eq!(
+            PendingChain::new(Arc::clone(&fresh))
+                .get_beacon_witness_payload_range(0, leaves.len() as u64),
+            leaves,
+        );
+        assert_eq!(
+            fresh.load_recovered_state().beacon_witness_leaf_hashes,
+            expected_hashes,
+        );
     }
 
     /// A diverging import root is terminal: the store holds an import
@@ -419,13 +492,20 @@ mod tests {
     #[test]
     fn import_root_mismatch_is_an_error() {
         let (serving, anchor) = replica(&[]);
+        let pending_chain = PendingChain::new(Arc::clone(&serving));
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
         let mut imported = false;
         for _ in 0..1_000 {
             for request in bootstrap.next_requests() {
-                if let BootstrapRequest::StateRange(id, request) = request {
-                    let response = serve_state_range_request(&serving, &request);
-                    bootstrap.on_state_range(id, &response);
+                match request {
+                    BootstrapRequest::StateRange(id, request) => {
+                        let response = serve_state_range_request(&serving, &request);
+                        bootstrap.on_state_range(id, &response);
+                    }
+                    BootstrapRequest::WitnessHistory(request) => {
+                        let response = serve_witness_history_request(&pending_chain, &request);
+                        bootstrap.on_witness_history(&response);
+                    }
                 }
             }
             if bootstrap.take_import().is_some() {
@@ -451,18 +531,19 @@ mod tests {
         let pending_chain = PendingChain::new(Arc::clone(&serving));
 
         let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
-        // Still in the state phase: a witness response is unsolicited.
-        let witness_request = GetWitnessHistoryRequest {
+        // Still in the witness phase: a state response is unsolicited.
+        let state_request = GetStateRangeRequest {
             height: anchor.height,
-            block_hash: anchor.block_hash,
-            start_index: 0,
+            start: Hash::ZERO,
+            end: Hash::ZERO,
             limit: 16,
         };
-        let response = serve_witness_history_request(&pending_chain, &witness_request);
+        let response = serve_state_range_request(&serving, &state_request);
         assert!(matches!(
-            bootstrap.on_witness_history(&response),
+            bootstrap.on_state_range(0, &response),
             BootstrapOutcome::Rejected(_),
         ));
+        let _ = pending_chain;
         assert!(!bootstrap.next_requests().is_empty());
     }
 }

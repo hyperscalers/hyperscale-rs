@@ -18,8 +18,8 @@ use std::sync::Arc;
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, JmtSnapshot, ResolveLeaf, filter_updates_to_prefix,
-    merge_owned_nodes, merge_updates_from_receipts,
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, JmtSnapshot, ResolveLeaf, WitnessSeed,
+    filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, Hash, StateRoot, StoredReceipt};
 use rocksdb::checkpoint::Checkpoint;
@@ -27,7 +27,8 @@ use rocksdb::{DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf, SubstateBytesCf,
+    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf,
+    SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -231,6 +232,7 @@ impl BoundaryStore for RocksDbShardStorage {
         &self,
         height: BlockHeight,
         leaves: Vec<ImportLeaf>,
+        witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let _commit_guard = self
             .commit_lock
@@ -266,6 +268,20 @@ impl BoundaryStore for RocksDbShardStorage {
                 assoc_cf,
                 &Hash::from_hash_bytes(&leaf.leaf_key),
                 &leaf.storage_key,
+            );
+        }
+        // Seed the anchor window's witness payloads at their absolute leaf
+        // indices, exactly where a store that committed through the
+        // boundary would hold them: the accumulator rebuilds from this
+        // column on restart, and the beacon fold's witness fetches answer
+        // from it.
+        let witness_cf = BeaconWitnessesCf::handle(&cf);
+        for (offset, payload) in witnesses.payloads.iter().enumerate() {
+            batch_put::<BeaconWitnessesCf>(
+                &mut batch,
+                witness_cf,
+                &(witnesses.base.inner() + offset as u64),
+                payload,
             );
         }
         // Seed the substate byte total: a fresh-tree import's byte delta IS

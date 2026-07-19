@@ -293,7 +293,7 @@ impl KeeperHalf {
     fn new(child: ShardId, anchor: ShardAnchor) -> Self {
         Self {
             child,
-            bootstrap: Box::new(ShardBootstrap::new(child, anchor)),
+            bootstrap: Box::new(ShardBootstrap::state_only(child, anchor)),
             leaves: None,
             terminal: None,
             terminal_requested: false,
@@ -1111,7 +1111,7 @@ fn advance_keeper_half(
                 kind: FetchKind::StateRange { sub_range, request },
             });
         }
-        if let Some((_, leaves)) = half.bootstrap.take_import() {
+        if let Some((_, leaves, _)) = half.bootstrap.take_import() {
             half.leaves = Some(leaves);
         }
     }

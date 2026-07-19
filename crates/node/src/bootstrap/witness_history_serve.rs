@@ -2,18 +2,16 @@
 
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_types::MAX_WITNESSES_PER_FETCH;
 use hyperscale_types::network::request::GetWitnessHistoryRequest;
-use hyperscale_types::network::response::{
-    GetWitnessHistoryResponse, MAX_HASHES_PER_WITNESS_HISTORY, WitnessHistoryChunk,
-};
-use hyperscale_types::{Hash, ShardWitnessPayload};
+use hyperscale_types::network::response::{GetWitnessHistoryResponse, WitnessHistoryChunk};
 use tracing::{debug, warn};
 
 /// Serve an inbound snap-sync witness-history request.
 ///
 /// Resolves the boundary header the joiner's beacon-attested anchor
 /// names, cross-checks its hash, and answers a page of the
-/// accumulator's leaf hashes up to the header's leaf count. Every
+/// accumulator's leaf payloads up to the header's leaf count. Every
 /// degraded case — unknown height, fork-divergent hash, retention-pruned
 /// leaves — answers `history: None` so the joiner rotates to another
 /// peer rather than receiving something unverifiable.
@@ -50,7 +48,7 @@ pub fn serve_witness_history_request<S: ShardStorage>(
     if start > count {
         return unavailable;
     }
-    let limit = (req.limit as usize).clamp(1, MAX_HASHES_PER_WITNESS_HISTORY) as u64;
+    let limit = (req.limit as usize).clamp(1, MAX_WITNESSES_PER_FETCH) as u64;
     let end = count.min(start.saturating_add(limit));
     let payloads = pending_chain.get_beacon_witness_payload_range(start, end);
     if (payloads.len() as u64) < end - start {
@@ -63,16 +61,12 @@ pub fn serve_witness_history_request<S: ShardStorage>(
         );
         return unavailable;
     }
-    let leaf_hashes: Vec<Hash> = payloads
-        .iter()
-        .map(ShardWitnessPayload::leaf_hash)
-        .collect();
 
-    record_fetch_response_sent("witness_history", leaf_hashes.len());
+    record_fetch_response_sent("witness_history", payloads.len());
     GetWitnessHistoryResponse {
         history: Some(WitnessHistoryChunk {
             header: header.clone(),
-            leaf_hashes: leaf_hashes.into(),
+            payloads: payloads.into(),
             more: end < count,
         }),
     }
@@ -85,7 +79,7 @@ mod tests {
     use hyperscale_storage::PendingChain;
     use hyperscale_storage::test_helpers::{commit_block_with_witnesses, stake_deposit};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::{BlockHash, BlockHeight};
+    use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
 
     use super::*;
 
@@ -117,7 +111,7 @@ mod tests {
                 .history
                 .expect("committed anchor serves");
             assert_eq!(chunk.header.hash(), block_hash);
-            assembled.extend(chunk.leaf_hashes.iter().copied());
+            assembled.extend(chunk.payloads.iter().map(ShardWitnessPayload::leaf_hash));
             if !chunk.more {
                 break;
             }
@@ -177,7 +171,7 @@ mod tests {
         let chunk = serve_witness_history_request(&pending_chain, &request(1, block_hash, 0, 10))
             .history
             .expect("zero-leaf anchor still serves its header");
-        assert!(chunk.leaf_hashes.is_empty());
+        assert!(chunk.payloads.is_empty());
         assert!(!chunk.more);
     }
 }

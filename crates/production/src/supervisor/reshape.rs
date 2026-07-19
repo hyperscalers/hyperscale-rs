@@ -22,7 +22,9 @@ use hyperscale_node::reshape::orchestrator::{
 };
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::serve_state_range_request;
-use hyperscale_storage::{BoundaryStore, ImportLeaf, RecoveredState, ShardChainReader};
+use hyperscale_storage::{
+    BoundaryStore, ImportLeaf, RecoveredState, ShardChainReader, WitnessSeed,
+};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::GetStateRangeRequest;
@@ -432,7 +434,7 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match storage.import_boundary_state(height, leaves) {
+            match storage.import_boundary_state(height, leaves, WitnessSeed::default()) {
                 Ok(root) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Imported {
                         shard,

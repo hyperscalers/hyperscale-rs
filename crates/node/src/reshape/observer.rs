@@ -424,7 +424,7 @@ mod tests {
 
     use hyperscale_jmt::{Blake3Hasher, Hasher};
     use hyperscale_storage::test_helpers::pin_snap_sync_replica;
-    use hyperscale_storage::{BoundaryStore, SubstateStore};
+    use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::Hash;
 
@@ -467,7 +467,9 @@ mod tests {
                 );
             }
             if let Some((height, leaves)) = bootstrap.take_import() {
-                let root = store.import_boundary_state(height, leaves).unwrap();
+                let root = store
+                    .import_boundary_state(height, leaves, WitnessSeed::default())
+                    .unwrap();
                 bootstrap.on_imported(root);
             }
         }

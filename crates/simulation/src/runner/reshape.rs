@@ -32,7 +32,7 @@ use hyperscale_node::reshape::orchestrator::{
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{serve_block_request, serve_state_range_request};
-use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, WitnessSeed};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::GetBlockRequest;
@@ -124,7 +124,7 @@ impl SimulationRunner {
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .import_boundary_state(height, leaves)
+                    .import_boundary_state(height, leaves, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
                 Some(ReshapeEvent::Imported { shard, root })
             }

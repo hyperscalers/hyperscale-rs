@@ -355,9 +355,9 @@ impl SimulationRunner {
             if bootstrap.is_complete() {
                 break;
             }
-            if let Some((height, leaves)) = bootstrap.take_import() {
+            if let Some((height, leaves, witnesses)) = bootstrap.take_import() {
                 let root = storage
-                    .import_boundary_state(height, leaves)
+                    .import_boundary_state(height, leaves, witnesses)
                     .expect("boundary import into a fresh store");
                 bootstrap
                     .on_imported(root)

@@ -17,6 +17,7 @@ use hyperscale_storage::{
     BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
     DbSubstateValue, GenesisCommit, ImportLeaf, JmtSnapshot, PartitionEntry, SafeVoteRegisterStore,
     ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
+    WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
@@ -175,8 +176,9 @@ impl BoundaryStore for SharedStorage {
         &self,
         height: BlockHeight,
         leaves: Vec<ImportLeaf>,
+        witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
-        self.0.import_boundary_state(height, leaves)
+        self.0.import_boundary_state(height, leaves, witnesses)
     }
 
     fn follow_block_writes(
