@@ -25,9 +25,23 @@ from math import comb, exp, lgamma, log
 
 # ── Deployment parameters (defaults mirror intent, not the dev constants) ──
 EPOCH_SECONDS = 300             # production target (BeaconChainConfig default); dev sim uses 2s
-SHUFFLE_INTERVAL_EPOCHS = 16    # crates/types/src/beacon/constants.rs
+SHUFFLE_SYNC_HEADROOM = 8       # crates/types/src/beacon/constants.rs
+READY_TIMEOUT_EPOCHS = 32       # BeaconChainConfig::production() sync budget
 EPOCHS_PER_YEAR = 365.25 * 86400 / EPOCH_SECONDS
-SHUFFLE_EVENTS_PER_SHARD_YEAR = EPOCHS_PER_YEAR / SHUFFLE_INTERVAL_EPOCHS
+
+
+def shuffle_interval_epochs(n: int) -> int:
+    """The fold's derived rotation cadence
+    (BeaconChainConfig::shuffle_interval_epochs):
+    max(1, ceil(SHUFFLE_SYNC_HEADROOM * READY_TIMEOUT_EPOCHS / n)).
+    Tenure n*I >= SHUFFLE_SYNC_HEADROOM * READY_TIMEOUT_EPOCHS whatever
+    the committee size, keeping at most n/SHUFFLE_SYNC_HEADROOM seats
+    inside their sync budget concurrently."""
+    return max(1, -(-(SHUFFLE_SYNC_HEADROOM * READY_TIMEOUT_EPOCHS) // max(n, 1)))
+
+
+def shuffle_events_per_shard_year(n: int) -> float:
+    return EPOCHS_PER_YEAR / shuffle_interval_epochs(n)
 
 # Candidate committee sizes, capped by message complexity (256 is already
 # questionable on that axis); 4 is the current dev value, for reference.
@@ -106,7 +120,7 @@ def crossing_rate(N: int, M: int, n: int, boundary: int | None = None) -> float:
 # the beacon committee; the resample boost lifts it above that (table T).
 
 def grind_shard_march_days(
-    n: int, beta: float, t: int, interval: int = SHUFFLE_INTERVAL_EPOCHS
+    n: int, beta: float, t: int, interval: int | None = None
 ) -> float:
     """Expected days to march ONE targeted shard from beta*n to f+1 corrupt
     seats under a best-of-2^t grind of the trickle shuffle. Each event the
@@ -116,6 +130,7 @@ def grind_shard_march_days(
     steers away from corrupt-losing rotations, so a no-gain event holds rather
     than loses. Converges to the deterministic floor (f+1-beta*n events) as
     2^t * p_gain >> 1."""
+    interval = shuffle_interval_epochs(n) if interval is None else interval
     f = f_of(n)
     c0 = round(beta * n)
     k = 2 ** t
@@ -572,6 +587,7 @@ def sim_resample_boost(n, beta, beacon_size, omit_frac, jail, cooldown,
 
     rng = Random(seed)
     f = f_of(n)
+    interval = shuffle_interval_epochs(n)
     E_tot = eligible if eligible is not None else shards * n + round(pool_factor * n)
     A_c = round(beta * E_tot)          # corrupt eligible, not jailed, not on target
     ring = [0] * max(cooldown, 1)      # jail-return ring buffer
@@ -602,7 +618,7 @@ def sim_resample_boost(n, beta, beacon_size, omit_frac, jail, cooldown,
             jailed += take
             ring[(t + cooldown) % len(ring)] += take
 
-        if t % SHUFFLE_INTERVAL_EPOCHS == 0:
+        if t % interval == 0:
             shuffle_events += 1
             if committee.pop(0):
                 A_c += 1
@@ -700,8 +716,10 @@ def check_resample_boost() -> None:
 # natural (beta*b) — a rate limit the huge supply does not defeat. Stacked
 # additively with jail-on-first (which plugs the ramp leak when its cooldown
 # matches the recency period) and FIFO shard eviction (which stops bursts from
-# accumulating), it holds the target shard's sustained corrupt below the terminal
-# 2f+1 line and pushes the first 2f+1 crossing from beta~0.12 to ~0.14. Mean
+# accumulating), it holds the target shard's sustained corrupt well below the
+# no-recency stack's and trims the burst peaks; at the derived shuffle interval
+# the first 2f+1 PEAK crossing sits at beta~0.12, level with the sampling
+# budget line rather than outside it (table T commentary). Mean
 # field over recency buckets (exact depletion feedback). The ramp sharpness and
 # jail-cooldown coupling are tuning knobs — a sharper ramp caps tighter but
 # makes the committee more predictable (the §4 trade).
@@ -715,6 +733,7 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
 
     rng = Random(seed)
     E = shards * n
+    interval = shuffle_interval_epochs(n)
     cooldown = max(1, E // b)                 # additive recovery period
     jail_cd = cooldown if jail_cd is None else jail_cd
     Cn = round(beta * E)
@@ -766,7 +785,7 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
         w_prev = 1 << min(T, 60)
         sum_T += T
         peak_T = max(peak_T, T)
-        if t % SHUFFLE_INTERVAL_EPOCHS == 0:
+        if t % interval == 0:
             if with_fifo:
                 committee.pop(0)
             else:
@@ -841,13 +860,14 @@ def reveal_ceremony_p_event(beta, p, beacon_size=16):
 
 
 def witness_march_days(n, beta, sight=1.0, edge_windows=2,
-                       interval=SHUFFLE_INTERVAL_EPOCHS):
+                       interval=None):
     """Days to march one targeted shard from beta*n to f+1 under the
     witness-reveal fold — grind_shard_march_days with each step's best-of-2^t
     replaced by the edge residual. Retains that model's monotone-hold grant
     (no-gain events never lose seats), which the witness fold does NOT give
     the adversary — unsighted epochs are natural mean-reverting rotations —
     so this is a strict upper bound on the march speed."""
+    interval = shuffle_interval_epochs(n) if interval is None else interval
     f = f_of(n)
     c = round(beta * n)
     intervals = 0.0
@@ -930,9 +950,10 @@ def wt_edge_p_event(beta, p):
     return (1.0 - beta) * p + beta * (1.0 - (1.0 - p) ** 2)
 
 
-def wt_march_days(n, beta, interval=SHUFFLE_INTERVAL_EPOCHS):
+def wt_march_days(n, beta, interval=None):
     """Days to march one shard to f+1 under the WT-cutoff residual — the
     grind_shard_march_days skeleton with the beta-gated best-of-2 per step."""
+    interval = shuffle_interval_epochs(n) if interval is None else interval
     f = f_of(n)
     c = round(beta * n)
     intervals = 0.0
@@ -1038,12 +1059,14 @@ def main() -> None:
     # B: trickle-shuffle boundary crossings per shard-year
     table(
         f"B. Expected compromises per shard-year under the trickle shuffle\n"
-        f"   ({EPOCH_SECONDS}s epochs, shuffle every {SHUFFLE_INTERVAL_EPOCHS} epochs "
-        f"=> {SHUFFLE_EVENTS_PER_SHARD_YEAR:,.0f} events/shard-year)",
+        f"   ({EPOCH_SECONDS}s epochs; derived interval I(n) = "
+        f"ceil({SHUFFLE_SYNC_HEADROOM * READY_TIMEOUT_EPOCHS}/n) epochs => "
+        f"{', '.join(f'{n}: {shuffle_events_per_shard_year(n):,.0f}' for n in N_SWEEP)} "
+        f"events/shard-year)",
         "n",
         N_SWEEP,
         BETA_SWEEP,
-        lambda n, b: SHUFFLE_EVENTS_PER_SHARD_YEAR
+        lambda n, b: shuffle_events_per_shard_year(n)
         * crossing_rate(POOL_FACTOR * n, round(POOL_FACTOR * n * b), n),
     )
 
@@ -1068,7 +1091,7 @@ def main() -> None:
         for b in BETA_SWEEP:
             found = "    -    "
             for n in CANDIDATES:
-                rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(
+                rate = shuffle_events_per_shard_year(n) * crossing_rate(
                     POOL_FACTOR * n, round(POOL_FACTOR * n * b), n
                 )
                 if rate <= budget:
@@ -1089,7 +1112,7 @@ def main() -> None:
             N = POOL_FACTOR * n
             best = 0
             for M in range(0, N // 2):
-                rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n)
+                rate = shuffle_events_per_shard_year(n) * crossing_rate(N, M, n)
                 if rate > budget:
                     break
                 best = M
@@ -1102,19 +1125,20 @@ def main() -> None:
     # member's residual tenure (~n * I epochs). Little's law gives the
     # equilibrium landed count; the budget is the slack f - beta*n.
     print("\nE. Max sustainable targeted corruptions/epoch against one shard")
-    print("   (r_max = (f - beta*n) / (survival(tau) * n * I);  I = "
-          f"{SHUFFLE_INTERVAL_EPOCHS} epochs)")
+    print("   (r_max = (f - beta*n) / (survival(tau) * n * I(n));  derived "
+          "I(n) per row)")
     beta = 0.10
     taus = [16, 160, 1600, 16000]
     print(f"   beta={beta}:  n  | " + " ".join(f"tau={t:<6}" for t in taus))
     print("  " + "-" * 60)
     for n in [32, 128, 256]:
         f = f_of(n)
+        interval = shuffle_interval_epochs(n)
         cells = []
         for tau in taus:
-            surv = (1 - 1 / n) ** (tau / SHUFFLE_INTERVAL_EPOCHS)
+            surv = (1 - 1 / n) ** (tau / interval)
             slack = f - beta * n
-            r = slack / (surv * n * SHUFFLE_INTERVAL_EPOCHS) if surv > 0 else float("inf")
+            r = slack / (surv * n * interval) if surv > 0 else float("inf")
             cells.append(fmt(r))
         print(f"        {n:>6} | " + " ".join(cells))
 
@@ -1163,15 +1187,16 @@ def main() -> None:
     n = 128
     N = POOL_FACTOR * n
     f = f_of(n)
+    interval = shuffle_interval_epochs(n)
     shards = 100
     print(f"\nG. Operating point n=128: f={f}, quorum={2 * f + 1}, "
-          f"turnover {n * SHUFFLE_INTERVAL_EPOCHS} epochs "
-          f"({n * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 3600:.1f}h at "
+          f"derived I={interval}, turnover {n * interval} epochs "
+          f"({n * interval * EPOCH_SECONDS / 3600:.1f}h at "
           f"{EPOCH_SECONDS}s epochs)")
     print(f"    beta   | per-shard-yr | {shards}-shard network")
     print("  " + "-" * 50)
     for beta in [0.08, 0.10, 0.11, 0.12, 0.122, 0.13, 0.14, 0.15]:
-        rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, round(N * beta), n)
+        rate = shuffle_events_per_shard_year(n) * crossing_rate(N, round(N * beta), n)
         net = rate * shards
         right = f"1 per {1 / net:,.0f} yr" if net < 1 else f"{net:.2f} / yr"
         print(f"    {beta:5.3f}  |   {rate:8.2e}   | {right}")
@@ -1221,7 +1246,7 @@ def main() -> None:
     harmonic = sum(1 / j for j in range(1, j_ops + 1))
     zipf = [max(1, round(N / harmonic / j)) for j in range(1, j_ops + 1)]
     profiles[2] = ("zipf, 256 entities", zipf)
-    targets = [0.05, 0.10, 0.131]
+    targets = [0.05, 0.10, 0.123]
     print("\nL. Units to subvert (largest-first) to reach a corrupt seat share")
     print("   (a hacked machine or bribed entity; the protocol cannot bound "
           "concentration)")
@@ -1307,10 +1332,11 @@ def main() -> None:
     beta = 0.10
     f = f_of(n)
     c0 = round(beta * n)
-    floor_days = (f + 1 - c0) * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 86400
+    interval = shuffle_interval_epochs(n)
+    floor_days = (f + 1 - c0) * interval * EPOCH_SECONDS / 86400
     print(f"\nM. Fallback ceremony grind: days to march one targeted shard "
           f"from beta*n={c0} to f+1={f + 1} corrupt")
-    print(f"   (n={n}, beta={beta}, shuffle every {SHUFFLE_INTERVAL_EPOCHS} "
+    print(f"   (n={n}, beta={beta}, derived shuffle interval {interval} "
           f"epochs; best-of-2^t steering of the ceremony mix)")
     print("    grind t | candidate seeds 2^t | days to fork the shard")
     print("  " + "-" * 56)
@@ -1429,8 +1455,8 @@ def main() -> None:
     print("  " + "-" * 66)
     for beta in (0.30, 0.35, 0.38, 0.40, 0.42, 0.45):
         M = round(N * beta)
-        t_rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n, terminal)
-        h_rate = SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n)
+        t_rate = shuffle_events_per_shard_year(n) * crossing_rate(N, M, n, terminal)
+        h_rate = shuffle_events_per_shard_year(n) * crossing_rate(N, M, n)
         net = t_rate * shards
         right = f"1 per {1 / net:,.0f} yr" if 0 < net < 1 else f"{net:8.2f} / yr"
         print(f"    {beta:5.3f}  |     {t_rate:8.2e}  | {right:>17} | "
@@ -1440,7 +1466,7 @@ def main() -> None:
     for budget in (1e-3, 1e-6, 1e-9):
         best = 0
         for M in range(0, round(N * 0.6)):
-            if SHUFFLE_EVENTS_PER_SHARD_YEAR * crossing_rate(N, M, n, terminal) > budget:
+            if shuffle_events_per_shard_year(n) * crossing_rate(N, M, n, terminal) > budget:
                 break
             best = M
         print(f"    {budget:26.0e} | {best / N:8.3f}")
@@ -1488,10 +1514,13 @@ def main() -> None:
         downtime = halt_days / (march + halt_days)
         print(f"    {beta:5.2f} | {march:>10.1f}d | {halt_days * 24:>8.1f}h | "
               f"{downtime:>28.1%}")
-    print("   (continuous grinding buys a few-percent downtime on one shard, "
-          "flushed each cycle — this recovers")
-    print("    the f+1 LIVENESS halt only; the 2f+1 safety march is terminal and "
-          "prevention-only, §10.1.)")
+    print("   (at the derived interval the march is short enough that continuous "
+          "grinding sustains roughly a")
+    print("    quarter downtime on ONE shard, flushed each cycle — this recovers "
+          "the f+1 LIVENESS halt only;")
+    print("    the 2f+1 safety march is terminal and prevention-only, §10.1. "
+          "Sustaining the march at all")
+    print("    requires the network-scale crossing suppression of §10.4.)")
 
     # T: the small-beacon width cap, tested against the pool it actually draws
     # from (§10.5). grind_width_cap prices the target equilibrium off the
@@ -1551,7 +1580,7 @@ def main() -> None:
               f"     | {r20['final_c']:>3d}({r20['max_c']:>3d}) {reach(r20):>6}")
     print("   (2f+1 is TERMINAL — no recovery. b=16 holds the shard below it to "
           "beta~0.12, thin against")
-    print("    the ~0.13 the sampling budget tolerates; b=20 reaches 2f+1 already "
+    print("    the ~0.12 the sampling budget tolerates; b=20 reaches 2f+1 already "
           "at the design point.")
     print("    Pool hygiene keeping beta low is the primary means of widening the "
           "margin.)")
@@ -1567,14 +1596,16 @@ def main() -> None:
         fu = sim_recency(n, beta, 16, 12000, 400 + int(beta * 100))
         print(f"    {beta:.2f}  | {d['final_c']:>3d}({d['max_c']:>3d}) {reach(d):>6}      "
               f" | {fu['final_c']:>3d}({fu['max_c']:>3d}) {reach(fu):>6}")
-    print("   (recency pushes the first 2f+1 crossing from beta~0.12 to ~0.14 — "
-          "outside the ~0.13 the budget")
-    print("    tolerates — and leaves a wide margin at the design point. As built: "
-          "a linear-additive ramp over")
-    print("    eligible/b, and the jail-on-first synergy is realized by holding the "
-          "withholding jail for a full")
-    print("    recency period (jail_cd = cooldown here) — the ramp alone lands at "
-          "~0.12; the long jail reaches ~0.14.)")
+    print("   (recency roughly halves the SUSTAINED foothold at the design point "
+          "and trims the peaks, but at")
+    print("    the derived interval the full stack's first 2f+1 PEAK crossing "
+          "sits at beta~0.12 — level with")
+    print("    the ~0.12 budget line, not outside it. The terminal margin rests "
+          "on the sustained line, pool")
+    print("    hygiene, and the §10.4 suppression cost. As built: a "
+          "linear-additive ramp over eligible/b,")
+    print("    with the withholding jail held for a full recency period "
+          "(jail_cd = cooldown here).)")
 
     print("\n   Jail-on-first honest purge: worst-case ceiling vs realized under "
           "partial synchrony (b=20):")
@@ -1622,7 +1653,7 @@ def main() -> None:
           "dilutes it further.)")
 
     print(f"\nW2. Days to march one targeted shard to f+1 (n={n}, beta={beta}, "
-          f"I={SHUFFLE_INTERVAL_EPOCHS})")
+          f"derived I={shuffle_interval_epochs(n)})")
     print("    scheme                         | days to f+1")
     print("  " + "-" * 48)
     cer = grind_shard_march_days(n, beta, round(beta * 16))
@@ -1630,7 +1661,7 @@ def main() -> None:
     for m in (1, 2, 4):
         wd = witness_march_days(n, beta, 1.0, m)
         print(f"    witness edge  m={m} (sight=1)      | {wd:>10.1f}")
-    floor_days = (f + 1 - round(beta * n)) * SHUFFLE_INTERVAL_EPOCHS * EPOCH_SECONDS / 86400
+    floor_days = (f + 1 - round(beta * n)) * shuffle_interval_epochs(n) * EPOCH_SECONDS / 86400
     print(f"   (deterministic floor {floor_days:.1f}d. The witness march is an "
           "UPPER bound on speed —")
     print("    it keeps the model's monotone-hold grant the witness fold does "

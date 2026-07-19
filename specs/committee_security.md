@@ -66,22 +66,26 @@ certification.
 
 ## 2. The trickle shuffle is a birth–death chain
 
-One member rotates out per shard per `SHUFFLE_INTERVAL_EPOCHS` (16), replaced
-from the pool. The committee's corrupt count k is then a Bernoulli–Laplace
+One member rotates out per shard per shuffle interval, replaced from the
+pool. The interval is derived, not stored:
+`I(n) = max(1, ⌈SHUFFLE_SYNC_HEADROOM · ready_timeout_epochs / n⌉)`
+(§6 Rider 1 — at the production sync budget, I(32)=8, I(128)=2, I(256)=1).
+The committee's corrupt count k is then a Bernoulli–Laplace
 birth–death chain whose stationary law is *exactly* the hypergeometric of §1
 (detailed balance; asserted numerically in the script, measured against the
 fold in §7). Failures are boundary crossings k = f → f+1; the stationary
 crossing rate π(f)·p↑(f) per shuffle event, conservatively counting every
 crossing as a compromise, gives expected compromises per shard-year (300s
-epochs → 6,574 events/shard-year):
+epochs; the derived interval makes events/shard-year n-dependent — 13,149 at
+n=32 up to 105,192 at n=256):
 
 | n | β=0.05 | β=0.10 | β=0.15 | β=0.20 |
 |---|---|---|---|---|
-| 32 | 1.0e-04 | 0.18 | 5.9 | 41 |
-| 64 | 1.9e-11 | 6.8e-05 | 0.081 | 4.4 |
-| 96 | 5.8e-17 | 1.6e-07 | 3.9e-03 | 1.1 |
-| 128 | 1.3e-23 | 7.4e-11 | 6.7e-05 | 0.14 |
-| 256 | 6.7e-49 | 2.3e-23 | 2.1e-11 | 1.1e-04 |
+| 32 | 2.1e-04 | 0.36 | 12 | 83 |
+| 64 | 7.8e-11 | 2.7e-04 | 0.32 | 17 |
+| 96 | 3.1e-16 | 8.3e-07 | 0.021 | 5.9 |
+| 128 | 1.1e-22 | 5.9e-10 | 5.4e-04 | 1.2 |
+| 256 | 1.1e-47 | 3.8e-22 | 3.4e-10 | 1.7e-03 |
 
 Trickling beats independent per-event redraws by only 3–20× (script table C;
 the beacon committee's per-epoch resample lives in the redraw column — §1):
@@ -96,24 +100,24 @@ maximum pool corruption each candidate tolerates:
 
 | budget | β=0.05 | β=0.10 | β=0.15 | β=0.20 |
 |---|---|---|---|---|
-| 10⁻³ | 32 | 64 | 128 | 256 |
+| 10⁻³ | 32 | 64 | 128 | — |
 | 10⁻⁶ | 64 | 96 | 256 | — |
 | 10⁻⁹ | 64 | 128 | 256 | — |
 
 | budget | n=32 | n=64 | n=96 | n=128 | n=256 |
 |---|---|---|---|---|---|
-| 10⁻³ | β≤0.059 | 0.115 | 0.141 | 0.164 | 0.210 |
-| 10⁻⁶ | β≤0.034 | 0.080 | 0.107 | 0.131 | 0.182 |
-| 10⁻⁹ | β≤0.022 | 0.059 | 0.083 | 0.107 | 0.160 |
+| 10⁻³ | β≤0.056 | 0.107 | 0.131 | 0.153 | 0.198 |
+| 10⁻⁶ | β≤0.033 | 0.075 | 0.101 | 0.123 | 0.172 |
+| 10⁻⁹ | β≤0.020 | 0.055 | 0.079 | 0.101 | 0.153 |
 
-Boundary note: 96 at β=0.10 clears the 10⁻⁶ budget by 6× — workable but
-thin; 128 clears it by four orders.
+Boundary note: 96 at β=0.10 barely clears the 10⁻⁶ budget (1.2×); 128
+clears it by three orders.
 
 **β dominates n, and the cap makes that binding.** Going from
 n=32 to n=256 (8× the seats, and the message-complexity price that implies)
-only moves tolerable corruption from 3% to 18% at the 10⁻⁶ budget. With the
-practical ceiling at 128, the pool must stay under ~13% corrupt seats — under
-~11% if 96 is the operating point. Every mechanism that suppresses pool
+only moves tolerable corruption from 3% to 17% at the 10⁻⁶ budget. With the
+practical ceiling at 128, the pool must stay under ~12% corrupt seats — under
+~10% if 96 is the operating point. Every mechanism that suppresses pool
 corruption (the stake price, jailing, expulsion, the sybil floor) buys more
 security per unit than seats do; committee size is the dial, pool hygiene is
 the lever, and the ceiling on n turns "keep β low" from advice into a
@@ -147,16 +151,18 @@ campaign], the transient the heuristic approximates:
   — the campaign compromises with probability 1 at every I from 16 down to
   2. Rotation cannot flush a target that turns in half a day.
 - **Slow corruption (τ=1,600 epochs ≈ 5.6 days) is where the interval
-  bites.** At the default I=16 the campaign still wins (0.63 even at
-  pressure 16); at I=2 it is forced onto the graded tail (P = 0.016 at
-  pressure 64, 0.25 at pressure 85 — and 85 concurrent attempts costs ~111
-  targeted corruptions/day, sustained).
+  bites.** At a slow interval (I=16) the campaign still wins (0.63 even at
+  pressure 16); at the derived operating interval (I(128)=2) it is forced
+  onto the graded tail (P = 0.016 at pressure 64, 0.25 at pressure 85 — and
+  85 concurrent attempts costs ~111 targeted corruptions/day, sustained).
 
 **Fast rotation converts slow cheap corruption into fast expensive
 corruption; it does not stop a fast adversary.** This is the
-heuristic's qualitative claim, now exact. Per-member tenure grows with n
-(n=128, I=16: 7.1 days at 300s epochs), so larger committees are more
-exposed to slow adaptation; shrinking I is the lever (§6). What the rate
+heuristic's qualitative claim, now exact. Under a fixed interval,
+per-member tenure would grow with n, exposing larger committees more to
+slow adaptation; the derived interval cancels exactly that — tenure is
+pinned near `SHUFFLE_SYNC_HEADROOM · ready_timeout_epochs` (21.3h at the
+production sync budget) whatever the committee size (§6). What the rate
 heuristic misses entirely is the **budget-constrained** adversary.
 
 **A budget-limited adversary gains materially from adapting, so the
@@ -238,13 +244,22 @@ sampling decides where seats land, so the adversary buys the pool fraction.
 
 Two riders, without which 128 is not this strong:
 
-**Rider 1 — rotation must scale, by shortening the interval.** Rotation
+**Rider 1 — rotation must scale, and the interval derives it.** Rotation
 speed trades static security for adaptive resistance, and the trade is
 lopsided: the static cost is linear in the rate (more draws per year), while
 the adaptive gain is exponential (survival of a corruption attempt is
-`(1−1/n)^(τ/I)`). At 300s epochs the default interval leaves a seat parked
-for a week — a multi-day corruption pipeline half-survives that rotation.
-Script table H, at n=128, β=0.10, τ=1,600 epochs (≈5.6 days):
+`(1−1/n)^(τ/I)`). A fixed interval cannot express the required `I ∝ 1/n`
+coupling — at 300s epochs a 16-epoch interval parks a 128-seat shard's every
+member for a week, and a multi-day corruption pipeline half-survives that
+rotation. The fold therefore derives the interval from genesis config:
+`I(n) = max(1, ⌈SHUFFLE_SYNC_HEADROOM · ready_timeout_epochs / n⌉)` —
+rotation at the fastest cadence the ready margin allows (at most
+`n / SHUFFLE_SYNC_HEADROOM` seats inside their sync budget concurrently,
+the same bound on each seat's sync duty cycle) and no faster. Tenure
+`n · I(n)` is thereby pinned at `≥ SHUFFLE_SYNC_HEADROOM ·
+ready_timeout_epochs` for every n, and the production point lands at
+I(128) = 2. Script table H sweeps the interval at n=128, β=0.10, τ=1,600
+epochs (≈5.6 days) — the derived operating row is I=2:
 
 | I (epochs) | tenure | crossings/shard-yr | max β @10⁻⁶ | slow-adaptive r_max |
 |---|---|---|---|---|
@@ -260,16 +275,28 @@ with probability 0.4% — sustaining pressure against that flush costs
 thousands of targeted corruptions per day. Properly stated, fast rotation
 does not make corruption impossible — it forces the adversary off cheap
 slow corruption onto fast expensive corruption, a harder threat class.
-**The interval is a two-way trade, dominated by the adaptive side.** Adaptive
-corruption wants `I` small: I=2 flushes a ~5-day pipeline to 0.4% survival at
-≈21h tenure (the 5-minute epoch puts sub-5h tenures out of reach — even I=1
-leaves 10.7h). The randomness grind wants `I` large — a fork march is linear
-in `I` (§10 table M) — but that duty is confined to the fallback seed path,
-where sustaining a march requires the self-announcing network-scale
-suppression of §10.4, and to the window-edge residual, whose FIFO equilibrium
-is interval-independent (§10.3). So `I` is chosen chiefly by balancing the τ
-of the realistic adaptive threat against rotation churn, with the fallback
-exposure as the residual caution against driving it to the floor.
+**The interval remains a two-way trade, dominated by the adaptive side.**
+Adaptive corruption wants `I` small: I=2 flushes a ~5-day pipeline to 0.4%
+survival at ≈21h tenure (the 5-minute epoch puts sub-5h tenures out of
+reach — even I=1 leaves 10.7h). The randomness grind wants `I` large — a
+fork march is linear in `I` (§10 table M, priced at the derived interval) —
+but that duty is confined to the fallback seed path, where sustaining a
+march requires the self-announcing network-scale suppression of §10.4, and
+to the window-edge residual, whose FIFO equilibrium is
+interval-independent (§10.3). The derivation resolves the trade on the
+adaptive side by construction; the fallback exposure is the residual §10
+prices at I(n).
+
+The handoff to accountability is computable. Rotation prices a campaign by
+`survival ≈ e^(−τ/T)` with `T = n · I(n)` epochs of tenure (and survival
+= 1 below two intervals — the readiness flush floor, §7). At the production
+point T = 256 epochs: the half-line sits at τ½ ≈ 0.69·T ≈ 15h, and below
+~T/10 (≈2h) rotation is inert (survival > 0.9). Faster-than-that
+corruption is met by detection, not rotation: self-proving equivocation
+halts the shard rather than forking it, the key is permanently revoked
+(INV-SEC-3), and the residual exposure is finality latency for external
+consumers — jailing and key-revocation, never slashing (§4 framing;
+docs/05 §3).
 
 The mechanism is the shorter interval, *not* rotating k seats per batch,
 for three reasons: a k-batch guarantees a synchronized dip of k unready
@@ -281,11 +308,12 @@ victim/draw logic survive as written; and the birth–death model stays exact
 (±1 steps), so this note's tables remain valid under interval scaling
 without re-derivation.
 
-**Rider 2 — β ≲ 0.13 is load-bearing**: the 10⁻⁶ budget dies at β = 0.131,
-five points of β cost four orders of magnitude, and nothing on the
-candidate grid rescues β ≥ 0.2 — pool hygiene (pricing, jailing, expulsion)
-is where the security actually lives. (The beacon committee's own
-compromise rate is a severity question, not a fork line — §1, §10.5.)
+**Rider 2 — β ≲ 0.12 is load-bearing**: at the derived operating interval
+the 10⁻⁶ budget dies at β = 0.123, five points of β cost four orders of
+magnitude, and nothing on the candidate grid rescues β ≥ 0.2 — pool hygiene
+(pricing, jailing, expulsion) is where the security actually lives. (The
+beacon committee's own compromise rate is a severity question, not a fork
+line — §1, §10.5.)
 
 ## 7. Idealizations, measured
 
@@ -303,8 +331,8 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   β ∈ {0.10, 0.25}, 200k events per cell (occupancy TV vs the hypergeometric
   ≤ 0.009). Ready-gating does not bend it: readiness is uncorrelated with
   corruption, so the corrupt-count kernel is invariant to the Ready lag —
-  measured at lags of zero, one, and two intervals (two is
-  `READY_TIMEOUT_EPOCHS`, the fold's ceiling with no witness at all; any lag
+  measured at lags of zero, one, and two intervals (two is the cell's
+  `ready_timeout_epochs`, the fold's ceiling with no witness at all; any lag
   collapses to whole intervals because eligibility is sampled at shuffle
   boundaries). What the lag moves is the flush floor: no seat rotates out
   before its second shuffle event (P[tenure ≥ 2 intervals] measured 0.94 at
@@ -336,8 +364,8 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   of reaching M whenever the adversary's unit is coarser than one seat: a
   compromised machine (hacking) and a bribed controlling entity (bribery)
   each flip every seat they hold at once. Script table L prices it over one
-  pool (N = 2,560 seats): under uniform 1-seat holders 336 must be subverted
-  to reach the β = 0.131 boundary, but under a Zipf profile the largest
+  pool (N = 2,560 seats): under uniform 1-seat holders 315 must be subverted
+  to reach the β = 0.123 boundary, but under a Zipf profile the largest
   holder already carries 16% of the pool — one machine, or one negotiation,
   clears it. **The protocol has no lever on the concentration.** It cannot
   attribute seats to a controlling entity: distinct stake-pool identities
@@ -497,16 +525,16 @@ at n = 128):
 
 | terminal budget (crossings/shard-yr) | max β |
 |---|---|
-| 10⁻³ | 0.453 |
-| 10⁻⁶ | 0.400 |
-| 10⁻⁹ | 0.357 |
+| 10⁻³ | 0.436 |
+| 10⁻⁶ | 0.386 |
+| 10⁻⁹ | 0.346 |
 
 Unsteered sampling essentially cannot produce the terminal event: the 10⁻⁶
-budget tolerates β ≤ 0.400 — three times the f+1 line (0.131, §3) and above
+budget tolerates β ≤ 0.386 — three times the f+1 line (0.123, §3) and above
 the ⅓-of-stake threshold an *unsharded* BFT chain fails at. The system has
-two β lines, not one. **Healthy, β ≲ 0.13**: the f+1 budget holds and halts
-are negligible. **Sound, β ≲ 0.40**: in the band between, the network
-degrades without breaking — at β = 0.40 the f+1 boundary is crossed ~31 times
+two β lines, not one. **Healthy, β ≲ 0.12**: the f+1 budget holds and halts
+are negligible. **Sound, β ≲ 0.39**: in the band between, the network
+degrades without breaking — at β = 0.40 the f+1 boundary is crossed ~250 times
 per shard-year and the stationary mean corrupt count β·n ≈ 51 exceeds f, so
 shards halt, re-draw, and pay detection-latency exposure windows more or less
 continuously — but unilateral control never assembles. The tables of §1–§6
@@ -739,12 +767,16 @@ natural β·b — the single biggest margin-widener, and a rate limit the huge
 eligible supply does not defeat. The ramp is linear-additive rather than a
 sharp cutoff (a sharper ramp makes the committee more predictable — the §4
 adaptive trade), and its synergy with jail-on-first comes from matching the
-withholding jail to the recency period: the ramp alone puts the first 2f+1
-crossing at β ≈ 0.12; holding omitting grinders out of the eligible pool for
-a full turnover reaches β ≈ 0.14 (table T) — outside the ≈ 0.131 the sampling
-budget itself tolerates — and leaves the design point with wide margin
-(c_T(max) = 55 at β = 0.10 under the full stack, against 85). The honest cost
-of the long jail stays the rounding-error purge above.
+withholding jail to the recency period. At the derived interval the stack's
+margin is thinner than the sustained line alone suggests: recency roughly
+halves the sustained foothold at the design point (c_T = 34 at β = 0.10
+under the full stack, against the no-recency 59) and trims the burst peaks
+(73 against 81, with 2f+1 = 85), but the full stack's first 2f+1 *peak*
+crossing sits at β ≈ 0.12 — level with the ≈ 0.12 the sampling budget
+itself tolerates, not outside it (table T). The terminal margin therefore
+rests on the sustained line, pool hygiene, and §10.4's suppression cost
+rather than on peak headroom. The honest cost of the long jail stays the
+rounding-error purge above.
 
 **What the stack does not do** is close the ceremony grind outright: at the
 design point the boosted width still lifts every trickle step, and any
@@ -752,8 +784,9 @@ ceremony-seeded epoch is a best-of-2^t draw. The stack's job is narrower and
 sufficient. The ceremony seeds only zero-crossing epochs (§10.4), so a
 *sustained* ceremony march requires suppressing every shard's crossings epoch
 after epoch — a self-announcing, network-scale attack that trips the halt
-detector — and within any such window the stack holds the sustained foothold
-below the terminal line with the β ≈ 0.14 margin. On the primary path the
+detector — and within any such window the stack holds the *sustained*
+foothold below the terminal line at the design point (peak margin is the
+thinner line — table T commentary). On the primary path the
 same stack is defense-in-depth behind a seed with no toggle to grind (§10.2).
 
 ### 10.6 The f+1 recovery: detect the halt, re-draw the committee
@@ -781,11 +814,15 @@ seed. It is **outcome-triggered, not behavior-triggered**, which is why it
 succeeds where the withholding charge alone cannot (§10.5 must distinguish a
 grinder's withholding from honest delay; the rotation reacts only to the
 observable halt and asks nothing about intent). The attacker economics
-collapse: ~1.7 days of grinding to reach f+1 buys a halt of at most
-`HALT_THRESHOLD` epochs plus a sync gap, then the foothold flushes and the
-march restarts from ~β·n — a few-percent downtime on *one* shard (the finite
-corrupt supply, §10.5, bounds it to roughly one at a time), for continuous
-grinding. No rational adversary runs it.
+stay bounded rather than collapsing outright: at the derived interval the
+march to f+1 takes ~0.2 days of grinding, buying a halt of at most
+`HALT_THRESHOLD` epochs plus a sync gap before the foothold flushes and the
+march restarts from ~β·n — sustained, roughly a quarter downtime on *one*
+shard (the finite corrupt supply, §10.5, bounds it to roughly one at a
+time). What keeps that unattractive is not the duty cycle alone: every
+cycle requires re-suppressing the shard's crossings network-wide (§10.4 —
+self-announcing), the yield is a recurring liveness halt with zero safety
+impact, and each flushed foothold burns jailed keys.
 
 Design constraints:
 
@@ -834,9 +871,9 @@ The fallback ceremony is confined to zero-crossing epochs — rare, and
 self-announcing when adversarially induced — and hardened by the input-side
 stack (§10.5): b = 16 (b = 20's sustained foothold reaches the terminal
 line), FIFO eviction, jail-on-first with the withholding jail held for a full
-recency period, and the recency-weighted resample, under which the first 2f+1
-crossing sits at β ≈ 0.14 — outside the 0.131 the sampling budget tolerates
-(table T).
+recency period, and the recency-weighted resample, under which the sustained
+foothold pins near natural β·b and the first 2f+1 peak crossing sits at
+β ≈ 0.12 — level with the 0.123 the sampling budget tolerates (table T).
 
 The two failure boundaries are defended apart (§10.1). **f+1** is a
 recoverable halt: detect-and-rotate re-draws the committee and flushes the
