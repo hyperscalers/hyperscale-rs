@@ -1293,16 +1293,19 @@ impl VerificationPipeline {
         // proceeds without it — bit-identical to a network without the
         // feature. Enabled, a missing ancestor delta parks the
         // verification exactly like a missing witness ancestor — except
-        // when the walk crosses a pending halt recovery's sync-admitted
-        // suffix: those blocks are QC-attested but never locally
-        // executed, so no delta can ever land, and the halted tip's
-        // commit needs the successor QC this very verification gates.
-        // There the predicate is out of play (`None`) and the required
-        // assertion is absent; every replica that can vote synced the
-        // same suffix, so the suppression is byte-agreed. Without a
-        // pending recovery a sync-admitted crossing is one lagging
-        // replica's local state — park as usual and let commits from the
-        // live quorum drain it.
+        // when the walk crosses a halt recovery's sync-admitted suffix:
+        // those blocks are QC-attested but never locally executed, so no
+        // delta can ever land, and the halted tip's commit needs the
+        // successor QC this very verification gates. There the predicate
+        // is out of play (`None`) and the required assertion is absent;
+        // every replica that synced the suffix agrees byte-for-byte on
+        // its absence. The band holds through the completed recovery
+        // record — a member whose walk still crosses the suffix after the
+        // pending record clears on the first crossing must not start
+        // parking, or the circular drain above wedges it permanently. A
+        // sync-admitted block outside the band — an ordinary lagging
+        // replica's local state, whatever the shard's recovery history —
+        // parks as usual and commits from the live quorum drain it.
         let thresholds = count_source.thresholds;
         let substate_bytes = if thresholds == ReshapeThresholds::DISABLED {
             None
@@ -1314,8 +1317,17 @@ impl VerificationPipeline {
                 &self.verified_certified_blocks,
             ) {
                 Ok(count) => Some(count),
-                Err(SubstateCountBlocked::SyncAdmitted(_))
-                    if schedule.recovery_bridge(local_shard).is_some() =>
+                Err(SubstateCountBlocked::SyncAdmitted(blocking_hash))
+                    if self
+                        .verified_certified_blocks
+                        .get(&blocking_hash)
+                        .is_some_and(|certified| {
+                            schedule.recovery_suffix_band(
+                                local_shard,
+                                certified.block().header().parent_qc().weighted_timestamp(),
+                                certified.qc().weighted_timestamp(),
+                            )
+                        }) =>
                 {
                     None
                 }
@@ -1480,7 +1492,7 @@ impl VerificationPipeline {
 /// wedge differently — a witness ancestor resolves when its own
 /// verification or commit lands; a substate byte delta can be permanently
 /// unobtainable for a sync-admitted block — so the incomplete-verification
-/// report and the pile-up warning name the kind.
+/// report names the kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BeaconWitnessDefer {
     /// [`prospective_parent_witness_leaves`] could not produce the parent
@@ -1518,11 +1530,12 @@ pub enum SubstateCountBlocked {
     /// The walk crossed the named sync-admitted certified block:
     /// QC-attested but never locally executed, so no byte delta can ever
     /// land for it — only its commit (whose persistence reconciles the
-    /// frontier from storage) resolves the walk. During a pending halt
-    /// recovery, every replica that can vote synced the same suffix, so
-    /// suppressing the reshape assertion on this variant keeps proposer
-    /// and verifiers byte-agreed; without a recovery it is one lagging
-    /// replica's local state, and the caller parks as for
+    /// frontier from storage) resolves the walk. For a block inside a halt
+    /// recovery's suffix band (pending or completed —
+    /// `TopologySchedule::recovery_suffix_band`), every replica that
+    /// synced the suffix agrees on the absent delta, so the caller
+    /// suppresses the reshape assertion; outside the band it is one
+    /// lagging replica's local state, and the caller parks as for
     /// [`Self::Outstanding`].
     SyncAdmitted(BlockHash),
 }
