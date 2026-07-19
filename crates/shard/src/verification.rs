@@ -311,12 +311,12 @@ pub struct VerificationPipeline {
 
     /// Beacon-witness verifications waiting for a missing/unassembled
     /// ancestor to become available. Keyed by the blocking ancestor's
-    /// hash; values are the deferred child block hashes. A retry runs
-    /// when [`Self::take_deferred_beacon_witness_children`] is drained
-    /// after the ancestor's beacon-witness verification completes (or
-    /// when the ancestor commits past `committed_hash`, see
-    /// [`Self::take_committed_beacon_witness_children`]).
-    deferred_beacon_witness_verifications: HashMap<BlockHash, Vec<BlockHash>>,
+    /// hash; values are the deferred child block hashes, each tagged with
+    /// which walk parked it. A retry runs when
+    /// [`Self::take_deferred_beacon_witness_children`] drains the entry —
+    /// on the ancestor's own beacon-witness verification completing, or
+    /// on a commit advancing `committed_hash` to it.
+    deferred_beacon_witness_verifications: HashMap<BlockHash, Vec<(BlockHash, BeaconWitnessDefer)>>,
 
     /// Beacon-witness verifications whose block's governing committee is not
     /// yet resolvable because this node's beacon is behind — the topology
@@ -911,10 +911,11 @@ impl VerificationPipeline {
             "skipped(no_provision_targets)",
             !h.provision_tx_roots().is_empty(),
         );
-        let beacon_witness_root_status = if self.is_beacon_witness_deferred(block_hash) {
-            "deferred(ancestor)"
-        } else {
-            root_status(VerificationKind::BeaconWitnessRoot, "skipped", true)
+        let beacon_witness_defer = self.beacon_witness_defer(block_hash);
+        let beacon_witness_root_status = match beacon_witness_defer {
+            Some((_, BeaconWitnessDefer::WitnessAncestor)) => "deferred(witness_ancestor)",
+            Some((_, BeaconWitnessDefer::SubstateCount)) => "deferred(substate_count)",
+            None => root_status(VerificationKind::BeaconWitnessRoot, "skipped", true),
         };
 
         let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
@@ -936,6 +937,7 @@ impl VerificationPipeline {
             provision_root = provision_root_status,
             provision_tx_root = provision_tx_root_status,
             beacon_witness_root = beacon_witness_root_status,
+            beacon_witness_blocker = ?beacon_witness_defer.map(|(blocker, _)| blocker),
             in_flight = in_flight_status,
             "View change — block verification was incomplete"
         );
@@ -1249,8 +1251,7 @@ impl VerificationPipeline {
     /// verification is parked on the blocking ancestor's hash and the
     /// returned action list is empty. The coordinator drives the retry
     /// via [`Self::take_deferred_beacon_witness_children`] when that
-    /// ancestor's own beacon-witness verification completes, or via
-    /// [`Self::take_committed_beacon_witness_children`] when it
+    /// ancestor's own beacon-witness verification completes or when it
     /// commits.
     #[allow(clippy::too_many_arguments)] // beacon-witness verification needs the chain prefix
     pub(crate) fn initiate_beacon_witness_root_verification(
@@ -1278,15 +1279,11 @@ impl VerificationPipeline {
         ) {
             Ok(window) => window,
             Err(blocking_hash) => {
-                debug!(
-                    ?block_hash,
-                    ?blocking_hash,
-                    "Deferring beacon-witness verification — ancestor not yet available"
+                self.park_beacon_witness(
+                    blocking_hash,
+                    block_hash,
+                    BeaconWitnessDefer::WitnessAncestor,
                 );
-                self.deferred_beacon_witness_verifications
-                    .entry(blocking_hash)
-                    .or_default()
-                    .push(block_hash);
                 return Vec::new();
             }
         };
@@ -1323,16 +1320,11 @@ impl VerificationPipeline {
                     None
                 }
                 Err(blocked) => {
-                    let blocking_hash = blocked.blocking_hash();
-                    debug!(
-                        ?block_hash,
-                        ?blocking_hash,
-                        "Deferring beacon-witness verification — substate byte total not yet known"
+                    self.park_beacon_witness(
+                        blocked.blocking_hash(),
+                        block_hash,
+                        BeaconWitnessDefer::SubstateCount,
                     );
-                    self.deferred_beacon_witness_verifications
-                        .entry(blocking_hash)
-                        .or_default()
-                        .push(block_hash);
                     return Vec::new();
                 }
             }
@@ -1375,6 +1367,28 @@ impl VerificationPipeline {
         }]
     }
 
+    /// Park `block_hash`'s beacon-witness verification on `blocking_hash`,
+    /// tagged with which walk parked it. A persistent blocker surfaces at
+    /// warn level through the view-change incomplete report, which names
+    /// the kind and the blocker.
+    fn park_beacon_witness(
+        &mut self,
+        blocking_hash: BlockHash,
+        block_hash: BlockHash,
+        kind: BeaconWitnessDefer,
+    ) {
+        debug!(
+            ?block_hash,
+            ?blocking_hash,
+            ?kind,
+            "Deferring beacon-witness verification — blocker not yet available"
+        );
+        self.deferred_beacon_witness_verifications
+            .entry(blocking_hash)
+            .or_default()
+            .push((block_hash, kind));
+    }
+
     /// Parents with children parked on them. The coordinator retries
     /// every entry when the byte frontier reconciles from persistence
     /// — the blocker for a frontier-lagged park is the committed tip,
@@ -1402,6 +1416,9 @@ impl VerificationPipeline {
         self.deferred_beacon_witness_verifications
             .remove(&parent_hash)
             .unwrap_or_default()
+            .into_iter()
+            .map(|(child, _)| child)
+            .collect()
     }
 
     /// Park `block_hash`'s beacon-witness verification until the beacon
@@ -1436,13 +1453,42 @@ impl VerificationPipeline {
         }
     }
 
+    /// The blocker and walk kind a block's beacon-witness verification is
+    /// currently parked on, if any.
+    fn beacon_witness_defer(
+        &self,
+        block_hash: BlockHash,
+    ) -> Option<(BlockHash, BeaconWitnessDefer)> {
+        self.deferred_beacon_witness_verifications
+            .iter()
+            .find_map(|(blocker, children)| {
+                children
+                    .iter()
+                    .find(|(child, _)| *child == block_hash)
+                    .map(|(_, kind)| (*blocker, *kind))
+            })
+    }
+
     /// Whether a block's beacon-witness verification is currently
     /// parked on a missing/unassembled ancestor.
     fn is_beacon_witness_deferred(&self, block_hash: BlockHash) -> bool {
-        self.deferred_beacon_witness_verifications
-            .values()
-            .any(|children| children.contains(&block_hash))
+        self.beacon_witness_defer(block_hash).is_some()
     }
+}
+
+/// Which verification walk parked a block on a blocking ancestor. The two
+/// wedge differently — a witness ancestor resolves when its own
+/// verification or commit lands; a substate byte delta can be permanently
+/// unobtainable for a sync-admitted block — so the incomplete-verification
+/// report and the pile-up warning name the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeaconWitnessDefer {
+    /// [`prospective_parent_witness_leaves`] could not produce the parent
+    /// leaf window.
+    WitnessAncestor,
+    /// The reshape predicate's substate byte walk crossed a block with no
+    /// known delta (see [`SubstateCountBlocked`]).
+    SubstateCount,
 }
 
 /// Inputs for resolving the substate byte total behind a block's parent —
@@ -1974,7 +2020,7 @@ impl VerificationPipeline {
         // Drop deferred beacon-witness entries whose child has been
         // pruned. Parent keys whose values empty out are removed too.
         for children in self.deferred_beacon_witness_verifications.values_mut() {
-            children.retain(|child| pending_blocks.contains_key(*child));
+            children.retain(|(child, _)| pending_blocks.contains_key(*child));
         }
         self.deferred_beacon_witness_verifications
             .retain(|_, children| !children.is_empty());
