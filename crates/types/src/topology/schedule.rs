@@ -408,9 +408,40 @@ impl TopologySchedule {
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> bool {
-        self.recovery_bridge(shard).is_some_and(|bridge| {
-            self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
-        })
+        self.recovery_bridge(shard)
+            .is_some_and(|bridge| self.below_bridge_band(bridge, anchor_wt, qc_wt))
+    }
+
+    /// Whether a certified block of `shard` sits inside a halt recovery's
+    /// suffix band — anchored and certified below the bridge epoch — for a
+    /// recovery pending **or** completed. The same banding as
+    /// [`recovery_resolves_retained`](Self::recovery_resolves_retained),
+    /// held permanently through the completed record: a suffix block is
+    /// QC-attested but never locally executed on any replica that synced
+    /// it, and that stays true after the pending record clears on the
+    /// shard's first crossing.
+    #[must_use]
+    pub fn recovery_suffix_band(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> bool {
+        self.certified_recovery_bridge(shard)
+            .is_some_and(|bridge| self.below_bridge_band(bridge, anchor_wt, qc_wt))
+    }
+
+    /// The suffix-band test shared by the pending and certified recovery
+    /// predicates: both the anchor and the QC stamp resolve below the
+    /// bridge epoch. A bridge block fails it — anchored below but
+    /// certified at or past the bridge.
+    fn below_bridge_band(
+        &self,
+        bridge: Epoch,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> bool {
+        self.epoch_for(anchor_wt) < bridge && self.epoch_for(qc_wt).next() < bridge
     }
 
     /// The first epoch whose committee bridges `shard`'s halt gap —
@@ -1295,13 +1326,15 @@ mod tests {
 
         // `recovery_resolves_retained` isolates the orphan shape — a stale
         // anchor whose QC also sits in the suffix band, which the beacon
-        // boundary fold and remote-header verify reject. The suffix/orphan
-        // shape is true; a bridge block (re-bound) and a current anchor are
-        // false.
+        // boundary fold and remote-header verify reject. A bridge block
+        // (re-bound) and a current anchor are false.
         assert!(sched.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, bridge_qc));
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, edge_qc));
         assert!(!sched.recovery_resolves_retained(shard, bridge_qc, bridge_qc));
+        // While the recovery pends, the suffix band matches retained
+        // resolution; the negatives are pinned in the completed-record test.
+        assert!(sched.recovery_suffix_band(shard, stale_anchor, suffix_qc));
 
         // The fenced lookup folds the reject and the resolution into one
         // call: the orphan shape is `None`, everything else resolves.
@@ -1413,6 +1446,14 @@ mod tests {
         // The pending-scoped fences do not outlive the recovery.
         assert!(!sched.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
         assert!(!sched.recovery_fences(shard, BlockHeight::new(1_000)));
+        // The suffix band does outlive it: a sync-admitted suffix block
+        // never gains an execution delta, however long ago the record
+        // cleared, so the byte-walk suppression that reads this must not
+        // lapse with the pending record.
+        assert!(sched.recovery_suffix_band(shard, stale_anchor, suffix_qc));
+        assert!(!sched.recovery_suffix_band(shard, stale_anchor, bridge_qc));
+        // A shard with no recovery history has no band.
+        assert!(!sched.recovery_suffix_band(ShardId::leaf(1, 1), stale_anchor, suffix_qc));
     }
 
     #[test]
