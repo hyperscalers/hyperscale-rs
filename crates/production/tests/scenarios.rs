@@ -443,17 +443,12 @@ fn halted_shard_recovers_by_committee_redraw_prod() {
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
 }
 
-/// Known to fail at the final assertion on a real network: a recovery
-/// committee drawn cold from the pool restores intra-shard consensus, but
-/// nothing on the seat path dials the sibling committees, so the cross-shard
-/// unicast rail (provision and execution certificate notifies resolve
-/// `ValidatorId -> PeerId` only over already-bound connections) stays dark
-/// and the post-recovery transfers never settle. Every assertion up to that
-/// settle passes. The sim variant plus `halted_shard_recovers_by_committee_redraw_prod`
-/// carry the halt-recovery coverage meanwhile.
 #[test]
 #[serial]
-#[ignore = "cold-drawn recovery committee lacks cross-shard unicast connectivity on a real network"]
+#[cfg_attr(
+    not(feature = "ci"),
+    ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
+)]
 fn halted_shard_straddler_atomic_prod() {
     let mut cluster = ProdCluster::start_with_balances(
         &halt_recovery_config(),

@@ -12,7 +12,7 @@
 //! small `epoch_duration_ms` and mark `#[serial]`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -40,12 +40,16 @@ use tokio::time::{sleep, timeout};
 use super::temp_storage_dir;
 
 /// Per-host registry of every `RocksDbShardStorage` the host has opened —
-/// the startup shards plus any the supervisor opens at a reshape flip.
-/// Shared with the live runner (`RocksDB` permits concurrent reads on a
-/// single open handle), so a test scans committed chains and reads byte
-/// totals straight off the same store the consensus threads write into,
-/// no second open and no lock contention.
-pub type StoreRegistry = Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>;
+/// the startup shards plus any the supervisor opens at a reshape flip or a
+/// runtime join. Entries are `Weak`: the harness observes the runner's
+/// stores, it never extends their lives. A strong clone here would hold the
+/// `RocksDB` directory lock through the runner's teardown, and any later
+/// re-seat of the host onto that shard — a halt-recovery redraw of a
+/// jailed-out member — would spin forever on "lock hold by current
+/// process" at the storage open. Reads upgrade per call: a torn-down
+/// shard's entry resolves `None`, and the cluster-level scan finds a host
+/// that still serves the shard.
+pub type StoreRegistry = Arc<Mutex<HashMap<ShardId, Weak<RocksDbShardStorage>>>>;
 
 /// How long to wait for host 0 to surface a listen address before
 /// bootstrapping the rest of the cluster to it.
@@ -66,7 +70,7 @@ fn capturing_storage_factory(dir: &TempDir, registry: StoreRegistry) -> StorageF
         registry
             .lock()
             .expect("store registry")
-            .insert(shard, Arc::clone(&store));
+            .insert(shard, Arc::downgrade(&store));
         Ok(store)
     })
 }
@@ -326,18 +330,20 @@ impl Harness {
 
     /// A live handle to any host's `RocksDbShardStorage` for `shard`. Every
     /// committee member commits the same chain, so the first match suffices.
+    /// A host whose runner has torn the shard down upgrades to `None` and is
+    /// skipped — only stores the consensus threads actually hold are read.
     fn store_for(&self, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
         self.hosts.iter().find_map(|h| {
             h.stores
                 .lock()
                 .expect("store registry")
                 .get(&shard)
-                .cloned()
+                .and_then(Weak::upgrade)
         })
     }
 
     /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
-    /// `None` if that host has not opened one there.
+    /// `None` if that host does not currently hold one there.
     fn host_store(&self, host: usize, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
         self.hosts
             .get(host)?
@@ -345,7 +351,7 @@ impl Harness {
             .lock()
             .expect("store registry")
             .get(&shard)
-            .cloned()
+            .and_then(Weak::upgrade)
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

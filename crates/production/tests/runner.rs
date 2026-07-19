@@ -154,6 +154,83 @@ async fn pooled_validator_boots_as_follower_only_host() {
     assert!(result.unwrap().is_ok(), "runner returns Ok");
 }
 
+/// Leaving a shard releases its store: a host that leaves a shard and is
+/// later re-seated on it must reopen the same `RocksDB` directory. Guards the
+/// teardown storage-release path a halt-recovery redraw depends on — a leaked
+/// store handle leaves every rejoin spinning on the `RocksDB` lock
+/// ("Join rejected: storage open failed … lock hold by current process").
+///
+/// Runs the cycle on a pooled surplus validator the committed view never
+/// seats: a seated validator's manual leave is undone by the supervisor's
+/// reconcile backstop on its own schedule, which races the assertions.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn shard_rejoin_reopens_the_store_after_leave() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::with_surplus(45, 1, 1);
+    let surplus = ValidatorId::new(1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
+
+    let adapter = Arc::clone(runner.network());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+
+    let join_root = || ShardCommand::Join {
+        shard: ShardId::ROOT,
+        vnodes: vec![VnodeConfig {
+            validator_id: surplus,
+            local_shard: ShardId::ROOT,
+            signing_key: fixtures.signing_key(1),
+        }],
+    };
+
+    reconfigure
+        .send(join_root())
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("first join seats the shard");
+
+    reconfigure
+        .send(ShardCommand::Leave {
+            shard: ShardId::ROOT,
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("left shard is removed from the adapter");
+
+    reconfigure
+        .send(join_root())
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the rejoin reopens the shard store and seats the shard");
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after the rejoin");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
 /// The `beacon_chain_config` builder setter threads a custom config through into
 /// the committed beacon genesis state. Every other production test leaves the
 /// setter unused and is unaffected: a custom `epoch_duration_ms` and reshape
