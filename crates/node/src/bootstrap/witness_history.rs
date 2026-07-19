@@ -17,13 +17,20 @@
 //! Pages carry no individual proof. The served header must hash to the
 //! beacon-attested anchor `block_hash` (binding its witness root and
 //! count), and the fully assembled vector must merkle to that root with
-//! exactly that count. A mismatch — whichever page caused it — resets
-//! the assembly to scratch; the driver rotates peers and retries, so a
-//! Byzantine page costs one round, never a poisoned seed.
+//! exactly that count. A final-root mismatch — whichever page caused it
+//! — resets the assembly to scratch; the driver rotates peers and
+//! retries, so a Byzantine page costs one assembly, never a poisoned
+//! seed. A rejection *before* a page is absorbed — an unavailable peer,
+//! a header off the anchor, window arithmetic — keeps the assembled
+//! prefix: mid-recovery serving sets mix capable peers with just-seated
+//! members that cannot serve yet, and a multi-page assembly must
+//! survive landing on one of those between pages.
 
 use hyperscale_types::network::request::GetWitnessHistoryRequest;
 use hyperscale_types::network::response::GetWitnessHistoryResponse;
-use hyperscale_types::{BeaconWitnessRoot, BlockHeader, Hash, ShardAnchor, compute_merkle_root};
+use hyperscale_types::{
+    BeaconWitnessRoot, BlockHeader, Hash, ShardAnchor, ShardWitnessPayload, compute_merkle_root,
+};
 
 use super::BootstrapOutcome;
 
@@ -43,7 +50,7 @@ pub struct WitnessHistorySync {
     limit: u32,
     state: SyncState,
     header: Option<BlockHeader>,
-    hashes: Vec<Hash>,
+    payloads: Vec<ShardWitnessPayload>,
 }
 
 impl WitnessHistorySync {
@@ -56,7 +63,7 @@ impl WitnessHistorySync {
             limit: limit.max(1),
             state: SyncState::Idle,
             header: None,
-            hashes: Vec::new(),
+            payloads: Vec::new(),
         }
     }
 
@@ -79,7 +86,7 @@ impl WitnessHistorySync {
         Some(GetWitnessHistoryRequest {
             height: self.anchor.height,
             block_hash: self.anchor.block_hash,
-            start_index: base + self.hashes.len() as u64,
+            start_index: base + self.payloads.len() as u64,
             limit: self.limit,
         })
     }
@@ -100,10 +107,10 @@ impl WitnessHistorySync {
         self.state = SyncState::Idle;
 
         let Some(chunk) = &response.history else {
-            return self.reject("history unavailable at peer");
+            return BootstrapOutcome::Rejected("history unavailable at peer");
         };
         if chunk.header.hash() != self.anchor.block_hash {
-            return self.reject("served header does not hash to the anchor");
+            return BootstrapOutcome::Rejected("served header does not hash to the anchor");
         }
         // The header's commitment spans its window `[base, count)`; the
         // assembly is the window's hashes only.
@@ -112,31 +119,36 @@ impl WitnessHistorySync {
             .beacon_witness_leaf_count()
             .inner()
             .saturating_sub(chunk.header.beacon_witness_base().inner());
-        let assembled = self.hashes.len() as u64 + chunk.leaf_hashes.len() as u64;
+        let assembled = self.payloads.len() as u64 + chunk.payloads.len() as u64;
         if assembled > window_len {
-            return self.reject("served hashes exceed the header's window");
+            return BootstrapOutcome::Rejected("served payloads exceed the header's window");
         }
         if chunk.more {
-            if chunk.leaf_hashes.is_empty() {
-                return self.reject("empty page with continuation");
+            if chunk.payloads.is_empty() {
+                return BootstrapOutcome::Rejected("empty page with continuation");
             }
             if assembled == window_len {
-                return self.reject("continuation past the header's window");
+                return BootstrapOutcome::Rejected("continuation past the header's window");
             }
         } else if assembled < window_len {
-            return self.reject("final page leaves the window short");
+            return BootstrapOutcome::Rejected("final page leaves the window short");
         }
 
         self.header = Some(chunk.header.clone());
-        self.hashes.extend(chunk.leaf_hashes.iter().copied());
+        self.payloads.extend(chunk.payloads.iter().cloned());
         if chunk.more {
             return BootstrapOutcome::Accepted;
         }
 
-        // Final binding: the assembled window must merkle to the
-        // anchor-bound header's commitment. Count equality holds by the
-        // arithmetic above.
-        let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&self.hashes));
+        // Final binding: the assembled window's derived leaf hashes must
+        // merkle to the anchor-bound header's commitment. Count equality
+        // holds by the arithmetic above.
+        let hashes: Vec<Hash> = self
+            .payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&hashes));
         if root != chunk.header.beacon_witness_root() {
             return self.reject("assembled window does not merkle to the header's root");
         }
@@ -150,15 +162,16 @@ impl WitnessHistorySync {
         self.state == SyncState::Complete
     }
 
-    /// Take the verified boundary header and leaf-hash history, ready
-    /// to seed a `RecoveredState`.
+    /// Take the verified boundary header and leaf-payload history:
+    /// the derived hashes seed a `RecoveredState`'s accumulator and the
+    /// payloads seed the store's witness window at the boundary import.
     ///
     /// # Panics
     ///
     /// Panics unless [`Self::is_complete`] — a partial history would
     /// seed an accumulator whose roots can never match.
     #[must_use]
-    pub fn take_parts(&mut self) -> (BlockHeader, Vec<Hash>) {
+    pub fn take_parts(&mut self) -> (BlockHeader, Vec<ShardWitnessPayload>) {
         assert!(
             self.is_complete(),
             "witness history taken before assembly completed",
@@ -167,14 +180,16 @@ impl WitnessHistorySync {
             self.header
                 .take()
                 .expect("complete assembly stored its header"),
-            std::mem::take(&mut self.hashes),
+            std::mem::take(&mut self.payloads),
         )
     }
 
-    /// Drop everything assembled so far and re-arm. Pages carry no
-    /// individual proof, so any failure poisons the whole assembly.
+    /// Drop everything assembled so far and re-arm — the final-root
+    /// mismatch path only: pages carry no individual proof, so a root
+    /// that fails implicates every absorbed page. Pre-absorb rejections
+    /// return `Rejected` directly and keep the assembled prefix.
     fn reject(&mut self, reason: &'static str) -> BootstrapOutcome {
-        self.hashes.clear();
+        self.payloads.clear();
         self.header = None;
         self.state = SyncState::Idle;
         BootstrapOutcome::Rejected(reason)
@@ -236,12 +251,16 @@ mod tests {
         assert!(sync.is_complete());
         assert!(sync.next_request().is_none());
 
-        let (header, hashes) = sync.take_parts();
+        let (header, payloads) = sync.take_parts();
         assert_eq!(header.hash(), anchor.block_hash);
+        assert_eq!(payloads, leaves);
         let expected: Vec<Hash> = leaves.iter().map(ShardWitnessPayload::leaf_hash).collect();
-        assert_eq!(hashes, expected);
 
-        // The verified parts seed a snap-synced bootstrap's recovery.
+        // The derived hashes seed a snap-synced bootstrap's recovery.
+        let hashes: Vec<Hash> = payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
         let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, hashes, 0);
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
@@ -297,11 +316,14 @@ mod tests {
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
 
-        let (header, hashes) = sync.take_parts();
+        let (header, payloads) = sync.take_parts();
         assert_eq!(header.beacon_witness_base(), BeaconWitnessLeafCount::new(3));
-        let expected: Vec<Hash> = window.iter().map(ShardWitnessPayload::leaf_hash).collect();
-        assert_eq!(hashes, expected);
+        assert_eq!(payloads, window);
 
+        let hashes: Vec<Hash> = payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
         let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, hashes, 0);
         assert_eq!(
             recovered.beacon_witness_start,
@@ -345,7 +367,7 @@ mod tests {
         let mut sync = WitnessHistorySync::new(anchor, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
-        response.history.as_mut().unwrap().leaf_hashes.0[1] = Hash::from_bytes(b"tampered");
+        response.history.as_mut().unwrap().payloads.0[1] = stake_deposit(999);
         assert!(matches!(
             sync.on_response(&response),
             BootstrapOutcome::Rejected("assembled window does not merkle to the header's root"),
@@ -365,7 +387,7 @@ mod tests {
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
         let chunk = response.history.as_mut().unwrap();
-        chunk.leaf_hashes.0.pop();
+        chunk.payloads.0.pop();
         assert!(matches!(
             sync.on_response(&response),
             BootstrapOutcome::Rejected("final page leaves the window short"),
@@ -381,12 +403,40 @@ mod tests {
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
         let chunk = response.history.as_mut().unwrap();
-        chunk.leaf_hashes.0.clear();
+        chunk.payloads.0.clear();
         chunk.more = true;
         assert!(matches!(
             sync.on_response(&response),
             BootstrapOutcome::Rejected("empty page with continuation"),
         ));
+    }
+
+    /// A multi-page assembly survives a serving rotation that
+    /// periodically lands on a peer that cannot serve — the mid-recovery
+    /// shape where just-seated members sit in the serving set with
+    /// nothing to serve yet. A pre-absorb rejection keeps the assembled
+    /// prefix; resetting instead can never outrun the rotation.
+    #[test]
+    fn multi_page_assembly_survives_interleaved_unavailable_peers() {
+        let leaves: Vec<_> = (1u64..=6).map(stake_deposit).collect();
+        let (peer, anchor) = replica(&leaves);
+
+        // Three two-leaf pages; every other request lands unavailable.
+        let mut sync = WitnessHistorySync::new(anchor, 2);
+        for attempt in 0..100 {
+            let Some(request) = sync.next_request() else {
+                break;
+            };
+            let response = if attempt % 2 == 1 {
+                GetWitnessHistoryResponse { history: None }
+            } else {
+                serve_witness_history_request(&peer, &request)
+            };
+            let _ = sync.on_response(&response);
+        }
+        assert!(sync.is_complete());
+        let (_, payloads) = sync.take_parts();
+        assert_eq!(payloads, leaves);
     }
 
     #[test]

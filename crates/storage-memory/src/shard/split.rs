@@ -276,7 +276,7 @@ fn install_adoption(
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher};
-    use hyperscale_storage::{BoundaryStore, ImportLeaf};
+    use hyperscale_storage::{BoundaryStore, ImportLeaf, WitnessSeed};
     use hyperscale_types::{
         Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot, ValidatorId,
         WeightedTimestamp,
@@ -301,7 +301,11 @@ mod tests {
     fn merged_store() -> (SimShardStorage, StateRoot) {
         let store = SimShardStorage::default();
         let root = store
-            .import_boundary_state(BlockHeight::new(10), vec![leaf(0x00), leaf(0x80)])
+            .import_boundary_state(
+                BlockHeight::new(10),
+                vec![leaf(0x00), leaf(0x80)],
+                WitnessSeed::default(),
+            )
             .unwrap();
         (store, root)
     }
@@ -367,6 +371,7 @@ mod tests {
             .import_boundary_state(
                 BlockHeight::new(9),
                 vec![leaf(0x00), leaf(0x01), leaf(0x80)],
+                WitnessSeed::default(),
             )
             .unwrap();
         (store, root)

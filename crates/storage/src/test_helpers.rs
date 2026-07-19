@@ -33,6 +33,7 @@ use crate::tree::Jmt;
 use crate::{
     BOUNDARY_RETAIN, BoundaryStore, DatabaseUpdates, DbSortKey, ImportLeaf, NodeDatabaseUpdates,
     PartitionDatabaseUpdates, ResolveLeaf, ShardChainReader, ShardChainWriter, SubstateStore,
+    WitnessSeed,
 };
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
@@ -832,7 +833,7 @@ where
         .expect("seed-3 leaf present");
 
     let imported_root = fresh
-        .import_boundary_state(BlockHeight::new(6), leaves)
+        .import_boundary_state(BlockHeight::new(6), leaves, WitnessSeed::default())
         .unwrap();
     assert_eq!(imported_root, source_root);
     assert_eq!(fresh.state_root(), source_root);
@@ -848,7 +849,7 @@ where
     // A second import is rejected — the store is no longer empty.
     assert!(
         fresh
-            .import_boundary_state(BlockHeight::new(6), Vec::new())
+            .import_boundary_state(BlockHeight::new(6), Vec::new(), WitnessSeed::default())
             .is_err()
     );
 }

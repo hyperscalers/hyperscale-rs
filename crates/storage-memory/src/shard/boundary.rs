@@ -12,7 +12,7 @@ use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, filter_updates_to_prefix,
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, WitnessSeed, filter_updates_to_prefix,
     merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
@@ -89,6 +89,7 @@ impl BoundaryStore for SimShardStorage {
         &self,
         height: BlockHeight,
         leaves: Vec<ImportLeaf>,
+        witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let mut state = write_or_recover(&self.state);
         if state.current_block_height != BlockHeight::GENESIS
@@ -118,6 +119,17 @@ impl BoundaryStore for SimShardStorage {
         state.current_block_height = height;
         state.current_root_hash = root;
         drop(state);
+
+        // Seed the anchor window's witness payloads at their absolute leaf
+        // indices, mirroring the RocksDB import: the accumulator rebuilds
+        // and the beacon fold's fetches answer from this column.
+        let mut consensus = write_or_recover(&self.consensus);
+        for (offset, payload) in witnesses.payloads.into_iter().enumerate() {
+            consensus
+                .beacon_witnesses
+                .insert(witnesses.base.inner() + offset as u64, payload);
+        }
+        drop(consensus);
         Ok(root)
     }
 

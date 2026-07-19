@@ -279,11 +279,11 @@ fn verify_chunk(
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_storage::BoundaryStore;
     use hyperscale_storage::test_helpers::{
         commit_block_with_updates, commit_block_with_witnesses, make_database_update,
         pin_snap_sync_replica,
     };
+    use hyperscale_storage::{BoundaryStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::BlockHeight;
 
@@ -348,7 +348,9 @@ mod tests {
         assert_eq!(leaves.len(), usize::from(ENTRIES));
 
         let fresh = SimShardStorage::default();
-        let imported_root = fresh.import_boundary_state(anchor.height, leaves).unwrap();
+        let imported_root = fresh
+            .import_boundary_state(anchor.height, leaves, WitnessSeed::default())
+            .unwrap();
         assert_eq!(imported_root, anchor.state_root);
     }
 
@@ -391,7 +393,7 @@ mod tests {
 
         let fresh = SimShardStorage::default();
         let imported_root = fresh
-            .import_boundary_state(anchor.height, sync.take_leaves())
+            .import_boundary_state(anchor.height, sync.take_leaves(), WitnessSeed::default())
             .unwrap();
         assert_eq!(imported_root, anchor.state_root);
     }

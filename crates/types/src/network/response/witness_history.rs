@@ -2,21 +2,26 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BlockHeader, BoundedVec, Hash, MessageClass, NetworkMessage};
+use crate::{
+    BlockHeader, BoundedVec, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage,
+    ShardWitnessPayload,
+};
 
-/// Cap on the leaf hashes a single witness-history page can carry.
+/// One page of a shard's beacon-witness history at a boundary anchor.
 ///
-/// Bounds the response decode; a joiner paginates with `more` + index
-/// continuation, so the cap sizes pages (128 KiB of hashes), not the
-/// total transfer.
-pub const MAX_HASHES_PER_WITNESS_HISTORY: usize = 4_096;
-
-/// One page of a shard's beacon-witness leaf-hash history at a
-/// boundary anchor.
+/// Ships the leaf *payloads*: the joiner derives each leaf hash for the
+/// commitment check and imports the payloads into its own store, so a
+/// snap-synced member rebuilds its accumulator across a restart and
+/// answers the beacon fold's witness fetches for the window it seeded —
+/// an all-cold recovery committee would otherwise hold no payloads below
+/// its anchor and starve both. Pages are capped by the payload-sized
+/// [`MAX_WITNESSES_PER_FETCH`], the bound the beacon's own witness fetch
+/// decodes under.
 ///
 /// The verifier trusts none of it bare: `header` must hash to the
-/// beacon-attested anchor `block_hash`, and the fully assembled hash
-/// vector must merkle to `header.beacon_witness_root()` with exactly
+/// beacon-attested anchor `block_hash`, and the hashes of the fully
+/// assembled payload vector must merkle to
+/// `header.beacon_witness_root()` with exactly
 /// `header.beacon_witness_leaf_count()` entries. Individual pages
 /// carry no proof — a mismatch at final assembly restarts the fetch.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -27,9 +32,9 @@ pub struct WitnessHistoryChunk {
     /// `parent_qc` carries the committee-anchor weighted timestamp the
     /// joiner seeds its recovered state with.
     pub header: BlockHeader,
-    /// Leaf hashes from the requested `start_index`, in leaf-index
+    /// Leaf payloads from the requested `start_index`, in leaf-index
     /// order.
-    pub leaf_hashes: BoundedVec<Hash, MAX_HASHES_PER_WITNESS_HISTORY>,
+    pub payloads: BoundedVec<ShardWitnessPayload, MAX_WITNESSES_PER_FETCH>,
     /// Whether leaves beyond the last returned remain below the
     /// header's leaf count — the joiner resumes at the next index.
     pub more: bool,
@@ -65,8 +70,9 @@ mod tests {
     use super::*;
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-        ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, ValidatorId,
+        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardId, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId,
     };
 
     fn make_header() -> BlockHeader {
@@ -109,7 +115,17 @@ mod tests {
         let response = GetWitnessHistoryResponse {
             history: Some(WitnessHistoryChunk {
                 header: make_header(),
-                leaf_hashes: vec![Hash::from_bytes(b"leaf-0"), Hash::from_bytes(b"leaf-1")].into(),
+                payloads: vec![
+                    ShardWitnessPayload::StakeDeposit {
+                        pool_id: StakePoolId::new(1),
+                        amount: Stake::from_whole_tokens(5),
+                    },
+                    ShardWitnessPayload::StakeDeposit {
+                        pool_id: StakePoolId::new(2),
+                        amount: Stake::from_whole_tokens(7),
+                    },
+                ]
+                .into(),
                 more: true,
             }),
         };

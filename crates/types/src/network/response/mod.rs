@@ -26,6 +26,4 @@ pub use state_range::{
     GetStateRangeResponse, MAX_LEAVES_PER_STATE_RANGE, StateRangeChunk, StateRangeLeaf,
 };
 pub use transaction::GetTransactionsResponse;
-pub use witness_history::{
-    GetWitnessHistoryResponse, MAX_HASHES_PER_WITNESS_HISTORY, WitnessHistoryChunk,
-};
+pub use witness_history::{GetWitnessHistoryResponse, WitnessHistoryChunk};
