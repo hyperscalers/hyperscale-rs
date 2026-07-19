@@ -4,8 +4,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconState, EMISSIONS_PER_EPOCH, READY_TIMEOUT_EPOCHS, Stake, StakePoolId, ValidatorId,
-    ValidatorStatus,
+    BeaconState, EMISSIONS_PER_EPOCH, Stake, StakePoolId, ValidatorId, ValidatorStatus,
 };
 
 /// Promote `InsufficientStake` validators back to `Pooled` for every
@@ -149,7 +148,7 @@ pub(super) fn distribute_epoch_rewards(state: &mut BeaconState) -> BTreeMap<Stak
 }
 
 /// Flip `OnShard { ready: false }` validators to `ready: true` once
-/// `current_epoch − placed_at_epoch ≥ READY_TIMEOUT_EPOCHS`.
+/// `current_epoch − placed_at_epoch ≥ chain_config.ready_timeout_epochs`.
 ///
 /// Backstop for the event-driven ready path: validators normally
 /// signal sync-completion via a `Ready` shard witness; the timeout
@@ -162,6 +161,7 @@ pub(super) fn distribute_epoch_rewards(state: &mut BeaconState) -> BTreeMap<Stak
 /// by `BTreeMap` iteration.
 pub(super) fn auto_ready_timeout(state: &mut BeaconState) -> Vec<ValidatorId> {
     let current_epoch = state.current_epoch.inner();
+    let timeout = state.chain_config.ready_timeout_epochs;
     let mut readied = Vec::new();
     for (id, rec) in &mut state.validators {
         if let ValidatorStatus::OnShard {
@@ -169,7 +169,7 @@ pub(super) fn auto_ready_timeout(state: &mut BeaconState) -> Vec<ValidatorId> {
             ready: false,
             placed_at_epoch,
         } = rec.status
-            && current_epoch.saturating_sub(placed_at_epoch.inner()) >= READY_TIMEOUT_EPOCHS
+            && current_epoch.saturating_sub(placed_at_epoch.inner()) >= timeout
         {
             rec.status = ValidatorStatus::OnShard {
                 shard,
@@ -634,7 +634,11 @@ mod tests {
 
     // ─── auto_ready_timeout ──────────────────────────────────────────────
 
-    use hyperscale_types::READY_TIMEOUT_EPOCHS;
+    /// The ready timeout the fixture states run under — the dev-default
+    /// `chain_config.ready_timeout_epochs`.
+    fn ready_timeout() -> u64 {
+        empty_state().chain_config.ready_timeout_epochs
+    }
 
     /// Helper: place validator `id` on shard 0 at `placed_at_epoch`
     /// with `ready: false`. Inserts into pool 0's validator set so
@@ -667,12 +671,12 @@ mod tests {
         );
     }
 
-    /// Validator placed `READY_TIMEOUT_EPOCHS` epochs ago flips to
+    /// Validator placed `ready_timeout_epochs` epochs ago flips to
     /// `ready: true` (with `placed_at_epoch` preserved).
     #[test]
     fn auto_ready_timeout_flips_after_threshold() {
         let placed = Epoch::new(3);
-        let current = Epoch::new(placed.inner() + READY_TIMEOUT_EPOCHS);
+        let current = Epoch::new(placed.inner() + ready_timeout());
         let mut state = empty_state();
         state.current_epoch = current;
         state.committee = vec![ValidatorId::new(0)];
@@ -697,7 +701,7 @@ mod tests {
         let placed = Epoch::new(3);
         // Two short of maturity — apply_next_epoch's advance lands at
         // (placed + THRESHOLD - 1), still under.
-        let current = Epoch::new(placed.inner() + READY_TIMEOUT_EPOCHS - 2);
+        let current = Epoch::new(placed.inner() + ready_timeout() - 2);
         let mut state = empty_state();
         state.current_epoch = current;
         state.committee = vec![ValidatorId::new(0)];
@@ -719,7 +723,7 @@ mod tests {
     fn auto_ready_timeout_ignores_non_unready_on_shard() {
         let mut state = single_pool_state(4); // 4 ready OnShard
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        state.current_epoch = Epoch::new(10 * READY_TIMEOUT_EPOCHS);
+        state.current_epoch = Epoch::new(10 * ready_timeout());
         // Add a Pooled and a Jailed validator — neither should flip.
         state.validators.insert(
             ValidatorId::new(10),
@@ -757,17 +761,13 @@ mod tests {
     /// flip; the under-threshold ones stay.
     #[test]
     fn auto_ready_timeout_flips_selectively_by_placed_epoch() {
-        let current = Epoch::new(2 * READY_TIMEOUT_EPOCHS);
+        let current = Epoch::new(2 * ready_timeout());
         let mut state = empty_state();
         state.current_epoch = current;
         // Three validators at distinct ages: 2T past, 1 under, exactly T past.
         insert_unready_on_shard(&mut state, 0, Epoch::GENESIS);
         insert_unready_on_shard(&mut state, 1, Epoch::new(current.inner() - 1));
-        insert_unready_on_shard(
-            &mut state,
-            2,
-            Epoch::new(current.inner() - READY_TIMEOUT_EPOCHS),
-        );
+        insert_unready_on_shard(&mut state, 2, Epoch::new(current.inner() - ready_timeout()));
 
         let effects = apply_next_epoch(&mut state, &[]);
 
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn readied_field_carries_both_witness_and_timeout_flips() {
         let mut state = empty_state();
-        state.current_epoch = Epoch::new(5 * READY_TIMEOUT_EPOCHS);
+        state.current_epoch = Epoch::new(5 * ready_timeout());
         state.committee = vec![ValidatorId::new(0)];
 
         // Validator 0: OnShard{ready:true} — needed to sign the
