@@ -97,10 +97,15 @@ struct Cell {
     /// Zero grants instant readiness, making the victim set the full
     /// committee (the note's idealized chain). Victim eligibility is
     /// only sampled at shuffle epochs, so the effective granularity is
-    /// `SHUFFLE_INTERVAL_EPOCHS`; `auto_ready_timeout` caps the
-    /// achievable lag at `READY_TIMEOUT_EPOCHS`, the fold's own worst
-    /// case.
+    /// the shuffle interval; `auto_ready_timeout` caps the achievable
+    /// lag at `ready_timeout_epochs`, the fold's own worst case.
     ready_lag_epochs: u64,
+    /// The fold's auto-ready backstop
+    /// (`chain_config.ready_timeout_epochs`) for this cell. Must sit
+    /// at or above `ready_lag_epochs`, or the backstop flips seats
+    /// before the harness's emulated witness does and the intended lag
+    /// never materializes.
+    ready_timeout_epochs: u64,
     /// `Some(size)`: set `beacon_committee_size` and tally each epoch's
     /// beacon-committee resample.
     beacon_size: Option<u32>,
@@ -215,8 +220,13 @@ fn mc_state(cell: &Cell) -> BeaconState {
         },
     );
 
+    assert!(
+        cell.ready_timeout_epochs >= cell.ready_lag_epochs,
+        "the auto-ready backstop would fire before the cell's emulated lag"
+    );
     let mut chain_config = BeaconChainConfig {
         shard_size: cell.shard_size,
+        ready_timeout_epochs: cell.ready_timeout_epochs,
         ..BeaconChainConfig::default()
     };
     if let Some(size) = cell.beacon_size {
@@ -419,6 +429,7 @@ fn shuffle_kernel_matches_birth_death_chain() {
         corrupt: 40,
         epochs: 160_000,
         ready_lag_epochs: 0,
+        ready_timeout_epochs: 8,
         beacon_size: None,
         seed: 0x07,
     };
@@ -447,6 +458,7 @@ fn shuffle_kernel_matches_at_low_corruption() {
         corrupt: 16,
         epochs: 160_000,
         ready_lag_epochs: 0,
+        ready_timeout_epochs: 8,
         beacon_size: None,
         seed: 0x2a,
     };
@@ -536,6 +548,7 @@ fn kernel_comparison_tables() {
             corrupt,
             epochs: 200_000 * SHUFFLE_INTERVAL_EPOCHS,
             ready_lag_epochs: 0,
+            ready_timeout_epochs: 8,
             beacon_size: None,
             seed: 0x11,
         };
@@ -562,6 +575,7 @@ fn depletion_tables() {
             corrupt,
             epochs: 50_000 * SHUFFLE_INTERVAL_EPOCHS,
             ready_lag_epochs: 0,
+            ready_timeout_epochs: 8,
             beacon_size: None,
             seed: 0x13,
         };
@@ -572,8 +586,8 @@ fn depletion_tables() {
 }
 
 /// Ready-lag victim immunity: fresh draws are victim-ineligible until
-/// readied. Lag 0 emulates instant `Ready` witnesses; 32 is
-/// `READY_TIMEOUT_EPOCHS`, the fold's own ceiling with no witness at
+/// readied. Lag 0 emulates instant `Ready` witnesses; 32 is the cell's
+/// `ready_timeout_epochs`, the fold's own ceiling with no witness at
 /// all. Prints the kernel shift and the seat-tenure shape (Little's
 /// law pins the mean at `n` intervals regardless; the lag moves the
 /// floor).
@@ -588,6 +602,7 @@ fn ready_lag_tables() {
             corrupt: 80,
             epochs: 100_000 * SHUFFLE_INTERVAL_EPOCHS,
             ready_lag_epochs: lag,
+            ready_timeout_epochs: 32,
             beacon_size: None,
             seed: 0x17,
         };
@@ -626,6 +641,7 @@ fn beacon_resample_tables() {
         corrupt: 320,
         epochs: 400_000,
         ready_lag_epochs: 0,
+        ready_timeout_epochs: 8,
         beacon_size: Some(8),
         seed: 0x19,
     };
@@ -684,6 +700,7 @@ fn beacon_resample_matches_hypergeometric() {
         corrupt: 160,
         epochs: 30_000,
         ready_lag_epochs: 0,
+        ready_timeout_epochs: 8,
         beacon_size: Some(8),
         seed: 0x1f,
     };
@@ -731,6 +748,7 @@ fn shuffle_skips_split_pending_shard() {
         corrupt: 0,
         epochs: 0,
         ready_lag_epochs: 0,
+        ready_timeout_epochs: 8,
         beacon_size: None,
         seed: 0x23,
     };

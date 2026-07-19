@@ -138,13 +138,6 @@ pub const POOL_BUFFER_TARGET: usize = 4;
 /// The opened slot triggers an immediate pool draw on the same shard.
 pub const SHUFFLE_INTERVAL_EPOCHS: u64 = 16;
 
-/// Cap on how long a placed validator can sit `OnShard { ready: false }`
-/// before beacon auto-flips them to `ready: true`.
-///
-/// The shard's natural miss-counter then catches anyone who was never
-/// actually synced.
-pub const READY_TIMEOUT_EPOCHS: u64 = 32;
-
 /// How many consecutive boundary folds may observe a live shard missing
 /// before the beacon flags it as halted.
 ///

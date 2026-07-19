@@ -55,19 +55,28 @@ pub struct BeaconChainConfig {
     /// config hash. Zero (the default) leaves the clock at raw wall-clock —
     /// correct for the simulator, whose logical clock already starts at zero.
     pub genesis_timestamp_ms: u64,
+    /// Epochs a placed validator may sit `OnShard { ready: false }` before
+    /// the fold auto-flips it to `ready: true` — the network's
+    /// consensus-agreed sync budget. A physical, per-network quantity like
+    /// `epoch_duration_ms`: a dev sim syncs a shard in an epoch or two,
+    /// while a production shard takes hours, so no single value fits both.
+    pub ready_timeout_epochs: u64,
 }
 
 impl BeaconChainConfig {
     /// The production sizing: [`Self::default`] with the beacon committee
     /// capped at [`PRODUCTION_BEACON_COMMITTEE_SIZE`] rather than the small
-    /// dev/sim [`BEACON_SIGNER_COUNT`]. The validator binary seats this so a
-    /// live network runs the grind-hardened committee while simulations keep
-    /// the small default.
+    /// dev/sim [`BEACON_SIGNER_COUNT`], and the ready timeout stretched to a
+    /// production sync budget (hours of snap-sync plus tail sync at 5-minute
+    /// epochs, where the dev default assumes a sim that syncs in one or two).
+    /// The validator binary seats this so a live network runs the
+    /// grind-hardened committee while simulations keep the small defaults.
     #[must_use]
     pub fn production() -> Self {
         Self {
             beacon_committee_size: u32::try_from(PRODUCTION_BEACON_COMMITTEE_SIZE)
                 .unwrap_or(u32::MAX),
+            ready_timeout_epochs: 32,
             ..Self::default()
         }
     }
@@ -88,7 +97,10 @@ impl BeaconChainConfig {
 }
 
 impl Default for BeaconChainConfig {
-    /// Defaults: 5-minute epochs, shard size 4, beacon committee 4.
+    /// Defaults: 5-minute epochs, shard size 4, beacon committee 4, ready
+    /// timeout 8 — test-grade sizing (sims sync in one or two epochs; the
+    /// timeout leaves slack over that without parking a wedged joiner for
+    /// long).
     fn default() -> Self {
         Self {
             epoch_duration_ms: u64::try_from(EPOCH_DURATION.as_millis()).unwrap_or(u64::MAX),
@@ -96,6 +108,7 @@ impl Default for BeaconChainConfig {
             beacon_committee_size: u32::try_from(BEACON_SIGNER_COUNT).unwrap_or(u32::MAX),
             reshape_thresholds: ReshapeThresholds::DISABLED,
             genesis_timestamp_ms: 0,
+            ready_timeout_epochs: 8,
         }
     }
 }
@@ -236,20 +249,26 @@ mod tests {
     }
 
     /// The production config differs from the dev/sim default in exactly
-    /// the beacon committee size: `PRODUCTION_BEACON_COMMITTEE_SIZE`, with
+    /// two knobs — the beacon committee size
+    /// (`PRODUCTION_BEACON_COMMITTEE_SIZE`) and the ready timeout — with
     /// every other sizing knob unchanged.
     #[test]
-    fn production_caps_only_the_beacon_committee() {
+    fn production_scales_committee_and_ready_timeout() {
         let prod = BeaconChainConfig::production();
         let dev = BeaconChainConfig::default();
         assert_eq!(
             prod.beacon_committee_size,
             u32::try_from(PRODUCTION_BEACON_COMMITTEE_SIZE).unwrap(),
         );
+        assert!(
+            prod.ready_timeout_epochs > dev.ready_timeout_epochs,
+            "production must budget more sync epochs than a sim",
+        );
         assert_eq!(
             prod,
             BeaconChainConfig {
                 beacon_committee_size: prod.beacon_committee_size,
+                ready_timeout_epochs: prod.ready_timeout_epochs,
                 ..dev
             },
         );

@@ -21,7 +21,7 @@ use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BlockHeight, READY_TIMEOUT_EPOCHS, SHUFFLE_INTERVAL_EPOCHS, ValidatorId, ValidatorStatus,
+    BeaconChainConfig, BlockHeight, SHUFFLE_INTERVAL_EPOCHS, ValidatorId, ValidatorStatus,
     shard_prefix_path,
 };
 use tracing_test::traced_test;
@@ -41,10 +41,11 @@ const SEED: u64 = 7;
 /// surface through `StepOutput`.
 const SHUFFLE_SLACK_EPOCHS: u64 = 4;
 
-/// Epochs the joiner gets to tail-sync and flip `ready: true` — far
-/// inside `READY_TIMEOUT_EPOCHS`, so the flip is signal-driven, not
-/// the timeout fallback.
-const READY_BUDGET_EPOCHS: u64 = 8;
+/// Epochs the joiner gets to tail-sync and flip `ready: true`. The
+/// budget is liveness slack only; the flip being signal-driven rather
+/// than the `ready_timeout_epochs` backstop is asserted separately
+/// against the flip epoch.
+const READY_BUDGET_EPOCHS: u64 = 6;
 
 /// Epochs the seated mover gets to land a committed proposal in the
 /// destination shard.
@@ -137,8 +138,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
 
     // ── Ready: tail sync completes and the fold flips the flag ──────
     // The joiner's self-signed ReadySignal must flip `ready: true`
-    // within a few epochs — far inside READY_TIMEOUT_EPOCHS, so the
-    // flip is signal-driven, not the timeout fallback.
+    // within a few epochs.
     let ready_deadline = runner.now() + Duration::from_millis(EPOCH_MS * READY_BUDGET_EPOCHS);
     let became_ready = run_until_or(&mut *runner, ready_deadline, &mut moves, |r| {
         matches!(
@@ -149,7 +149,31 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     assert!(
         became_ready,
         "joiner must flip ready:true via its ReadySignal within \
-         {READY_BUDGET_EPOCHS} epochs (READY_TIMEOUT is {READY_TIMEOUT_EPOCHS})"
+         {READY_BUDGET_EPOCHS} epochs"
+    );
+    // The flip must beat the auto-ready backstop: the committed state
+    // that first shows `ready: true` sits before `placed_at_epoch +
+    // ready_timeout_epochs`, so the fold consumed the mover's
+    // ReadySignal witness — the timeout fallback could not have fired
+    // yet.
+    let ready_timeout = BeaconChainConfig::default().ready_timeout_epochs;
+    let (_, flip_state) = runner
+        .beacon_storage(node)
+        .expect("mover host has beacon storage")
+        .latest_committed()
+        .expect("beacon chain is committed");
+    let Some(ValidatorStatus::OnShard {
+        placed_at_epoch, ..
+    }) = flip_state.validators.get(&validator).map(|r| r.status)
+    else {
+        panic!("mover must be OnShard in the flip-epoch state");
+    };
+    assert!(
+        flip_state.current_epoch.inner() < placed_at_epoch.inner() + ready_timeout,
+        "ready flip at epoch {} is not signal-driven: the auto-ready \
+         timeout (placed {} + {ready_timeout}) had already matured",
+        flip_state.current_epoch.inner(),
+        placed_at_epoch.inner(),
     );
 
     // ── Participation: the mover follows, votes, and proposes in B ──
