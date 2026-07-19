@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, HaltRecovery,
-    MIN_BEACON_COMMITTEE_SIZE, PendingReshape, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId,
-    TransitionCause, ValidatorId, ValidatorStatus,
+    MIN_BEACON_COMMITTEE_SIZE, PendingReshape, ShardCommittee, ShardId, TransitionCause,
+    ValidatorId, ValidatorStatus,
 };
 
 use crate::sampling::{sample_committee, sample_committee_weighted};
@@ -20,12 +20,13 @@ use crate::state::pool::pool_draw;
 const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
 
 /// Trickled committee rotation. When `state.current_epoch` lands on a
-/// [`SHUFFLE_INTERVAL_EPOCHS`] boundary (and `epoch > 0`), each shard
-/// rotates one of its ready `OnShard` validators back to `Pooled` and
-/// immediately refills the freed slot via [`pool_draw`]. The system-wide
-/// rotation rate is one validator per shard per
-/// [`SHUFFLE_INTERVAL_EPOCHS`] epochs, keeping per-shard composition
-/// churn uniform and bounded.
+/// shuffle-interval boundary (and `epoch > 0`), each shard rotates one
+/// of its ready `OnShard` validators back to `Pooled` and immediately
+/// refills the freed slot via [`pool_draw`]. The system-wide rotation
+/// rate is one validator per shard per interval, keeping per-shard
+/// composition churn uniform and bounded; the interval itself derives
+/// from the chain config
+/// ([`BeaconChainConfig::shuffle_interval_epochs`](hyperscale_types::BeaconChainConfig::shuffle_interval_epochs)).
 ///
 /// Shards iterate in sorted [`ShardId`] order; the victim within each
 /// shard is its longest-tenured ready member — the smallest
@@ -55,7 +56,8 @@ const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
 /// cross-shard reassignment.
 pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     let epoch = state.current_epoch;
-    if epoch.inner() == 0 || !epoch.inner().is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
+    let interval = state.chain_config.shuffle_interval_epochs();
+    if epoch.inner() == 0 || !epoch.inner().is_multiple_of(interval) {
         return;
     }
     let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
@@ -424,7 +426,8 @@ pub(super) fn diff_shard_committees(
     pre_shard_members: &BTreeMap<ShardId, Vec<ValidatorId>>,
 ) -> BTreeMap<ShardId, CommitteeTransition> {
     let epoch = state.current_epoch;
-    let cause = if epoch.inner() > 0 && epoch.inner().is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
+    let interval = state.chain_config.shuffle_interval_epochs();
+    let cause = if epoch.inner() > 0 && epoch.inner().is_multiple_of(interval) {
         TransitionCause::NaturalShuffle
     } else {
         TransitionCause::MembershipChange
@@ -463,9 +466,8 @@ mod tests {
     use hyperscale_types::{
         BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
         HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR, PendingReshape, Randomness,
-        SHUFFLE_INTERVAL_EPOCHS, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload,
-        Stake, StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
-        WeightedTimestamp,
+        ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
+        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
     };
 
     use super::{recover_halted_committees, resample_beacon_committee};
@@ -473,6 +475,12 @@ mod tests {
         apply_next_epoch, apply_witness_chunk, empty_state, single_pool_state, validator_record,
     };
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
+
+    /// The shuffle interval the fixture states derive — all of them run
+    /// under the dev-default `BeaconChainConfig`.
+    fn shuffle_interval() -> u64 {
+        empty_state().chain_config.shuffle_interval_epochs()
+    }
 
     /// Seat four ready validators on an untracked sibling shard so
     /// `beacon_eligible` has slack past the rotation guard. The sibling
@@ -555,7 +563,7 @@ mod tests {
     /// byte-identical; no transition emitted.
     #[test]
     fn shuffle_doesnt_fire_off_interval() {
-        // Land at epoch 1 — not a multiple of SHUFFLE_INTERVAL_EPOCHS.
+        // Land at epoch 1 — not a shuffle-interval multiple.
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         // Park a Pooled extra so a hypothetical refill would have stock.
@@ -660,7 +668,7 @@ mod tests {
         );
     }
 
-    /// On a `SHUFFLE_INTERVAL_EPOCHS` boundary, each shard rotates one
+    /// On a shuffle-interval boundary, each shard rotates one
     /// of its ready `OnShard` validators back to `Pooled` and refills
     /// the freed slot via `pool_draw`.
     #[test]
@@ -668,7 +676,7 @@ mod tests {
         // 2 shards × 4 ready actives + 2 pool extras = 10 validators.
         let mut state = multi_shard_state(2, 4, 2);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         let initial_shard_0 = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
@@ -743,7 +751,7 @@ mod tests {
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         let initial_members = state.next_shard_committees[&shard].members.clone();
         apply_next_epoch(&mut state, &[]);
@@ -789,7 +797,7 @@ mod tests {
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.validators.insert(spare);
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         let initial_members = state.next_shard_committees[&shard].members.clone();
         apply_next_epoch(&mut state, &[]);
@@ -845,7 +853,7 @@ mod tests {
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.validators.insert(spare);
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         apply_next_epoch(&mut state, &[]);
 
@@ -875,7 +883,7 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
         assert!(state.pooled_validators().is_empty());
 
         let initial_members = state.next_shard_committees[&shard].members.clone();
@@ -905,7 +913,7 @@ mod tests {
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
         assert_eq!(state.beacon_eligible().len(), 4);
 
         let initial_members = state.next_shard_committees[&shard].members.clone();
@@ -930,15 +938,15 @@ mod tests {
         // stock to refill with.
         let mut state = multi_shard_state(2, 4, 2);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
         // Arm a pending split with an empty cohort: the readiness gate
         // can't pass (no cohort seats), so the split won't execute this
         // epoch and the shard stays in the lookahead to inspect.
         state.pending_reshapes.insert(
             splitting,
             PendingReshape::Split {
-                last_asserted: Epoch::new(SHUFFLE_INTERVAL_EPOCHS),
-                admitted_at: Epoch::new(SHUFFLE_INTERVAL_EPOCHS),
+                last_asserted: Epoch::new(shuffle_interval()),
+                admitted_at: Epoch::new(shuffle_interval()),
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
             },
@@ -980,7 +988,7 @@ mod tests {
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         let effects = apply_next_epoch(&mut state, &[]);
         let transition = effects
@@ -988,7 +996,7 @@ mod tests {
             .get(&ShardId::leaf(1, 0))
             .expect("shuffle on shard 0 emits a transition");
         assert_eq!(transition.cause, TransitionCause::NaturalShuffle);
-        assert_eq!(transition.at_slot, Epoch::new(SHUFFLE_INTERVAL_EPOCHS));
+        assert_eq!(transition.at_slot, Epoch::new(shuffle_interval()));
     }
 
     /// Empty epoch with no witnesses and no shuffle boundary leaves
@@ -1014,7 +1022,7 @@ mod tests {
         // than shrinks, making the lookahead differ from the active.
         let mut state = multi_shard_state(2, 4, 2);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
         // Boundary epoch: the pipeline rotates `next_shard_committees`
         // (the lookahead governing the following window); the active

@@ -132,11 +132,21 @@ pub const POOL_BUFFER_TARGET: usize = 4;
 
 // ─── Lifecycle cadences ────────────────────────────────────────────────────
 
-/// One validator rotates out of a shard back to the pool every this
-/// many epochs.
+/// Ready-margin headroom in the derived shuffle interval
+/// (`BeaconChainConfig::shuffle_interval_epochs`).
 ///
-/// The opened slot triggers an immediate pool draw on the same shard.
-pub const SHUFFLE_INTERVAL_EPOCHS: u64 = 16;
+/// The interval satisfies `interval ≥ SHUFFLE_SYNC_HEADROOM ·
+/// ready_timeout_epochs / shard_size`, so with one draw per shard per
+/// interval at most `shard_size / SHUFFLE_SYNC_HEADROOM` seats sit
+/// inside their sync budget concurrently, and each seat spends at most
+/// `1 / SHUFFLE_SYNC_HEADROOM` of its tenure mid-sync. The margin is
+/// what the unready dip costs: quorum is denominated in the
+/// ready-filtered consensus subset, so every mid-sync seat shrinks the
+/// committee while corrupt seats always signal ready — and once the
+/// ready timeout auto-flips a still-unsynced seat, it sits in the
+/// denominator as dead weight until the miss jail catches it. Eight
+/// caps both erosions at an eighth of the committee.
+pub const SHUFFLE_SYNC_HEADROOM: u64 = 8;
 
 /// How many consecutive boundary folds may observe a live shard missing
 /// before the beacon flags it as halted.

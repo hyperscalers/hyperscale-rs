@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Bls12381G1PublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
+    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 const V: usize = 3;
@@ -168,7 +168,7 @@ fn lookahead_committee_promotes_unchanged_to_active() {
     let network = NetworkDefinition::simulator();
     let mut state = initial_state();
 
-    let last = SHUFFLE_INTERVAL_EPOCHS + 1;
+    let last = state.chain_config.shuffle_interval_epochs() + 1;
     let mut lookahead_after: BTreeMap<u64, BTreeMap<ShardId, ShardCommittee>> = BTreeMap::new();
     let mut active_after: BTreeMap<u64, BTreeMap<ShardId, ShardCommittee>> = BTreeMap::new();
 
@@ -198,7 +198,7 @@ fn lookahead_committee_promotes_unchanged_to_active() {
 
     // Non-triviality: the shuffle rotates the lookahead so it diverges from the
     // committee it supersedes, and that rotated set becomes active one epoch on.
-    let boundary = SHUFFLE_INTERVAL_EPOCHS;
+    let boundary = last - 1;
     assert_ne!(
         lookahead_after[&boundary], active_after[&boundary],
         "the shuffle at epoch {boundary} must rotate the lookahead committee",

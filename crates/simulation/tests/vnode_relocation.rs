@@ -1,7 +1,7 @@
 //! End-to-end vnode relocation across a shard committee rotation.
 //!
-//! Boots a 2-shard network, runs past the `SHUFFLE_INTERVAL_EPOCHS`
-//! boundary, and — unlike [`topology_rotation`], which only checks that
+//! Boots a 2-shard network, runs past the shuffle-interval boundary,
+//! and — unlike [`topology_rotation`], which only checks that
 //! cross-shard *verification* survives the rotation — actually moves
 //! the shuffled vnode: the lookahead placement delta surfaces through
 //! `StepOutput`, the harness snap-syncs the destination shard against
@@ -21,8 +21,7 @@ use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, SHUFFLE_INTERVAL_EPOCHS, ValidatorId, ValidatorStatus,
-    shard_prefix_path,
+    BeaconChainConfig, BlockHeight, ValidatorId, ValidatorStatus, shard_prefix_path,
 };
 use tracing_test::traced_test;
 
@@ -30,11 +29,12 @@ mod support;
 
 use support::{SimCluster, committee_member_host, rotation_config};
 
-/// Seed chosen so the epoch-16 shuffle produces a *direct* cross-shard
-/// move: one shard's rotation victim is drawn straight into the other
-/// shard's freed slot, yielding a single `ParticipationChange` with
-/// both `join` and `leave` set on a hosted vnode. `RELOC_SEED` overrides
-/// it to search for a direct move under a different grown placement.
+/// Seed chosen so the first shuffle (epoch 16 at this config's derived
+/// interval) produces a *direct* cross-shard move: one shard's rotation
+/// victim is drawn straight into the other shard's freed slot, yielding
+/// a single `ParticipationChange` with both `join` and `leave` set on a
+/// hosted vnode. `RELOC_SEED` overrides it to search for a direct move
+/// under a different grown placement.
 const SEED: u64 = 7;
 
 /// Epochs past the shuffle boundary the placement delta gets to
@@ -101,9 +101,14 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     runner.grow_to(2);
     let _ = runner.take_participation_changes();
 
-    // ── Detection: the epoch-16 shuffle surfaces a direct move ──────
-    let shuffle =
-        Duration::from_millis(EPOCH_MS * (SHUFFLE_INTERVAL_EPOCHS + SHUFFLE_SLACK_EPOCHS));
+    // ── Detection: the first shuffle surfaces a direct move ─────────
+    let (_, chain_state) = runner
+        .beacon_storage(0)
+        .expect("host 0 exists")
+        .latest_committed()
+        .expect("beacon committed");
+    let shuffle_interval = chain_state.chain_config.shuffle_interval_epochs();
+    let shuffle = Duration::from_millis(EPOCH_MS * (shuffle_interval + SHUFFLE_SLACK_EPOCHS));
     let mut moves: Vec<(NodeIndex, ParticipationChange)> = Vec::new();
     run_until_or(&mut *runner, shuffle, &mut moves, |_| false);
     let (node, change) = moves

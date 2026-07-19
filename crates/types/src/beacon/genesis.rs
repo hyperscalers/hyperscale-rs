@@ -15,7 +15,7 @@ use sbor::prelude::*;
 use crate::{
     BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash,
     Hash, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, ReshapeThresholds,
-    SHARD_CAPACITY, Stake, StakePoolId, ValidatorId,
+    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -93,6 +93,32 @@ impl BeaconChainConfig {
     #[must_use]
     pub const fn epoch_windows(&self) -> EpochWindows {
         EpochWindows::new(self.epoch_duration_ms)
+    }
+
+    /// Epochs between committee-rotation events — the trickle shuffle's
+    /// cadence, derived rather than stored:
+    /// `max(1, ⌈SHUFFLE_SYNC_HEADROOM · ready_timeout_epochs / shard_size⌉)`.
+    ///
+    /// Per-seat tenure is `shard_size × interval` epochs, so the formula
+    /// pins tenure at `≥ SHUFFLE_SYNC_HEADROOM × ready_timeout_epochs`
+    /// whatever the committee size. Rotation is the defense against
+    /// adaptive corruption of seated validators, and its resistance grows
+    /// exponentially in the rotation rate while the honest cost grows
+    /// linearly — so the interval sits at the fastest cadence the ready
+    /// margin allows ([`SHUFFLE_SYNC_HEADROOM`]), and no faster. A pure
+    /// function of genesis-frozen config: every replica derives the same
+    /// cadence, with no stored copy to diverge.
+    #[must_use]
+    pub const fn shuffle_interval_epochs(&self) -> u64 {
+        let shard_size = if self.shard_size == 0 {
+            1
+        } else {
+            self.shard_size as u64
+        };
+        let interval = SHUFFLE_SYNC_HEADROOM
+            .saturating_mul(self.ready_timeout_epochs)
+            .div_ceil(shard_size);
+        if interval == 0 { 1 } else { interval }
     }
 }
 
@@ -272,6 +298,30 @@ mod tests {
                 ..dev
             },
         );
+    }
+
+    /// The derived shuffle interval at the operating points the security
+    /// analysis names: dev defaults keep today's 16-epoch cadence, the
+    /// production target (n = 128, S = 32) lands on spec Rider 1's
+    /// recommendation, and n = 256 sits exactly on the one-epoch floor.
+    #[test]
+    fn shuffle_interval_derives_from_sync_budget_and_shard_size() {
+        let at = |shard_size: u32, ready_timeout_epochs: u64| {
+            BeaconChainConfig {
+                shard_size,
+                ready_timeout_epochs,
+                ..BeaconChainConfig::default()
+            }
+            .shuffle_interval_epochs()
+        };
+        assert_eq!(BeaconChainConfig::default().shuffle_interval_epochs(), 16);
+        assert_eq!(at(128, 32), 2);
+        assert_eq!(at(256, 32), 1);
+        // Past the floor the clamp holds: tenure headroom is already met.
+        assert_eq!(at(1024, 32), 1);
+        // Degenerate sizes clamp rather than divide by zero or stall.
+        assert_eq!(at(0, 8), 64);
+        assert_eq!(at(4, 0), 1);
     }
 
     fn net() -> NetworkDefinition {
