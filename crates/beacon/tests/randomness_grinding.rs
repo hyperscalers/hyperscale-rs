@@ -48,9 +48,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Epoch, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake,
-    StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
-    byzantine_threshold, vrf_sign,
+    NetworkDefinition, Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, byzantine_threshold,
+    vrf_sign,
 };
 
 // ─── Analytic model (ported from committee_security.py) ──────────────────────
@@ -621,9 +621,9 @@ struct GrindParams {
 }
 
 /// Run the grind for up to `max_events`, one shuffle per event (epoch
-/// advances by [`SHUFFLE_INTERVAL_EPOCHS`], so each [`apply_epoch`] lands
-/// on a shuffle boundary). Returns the final state, the run context, and
-/// the per-event outcomes.
+/// advances by the state's derived shuffle interval, so each
+/// [`apply_epoch`] lands on a shuffle boundary). Returns the final
+/// state, the run context, and the per-event outcomes.
 /// Build the run context and initial state for a grind configuration.
 fn build_run(p: GrindParams, seed: u64) -> (Ctx, BeaconState) {
     let population = p.pool_factor * u64::from(p.n);
@@ -663,10 +663,11 @@ fn run_march(
     let (ctx, mut state) = build_run(p, seed);
 
     let f_plus_1 = f_of(p.n) + 1;
+    let interval = state.chain_config.shuffle_interval_epochs();
     let mut outcomes = Vec::new();
     let mut epoch = 0u64;
     for _ in 0..max_events {
-        epoch += SHUFFLE_INTERVAL_EPOCHS;
+        epoch += interval;
         let out = grind_event(
             &mut state,
             &ctx,
@@ -735,7 +736,7 @@ fn grind_gain_probability_matches_best_of_2t_entrant_model() {
             let out = grind_event(
                 &mut state,
                 &ctx,
-                Epoch::new(SHUFFLE_INTERVAL_EPOCHS),
+                Epoch::new(template.chain_config.shuffle_interval_epochs()),
                 t,
                 honest,
                 Adversary::WITHHOLDING,

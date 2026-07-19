@@ -53,7 +53,7 @@ pub use beacon::{
     PcVoteVerifyContext, PcXpProof, PendingReshape, PendingWithdrawal, RESHAPE_HANDOFF_TTL_EPOCHS,
     RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError,
     RatifyPhase, RatifyVerifyContext, RatifyVote, RatifyVoteRecord, RatifyVoteVerifyError,
-    ReadySignal, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG, SHUFFLE_INTERVAL_EPOCHS,
+    ReadySignal, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG, SHUFFLE_SYNC_HEADROOM,
     SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardBoundary, ShardCommittee, ShardEpochContribution,
     ShardWitness, ShardWitnessPayload, ShardWitnessProof, ShardWitnessVerifyError, SkipReport,
     SlotEffects, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,

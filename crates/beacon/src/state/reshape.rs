@@ -1230,14 +1230,12 @@ mod tests {
     /// shuffle rotates only non-keeper members.
     #[test]
     fn merge_keepers_are_pinned_against_rotation() {
-        use hyperscale_types::SHUFFLE_INTERVAL_EPOCHS;
-
         use crate::state::committee::run_shuffle_step;
 
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(4);
-        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS);
+        state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
         apply_shard_payload(&mut state, left, &merge);
         apply_shard_payload(&mut state, right, &merge);

@@ -15,8 +15,8 @@ use tracing_test::traced_test;
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
 /// eight validators: the first four sit on the genesis beacon committee, the
 /// other four are active shard members forming the eligibility slack the
-/// shuffle needs once `SHUFFLE_INTERVAL_EPOCHS == 16` fires and the
-/// skip-quorum source when the committee stalls.
+/// shuffle needs once the derived interval fires and the skip-quorum
+/// source when the committee stalls.
 fn beacon_chain_config(epoch_duration_ms: u64) -> BeaconChainConfig {
     BeaconChainConfig {
         epoch_duration_ms,
@@ -170,7 +170,7 @@ fn skip_path_advances_past_blocked_epoch() {
 #[traced_test]
 #[test]
 fn fetch_recovery_path_unblocks_dropped_peer() {
-    // The whole drop-and-recover run stays below the epoch-16 committee
+    // The whole drop-and-recover run stays below the first committee
     // shuffle, so a fetch-recovered block never commits against an evicted
     // committee — the 3-epoch topology retention window is sized for exactly
     // this shape.

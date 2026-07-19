@@ -38,8 +38,8 @@ use std::time::Instant;
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
-    Randomness, SHUFFLE_INTERVAL_EPOCHS, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
+    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -134,6 +134,17 @@ struct KernelTally {
 }
 
 const BURN_IN_EVENTS: u64 = 64;
+
+/// The shuffle interval a cell's chain config derives — used to size
+/// `epochs` in event counts before the cell is built.
+fn cell_interval(shard_size: u32, ready_timeout_epochs: u64) -> u64 {
+    BeaconChainConfig {
+        shard_size,
+        ready_timeout_epochs,
+        ..BeaconChainConfig::default()
+    }
+    .shuffle_interval_epochs()
+}
 
 /// Corrupt ids spread evenly across the id space, so the marking is
 /// uncorrelated with the initial block seating.
@@ -279,6 +290,7 @@ fn count_corrupt(members: &[ValidatorId], corrupt: &BTreeSet<ValidatorId>) -> u6
 fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
     let network = NetworkDefinition::simulator();
     let mut state = mc_state(cell);
+    let interval = state.chain_config.shuffle_interval_epochs();
     let mut tally = KernelTally::default();
     let no_contributions = BTreeMap::new();
     // Seat-tenure tracker: seating epoch per current member.
@@ -309,7 +321,7 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
             *tally.beacon.entry((m, k)).or_default() += 1;
         }
 
-        if !e.is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
+        if !e.is_multiple_of(interval) {
             assert_eq!(
                 before, state.next_shard_committees,
                 "membership changed outside a shuffle epoch (epoch {e})"
@@ -336,7 +348,7 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
             if !burned_in {
                 continue;
             }
-            let intervals = (e - seated) / SHUFFLE_INTERVAL_EPOCHS;
+            let intervals = (e - seated) / interval;
             let tenure = if corrupt.contains(&out) {
                 &mut tally.tenure_corrupt
             } else {
@@ -546,7 +558,7 @@ fn kernel_comparison_tables() {
             shard_size,
             population,
             corrupt,
-            epochs: 200_000 * SHUFFLE_INTERVAL_EPOCHS,
+            epochs: 200_000 * cell_interval(shard_size, 8),
             ready_lag_epochs: 0,
             ready_timeout_epochs: 8,
             beacon_size: None,
@@ -573,7 +585,7 @@ fn depletion_tables() {
             shard_size: 16,
             population,
             corrupt,
-            epochs: 50_000 * SHUFFLE_INTERVAL_EPOCHS,
+            epochs: 50_000 * cell_interval(16, 8),
             ready_lag_epochs: 0,
             ready_timeout_epochs: 8,
             beacon_size: None,
@@ -600,7 +612,7 @@ fn ready_lag_tables() {
             shard_size: 16,
             population: 320,
             corrupt: 80,
-            epochs: 100_000 * SHUFFLE_INTERVAL_EPOCHS,
+            epochs: 100_000 * cell_interval(16, 32),
             ready_lag_epochs: lag,
             ready_timeout_epochs: 32,
             beacon_size: None,
@@ -754,6 +766,7 @@ fn shuffle_skips_split_pending_shard() {
     };
     let network = NetworkDefinition::simulator();
     let mut state = mc_state(&cell);
+    let interval = state.chain_config.shuffle_interval_epochs();
     let target = shard_ids(cell.shards)[0];
     let window = 32..=128;
     let no_contributions = BTreeMap::new();
@@ -792,7 +805,7 @@ fn shuffle_skips_split_pending_shard() {
             },
         );
         flip_ready(&mut state, 0);
-        if !e.is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
+        if !e.is_multiple_of(interval) {
             continue;
         }
         for (shard, committee_before) in &before {
@@ -820,8 +833,11 @@ fn shuffle_skips_split_pending_shard() {
             }
         }
     }
-    // The window covers shuffle epochs 32..128 (7 events); the target
-    // rotates at 16 and again at 144+.
-    assert_eq!(skipped_events, 7);
+    // Every shuffle epoch inside the pending window skips the target;
+    // the target still rotates before the window opens and after it
+    // clears (the 200-epoch run leaves shuffle events on both sides).
+    let expected_skips = window.filter(|e| e.is_multiple_of(interval)).count();
+    assert!(expected_skips >= 5, "window too narrow to be probative");
+    assert_eq!(skipped_events, expected_skips);
     assert!(rotated_events >= 5);
 }
