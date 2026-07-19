@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::{SeatVnodeGroup, VnodeInit, seat_vnode_group};
@@ -24,6 +25,7 @@ use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use super::{ShardSupervisor, ShardThread, SupervisorEvent};
@@ -434,7 +436,28 @@ impl ShardSupervisor {
     /// join that queued behind the drain.
     pub(super) fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
         detach_shard(&self.process, shard);
-        self.storages.lock().expect("storages lock").remove(&shard);
+        let storage = self.storages.lock().expect("storages lock").remove(&shard);
+        if let Some(storage) = storage {
+            // A store handle that outlives its teardown holds the RocksDB
+            // directory lock, and every later re-seat of this host onto the
+            // shard fails its storage open until the process restarts. That
+            // failure is silent at the leak site and surfaces minutes or
+            // days later as a join-retry loop, so probe for it: transient
+            // holders (an in-flight GC pass, a serving request) drain in
+            // well under the grace.
+            let probe = Arc::downgrade(&storage);
+            drop(storage);
+            self.tokio_handle.spawn(async move {
+                sleep(Duration::from_secs(5)).await;
+                if let Some(live) = probe.upgrade() {
+                    warn!(
+                        shard = ?shard,
+                        holders = Arc::strong_count(&live).saturating_sub(1),
+                        "Shard store handle still held after teardown; its RocksDB lock is leaked"
+                    );
+                }
+            });
+        }
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
         info!(shard = ?shard, "Shard left and torn down");
