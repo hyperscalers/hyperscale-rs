@@ -19,7 +19,6 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Hash, ShardId,
     ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, WeightedTimestamp,
     commit_witness_window, compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit,
-    vrf_output_from_proof,
 };
 
 use crate::pending::{PendingBlock, PendingBlocks};
@@ -135,7 +134,7 @@ impl BeaconWitnessAccumulator {
 ///
 /// Walks from `parent_block_hash` back through the pending chain to
 /// the committed tip, re-deriving each ancestor's witness-leaf delta
-/// from its receipts + manifest's `ready_signals` + missed-round scan,
+/// from its receipts + carried witness sources + missed-round scan,
 /// then prepends the committed accumulator's retained window. Each
 /// ancestor's leaves resolve against *its own* committee — the certified
 /// binding of its anchor (`parent_qc.weighted_timestamp()`) and its
@@ -234,14 +233,9 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
         let new_leaves = derive_leaves(
             local_shard,
             committee,
-            vrf_output_from_proof(block.randomness_reveal()),
             &receipts,
             &missed,
-            block.ready_signals().as_slice(),
-            block
-                .reshape_trigger()
-                .and_then(|t| t.to_payload(local_shard)),
-            block.equivocations().as_slice(),
+            block.witness_sources(),
         );
         chain_deltas.push(
             new_leaves
@@ -265,9 +259,9 @@ mod tests {
 
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessRoot, BlockHeight, Bls12381G2Signature, NetworkDefinition, ReadySignal, Round,
-        Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, VrfOutput,
-        WeightedTimestamp, compute_merkle_root,
+        BeaconWitnessRoot, BlockHeight, Bls12381G2Signature, NetworkDefinition, ReadySignal,
+        ReshapeTrigger, Round, Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo,
+        ValidatorSet, VrfProof, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
 
     use super::*;
@@ -478,17 +472,18 @@ mod tests {
 
         // Validator 2 holds an observer seat: its signal classifies as
         // `ReshapeReady` in the same ascending-id position.
+        let sources = WitnessSources::new(
+            ready,
+            Vec::new(),
+            Some(ReshapeTrigger::Split),
+            VrfProof::ZERO,
+        );
         let leaves = derive_leaves(
             ShardId::ROOT,
             &topology_with_observer(2),
-            VrfOutput::ZERO,
             &receipts,
             &missed,
-            &ready,
-            Some(ShardWitnessPayload::ScheduleSplit {
-                shard: ShardId::ROOT,
-            }),
-            &[],
+            &sources,
         );
         // Leaf 0 is the randomness reveal, then 1 MissedProposal + 3 readiness
         // witnesses (sorted ascending by validator id, kind per sender) + the
@@ -533,26 +528,9 @@ mod tests {
         let ready = ready_signals(&[7, 2]);
         let receipts: Vec<StoredReceipt> = Vec::new();
 
-        let a = derive_leaves(
-            ShardId::ROOT,
-            &topo,
-            VrfOutput::ZERO,
-            &receipts,
-            &missed,
-            &ready,
-            None,
-            &[],
-        );
-        let b = derive_leaves(
-            ShardId::ROOT,
-            &topo,
-            VrfOutput::ZERO,
-            &receipts,
-            &missed,
-            &ready,
-            None,
-            &[],
-        );
+        let sources = WitnessSources::new(ready, Vec::new(), None, VrfProof::ZERO);
+        let a = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
+        let b = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
         assert_eq!(a, b);
 
         let mut acc_a = BeaconWitnessAccumulator::new();

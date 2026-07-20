@@ -429,8 +429,8 @@ mod tests {
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, Verifiable, VrfProof, WaveCertificate, WaveId, WeightedTimestamp,
-        zero_bls_signature,
+        TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
+        WitnessSources, zero_bls_signature,
     };
 
     use super::*;
@@ -574,10 +574,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -591,10 +588,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -612,10 +606,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
@@ -637,10 +628,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -668,10 +656,7 @@ mod tests {
             transactions: Arc::new(vec![tx].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -695,10 +680,7 @@ mod tests {
             transactions: Arc::new(vec![tx].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -719,10 +701,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(vec![fw].into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -777,10 +756,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(vec![fw].into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -808,10 +784,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(vec![fw].into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -859,10 +832,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(vec![fw].into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);

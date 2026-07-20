@@ -875,7 +875,7 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, make_live_block};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
-        ValidatorId,
+        ValidatorId, WitnessSources,
     };
 
     use super::*;
@@ -1547,7 +1547,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, TransactionRoot, VrfProof,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, TransactionRoot,
     };
 
     /// Tag the pin hook pushes into the sink, distinguishing pins from
@@ -1612,10 +1612,7 @@ mod tests {
             transactions: Arc::new(vec![].into()),
             certificates: Arc::new(vec![].into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
         // SAFETY: synthetic test fixture, no real signature.

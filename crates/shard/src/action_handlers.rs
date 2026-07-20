@@ -16,18 +16,18 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext,
-    CertifiedBlockHeader, CertifiedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
-    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
+    BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
+    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardVoteEquivocation,
     SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
     TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, block_header_message, block_vote_message,
-    certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
-    local_settled_wave_ids, missed_proposals_since_prev_commit, ready_signal_message,
-    shard_reveal_sign, vrf_output_from_proof,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
+    block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
+    derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
+    ready_signal_message, shard_reveal_sign,
 };
 
 /// Result of QC verification and assembly.
@@ -162,12 +162,6 @@ pub struct ProposalResult {
     pub block: Block,
     /// Hash of the constructed block, cached so callers don't recompute.
     pub block_hash: BlockHash,
-    /// Manifest carrying the proposer's drained `ready_signals` alongside
-    /// the standard tx/cert/provision hash lists, for the downstream
-    /// gossip + pending-block pathway. The same fields ride on
-    /// [`block`](Self::block) too, so a sync-committed or reloaded copy of
-    /// this block recovers them via `BlockManifest::from_block`.
-    pub manifest: BlockManifest,
     /// JMT prepared-commit closure from the proposer's pre-commit,
     /// threaded to the commit pipeline so the proposer doesn't recompute
     /// on commit.
@@ -249,6 +243,12 @@ pub fn build_proposal<S: ShardChainWriter>(
     // missed-round walk derives here from the same `(parent_round, round,
     // topology)` the verifier reads, so proposer and verifier share the one
     // helper and their leaf order can't drift.
+    let witness_sources = Arc::new(WitnessSources::new(
+        ready_signals,
+        equivocations,
+        reshape_trigger,
+        randomness_reveal,
+    ));
     let missed = missed_proposals_since_prev_commit(
         local_shard,
         height,
@@ -259,12 +259,9 @@ pub fn build_proposal<S: ShardChainWriter>(
     let new_witness_leaves = derive_leaves(
         local_shard,
         topology_snapshot,
-        vrf_output_from_proof(&randomness_reveal),
         &receipts,
         &missed,
-        &ready_signals,
-        reshape_trigger.and_then(|t| t.to_payload(local_shard)),
-        &equivocations,
+        &witness_sources,
     );
     let (beacon_witness_root, beacon_witness_leaf_count) = commit_witness_window(
         parent_witness_leaves,
@@ -316,35 +313,19 @@ pub fn build_proposal<S: ShardChainWriter>(
         settled_waves_root,
     );
 
-    let tx_hashes: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
-    let cert_ids: Vec<_> = certificates.iter().map(|c| c.wave_id().clone()).collect();
     let block = Block::Live {
         header,
         transactions: Arc::new(transactions.into()),
         certificates: Arc::new(certificates.into()),
         provisions: Arc::new(provisions.into()),
-        ready_signals: Arc::new(ready_signals.clone().into()),
-        equivocations: Arc::new(equivocations.clone().into()),
-        reshape_trigger,
-        randomness_reveal,
+        witness_sources,
     };
-
-    let manifest = BlockManifest::new(
-        tx_hashes,
-        cert_ids,
-        provision_hashes,
-        ready_signals,
-        equivocations,
-        reshape_trigger,
-        randomness_reveal,
-    );
 
     let block_hash = block.hash();
 
     ProposalResult {
         block,
         block_hash,
-        manifest,
         prepared_commit: prepared,
         jmt_snapshot,
     }
@@ -586,13 +567,10 @@ where
             parent_round,
             height,
             round,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
+            witness_sources,
             substate_bytes,
             thresholds,
             finalized_waves,
-            randomness_reveal,
             topology_snapshot,
         } => {
             let start = std::time::Instant::now();
@@ -610,10 +588,7 @@ where
                 height,
                 round,
                 receipts: &receipts,
-                ready_signals: &ready_signals,
-                equivocations: &equivocations,
-                randomness_reveal,
-                reshape_trigger,
+                witness_sources: &witness_sources,
                 substate_bytes,
                 thresholds,
                 topology_snapshot: &topology_snapshot,
@@ -844,7 +819,6 @@ where
                 round,
                 block: Arc::new(result.block),
                 block_hash,
-                manifest: result.manifest,
                 finalized_waves,
                 provisions,
                 bytes_delta,

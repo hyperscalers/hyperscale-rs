@@ -25,10 +25,9 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, BoundedVec, CertifiedBlock,
-    FinalizedWave, MAX_EQUIVOCATIONS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, ReadySignal, ReshapeTrigger, RoutableTransaction,
-    ShardVoteEquivocation, TxHash, Verifiable, VrfProof, WaveId,
+    FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, Verifiable, WaveId,
+    WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -94,19 +93,10 @@ pub struct ElidedCertifiedBlock {
     certificates:
         BoundedVec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>), MAX_FINALIZED_TX_PER_BLOCK>,
     provisions: ElidedProvisions,
-    /// Beacon-witness-bearing block fields, always inline (never elided):
+    /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
-    ready_signals: BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>,
-    reshape_trigger: Option<ReshapeTrigger>,
-    /// The proposer's randomness reveal — leaf 0 of the block's witness
-    /// contribution. Inline for the same reason as `ready_signals`: the
-    /// receiver re-verifies it and reproduces leaf 0 at commit.
-    randomness_reveal: VrfProof,
-    /// Double-vote equivocation evidence — inline for the same reason as
-    /// `ready_signals`: the receiver re-verifies it and reproduces its
-    /// `VoteEquivocation` leaves at commit.
-    equivocations: BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK>,
+    witness_sources: WitnessSources,
 }
 
 /// Variant-discriminated provisions payload for [`ElidedCertifiedBlock`].
@@ -249,15 +239,7 @@ impl ElidedCertifiedBlock {
             transactions: transactions.into(),
             certificates: certificates.into(),
             provisions,
-            randomness_reveal: *block.randomness_reveal(),
-            equivocations: (**block.equivocations()).clone(),
-            ready_signals: block
-                .ready_signals()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .into(),
-            reshape_trigger: block.reshape_trigger(),
+            witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
 
@@ -360,10 +342,7 @@ impl ElidedCertifiedBlock {
                     transactions: txs,
                     certificates: certs,
                     provisions: Arc::new(provisions.into()),
-                    ready_signals: Arc::new(self.ready_signals.clone()),
-                    equivocations: Arc::new(self.equivocations.clone()),
-                    reshape_trigger: self.reshape_trigger,
-                    randomness_reveal: self.randomness_reveal,
+                    witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
             (None, ElidedProvisions::Sealed(hashes)) => Block::Sealed {
@@ -371,10 +350,7 @@ impl ElidedCertifiedBlock {
                 transactions: txs,
                 certificates: certs,
                 provision_hashes: Arc::new(hashes.clone()),
-                ready_signals: Arc::new(self.ready_signals.clone()),
-                equivocations: Arc::new(self.equivocations.clone()),
-                reshape_trigger: self.reshape_trigger,
-                randomness_reveal: self.randomness_reveal,
+                witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
                 unreachable!("live_provs is Some when provisions is Live")
@@ -499,10 +475,7 @@ mod tests {
             transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -665,7 +638,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(9).unwrap();
+            enc.write_size(6).unwrap();
             enc.encode(&header).unwrap();
             enc.encode(&qc).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
@@ -697,7 +670,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(9).unwrap();
+            enc.write_size(6).unwrap();
             enc.encode(&header).unwrap();
             enc.encode(&qc).unwrap();
             // Empty transactions.
@@ -734,7 +707,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(9).unwrap();
+            enc.write_size(6).unwrap();
             enc.encode(&header).unwrap();
             enc.encode(&qc).unwrap();
             enc.encode(&Vec::<(TxHash, Option<Arc<RoutableTransaction>>)>::new())

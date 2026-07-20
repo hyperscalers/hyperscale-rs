@@ -183,7 +183,6 @@ impl ShardParticipation {
                 round,
                 block,
                 block_hash,
-                manifest,
                 finalized_waves,
                 provisions,
                 bytes_delta,
@@ -193,7 +192,6 @@ impl ShardParticipation {
                 round,
                 &block,
                 block_hash,
-                &manifest,
                 finalized_waves,
                 provisions,
                 bytes_delta,
@@ -382,7 +380,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
         CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp,
         MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
-        Round, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, VrfProof, WaveId,
+        Round, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WitnessSources,
     };
 
     use crate::state::test_support::TestNode;
@@ -671,15 +669,8 @@ mod tests {
         // single-tx manifest so the projection cleanly fits.
         let TestNode { mut node, .. } = TestNode::new();
 
-        let manifest = BlockManifest::new(
-            vec![TxHash::ZERO],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            VrfProof::ZERO,
-        );
+        let manifest =
+            BlockManifest::new(vec![TxHash::ZERO], vec![], vec![], WitnessSources::empty());
 
         // `make_live_block` stamps round 0, and proposer_for(r=0) =
         // committee[0] = ValidatorId::new(0). The shard coordinator's header

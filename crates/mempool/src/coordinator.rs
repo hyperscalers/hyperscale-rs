@@ -1262,7 +1262,7 @@ mod tests {
         TestCommittee, certify, make_finalized_wave, make_live_block, test_node, test_transaction,
         test_transaction_with_nodes,
     };
-    use hyperscale_types::{BoundedVec, Verified};
+    use hyperscale_types::{Verified, WitnessSources};
 
     /// Test-only convenience: wrap any `RoutableTransaction` in a
     /// `Verified` witness via the test-only gate.
@@ -1271,7 +1271,7 @@ mod tests {
     }
     use hyperscale_types::{
         Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardId, ValidatorId, VrfProof,
+        ShardId, ValidatorId,
     };
 
     use super::*;
@@ -1340,10 +1340,7 @@ mod tests {
                 transactions,
                 certificates,
                 provisions: Arc::new(vec![Arc::new(provision.into())].into()),
-                ready_signals: Arc::new(BoundedVec::new()),
-                equivocations: Arc::new(BoundedVec::new()),
-                reshape_trigger: None,
-                randomness_reveal: VrfProof::ZERO,
+                witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,
         };

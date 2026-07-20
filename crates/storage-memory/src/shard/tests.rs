@@ -18,8 +18,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BoundedVec, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, StateRoot,
-    StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, VrfProof, WaveCertificate,
-    WaveId, WeightedTimestamp,
+    StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -147,10 +147,7 @@ fn commit_with(
                 transactions,
                 certificates,
                 provisions,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
                 certificates.push(new_fw);
@@ -159,10 +156,7 @@ fn commit_with(
                     transactions,
                     certificates: Arc::new(certificates),
                     provisions,
-                    ready_signals,
-                    equivocations,
-                    reshape_trigger,
-                    randomness_reveal,
+                    witness_sources,
                 }
             }
             Block::Sealed {
@@ -170,10 +164,7 @@ fn commit_with(
                 transactions,
                 certificates,
                 provision_hashes,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
                 certificates.push(new_fw);
@@ -182,10 +173,7 @@ fn commit_with(
                     transactions,
                     certificates: Arc::new(certificates),
                     provision_hashes,
-                    ready_signals,
-                    equivocations,
-                    reshape_trigger,
-                    randomness_reveal,
+                    witness_sources,
                 }
             }
         }
@@ -485,10 +473,7 @@ fn test_transactions_batch_with_indexed_block() {
             transactions: Arc::new(vec![tx].into()),
             certificates,
             provisions,
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
             header,
@@ -500,10 +485,7 @@ fn test_transactions_batch_with_indexed_block() {
             transactions: Arc::new(vec![tx].into()),
             certificates,
             provision_hashes,
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
 

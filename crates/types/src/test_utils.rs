@@ -23,7 +23,7 @@ use crate::{
     NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
     ShardId, SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, VrfProof, WaveCertificate, WaveId, WeightedTimestamp, bls_keypair_from_seed,
+    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, bls_keypair_from_seed,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -381,10 +381,7 @@ pub fn make_live_block(
         transactions: Arc::new(transactions.into()),
         certificates: Arc::new(certificates.into()),
         provisions: Arc::new(BoundedVec::new()),
-        ready_signals: Arc::new(BoundedVec::new()),
-        equivocations: Arc::new(BoundedVec::new()),
-        reshape_trigger: None,
-        randomness_reveal: VrfProof::ZERO,
+        witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
 
@@ -487,38 +484,26 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provisions,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => Block::Live {
             header: restamp(header),
             transactions,
             certificates,
             provisions,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         },
         Block::Sealed {
             header,
             transactions,
             certificates,
             provision_hashes,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => Block::Sealed {
             header: restamp(header),
             transactions,
             certificates,
             provision_hashes,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         },
     }
 }

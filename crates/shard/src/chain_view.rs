@@ -175,7 +175,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
         CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield, TransactionRoot,
-        ValidatorId, Verifiable, VrfProof, WeightedTimestamp, test_utils, zero_bls_signature,
+        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -212,10 +212,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -248,14 +245,7 @@ mod tests {
     }
 
     fn pending_from_block(block: &Block) -> PendingBlock {
-        let mut pb = PendingBlock::from_complete_block(
-            block,
-            vec![],
-            None,
-            vec![],
-            vec![],
-            LocalTimestamp::ZERO,
-        );
+        let mut pb = PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
         pb.construct_block().expect("construct block");
         pb
     }
@@ -303,15 +293,8 @@ mod tests {
             BlockHeight::new(2),
             std::collections::BTreeSet::new(),
         );
-        let manifest = BlockManifest::new(
-            vec![],
-            vec![wave.clone()],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            VrfProof::ZERO,
-        );
+        let manifest =
+            BlockManifest::new(vec![], vec![wave.clone()], vec![], WitnessSources::empty());
         let pending_block = PendingBlock::from_manifest(header, manifest, LocalTimestamp::ZERO);
         let mut pending = PendingBlocks::new();
         pending.insert(pending_block);
@@ -352,10 +335,7 @@ mod tests {
             transactions: Arc::new(vec![tx].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let low_pending = pending_from_block(&low);
         let low_hash = low_pending.header().hash();

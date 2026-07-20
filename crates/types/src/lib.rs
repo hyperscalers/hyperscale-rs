@@ -153,8 +153,8 @@ pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;
 pub use shard::{
-    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
-    shared_transactions_from_raw,
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
+    VerifiedBlockAssembleError, WitnessSources, shared_transactions_from_raw,
 };
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,

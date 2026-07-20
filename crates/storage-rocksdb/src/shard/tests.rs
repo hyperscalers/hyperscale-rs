@@ -19,8 +19,8 @@ use hyperscale_types::{
     Bls12381G2Signature, BoundedVec, CertifiedBlock, ChainOrigin, ConsensusReceipt,
     ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, SignerBitfield,
-    StateRoot, StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, VrfProof,
-    WaveCertificate, WaveId, WeightedTimestamp,
+    StateRoot, StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate,
+    WaveId, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -527,10 +527,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provision_hashes: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
     *block = match taken {
@@ -539,10 +536,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             transactions,
             certificates,
             provisions,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(fw);
@@ -551,10 +545,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             }
         }
         Block::Sealed {
@@ -562,10 +553,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             transactions,
             certificates,
             provision_hashes,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(fw);
@@ -574,10 +562,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             }
         }
     };
@@ -609,10 +594,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provision_hashes: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
     *block = match taken {
@@ -621,10 +603,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions,
             certificates,
             provisions,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(new_fw);
@@ -633,10 +612,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             }
         }
         Block::Sealed {
@@ -644,10 +620,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions,
             certificates,
             provision_hashes,
-            ready_signals,
-            equivocations,
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(new_fw);
@@ -656,10 +629,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             }
         }
     };
@@ -756,10 +726,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provisions,
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
             header,
@@ -771,10 +738,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provision_hashes,
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
     let _ = storage.commit_block(&make_test_certified(block), &no_witness());

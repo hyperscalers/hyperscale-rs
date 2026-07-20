@@ -144,7 +144,7 @@ mod tests {
         BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
         InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
-        StateRoot, TransactionRoot, ValidatorId, Verified, VrfProof, WeightedTimestamp,
+        StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp, WitnessSources,
         compute_merkle_root, verify_merkle_inclusion, zero_bls_signature,
     };
 
@@ -221,10 +221,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = make_qc_for(&block);
         let block_hash = block.hash();

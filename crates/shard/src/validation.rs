@@ -455,8 +455,8 @@ mod tests {
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
         ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
         StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, VrfProof, WeightedTimestamp, bls_keypair_from_seed, compute_waves, test_utils,
-        zero_bls_signature,
+        Verifiable, WeightedTimestamp, WitnessSources, bls_keypair_from_seed, compute_waves,
+        test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -567,10 +567,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -1020,10 +1017,7 @@ mod tests {
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -1124,10 +1118,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(wrapped.into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -1194,10 +1185,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(wrapped.into()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 

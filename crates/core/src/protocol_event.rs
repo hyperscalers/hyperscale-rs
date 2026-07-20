@@ -156,7 +156,7 @@ pub enum ProtocolEvent {
     /// pushed. Admission to the shard coordinator's `ReadySignalPool`
     /// is a pure local-state update; the next proposer drains
     /// dwell-eligible signals into the block's
-    /// [`BlockManifest::ready_signals`](hyperscale_types::BlockManifest::ready_signals).
+    /// [`WitnessSources`](hyperscale_types::WitnessSources).
     ReadySignalReceived {
         /// The signal received from `sender`.
         signal: ReadySignal,
@@ -353,11 +353,6 @@ pub enum ProtocolEvent {
         block: Arc<Block>,
         /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
-        /// Manifest carrying the proposer's drained `ready_signals`
-        /// alongside the standard hash lists. Threaded back from
-        /// `build_proposal` because `BlockManifest::from_block` can't
-        /// recover `ready_signals` from a `Block` alone.
-        manifest: BlockManifest,
         /// Finalized waves included in the block (carry certs + receipts + ECs).
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Net substate byte total change from the build's JMT

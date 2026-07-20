@@ -5,9 +5,8 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-    MAX_EQUIVOCATIONS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, ShardVoteEquivocation, TxHash, Verifiable, VrfProof, WaveId,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, TxHash, Verifiable, WaveId, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -23,29 +22,22 @@ pub struct BlockManifest {
     tx_hashes: BoundedVec<TxHash, MAX_TXS_PER_BLOCK>,
     cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
     provision_hashes: BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>,
-    ready_signals: BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>,
-    equivocations: BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK>,
-    reshape_trigger: Option<ReshapeTrigger>,
-    /// The proposer's randomness reveal — carried so the sync/reload path
-    /// reproduces leaf 0 of the block's beacon-witness contribution and
-    /// re-verifies the reveal against the proposer's key. See
-    /// `Block::Live::randomness_reveal`.
-    randomness_reveal: VrfProof,
+    /// The block's beacon-witness inputs, mirrored verbatim — the
+    /// sync/reload path replays leaf derivation from the manifest under
+    /// QC trust. See [`WitnessSources`].
+    witness_sources: WitnessSources,
 }
 
 impl Default for BlockManifest {
-    /// An empty manifest with the reveal sentinel. Hand-written rather than
-    /// derived so the sentinel stays confined to this projection and
-    /// `VrfProof` is never blanket-defaultable to an invalid proof.
+    /// An empty manifest with the reveal sentinel
+    /// ([`WitnessSources::empty`]). Hand-written rather than derived so
+    /// the sentinel stays an explicit choice.
     fn default() -> Self {
         Self {
             tx_hashes: BoundedVec::new(),
             cert_ids: BoundedVec::new(),
             provision_hashes: BoundedVec::new(),
-            ready_signals: BoundedVec::new(),
-            equivocations: BoundedVec::new(),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: WitnessSources::empty(),
         }
     }
 }
@@ -61,19 +53,13 @@ impl BlockManifest {
         tx_hashes: Vec<TxHash>,
         cert_ids: Vec<WaveId>,
         provision_hashes: Vec<ProvisionHash>,
-        ready_signals: Vec<ReadySignal>,
-        equivocations: Vec<ShardVoteEquivocation>,
-        reshape_trigger: Option<ReshapeTrigger>,
-        randomness_reveal: VrfProof,
+        witness_sources: WitnessSources,
     ) -> Self {
         Self {
             tx_hashes: tx_hashes.into(),
             cert_ids: cert_ids.into(),
             provision_hashes: provision_hashes.into(),
-            ready_signals: ready_signals.into(),
-            equivocations: equivocations.into(),
-            reshape_trigger,
-            randomness_reveal,
+            witness_sources,
         }
     }
 
@@ -97,33 +83,10 @@ impl BlockManifest {
         &self.provision_hashes
     }
 
-    /// Validator-emitted `ReadySignal`s the proposer included. The
-    /// shard's beacon-witness derivation projects one
-    /// `ShardWitnessPayload::Ready` per signal at block-assembly time.
+    /// The block's beacon-witness inputs.
     #[must_use]
-    pub const fn ready_signals(&self) -> &BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK> {
-        &self.ready_signals
-    }
-
-    /// Double-vote equivocation evidence the proposer included. The
-    /// shard's beacon-witness derivation projects one
-    /// `ShardWitnessPayload::VoteEquivocation` leaf per entry at
-    /// block-assembly time.
-    #[must_use]
-    pub const fn equivocations(
-        &self,
-    ) -> &BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK> {
-        &self.equivocations
-    }
-
-    /// The proposer's reshape assertion, if any. Replicas validate it
-    /// against their own load predicate before voting; the witness
-    /// derivation projects it into a trigger leaf at block-assembly
-    /// time, so the sync path replays it from the manifest under QC
-    /// trust without needing historical substate byte totals.
-    #[must_use]
-    pub const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
-        self.reshape_trigger
+    pub const fn witness_sources(&self) -> &WitnessSources {
+        &self.witness_sources
     }
 
     /// Get total transaction count.
@@ -139,9 +102,9 @@ impl BlockManifest {
     /// responsible for only invoking this on `Live` blocks (or accepting
     /// the empty result) when provision-hash fidelity matters — e.g. the
     /// commit-bookkeeping path that populates `CommitDedupIndex`.
-    /// `ready_signals` and `reshape_trigger` are carried on the block
-    /// itself, so they round-trip faithfully here — the commit-time
-    /// beacon-witness leaf derivation reads them and must match every node.
+    /// `witness_sources` is carried on the block itself, so it
+    /// round-trips faithfully here — the commit-time beacon-witness leaf
+    /// derivation reads it and must match every node.
     #[must_use]
     pub fn from_block(block: &Block) -> Self {
         // The source `Block` collections are themselves `BoundedVec`s capped
@@ -154,23 +117,12 @@ impl BlockManifest {
             .map(|c| c.wave_id().clone())
             .collect();
         let provision_hashes = block.provision_hashes();
-        let ready_signals = block.ready_signals().iter().cloned().collect();
-        let equivocations = block.equivocations().iter().cloned().collect();
         Self::new(
             tx_hashes,
             cert_ids,
             provision_hashes,
-            ready_signals,
-            equivocations,
-            block.reshape_trigger(),
-            *block.randomness_reveal(),
+            block.witness_sources().as_ref().clone(),
         )
-    }
-
-    /// The proposer's randomness reveal carried on the block.
-    #[must_use]
-    pub const fn randomness_reveal(&self) -> &VrfProof {
-        &self.randomness_reveal
     }
 }
 
@@ -306,7 +258,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(7).unwrap();
+            enc.write_size(4).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxHash::value_kind()).unwrap();
             enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
@@ -327,7 +279,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(7).unwrap();
+            enc.write_size(4).unwrap();
             // Empty tx_hashes.
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             // Oversized cert_ids.
@@ -352,7 +304,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(7).unwrap();
+            enc.write_size(4).unwrap();
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             enc.encode(&Vec::<WaveId>::new()).unwrap();
             // Oversized provision_hashes.

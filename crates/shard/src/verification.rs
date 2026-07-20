@@ -1241,9 +1241,9 @@ impl VerificationPipeline {
     ///
     /// Pure CPU check that runs in parallel with the other per-root
     /// verifiers. Pulls the deterministic inputs (`parent_witness_leaves`
-    /// from the in-chain pending-block walk, `ready_signals` from the
-    /// pending block's manifest, `finalized_waves` from the block's
-    /// own certificates) so callers only thread the parts they own.
+    /// from the in-chain pending-block walk, `witness_sources` and
+    /// `finalized_waves` from the block itself) so callers only thread
+    /// the parts they own.
     /// The handler re-derives the leaf list and emits
     /// `BeaconWitnessRootVerified { block_hash, valid }`.
     ///
@@ -1341,15 +1341,6 @@ impl VerificationPipeline {
                 }
             }
         };
-        let (ready_signals, reshape_trigger) = pending_blocks.get(block_hash).map_or_else(
-            || (Vec::new(), None),
-            |pending| {
-                (
-                    pending.manifest().ready_signals().as_slice().to_vec(),
-                    pending.manifest().reshape_trigger(),
-                )
-            },
-        );
         let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
             block.certificates().iter().cloned().collect();
         debug!(
@@ -1369,13 +1360,10 @@ impl VerificationPipeline {
             parent_round: header.parent_qc().round(),
             height: header.height(),
             round: header.round(),
-            ready_signals,
-            equivocations: block.equivocations().as_slice().to_vec(),
-            reshape_trigger,
+            witness_sources: Arc::clone(block.witness_sources()),
             substate_bytes,
             thresholds,
             finalized_waves,
-            randomness_reveal: *block.randomness_reveal(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -2083,6 +2071,7 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::WitnessSources;
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, i64>> = std::sync::OnceLock::new();
@@ -2096,8 +2085,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Epoch, Hash, LocalReceiptRoot,
         LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardId,
-        SignerBitfield, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        zero_bls_signature,
+        SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -2147,10 +2135,7 @@ mod tests {
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -2259,14 +2244,8 @@ mod tests {
             None,
         );
 
-        let mut pb = PendingBlock::from_complete_block(
-            &block,
-            vec![],
-            None,
-            vec![],
-            vec![],
-            LocalTimestamp::ZERO,
-        );
+        let mut pb =
+            PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
         pb.construct_block()
             .expect("complete block constructs cleanly");
         let mut pending_with_block = PendingBlocks::new();
@@ -2345,14 +2324,8 @@ mod tests {
 
         let block = block_with(BlockHeight::new(1), committed_hash, 0, vec![]);
         let block_hash = block.hash();
-        let mut pb = PendingBlock::from_complete_block(
-            &block,
-            vec![],
-            None,
-            vec![],
-            vec![],
-            LocalTimestamp::ZERO,
-        );
+        let mut pb =
+            PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
         pb.construct_block()
             .expect("complete block constructs cleanly");
         let mut pending = PendingBlocks::new();
@@ -2681,10 +2654,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let block_hash = block.hash();
         vp.track_pending_assembly(Arc::new(block));

@@ -15,10 +15,10 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
     RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, ShardVoteEquivocation,
-    SharedCertificates, SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, VoteCount, VrfProof, WaveId, WeightedTimestamp,
+    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
+    Timeout, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -600,12 +600,12 @@ pub enum Action {
 
     /// Verify a block's beacon-witness root + leaf count.
     ///
-    /// Re-derives the new witness leaves from the same three deterministic
+    /// Re-derives the new witness leaves from the same deterministic
     /// sources the proposer used — receipts (via `finalized_waves`), the
     /// missed-round walk over `(parent_round, round)` against
-    /// `topology_snapshot`, and the manifest's `ready_signals` — then
-    /// applies them against `parent_witness_leaves` (the accumulator state
-    /// the parent block left behind) and compares the resulting
+    /// `topology_snapshot`, and the block's carried `witness_sources` —
+    /// then applies them against `parent_witness_leaves` (the accumulator
+    /// state the parent block left behind) and compares the resulting
     /// `(root, leaf_count)` to the header's claim. A mismatch fails the
     /// check; honest validators reject the block.
     ///
@@ -635,16 +635,13 @@ pub enum Action {
         height: BlockHeight,
         /// Block round; the upper bound of the missed-round walk.
         round: Round,
-        /// Ready signals the proposer drained into the manifest.
-        ready_signals: Vec<ReadySignal>,
-        /// Double-vote equivocation evidence the proposer carried on the
-        /// block. Re-verified against each equivocator's registered key
-        /// inside the shared verifier before its `VoteEquivocation` leaf
-        /// folds, so an invalid entry fails the block.
-        equivocations: Vec<ShardVoteEquivocation>,
-        /// The manifest's reshape assertion, validated against the
-        /// locally recomputed load predicate.
-        reshape_trigger: Option<ReshapeTrigger>,
+        /// The block's carried witness sources. Every claim is
+        /// re-verified inside the shared verifier before its leaf folds
+        /// — equivocation evidence against each equivocator's registered
+        /// key, the reshape assertion against the locally recomputed
+        /// load predicate, the randomness reveal (leaf 0) against the
+        /// proposer's key — so an invalid entry fails the block.
+        witness_sources: SharedWitnessSources,
         /// Committed substate byte total behind the parent block's
         /// post-state — the load the reshape predicate evaluates. `None`
         /// takes the predicate out of play (reshaping disabled, or the
@@ -656,10 +653,6 @@ pub enum Action {
         /// Finalized waves whose receipts contribute receipt-sourced
         /// witness events.
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
-        /// The block's randomness reveal (leaf 0). Verification checks its
-        /// BLS validity against the proposer's key and folds its digest into
-        /// the recomputed root.
-        randomness_reveal: VrfProof,
         /// Topology snapshot for `proposer_for` lookups in the
         /// missed-round walk.
         topology_snapshot: TopologySnapshot,

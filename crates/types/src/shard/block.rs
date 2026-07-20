@@ -13,12 +13,11 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
-    ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_EQUIVOCATIONS_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, RoutableTransaction, ShardId,
-    ShardVoteEquivocation, StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified,
-    VrfProof, WeightedTimestamp,
+    ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RoutableTransaction, ShardId, SharedWitnessSources,
+    StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -79,25 +78,6 @@ pub type SharedProvisions = Arc<BoundedVec<Arc<Verifiable<Provisions>>, MAX_PROV
 /// payload has been dropped. Same `Arc` rationale as [`SharedTransactions`].
 pub type SharedProvisionHashes = Arc<BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>>;
 
-/// Shared ready-signal list — the proposer's drained `ready_signals`,
-/// carried on the block so the beacon-witness leaf derivation reproduces
-/// them on every node regardless of how the block arrived. They are
-/// committed via the header's `beacon_witness_root` (so the block hash
-/// already binds them) but cannot be recovered from a header alone, so
-/// they ride the body like transactions ride `transaction_root`. Same
-/// `Arc` rationale as [`SharedTransactions`].
-pub type SharedReadySignals = Arc<BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>>;
-
-/// Shared shard-vote-equivocation evidence list — the double-vote
-/// evidence the proposer drained into this block. Committed via the
-/// header's `beacon_witness_root` (one `VoteEquivocation` leaf per entry)
-/// and re-verified by voters as a block-validity condition, so the QC
-/// attests each entry is genuine before the beacon folds it. Carried on
-/// the body and retained through sealing for the same reason as
-/// [`SharedReadySignals`]: the beacon-witness fold that jails on them can
-/// run after the block seals.
-pub type SharedEquivocations = Arc<BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK>>;
-
 /// Complete block with header and transaction data.
 ///
 /// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
@@ -126,26 +106,11 @@ pub enum Block {
         certificates: SharedCertificates,
         /// Provisions needed to execute cross-shard waves locally.
         provisions: SharedProvisions,
-        /// Ready signals the proposer drained into this block. Committed
-        /// via `beacon_witness_root`; carried here so commit-time
-        /// beacon-witness leaf derivation is identical on every node.
-        ready_signals: SharedReadySignals,
-        /// Double-vote equivocation evidence the proposer drained into this
-        /// block. Committed via `beacon_witness_root` and re-verified as a
-        /// block-validity condition; carried here for the same reason as
-        /// `ready_signals`.
-        equivocations: SharedEquivocations,
-        /// The block's reshape assertion, if any. Committed via
-        /// `beacon_witness_root`; carried here for the same reason as
-        /// `ready_signals`.
-        reshape_trigger: Option<ReshapeTrigger>,
-        /// The proposer's per-block randomness reveal — the VRF proof over
-        /// `(network, shard, height)`. Its digest is leaf 0 of the block's
-        /// beacon-witness contribution, so `beacon_witness_root` (hence the
-        /// block hash) binds the reveal *output*; the proof rides the body
-        /// like `ready_signals` so validators re-verify it against the
-        /// proposer's key. Genesis blocks carry [`VrfProof::ZERO`].
-        randomness_reveal: VrfProof,
+        /// Proposer-supplied beacon-witness inputs. Committed via the
+        /// header's `beacon_witness_root`; carried on the body so
+        /// commit-time leaf derivation is identical on every node. See
+        /// [`WitnessSources`].
+        witness_sources: SharedWitnessSources,
     },
     /// Block past its execution window — provision bodies dropped, but
     /// the original `ProvisionHash` list is retained so sync-serving glue
@@ -162,22 +127,11 @@ pub enum Block {
         /// Content hashes of the provisions the block consumed while
         /// `Live`. Empty iff the block consumed no provisions.
         provision_hashes: SharedProvisionHashes,
-        /// Ready signals the proposer drained into this block — retained
-        /// through sealing (unlike provisions) because the beacon-witness
-        /// fold consuming them can run well after the block sealed. See
-        /// `Block::Live::ready_signals`.
-        ready_signals: SharedReadySignals,
-        /// Double-vote equivocation evidence — retained through sealing for
-        /// the same reason as `ready_signals`. See
-        /// `Block::Live::equivocations`.
-        equivocations: SharedEquivocations,
-        /// The block's reshape assertion, if any. Retained through
-        /// sealing for the same reason as `ready_signals`.
-        reshape_trigger: Option<ReshapeTrigger>,
-        /// The proposer's per-block randomness reveal — retained through
-        /// sealing for the same reason as `ready_signals`: a synced block is
-        /// re-verified from its stored form. See `Block::Live::randomness_reveal`.
-        randomness_reveal: VrfProof,
+        /// Proposer-supplied beacon-witness inputs — retained through
+        /// sealing (unlike provisions) because the beacon-witness fold
+        /// consuming them can run well after the block sealed. See
+        /// [`WitnessSources`].
+        witness_sources: SharedWitnessSources,
     },
 }
 
@@ -235,10 +189,7 @@ impl Block {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -263,10 +214,7 @@ impl Block {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -294,10 +242,7 @@ impl Block {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -360,54 +305,20 @@ impl Block {
         }
     }
 
-    /// Ready signals carried on the block — present in both variants.
-    /// The beacon-witness leaf derivation reads these at commit, so they
-    /// must be byte-identical across nodes; carrying them on the block
-    /// (rather than only the in-memory manifest) makes that hold for
-    /// sync-committed and reloaded blocks.
+    /// Proposer-supplied beacon-witness inputs — present in both
+    /// variants. The beacon-witness leaf derivation reads these at
+    /// commit, so they must be byte-identical across nodes; carrying
+    /// them on the block (rather than only the in-memory manifest)
+    /// makes that hold for sync-committed and reloaded blocks.
     #[must_use]
-    pub const fn ready_signals(&self) -> &SharedReadySignals {
-        match self {
-            Self::Live { ready_signals, .. } | Self::Sealed { ready_signals, .. } => ready_signals,
-        }
-    }
-
-    /// Double-vote equivocation evidence carried on the block — present in
-    /// both variants. The beacon-witness leaf derivation reads these at
-    /// commit, so they ride the block for the same reason as
-    /// [`ready_signals`](Self::ready_signals).
-    #[must_use]
-    pub const fn equivocations(&self) -> &SharedEquivocations {
-        match self {
-            Self::Live { equivocations, .. } | Self::Sealed { equivocations, .. } => equivocations,
-        }
-    }
-
-    /// The block's reshape assertion, if any — present in both variants.
-    #[must_use]
-    pub const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
+    pub const fn witness_sources(&self) -> &SharedWitnessSources {
         match self {
             Self::Live {
-                reshape_trigger, ..
+                witness_sources, ..
             }
             | Self::Sealed {
-                reshape_trigger, ..
-            } => *reshape_trigger,
-        }
-    }
-
-    /// The proposer's per-block randomness reveal — present in both variants.
-    /// Its digest is leaf 0 of the block's beacon-witness contribution; the
-    /// proof is re-verified against the proposer's key during block validation.
-    #[must_use]
-    pub const fn randomness_reveal(&self) -> &VrfProof {
-        match self {
-            Self::Live {
-                randomness_reveal, ..
-            }
-            | Self::Sealed {
-                randomness_reveal, ..
-            } => randomness_reveal,
+                witness_sources, ..
+            } => witness_sources,
         }
     }
 
@@ -429,10 +340,7 @@ impl Block {
                 transactions,
                 certificates,
                 provisions,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             } => {
                 let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
                 Self::Sealed {
@@ -440,10 +348,7 @@ impl Block {
                     transactions,
                     certificates,
                     provision_hashes: Arc::new(hashes.into()),
-                    ready_signals,
-                    equivocations,
-                    reshape_trigger,
-                    randomness_reveal,
+                    witness_sources,
                 }
             }
             sealed @ Self::Sealed { .. } => sealed,
@@ -465,20 +370,14 @@ impl Block {
                 header,
                 transactions,
                 certificates,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
                 ..
             } => Self::Live {
                 header,
                 transactions,
                 certificates,
                 provisions,
-                ready_signals,
-                equivocations,
-                reshape_trigger,
-                randomness_reveal,
+                witness_sources,
             },
             Self::Live { .. } => {
                 panic!("into_live called on an already-Live block")

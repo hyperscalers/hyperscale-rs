@@ -91,7 +91,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, StateRoot, TransactionRoot, TxHash, ValidatorId,
-        VrfProof,
+        WitnessSources,
     };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
@@ -136,10 +136,7 @@ mod tests {
             ],
             vec![],
             vec![],
-            vec![],
-            vec![],
-            None,
-            VrfProof::ZERO,
+            WitnessSources::empty(),
         );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
@@ -155,10 +152,7 @@ mod tests {
             vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
             vec![],
             vec![],
-            vec![],
-            vec![],
-            None,
-            VrfProof::ZERO,
+            WitnessSources::empty(),
         );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
@@ -175,15 +169,7 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest::new(
-                vec![tx1, tx2, tx3],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                None,
-                VrfProof::ZERO,
-            ),
+            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![], WitnessSources::empty()),
             zero_sig(),
         );
 

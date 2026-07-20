@@ -90,7 +90,7 @@ use hyperscale_types::{
     ShardVoteEquivocation, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
     TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
     Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload, vrf_output_from_proof,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -3418,7 +3418,7 @@ impl ShardCoordinator {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the `WriteBatch`
     /// for efficient commit later.
-    #[instrument(skip(self, topology_schedule, block, manifest, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
+    #[instrument(skip(self, topology_schedule, block, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
@@ -3427,7 +3427,6 @@ impl ShardCoordinator {
         round: Round,
         block: &Block,
         block_hash: BlockHash,
-        manifest: &BlockManifest,
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
@@ -3457,19 +3456,8 @@ impl ShardCoordinator {
         let has_certificates = !block.certificates().is_empty();
 
         // Store our own block as pending (with all finalized waves + provisions).
-        // The supplied `manifest` carries the proposer-drained
-        // `ready_signals`, which the block itself doesn't carry — thread
-        // them through `from_complete_block` so the pending entry's
-        // manifest mirrors the header the proposer broadcasts.
-        let ready_signals: Vec<ReadySignal> = manifest.ready_signals().iter().cloned().collect();
-        let mut pending_block = PendingBlock::from_complete_block(
-            block,
-            ready_signals,
-            manifest.reshape_trigger(),
-            finalized_waves,
-            provisions,
-            self.now,
-        );
+        let mut pending_block =
+            PendingBlock::from_complete_block(block, finalized_waves, provisions, self.now);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -3918,7 +3906,7 @@ impl ShardCoordinator {
 
         // Evidence that reached a committed block is on-chain — the beacon
         // will fold and jail on it — so drop it from the pending buffer.
-        for ev in block.equivocations().iter() {
+        for ev in block.witness_sources().equivocations().iter() {
             self.detected_equivocations.remove(&ev.validator);
         }
         // The committee that signed this block is `at(parent_qc weighted ts)`;
@@ -3962,11 +3950,11 @@ impl ShardCoordinator {
         self.dedup_index
             .register_committed_provisions(manifest.provision_hashes(), commit_ts);
 
-        // Derive this block's beacon-witness leaves from the same three
+        // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
         // waves, missed-proposal walk over `(parent_round, round)`, and
-        // the manifest's `ready_signals`). The leaves are folded into
-        // the in-memory accumulator and packaged into a
+        // the block's carried witness sources). The leaves are folded
+        // into the in-memory accumulator and packaged into a
         // [`BeaconWitnessCommit`] so the io_loop can persist them in
         // the same atomic `WriteBatch` as the block.
         let parent_round = block.header().parent_qc().round();
@@ -4007,14 +3995,9 @@ impl ShardCoordinator {
         let new_leaves = derive_leaves(
             self.local_shard,
             committee,
-            vrf_output_from_proof(block.randomness_reveal()),
             &receipts,
             &missed,
-            manifest.ready_signals().as_slice(),
-            manifest
-                .reshape_trigger()
-                .and_then(|t| t.to_payload(self.local_shard)),
-            manifest.equivocations().as_slice(),
+            block.witness_sources(),
         );
         let starting_leaf_index = self.beacon_witness_accumulator.leaf_count();
         self.beacon_witness_accumulator.commit_append(&new_leaves);
@@ -5498,22 +5481,16 @@ mod tests {
         CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
         MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
         RoutableTransaction, ShardId, SignerBitfield, TopologySchedule, TopologySnapshot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
-        WeightedTimestamp, generate_bls_keypair, test_utils, zero_bls_signature,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        WitnessSources, generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
     use super::*;
     use crate::validation::validate_no_duplicate_transactions;
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
-        let mut pending = PendingBlock::from_complete_block(
-            block,
-            vec![],
-            None,
-            vec![],
-            vec![],
-            LocalTimestamp::ZERO,
-        );
+        let mut pending =
+            PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
         pending
             .construct_block()
             .expect("complete block constructs cleanly");
@@ -5684,10 +5661,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -5801,10 +5775,7 @@ mod tests {
                 transactions: Arc::new(BoundedVec::new()),
                 certificates: Arc::new(BoundedVec::new()),
                 provisions: Arc::new(BoundedVec::new()),
-                ready_signals: Arc::new(BoundedVec::new()),
-                equivocations: Arc::new(BoundedVec::new()),
-                reshape_trigger: None,
-                randomness_reveal: VrfProof::ZERO,
+                witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
 
@@ -6051,10 +6022,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -6545,10 +6513,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
         state.committed_height = BlockHeight::new(1);
@@ -8490,10 +8455,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -8566,10 +8528,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -8621,10 +8580,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -8825,10 +8781,7 @@ mod tests {
             transactions: Arc::new(vec![tx1.clone()].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -8866,10 +8819,7 @@ mod tests {
             transactions: Arc::new(txs.into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
 
         let result = {
@@ -8919,10 +8869,7 @@ mod tests {
             transactions: Arc::new(vec![tx1.clone()].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -8958,10 +8905,7 @@ mod tests {
             transactions: Arc::new(vec![tx1].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -9245,10 +9189,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(certs.into()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -9410,10 +9351,7 @@ mod tests {
                 vec![cross_shard_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1)].into(),
             ),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
@@ -9441,14 +9379,8 @@ mod tests {
         // `install_complete_block` helper drops them).
         let waves: Vec<Arc<Verifiable<FinalizedWave>>> =
             block.certificates().iter().cloned().collect();
-        let mut pending = PendingBlock::from_complete_block(
-            &block,
-            vec![],
-            None,
-            waves,
-            vec![],
-            LocalTimestamp::ZERO,
-        );
+        let mut pending =
+            PendingBlock::from_complete_block(&block, waves, vec![], LocalTimestamp::ZERO);
         pending
             .construct_block()
             .expect("complete block constructs cleanly");

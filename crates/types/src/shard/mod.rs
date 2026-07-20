@@ -17,6 +17,8 @@
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`vote_registers`]: snapshot type for the two monotone safe-vote
 //!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).
+//! - [`witness_sources`]: [`WitnessSources`] — the proposer-supplied
+//!   beacon-witness inputs a block carries.
 
 #[allow(clippy::module_inception)]
 mod block;
@@ -35,11 +37,13 @@ pub mod storage_commit;
 pub mod timeout;
 pub mod vote;
 pub mod vote_registers;
+pub mod witness_sources;
 
 pub use block::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
     shared_transactions_from_raw,
 };
+pub use witness_sources::{SharedWitnessSources, WitnessSources};
 
 #[cfg(test)]
 mod tests {

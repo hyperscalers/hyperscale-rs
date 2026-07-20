@@ -14,7 +14,7 @@ use hyperscale_types::{
     BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
     InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
     ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, Verified, VrfProof, WaveId, WeightedTimestamp,
+    TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp, WitnessSources,
     zero_bls_signature,
 };
 
@@ -58,10 +58,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         transactions: Arc::new(BoundedVec::new()),
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
-        ready_signals: Arc::new(BoundedVec::new()),
-        equivocations: Arc::new(BoundedVec::new()),
-        reshape_trigger: None,
-        randomness_reveal: VrfProof::ZERO,
+        witness_sources: Arc::new(WitnessSources::empty()),
     };
     let qc = {
         let __qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);

@@ -764,7 +764,8 @@ mod tests {
         CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
         ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
         Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash, ValidatorId,
-        Verifiable, VrfProof, WaveId, WeightedTimestamp, compute_merkle_root, zero_bls_signature,
+        Verifiable, WaveId, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        zero_bls_signature,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1465,10 +1466,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = {
             let __qc = QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT);
@@ -1776,10 +1774,7 @@ mod tests {
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::from(vec![provisions_verifiable])),
-            ready_signals: Arc::new(BoundedVec::new()),
-            equivocations: Arc::new(BoundedVec::new()),
-            reshape_trigger: None,
-            randomness_reveal: VrfProof::ZERO,
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
             block.hash(),
