@@ -8,7 +8,8 @@ coupled dynamics no closed form covers.
 
 Units: seats (voting is per seat; stake is the admission gate). The primary
 failure event is a committee reaching k >= f+1 corrupt seats, f = (n-1)//3 —
-a recoverable halt; the terminal boundary 2f+1 is priced by table V.
+a recoverable degradation band, not a safety guarantee (note S10.1); the
+terminal boundary 2f+1 is priced by table V.
 
 Table index (letter -> note section):
   A fresh draws (S1)         I beacon redraw (S1)       B/C trickle chain (S2)
@@ -1436,10 +1437,11 @@ def main() -> None:
 
     # V: the TERMINAL boundary priced unsteered — the k = 2f -> 2f+1 crossing
     # on the same chain (§10.1). The f+1 tables above price a RECOVERABLE
-    # liveness halt, i.e. availability; the unrecoverable event is 2f+1, and
-    # unsteered sampling essentially cannot produce it — its budget lines sit
-    # at beta ~ 0.36-0.45, far above pool-hygiene territory (and above the 1/3
-    # stake line an unsharded BFT chain fails at). Steering is the only route
+    # degradation band (not a safety guarantee — §10.1); the unrecoverable
+    # event is 2f+1, and unsteered sampling essentially cannot produce it —
+    # its budget lines sit at beta ~ 0.36-0.45, far above pool-hygiene
+    # territory (a risk bound on the unsteered draw, not a comparison an
+    # unsharded chain loses; steering voids it). Steering is the only route
     # to 2f+1 at plausible beta (table M's march at ~2.5x the f+1 time), which
     # is what the input-side stack (T) and the reveal-leaf fold (W) defend.
     # Between the two lines the network degrades but stays sound: the f+1
