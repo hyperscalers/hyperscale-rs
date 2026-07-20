@@ -5251,6 +5251,15 @@ impl ShardCoordinator {
         self.committed_height
     }
 
+    /// Number of distinct validators for which this coordinator holds
+    /// detected double-vote equivocation evidence not yet carried into a
+    /// committed block. Drained into each proposal and pruned once the
+    /// evidence lands on-chain.
+    #[must_use]
+    pub fn pending_equivocation_count(&self) -> usize {
+        self.detected_equivocations.len()
+    }
+
     /// Single chokepoint for dropping a pending block. All single-block
     /// removals (failed verification, abort, view-change drop) go through
     /// here so future bookkeeping (metrics, indices, etc.) has one place to

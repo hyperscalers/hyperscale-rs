@@ -358,6 +358,10 @@ pub struct ShardCoordinatorSim {
     /// [`ByzantineBehaviour::ExtendStaleParent`] walks these back from the
     /// high QC's block to find the ancestor it re-parents onto.
     header_by_block: HashMap<BlockHash, Arc<BlockHeader>>,
+    /// The manifest broadcast alongside each proposed header, keyed by block
+    /// hash. Lets a test re-deliver a proposed block (or a minted sibling that
+    /// shares its body) through [`Self::deliver_header_now`].
+    manifest_by_block: HashMap<BlockHash, BlockManifest>,
     /// Per-replica count of Byzantine transforms that have actually
     /// fired. Exposed for tests to confirm the adversarial path
     /// triggered.
@@ -444,6 +448,7 @@ impl ShardCoordinatorSim {
             byzantine: vec![None; n],
             scheduled: Vec::new(),
             header_by_block: HashMap::new(),
+            manifest_by_block: HashMap::new(),
             byzantine_fires: vec![0; n],
             sync_targets: (0..n).map(|_| Vec::new()).collect(),
             now: LocalTimestamp::ZERO,
@@ -540,6 +545,101 @@ impl ShardCoordinatorSim {
         let idx = self.idx_of(replica);
         let actions = self.coordinators[idx].on_block_persisted(&self.topology_schedule, height, 0);
         self.absorb(idx, actions);
+    }
+
+    /// Hand `header` to `replica`'s `on_block_header` inline (bypassing the
+    /// delivery queue) so the header is in its `pending_blocks` before the
+    /// next test statement runs. Adversarial tests use this to seat a sibling
+    /// header a double-voter's evidence needs, without racing the scheduler.
+    pub fn deliver_header_now(
+        &mut self,
+        replica: ValidatorId,
+        header: &BlockHeader,
+        manifest: BlockManifest,
+    ) {
+        let idx = self.idx_of(replica);
+        let pool = &self.tx_pools[idx];
+        let lookup_tx = |hash: &TxHash| -> Option<Arc<Verifiable<RoutableTransaction>>> {
+            pool.get(hash)
+                .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
+        };
+        let actions = self.coordinators[idx].on_block_header(
+            &self.topology_schedule,
+            header,
+            manifest,
+            lookup_tx,
+            |_| None,
+            |_| None,
+        );
+        self.absorb(idx, actions);
+    }
+
+    /// Sign a genuine [`BlockVote`] from `signer` over `block_hash` /
+    /// `parent_block_hash` at `(height, round)` on this sim's shard. Used to
+    /// mint the two conflicting votes of a shard double-vote, each a real BLS
+    /// signature under the signer's key so the assembled evidence verifies.
+    #[must_use]
+    pub fn sign_block_vote(
+        &self,
+        signer: ValidatorId,
+        block_hash: BlockHash,
+        parent_block_hash: BlockHash,
+        height: BlockHeight,
+        round: Round,
+    ) -> Verified<BlockVote> {
+        let idx = self.idx_of(signer);
+        Verified::<BlockVote>::sign_local(
+            &self.network,
+            block_hash,
+            parent_block_hash,
+            self.shard,
+            height,
+            round,
+            signer,
+            &self.sks[idx],
+            ProposerTimestamp::ZERO,
+        )
+    }
+
+    /// Drive `verified_vote` through `aggregator`'s real QC-result path with
+    /// no QC formed — the production case where a verified batch fell short of
+    /// quorum. This is the only entry that runs `track_verified_received_vote`,
+    /// so feeding an aggregator two conflicting votes for one `(height, round)`
+    /// (each block's header already seated via [`Self::deliver_header_now`])
+    /// makes it assemble the self-proving equivocation into its pending buffer.
+    pub fn feed_qc_result_no_quorum(
+        &mut self,
+        aggregator: ValidatorId,
+        block_hash: BlockHash,
+        verified_vote: Verified<BlockVote>,
+    ) {
+        let idx = self.idx_of(aggregator);
+        let voter_index = self
+            .topology_schedule
+            .head()
+            .committee_index_for_shard(self.shard, verified_vote.voter())
+            .expect("voter is a committee member");
+        let actions = self.coordinators[idx].on_qc_result(
+            &self.topology_schedule,
+            block_hash,
+            None,
+            vec![(voter_index, verified_vote)],
+        );
+        self.absorb(idx, actions);
+    }
+
+    /// A proposed `(header, manifest)` recorded at `height`, if any — the
+    /// block a round's proposer broadcast. Tests mint a same-height sibling
+    /// from it to stage a double-vote.
+    #[must_use]
+    pub fn proposed_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Arc<BlockHeader>, BlockManifest)> {
+        self.header_by_block
+            .iter()
+            .find(|(_, h)| h.height() == height)
+            .map(|(hash, h)| (Arc::clone(h), self.manifest_by_block[hash].clone()))
     }
 
     /// Kick every replica's first proposal attempt. The round-0
@@ -1049,6 +1149,8 @@ impl ShardCoordinatorSim {
                 let manifest = *manifest;
                 self.header_by_block
                     .insert(header.hash(), Arc::clone(&header));
+                self.manifest_by_block
+                    .insert(header.hash(), manifest.clone());
                 let committee_ids: Vec<ValidatorId> = self
                     .topology_schedule
                     .head()

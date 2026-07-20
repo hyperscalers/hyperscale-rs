@@ -727,11 +727,11 @@ mod tests {
 
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
-        BlockHash, BlockHeight, Bls12381G2Signature, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
-        JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
-        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Randomness, Round, ShardCommittee, ShardId,
-        ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId,
-        ValidatorStatus,
+        BlockHash, BlockHeight, BlockVote, Bls12381G2Signature, CohortSeat, EMISSIONS_PER_EPOCH,
+        Epoch, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
+        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, ProposerTimestamp, Randomness, Round,
+        ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool,
+        StakePoolId, ValidatorId, ValidatorStatus, verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -1761,6 +1761,97 @@ mod tests {
                 reason: JailReason::Equivocation,
             },
         );
+    }
+
+    /// Two genuine, conflicting votes by `equivocator` at one `(height,
+    /// round)`, assembled into the self-proving evidence a shard proposer
+    /// carries. Each signature is real, so the leaf verifies against the
+    /// signer's key — the block-validity soundness the shard QC attests.
+    fn genuine_equivocation(equivocator: u64) -> ShardVoteEquivocation {
+        let sk = keypair(equivocator);
+        let shard = ShardId::leaf(1, 0);
+        let (height, round) = (BlockHeight::new(5), Round::new(2));
+        let voter = ValidatorId::new(equivocator);
+        let sign = |blk: &[u8], parent: &[u8]| {
+            let block_hash = BlockHash::from_raw(Hash::from_bytes(blk));
+            let parent_hash = BlockHash::from_raw(Hash::from_bytes(parent));
+            let vote = BlockVote::new(
+                &net(),
+                block_hash,
+                parent_hash,
+                shard,
+                height,
+                round,
+                voter,
+                &sk,
+                ProposerTimestamp::ZERO,
+            );
+            (block_hash, parent_hash, vote.signature())
+        };
+        let (block_hash_a, parent_block_hash_a, sig_a) = sign(b"equiv-block-a", b"equiv-parent-a");
+        let (block_hash_b, parent_block_hash_b, sig_b) = sign(b"equiv-block-b", b"equiv-parent-b");
+        ShardVoteEquivocation {
+            validator: voter,
+            shard,
+            height,
+            round,
+            block_hash_a,
+            parent_block_hash_a,
+            sig_a,
+            block_hash_b,
+            parent_block_hash_b,
+            sig_b,
+        }
+    }
+
+    /// The exact leaf a shard proposer produces — two genuine conflicting
+    /// signatures under the double-signer's key — verifies as a block-validity
+    /// condition and, folded on QC trust, permanently jails the signer and
+    /// refills its committee seat. This is the beacon end of the pipeline the
+    /// shard `vote_equivocation` integration test drives to a committed block.
+    #[test]
+    fn genuine_vote_equivocation_leaf_verifies_and_jails() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        let target = ValidatorId::new(1);
+        let ev = genuine_equivocation(1);
+        // The soundness check a voter runs before its QC attests the leaf.
+        assert_eq!(
+            verify_shard_vote_equivocation(&ev, &net(), &pubkey(1)),
+            Ok(())
+        );
+
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::VoteEquivocation(Box::new(ev))],
+        );
+
+        assert_eq!(effects.jailed, vec![target]);
+        assert_eq!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: state.current_epoch,
+                reason: JailReason::Equivocation,
+            },
+        );
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
+        assert!(!members.contains(&target));
+        assert!(members.contains(&ValidatorId::new(4)));
     }
 
     /// VRF jail cascade also clears the miss counter.
