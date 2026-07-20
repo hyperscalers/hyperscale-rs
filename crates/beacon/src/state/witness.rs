@@ -577,6 +577,34 @@ pub(super) fn apply_shard_payload(
             // not applied as validator state. No host event.
             None
         }
+        ShardWitnessPayload::VoteEquivocation(ev) => {
+            // The shard committee verified the double-sign as a
+            // block-validity condition before its QC formed, so the
+            // QC-attested witness root vouches for it — jail without
+            // re-verifying, exactly as every other witness payload is
+            // trusted (a byzantine majority that could forge this could
+            // already forge arbitrary state; that is the terminal tier).
+            // Permanent, superseding every status but an existing
+            // permanent equivocation jail, so a second leaf naming the
+            // same key is idempotent.
+            let rec = state.validators.get(&ev.validator)?;
+            if matches!(
+                rec.status,
+                ValidatorStatus::Jailed {
+                    reason: JailReason::Equivocation,
+                    ..
+                }
+            ) {
+                return None;
+            }
+            jail_validator(
+                state,
+                ev.validator,
+                JailReason::Equivocation,
+                state.current_epoch,
+            );
+            Some(HostEvent::Jailed(ev.validator))
+        }
     }
 }
 
@@ -699,10 +727,11 @@ mod tests {
 
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
-        BlockHeight, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, JAIL_COOLDOWN_EPOCHS, JailReason,
-        MAX_SHARDS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Randomness,
-        Round, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
-        ValidatorId, ValidatorStatus,
+        BlockHash, BlockHeight, Bls12381G2Signature, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
+        JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
+        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, Randomness, Round, ShardCommittee, ShardId,
+        ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId,
+        ValidatorStatus,
     };
 
     use super::*;
@@ -1633,6 +1662,105 @@ mod tests {
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    // ─── VoteEquivocation leaf (shard double-vote) ───────────────────────
+    // The shard-witness path, distinct from the PC-ballot equivocation
+    // tests below (which drive `ingest_equivocations` via a proposal).
+
+    fn equivocation_payload(validator: ValidatorId) -> ShardWitnessPayload {
+        // The fold trusts the QC-attested leaf and does not re-verify, so
+        // placeholder signatures are faithful to the applied path.
+        ShardWitnessPayload::VoteEquivocation(Box::new(ShardVoteEquivocation {
+            validator,
+            shard: ShardId::leaf(1, 0),
+            height: BlockHeight::GENESIS,
+            round: Round::INITIAL,
+            block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"block-a")),
+            parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"parent-a")),
+            sig_a: Bls12381G2Signature([1u8; 96]),
+            block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"block-b")),
+            parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"parent-b")),
+            sig_b: Bls12381G2Signature([2u8; 96]),
+        }))
+    }
+
+    /// A `VoteEquivocation` leaf permanently jails the named validator
+    /// under `Equivocation` and cascades the committee removal + pool
+    /// refill — applied on the QC-attested leaf alone, no signature
+    /// re-check.
+    #[test]
+    fn vote_equivocation_leaf_jails_permanently() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        let target = ValidatorId::new(1);
+        let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
+
+        assert_eq!(effects.jailed, vec![target]);
+        assert_eq!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: state.current_epoch,
+                reason: JailReason::Equivocation,
+            },
+        );
+        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
+        assert!(!members.contains(&target));
+        assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    /// A `VoteEquivocation` naming a validator absent from the registry is
+    /// silently dropped — no panic, no jail.
+    #[test]
+    fn vote_equivocation_leaf_of_unknown_validator_dropped() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![equivocation_payload(ValidatorId::new(9_999))],
+        );
+
+        assert!(effects.jailed.is_empty());
+    }
+
+    /// A second `VoteEquivocation` against an already permanently-jailed
+    /// key is idempotent: no duplicate jail event, `since_epoch` unchanged.
+    #[test]
+    fn vote_equivocation_leaf_idempotent_when_already_jailed() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+        state.validators.get_mut(&target).unwrap().status = ValidatorStatus::Jailed {
+            since_epoch: Epoch::GENESIS,
+            reason: JailReason::Equivocation,
+        };
+
+        let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
+
+        assert!(effects.jailed.is_empty());
+        assert_eq!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: Epoch::GENESIS,
+                reason: JailReason::Equivocation,
+            },
+        );
     }
 
     /// VRF jail cascade also clears the miss counter.
