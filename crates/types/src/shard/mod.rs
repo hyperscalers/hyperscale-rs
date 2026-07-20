@@ -1,27 +1,29 @@
 //! Shard consensus types.
 //!
-//! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`block`]: [`Block`] (the Live/Sealed enum).
-//! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
-//! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
-//! - [`vote`]: [`BlockVote`] shard consensus vote.
-//! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
+//! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
+//! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
+//! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
+//! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
-//! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
-//! - [`vote_registers`]: snapshot type for the two monotone safe-vote
-//!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).
+//! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
 //!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
 //!   threaded through shard block commits.
+//! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
+//! - [`vote`]: [`BlockVote`] shard consensus vote.
+//! - [`vote_registers`]: snapshot type for the two monotone safe-vote
+//!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).
 
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
 pub mod certified_header;
 pub mod chain_origin;
+pub mod evidence;
 pub mod header;
 pub mod inventory;
 pub mod limits;

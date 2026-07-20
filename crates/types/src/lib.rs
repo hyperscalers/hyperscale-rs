@@ -125,6 +125,9 @@ pub use sbor_codec::{
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::ChainOrigin;
+pub use shard::evidence::{
+    ShardVoteEquivocation, ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
+};
 pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
