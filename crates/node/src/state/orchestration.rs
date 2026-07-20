@@ -67,7 +67,10 @@ impl NodeStateMachine {
                 .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
         );
 
-        actions.extend(s.provisions_coordinator.on_block_committed(certified));
+        actions.extend(
+            s.provisions_coordinator
+                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
+        );
 
         s.outbound_provisions
             .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
@@ -113,6 +116,10 @@ impl NodeStateMachine {
     /// Fan a verified remote header to execution and provisions, then feed it to
     /// the beacon coordinator. Shard consensus already received the header in
     /// `RemoteHeaderQcVerified` (early insertion for deferral proof validation).
+    ///
+    /// Admission arms expectations only — the header's exports (provisions,
+    /// execution certificates) become consumable on `RemoteHeaderCommitted`,
+    /// once its commit proof is held.
     pub(super) fn on_remote_header_admitted(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
@@ -135,6 +142,32 @@ impl NodeStateMachine {
             self.beacon_coordinator
                 .on_verified_source_header(certified_header),
         );
+        actions
+    }
+
+    /// Fan a commit-proven remote header to the cross-shard consumers: the
+    /// provisions coordinator opens the header for provision verification
+    /// and drains bundles parked on it; the execution coordinator marks the
+    /// source block proven and drains execution certificates deferred on the
+    /// proof.
+    pub(super) fn on_remote_header_committed(
+        &mut self,
+        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        let topology_schedule = self.beacon_coordinator.topology_schedule();
+        let Some(s) = self.shard.as_mut() else {
+            return Vec::new();
+        };
+
+        let mut actions = s
+            .provisions_coordinator
+            .on_committed_remote_header(topology_schedule, certified_header);
+        actions.extend(s.execution_coordinator.on_committed_remote_header(
+            topology_schedule,
+            certified_header.shard_id(),
+            certified_header.header().height(),
+            certified_header.header().parent_qc().weighted_timestamp(),
+        ));
         actions
     }
 }

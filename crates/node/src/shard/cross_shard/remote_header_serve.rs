@@ -46,7 +46,14 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
 
     for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
-        let Some(header) = pending_chain.certified_header(height) else {
+        // Committed heights first; then the certified-but-uncommitted tip,
+        // whose header carries the committed tip's committing QC — without
+        // it a requester cannot complete a commit proof of the tip, and if
+        // this chain has stalled no later commit will ever gossip it.
+        let Some(header) = pending_chain
+            .certified_header(height)
+            .or_else(|| pending_chain.certified_uncommitted_header(height))
+        else {
             break;
         };
         headers.push((**header).clone());

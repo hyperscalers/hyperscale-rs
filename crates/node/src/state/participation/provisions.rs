@@ -19,10 +19,10 @@ impl ShardParticipation {
         match event {
             ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
-                .on_state_provisions_received(std::sync::Arc::unwrap_or_clone(provisions)),
+                .on_state_provisions_received(sched, std::sync::Arc::unwrap_or_clone(provisions)),
             ProtocolEvent::VerifiedProvisionsReceived { provisions } => self
                 .provisions_coordinator
-                .on_verified_state_provisions_received(provisions, self.now),
+                .on_verified_state_provisions_received(sched, provisions, self.now),
             ProtocolEvent::StateProvisionsVerified {
                 result,
                 certified_header,

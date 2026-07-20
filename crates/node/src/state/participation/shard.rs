@@ -386,10 +386,11 @@ mod tests {
     use crate::state::test_support::TestNode;
 
     /// `RemoteHeaderAdmitted` must fan out to **both** execution and
-    /// provisions: execution registers expected ECs from the header's
-    /// wave list (only for waves whose `remote_shards` includes local);
-    /// provisions records the verified header for cross-shard provision
-    /// flows. Dropping either side leaves the shard blind to one half of
+    /// provisions: each registers its expectations from the header's wave
+    /// list (only for waves whose `remote_shards` includes local). The
+    /// header opens for provision verification only on
+    /// `RemoteHeaderCommitted`, once its commit proof is held. Dropping
+    /// either fan-out side leaves the shard blind to one half of
     /// cross-shard work.
     #[test]
     fn remote_header_admitted_fans_to_execution_and_provisions() {
@@ -443,11 +444,16 @@ mod tests {
             .execution_coordinator()
             .memory_stats()
             .expected_exec_certs;
-        let pre_prov = node.provisions_coordinator().verified_remote_header_count();
+        let pre_prov = node
+            .provisions_coordinator()
+            .memory_stats()
+            .expected_provisions;
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::RemoteHeaderAdmitted { certified_header },
+            ProtocolEvent::RemoteHeaderAdmitted {
+                certified_header: Arc::clone(&certified_header),
+            },
         );
 
         assert_eq!(
@@ -458,9 +464,27 @@ mod tests {
             "execution must register the wave from the verified header as an expected EC",
         );
         assert_eq!(
-            node.provisions_coordinator().verified_remote_header_count(),
+            node.provisions_coordinator()
+                .memory_stats()
+                .expected_provisions,
             pre_prov + 1,
-            "provisions must record the verified remote header",
+            "provisions must register the expected provisions",
+        );
+        assert_eq!(
+            node.provisions_coordinator().verified_remote_header_count(),
+            0,
+            "a merely-certified header must not open provision verification",
+        );
+
+        // The committed event opens the header for provision verification.
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::RemoteHeaderCommitted { certified_header },
+        );
+        assert_eq!(
+            node.provisions_coordinator().verified_remote_header_count(),
+            1,
+            "the commit-proven header must be recorded for provision verification",
         );
     }
 

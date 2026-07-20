@@ -124,6 +124,12 @@ pub struct ExecutionMemoryStats {
     pub fulfilled_exec_certs: usize,
     /// Outbound ECs retained for re-broadcast to remote shards.
     pub outbound_certs: usize,
+    /// Commit-proven remote source blocks within retention.
+    pub proven_remote_blocks: usize,
+    /// Cross-shard ECs deferred on their source block's commit proof. A
+    /// sustained rise means a source shard certifies without proving
+    /// commits — the fork/withholding signature.
+    pub unproven_ecs: usize,
 }
 
 /// Execution state machine.
@@ -228,6 +234,25 @@ pub struct ExecutionCoordinator {
     awaiting_waves: AwaitingTopologyBuffer<Arc<Verifiable<FinalizedWave>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Commit-proof gate
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Commit-proven remote source blocks, fed by `RemoteHeaderCommitted`:
+    /// the remote-header coordinator also holds each block's committing
+    /// structure. A cross-shard EC is consumable only against a proven
+    /// source block — a bare QC certifies availability, and an f+1..2f
+    /// corrupt committee can certify a sibling that never commits and
+    /// export ECs computed from it. Values are the source block's
+    /// authenticated timestamp, the pruning anchor.
+    proven_remote: HashMap<(ShardId, BlockHeight), WeightedTimestamp>,
+
+    /// Cross-shard ECs racing ahead of their source block's commit proof,
+    /// keyed by the EC's shard, bounded per shard (drop-oldest). Replayed
+    /// when `RemoteHeaderCommitted` proves a block for the shard; entries
+    /// still unproven re-buffer. Dropping an entry is safe — the expected
+    /// tracker re-fetches on timeout.
+    unproven_ecs: AwaitingTopologyBuffer<Verifiable<ExecutionCertificate>>,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Split-boundary finalize gate
     // ═══════════════════════════════════════════════════════════════════════
     /// Settled-wave sets of past-terminal shards, fed by the `io_loop`'s
@@ -311,6 +336,8 @@ impl ExecutionCoordinator {
             pending_finalized_wave_verifications: HashSet::new(),
             awaiting_certs: AwaitingTopologyBuffer::new(),
             awaiting_waves: AwaitingTopologyBuffer::new(),
+            proven_remote: HashMap::new(),
+            unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
             gated_finalized: HashMap::new(),
             pending_counterpart_sweeps: HashMap::new(),
@@ -1232,6 +1259,29 @@ impl ExecutionCoordinator {
             })];
         }
 
+        // Commit-proof gate: a cross-shard EC is consumable only against a
+        // commit-proven source block. Certification alone is not enough —
+        // an f+1..2f corrupt committee can certify a sibling block that
+        // never commits and export ECs computed from it. Defer until the
+        // remote-header coordinator holds the committing structure
+        // (`RemoteHeaderCommitted` replays the buffer); the proof trails
+        // the source header by one child header at worst.
+        if shard != self.local_shard
+            && !self
+                .proven_remote
+                .contains_key(&(shard, cert.block_height()))
+        {
+            tracing::debug!(
+                shard = shard.inner(),
+                wave = %cert.wave_id(),
+                height = cert.block_height().inner(),
+                "Deferring EC until its source block is commit-proven"
+            );
+            self.pending_ec_verifications.remove(&wire_hash);
+            self.unproven_ecs.push(shard, cert);
+            return vec![];
+        }
+
         let committee = match topology_schedule.lookup(cert.vote_anchor_ts()) {
             ScheduleLookup::Committee(committee) => committee,
             ScheduleLookup::NotYetCommitted => {
@@ -1434,6 +1484,33 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
+    ///
+    /// Marks the source block proven — opening the commit-proof gate for
+    /// its ECs — and replays the shard's deferred ECs through
+    /// [`Self::on_wave_certificate`]. Entries whose source block is still
+    /// unproven re-buffer.
+    pub fn on_committed_remote_header(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        source_shard: ShardId,
+        block_height: BlockHeight,
+        source_ts: WeightedTimestamp,
+    ) -> Vec<Action> {
+        if source_shard == self.local_shard {
+            return vec![];
+        }
+        self.proven_remote
+            .insert((source_shard, block_height), source_ts);
+
+        let deferred = self.unproven_ecs.drain_shard(source_shard);
+        let mut actions = Vec::new();
+        for cert in deferred {
+            actions.extend(self.on_wave_certificate(topology_schedule, cert));
+        }
+        actions
+    }
+
     /// Eager-fetch every expected execution cert whose fallback hasn't fired,
     /// independent of block commit. The commit-driven [`Self::check_exec_cert_timeouts`]
     /// stops running when the shard stalls on the missing certs, so a
@@ -1625,6 +1702,11 @@ impl ExecutionCoordinator {
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         self.provisioning.gc_stale_provisions(self.committed_ts);
+        // Commit-proof marks age out with the ECs they gate: past the
+        // retention horizon no EC against the block is consumable anywhere.
+        // Deferred ECs likewise drop at their own deadline.
+        let horizon = self.committed_ts.minus(RETENTION_HORIZON);
+        self.proven_remote.retain(|_, ts| *ts >= horizon);
 
         // Re-check gate-held finalized waves against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
@@ -2533,6 +2615,8 @@ impl ExecutionCoordinator {
             pending_routing: self.early.pending_routing_len(),
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
+            proven_remote_blocks: self.proven_remote.len(),
+            unproven_ecs: self.unproven_ecs.len(),
         }
     }
 
@@ -3433,6 +3517,53 @@ mod tests {
         );
     }
 
+    /// A cross-shard EC defers on its source block's commit proof: a bare
+    /// QC-certified header is not consumability, and the committed event
+    /// replays the deferred EC into BLS dispatch.
+    #[test]
+    fn on_wave_certificate_defers_until_source_block_commit_proven() {
+        let topo = make_two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+
+        let remote_shard = ShardId::leaf(1, 1);
+        let wave_id = WaveId::new(
+            remote_shard,
+            BlockHeight::new(5),
+            std::iter::once(ShardId::leaf(1, 0)).collect(),
+        );
+        let cert = ExecutionCertificate::new(
+            wave_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"deferred_tx")),
+                ExecutionOutcome::Aborted,
+            )],
+            zero_bls_signature(),
+            SignerBitfield::new(4),
+        );
+
+        let actions = state.on_wave_certificate(&topo, cert.into());
+        assert!(
+            actions.is_empty(),
+            "an EC from an unproven source block must defer, got {actions:?}"
+        );
+
+        // The commit proof lands: the deferred EC replays into dispatch.
+        let actions = state.on_committed_remote_header(
+            &topo,
+            remote_shard,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            "the committed event must replay the deferred EC, got {actions:?}"
+        );
+    }
+
     /// No pending recovery for the shard: the fence is inert, an EC at any
     /// height dispatches as usual.
     #[test]
@@ -3778,6 +3909,14 @@ mod tests {
             SignerBitfield::new(4),
         );
 
+        // The source block is commit-proven; the gate under test is BLS
+        // dispatch without a local tracker, not the commit-proof gate.
+        state.on_committed_remote_header(
+            &topo,
+            remote_shard,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+        );
         let actions = state.on_wave_certificate(&topo, cert.into());
         assert!(
             actions

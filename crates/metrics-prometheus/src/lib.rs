@@ -1329,6 +1329,14 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["outbound_certs"])
             .set(m.exec_outbound_certs as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["proven_remote_blocks"])
+            .set(m.exec_proven_remote_blocks as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["unproven_ecs"])
+            .set(m.exec_unproven_ecs as f64);
 
         // Mempool
         self.metrics
@@ -1369,6 +1377,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_remote_headers
             .with_label_values(&["verified_headers"])
             .set(m.rh_verified_headers as f64);
+        self.metrics
+            .memory_remote_headers
+            .with_label_values(&["proven_headers"])
+            .set(m.rh_proven_headers as f64);
         self.metrics
             .memory_remote_headers
             .with_label_values(&["expected_headers"])

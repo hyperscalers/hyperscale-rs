@@ -268,6 +268,22 @@ pub enum ProtocolEvent {
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
 
+    /// A remote header's commit proof is held: the `RemoteHeaderCoordinator`
+    /// also holds the header's committing structure — a round-contiguous
+    /// certified child, or a parent-hash link under a proven descendant for
+    /// a block committed as the prefix of a later two-chain.
+    ///
+    /// Emitted at most once per `(shard, height)`, always after that
+    /// header's `RemoteHeaderAdmitted`. Cross-shard consumption of the
+    /// block's exports — provisions and execution certificates — gates on
+    /// this event, not on admission: a bare QC certifies availability, and
+    /// an f+1..2f corrupt committee can certify a sibling that never
+    /// commits.
+    RemoteHeaderCommitted {
+        /// The commit-proven certified header.
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+
     /// Transaction-root verification completed for a pending block.
     /// On success the payload carries the verified root (predicate
     /// includes per-tx validity-window checks against the parent QC's

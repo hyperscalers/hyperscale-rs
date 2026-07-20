@@ -123,6 +123,25 @@ impl ProvisionPipeline {
             .unwrap_or_default()
     }
 
+    /// Drop parked bundles keyed to `shard` strictly above a pending
+    /// recovery's attested frontier — they can never verify — returning
+    /// their hashes so in-flight local-DA fetches can be abandoned.
+    pub(crate) fn purge_fenced(
+        &mut self,
+        shard: ShardId,
+        frontier: BlockHeight,
+    ) -> Vec<ProvisionHash> {
+        let mut evicted = Vec::new();
+        self.pending.retain(|&(s, h), entries| {
+            if s != shard || h <= frontier {
+                return true;
+            }
+            evicted.extend(entries.iter().map(|p| p.provisions.hash()));
+            false
+        });
+        evicted
+    }
+
     /// Insert verified provisions into the pipeline + store. Returns the
     /// verified `Arc` the coordinator hands downstream (queue + `ProvisionsAdmitted`
     /// emit). Idempotent if the same content hash is inserted twice.

@@ -249,6 +249,23 @@ where
         self.base.get_certified_header(height).map(Arc::new)
     }
 
+    /// Certified-but-uncommitted header at `height`, if any — the certified
+    /// tip before its committing child exists, best-guessed by highest QC
+    /// round when siblings certified. Serves remote-header fetches one
+    /// height above the committed tip so a cross-shard consumer can
+    /// complete a commit proof of the tip itself: the tip's committing QC
+    /// travels only inside this header, and if the chain stalls here no
+    /// later commit will ever gossip it. A losing sibling served by the
+    /// guess is harmless — it fails the consumer's parent-hash link and
+    /// proves nothing.
+    pub fn certified_uncommitted_header(
+        &self,
+        height: BlockHeight,
+    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+        self.pending_certified_uncommitted_at(height)
+            .map(|certified| Arc::new(certified.certified_header()))
+    }
+
     /// Transactions in the block at `height`. Pending entry first, base
     /// store fallback. Each tx is `Arc`-cloned from the pending block —
     /// callers receive shared refcounts, not deep copies.

@@ -379,10 +379,30 @@ impl TopologySchedule {
     /// propagation.
     #[must_use]
     pub fn recovery_fences(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.head
-            .pending_recoveries()
-            .get(&shard)
-            .is_some_and(|recovery| height > recovery.attested_frontier)
+        self.head.recovery_fences(shard, height)
+    }
+
+    /// The recovery fence as a block-validity input: resolved from the
+    /// snapshot governing `wt` — a block's anchor timestamp — rather than
+    /// the schedule head, so every replica validating the block reads the
+    /// same records regardless of when it validates (the same determinism
+    /// discipline as committee resolution, INV-BEACON-4). A block anchored
+    /// before the recovery folded stays valid; one anchored at or past the
+    /// fold is invalid if it carries content from `shard` above the
+    /// recovery's attested frontier.
+    ///
+    /// Callers run after `wt`'s epoch has resolved a committee — the block
+    /// would defer on the committee lookup otherwise — so an unresolvable
+    /// epoch is unreachable here and reads as unfenced.
+    #[must_use]
+    pub fn recovery_fences_at(
+        &self,
+        wt: WeightedTimestamp,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> bool {
+        self.at(wt)
+            .is_some_and(|snapshot| snapshot.recovery_fences(shard, height))
     }
 
     /// During a pending recovery, whether a certified artifact resolves the
@@ -812,11 +832,19 @@ mod tests {
     }
 
     fn halt_recovery(rotated_at: u64, retained: &[ValidatorId]) -> ShardRecovery {
+        halt_recovery_at(rotated_at, retained, BlockHeight::GENESIS)
+    }
+
+    fn halt_recovery_at(
+        rotated_at: u64,
+        retained: &[ValidatorId],
+        attested_frontier: BlockHeight,
+    ) -> ShardRecovery {
         ShardRecovery {
             cause: RecoveryCause::Halt,
             rotated_at: Epoch::new(rotated_at),
             retained: retained.to_vec(),
-            attested_frontier: BlockHeight::GENESIS,
+            attested_frontier,
         }
     }
 
@@ -1446,6 +1474,49 @@ mod tests {
         assert!(!sched.recovery_suffix_band(shard, stale_anchor, bridge_qc));
         // A shard with no recovery history has no band.
         assert!(!sched.recovery_suffix_band(ShardId::leaf(1, 1), stale_anchor, suffix_qc));
+    }
+
+    /// The WT-keyed fence resolves the snapshot governing the block's
+    /// anchor, not the head: a block anchored in an epoch before the
+    /// recovery folded reads a record-free snapshot and stays valid, while
+    /// one anchored at or past the fold reads the record and fences above
+    /// the frontier.
+    #[test]
+    fn recovery_fences_at_reads_the_governing_snapshot() {
+        let shard = ShardId::leaf(1, 0);
+        let frontier = BlockHeight::new(50);
+        let clean = snapshot();
+        let recovering = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(Vec::new()),
+            )
+            .with_pending_recoveries(
+                std::iter::once((shard, halt_recovery_at(20, &[], frontier))).collect(),
+            ),
+        );
+
+        // Epochs are 1000 ms wide: epoch 4 is pre-fold, epoch 5 folded the
+        // recovery. The head carries the record.
+        let mut sched = TopologySchedule::new(1000, Epoch::new(4), clean);
+        sched.insert(Epoch::new(5), Arc::clone(&recovering));
+        sched.set_head(recovering);
+
+        let pre_fold = WeightedTimestamp::from_millis(4_500);
+        let post_fold = WeightedTimestamp::from_millis(5_500);
+        let above = BlockHeight::new(51);
+
+        // Head-keyed admission form fences.
+        assert!(sched.recovery_fences(shard, above));
+        // Validity form: the pre-fold anchor resolves the record-free
+        // snapshot and stays unfenced; the post-fold anchor fences above
+        // the frontier and not at it.
+        assert!(!sched.recovery_fences_at(pre_fold, shard, above));
+        assert!(sched.recovery_fences_at(post_fold, shard, above));
+        assert!(!sched.recovery_fences_at(post_fold, shard, frontier));
+        // Another shard is never fenced.
+        assert!(!sched.recovery_fences_at(post_fold, ShardId::leaf(1, 1), above));
     }
 
     #[test]
