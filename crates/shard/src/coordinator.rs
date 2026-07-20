@@ -86,10 +86,11 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters, StateRoot,
-    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload, vrf_output_from_proof,
+    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters,
+    ShardVoteEquivocation, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
+    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload, vrf_output_from_proof,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -297,6 +298,13 @@ pub struct ShardCoordinator {
     /// next proposed block. Drained at proposal time.
     ready_signal_pool: ReadySignalPool,
 
+    /// Double-vote equivocation evidence this replica detected among the
+    /// votes it received, first-wins per validator (one entry is enough —
+    /// the beacon jail is permanent). Cloned into every proposal until the
+    /// evidence lands in a committed block, then pruned; retained across
+    /// proposals so a lost or uncommitted block does not drop it.
+    detected_equivocations: std::collections::BTreeMap<ValidatorId, ShardVoteEquivocation>,
+
     /// Per-shard beacon-witness accumulator. Previewed at proposal time
     /// to fill the new block's `(beacon_witness_root, beacon_witness_leaf_count)`;
     /// mutated on each committed block via [`Self::record_block_committed`].
@@ -421,6 +429,7 @@ impl ShardCoordinator {
             proposal: ProposalTracker::new(),
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
+            detected_equivocations: std::collections::BTreeMap::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
                 recovered.beacon_witness_start,
                 recovered.beacon_witness_leaf_hashes,
@@ -1734,6 +1743,7 @@ impl ShardCoordinator {
             self.now,
             kind,
             preview.ready_signals,
+            self.detected_equivocations.values().cloned().collect(),
             preview.reshape_trigger,
             preview.parent_window,
             preview.base,
@@ -2884,8 +2894,15 @@ impl ShardCoordinator {
 
         // Per-vote: view sync + equivocation tracking. Tracking runs only on
         // verified votes so a forged vote can't pre-empt a legitimate one.
+        // The voted block's parent is bound into every vote's signing
+        // message, so it is needed to assemble equivocation evidence; all
+        // votes here target `block_hash`, so it resolves once.
         let validator_id = self.me;
         let high_qc_round = self.high_qc_round();
+        let parent_block_hash = self
+            .pending_blocks
+            .get_header(block_hash)
+            .map(BlockHeader::parent_block_hash);
         for (_, vote) in &verified_votes {
             let old_view = self.view_change.view;
             if self
@@ -2901,7 +2918,14 @@ impl ShardCoordinator {
                     "View synchronization: advancing view to match verified vote"
                 );
             }
-            self.votes.track_verified_received_vote(block_hash, vote);
+            if let Some(evidence) =
+                self.votes
+                    .track_verified_received_vote(block_hash, parent_block_hash, vote)
+            {
+                self.detected_equivocations
+                    .entry(evidence.validator)
+                    .or_insert(evidence);
+            }
         }
 
         self.votes
@@ -3891,6 +3915,12 @@ impl ShardCoordinator {
         self.committed_height = height;
         self.committed_hash = block_hash;
         self.committed_ts = commit_ts;
+
+        // Evidence that reached a committed block is on-chain — the beacon
+        // will fold and jail on it — so drop it from the pending buffer.
+        for ev in block.equivocations().iter() {
+            self.detected_equivocations.remove(&ev.validator);
+        }
         // The committee that signed this block is `at(parent_qc weighted ts)`;
         // retain it so [`Self::committee_anchor`] can resolve the tip's
         // committee after it is pruned from `pending_blocks`.
