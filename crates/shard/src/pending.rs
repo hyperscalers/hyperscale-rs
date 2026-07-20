@@ -575,6 +575,7 @@ impl PendingBlock {
             cert_ids,
             provision_hashes,
             ready_signals,
+            block.equivocations().iter().cloned().collect(),
             reshape_trigger,
             *block.randomness_reveal(),
         );
@@ -757,6 +758,7 @@ impl PendingBlock {
             certificates: Arc::new(certificates.into()),
             provisions: Arc::new(provisions.into()),
             ready_signals: Arc::new(self.manifest.ready_signals().clone()),
+            equivocations: Arc::new(self.manifest.equivocations().clone()),
             reshape_trigger: self.manifest.reshape_trigger(),
             randomness_reveal: *self.manifest.randomness_reveal(),
         });
@@ -923,7 +925,15 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1, tx2], vec![], vec![], vec![], None, VrfProof::ZERO),
+            BlockManifest::new(
+                vec![tx1, tx2],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -957,6 +967,7 @@ mod tests {
                 vec![wave1.clone(), wave2.clone()],
                 vec![],
                 vec![],
+                vec![],
                 None,
                 VrfProof::ZERO,
             ),
@@ -980,6 +991,7 @@ mod tests {
             BlockManifest::new(
                 vec![],
                 vec![wave_id.clone()],
+                vec![],
                 vec![],
                 vec![],
                 None,
@@ -1017,6 +1029,7 @@ mod tests {
             BlockManifest::new(
                 vec![tx_hash],
                 vec![wave_id.clone()],
+                vec![],
                 vec![],
                 vec![],
                 None,
@@ -1059,6 +1072,7 @@ mod tests {
             certificates: Arc::new(vec![wire_fw].into()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         };
@@ -1090,6 +1104,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![prov_a, prov_b],
+                vec![],
                 vec![],
                 None,
                 VrfProof::ZERO,
@@ -1141,6 +1156,7 @@ mod tests {
                 vec![],
                 vec![shared, only_stale],
                 vec![],
+                vec![],
                 None,
                 VrfProof::ZERO,
             ),
@@ -1148,7 +1164,15 @@ mod tests {
         );
         let live = PendingBlock::from_manifest(
             make_header(BlockHeight::new(10)),
-            BlockManifest::new(vec![], vec![], vec![shared], vec![], None, VrfProof::ZERO),
+            BlockManifest::new(
+                vec![],
+                vec![],
+                vec![shared],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(stale);
@@ -1175,6 +1199,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 None,
                 VrfProof::ZERO,
             ),
@@ -1183,7 +1208,15 @@ mod tests {
         let dropped_hash = dropped.header().hash();
         let other = PendingBlock::from_manifest(
             make_header(BlockHeight::new(8)),
-            BlockManifest::new(vec![shared], vec![], vec![], vec![], None, VrfProof::ZERO),
+            BlockManifest::new(
+                vec![shared],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                VrfProof::ZERO,
+            ),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(dropped);

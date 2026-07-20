@@ -5,9 +5,10 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, Round, ShardId, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, ValidatorId, Verified, Verify, VrfOutput, VrfProof, compute_merkle_root,
-    shard_reveal_verify, vrf_output_from_proof,
+    ReshapeThresholds, ReshapeTrigger, Round, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    StoredReceipt, TopologySnapshot, ValidatorId, Verified, Verify, VrfOutput, VrfProof,
+    compute_merkle_root, shard_reveal_verify, verify_shard_vote_equivocation,
+    vrf_output_from_proof,
 };
 
 /// Inputs the [`BeaconWitnessRoot`] verifier reads against.
@@ -47,6 +48,12 @@ pub struct BeaconWitnessRootContext<'a> {
     pub receipts: &'a [StoredReceipt],
     /// Ready signals carried on the block's manifest.
     pub ready_signals: &'a [ReadySignal],
+    /// Double-vote equivocation evidence carried on the block. Each entry
+    /// is re-verified against the equivocator's registered key (two BLS
+    /// checks) before its `VoteEquivocation` leaf folds — an invalid or
+    /// off-shard entry fails the block, so the QC attests every carried
+    /// entry is genuine and the beacon jails on it without re-verifying.
+    pub equivocations: &'a [ShardVoteEquivocation],
     /// The manifest's reshape assertion. Verification recomputes the
     /// load predicate from `substate_bytes` + `thresholds` and rejects
     /// the block when the claim diverges — a committed trigger
@@ -120,6 +127,11 @@ pub enum BeaconWitnessRootVerifyError {
     /// choose the output and grind the seed.
     #[error("randomness reveal is not a valid VRF by the block proposer")]
     RevealInvalid,
+    /// A carried double-vote equivocation is off-shard, names an unknown
+    /// validator, or its signatures do not verify — so the block cannot
+    /// carry it as a jail-bearing `VoteEquivocation` leaf.
+    #[error("carried vote equivocation evidence is invalid")]
+    EquivocationInvalid,
 }
 
 /// Walk the rounds `(parent_round, committed_round)` and emit one
@@ -209,12 +221,17 @@ pub fn derive_reshape_trigger(
 ///    `validator_id` order — `ReshapeReady` for a sender holding an
 ///    observer seat on this shard's pending split, `Ready` otherwise.
 /// 4. The block's reshape trigger, if asserted (at most one).
+/// 5. One `VoteEquivocation` leaf per carried evidence, in ascending
+///    `(validator, block_hash_a, block_hash_b)` order — a total order on
+///    distinct evidence, so every honest proposer emits the same sequence
+///    whatever order it observed the double-votes in.
 ///
 /// `reveal_output` is the digest of the proposer's VRF proof for the block's
 /// slot: computed from the key at proposal time, read from the block body's
 /// `randomness_reveal` at verify and commit. It is unforgeable and
 /// unchooseable, so it is the block's grind-resistant randomness contribution.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // one parameter per canonical witness source
 pub fn derive_leaves(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
@@ -223,6 +240,7 @@ pub fn derive_leaves(
     missed: &[ShardWitnessPayload],
     ready_signals: &[ReadySignal],
     reshape: Option<ShardWitnessPayload>,
+    equivocations: &[ShardVoteEquivocation],
 ) -> Vec<ShardWitnessPayload> {
     let mut out = vec![ShardWitnessPayload::RandomnessReveal {
         output: reveal_output,
@@ -250,6 +268,17 @@ pub fn derive_leaves(
         ));
     }
     out.extend(reshape);
+    let mut sorted_ev: Vec<&ShardVoteEquivocation> = equivocations.iter().collect();
+    sorted_ev.sort_by(|a, b| {
+        (a.validator, a.block_hash_a, a.block_hash_b).cmp(&(
+            b.validator,
+            b.block_hash_a,
+            b.block_hash_b,
+        ))
+    });
+    for ev in sorted_ev {
+        out.push(ShardWitnessPayload::VoteEquivocation(Box::new(ev.clone())));
+    }
     out
 }
 
@@ -322,6 +351,35 @@ impl Verified<BeaconWitnessRoot> {
 /// merkle-ing the result produces a root that equals the header's
 /// claimed [`BeaconWitnessRoot`] **and** a leaf count that equals the
 /// header's claimed count.
+/// Verify every carried double-vote equivocation: each must concern this
+/// block's shard, name a validator whose key the schedule knows, and carry
+/// two genuine conflicting signatures. The beacon folds the resulting
+/// `VoteEquivocation` leaves on QC trust without re-verifying, so validity
+/// is pinned here — an unverified entry would let a proposer jail an
+/// innocent key.
+fn verify_carried_equivocations(
+    ctx: &BeaconWitnessRootContext<'_>,
+) -> Result<(), BeaconWitnessRootVerifyError> {
+    for ev in ctx.equivocations {
+        let valid = ev.shard == ctx.shard
+            && ctx
+                .topology_snapshot
+                .public_key(ev.validator)
+                .is_some_and(|pk| {
+                    verify_shard_vote_equivocation(ev, ctx.topology_snapshot.network(), &pk).is_ok()
+                });
+        if !valid {
+            tracing::warn!(
+                validator = ev.validator.inner(),
+                height = ctx.height.inner(),
+                "Carried vote-equivocation evidence verification FAILED"
+            );
+            return Err(BeaconWitnessRootVerifyError::EquivocationInvalid);
+        }
+    }
+    Ok(())
+}
+
 impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
     type Error = BeaconWitnessRootVerifyError;
 
@@ -412,6 +470,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
                 derived,
             });
         }
+        verify_carried_equivocations(ctx)?;
         let new_leaves = derive_leaves(
             ctx.shard,
             ctx.topology_snapshot,
@@ -420,6 +479,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
             &missed,
             ctx.ready_signals,
             derived.and_then(|t| t.to_payload(ctx.shard)),
+            ctx.equivocations,
         );
 
         let (computed_root, computed_count) =
@@ -451,9 +511,96 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bls12381G1PrivateKey, NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet,
-        bls_keypair_from_seed, shard_reveal_sign,
+        BlockHash, Bls12381G1PrivateKey, NetworkDefinition, ValidatorId, ValidatorInfo,
+        ValidatorSet, block_vote_message, bls_keypair_from_seed, shard_reveal_sign,
     };
+
+    /// A double-vote equivocation signed by `sk` for validator 0 at
+    /// `(shard, height 5, round INITIAL)` — the block's proposer key the
+    /// test snapshots seat, so the verifier resolves its pubkey.
+    fn signed_equivocation(
+        sk: &Bls12381G1PrivateKey,
+        shard: ShardId,
+        block_a: &[u8],
+        block_b: &[u8],
+    ) -> ShardVoteEquivocation {
+        let net = NetworkDefinition::simulator();
+        let (height, round) = (BlockHeight::new(5), Round::INITIAL);
+        let ha = BlockHash::from_raw(Hash::from_bytes(block_a));
+        let hb = BlockHash::from_raw(Hash::from_bytes(block_b));
+        let pa = BlockHash::from_raw(Hash::from_bytes(b"pa"));
+        let pb = BlockHash::from_raw(Hash::from_bytes(b"pb"));
+        let msg_a = block_vote_message(&net, shard, height, round, &ha, &pa);
+        let msg_b = block_vote_message(&net, shard, height, round, &hb, &pb);
+        ShardVoteEquivocation {
+            validator: ValidatorId::new(0),
+            shard,
+            height,
+            round,
+            block_hash_a: ha,
+            parent_block_hash_a: pa,
+            sig_a: sk.sign_v1(&msg_a),
+            block_hash_b: hb,
+            parent_block_hash_b: pb,
+            sig_b: sk.sign_v1(&msg_b),
+        }
+    }
+
+    /// A valid carried equivocation folds one `VoteEquivocation` leaf: the
+    /// root recomputed with it matches, so `verify` accepts.
+    #[test]
+    fn valid_carried_equivocation_folds_a_leaf() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        let ev = signed_equivocation(&proposer_sk(), shard, b"block-a", b"block-b");
+        let evs = vec![ev.clone()];
+        let mut ctx = context_with(&topology_snapshot, shard, 0, Vec::new(), 2);
+        ctx.equivocations = &evs;
+
+        let leaves = vec![
+            ShardWitnessPayload::RandomnessReveal {
+                output: vrf_output_from_proof(&signed_reveal(shard)),
+            },
+            ShardWitnessPayload::VoteEquivocation(Box::new(ev)),
+        ];
+        let (root, _) = commit_witness_window(&[], &leaves, BeaconWitnessLeafCount::ZERO);
+        assert!(root.verify(&ctx).is_ok());
+    }
+
+    /// An equivocation for a different shard is rejected before any root
+    /// comparison — a block attests only its own committee's double-votes.
+    #[test]
+    fn off_shard_carried_equivocation_rejected() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        let ev = signed_equivocation(&proposer_sk(), ShardId::leaf(1, 1), b"a", b"b");
+        let evs = vec![ev];
+        let mut ctx = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
+        ctx.equivocations = &evs;
+
+        assert_eq!(
+            BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
+            BeaconWitnessRootVerifyError::EquivocationInvalid,
+        );
+    }
+
+    /// An equivocation whose signatures don't verify under the named key is
+    /// rejected (here signed by an unrelated key).
+    #[test]
+    fn bad_sig_carried_equivocation_rejected() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        let intruder = bls_keypair_from_seed(&[9u8; 32]);
+        let ev = signed_equivocation(&intruder, shard, b"a", b"b");
+        let evs = vec![ev];
+        let mut ctx = context_with(&topology_snapshot, shard, 0, Vec::new(), 0);
+        ctx.equivocations = &evs;
+
+        assert_eq!(
+            BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
+            BeaconWitnessRootVerifyError::EquivocationInvalid,
+        );
+    }
 
     /// The single committee member's key. Deterministic so a test can both
     /// seat its public key on the snapshot and sign a valid reveal with the
@@ -555,6 +702,7 @@ mod tests {
             round: Round::INITIAL.next(),
             receipts: &[],
             ready_signals: &[],
+            equivocations: &[],
             reshape_trigger: None,
             randomness_reveal: signed_reveal(shard),
             substate_bytes: None,

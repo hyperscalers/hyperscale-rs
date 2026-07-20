@@ -382,6 +382,7 @@ pub fn make_live_block(
         certificates: Arc::new(certificates.into()),
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
+        equivocations: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
         randomness_reveal: VrfProof::ZERO,
     }
@@ -487,6 +488,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificates,
             provisions,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => Block::Live {
@@ -495,6 +497,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificates,
             provisions,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         },
@@ -504,6 +507,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificates,
             provision_hashes,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => Block::Sealed {
@@ -512,6 +516,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificates,
             provision_hashes,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         },

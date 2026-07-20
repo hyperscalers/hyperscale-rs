@@ -528,6 +528,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             certificates: Arc::new(BoundedVec::new()),
             provision_hashes: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },
@@ -539,6 +540,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             certificates,
             provisions,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -550,6 +552,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
                 certificates: Arc::new(certificates),
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -560,6 +563,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
             certificates,
             provision_hashes,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -571,6 +575,7 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
                 certificates: Arc::new(certificates),
                 provision_hashes,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -605,6 +610,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             certificates: Arc::new(BoundedVec::new()),
             provision_hashes: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },
@@ -616,6 +622,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             certificates,
             provisions,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -627,6 +634,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 certificates: Arc::new(certificates),
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -637,6 +645,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             certificates,
             provision_hashes,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -648,6 +657,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 certificates: Arc::new(certificates),
                 provision_hashes,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -747,6 +757,7 @@ fn test_commit_block_stores_certificates() {
             certificates: fw_certificates,
             provisions,
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },
@@ -761,6 +772,7 @@ fn test_commit_block_stores_certificates() {
             certificates: fw_certificates,
             provision_hashes,
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },

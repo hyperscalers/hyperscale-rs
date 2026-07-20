@@ -1370,6 +1370,7 @@ impl VerificationPipeline {
             height: header.height(),
             round: header.round(),
             ready_signals,
+            equivocations: block.equivocations().as_slice().to_vec(),
             reshape_trigger,
             substate_bytes,
             thresholds,
@@ -2147,6 +2148,7 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -2680,6 +2682,7 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         };

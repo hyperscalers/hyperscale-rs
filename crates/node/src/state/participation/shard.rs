@@ -676,6 +676,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
             None,
             VrfProof::ZERO,
         );

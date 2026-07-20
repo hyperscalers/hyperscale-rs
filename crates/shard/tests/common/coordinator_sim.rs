@@ -1239,6 +1239,7 @@ impl ShardCoordinatorSim {
                 parent_in_flight,
                 finalized_tx_count,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 parent_witness_leaves,
                 beacon_witness_base,
@@ -1318,6 +1319,7 @@ impl ShardCoordinatorSim {
                     parent_in_flight,
                     finalized_tx_count,
                     ready_signals,
+                    equivocations,
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
                     // block's leaf 0 passes the BLS gate `verify` now runs;
@@ -1489,6 +1491,7 @@ impl ShardCoordinatorSim {
                 height,
                 round,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 substate_bytes,
                 thresholds,
@@ -1511,6 +1514,7 @@ impl ShardCoordinatorSim {
                     round,
                     receipts: &receipts,
                     ready_signals: &ready_signals,
+                    equivocations: &equivocations,
                     randomness_reveal,
                     reshape_trigger,
                     substate_bytes,

@@ -1341,6 +1341,7 @@ mod tests {
                 certificates,
                 provisions: Arc::new(vec![Arc::new(provision.into())].into()),
                 ready_signals: Arc::new(BoundedVec::new()),
+                equivocations: Arc::new(BoundedVec::new()),
                 reshape_trigger: None,
                 randomness_reveal: VrfProof::ZERO,
             },
