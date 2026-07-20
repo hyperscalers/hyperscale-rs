@@ -194,7 +194,7 @@ pub fn apply_epoch(
         shard_contributions,
     } = input
     {
-        record_boundaries(state, epoch, committed, shard_contributions)
+        record_boundaries(state, network, epoch, committed, shard_contributions)
     } else {
         (WitnessOutcome::default(), BTreeMap::new())
     };
@@ -609,6 +609,7 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 
 fn record_boundaries(
     state: &mut BeaconState,
+    network: &NetworkDefinition,
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
@@ -671,6 +672,7 @@ fn record_boundaries(
         }
         if !apply_contribution_witnesses(
             state,
+            network,
             header,
             &contribution.witnesses,
             prior,
@@ -1278,7 +1280,13 @@ mod tests {
         ))
         .collect();
 
-        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
 
         let recorded = state.boundaries.get(&shard).expect("boundary recorded");
         assert_eq!(recorded.state_root, anchor);
@@ -1336,7 +1344,13 @@ mod tests {
         ))
         .collect();
 
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
 
         let chunk = reveals.get(&shard).expect("reveals collected");
         assert_eq!(
@@ -1376,7 +1390,7 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, Epoch::new(1), &committed, &fresh);
+        record_boundaries(&mut state, &net(), Epoch::new(1), &committed, &fresh);
         assert_eq!(state.boundaries[&shard].consecutive_misses, 0);
 
         state.pending_recoveries.insert(
@@ -1398,7 +1412,7 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, Epoch::new(2), &committed, &refold);
+        record_boundaries(&mut state, &net(), Epoch::new(2), &committed, &refold);
 
         let recorded = &state.boundaries[&shard];
         assert_eq!(
@@ -1544,7 +1558,13 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
 
         let projected = state.derive_topology_snapshot(net()).boundary(shard);
         let anchor = projected.expect("recorded boundary projects");
@@ -1601,7 +1621,13 @@ mod tests {
         ))
         .collect();
 
-        record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
 
         assert_eq!(state.boundaries.get(&shard).unwrap().consecutive_misses, 1,);
     }
@@ -1657,6 +1683,7 @@ mod tests {
         // boundary commits `total > cap` leaves.
         record_boundaries(
             &mut state,
+            &net(),
             Epoch::new(1),
             &committed,
             &contribution_with(&witnesses[..cap]),
@@ -1687,6 +1714,7 @@ mod tests {
         // the pending recovery survives.
         record_boundaries(
             &mut state,
+            &net(),
             Epoch::new(2),
             &committed,
             &contribution_with(&witnesses[cap..2 * cap]),
@@ -1708,6 +1736,7 @@ mod tests {
         // boundary's full leaf count while the miss counter keeps climbing.
         record_boundaries(
             &mut state,
+            &net(),
             Epoch::new(3),
             &committed,
             &contribution_with(&witnesses[2 * cap..]),
@@ -1777,7 +1806,13 @@ mod tests {
         // fence over its full count persists on the record.
         let (committed, contributions) =
             contribution_for(shard, b.clone(), witnesses[..cap].to_vec(), 1_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
         assert!(reveals.is_empty(), "completing chunk is fenced");
         assert!(!state.pending_recoveries.contains_key(&shard));
         let record = state.boundaries.get(&shard).expect("boundary recorded");
@@ -1790,7 +1825,13 @@ mod tests {
         // seed; the fence clears once the watermark reaches it.
         let (committed, contributions) =
             contribution_for(shard, b, witnesses[cap..].to_vec(), 1_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
         assert!(reveals.is_empty(), "drain chunk is fenced");
         let record = state.boundaries.get(&shard).expect("boundary kept");
         assert_eq!(
@@ -1809,7 +1850,13 @@ mod tests {
         );
         let (committed, contributions) =
             contribution_for(shard, b2, witnesses2[total..].to_vec(), 2_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+        );
         assert_eq!(
             reveals.get(&shard),
             Some(&vec![reveal_output_at(total), reveal_output_at(total + 1)]),
@@ -1829,7 +1876,13 @@ mod tests {
         let (b, witnesses) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(2));
         let (committed, contributions) = contribution_for(shard, b, witnesses, 1_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
 
         assert_eq!(
             reveals.get(&shard),
@@ -1858,7 +1911,13 @@ mod tests {
         // Completing epoch: first chunk of the beyond-frontier backlog.
         let (committed, contributions) =
             contribution_for(shard, b, witnesses[..cap].to_vec(), 1_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(1), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &contributions,
+        );
         assert!(reveals.is_empty());
         assert_eq!(
             state.boundaries.get(&shard).unwrap().reveals_fenced_below,
@@ -1878,7 +1937,13 @@ mod tests {
         );
         let (committed, contributions) =
             contribution_for(shard, b2.clone(), witnesses2[cap..band].to_vec(), 2_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
         assert!(reveals.is_empty(), "carried fence covers the band");
         let record = state.boundaries.get(&shard).expect("record refreshed");
         assert_eq!(record.block_hash, b2.hash());
@@ -1887,7 +1952,13 @@ mod tests {
         // The newer crossing's own remainder is past the band: it seeds.
         let (committed, contributions) =
             contribution_for(shard, b2, witnesses2[band..].to_vec(), 2_500);
-        let (_, reveals) = record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        let (_, reveals) = record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+        );
         assert_eq!(
             reveals.get(&shard),
             Some(&vec![
@@ -2283,7 +2354,13 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header.clone(), witnesses, 2_500);
 
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         for (child, child_root) in [(left, pair.left), (right, pair.right)] {
             let record = state.boundaries.get(&child).expect("child seeded");
@@ -2321,7 +2398,13 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
 
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         for child in <[ShardId; 2]>::from(parent.children()) {
             let record = state.boundaries.get(&child).expect("placeholder kept");
@@ -2344,7 +2427,13 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 1_500);
 
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         let record = state.boundaries.get(&parent).expect("record kept");
         assert_eq!(
@@ -2365,7 +2454,7 @@ mod tests {
     fn terminal_records_do_not_bump_misses() {
         let (mut state, parent, _, _) = terminating_state();
 
-        record_boundaries(&mut state, Epoch::new(2), &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), Epoch::new(2), &[], &BTreeMap::new());
 
         assert_eq!(state.boundaries.get(&parent).unwrap().consecutive_misses, 0);
     }
@@ -2386,7 +2475,13 @@ mod tests {
         let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
         let (committed, contributions) =
             contribution_for(parent, header.clone(), first_chunk, 2_500);
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         let record = state.boundaries.get(&parent).expect("lingers mid-drain");
         assert_eq!(
@@ -2402,7 +2497,13 @@ mod tests {
 
         let rest = witnesses[MAX_WITNESSES_PER_SHARD..].to_vec();
         let (committed, contributions) = contribution_for(parent, header, rest, 2_500);
-        record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+        );
 
         let record = state
             .boundaries
@@ -2424,7 +2525,13 @@ mod tests {
         let (header, witnesses) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
         assert!(
             state.boundaries.contains_key(&parent),
             "lingers within the retention window",
@@ -2439,7 +2546,7 @@ mod tests {
         // Advance to an epoch whose window opens past the terminal cut
         // (2000ms at epoch_duration 1000) plus `RETENTION_HORIZON`.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, past, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
         assert!(
             !state.boundaries.contains_key(&parent),
             "terminal record drops past the retention horizon once its children are live",
@@ -2483,7 +2590,7 @@ mod tests {
         // The beacon commits empty well past the horizon: no terminal fold
         // yet, so both children stay on their placeholder anchors.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, past, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
         assert!(
             state.boundaries.contains_key(&parent),
             "an unseeded split parent is held past the horizon",
@@ -2501,7 +2608,7 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
-        record_boundaries(&mut state, later, &committed, &contributions);
+        record_boundaries(&mut state, &net(), later, &committed, &contributions);
 
         for child in <[ShardId; 2]>::from(parent.children()) {
             assert_ne!(
@@ -2524,7 +2631,7 @@ mod tests {
             state.advanced.insert(child);
         }
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
-        record_boundaries(&mut state, even_later, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), even_later, &[], &BTreeMap::new());
         assert!(
             !state.boundaries.contains_key(&parent),
             "the parent drops once its children are live",
@@ -2598,7 +2705,7 @@ mod tests {
         // The beacon commits empty well past the horizon: the parent hasn't
         // composed, so both children's terminal records must be held.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, past, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
         for child in [left, right] {
             assert!(
                 state.boundaries.contains_key(&child),
@@ -2615,7 +2722,7 @@ mod tests {
             .expect("parent placeholder")
             .block_hash = BlockHash::from_raw(Hash::from_bytes(b"composed parent"));
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
-        record_boundaries(&mut state, later, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), later, &[], &BTreeMap::new());
         for child in [left, right] {
             assert!(
                 state.boundaries.contains_key(&child),
@@ -2627,7 +2734,7 @@ mod tests {
         // so the children drop on the next horizon sweep.
         state.advanced.insert(parent);
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
-        record_boundaries(&mut state, even_later, &[], &BTreeMap::new());
+        record_boundaries(&mut state, &net(), even_later, &[], &BTreeMap::new());
         for child in [left, right] {
             assert!(
                 !state.boundaries.contains_key(&child),
@@ -2652,7 +2759,13 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
         let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
         let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
         assert_eq!(folded.settled_waves_root, Some(root));
@@ -2784,7 +2897,13 @@ mod tests {
         .into_iter()
         .collect();
 
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
         let record = state.boundaries.get(&parent).expect("parent composed");
@@ -2847,7 +2966,13 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
 
         // The spanning refresh recorded — but as a live refresh, not a
         // terminal: no terminal_qc_wt, and the parent stays pending
@@ -2880,7 +3005,13 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+        );
 
         let anchor = expected_merge_anchor(parent, &coast_header, &rh, 2_000);
         let record = state.boundaries.get(&parent).expect("parent composed");
@@ -2938,7 +3069,13 @@ mod tests {
         // Fold E: only the left child terminates. It is held (the parent
         // can't compose without the sibling) and the parent stays pending.
         let (committed, contributions) = contribution_for(left, lh.clone(), lw.clone(), 2_500);
-        record_boundaries(&mut state, Epoch::new(2), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+        );
         assert!(state.boundaries.contains_key(&left), "left held");
         assert_eq!(
             state.boundaries[&parent].block_hash,
@@ -2951,7 +3088,13 @@ mod tests {
         // terminal record, so the compose no longer hinges on both terminals
         // landing in a single fold (the case staggered witness fetches miss).
         let (committed, contributions) = contribution_for(right, rh.clone(), rw.clone(), 2_500);
-        record_boundaries(&mut state, Epoch::new(3), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+        );
         let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
         assert_eq!(state.boundaries[&parent].block_hash, anchor.hash());
         assert!(
@@ -2963,7 +3106,13 @@ mod tests {
         // composed, linger past the drain (carrying their settled-waves
         // roots for surviving counterparts) until the retention GC.
         let (committed, contributions) = both(2_500, 2_500);
-        record_boundaries(&mut state, Epoch::new(4), &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(4),
+            &committed,
+            &contributions,
+        );
         assert!(state.boundaries.contains_key(&left), "left lingers");
         assert!(state.boundaries.contains_key(&right), "right lingers");
         assert_eq!(

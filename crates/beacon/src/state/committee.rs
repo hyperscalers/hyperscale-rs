@@ -472,7 +472,8 @@ mod tests {
 
     use super::{recover_halted_committees, resample_beacon_committee};
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, single_pool_state, validator_record,
+        apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
+        validator_record,
     };
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
 
@@ -1386,6 +1387,7 @@ mod tests {
                     pool_id: StakePoolId::new(0),
                     validator_id: ValidatorId::new(77),
                     pubkey: state.validators[&ValidatorId::new(0)].pubkey,
+                    possession_proof: possession_proof(0, ValidatorId::new(77)),
                 }],
             );
             for _ in 0..4 {

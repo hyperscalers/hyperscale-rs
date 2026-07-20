@@ -81,7 +81,7 @@ mod tests {
     };
 
     use super::tally_param_votes;
-    use crate::state::test_fixtures::empty_state;
+    use crate::state::test_fixtures::{empty_state, net};
     use crate::state::witness::apply_shard_payload;
 
     const HIGH: u64 = 1_000_000;
@@ -116,6 +116,7 @@ mod tests {
     fn cast(state: &mut BeaconState, pool: u32, proposal: Option<ParamProposal>) {
         apply_shard_payload(
             state,
+            &net(),
             ShardId::ROOT,
             &ShardWitnessPayload::ParamVote(ParamVote {
                 pool: StakePoolId::new(pool),

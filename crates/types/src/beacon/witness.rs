@@ -13,9 +13,10 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, BoundedVec, CertifiedBlockHeader,
-    Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId, ShardVoteEquivocation,
-    Stake, StakePoolId, ValidatorId, Verified, Verify, VrfOutput, verify_merkle_inclusion,
+    BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec,
+    CertifiedBlockHeader, Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId,
+    ShardVoteEquivocation, Stake, StakePoolId, ValidatorId, Verified, Verify, VrfOutput,
+    verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -63,7 +64,8 @@ pub enum ShardWitnessPayload {
     /// is carried on the witness so the beacon can verify the
     /// validator's signed outputs without a side-channel registry.
     /// Rejected by `apply_epoch` if the pool's effective stake doesn't
-    /// support another activation at the current dynamic `min_stake`.
+    /// support another activation at the current dynamic `min_stake`,
+    /// or if `possession_proof` fails to prove possession of `pubkey`.
     RegisterValidator {
         /// Pool that operates this validator.
         pool_id: StakePoolId,
@@ -71,6 +73,12 @@ pub enum ShardWitnessPayload {
         validator_id: ValidatorId,
         /// 48-byte compressed BLS pubkey.
         pubkey: Bls12381G1PublicKey,
+        /// Proof-of-possession: the registrant's signature over
+        /// `validator_possession_proof_message(network, validator_id, pubkey)` under
+        /// `pubkey` itself. Verified by the beacon fold before the key
+        /// enters the registry — the rogue-key defense every
+        /// aggregate-signature verifier relies on.
+        possession_proof: Bls12381G2Signature,
     },
     /// The pool operator deactivates one of their validator nodes.
     /// Transitions the validator out of any active role; if currently
@@ -240,6 +248,9 @@ pub enum BeaconWitnessEvent {
         validator_id: ValidatorId,
         /// 48-byte compressed BLS pubkey.
         pubkey: Bls12381G1PublicKey,
+        /// Proof-of-possession of `pubkey`; see
+        /// [`ShardWitnessPayload::RegisterValidator`].
+        possession_proof: Bls12381G2Signature,
     },
     /// Mirrors [`ShardWitnessPayload::DeactivateValidator`].
     DeactivateValidator {
@@ -268,10 +279,12 @@ impl From<BeaconWitnessEvent> for ShardWitnessPayload {
                 pool_id,
                 validator_id,
                 pubkey,
+                possession_proof,
             } => Self::RegisterValidator {
                 pool_id,
                 validator_id,
                 pubkey,
+                possession_proof,
             },
             BeaconWitnessEvent::DeactivateValidator { validator_id } => {
                 Self::DeactivateValidator { validator_id }
@@ -468,6 +481,7 @@ mod tests {
                 pool_id: StakePoolId::new(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
+                possession_proof: Bls12381G2Signature([0xAB; 96]),
             },
             ShardWitnessPayload::DeactivateValidator {
                 validator_id: ValidatorId::new(8),
@@ -597,6 +611,7 @@ mod tests {
                 pool_id: StakePoolId::new(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
+                possession_proof: Bls12381G2Signature([0xCD; 96]),
             },
             BeaconWitnessEvent::DeactivateValidator {
                 validator_id: ValidatorId::new(8),
@@ -647,11 +662,13 @@ mod tests {
                     pool_id: StakePoolId::new(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
+                    possession_proof: Bls12381G2Signature([0xEF; 96]),
                 },
                 ShardWitnessPayload::RegisterValidator {
                     pool_id: StakePoolId::new(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
+                    possession_proof: Bls12381G2Signature([0xEF; 96]),
                 },
             ),
             (

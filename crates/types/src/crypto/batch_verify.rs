@@ -71,7 +71,13 @@ pub fn batch_verify_bls_same_message(
         return false;
     };
 
-    // Aggregate public keys (skip validation - keys come from trusted topology)
+    // Aggregate public keys without G1 subgroup validation: topology keys
+    // enter the registry through the beacon fold's `RegisterValidator`
+    // gate, which verifies a proof-of-possession — a key that proves
+    // possession is a real G1 point, and the same proof forecloses the
+    // rogue-key constructions unvalidated aggregation would otherwise
+    // admit. (Genesis keys skip the gate; they are operator-trusted
+    // config, not an adversarial channel.)
     let Ok(agg_pk) = Bls12381G1PublicKey::aggregate(pubkeys, false) else {
         return false;
     };
@@ -166,9 +172,13 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
 /// Internally calls Radix's [`aggregate_verify_bls12381_v1`], so domain
 /// separation lives in the message bytes (the BLS suite is the fixed
 /// POP-style `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`). Rogue-key
-/// safety comes from POP at key registration time — callers must
-/// ensure every public key has been validated as a real validator key
-/// before reaching this verifier.
+/// safety holds because every post-genesis validator key proved
+/// possession at registration: the beacon fold's `RegisterValidator`
+/// arm verifies a proof-of-possession
+/// (`validator_possession_proof_verify`) before the key enters the
+/// registry. Genesis keys skip the gate — they are operator-trusted
+/// config — so the topology pubkeys callers select from here are all
+/// possession-proven or genesis-trusted.
 ///
 /// Returns `false` on empty input, length mismatch between `messages`
 /// and `pubkeys`, or invalid signature.

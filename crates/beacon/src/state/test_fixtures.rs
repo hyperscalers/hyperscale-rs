@@ -11,13 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR,
-    NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool,
-    StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus,
-    VrfProof, WeightedTimestamp, bls_keypair_from_seed, compute_merkle_root_with_proof, vrf_sign,
-    zero_bls_signature,
+    Bls12381G2Signature, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
+    MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
+    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake,
+    StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord,
+    ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
+    compute_merkle_root_with_proof, validator_possession_proof_sign, vrf_sign, zero_bls_signature,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -34,6 +34,11 @@ pub fn pubkey(seed: u64) -> Bls12381G1PublicKey {
 
 pub fn net() -> NetworkDefinition {
     NetworkDefinition::simulator()
+}
+
+/// A valid proof-of-possession for `pubkey(seed)` claimed under `id`.
+pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
+    validator_possession_proof_sign(&keypair(seed), &net(), id)
 }
 
 /// Build an honest VRF-signed empty `BeaconProposal` for validator

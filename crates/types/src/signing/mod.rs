@@ -19,12 +19,13 @@
 //! | `EXEC_VOTE` | Execution votes |
 //! | `EXEC_VOTE_BATCH` | Execution vote batch gossip |
 //! | `EXEC_CERT_BATCH` | Execution certificate batch gossip |
-//! | `HYPERSCALE_READY_SIGNAL_v1` | Validator "ready on shard" signals |
 //! | `HYPERSCALE_PC_VOTE{1,2,3}_v1` | Beacon PC inner-consensus votes |
 //! | `HYPERSCALE_PC_VOTE2_LENGTH_v1` | Length attestation rider on PC round-2 |
 //! | `HYPERSCALE_PC_EMPTY_VIEW_v1` | SPC empty-view skip statement |
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-epoch randomness contribution) |
 //! | `HYPERSCALE_RATIFY_VOTE_v1` | Epoch ratification vote + aggregated ratify cert sig |
+//! | `HYPERSCALE_READY_SIGNAL_v1` | Validator "ready on shard" signals |
+//! | `HYPERSCALE_VALIDATOR_POSSESSION_PROOF_v1` | Validator BLS proof-of-possession at registration |
 //!
 //! # Usage
 //!
@@ -42,6 +43,7 @@ mod shard;
 mod shard_reveal;
 mod validator_address;
 mod validator_bind;
+mod validator_possession_proof;
 
 pub use beacon_pc::{
     DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH,
@@ -67,3 +69,7 @@ pub use shard_reveal::{
 };
 pub use validator_address::{DOMAIN_VALIDATOR_ADDRESS, validator_address_message};
 pub use validator_bind::{DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, validator_bind_message};
+pub use validator_possession_proof::{
+    DOMAIN_VALIDATOR_POSSESSION_PROOF, validator_possession_proof_message,
+    validator_possession_proof_sign, validator_possession_proof_verify,
+};
