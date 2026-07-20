@@ -14,17 +14,19 @@
 //!
 //! ## Equivocation Detection
 //!
-//! [`VoteKeeper::received_votes_by_height`] records `(height, validator) →
-//! (block_hash, round)` for every verified vote we receive. A second vote
-//! from the same validator at the same `(height, round)` for a different
-//! block is equivocation; a vote at a later round is a legitimate revote.
+//! [`VoteKeeper::received_votes_by_height`] retains, per `(height,
+//! validator)`, the verified vote we received (block, parent, round, and
+//! signature). A second vote from the same validator at the same `(height,
+//! round)` for a different block is equivocation — the retained sibling and
+//! the incoming vote assemble into a self-proving [`ShardVoteEquivocation`];
+//! a vote at a later round is a legitimate revote.
 
 use std::collections::HashMap;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, ShardId,
-    TopologySnapshot, ValidatorId, Verified,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
+    Round, ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified,
 };
 use tracing::{info, trace, warn};
 
@@ -77,10 +79,12 @@ pub struct VoteKeeper {
     vote_sets: HashMap<BlockHash, VoteSet>,
 
     /// Per-validator record of received verified votes for equivocation
-    /// detection. Key: (height, validator), Value: (`block_hash`, round).
-    /// A different-block vote at the same (height, round) is equivocation;
-    /// at a later round it's a legitimate revote.
-    received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
+    /// detection. Key: (height, validator). A different-block vote at the
+    /// same (height, round) is equivocation; at a later round it's a
+    /// legitimate revote. The stored vote carries enough to reconstruct
+    /// its signing message, so a conflicting sibling assembles into
+    /// self-proving [`ShardVoteEquivocation`] evidence on the spot.
+    received_votes_by_height: HashMap<(BlockHeight, ValidatorId), StoredVote>,
 
     /// Votes that arrived before their block's header. Without the header we
     /// can't resolve the block's exact committee to index/admit them, so they
@@ -158,7 +162,9 @@ impl VoteKeeper {
         height: BlockHeight,
         voter: ValidatorId,
     ) -> Option<(BlockHash, Round)> {
-        self.received_votes_by_height.get(&(height, voter)).copied()
+        self.received_votes_by_height
+            .get(&(height, voter))
+            .map(|sv| (sv.block_hash, sv.round))
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -401,24 +407,52 @@ impl VoteKeeper {
         }
     }
 
-    /// Record a verified vote into the per-height equivocation log, warning
-    /// on a different-block vote at the same round. Called after signature
-    /// verification so a forged vote can't pre-empt a legitimate one.
-    pub fn track_verified_received_vote(&mut self, block_hash: BlockHash, vote: &BlockVote) {
-        match self.record_received_vote(vote.height(), vote.voter(), block_hash, vote.round()) {
-            RecordResult::Accepted | RecordResult::Duplicate => {}
-            RecordResult::Equivocation {
-                existing_block,
-                existing_round: _,
-            } => {
+    /// Record a verified vote into the per-height equivocation log. On a
+    /// different-block vote at the same round, warns and — when both votes'
+    /// parents are known — assembles the self-proving
+    /// [`ShardVoteEquivocation`] from the retained sibling. Called after
+    /// signature verification so a forged vote can't pre-empt a legitimate
+    /// one; both stored signatures are therefore genuine, so the evidence
+    /// verifies. `parent_block_hash` is the voted block's parent, bound into
+    /// the vote's signing message and needed to reconstruct it — `None` when
+    /// the caller can't resolve the block (e.g. it is no longer pending);
+    /// the vote is still recorded for detection, but no evidence assembles.
+    pub fn track_verified_received_vote(
+        &mut self,
+        block_hash: BlockHash,
+        parent_block_hash: Option<BlockHash>,
+        vote: &BlockVote,
+    ) -> Option<ShardVoteEquivocation> {
+        let incoming = StoredVote {
+            block_hash,
+            parent_block_hash,
+            round: vote.round(),
+            signature: vote.signature(),
+        };
+        match self.record_received_vote(vote.height(), vote.voter(), incoming) {
+            RecordResult::Accepted | RecordResult::Duplicate => None,
+            RecordResult::Equivocation { existing } => {
                 warn!(
                     voter = ?vote.voter(),
                     height = vote.height().inner(),
                     round = vote.round().inner(),
-                    existing_block = ?existing_block,
+                    existing_block = ?existing.block_hash,
                     new_block = ?block_hash,
                     "EQUIVOCATION DETECTED: validator voted for different blocks at same height/round"
                 );
+                let (parent_a, parent_b) = (existing.parent_block_hash?, parent_block_hash?);
+                Some(ShardVoteEquivocation {
+                    validator: vote.voter(),
+                    shard: vote.shard_id(),
+                    height: vote.height(),
+                    round: vote.round(),
+                    block_hash_a: existing.block_hash,
+                    parent_block_hash_a: parent_a,
+                    sig_a: existing.signature,
+                    block_hash_b: block_hash,
+                    parent_block_hash_b: parent_b,
+                    sig_b: vote.signature(),
+                })
             }
         }
     }
@@ -470,27 +504,21 @@ impl VoteKeeper {
         &mut self,
         height: BlockHeight,
         voter: ValidatorId,
-        block_hash: BlockHash,
-        round: Round,
+        incoming: StoredVote,
     ) -> RecordResult {
         let key = (height, voter);
         match self.received_votes_by_height.get(&key).copied() {
             None => {
-                self.received_votes_by_height
-                    .insert(key, (block_hash, round));
+                self.received_votes_by_height.insert(key, incoming);
                 RecordResult::Accepted
             }
-            Some((existing_block, existing_round)) => {
-                if existing_block == block_hash {
+            Some(existing) => {
+                if existing.block_hash == incoming.block_hash {
                     RecordResult::Duplicate
-                } else if existing_round == round {
-                    RecordResult::Equivocation {
-                        existing_block,
-                        existing_round,
-                    }
-                } else if existing_round < round {
-                    self.received_votes_by_height
-                        .insert(key, (block_hash, round));
+                } else if existing.round == incoming.round {
+                    RecordResult::Equivocation { existing }
+                } else if existing.round < incoming.round {
+                    self.received_votes_by_height.insert(key, incoming);
                     RecordResult::Accepted
                 } else {
                     RecordResult::Duplicate
@@ -498,6 +526,24 @@ impl VoteKeeper {
             }
         }
     }
+}
+
+/// A received verified vote, retained per `(height, validator)` for
+/// equivocation detection. Carries what reconstructs the vote's signing
+/// message (`block_vote_message`) so a conflicting sibling assembles into
+/// [`ShardVoteEquivocation`] evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredVote {
+    /// Block the vote was cast for.
+    pub block_hash: BlockHash,
+    /// Parent of the voted block, bound into the signing message. `None`
+    /// when the recorder couldn't resolve it — the vote still counts for
+    /// detection, but no evidence can be reconstructed from it.
+    pub parent_block_hash: Option<BlockHash>,
+    /// Round the vote was cast in.
+    pub round: Round,
+    /// The vote's BLS signature.
+    pub signature: Bls12381G2Signature,
 }
 
 /// Result of `VoteKeeper::record_received_vote`.
@@ -510,10 +556,11 @@ pub enum RecordResult {
     /// No state change.
     Duplicate,
     /// Byzantine: voter previously voted for a different block at the same
-    /// `(height, round)`. The original is preserved.
+    /// `(height, round)`. The retained original is returned so the caller
+    /// can assemble self-proving evidence.
     Equivocation {
-        existing_block: BlockHash,
-        existing_round: Round,
+        /// The first vote, preserved (first-wins).
+        existing: StoredVote,
     },
 }
 
@@ -523,10 +570,22 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, generate_bls_keypair,
+        ValidatorInfo, ValidatorSet, generate_bls_keypair, verify_shard_vote_equivocation,
     };
 
     use super::*;
+
+    /// A `StoredVote` for the dedup/equivocation-logic tests, which don't
+    /// exercise signature reconstruction — parent and signature are
+    /// placeholders.
+    fn sv(block_hash: BlockHash, round: Round) -> StoredVote {
+        StoredVote {
+            block_hash,
+            parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
+            round,
+            signature: Bls12381G2Signature([0u8; 96]),
+        }
+    }
 
     fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
         BlockHeader::new(
@@ -565,7 +624,7 @@ mod tests {
             .insert(hdr_h3.hash(), VoteSet::new(Some(&hdr_h3), 4));
         vk.received_votes_by_height.insert(
             (BlockHeight::new(2), ValidatorId::new(7)),
-            (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
+            sv(BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
         );
 
         vk.cleanup_committed(BlockHeight::new(2));
@@ -589,7 +648,7 @@ mod tests {
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
         assert_eq!(
-            vk.record_received_vote(h, v, block, Round::new(0)),
+            vk.record_received_vote(h, v, sv(block, Round::new(0))),
             RecordResult::Accepted
         );
         assert_eq!(vk.received_votes_len(), 1);
@@ -603,22 +662,19 @@ mod tests {
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
-        vk.record_received_vote(h, v, block_a, Round::new(0));
-        let result = vk.record_received_vote(h, v, block_b, Round::new(0));
+        vk.record_received_vote(h, v, sv(block_a, Round::new(0)));
+        let result = vk.record_received_vote(h, v, sv(block_b, Round::new(0)));
 
         match result {
-            RecordResult::Equivocation {
-                existing_block,
-                existing_round,
-            } => {
-                assert_eq!(existing_block, block_a);
-                assert_eq!(existing_round, Round::new(0));
+            RecordResult::Equivocation { existing } => {
+                assert_eq!(existing.block_hash, block_a);
+                assert_eq!(existing.round, Round::new(0));
             }
             other => panic!("expected Equivocation, got {other:?}"),
         }
         // Original vote preserved.
-        let (stored_block, _) = vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
-        assert_eq!(stored_block, block_a);
+        let stored = vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
+        assert_eq!(stored.block_hash, block_a);
     }
 
     #[test]
@@ -629,16 +685,15 @@ mod tests {
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
-        vk.record_received_vote(h, v, block_a, Round::new(0));
+        vk.record_received_vote(h, v, sv(block_a, Round::new(0)));
         assert_eq!(
-            vk.record_received_vote(h, v, block_b, Round::new(1)),
+            vk.record_received_vote(h, v, sv(block_b, Round::new(1))),
             RecordResult::Accepted
         );
 
-        let (stored_block, stored_round) =
-            vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
-        assert_eq!(stored_block, block_b);
-        assert_eq!(stored_round, Round::new(1));
+        let stored = vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
+        assert_eq!(stored.block_hash, block_b);
+        assert_eq!(stored.round, Round::new(1));
     }
 
     #[test]
@@ -650,12 +705,12 @@ mod tests {
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         assert_eq!(
-            vk.record_received_vote(BlockHeight::new(5), v, block_a, round),
+            vk.record_received_vote(BlockHeight::new(5), v, sv(block_a, round)),
             RecordResult::Accepted
         );
         // Different block at DIFFERENT height: independent, accepted.
         assert_eq!(
-            vk.record_received_vote(BlockHeight::new(6), v, block_b, round),
+            vk.record_received_vote(BlockHeight::new(6), v, sv(block_b, round)),
             RecordResult::Accepted
         );
         assert_eq!(vk.received_votes_len(), 2);
@@ -668,9 +723,9 @@ mod tests {
         let v = ValidatorId::new(2);
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
-        vk.record_received_vote(h, v, block, Round::new(0));
+        vk.record_received_vote(h, v, sv(block, Round::new(0)));
         assert_eq!(
-            vk.record_received_vote(h, v, block, Round::new(0)),
+            vk.record_received_vote(h, v, sv(block, Round::new(0))),
             RecordResult::Duplicate
         );
     }
@@ -683,16 +738,57 @@ mod tests {
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
-        vk.record_received_vote(h, v, block_a, Round::new(3));
+        vk.record_received_vote(h, v, sv(block_a, Round::new(3)));
         // Later arrival at LOWER round: stale, dropped without overwriting.
         assert_eq!(
-            vk.record_received_vote(h, v, block_b, Round::new(1)),
+            vk.record_received_vote(h, v, sv(block_b, Round::new(1))),
             RecordResult::Duplicate
         );
-        let (stored_block, stored_round) =
-            vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
-        assert_eq!(stored_block, block_a);
-        assert_eq!(stored_round, Round::new(3));
+        let stored = vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
+        assert_eq!(stored.block_hash, block_a);
+        assert_eq!(stored.round, Round::new(3));
+    }
+
+    /// Two genuinely-signed conflicting votes assemble into evidence that
+    /// verifies against the equivocator's key — the end-to-end detection
+    /// path, from received votes to self-proving `ShardVoteEquivocation`.
+    #[test]
+    fn track_assembles_verifiable_evidence_on_conflicting_votes() {
+        let net = NetworkDefinition::simulator();
+        let sk = generate_bls_keypair();
+        let pk = sk.public_key();
+        let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(5), Round::new(2));
+        let voter = ValidatorId::new(3);
+        let signed = |blk: &[u8], parent: &[u8]| {
+            let block_hash = BlockHash::from_raw(Hash::from_bytes(blk));
+            let parent_hash = BlockHash::from_raw(Hash::from_bytes(parent));
+            let vote = BlockVote::new(
+                &net,
+                block_hash,
+                parent_hash,
+                shard,
+                height,
+                round,
+                voter,
+                &sk,
+                ProposerTimestamp::ZERO,
+            );
+            (block_hash, parent_hash, vote)
+        };
+        let (ba, pa, va) = signed(b"block-a", b"parent-a");
+        let (bb, pb, vb) = signed(b"block-b", b"parent-b");
+
+        let mut vk = VoteKeeper::new();
+        assert!(vk.track_verified_received_vote(ba, Some(pa), &va).is_none());
+        let ev = vk
+            .track_verified_received_vote(bb, Some(pb), &vb)
+            .expect("conflicting vote assembles evidence");
+
+        assert_eq!(ev.validator, voter);
+        assert_eq!(ev.shard, shard);
+        assert_eq!(ev.block_hash_a, ba);
+        assert_eq!(ev.block_hash_b, bb);
+        assert_eq!(verify_shard_vote_equivocation(&ev, &net, &pk), Ok(()));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -844,6 +940,18 @@ mod properties {
 
     use super::*;
 
+    /// A `StoredVote` with placeholder parent/signature — these property
+    /// tests exercise the dedup/equivocation logic, not signature
+    /// reconstruction.
+    fn sv(block_hash: BlockHash, round: Round) -> StoredVote {
+        StoredVote {
+            block_hash,
+            parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
+            round,
+            signature: Bls12381G2Signature([0u8; 96]),
+        }
+    }
+
     /// Arbitrary received-vote event, drawn from a small key space so multiple
     /// events are likely to collide on `(height, voter)` and stress the
     /// equivocation path.
@@ -878,7 +986,7 @@ mod properties {
             let mut model: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)> = HashMap::new();
 
             for (h, v, block, round) in events {
-                let result = vk.record_received_vote(h, v, block, round);
+                let result = vk.record_received_vote(h, v, sv(block, round));
                 let key = (h, v);
                 match model.get(&key).copied() {
                     None => {
@@ -892,8 +1000,7 @@ mod properties {
                             prop_assert_eq!(
                                 result,
                                 RecordResult::Equivocation {
-                                    existing_block,
-                                    existing_round,
+                                    existing: sv(existing_block, existing_round),
                                 }
                             );
                         } else if existing_round < round {
@@ -905,7 +1012,10 @@ mod properties {
                     }
                 }
                 // Invariant: the keeper's stored value always matches the model.
-                let stored = vk.received_votes_by_height.get(&key).copied();
+                let stored = vk
+                    .received_votes_by_height
+                    .get(&key)
+                    .map(|s| (s.block_hash, s.round));
                 prop_assert_eq!(stored, model.get(&key).copied());
             }
         }
@@ -920,13 +1030,13 @@ mod properties {
             let mut last_round: HashMap<(BlockHeight, ValidatorId), Round> = HashMap::new();
 
             for (h, v, block, round) in events {
-                vk.record_received_vote(h, v, block, round);
+                vk.record_received_vote(h, v, sv(block, round));
                 let key = (h, v);
-                if let Some((_, stored_round)) = vk.received_votes_by_height.get(&key).copied() {
+                if let Some(stored) = vk.received_votes_by_height.get(&key).copied() {
                     if let Some(prev) = last_round.get(&key).copied() {
-                        prop_assert!(stored_round >= prev);
+                        prop_assert!(stored.round >= prev);
                     }
-                    last_round.insert(key, stored_round);
+                    last_round.insert(key, stored.round);
                 }
             }
         }
