@@ -474,6 +474,18 @@ where
             });
         }
 
+        Action::VerifyShardForkProof { proof, committees } => {
+            let start = std::time::Instant::now();
+            let verified = proof
+                .verify_resolved(ctx.topology_snapshot.network(), &committees)
+                .is_ok();
+            record_signature_verification_latency(
+                "shard_fork_proof",
+                start.elapsed().as_secs_f64(),
+            );
+            ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
+        }
+
         Action::VerifyTransactionRoot {
             block_hash,
             expected_root,

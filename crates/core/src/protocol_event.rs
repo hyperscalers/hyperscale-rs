@@ -19,10 +19,11 @@ use hyperscale_types::{
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
     RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
-    RoutableTransaction, ShardId, ShardWitness, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
-    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
-    SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout, TransactionRoot, TxOutcome,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, WaveId, WeightedTimestamp,
+    RoutableTransaction, ShardForkProof, ShardId, ShardWitness, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
+    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -282,6 +283,26 @@ pub enum ProtocolEvent {
     RemoteHeaderCommitted {
         /// The commit-proven certified header.
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+
+    /// A shard committee's fork was assembled locally from two
+    /// commit-proven conflicting headers at one `(shard, height)`. The
+    /// proof is built from already-verified headers, so it needs no
+    /// re-verification on this path; downstream buffers, re-gossips, and
+    /// fences on it.
+    ShardForkDetected {
+        /// The self-proving fork evidence.
+        proof: Box<ShardForkProof>,
+    },
+
+    /// A shard fork proof finished off-thread verification (the receive
+    /// path for a gossiped or beacon-carried proof). `verified` is the
+    /// verdict against the local schedule's committees.
+    ShardForkProofVerified {
+        /// The proof that was checked.
+        proof: Box<ShardForkProof>,
+        /// Whether it verified against the local topology.
+        verified: bool,
     },
 
     /// Transaction-root verification completed for a pending block.

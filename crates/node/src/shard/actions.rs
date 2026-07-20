@@ -67,6 +67,7 @@ where
             | Action::VerifyQcSignature { .. }
             | Action::VerifyTimeout { .. }
             | Action::VerifyRemoteHeaderQc { .. }
+            | Action::VerifyShardForkProof { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyBeaconWitnessRoot { .. }
             | Action::VerifyTransactionRoot { .. }

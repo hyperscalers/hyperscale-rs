@@ -144,6 +144,8 @@ pub struct MemoryMetrics {
     pub rh_verified_headers: usize,
     /// Verified remote headers whose commit proof is also held.
     pub rh_proven_headers: usize,
+    /// Held off-branch fork siblings — nonzero signals a forking committee.
+    pub rh_fork_siblings: usize,
     /// Remote shards being tracked for liveness.
     pub rh_expected_headers: usize,
 
