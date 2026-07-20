@@ -79,7 +79,7 @@ axum = "0.8.9"
 # CLI and configuration (for validator binary)
 clap.workspace = true
 toml.workspace = true
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 hex.workspace = true
 rand.workspace = true
 
