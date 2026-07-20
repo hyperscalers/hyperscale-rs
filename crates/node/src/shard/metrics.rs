@@ -342,6 +342,7 @@ where
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
             rh_proven_headers: rh_mem.proven_headers,
+            rh_fork_siblings: rh_mem.fork_siblings,
             rh_expected_headers: rh_mem.expected_headers,
             // Provision
             prov_verified_remote_headers: prov_mem.verified_remote_headers,

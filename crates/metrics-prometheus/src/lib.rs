@@ -1383,6 +1383,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.rh_proven_headers as f64);
         self.metrics
             .memory_remote_headers
+            .with_label_values(&["fork_siblings"])
+            .set(m.rh_fork_siblings as f64);
+        self.metrics
+            .memory_remote_headers
             .with_label_values(&["expected_headers"])
             .set(m.rh_expected_headers as f64);
 

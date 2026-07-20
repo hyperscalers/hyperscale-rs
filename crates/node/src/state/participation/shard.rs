@@ -223,6 +223,29 @@ impl ShardParticipation {
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
                 .on_finalized_waves_admitted(topology_schedule, &waves),
+            ProtocolEvent::ShardForkDetected { proof } => {
+                // Locally assembled from already-verified headers — the
+                // fence and re-gossip land in the next phase; for now record
+                // that the committee is provably forked.
+                tracing::error!(
+                    shard = proof.shard().inner(),
+                    height = proof.height().inner(),
+                    "shard fork proven: committee committed two chains at one height"
+                );
+                Vec::new()
+            }
+            ProtocolEvent::ShardForkProofVerified { proof, verified } => {
+                if verified {
+                    tracing::error!(
+                        shard = proof.shard().inner(),
+                        height = proof.height().inner(),
+                        "shard fork proof verified from a peer"
+                    );
+                } else {
+                    tracing::warn!("discarding a shard fork proof that failed verification");
+                }
+                Vec::new()
+            }
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }

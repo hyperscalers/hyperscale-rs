@@ -17,8 +17,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ScheduleLookup, ShardId,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, CommitProof, InFlightCount, REMOTE_HEADER_RETENTION,
+    ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
+    Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -46,6 +47,9 @@ pub struct RemoteHeaderMemoryStats {
     pub verified_headers: usize,
     pub proven_headers: usize,
     pub expected_headers: usize,
+    /// Held off-branch fork siblings — nonzero means a remote committee is
+    /// producing conflicting certified headers at some height.
+    pub fork_siblings: usize,
 }
 
 /// Tracks an expected header from a remote shard that hasn't arrived yet.
@@ -119,6 +123,21 @@ pub struct RemoteHeaderCoordinator {
     /// pruned with them.
     proven: HashSet<(ShardId, BlockHeight)>,
 
+    /// Verified headers that lost the canonical [`Self::verified`] slot to
+    /// a first-seen different-hash header at their `(shard, height)` — the
+    /// off-branch siblings of a committee fork. A QC certifies availability,
+    /// not canonicality, so a sibling here is a genuine committee-signed
+    /// block on a losing branch; held only to assemble a
+    /// [`ShardForkProof`] once both branches are commit-proven. Empty
+    /// under honest operation (an honest committee produces one chain).
+    /// Pruned with [`Self::verified`].
+    fork_siblings: HashMap<(ShardId, BlockHeight), Vec<Arc<Verified<CertifiedBlockHeader>>>>,
+
+    /// `(shard, height)` slots a fork proof has already been assembled and
+    /// emitted for — one proof per forked height. Bounded by the number of
+    /// genuine forks (a Byzantine event), so it is not WT-pruned.
+    forks_emitted: HashSet<(ShardId, BlockHeight)>,
+
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
@@ -167,6 +186,8 @@ impl RemoteHeaderCoordinator {
             pending: HashMap::new(),
             verified: HashMap::new(),
             proven: HashSet::new(),
+            fork_siblings: HashMap::new(),
+            forks_emitted: HashSet::new(),
             tips: HashMap::new(),
             expected: BTreeMap::new(),
             local_committed_height: BlockHeight::new(0),
@@ -199,11 +220,6 @@ impl RemoteHeaderCoordinator {
             return vec![];
         }
 
-        let key = (shard, height);
-        if self.verified.contains_key(&key) {
-            return vec![];
-        }
-
         debug!(
             shard = shard.inner(),
             height = height.inner(),
@@ -214,21 +230,8 @@ impl RemoteHeaderCoordinator {
 
         let header_ts = certified_header.header().parent_qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
-        self.verified.insert(key, Arc::clone(&certified_header));
-        self.pending.remove(&key);
-
-        if let Some(expected) = self.expected.get_mut(&shard)
-            && height > expected.last_verified_height
-        {
-            expected.last_verified_height = height;
-            expected.last_verified_at = Some(self.local_committed_ts);
-        }
-
-        let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
-            certified_header,
-        })];
-        actions.extend(self.prove_commits(shard, height));
-        actions
+        self.pending.remove(&(shard, height));
+        self.admit_verified_header(certified_header)
     }
 
     /// Handle a committed block header received from a remote shard (gossip or fetch).
@@ -250,13 +253,21 @@ impl RemoteHeaderCoordinator {
             return vec![];
         }
 
-        // Already verified — nothing to do.
-        if self.verified.contains_key(&(shard, height)) {
+        // Structural pre-check: certifying QC must match header hash.
+        let header_hash = certified_header.header().hash();
+
+        // A header already verified at this `(shard, height)`: a byte-exact
+        // duplicate is nothing to do, but a *different* hash is a fork
+        // candidate — a second committee-signed block at one height. Let it
+        // through to QC verification rather than dropping it blind; on
+        // success it feeds fork detection without taking the canonical
+        // `verified` slot.
+        if let Some(existing) = self.verified.get(&(shard, height))
+            && existing.block_hash() == header_hash
+        {
             return vec![];
         }
 
-        // Structural pre-check: certifying QC must match header hash.
-        let header_hash = certified_header.header().hash();
         if certified_header.qc().block_hash() != header_hash {
             warn!(
                 shard = shard.inner(),
@@ -472,25 +483,39 @@ impl RemoteHeaderCoordinator {
             "Remote header QC verified — promoting"
         );
 
-        // The local-dispatch fast path can land a header at this key while
-        // QC verification is in flight. First valid wins — the same
-        // idempotency the ingest side applies — so a late verification
-        // result cannot displace an admitted (possibly commit-proven)
-        // header with a different-hash sibling.
         self.pending.remove(&key);
-        if self.verified.contains_key(&key) {
-            return Vec::new();
+        self.admit_verified_header(Arc::new(verified))
+    }
+
+    /// Promote a freshly-verified remote header: take the canonical
+    /// `(shard, height)` slot (first valid wins), advance liveness, and
+    /// emit the admitted + commit-proof continuations. A byte-exact
+    /// re-verification is a no-op; a different-hash header at an occupied
+    /// slot is a fork sibling routed to detection rather than displacing
+    /// the admitted (possibly commit-proven) winner. Shared by the QC-verify
+    /// callback and the local-dispatch fast path; the caller owns the tip
+    /// prune.
+    fn admit_verified_header(
+        &mut self,
+        verified: Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        let shard = verified.shard_id();
+        let height = verified.height();
+        let key = (shard, height);
+
+        if let Some(existing) = self.verified.get(&key) {
+            if existing.block_hash() == verified.block_hash() {
+                return Vec::new();
+            }
+            warn!(
+                shard = shard.inner(),
+                height = height.inner(),
+                "Verified a conflicting certified header at an occupied height — fork candidate"
+            );
+            return self.observe_fork_sibling(verified);
         }
-        let verified = Arc::new(verified);
         self.verified.insert(key, Arc::clone(&verified));
 
-        let mut actions = Vec::new();
-
-        // Update liveness tracking: advance the remote tip and record the
-        // local height at which we received it. The I/O loop's
-        // `RemoteHeaderSync` observes the same `RemoteHeaderAdmitted`
-        // continuation and advances its per-shard `committed` counter,
-        // ending an in-flight catch-up cycle once it reaches target.
         if let Some(expected) = self.expected.get_mut(&shard)
             && height > expected.last_verified_height
         {
@@ -498,10 +523,13 @@ impl RemoteHeaderCoordinator {
             expected.last_verified_at = Some(self.local_committed_ts);
         }
 
-        actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
+        let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header: verified,
-        }));
+        })];
         actions.extend(self.prove_commits(shard, height));
+        // The canonical winner can also be one branch of a fork whose losing
+        // branch is already held.
+        actions.extend(self.check_fork_at(shard, height));
         actions
     }
 
@@ -765,6 +793,7 @@ impl RemoteHeaderCoordinator {
             verified_headers: self.verified.len(),
             proven_headers: self.proven.len(),
             expected_headers: self.expected.len(),
+            fork_siblings: self.fork_siblings.values().map(Vec::len).sum(),
         }
     }
 
@@ -787,6 +816,18 @@ impl RemoteHeaderCoordinator {
             }
         }
         self.proven.retain(|key| self.verified.contains_key(key));
+        for (&shard, &(_, tip_ts)) in &self.tips {
+            let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
+            if cutoff > WeightedTimestamp::ZERO {
+                self.fork_siblings.retain(|&(s, _), sibs| {
+                    if s != shard {
+                        return true;
+                    }
+                    sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
+                    !sibs.is_empty()
+                });
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -819,7 +860,113 @@ impl RemoteHeaderCoordinator {
                 s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
             });
             self.proven.retain(|key| self.verified.contains_key(key));
+            self.fork_siblings.retain(|&(s, _), sibs| {
+                if s != shard {
+                    return true;
+                }
+                sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
+                !sibs.is_empty()
+            });
         }
+    }
+
+    /// Record a verified fork sibling and check whether it completes a fork
+    /// proof. The sibling lost the canonical [`Self::verified`] slot to a
+    /// first-seen different-hash header, so it lives here until both fork
+    /// branches are commit-proven.
+    fn observe_fork_sibling(
+        &mut self,
+        sibling: Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        let shard = sibling.shard_id();
+        let height = sibling.height();
+        self.fork_siblings
+            .entry((shard, height))
+            .or_default()
+            .push(sibling);
+        self.check_fork_at(shard, height)
+    }
+
+    /// Assemble and emit a fork proof if a newly-held header at
+    /// `(shard, height)` completes one — either at its own height (it is a
+    /// block with a committing child) or at the height below (it is the
+    /// committing child of a lower block). One proof per forked height.
+    fn check_fork_at(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for h in [Some(height), height.prev()].into_iter().flatten() {
+            if self.forks_emitted.contains(&(shard, h)) {
+                continue;
+            }
+            if let Some(proof) = self.try_assemble_fork(shard, h) {
+                self.forks_emitted.insert((shard, h));
+                warn!(
+                    shard = shard.inner(),
+                    height = h.inner(),
+                    "Assembled a shard fork proof from two conflicting commit proofs"
+                );
+                actions.push(Action::Continuation(ProtocolEvent::ShardForkDetected {
+                    proof: Box::new(proof),
+                }));
+            }
+        }
+        actions
+    }
+
+    /// Two distinct commit-proven blocks at `(shard, height)` — a committee
+    /// fork. Pairs the first two proofs with different proven-block hashes.
+    fn try_assemble_fork(&self, shard: ShardId, height: BlockHeight) -> Option<ShardForkProof> {
+        let proofs = self.direct_commit_proofs_at(shard, height);
+        let a = proofs.first()?;
+        let b = proofs
+            .iter()
+            .skip(1)
+            .find(|p| p.proven_block_hash() != a.proven_block_hash())?;
+        Some(ShardForkProof::ConflictingCommits {
+            a: a.clone(),
+            b: b.clone(),
+        })
+    }
+
+    /// Every direct-commit proof `(block, round-contiguous child)` held at
+    /// `(shard, height)`, across both the canonical winner and the fork
+    /// siblings.
+    fn direct_commit_proofs_at(&self, shard: ShardId, height: BlockHeight) -> Vec<CommitProof> {
+        let child_height = height.next();
+        let blocks = self.verified.get(&(shard, height)).into_iter().chain(
+            self.fork_siblings
+                .get(&(shard, height))
+                .into_iter()
+                .flatten(),
+        );
+        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = self
+            .verified
+            .get(&(shard, child_height))
+            .into_iter()
+            .chain(
+                self.fork_siblings
+                    .get(&(shard, child_height))
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect();
+
+        let mut proofs = Vec::new();
+        for block in blocks {
+            let block_header: &CertifiedBlockHeader = block;
+            if let Some(child) = children.iter().find(|c| {
+                let ch: &CertifiedBlockHeader = c;
+                ch.header().parent_block_hash() == block_header.block_hash()
+                    && ch.height() == child_height
+                    && ch.header().round() == block_header.header().round().next()
+            }) {
+                let child_header: &CertifiedBlockHeader = child;
+                proofs.push(CommitProof::direct(
+                    block_header.clone(),
+                    child_header.clone(),
+                ));
+            }
+        }
+        proofs
     }
 
     /// Mark every height the insertion at `(shard, height)` newly commit-proves,
@@ -1616,5 +1763,96 @@ mod tests {
             "7 commits 6, and the mismatched link leaves the sibling at 5 alone"
         );
         assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Fork assembly tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn fork_proofs(actions: &[Action]) -> Vec<&ShardForkProof> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Continuation(ProtocolEvent::ShardForkDetected { proof }) => Some(&**proof),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn conflicting_commit_proofs_assemble_a_fork() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        // Winner branch: block@5(r5) ← child@6(r6). Sibling branch shares the
+        // parent but forks the round, so its blocks carry distinct hashes:
+        // block@5(r7) ← child@6(r8).
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        let s = chain_header(remote, 5, 7, None);
+        let sc = chain_header(remote, 6, 8, Some(&s));
+
+        assert!(
+            fork_proofs(&coord.on_verified_remote_header_received(w, ValidatorId::new(1)))
+                .is_empty()
+        );
+        assert!(
+            fork_proofs(&coord.on_verified_remote_header_received(wc, ValidatorId::new(1)))
+                .is_empty()
+        );
+        assert!(
+            fork_proofs(&coord.on_verified_remote_header_received(s, ValidatorId::new(1)))
+                .is_empty(),
+            "a sibling block without its own committing child assembles nothing yet"
+        );
+
+        // The sibling's committing child completes the second branch's commit
+        // proof — now two committed chains at height 5 exist.
+        let actions =
+            coord.on_verified_remote_header_received(Arc::clone(&sc), ValidatorId::new(1));
+        let forks = fork_proofs(&actions);
+        assert_eq!(
+            forks.len(),
+            1,
+            "the completing sibling child assembles the fork"
+        );
+        match forks[0] {
+            ShardForkProof::ConflictingCommits { a, b } => {
+                assert_eq!(a.proven_height(), BlockHeight::new(5));
+                assert_eq!(b.proven_height(), BlockHeight::new(5));
+                assert_ne!(a.proven_block_hash(), b.proven_block_hash());
+            }
+            ShardForkProof::BoundaryConflict { .. } => panic!("expected ConflictingCommits"),
+        }
+
+        // Re-observing the same conflict does not re-emit — one proof per
+        // forked height.
+        let again = coord.on_verified_remote_header_received(sc, ValidatorId::new(2));
+        assert!(
+            fork_proofs(&again).is_empty(),
+            "a fork is proven at a height only once"
+        );
+    }
+
+    #[test]
+    fn certified_sibling_without_committing_child_assembles_nothing() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        // Winner branch is commit-proven; the sibling is a bare certified
+        // header with no committing child — harmless under commit-proof
+        // consumption, and no fork proof.
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        let s = chain_header(remote, 5, 7, None);
+        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(s, ValidatorId::new(1));
+        assert!(
+            fork_proofs(&actions).is_empty(),
+            "a certified sibling with no committing child is not a fork"
+        );
     }
 }

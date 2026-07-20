@@ -13,12 +13,12 @@ use hyperscale_types::{
     GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector,
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
-    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, ShardVoteEquivocation,
-    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
-    Timeout, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
+    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, Round,
+    RoutableTransaction, RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardForkProof,
+    ShardId, ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
+    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
+    StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -531,6 +531,25 @@ pub enum Action {
         shard: ShardId,
         /// Remote block height (for correlation in callback).
         height: BlockHeight,
+    },
+
+    /// Verify an assembled shard fork proof off the state-machine thread.
+    ///
+    /// A fork proof costs up to four QC verifications; a flood of garbage
+    /// proofs would stall the state machine if run inline. The dispatcher
+    /// (which holds the topology schedule) resolves each QC's committee via
+    /// [`ShardForkProof::resolve_committees`] and passes them here so the
+    /// handler runs pure BLS — the same emitter-resolves shape as
+    /// [`Self::VerifyBeaconBlock`].
+    ///
+    /// Delegated to the consensus crypto pool. Returns
+    /// `ProtocolEvent::ShardForkProofVerified`.
+    VerifyShardForkProof {
+        /// The proof to verify.
+        proof: Box<ShardForkProof>,
+        /// Committees resolved for the proof's QCs, positionally aligned to
+        /// its canonical QC order.
+        committees: Vec<ResolvedCommittee>,
     },
 
     /// Verify a block's local-receipt root and state root against the JMT.
@@ -1440,6 +1459,7 @@ impl Action {
             | Self::VerifyQcSignature { .. }
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyShardForkProof { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
@@ -1537,6 +1557,7 @@ impl Action {
             | Self::VerifyQcSignature { .. }
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyShardForkProof { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::VerifyTransactionRoot { .. }
@@ -1620,6 +1641,7 @@ impl Action {
             | Self::VerifyQcSignature { .. }
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyShardForkProof { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
