@@ -17,7 +17,7 @@ use crate::rules::{
     canonical_boundary_qcs, chunk_bounds, crossing_already_recorded, is_boundary_crossing,
 };
 use crate::state::committee::{
-    diff_shard_committees, recover_halted_committees, resample_beacon_committee, run_shuffle_step,
+    diff_shard_committees, recover_committees, resample_beacon_committee, run_shuffle_step,
     top_up_committees,
 };
 use crate::state::governance::tally_param_votes;
@@ -252,7 +252,7 @@ pub fn apply_epoch(
             "shard halted: no boundary crossing within the halt threshold"
         );
     }
-    recover_halted_committees(state, &halted_shards);
+    recover_committees(state, &halted_shards);
     // Grow any committee a short cohort draw left under `shard_size` back to
     // full strength, now that dissolved predecessors have freed their members.
     top_up_committees(state);
@@ -1367,7 +1367,7 @@ mod tests {
     /// every epoch and never flags.
     #[test]
     fn record_boundaries_ignores_a_no_progress_refold() {
-        use hyperscale_types::HaltRecovery;
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
 
         let mut state = single_pool_state(4);
         state.chain_config.epoch_duration_ms = 1_000;
@@ -1395,7 +1395,8 @@ mod tests {
 
         state.pending_recoveries.insert(
             shard,
-            HaltRecovery {
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
                 rotated_at: Epoch::new(1),
                 retained: Vec::new(),
                 attested_frontier: BlockHeight::GENESIS,
@@ -1646,7 +1647,7 @@ mod tests {
     /// halt detection behind a pre-loaded backlog.
     #[test]
     fn record_boundaries_drains_a_backlog_over_multiple_epochs() {
-        use hyperscale_types::HaltRecovery;
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
 
         let mut state = single_pool_state(4);
         state.chain_config.epoch_duration_ms = 1_000;
@@ -1702,7 +1703,8 @@ mod tests {
         // its retention.
         state.pending_recoveries.insert(
             shard,
-            HaltRecovery {
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
                 rotated_at: Epoch::new(1),
                 retained: Vec::new(),
                 attested_frontier: after_1.height,
@@ -1772,10 +1774,11 @@ mod tests {
     }
 
     fn stamp_recovery(state: &mut BeaconState, shard: ShardId, frontier: u64) {
-        use hyperscale_types::HaltRecovery;
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
         state.pending_recoveries.insert(
             shard,
-            HaltRecovery {
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
                 rotated_at: Epoch::new(1),
                 retained: Vec::new(),
                 attested_frontier: BlockHeight::new(frontier),

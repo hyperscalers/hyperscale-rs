@@ -40,7 +40,7 @@
 //     until the applied watermark passes it, so the whole backlog is held
 //     out — not just the epoch the recovery record clears. The frontier
 //     is the recorded crossing's position at stamp time
-//     (crates/beacon/src/state/committee.rs `recover_halted_committee`),
+//     (crates/beacon/src/state/committee.rs `recover_committee`),
 //     so the halted chain's legitimate backlog — at or below it — seeds
 //     on recovery.
 //   - Reseat: crates/beacon/src/state/epoch.rs `seed_split_children` /
@@ -178,7 +178,7 @@ module witness_fold {
 
   // ── Halt recovery fence ──
   var recoveryPending: bool
-  // `HaltRecovery::attested_frontier`, in the collapsed height≈count
+  // `ShardRecovery::attested_frontier`, in the collapsed height≈count
   // coordinates.
   var frontier: int
   // `ShardBoundary::reveals_fenced_below`: the leaf count below which

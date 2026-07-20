@@ -11,9 +11,9 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, HaltRecovery,
-    NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
-    SettledWavesRoot, ShardId, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, NetworkDefinition,
+    NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction, SettledWavesRoot,
+    ShardId, ShardRecovery, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
     WeightedTimestamp,
 };
 
@@ -164,16 +164,16 @@ pub struct TopologySnapshot {
     /// reach the attested settled-waves window back to the point
     /// counterpart fences began holding straddlers.
     settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
-    /// Each recovering shard's in-flight halt recovery, projected live
+    /// Each recovering shard's in-flight recovery, projected live
     /// from `BeaconState.pending_recoveries`. Carries the replaced
     /// committee — kept in the shard's routing view so fetches keep
-    /// reaching the nodes that hold the halted tip, and their hosts keep
-    /// serving — and the epoch the fresh committee was seated, which the
-    /// schedule's recovery bridge resolves committee bindings across.
+    /// reaching the nodes that hold the retained tip, and their hosts
+    /// keep serving — and the epoch the fresh committee was seated, which
+    /// the schedule's recovery bridge resolves committee bindings across.
     /// Cleared when the shard commits again and the beacon drops the
     /// record. Like `advanced`, a live head value.
-    pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
-    /// The epoch each shard's most recent completed halt recovery seated
+    pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
+    /// The epoch each shard's most recent completed recovery seated
     /// its fresh committee, projected from
     /// `BeaconState.completed_recoveries`. Permanent, unlike
     /// `pending_recoveries`: the schedule's certified resolution reads it
@@ -450,20 +450,20 @@ impl TopologySnapshot {
         self
     }
 
-    /// Set each recovering shard's in-flight halt recovery (see
+    /// Set each recovering shard's in-flight recovery (see
     /// [`Self::pending_recoveries`]). Defaults empty; the beacon
     /// projection supplies the live `BeaconState.pending_recoveries`
     /// value. Builder-set under the [`Self::with_advanced`] rationale.
     #[must_use]
     pub fn with_pending_recoveries(
         mut self,
-        pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
+        pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
     ) -> Self {
         self.pending_recoveries = pending_recoveries;
         self
     }
 
-    /// Set each shard's most recent completed halt recovery epoch (see
+    /// Set each shard's most recent completed recovery epoch (see
     /// [`Self::completed_recoveries`]). Defaults empty; the beacon
     /// projection supplies the `BeaconState.completed_recoveries` value.
     /// Builder-set under the [`Self::with_advanced`] rationale.
@@ -643,20 +643,21 @@ impl TopologySnapshot {
         &self.reshape_parent_halves
     }
 
-    /// Each recovering shard's in-flight halt recovery.
+    /// Each recovering shard's in-flight recovery.
     /// [`TopologySchedule::routing_committees`] unions the retained
     /// replaced committee into the shard's routing entry so fetches keep
-    /// reaching the members that hold the halted tip (and their hosts
+    /// reaching the members that hold the retained tip (and their hosts
     /// keep serving), and the schedule's recovery bridge reads the
-    /// seating epoch to resolve committee bindings across the halt gap.
+    /// seating epoch to resolve committee bindings across the recovery
+    /// gap.
     ///
     /// [`TopologySchedule::routing_committees`]: crate::TopologySchedule::routing_committees
     #[must_use]
-    pub const fn pending_recoveries(&self) -> &BTreeMap<ShardId, HaltRecovery> {
+    pub const fn pending_recoveries(&self) -> &BTreeMap<ShardId, ShardRecovery> {
         &self.pending_recoveries
     }
 
-    /// The epoch each shard's most recent completed halt recovery seated
+    /// The epoch each shard's most recent completed recovery seated
     /// its fresh committee. Read by the schedule's certified resolution so
     /// the recovery's bridge band binds stably after the pending record
     /// clears.

@@ -801,7 +801,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use super::*;
-    use crate::{BlockHeight, HaltRecovery, NetworkDefinition, ValidatorSet};
+    use crate::{BlockHeight, NetworkDefinition, RecoveryCause, ShardRecovery, ValidatorSet};
 
     fn snapshot() -> Arc<TopologySnapshot> {
         Arc::new(TopologySnapshot::new(
@@ -809,6 +809,15 @@ mod tests {
             1,
             ValidatorSet::new(Vec::new()),
         ))
+    }
+
+    fn halt_recovery(rotated_at: u64, retained: &[ValidatorId]) -> ShardRecovery {
+        ShardRecovery {
+            cause: RecoveryCause::Halt,
+            rotated_at: Epoch::new(rotated_at),
+            retained: retained.to_vec(),
+            attested_frontier: BlockHeight::GENESIS,
+        }
     }
 
     #[test]
@@ -1202,15 +1211,7 @@ mod tests {
                     .collect(),
             )
             .with_pending_recoveries(
-                std::iter::once((
-                    recovering,
-                    HaltRecovery {
-                        rotated_at: Epoch::new(2),
-                        retained: retained.clone(),
-                        attested_frontier: BlockHeight::GENESIS,
-                    },
-                ))
-                .collect(),
+                std::iter::once((recovering, halt_recovery(2, &retained))).collect(),
             ),
         );
         let sched = TopologySchedule::new(1000, Epoch::new(3), Arc::clone(&head));
@@ -1259,19 +1260,10 @@ mod tests {
         // The chain halted with its tip anchored in window 2; the recovery
         // seated the fresh committee at epoch 20, so the bridge is 21.
         let old_snap = snap(&old);
-        let fresh_snap = Arc::new(
-            snap(&fresh).as_ref().clone().with_pending_recoveries(
-                std::iter::once((
-                    shard,
-                    HaltRecovery {
-                        rotated_at: Epoch::new(20),
-                        retained: old.clone(),
-                        attested_frontier: BlockHeight::GENESIS,
-                    },
-                ))
-                .collect(),
-            ),
-        );
+        let fresh_snap =
+            Arc::new(snap(&fresh).as_ref().clone().with_pending_recoveries(
+                std::iter::once((shard, halt_recovery(20, &old))).collect(),
+            ));
         let mut sched = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
         sched.insert(Epoch::new(21), Arc::clone(&fresh_snap));
         sched.set_head(Arc::clone(&fresh_snap));
