@@ -13,9 +13,9 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
     InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp, WitnessSources,
-    zero_bls_signature,
+    ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySchedule,
+    TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp,
+    WitnessSources, zero_bls_signature,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -27,6 +27,10 @@ fn fresh_coordinator() -> ProvisionCoordinator {
 fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot) {
     let topology_snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
     (fresh_coordinator(), topology_snapshot)
+}
+
+fn sched() -> TopologySchedule {
+    TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(2)))
 }
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {
@@ -184,7 +188,7 @@ fn with_config_honours_dwell_time_setting() {
 #[test]
 fn on_block_committed_empty_block_yields_no_actions() {
     let (mut coord, _) = fresh_coordinator_with_topology();
-    let actions = coord.on_block_committed(&make_block(BlockHeight::new(1)));
+    let actions = coord.on_block_committed(&sched(), &make_block(BlockHeight::new(1)));
     assert!(actions.is_empty());
 }
 
@@ -221,12 +225,15 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
         "expectation must register when the remote wave targets us"
     );
     assert_eq!(
-        stats.verified_remote_headers, 1,
-        "header must be retained while the expectation is outstanding"
+        stats.verified_remote_headers, 0,
+        "a merely-certified header must not open provision verification"
     );
+
+    // The header opens for verification only once its commit proof is held.
+    coord.on_committed_remote_header(&sched(), &header);
     let stored = coord
         .get_remote_header(remote, BlockHeight::new(5))
-        .expect("present");
+        .expect("present after the committed event");
     assert!(Arc::ptr_eq(&stored, &header));
 }
 
@@ -243,7 +250,7 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     coord.on_verified_remote_header(&header);
 
     // First commit must NOT trigger a fallback fetch storm.
-    let actions = coord.on_block_committed(&make_block(BlockHeight::new(1)));
+    let actions = coord.on_block_committed(&sched(), &make_block(BlockHeight::new(1)));
     assert!(
         actions.is_empty(),
         "first commit must retro-stamp before timeout sweep so no fallback fires"

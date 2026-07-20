@@ -116,6 +116,10 @@ pub struct MemoryMetrics {
     pub exec_fulfilled_exec_certs: usize,
     /// Outbound ECs awaiting wave finalization (re-broadcast tracker).
     pub exec_outbound_certs: usize,
+    /// Commit-proven remote source blocks within retention.
+    pub exec_proven_remote_blocks: usize,
+    /// Cross-shard ECs deferred on their source block's commit proof.
+    pub exec_unproven_ecs: usize,
 
     // ── Mempool ──
     /// All transactions in the pool.
@@ -138,6 +142,8 @@ pub struct MemoryMetrics {
     pub rh_pending_headers: usize,
     /// Verified remote shard headers.
     pub rh_verified_headers: usize,
+    /// Verified remote headers whose commit proof is also held.
+    pub rh_proven_headers: usize,
     /// Remote shards being tracked for liveness.
     pub rh_expected_headers: usize,
 

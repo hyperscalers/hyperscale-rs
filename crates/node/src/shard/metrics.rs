@@ -328,6 +328,8 @@ where
             exec_pending_routing: exec_mem.pending_routing,
             exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
             exec_outbound_certs: exec_mem.outbound_certs,
+            exec_proven_remote_blocks: exec_mem.proven_remote_blocks,
+            exec_unproven_ecs: exec_mem.unproven_ecs,
             // Mempool
             mempool_pool: mempool_mem.pool,
             mempool_ready: mempool_mem.ready,
@@ -339,6 +341,7 @@ where
             // Remote Headers
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
+            rh_proven_headers: rh_mem.proven_headers,
             rh_expected_headers: rh_mem.expected_headers,
             // Provision
             prov_verified_remote_headers: prov_mem.verified_remote_headers,

@@ -55,6 +55,24 @@ impl VerifiedHeaderBuffer {
         self.headers.pin().get(&key).cloned()
     }
 
+    /// Remove every entry for `shard` strictly above `frontier`, returning
+    /// the removed keys. Applied when a pending recovery fences the shard:
+    /// above the attested frontier the retained committee's certified
+    /// history is rejected network-wide, so a pre-admitted header must not
+    /// keep anchoring provision verification.
+    pub fn remove_above(&self, shard: ShardId, frontier: BlockHeight) -> Vec<Key> {
+        let map = self.headers.pin();
+        let keys: Vec<Key> = map
+            .keys()
+            .filter(|&&(s, h)| s == shard && h > frontier)
+            .copied()
+            .collect();
+        for key in &keys {
+            map.remove(key);
+        }
+        keys
+    }
+
     /// Remove and return a verified header.
     pub fn remove(&self, key: Key) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
         self.headers.pin().remove(&key).cloned()

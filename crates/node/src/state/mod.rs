@@ -309,6 +309,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
                 self.on_remote_header_admitted(&certified_header)
             }
+            ProtocolEvent::RemoteHeaderCommitted { certified_header } => {
+                self.on_remote_header_committed(&certified_header)
+            }
 
             // ── Shard Consensus ────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockHeaderReceived { .. }

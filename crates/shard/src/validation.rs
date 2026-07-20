@@ -354,6 +354,29 @@ pub fn validate_no_duplicate_provisions(
     Ok(())
 }
 
+/// Validate that no provisions batch in the block is fenced by a recovery
+/// pending in the block's governing snapshot: content from a recovering
+/// shard above its attested frontier is rejected network-wide (INV-SEC-8),
+/// and folding the check into block validity keeps every replica's verdict
+/// a pure function of the block's own anchor — a block anchored before the
+/// recovery folded resolves a snapshot without the record and stays valid.
+pub fn validate_provisions_not_fenced(
+    topology_snapshot: &TopologySnapshot,
+    block: &Block,
+) -> Result<(), String> {
+    for batch in block.provisions() {
+        let source_shard = batch.source_shard();
+        if topology_snapshot.recovery_fences(source_shard, batch.block_height()) {
+            return Err(format!(
+                "provisions batch {:?} from recovering shard {source_shard:?} above the \
+                 attested frontier",
+                batch.hash(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run all pre-vote block-contents checks: transaction ordering, `waves`
 /// recomputation, and cross-ancestor uniqueness for txs, certs, and
 /// provisions. Returns a single diagnostic on the first failure so the
@@ -378,6 +401,7 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
+    validate_provisions_not_fenced(topology_snapshot, block)?;
     Ok(())
 }
 
@@ -1237,6 +1261,66 @@ mod tests {
             .register_committed_provisions(&[p.hash()], WeightedTimestamp::from_millis(1_000));
         let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // validate_provisions_not_fenced
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A snapshot whose `shard` is under a pending recovery fenced at
+    /// `frontier` — the governing snapshot of a block validated after the
+    /// recovery folded.
+    fn snapshot_recovering(shard: ShardId, frontier: BlockHeight) -> TopologySnapshot {
+        use hyperscale_types::{Epoch, NetworkDefinition, RecoveryCause, ShardRecovery};
+        TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(Vec::new()),
+        )
+        .with_pending_recoveries(
+            std::iter::once((
+                shard,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(2),
+                    retained: Vec::new(),
+                    attested_frontier: frontier,
+                },
+            ))
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn validate_provisions_not_fenced_rejects_above_frontier() {
+        // provisions_with_seed(9) sources from ShardId::leaf(1, 0) at
+        // height 9 — above a frontier of 5 the batch is fenced content.
+        let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(9)]);
+        let snapshot = snapshot_recovering(ShardId::leaf(1, 0), BlockHeight::new(5));
+        let err = validate_provisions_not_fenced(&snapshot, &block).unwrap_err();
+        assert!(err.contains("recovering shard"));
+    }
+
+    #[test]
+    fn validate_provisions_not_fenced_accepts_frontier_and_below() {
+        // At the frontier the batch is legitimate pre-failure history.
+        let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(5)]);
+        let snapshot = snapshot_recovering(ShardId::leaf(1, 0), BlockHeight::new(5));
+        assert!(validate_provisions_not_fenced(&snapshot, &block).is_ok());
+    }
+
+    #[test]
+    fn validate_provisions_not_fenced_ignores_other_shards_and_clean_snapshots() {
+        let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(9)]);
+        // Recovery pending for a different shard.
+        let other = snapshot_recovering(ShardId::leaf(1, 1), BlockHeight::new(5));
+        assert!(validate_provisions_not_fenced(&other, &block).is_ok());
+        // No recovery pending at all — a pre-fold governing snapshot.
+        let clean = snapshot_recovering(ShardId::leaf(1, 1), BlockHeight::new(5));
+        let mut recoveries = clean.pending_recoveries().clone();
+        recoveries.clear();
+        let clean = clean.with_pending_recoveries(recoveries);
+        assert!(validate_provisions_not_fenced(&clean, &block).is_ok());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

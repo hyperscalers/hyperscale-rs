@@ -53,6 +53,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         pending_routing,
         fulfilled_exec_certs,
         outbound_certs,
+        proven_remote_blocks,
+        unproven_ecs,
     } = coord.memory_stats();
 
     assert_eq!(wave_execution_receipts, 0);
@@ -71,6 +73,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(pending_routing, 0);
     assert_eq!(fulfilled_exec_certs, 0);
     assert_eq!(outbound_certs, 0);
+    assert_eq!(proven_remote_blocks, 0);
+    assert_eq!(unproven_ecs, 0);
 }
 
 #[test]

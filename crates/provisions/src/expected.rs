@@ -189,6 +189,24 @@ impl ExpectedProvisionTracker {
         dropped
     }
 
+    /// Drop expectations keyed to `shard` strictly above a pending
+    /// recovery's attested frontier, returning the dropped keys so
+    /// in-flight fallback fetches can be abandoned. Nothing can fulfil
+    /// them: the source content is rejected network-wide.
+    pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) -> Vec<Key> {
+        let mut dropped = Vec::new();
+        self.expected.retain(|&key, _| {
+            let (s, h) = key;
+            if s == shard && h > frontier {
+                dropped.push(key);
+                false
+            } else {
+                true
+            }
+        });
+        dropped
+    }
+
     /// Sweep timed-out expectations and emit a `TimeoutEffect` per entry
     /// that crossed the threshold without being requested. Sets
     /// `requested = true` on each effect so the next sweep skips it.

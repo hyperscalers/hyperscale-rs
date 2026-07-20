@@ -15,7 +15,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_types::{LocalTimestamp, ProvisionHash, Provisions, Verified, WeightedTimestamp};
+use hyperscale_types::{
+    BlockHeight, LocalTimestamp, ProvisionHash, Provisions, ShardId, Verified, WeightedTimestamp,
+};
 
 /// A queued provisions entry awaiting block inclusion. `added_at` drives
 /// dwell-time filtering; `source_block_ts` anchors deadline-based eviction
@@ -70,6 +72,15 @@ impl QueuedProvisionBuffer {
     pub(crate) fn drop_past_deadline(&mut self, now: WeightedTimestamp) {
         self.queue
             .retain(|q| q.provisions.deadline(q.source_block_ts) > now);
+    }
+
+    /// Drop queued provisions sourced from `shard` strictly above a pending
+    /// recovery's attested frontier — every peer rejects them, so proposing
+    /// them only burns rounds.
+    pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) {
+        self.queue.retain(|q| {
+            q.provisions.source_shard() != shard || q.provisions.block_height() <= frontier
+        });
     }
 
     /// Provisions eligible for block inclusion at `now`. Skips entries

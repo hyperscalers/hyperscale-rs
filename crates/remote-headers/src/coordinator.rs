@@ -10,7 +10,7 @@
 //! within the staleness threshold — the I/O loop's
 //! `RemoteHeaderSync` then runs sliding-window catch-up.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
 pub struct RemoteHeaderMemoryStats {
     pub pending_headers: usize,
     pub verified_headers: usize,
+    pub proven_headers: usize,
     pub expected_headers: usize,
 }
 
@@ -104,6 +105,20 @@ pub struct RemoteHeaderCoordinator {
     /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
     verified: HashMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
 
+    /// Keys in `verified` whose header is commit-proven: we also hold its
+    /// committing structure — a round-contiguous certified child, or a
+    /// parent-hash link under an already-proven descendant (a block that
+    /// commits as the prefix of a later two-chain, INV-SHARD-4). A bare QC
+    /// certifies availability, not canonicality: an f+1..2f corrupt
+    /// committee can certify two blocks at one height without violating
+    /// the safe-vote rule, but committing both is impossible below f+1
+    /// corrupt seats (INV-SHARD-1). Cross-shard consumers therefore gate
+    /// provision and execution-certificate consumption on the
+    /// `RemoteHeaderCommitted` continuation this set drives, never on
+    /// `RemoteHeaderAdmitted` alone. Always a subset of `verified` keys;
+    /// pruned with them.
+    proven: HashSet<(ShardId, BlockHeight)>,
+
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
@@ -151,6 +166,7 @@ impl RemoteHeaderCoordinator {
         Self {
             pending: HashMap::new(),
             verified: HashMap::new(),
+            proven: HashSet::new(),
             tips: HashMap::new(),
             expected: BTreeMap::new(),
             local_committed_height: BlockHeight::new(0),
@@ -208,9 +224,11 @@ impl RemoteHeaderCoordinator {
             expected.last_verified_at = Some(self.local_committed_ts);
         }
 
-        vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
+        let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header,
-        })]
+        })];
+        actions.extend(self.prove_commits(shard, height));
+        actions
     }
 
     /// Handle a committed block header received from a remote shard (gossip or fetch).
@@ -454,9 +472,17 @@ impl RemoteHeaderCoordinator {
             "Remote header QC verified — promoting"
         );
 
+        // The local-dispatch fast path can land a header at this key while
+        // QC verification is in flight. First valid wins — the same
+        // idempotency the ingest side applies — so a late verification
+        // result cannot displace an admitted (possibly commit-proven)
+        // header with a different-hash sibling.
+        self.pending.remove(&key);
+        if self.verified.contains_key(&key) {
+            return Vec::new();
+        }
         let verified = Arc::new(verified);
         self.verified.insert(key, Arc::clone(&verified));
-        self.pending.remove(&key);
 
         let mut actions = Vec::new();
 
@@ -475,6 +501,7 @@ impl RemoteHeaderCoordinator {
         actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header: verified,
         }));
+        actions.extend(self.prove_commits(shard, height));
         actions
     }
 
@@ -706,6 +733,14 @@ impl RemoteHeaderCoordinator {
         self.verified.contains_key(&(shard, height))
     }
 
+    /// Whether the held header at `(shard, height)` is commit-proven: its
+    /// committing structure — a round-contiguous certified child, or a
+    /// parent-hash link under a proven descendant — is also held.
+    #[must_use]
+    pub fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.proven.contains(&(shard, height))
+    }
+
     /// Get the in-flight count from the tip header of each remote shard.
     ///
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
@@ -728,6 +763,7 @@ impl RemoteHeaderCoordinator {
         RemoteHeaderMemoryStats {
             pending_headers: self.pending.values().map(BTreeMap::len).sum(),
             verified_headers: self.verified.len(),
+            proven_headers: self.proven.len(),
             expected_headers: self.expected.len(),
         }
     }
@@ -750,6 +786,7 @@ impl RemoteHeaderCoordinator {
                 });
             }
         }
+        self.proven.retain(|key| self.verified.contains_key(key));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -781,6 +818,89 @@ impl RemoteHeaderCoordinator {
             self.verified.retain(|&(s, _), hdr| {
                 s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
             });
+            self.proven.retain(|key| self.verified.contains_key(key));
+        }
+    }
+
+    /// Mark every height the insertion at `(shard, height)` newly commit-proves,
+    /// emitting a `RemoteHeaderCommitted` continuation per proven header.
+    ///
+    /// The inserted header can complete a two-chain over its parent, and a
+    /// held child can complete one over it; each proof then propagates down
+    /// the parent-hash chain (an ancestor of a committed block is committed,
+    /// whatever its own round layout — INV-SHARD-4).
+    fn prove_commits(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+        let mut actions = Vec::new();
+        self.try_prove(shard, height, &mut actions);
+        if let Some(parent) = height.prev() {
+            self.try_prove(shard, parent, &mut actions);
+        }
+        actions
+    }
+
+    /// Prove `(shard, height)` if its committing structure is held, then walk
+    /// the parent-hash chain downward marking every hash-linked ancestor.
+    ///
+    /// A height is provable when its held child links to it by parent hash
+    /// and either certifies the direct commit (round-contiguous, the
+    /// two-chain rule) or is itself already proven (the prefix-commit case).
+    /// The downward walk needs only the hash links: ancestry under a
+    /// committed block is commitment. A link that fails to match — the held
+    /// entry at that height is a certified sibling from another branch —
+    /// stops the walk and leaves that height unproven, which is exactly what
+    /// keeps a forked branch's exports unconsumable.
+    fn try_prove(&mut self, shard: ShardId, height: BlockHeight, actions: &mut Vec<Action>) {
+        if self.proven.contains(&(shard, height)) {
+            return;
+        }
+        let Some(header) = self.verified.get(&(shard, height)) else {
+            return;
+        };
+        let child_height = height.next();
+        let Some(child) = self.verified.get(&(shard, child_height)) else {
+            return;
+        };
+        if child.header().parent_block_hash() != header.block_hash() {
+            return;
+        }
+        let commits = child.header().round() == header.header().round().next()
+            || self.proven.contains(&(shard, child_height));
+        if !commits {
+            return;
+        }
+
+        let mut at = height;
+        let mut hash = header.block_hash();
+        let mut parent_hash = header.header().parent_block_hash();
+        loop {
+            self.proven.insert((shard, at));
+            let proven_header = self
+                .verified
+                .get(&(shard, at))
+                .expect("walk only visits held headers");
+            debug!(
+                shard = shard.inner(),
+                height = at.inner(),
+                block_hash = %hash,
+                "Remote header commit-proven"
+            );
+            actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
+                certified_header: Arc::clone(proven_header),
+            }));
+
+            let Some(prev) = at.prev() else { break };
+            if self.proven.contains(&(shard, prev)) {
+                break;
+            }
+            let Some(prev_header) = self.verified.get(&(shard, prev)) else {
+                break;
+            };
+            if prev_header.block_hash() != parent_hash {
+                break;
+            }
+            at = prev;
+            hash = prev_header.block_hash();
+            parent_hash = prev_header.header().parent_block_hash();
         }
     }
 
@@ -1248,5 +1368,253 @@ mod tests {
             verify_qc_keys(&drained).is_none(),
             "dropped siblings must not re-dispatch on beacon catch-up",
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Commit-proof tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A verified header for `shard` at `height`/`round`, parent-hash-linked
+    /// to `parent` (or to a synthetic hash when building a branch tip whose
+    /// parent is absent). Injected through the local-dispatch fast path,
+    /// which needs no topology.
+    fn chain_header(
+        shard: ShardId,
+        height: u64,
+        round: u64,
+        parent: Option<&Arc<Verified<CertifiedBlockHeader>>>,
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
+        let parent_hash = parent.map_or_else(
+            || BlockHash::from_raw(Hash::from_bytes(&height.to_le_bytes())),
+            |p| p.block_hash(),
+        );
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            shard,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::new(round.saturating_sub(1)),
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(height * 1_000),
+        );
+        let header = BlockHeader::new(
+            shard,
+            BlockHeight::new(height),
+            parent_hash,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::new(round),
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            None,
+            None,
+        );
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            shard,
+            BlockHeight::new(height),
+            parent_hash,
+            Round::new(round),
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(height * 1_000),
+        );
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header, qc,
+        )))
+    }
+
+    fn committed_heights(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Continuation(ProtocolEvent::RemoteHeaderCommitted { certified_header }) => {
+                    Some(certified_header.height().inner())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_contiguous_child_proves_its_parent() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        let parent = chain_header(remote, 5, 5, None);
+        let actions = coord.on_verified_remote_header_received(parent, ValidatorId::new(0));
+        assert!(
+            committed_heights(&actions).is_empty(),
+            "a lone certified header proves nothing"
+        );
+        assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
+
+        let parent = coord
+            .get_verified(remote, BlockHeight::new(5))
+            .expect("stored")
+            .clone();
+        let child = chain_header(remote, 6, 6, Some(&parent));
+        let actions = coord.on_verified_remote_header_received(child, ValidatorId::new(0));
+        assert_eq!(
+            committed_heights(&actions),
+            vec![5],
+            "the round-contiguous child commits its parent"
+        );
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+        assert!(
+            !coord.has_commit_proof(remote, BlockHeight::new(6)),
+            "the child itself stays unproven until its own child arrives"
+        );
+    }
+
+    #[test]
+    fn round_gapped_child_proves_nothing() {
+        // A certified sibling that lost its round: the next header links by
+        // parent hash but skips a round (view change), so no two-chain forms
+        // and the parent stays unconsumable.
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        let parent = chain_header(remote, 5, 5, None);
+        coord.on_verified_remote_header_received(parent, ValidatorId::new(0));
+        let parent = coord
+            .get_verified(remote, BlockHeight::new(5))
+            .expect("stored")
+            .clone();
+        let child = chain_header(remote, 6, 7, Some(&parent));
+        let actions = coord.on_verified_remote_header_received(child, ValidatorId::new(0));
+        assert!(
+            committed_heights(&actions).is_empty(),
+            "a round-gapped child is certification, not commitment"
+        );
+        assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
+    }
+
+    #[test]
+    fn prefix_commit_proves_hash_linked_ancestors() {
+        // Heights 5 (round 5) ← 6 (round 7, view change) ← 7 (round 8): the
+        // round-contiguous pair (6, 7) commits 6 directly, and 5 — committed
+        // as the prefix of that two-chain — proves through the hash link.
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 5, 5, None),
+            ValidatorId::new(0),
+        );
+        let h5 = coord
+            .get_verified(remote, BlockHeight::new(5))
+            .expect("stored")
+            .clone();
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 6, 7, Some(&h5)),
+            ValidatorId::new(0),
+        );
+        let h6 = coord
+            .get_verified(remote, BlockHeight::new(6))
+            .expect("stored")
+            .clone();
+        let actions = coord.on_verified_remote_header_received(
+            chain_header(remote, 7, 8, Some(&h6)),
+            ValidatorId::new(0),
+        );
+
+        let mut heights = committed_heights(&actions);
+        heights.sort_unstable();
+        assert_eq!(
+            heights,
+            vec![5, 6],
+            "the direct commit of 6 proves 5 through the ancestry link"
+        );
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(6)));
+        assert!(!coord.has_commit_proof(remote, BlockHeight::new(7)));
+    }
+
+    #[test]
+    fn gap_fill_extends_proof_downward_once() {
+        // Heights arrive 5, 7, 8: proving 7 cannot reach 5 (6 missing). The
+        // late arrival of 6 links the chain and proves 5 and 6 together —
+        // each height emits its committed continuation exactly once.
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 5, 5, None),
+            ValidatorId::new(0),
+        );
+        let h5 = coord
+            .get_verified(remote, BlockHeight::new(5))
+            .expect("stored")
+            .clone();
+        // Build 6 → 7 → 8 linked over 5, but deliver 6 last.
+        let h6 = chain_header(remote, 6, 6, Some(&h5));
+        let h7 = chain_header(remote, 7, 7, Some(&h6));
+        let h8 = chain_header(remote, 8, 8, Some(&h7));
+
+        let actions = coord.on_verified_remote_header_received(h7, ValidatorId::new(0));
+        assert!(
+            committed_heights(&actions).is_empty(),
+            "7 alone proves nothing"
+        );
+        let actions = coord.on_verified_remote_header_received(h8, ValidatorId::new(0));
+        assert_eq!(
+            committed_heights(&actions),
+            vec![7],
+            "8 commits 7; the walk stops at the missing 6"
+        );
+
+        let actions = coord.on_verified_remote_header_received(h6, ValidatorId::new(0));
+        let mut heights = committed_heights(&actions);
+        heights.sort_unstable();
+        assert_eq!(
+            heights,
+            vec![5, 6],
+            "filling the gap proves the ancestry below the proven suffix"
+        );
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+    }
+
+    #[test]
+    fn broken_hash_link_stops_the_walk() {
+        // The held header at 5 is a certified sibling from another branch:
+        // the committing chain above links 6 → canonical-5, not the held 5,
+        // so the walk stops and the sibling stays unproven.
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        // Held 5 is NOT the parent 6 links to (6 built over a synthetic hash).
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 5, 5, None),
+            ValidatorId::new(0),
+        );
+        let h6 = chain_header(remote, 6, 6, None);
+        let h7 = chain_header(remote, 7, 7, Some(&h6));
+        coord.on_verified_remote_header_received(h6, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(h7, ValidatorId::new(0));
+
+        assert_eq!(
+            committed_heights(&actions),
+            vec![6],
+            "7 commits 6, and the mismatched link leaves the sibling at 5 alone"
+        );
+        assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
     }
 }

@@ -657,6 +657,20 @@ impl TopologySnapshot {
         &self.pending_recoveries
     }
 
+    /// Whether a cross-shard artifact from `shard` at `height` is fenced by
+    /// a recovery pending in this snapshot: past the beacon-attested
+    /// frontier the retained (beyond-f) committee could only have produced
+    /// it after its failure, so no consumer that folded the record trusts
+    /// it. False when no recovery is pending for the shard (the ordinary
+    /// case) or when `height` is within the frontier (legitimate history,
+    /// still verifiable against the old committee).
+    #[must_use]
+    pub fn recovery_fences(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.pending_recoveries
+            .get(&shard)
+            .is_some_and(|recovery| height > recovery.attested_frontier)
+    }
+
     /// The epoch each shard's most recent completed recovery seated
     /// its fresh committee. Read by the schedule's certified resolution so
     /// the recovery's bridge band binds stably after the pending record

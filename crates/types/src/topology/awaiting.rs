@@ -63,6 +63,14 @@ impl<V> AwaitingTopologyBuffer<V> {
             .collect()
     }
 
+    /// Remove and return every value buffered under `shard`, in FIFO order.
+    pub fn drain_shard(&mut self, shard: ShardId) -> Vec<V> {
+        self.by_shard
+            .remove(&shard)
+            .map(Vec::from)
+            .unwrap_or_default()
+    }
+
     /// Total buffered count across all shards.
     #[must_use]
     pub fn len(&self) -> usize {
