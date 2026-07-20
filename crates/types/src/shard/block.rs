@@ -13,11 +13,12 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
-    ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, RoutableTransaction, ShardId, StateRoot, TransactionRoot, TxHash, ValidatorId,
-    Verifiable, Verified, VrfProof, WeightedTimestamp,
+    ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_EQUIVOCATIONS_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, RoutableTransaction, ShardId,
+    ShardVoteEquivocation, StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified,
+    VrfProof, WeightedTimestamp,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -87,6 +88,16 @@ pub type SharedProvisionHashes = Arc<BoundedVec<ProvisionHash, MAX_PROVISIONS_PE
 /// `Arc` rationale as [`SharedTransactions`].
 pub type SharedReadySignals = Arc<BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>>;
 
+/// Shared shard-vote-equivocation evidence list — the double-vote
+/// evidence the proposer drained into this block. Committed via the
+/// header's `beacon_witness_root` (one `VoteEquivocation` leaf per entry)
+/// and re-verified by voters as a block-validity condition, so the QC
+/// attests each entry is genuine before the beacon folds it. Carried on
+/// the body and retained through sealing for the same reason as
+/// [`SharedReadySignals`]: the beacon-witness fold that jails on them can
+/// run after the block seals.
+pub type SharedEquivocations = Arc<BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK>>;
+
 /// Complete block with header and transaction data.
 ///
 /// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
@@ -119,6 +130,11 @@ pub enum Block {
         /// via `beacon_witness_root`; carried here so commit-time
         /// beacon-witness leaf derivation is identical on every node.
         ready_signals: SharedReadySignals,
+        /// Double-vote equivocation evidence the proposer drained into this
+        /// block. Committed via `beacon_witness_root` and re-verified as a
+        /// block-validity condition; carried here for the same reason as
+        /// `ready_signals`.
+        equivocations: SharedEquivocations,
         /// The block's reshape assertion, if any. Committed via
         /// `beacon_witness_root`; carried here for the same reason as
         /// `ready_signals`.
@@ -151,6 +167,10 @@ pub enum Block {
         /// fold consuming them can run well after the block sealed. See
         /// `Block::Live::ready_signals`.
         ready_signals: SharedReadySignals,
+        /// Double-vote equivocation evidence — retained through sealing for
+        /// the same reason as `ready_signals`. See
+        /// `Block::Live::equivocations`.
+        equivocations: SharedEquivocations,
         /// The block's reshape assertion, if any. Retained through
         /// sealing for the same reason as `ready_signals`.
         reshape_trigger: Option<ReshapeTrigger>,
@@ -216,6 +236,7 @@ impl Block {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -243,6 +264,7 @@ impl Block {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -273,6 +295,7 @@ impl Block {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -349,6 +372,17 @@ impl Block {
         }
     }
 
+    /// Double-vote equivocation evidence carried on the block — present in
+    /// both variants. The beacon-witness leaf derivation reads these at
+    /// commit, so they ride the block for the same reason as
+    /// [`ready_signals`](Self::ready_signals).
+    #[must_use]
+    pub const fn equivocations(&self) -> &SharedEquivocations {
+        match self {
+            Self::Live { equivocations, .. } | Self::Sealed { equivocations, .. } => equivocations,
+        }
+    }
+
     /// The block's reshape assertion, if any — present in both variants.
     #[must_use]
     pub const fn reshape_trigger(&self) -> Option<ReshapeTrigger> {
@@ -396,6 +430,7 @@ impl Block {
                 certificates,
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             } => {
@@ -406,6 +441,7 @@ impl Block {
                     certificates,
                     provision_hashes: Arc::new(hashes.into()),
                     ready_signals,
+                    equivocations,
                     reshape_trigger,
                     randomness_reveal,
                 }
@@ -430,6 +466,7 @@ impl Block {
                 transactions,
                 certificates,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
                 ..
@@ -439,6 +476,7 @@ impl Block {
                 certificates,
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             },

@@ -241,6 +241,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
             block
                 .reshape_trigger()
                 .and_then(|t| t.to_payload(local_shard)),
+            block.equivocations().as_slice(),
         );
         chain_deltas.push(
             new_leaves
@@ -487,6 +488,7 @@ mod tests {
             Some(ShardWitnessPayload::ScheduleSplit {
                 shard: ShardId::ROOT,
             }),
+            &[],
         );
         // Leaf 0 is the randomness reveal, then 1 MissedProposal + 3 readiness
         // witnesses (sorted ascending by validator id, kind per sender) + the
@@ -539,6 +541,7 @@ mod tests {
             &missed,
             &ready,
             None,
+            &[],
         );
         let b = derive_leaves(
             ShardId::ROOT,
@@ -548,6 +551,7 @@ mod tests {
             &missed,
             &ready,
             None,
+            &[],
         );
         assert_eq!(a, b);
 

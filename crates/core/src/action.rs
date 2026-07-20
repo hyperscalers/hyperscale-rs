@@ -14,11 +14,11 @@ use hyperscale_types::{
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, Round, RoutableTransaction,
-    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, SharedCertificates,
-    SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, VrfProof,
-    WaveId, WeightedTimestamp,
+    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardId, ShardVoteEquivocation,
+    SharedCertificates, SharedTransactions, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VoteCount, VrfProof, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -637,6 +637,11 @@ pub enum Action {
         round: Round,
         /// Ready signals the proposer drained into the manifest.
         ready_signals: Vec<ReadySignal>,
+        /// Double-vote equivocation evidence the proposer carried on the
+        /// block. Re-verified against each equivocator's registered key
+        /// inside the shared verifier before its `VoteEquivocation` leaf
+        /// folds, so an invalid entry fails the block.
+        equivocations: Vec<ShardVoteEquivocation>,
         /// The manifest's reshape assertion, validated against the
         /// locally recomputed load predicate.
         reshape_trigger: Option<ReshapeTrigger>,
@@ -779,6 +784,10 @@ pub enum Action {
         /// for inclusion in the block's manifest. Beacon's `Ready` witness
         /// derives one entry per included signal at block-assembly time.
         ready_signals: Vec<ReadySignal>,
+        /// Double-vote equivocation evidence the proposer drained for
+        /// inclusion in the block. Beacon's `VoteEquivocation` witness
+        /// derives one leaf per entry at block-assembly time.
+        equivocations: Vec<ShardVoteEquivocation>,
         /// The proposer's reshape assertion for the manifest, derived
         /// from the load predicate over the parent state's substate
         /// count.

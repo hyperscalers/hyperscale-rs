@@ -879,6 +879,7 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         };

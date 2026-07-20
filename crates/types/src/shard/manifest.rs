@@ -5,9 +5,9 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal, ReshapeTrigger, TxHash,
-    Verifiable, VrfProof, WaveId,
+    MAX_EQUIVOCATIONS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal,
+    ReshapeTrigger, ShardVoteEquivocation, TxHash, Verifiable, VrfProof, WaveId,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -24,6 +24,7 @@ pub struct BlockManifest {
     cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
     provision_hashes: BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>,
     ready_signals: BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>,
+    equivocations: BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK>,
     reshape_trigger: Option<ReshapeTrigger>,
     /// The proposer's randomness reveal — carried so the sync/reload path
     /// reproduces leaf 0 of the block's beacon-witness contribution and
@@ -42,6 +43,7 @@ impl Default for BlockManifest {
             cert_ids: BoundedVec::new(),
             provision_hashes: BoundedVec::new(),
             ready_signals: BoundedVec::new(),
+            equivocations: BoundedVec::new(),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         }
@@ -60,6 +62,7 @@ impl BlockManifest {
         cert_ids: Vec<WaveId>,
         provision_hashes: Vec<ProvisionHash>,
         ready_signals: Vec<ReadySignal>,
+        equivocations: Vec<ShardVoteEquivocation>,
         reshape_trigger: Option<ReshapeTrigger>,
         randomness_reveal: VrfProof,
     ) -> Self {
@@ -68,6 +71,7 @@ impl BlockManifest {
             cert_ids: cert_ids.into(),
             provision_hashes: provision_hashes.into(),
             ready_signals: ready_signals.into(),
+            equivocations: equivocations.into(),
             reshape_trigger,
             randomness_reveal,
         }
@@ -99,6 +103,17 @@ impl BlockManifest {
     #[must_use]
     pub const fn ready_signals(&self) -> &BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK> {
         &self.ready_signals
+    }
+
+    /// Double-vote equivocation evidence the proposer included. The
+    /// shard's beacon-witness derivation projects one
+    /// `ShardWitnessPayload::VoteEquivocation` leaf per entry at
+    /// block-assembly time.
+    #[must_use]
+    pub const fn equivocations(
+        &self,
+    ) -> &BoundedVec<ShardVoteEquivocation, MAX_EQUIVOCATIONS_PER_BLOCK> {
+        &self.equivocations
     }
 
     /// The proposer's reshape assertion, if any. Replicas validate it
@@ -140,11 +155,13 @@ impl BlockManifest {
             .collect();
         let provision_hashes = block.provision_hashes();
         let ready_signals = block.ready_signals().iter().cloned().collect();
+        let equivocations = block.equivocations().iter().cloned().collect();
         Self::new(
             tx_hashes,
             cert_ids,
             provision_hashes,
             ready_signals,
+            equivocations,
             block.reshape_trigger(),
             *block.randomness_reveal(),
         )
@@ -289,7 +306,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(6).unwrap();
+            enc.write_size(7).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxHash::value_kind()).unwrap();
             enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
@@ -310,7 +327,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(6).unwrap();
+            enc.write_size(7).unwrap();
             // Empty tx_hashes.
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             // Oversized cert_ids.
@@ -335,7 +352,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(6).unwrap();
+            enc.write_size(7).unwrap();
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             enc.encode(&Vec::<WaveId>::new()).unwrap();
             // Oversized provision_hashes.

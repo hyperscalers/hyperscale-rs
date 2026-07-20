@@ -171,6 +171,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
+        equivocations: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
         randomness_reveal: VrfProof::ZERO,
     }
@@ -405,6 +406,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
             certificates,
             provisions,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -416,6 +418,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
                 certificates: Arc::new(certificates),
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -426,6 +429,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
             certificates,
             provision_hashes,
             ready_signals,
+            equivocations,
             reshape_trigger,
             randomness_reveal,
         } => {
@@ -437,6 +441,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
                 certificates: Arc::new(certificates),
                 provision_hashes,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             }
@@ -532,6 +537,7 @@ pub fn commit_block_with_witnesses(
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
+        equivocations: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
         randomness_reveal: VrfProof::ZERO,
     };
@@ -601,6 +607,7 @@ pub fn commit_block_with_witness_window(
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
         ready_signals: Arc::new(BoundedVec::new()),
+        equivocations: Arc::new(BoundedVec::new()),
         reshape_trigger: None,
         randomness_reveal: VrfProof::ZERO,
     };

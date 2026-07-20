@@ -393,6 +393,10 @@ pub fn assemble_build_action(
         parent_in_flight,
         finalized_tx_count,
         ready_signals,
+        // The proposer does not yet drain detected double-votes into the
+        // block; the carriage is in place and the coordinator will populate
+        // it once shard-side detection lands.
+        equivocations: Vec::new(),
         reshape_trigger,
         parent_witness_leaves,
         beacon_witness_base,

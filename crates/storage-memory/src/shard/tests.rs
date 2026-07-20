@@ -148,6 +148,7 @@ fn commit_with(
                 certificates,
                 provisions,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             } => {
@@ -159,6 +160,7 @@ fn commit_with(
                     certificates: Arc::new(certificates),
                     provisions,
                     ready_signals,
+                    equivocations,
                     reshape_trigger,
                     randomness_reveal,
                 }
@@ -169,6 +171,7 @@ fn commit_with(
                 certificates,
                 provision_hashes,
                 ready_signals,
+                equivocations,
                 reshape_trigger,
                 randomness_reveal,
             } => {
@@ -180,6 +183,7 @@ fn commit_with(
                     certificates: Arc::new(certificates),
                     provision_hashes,
                     ready_signals,
+                    equivocations,
                     reshape_trigger,
                     randomness_reveal,
                 }
@@ -482,6 +486,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provisions,
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },
@@ -496,6 +501,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provision_hashes,
             ready_signals: Arc::new(BoundedVec::new()),
+            equivocations: Arc::new(BoundedVec::new()),
             reshape_trigger: None,
             randomness_reveal: VrfProof::ZERO,
         },

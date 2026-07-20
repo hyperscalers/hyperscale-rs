@@ -289,6 +289,7 @@ impl RocksDbShardStorage {
             certificates: Arc::new(certificates.into()),
             provision_hashes: Arc::new(manifest.provision_hashes().clone()),
             ready_signals: Arc::new(manifest.ready_signals().clone()),
+            equivocations: Arc::new(manifest.equivocations().clone()),
             reshape_trigger: manifest.reshape_trigger(),
             randomness_reveal: *manifest.randomness_reveal(),
         };
@@ -436,6 +437,7 @@ impl RocksDbShardStorage {
             certificates: Arc::new(certificates.into()),
             provision_hashes: Arc::new(provision_hashes_bounded.clone()),
             ready_signals: Arc::new(manifest.ready_signals().clone()),
+            equivocations: Arc::new(manifest.equivocations().clone()),
             reshape_trigger: manifest.reshape_trigger(),
             randomness_reveal: *manifest.randomness_reveal(),
         };
