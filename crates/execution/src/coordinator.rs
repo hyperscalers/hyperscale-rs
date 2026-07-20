@@ -2565,9 +2565,9 @@ mod tests {
     };
     use hyperscale_types::{
         Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, Epoch,
-        ExecutionOutcome, GlobalReceiptHash, HaltRecovery, Hash, NetworkDefinition,
-        QuorumCertificate, SignerBitfield, ValidatorInfo, ValidatorSet, generate_bls_keypair,
-        zero_bls_signature,
+        ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
+        RecoveryCause, ShardRecovery, SignerBitfield, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
@@ -2608,7 +2608,8 @@ mod tests {
         let mut recoveries = BTreeMap::new();
         recoveries.insert(
             shard,
-            HaltRecovery {
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
                 rotated_at: Epoch::GENESIS,
                 retained: vec![ValidatorId::new(0)],
                 attested_frontier: frontier,

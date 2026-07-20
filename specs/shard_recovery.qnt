@@ -26,10 +26,10 @@
 //     exempt), not reshape-involved, misses strictly past
 //     `HALT_THRESHOLD_EPOCHS` (crates/types/src/beacon/constants.rs).
 //   - Recovery: crates/beacon/src/state/committee.rs
-//     `recover_halted_committee` — all-or-nothing full draw from the free
+//     `recover_committee` — all-or-nothing full draw from the free
 //     pool (a short pool defers and the shard retries each fold), fresh
 //     committee seated whole, replaced committee pooled and folded into
-//     the `HaltRecovery` retention (a stalled recovery's own fresh
+//     the `ShardRecovery` retention (a stalled recovery's own fresh
 //     committee joins the successor record's retention). Detection and
 //     recovery run in `apply_epoch` on skip epochs too — the recovery
 //     rides beacon liveness, not shard traffic.
@@ -101,17 +101,17 @@
 //     replaced, not every server since the halt began.
 //
 // Run:
-//   quint typecheck specs/halt_recovery.qnt
-//   quint test --main=halt_detection_ok specs/halt_recovery.qnt
-//   quint verify --main=halt_detection_ok --invariant=invAll --max-steps=6 specs/halt_recovery.qnt
+//   quint typecheck specs/shard_recovery.qnt
+//   quint test --main=halt_detection_ok specs/shard_recovery.qnt
+//   quint verify --main=halt_detection_ok --invariant=invAll --max-steps=6 specs/shard_recovery.qnt
 //     (holds; depth 6 covers the full double-recovery lifecycle at
 //      THRESHOLD = 1 — seed, halt, re-draw, stall, second re-draw, clear)
-//   quint verify --main=halt_refresh_on_refold --invariant=invDetectorSound --max-steps=6 specs/halt_recovery.qnt
+//   quint verify --main=halt_refresh_on_refold --invariant=invDetectorSound --max-steps=6 specs/shard_recovery.qnt
 //     (the twin refreshes on a consumed crossing; expect a counterexample)
-//   quint verify --main=halt_refresh_on_refold --invariant=invRetention --max-steps=7 specs/halt_recovery.qnt
+//   quint verify --main=halt_refresh_on_refold --invariant=invRetention --max-steps=7 specs/shard_recovery.qnt
 //     (the bogus refresh also releases a pending recovery's retention;
 //      expect a counterexample)
-//   quint verify --main=halt_wallclock_watermark --invariant=invNoFalseFlag --max-steps=6 specs/halt_recovery.qnt
+//   quint verify --main=halt_wallclock_watermark --invariant=invNoFalseFlag --max-steps=6 specs/shard_recovery.qnt
 //     (the twin bumps on skip epochs; expect a counterexample)
 
 module halt_detection {
@@ -179,7 +179,7 @@ module halt_detection {
 
   // The shared tail of every fold: store the new watermark, then run the
   // detector and — at the same fold — the all-or-nothing re-draw
-  // (`apply_epoch`: `halted_shards` then `recover_halted_committees`).
+  // (`apply_epoch`: `halted_shards` then `recover_committees`).
   // `newGround` is the environment's own count of observed quiet folds.
   action detectRecover(newMisses: int, newGround: int): bool = {
     val fires = and {
@@ -966,10 +966,10 @@ module recovery_bridge_honest_old {
 //     (`topology_schedule.lookup(cert.vote_anchor_ts())`);
 //     `ec_has_shard_quorum_power` (crates/execution/src/lookups.rs)
 //     checks the signer power against that resolved committee.
-//   - The freeze is the `attested_frontier` on the beacon's `HaltRecovery`
+//   - The freeze is the `attested_frontier` on the beacon's `ShardRecovery`
 //     record (crates/types/src/beacon/state.rs) — the shard's boundary
 //     height as folded at detection, recorded by
-//     `recover_halted_committee` (crates/beacon/src/state/committee.rs).
+//     `recover_committee` (crates/beacon/src/state/committee.rs).
 //     `TopologySchedule::recovery_fences` (crates/types/src/topology/schedule.rs)
 //     turns it into a height gate applied before the anchor lookup on
 //     every EC ingress path (`on_wave_certificate`,
@@ -1015,14 +1015,14 @@ module recovery_bridge_honest_old {
 //     fresh committee and are always safe to accept.
 //
 // Run:
-//   quint test --main=cross_shard_freeze_ok specs/halt_recovery.qnt
-//   quint verify --main=cross_shard_freeze_ok --invariant=invAll --max-steps=8 specs/halt_recovery.qnt
+//   quint test --main=cross_shard_freeze_ok specs/shard_recovery.qnt
+//   quint verify --main=cross_shard_freeze_ok --invariant=invAll --max-steps=8 specs/shard_recovery.qnt
 //     (the fence holds: no new forgery crosses the cut, the residual is
 //      bounded to the pre-fold poisoning, and the fresh committee stays live)
-//   quint verify --main=cross_shard_no_freeze --invariant=invFenceHolds --max-steps=8 specs/halt_recovery.qnt
+//   quint verify --main=cross_shard_no_freeze --invariant=invFenceHolds --max-steps=8 specs/shard_recovery.qnt
 //     (the unfenced counterfactual; expect a counterexample — an orphan is
 //      finalized after the halt is detected and the consumer folded)
-//   quint verify --main=cross_shard_no_freeze --invariant=invResidualBounded --max-steps=8 specs/halt_recovery.qnt
+//   quint verify --main=cross_shard_no_freeze --invariant=invResidualBounded --max-steps=8 specs/shard_recovery.qnt
 //     (same twin; the residual is unbounded without the fence)
 
 module cross_shard_freeze {

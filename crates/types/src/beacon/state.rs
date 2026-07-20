@@ -293,10 +293,11 @@ pub struct ShardBoundary {
     pub reshape_admitted_epoch: Option<Epoch>,
     /// Leaf index below which applied chunks' reveal outputs stay out of
     /// the epoch randomness: the accumulator count of a crossing that
-    /// folded above a pending halt recovery's
-    /// [`attested_frontier`](HaltRecovery::attested_frontier). Everything
+    /// folded above a pending recovery's
+    /// [`attested_frontier`](ShardRecovery::attested_frontier). Everything
     /// under that count is history the beyond-f retained committee could
-    /// have forged post-halt, so its reveals must not steer the seed — no
+    /// have forged after its failure, so its reveals must not steer the
+    /// seed — no
     /// matter how many epochs (or record refreshes) the backlog takes to
     /// drain. Carried forward on refresh and cleared once the applied
     /// watermark reaches it; `None` when no fenced band is draining.
@@ -386,22 +387,39 @@ pub enum PendingReshape {
     },
 }
 
-/// One in-flight halted-shard recovery: the shard's stalled committee
-/// has been replaced by a fresh pool draw, and the shard has not yet
-/// committed a boundary crossing under the new one.
+/// Why a shard's committee was recovered. Fence, re-draw, retention,
+/// bridge, and clearing are identical across causes; the cause records
+/// provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub enum RecoveryCause {
+    /// The committee went quiet: its committed-boundary watermark
+    /// stopped advancing past the halt threshold.
+    Halt,
+    /// The committee provably committed two conflicting chains at one
+    /// height — impossible below f+1 corrupt seats, so the committee
+    /// itself is compromised.
+    Fork,
+}
+
+/// One in-flight shard recovery: the shard's failed committee has been
+/// replaced by a fresh pool draw, and the shard has not yet committed a
+/// boundary crossing under the new one.
 ///
-/// Written when the fold re-draws a halted shard's committee — which
-/// also resets the boundary's miss count, so the fresh committee gets a
+/// Written when the fold re-draws a shard's committee — which also
+/// resets the boundary's miss count, so the fresh committee gets a
 /// full threshold of observed folds to produce before the shard
 /// re-flags — and cleared by the shard's next observed crossing. While
 /// it stands, the replaced members stay in the shard's routing view so
-/// incomers can fetch the halted chain's tip from nodes that hold it,
+/// incomers can fetch the retained chain's tip from nodes that hold it,
 /// the shard's members sit out beacon eligibility (seated on trust,
 /// they prove themselves serving only at that first crossing), and
 /// [`rotated_at`](Self::rotated_at) anchors the recovery bridge that
-/// binds blocks extending the halted tip to the fresh committee.
+/// binds blocks extending the retained tip to the fresh committee.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct HaltRecovery {
+pub struct ShardRecovery {
+    /// What the recovery answers. Provenance only: every consequence of
+    /// the record is cause-agnostic.
+    pub cause: RecoveryCause,
     /// Epoch the fresh committee was seated.
     pub rotated_at: Epoch,
     /// The replaced committee, retained for routing until the shard
@@ -413,11 +431,11 @@ pub struct HaltRecovery {
     /// the recovery was stamped — the beacon-authenticated frontier below
     /// which the retained committee's certified history is legitimate.
     /// Above it, an old-committee artifact is one the beyond-f committee
-    /// could only have forged after the halt, so the local bridge and
+    /// could only have forged after its failure, so the local bridge and
     /// cross-shard consumers reject it once they fold this record. It is
-    /// unforgeable by the halted committee: a pure function of the
-    /// committed beacon boundaries, not a claim the retained committee
-    /// makes about its own tip.
+    /// unforgeable by the retained committee: a pure function of the
+    /// committed beacon boundaries, not a claim that committee makes
+    /// about its own tip.
     pub attested_frontier: BlockHeight,
 }
 
@@ -600,12 +618,12 @@ pub struct BeaconState {
     /// fold's trigger admission; pruned by the per-epoch staleness
     /// sweep when assertions go quiet.
     pub pending_reshapes: BTreeMap<ShardId, PendingReshape>,
-    /// In-flight halted-shard recoveries, keyed by the recovered shard.
-    /// Written when the fold re-draws a halted committee; an entry
+    /// In-flight shard recoveries, keyed by the recovered shard.
+    /// Written when the fold re-draws a failed committee; an entry
     /// drops on the shard's next observed crossing (the fresh committee
     /// produced) and is GC'd with the shard's boundary record.
-    pub pending_recoveries: BTreeMap<ShardId, HaltRecovery>,
-    /// The epoch each shard's most recent completed halt recovery seated
+    pub pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
+    /// The epoch each shard's most recent completed recovery seated
     /// its fresh committee (`rotated_at`), stamped when the pending record
     /// clears on the shard's first crossing. Permanent — one entry per
     /// recovered shard, overwritten by a later recovery — so certified

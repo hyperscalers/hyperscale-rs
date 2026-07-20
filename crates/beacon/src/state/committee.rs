@@ -5,19 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, HaltRecovery,
-    MIN_BEACON_COMMITTEE_SIZE, PendingReshape, ShardCommittee, ShardId, TransitionCause,
+    BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, MIN_BEACON_COMMITTEE_SIZE,
+    PendingReshape, RecoveryCause, ShardCommittee, ShardId, ShardRecovery, TransitionCause,
     ValidatorId, ValidatorStatus,
 };
 
 use crate::sampling::{sample_committee, sample_committee_weighted};
 use crate::state::pool::pool_draw;
 
-/// Domain tag for the halted-shard recovery draw seed. Distinct from
+/// Domain tag for the shard recovery draw seed. Distinct from
 /// [`crate::sampling`]'s pool-draw tag so the full-committee re-draw
 /// never shares a PRNG stream with a same-epoch pool refill on the same
 /// `(randomness, epoch, shard)` input.
-const DOMAIN_HALT_RECOVERY: &[u8] = b"hyperscale-halt-recovery-v1";
+const DOMAIN_SHARD_RECOVERY: &[u8] = b"hyperscale-shard-recovery-v1";
 
 /// Trickled committee rotation. When `state.current_epoch` lands on a
 /// shuffle-interval boundary (and `epoch > 0`), each shard rotates one
@@ -174,15 +174,15 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 /// catch any member that never caught up. The replaced committee returns
 /// to the pool, excluded from its own replacement draw (its members are
 /// still `OnShard` when the pool derives), and is retained in the
-/// shard's routing view via [`HaltRecovery`] so the incomers can fetch
+/// shard's routing view via [`ShardRecovery`] so the incomers can fetch
 /// the halted tip from nodes that hold it.
-pub(super) fn recover_halted_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
+pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
     for &shard in halted {
-        recover_halted_committee(state, shard);
+        recover_committee(state, shard);
     }
 }
 
-fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
+fn recover_committee(state: &mut BeaconState, shard: ShardId) {
     let size = state.chain_config.shard_size as usize;
     // A genesis-born shard that never produced still carries its ZERO
     // placeholder, which the topology snapshot omits — so a fresh committee
@@ -221,7 +221,7 @@ fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
         return;
     }
     let mut h = Hasher::new();
-    h.update(DOMAIN_HALT_RECOVERY);
+    h.update(DOMAIN_SHARD_RECOVERY);
     h.update(state.randomness.as_bytes());
     h.update(&state.current_epoch.inner().to_le_bytes());
     h.update(&shard.inner().to_le_bytes());
@@ -281,7 +281,8 @@ fn recover_halted_committee(state: &mut BeaconState, shard: ShardId) {
     );
     state.pending_recoveries.insert(
         shard,
-        HaltRecovery {
+        ShardRecovery {
+            cause: RecoveryCause::Halt,
             rotated_at: state.current_epoch,
             retained,
             attested_frontier,
@@ -470,7 +471,7 @@ mod tests {
         StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
     };
 
-    use super::{recover_halted_committees, resample_beacon_committee};
+    use super::{recover_committees, resample_beacon_committee};
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
         validator_record,
@@ -1630,7 +1631,7 @@ mod tests {
             .copied()
             .collect();
 
-        recover_halted_committees(&mut state, &BTreeSet::from([s0]));
+        recover_committees(&mut state, &BTreeSet::from([s0]));
         let fresh1: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
             .members
             .iter()
@@ -1639,7 +1640,7 @@ mod tests {
         assert!(fresh1.is_disjoint(&old));
 
         state.current_epoch = Epoch::new(40);
-        recover_halted_committees(&mut state, &BTreeSet::from([s0]));
+        recover_committees(&mut state, &BTreeSet::from([s0]));
         let recovery = &state.pending_recoveries[&s0];
         assert_eq!(recovery.rotated_at, Epoch::new(40));
         assert_eq!(
@@ -1655,14 +1656,15 @@ mod tests {
     /// bridge band keeps resolving the fresh committee.
     #[test]
     fn recovery_clears_when_the_shard_commits_again() {
-        use hyperscale_types::HaltRecovery;
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let rotated_at = Epoch::GENESIS;
         state.pending_recoveries.insert(
             ShardId::leaf(1, 0),
-            HaltRecovery {
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
                 rotated_at,
                 retained: vec![ValidatorId::new(9)],
                 attested_frontier: BlockHeight::GENESIS,
