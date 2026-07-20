@@ -18,9 +18,24 @@ of the validator pool, n the committee size, and the failure event is a
 committee reaching k ≥ f+1 corrupt seats with f = ⌊(n−1)/3⌋ — the threshold
 at which both the safety and liveness arguments lapse. Failure probabilities
 compound across shards and years; a per-shard-year budget of 10⁻⁶ keeps a
-100-shard network under 10⁻⁴/year. f+1 prices a *recoverable* event —
-availability, not survival; the unrecoverable boundary is 2f+1, priced
-separately in §10.1.
+100-shard network under 10⁻⁴/year. f+1 prices a *recoverable* event — a
+degradation band, not a safety guarantee (above f the band is not safe:
+withholding halts, and a fork through self-proving double-signing is
+possible — §10.1); the unrecoverable boundary is 2f+1, priced separately in
+§10.1.
+
+**The quantity every table serves is a conversion rate**: from an
+adversary's share of the pool to the single-shard control it can actually
+achieve. Unsharded BFT is the 1:1 baseline — β of stake is β of the only
+committee. Sampling holds every committee's *mean* at β while the adversary
+attacks the max over shards; n concentrates each draw toward the mean (§1),
+shard count compounds the tail (the per-shard-year × network accounting
+above), and steering (§10) is what would collapse the rate toward one
+shard's stake-cost. The resulting guarantee is probabilistic where
+unsharded is a hard threshold: risk rises smoothly along the §3 cliff
+rather than switching at ⅓. The system's claim is that the curve stays
+security-competitive with the hard threshold while the network scales —
+never that it beats it.
 
 **Candidate committee sizes are {32, 64, 96, 128, 256}**, capped by message
 complexity — 256 is already questionable on that axis. The candidates are not
@@ -237,9 +252,11 @@ scales with it); the readiness gate is 85 ready per successor.
 
 Attack economics: exceeding the 10⁻⁶ budget requires >13% of all seats — at
 100 shards, ~1,680 seats ≥ 1.68B tokens at `MIN_STAKE_FLOOR` (more at the
-dynamic price). Any seat that equivocates is permanently key-revoked on the
-self-proving evidence (INV-SEC-3) — its position forfeit, though the stake is
-not slashed. Per-committee arithmetic ("43 seats") is the wrong frame:
+dynamic price). A seat that equivocates — a double-signed beacon ballot or a shard
+double-vote — is permanently key-revoked on the self-proving evidence
+(INV-SEC-3), its position forfeit though the stake is not slashed; the
+shard-vote pair rides the beacon-witness channel to the fold (docs/05 §3).
+Per-committee arithmetic ("43 seats") is the wrong frame:
 sampling decides where seats land, so the adversary buys the pool fraction.
 
 Two riders, without which 128 is not this strong:
@@ -292,11 +309,14 @@ The handoff to accountability is computable. Rotation prices a campaign by
 = 1 below two intervals — the readiness flush floor, §7). At the production
 point T = 256 epochs: the half-line sits at τ½ ≈ 0.69·T ≈ 15h, and below
 ~T/10 (≈2h) rotation is inert (survival > 0.9). Faster-than-that
-corruption is met by detection, not rotation: self-proving equivocation
-halts the shard rather than forking it, the key is permanently revoked
-(INV-SEC-3), and the residual exposure is finality latency for external
-consumers — jailing and key-revocation, never slashing (§4 framing;
-docs/05 §3).
+corruption is met by structure, not rotation: any fork must run through
+self-proving double-signing, which the honest vote locks bias toward a halt
+without precluding a double-commit across two consecutive equivocated
+rounds (§10.1), and the halt is detected and re-drawn (§10.6). No
+shard-level evidence pipeline exists — key revocation covers beacon
+ballots only (docs/05 §3) — so the residual exposure is §10.1's bounded
+window, and the accountability that does bind is jailing and
+key-revocation, never slashing (§4 framing).
 
 The mechanism is the shorter interval, *not* rotating k seats per batch,
 for three reasons: a k-batch guarantees a synchronized dip of k unready
@@ -377,15 +397,17 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   [06 §4](../docs/06-resource-economics.md). Accountability does not price this out:
   there is no slashing anywhere — a jailed validator's stake is preserved and
   withdrawable (INV-SEC-3 jails; it does not confiscate), so provable
-  equivocation revokes the *key* (permanent jail, no unjail) but not the
-  capital, which redeploys under a fresh identity. That is a re-registration
-  tax, not a bribe floor. So the defense against a bribed or hacked committee
-  is structural, not economic: a provable equivocation is self-proving
-  evidence that halts the shard rather than forking it (INV-SHARD-1
-  quorum intersection, INV-STATE-5 halt-loudly), degrading a safety attack to
-  a liveness halt — and the residual, an external consumer acting on one
-  branch before the evidence propagates, is a finality-latency question, not a
-  slashing one. Bribery is also the fast-adaptive limit of §4 (a negotiation,
+  equivocation — a beacon ballot or a shard double-vote — revokes the *key*
+  (permanent jail, no unjail) but not the capital, which redeploys under a
+  fresh identity (docs/05 §3). That is
+  a re-registration tax, not a bribe floor. So the defense against a bribed
+  or hacked committee is structural, not economic: quorum intersection
+  forces any fork through self-proving double-signed votes (INV-SHARD-1's
+  mechanism, INV-STATE-5 halt-loudly), biasing a safety attack toward a loud
+  liveness halt without precluding the fork (§10.1) — and the residual, an
+  external consumer acting on one branch before the fork surfaces, is a
+  bounded-exposure question, not a slashing one. Bribery is also the
+  fast-adaptive limit of §4 (a negotiation,
   not a multi-day intrusion), so it lands in table J's τ→small rows where
   rotation cannot help either. Only the *buying* adversary is
   concentration-neutral: `min_stake` is charged per seat regardless, so §1–3
@@ -455,8 +477,9 @@ steering aims at (§10.1), the seed and the residual steering it leaves
 Reaching f+1 corrupt on a shard is where the BFT guarantees lapse, but the
 two boundaries could hardly differ more.
 
-**f+1 is a liveness halt with a bounded cross-shard exposure window.** With
-f+1 corrupt withholding, the remaining ≤ 2f honest seats are short of the
+**f+1 opens a degradation band; withholding is a liveness halt with a
+bounded cross-shard exposure window.** With f+1 corrupt withholding, the
+remaining ≤ 2f honest seats are short of the
 2f+1 quorum: other shards keep committing, the local chain stops. The halt is
 the recoverable outcome — detect-and-rotate (§10.6) re-draws the committee —
 but it is not cleanly contained while it lasts (Model G, `recovery_bridge`
@@ -496,19 +519,38 @@ and the attested frontier the fresh committee inherits is itself poisonable
 is contained only in that at f+1..2f the honest co-signers recompute results
 (INV-DET), so what leaks is *chain choice* between two internally-correct
 chains, not a forged execution result: the stake-minting cascade still needs
-2f+1 or tricked validators. So f+1 is a recoverable liveness halt plus a
-bounded exposure window — which makes `HALT_THRESHOLD` a safety parameter (a
+2f+1 or tricked validators. So the withholding route is a recoverable
+liveness halt plus a bounded exposure window — which makes
+`HALT_THRESHOLD` a safety parameter (a
 shorter window is a smaller exposure), not only a liveness-latency knob, and
 makes the hardening stack of §10.5 load-bearing for *safety* in this regime,
 not merely defense-in-depth.
 
-**2f+1 is unilateral control, and it is terminal.** The equivocation route
-(f+1 double-signing two conflicting commits) is self-proving, so
-INV-SHARD-1's quorum intersection catches the sibling commits and INV-SEC-3
-revokes the keys — it cannot produce a silent fork. But 2f+1 corrupt commits
-a false state with a valid QC and **no** equivocation, so INV-SHARD-1 never
-fires, and no in-protocol verifier re-executes a committee it is supposed to
-trust (INV-STATE-5 governs a node's own sync-vs-consensus consistency, not a
+**The middle band can also fork, and no beacon detector flags the fork
+itself.** With f+1..2f corrupt, two conflicting commits require f+1
+double-signed votes in each of two consecutive rounds: the honest locks
+force the attack through self-proving equivocation — biasing it toward the
+halt above — but do not preclude the double-commit. Those double-votes are
+prosecuted: a replica holding both assembles self-proving evidence that
+rides a `VoteEquivocation` witness leaf to the beacon and permanently
+revokes the key (docs/05 §3) — best-effort, since an equivocator splitting
+its votes across separate collectors leaves no single replica with the
+pair. What nothing flags is the *fork itself*: the §10.6 trigger watches
+for a *quiet* watermark an actively forking shard never shows, and the
+boundary fold canonicalizes one crossing per shard per epoch
+(INV-BEACON-5) without surfacing a conflicting sibling. The band's
+containment is structural — honest co-signers recompute execution results,
+so what forks is chain choice — plus the key-revocation accountability
+above and the recovery once the fork collapses into the halt signature;
+"safe between f+1 and 2f" is not a claim this note makes anywhere.
+
+**2f+1 is unilateral control, and it is terminal.** The middle band's fork
+is at least self-evidencing — quorum intersection forces it to leave
+double-signed votes, so it cannot fork silently. But 2f+1 corrupt commits
+a false state with a valid QC and **no** equivocation, so nothing
+self-proving ever exists, and no in-protocol verifier re-executes a
+committee it is supposed to trust (INV-STATE-5 governs a node's own
+sync-vs-consensus consistency, not a
 cross-committee check; a valid QC over a self-consistent false state passes
 every soundness check downstream). Unilateral control of one shard mints
 stake — the network-wide admission gate — and cascades to every other shard.
@@ -530,10 +572,12 @@ at n = 128):
 | 10⁻⁹ | 0.346 |
 
 Unsteered sampling essentially cannot produce the terminal event: the 10⁻⁶
-budget tolerates β ≤ 0.386 — three times the f+1 line (0.123, §3) and above
-the ⅓-of-stake threshold an *unsharded* BFT chain fails at. The system has
-two β lines, not one. **Healthy, β ≲ 0.12**: the f+1 budget holds and halts
-are negligible. **Sound, β ≲ 0.39**: in the band between, the network
+budget tolerates β ≤ 0.386 — three times the f+1 line (0.123, §3). That is
+a risk bound on the unsteered draw, not a comparative claim against an
+unsharded chain: steering voids it, which is what the rest of this section
+prices. The system has two β lines, not one. **Healthy, β ≲ 0.12**: the
+f+1 budget holds and halts are negligible. **Sound, β ≲ 0.39**: in the
+band between, the network
 degrades without breaking — at β = 0.40 the f+1 boundary is crossed ~250 times
 per shard-year and the stationary mean corrupt count β·n ≈ 51 exceeds f, so
 shards halt, re-draw, and pay detection-latency exposure windows more or less
@@ -821,8 +865,9 @@ march restarts from ~β·n — sustained, roughly a quarter downtime on *one*
 shard (the finite corrupt supply, §10.5, bounds it to roughly one at a
 time). What keeps that unattractive is not the duty cycle alone: every
 cycle requires re-suppressing the shard's crossings network-wide (§10.4 —
-self-announcing), the yield is a recurring liveness halt with zero safety
-impact, and each flushed foothold burns jailed keys.
+self-announcing), the yield is a recurring halt whose safety residual is
+the bounded exposure window of §10.1, and each flushed foothold burns
+withholding-jailed keys on the fallback path.
 
 Design constraints:
 
@@ -875,10 +920,13 @@ recency period, and the recency-weighted resample, under which the sustained
 foothold pins near natural β·b and the first 2f+1 peak crossing sits at
 β ≈ 0.12 — level with the 0.123 the sampling budget tolerates (table T).
 
-The two failure boundaries are defended apart (§10.1). **f+1** is a
-recoverable halt: detect-and-rotate re-draws the committee and flushes the
-foothold (§10.6), with the cross-shard freeze bounding the exposure window to
-detection latency. **2f+1** is terminal, so its defense is entirely
+The two failure boundaries are defended apart (§10.1). **f+1** opens the
+recoverable band: withholding is a detected halt — detect-and-rotate
+re-draws the committee and flushes the foothold (§10.6), the cross-shard
+freeze bounding the exposure window to detection latency — while the band's
+fork case has no beacon-fold detector and is contained structurally,
+its double-signs key-revoked when caught (§10.1). **2f+1**
+is terminal, so its defense is entirely
 prevention: the seed, the stack, and above all **pool hygiene** (§3, §6
 Rider 2) — the deepest lever, since concentrating 2f+1 corrupt on one shard
 needs that many corrupt seats in play at all.
