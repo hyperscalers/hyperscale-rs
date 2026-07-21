@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
     CertifiedBlockHeader, NetworkDefinition, QcContext, QcVerifyError, QuorumCertificate, Round,
-    ShardBoundary, ShardId, TopologySchedule, ValidatorId, Verify, VoteCount, block_vote_message,
+    ShardId, TopologySchedule, ValidatorId, Verify, VoteCount, block_vote_message,
     verify_bls12381_v1,
 };
 
@@ -321,28 +321,15 @@ impl CommitProof {
     }
 }
 
-/// Self-authenticating proof that a shard committee ran a fork.
+/// Self-authenticating proof that a shard committee ran a fork: two commit
+/// proofs for the same shard and height with different proven-block hashes.
 ///
-/// Two shapes, one reliable consequence (fence + full committee re-draw):
-///
-/// - [`Self::ConflictingCommits`] — two commit proofs for the same shard
-///   and height with different proven-block hashes. Two committed chains
-///   at one height is impossible for an honest-majority committee whatever
-///   the round layout (INV-SHARD-1), so this is a self-proving
-///   committee-level fork. The cross-victim shape: victim B holds one
-///   proof, victim C the other, and together they are the fork proof.
-/// - [`Self::BoundaryConflict`] — a commit proof for a block at the
-///   beacon-canonical boundary's height whose hash differs from the
-///   attested `block_hash`. The single-victim shape: one consumer that
-///   finds its committed head orphaned by the beacon holds it alone. The
-///   type-level verifier checks the proof and the height/hash conflict;
-///   confirming the boundary is the folded canonical one is the beacon
-///   caller's check (it holds the folded `boundaries` record).
-// Variants differ in size (two commit proofs vs one plus a boundary), but a
-// fork proof is a rare Byzantine artifact always held behind a `Box` at every
-// use site (`ProtocolEvent`, `Action`, `BeaconProposal`), so the inline size
-// is moot and boxing the wire fields would only complicate SBOR.
-#[allow(clippy::large_enum_variant)]
+/// Two committed chains at one height is impossible for an honest-majority
+/// committee whatever the round layout (INV-SHARD-1), so the proof stands
+/// on its own — no beacon boundary or other external reference is needed to
+/// trust it. The cross-victim shape: victim B holds one commit proof,
+/// victim C the other, and together they are the fork proof. The consequence
+/// is fence + full committee re-draw.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum ShardForkProof {
     /// Two conflicting commits at one `(shard, height)`.
@@ -352,19 +339,12 @@ pub enum ShardForkProof {
         /// The other committed branch (different proven-block hash).
         b: CommitProof,
     },
-    /// A committed head that conflicts with the beacon-canonical boundary.
-    BoundaryConflict {
-        /// Commit proof for the orphaned head.
-        proof: CommitProof,
-        /// The beacon-canonical boundary the head conflicts with.
-        boundary: ShardBoundary,
-    },
 }
 
 /// Failure modes of [`ShardForkProof`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ShardForkProofVerifyError {
-    /// The first (`a`) / only commit proof failed.
+    /// The first (`a`) commit proof failed.
     #[error("commit proof a: {0}")]
     ProofA(CommitProofVerifyError),
     /// The second (`b`) commit proof failed.
@@ -380,11 +360,10 @@ pub enum ShardForkProofVerifyError {
     /// The two proofs are on different shards.
     #[error("conflicting commits span shards")]
     ShardMismatch,
-    /// The two proven blocks (or the boundary) are at different heights.
+    /// The two proven blocks are at different heights.
     #[error("conflicting commits are at different heights")]
     HeightMismatch,
-    /// The two proven blocks (or the boundary) share a hash — no
-    /// contradiction.
+    /// The two proven blocks share a hash — no contradiction.
     #[error("no conflict: proven blocks are equal")]
     NotConflicting,
 }
@@ -393,35 +372,25 @@ impl ShardForkProof {
     /// The shard the fork is on.
     #[must_use]
     pub const fn shard(&self) -> ShardId {
-        match self {
-            Self::ConflictingCommits { a, .. } => a.shard(),
-            Self::BoundaryConflict { proof, .. } => proof.shard(),
-        }
+        let Self::ConflictingCommits { a, .. } = self;
+        a.shard()
     }
 
     /// The forked height.
     #[must_use]
     pub fn height(&self) -> BlockHeight {
-        match self {
-            Self::ConflictingCommits { a, .. } => a.proven_height(),
-            Self::BoundaryConflict { proof, .. } => proof.proven_height(),
-        }
+        let Self::ConflictingCommits { a, .. } = self;
+        a.proven_height()
     }
 
     /// Every QC-bearing header in the proof, in canonical order —
-    /// `[a.certified, a.child, b.certified, b.child]` for
-    /// [`Self::ConflictingCommits`], `[certified, child]` for
-    /// [`Self::BoundaryConflict`]. The single ordering both committee
-    /// resolution and verification iterate.
+    /// `[a.certified, a.child, b.certified, b.child]`. The single ordering
+    /// both committee resolution and verification iterate.
     fn qc_headers(&self) -> Vec<&CertifiedBlockHeader> {
-        match self {
-            Self::ConflictingCommits { a, b } => {
-                let mut v = a.qc_headers().to_vec();
-                v.extend(b.qc_headers());
-                v
-            }
-            Self::BoundaryConflict { proof, .. } => proof.qc_headers().to_vec(),
-        }
+        let Self::ConflictingCommits { a, b } = self;
+        let mut v = a.qc_headers().to_vec();
+        v.extend(b.qc_headers());
+        v
     }
 
     /// Resolve each QC's committee from the schedule, keyed by the QC's
@@ -473,8 +442,8 @@ impl ShardForkProof {
     }
 
     /// Verify against pre-resolved committees (positionally aligned to
-    /// [`Self::qc_headers`]). Runs structure, BLS, and the variant's
-    /// contradiction check.
+    /// [`Self::qc_headers`]). Runs structure, BLS, and the contradiction
+    /// check.
     ///
     /// # Errors
     ///
@@ -487,43 +456,25 @@ impl ShardForkProof {
         if committees.len() != self.qc_headers().len() {
             return Err(ShardForkProofVerifyError::CommitteeCountMismatch);
         }
-        match self {
-            Self::ConflictingCommits { a, b } => {
-                a.verify_structure()
-                    .map_err(ShardForkProofVerifyError::ProofA)?;
-                b.verify_structure()
-                    .map_err(ShardForkProofVerifyError::ProofB)?;
-                a.verify_qcs(network, &committees[0..2])
-                    .map_err(ShardForkProofVerifyError::ProofA)?;
-                b.verify_qcs(network, &committees[2..4])
-                    .map_err(ShardForkProofVerifyError::ProofB)?;
-                if a.shard() != b.shard() {
-                    return Err(ShardForkProofVerifyError::ShardMismatch);
-                }
-                if a.proven_height() != b.proven_height() {
-                    return Err(ShardForkProofVerifyError::HeightMismatch);
-                }
-                if a.proven_block_hash() == b.proven_block_hash() {
-                    return Err(ShardForkProofVerifyError::NotConflicting);
-                }
-                Ok(())
-            }
-            Self::BoundaryConflict { proof, boundary } => {
-                proof
-                    .verify_structure()
-                    .map_err(ShardForkProofVerifyError::ProofA)?;
-                proof
-                    .verify_qcs(network, &committees[0..2])
-                    .map_err(ShardForkProofVerifyError::ProofA)?;
-                if proof.proven_height() != boundary.height {
-                    return Err(ShardForkProofVerifyError::HeightMismatch);
-                }
-                if proof.proven_block_hash() == boundary.block_hash {
-                    return Err(ShardForkProofVerifyError::NotConflicting);
-                }
-                Ok(())
-            }
+        let Self::ConflictingCommits { a, b } = self;
+        a.verify_structure()
+            .map_err(ShardForkProofVerifyError::ProofA)?;
+        b.verify_structure()
+            .map_err(ShardForkProofVerifyError::ProofB)?;
+        a.verify_qcs(network, &committees[0..2])
+            .map_err(ShardForkProofVerifyError::ProofA)?;
+        b.verify_qcs(network, &committees[2..4])
+            .map_err(ShardForkProofVerifyError::ProofB)?;
+        if a.shard() != b.shard() {
+            return Err(ShardForkProofVerifyError::ShardMismatch);
         }
+        if a.proven_height() != b.proven_height() {
+            return Err(ShardForkProofVerifyError::HeightMismatch);
+        }
+        if a.proven_block_hash() == b.proven_block_hash() {
+            return Err(ShardForkProofVerifyError::NotConflicting);
+        }
+        Ok(())
     }
 
     /// Extract any same-`(height, round)` different-hash QC pair across the
@@ -947,10 +898,13 @@ mod tests {
         }
 
         #[test]
-        fn prefix_commit_proof_verifies_via_ancestry() {
-            // Proven block B@8 committed as the prefix of the two-chain
-            // D@9 ← child@10 (round-contiguous), with B = D's parent. The
-            // proof points at B through the ancestry link.
+        fn prefix_commit_branch_verifies_via_ancestry() {
+            // One branch prefix-commits block B@8 as the prefix of the
+            // two-chain D@9 ← child@10 (round-contiguous, post view change),
+            // reaching B through the ancestry link; the other directly
+            // commits a different block B'@8. Both proven at height 8 with
+            // distinct hashes — a fork whose winning branch is a prefix
+            // commit.
             let committee = TestCommittee::new(4, 6);
             let parent = BlockHash::from_raw(Hash::from_bytes(b"grandparent"));
             let b = header(BlockHeight::new(8), Round::new(8), parent, 1);
@@ -962,63 +916,13 @@ mod tests {
                 &committee,
                 header(BlockHeight::new(10), Round::new(21), d.block_hash(), 3),
             );
-            let proof = CommitProof::new(d, child, vec![b.clone()]);
-            assert_eq!(proof.proven_height(), BlockHeight::new(8));
-            assert_eq!(proof.proven_block_hash(), b.hash());
+            let a = CommitProof::new(d, child, vec![b.clone()]);
+            assert_eq!(a.proven_height(), BlockHeight::new(8));
+            assert_eq!(a.proven_block_hash(), b.hash());
 
-            // Conflict it with a boundary at height 8 carrying a different hash.
-            let boundary = boundary_at(
-                BlockHeight::new(8),
-                BlockHash::from_raw(Hash::from_bytes(b"canon-8")),
-            );
-            let fork = ShardForkProof::BoundaryConflict { proof, boundary };
+            let other = direct_proof(&committee, BlockHeight::new(8), Round::new(8), parent, 99);
+            let fork = ShardForkProof::ConflictingCommits { a, b: other };
             assert_eq!(fork.verify(&schedule(&committee)), Ok(()));
-        }
-
-        fn boundary_at(height: BlockHeight, block_hash: BlockHash) -> ShardBoundary {
-            ShardBoundary {
-                state_root: StateRoot::ZERO,
-                block_hash,
-                height,
-                weighted_timestamp: WeightedTimestamp::ZERO,
-                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-                witness_base: BeaconWitnessLeafCount::ZERO,
-                last_live_epoch: Epoch::GENESIS,
-                consecutive_misses: 0,
-                terminal_epoch: None,
-                terminal_qc_wt: None,
-                settled_waves_root: None,
-                reshape_admitted_epoch: None,
-                reveals_fenced_below: None,
-            }
-        }
-
-        #[test]
-        fn boundary_conflict_verifies_and_matching_hash_rejected() {
-            let committee = TestCommittee::new(4, 7);
-            let parent = BlockHash::from_raw(Hash::from_bytes(b"p"));
-            let proof = direct_proof(&committee, BlockHeight::new(9), Round::new(9), parent, 1);
-            let orphan_hash = proof.proven_block_hash();
-
-            // A boundary at the same height with a different hash → conflict.
-            let conflicting = ShardForkProof::BoundaryConflict {
-                proof: proof.clone(),
-                boundary: boundary_at(
-                    BlockHeight::new(9),
-                    BlockHash::from_raw(Hash::from_bytes(b"canon")),
-                ),
-            };
-            assert_eq!(conflicting.verify(&schedule(&committee)), Ok(()));
-
-            // A boundary that IS the proven block → no conflict.
-            let agreeing = ShardForkProof::BoundaryConflict {
-                proof,
-                boundary: boundary_at(BlockHeight::new(9), orphan_hash),
-            };
-            assert_eq!(
-                agreeing.verify(&schedule(&committee)),
-                Err(ShardForkProofVerifyError::NotConflicting)
-            );
         }
 
         #[test]
