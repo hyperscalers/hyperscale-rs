@@ -23,6 +23,7 @@ mod sync;
 mod timers;
 mod transactions;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
@@ -81,6 +82,13 @@ pub(in crate::state) struct ShardParticipation {
     /// fetch it.
     pub(in crate::state) last_cleanup_height: Option<BlockHeight>,
     pub(in crate::state) cleanup_stall_ticks: u32,
+
+    /// Shards a fork proof has already engaged the local fence for,
+    /// `shard → fork_height`. Dedups one proof per forked shard so a proof
+    /// is engaged and re-gossiped exactly once; a later proof for an
+    /// already-fenced shard is ignored. Cleared per shard once its attested
+    /// recovery folds. Empty under honest operation.
+    pub(in crate::state) fork_fenced_shards: HashMap<ShardId, BlockHeight>,
 }
 
 impl ShardParticipation {
@@ -131,6 +139,7 @@ impl ShardParticipation {
             terminal_chain_swept: false,
             last_cleanup_height: None,
             cleanup_stall_ticks: 0,
+            fork_fenced_shards: HashMap::new(),
         }
     }
 

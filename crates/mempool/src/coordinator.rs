@@ -274,6 +274,14 @@ pub struct MempoolCoordinator {
     /// This validator's home shard. Filters declared-node iterators to
     /// local nodes only at lock-tracking time.
     local_shard: ShardId,
+
+    /// Shards under a gossip-timed fork fence. While non-empty, admission
+    /// rejects any transaction touching a fenced shard — no point starting
+    /// cross-shard work bound to a committee that is provably forked. A
+    /// liveness quiesce only; safety rests on the provision fence. Cleared
+    /// per shard once its attested recovery folds. Empty under honest
+    /// operation.
+    fork_fenced_shards: std::collections::HashSet<ShardId>,
 }
 
 impl std::fmt::Debug for MempoolCoordinator {
@@ -326,6 +334,7 @@ impl MempoolCoordinator {
             expected_txs: ExpectedTxs::new(),
             config,
             local_shard,
+            fork_fenced_shards: std::collections::HashSet::new(),
         }
     }
 
@@ -362,6 +371,24 @@ impl MempoolCoordinator {
                 end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
                 now_ms = self.current_ts.as_millis(),
                 "Rejecting expired transaction"
+            );
+            return None;
+        }
+
+        // Fork-fence quiesce: reject a tx touching a shard under a local
+        // fork fence. Starting cross-shard work bound to a provably-forked
+        // committee only wastes a round — the provisions it would need are
+        // fenced anyway. Skipped entirely when no fence is engaged (the
+        // ordinary case), so honest admission pays nothing.
+        if !self.fork_fenced_shards.is_empty()
+            && self
+                .fork_fenced_shards
+                .iter()
+                .any(|&s| topology_snapshot.involves_shard(s, tx))
+        {
+            tracing::debug!(
+                tx_hash = ?hash,
+                "Rejecting transaction bound to a fork-fenced shard"
             );
             return None;
         }
@@ -647,6 +674,12 @@ impl MempoolCoordinator {
         actions
     }
 
+    /// Engage the gossip-timed fork-fence quiesce for `shard`: stop admitting
+    /// transactions that touch it. Idempotent; a liveness measure only.
+    pub fn engage_fork_fence(&mut self, shard: ShardId) {
+        self.fork_fenced_shards.insert(shard);
+    }
+
     /// Process a committed block - update statuses and finalize transactions.
     ///
     /// This handles:
@@ -669,6 +702,13 @@ impl MempoolCoordinator {
 
         self.current_height = height;
         self.current_ts = block.header().parent_qc().weighted_timestamp();
+
+        // A gossip-timed fork fence self-clears once the attested recovery
+        // for its shard folds — the attested fence then governs admission.
+        if !self.fork_fenced_shards.is_empty() {
+            self.fork_fenced_shards
+                .retain(|shard| !topology_snapshot.pending_recoveries().contains_key(shard));
+        }
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
@@ -2621,5 +2661,52 @@ mod tests {
         );
         assert!(actions.is_empty(), "re-submission past expiry rejected");
         assert!(mempool.status(&tx_hash).is_none());
+    }
+
+    #[test]
+    fn fork_fence_quiesce_rejects_txs_touching_the_fenced_shard() {
+        let topology_snapshot = make_cross_shard_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
+
+        // A tx writing to a node, and that node's shard.
+        let node = test_node(7);
+        let fenced_shard = topology_snapshot.shard_for_node_id(&node);
+        let tx = test_transaction_with_nodes(&[7], vec![], vec![node]);
+        let hash = tx.hash();
+
+        // With the fence engaged for that shard, admission is rejected — no
+        // point starting cross-shard work bound to a forked committee.
+        mempool.engage_fork_fence(fenced_shard);
+        mempool.on_submit_transaction(
+            &topology_snapshot,
+            Arc::new(verified(tx)),
+            LocalTimestamp::ZERO,
+        );
+        assert!(
+            mempool.status(&hash).is_none(),
+            "a tx touching the fenced shard must not admit"
+        );
+
+        // A tx on a different, unfenced shard admits normally.
+        let mut seed = 8u8;
+        let other = loop {
+            let n = test_node(seed);
+            if topology_snapshot.shard_for_node_id(&n) != fenced_shard {
+                break n;
+            }
+            seed = seed.wrapping_add(1);
+            assert!(seed != 7, "could not find a node off the fenced shard");
+        };
+        let tx2 = test_transaction_with_nodes(&[seed], vec![], vec![other]);
+        let hash2 = tx2.hash();
+        mempool.on_submit_transaction(
+            &topology_snapshot,
+            Arc::new(verified(tx2)),
+            LocalTimestamp::ZERO,
+        );
+        assert!(
+            mempool.status(&hash2).is_some(),
+            "a tx off the fenced shard admits"
+        );
     }
 }

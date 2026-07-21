@@ -305,6 +305,15 @@ pub enum ProtocolEvent {
         verified: bool,
     },
 
+    /// A shard fork proof arrived over global gossip and still needs
+    /// verification. The proof self-authenticates, so the receive path
+    /// carries no sender trust — the state machine resolves committees
+    /// from its own schedule and dispatches `VerifyShardForkProof`.
+    UnverifiedShardForkProofReceived {
+        /// The fork evidence off the wire.
+        proof: Box<ShardForkProof>,
+    },
+
     /// Transaction-root verification completed for a pending block.
     /// On success the payload carries the verified root (predicate
     /// includes per-tx validity-window checks against the parent QC's

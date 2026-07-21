@@ -83,6 +83,7 @@ where
             | Action::SignAndBroadcastTimeout { .. }
             | Action::SignAndBroadcastReadySignal { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
+            | Action::BroadcastShardForkProof { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. }
             | Action::SignAndBroadcastPcVote1 { .. }

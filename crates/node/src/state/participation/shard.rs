@@ -65,8 +65,8 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, TopologySchedule, Verifiable,
-    Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
+    TopologySchedule, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -223,31 +223,112 @@ impl ShardParticipation {
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
                 .on_finalized_waves_admitted(topology_schedule, &waves),
+            // Locally assembled from already-verified headers — engage the
+            // fence and re-gossip directly (no re-verification needed).
             ProtocolEvent::ShardForkDetected { proof } => {
-                // Locally assembled from already-verified headers — the
-                // fence and re-gossip land in the next phase; for now record
-                // that the committee is provably forked.
-                tracing::error!(
-                    shard = proof.shard().inner(),
-                    height = proof.height().inner(),
-                    "shard fork proven: committee committed two chains at one height"
-                );
-                Vec::new()
+                self.on_fork_proven(topology_schedule, *proof)
             }
+            // A peer's proof finished verification: fence + re-gossip on a
+            // real verdict, discard a forgery.
             ProtocolEvent::ShardForkProofVerified { proof, verified } => {
                 if verified {
-                    tracing::error!(
-                        shard = proof.shard().inner(),
-                        height = proof.height().inner(),
-                        "shard fork proof verified from a peer"
-                    );
+                    self.on_fork_proven(topology_schedule, *proof)
                 } else {
                     tracing::warn!("discarding a shard fork proof that failed verification");
+                    Vec::new()
                 }
-                Vec::new()
+            }
+            // A gossiped proof: resolve committees from the local schedule
+            // and dispatch off-thread verification (self-authenticating, no
+            // sender trust).
+            ProtocolEvent::UnverifiedShardForkProofReceived { proof } => {
+                self.on_unverified_fork_proof(topology_schedule, *proof)
             }
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
+    }
+
+    /// A shard fork is locally proven (assembled here, or a peer's proof
+    /// verified). Engage the local provisional fence on every consuming
+    /// coordinator and re-gossip the proof — once per forked shard. A
+    /// second proof for an already-fenced shard is a no-op.
+    ///
+    /// The fence is gossip-timed, so it may not touch block validity (an
+    /// honest committee whose replicas hear the proof at different times
+    /// would fork if it did): it only quiesces the local node — provisions
+    /// from the forked shard above the fork height are dropped so no block
+    /// depending on them assembles (the replica abstains), the mempool
+    /// stops admitting transactions bound to it, and its headers stop
+    /// promoting. The beacon-attested `ShardRecovery` fold supersedes it.
+    fn on_fork_proven(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        proof: ShardForkProof,
+    ) -> Vec<Action> {
+        let shard = proof.shard();
+        let fork_height = proof.height();
+
+        // One fence per forked shard; a later proof only re-engages if it
+        // fences a strictly lower height.
+        if self
+            .fork_fenced_shards
+            .get(&shard)
+            .is_some_and(|&existing| existing <= fork_height)
+        {
+            return Vec::new();
+        }
+        self.fork_fenced_shards.insert(shard, fork_height);
+
+        tracing::error!(
+            shard = shard.inner(),
+            height = fork_height.inner(),
+            "shard fork proven — engaging local fence and re-gossiping"
+        );
+
+        let mut actions = self
+            .provisions_coordinator
+            .engage_fork_fence(shard, fork_height);
+        self.remote_headers_coordinator
+            .engage_fork_fence(shard, fork_height);
+        self.mempool_coordinator.engage_fork_fence(shard);
+        // A fenced provision might already sit in a proposal the shard is
+        // waiting to complete; nudge the proposer to re-evaluate without it.
+        self.shard_coordinator.queue_ready_proposal();
+        let _ = topology_schedule;
+
+        actions.push(Action::BroadcastShardForkProof {
+            proof: Box::new(proof),
+        });
+        actions
+    }
+
+    /// A fork proof arrived over gossip. Dedup against the already-fenced
+    /// shards, then resolve committees from the local schedule and dispatch
+    /// off-thread verification (the proof self-authenticates — no sender
+    /// trust). An unresolvable epoch drops the proof; a re-gossip retries.
+    fn on_unverified_fork_proof(
+        &self,
+        topology_schedule: &TopologySchedule,
+        proof: ShardForkProof,
+    ) -> Vec<Action> {
+        if self
+            .fork_fenced_shards
+            .get(&proof.shard())
+            .is_some_and(|&existing| existing <= proof.height())
+        {
+            return Vec::new();
+        }
+        let Some(committees) = proof.resolve_committees(topology_schedule) else {
+            tracing::warn!(
+                shard = proof.shard().inner(),
+                "dropping fork proof whose committees the local schedule cannot resolve"
+            );
+            return Vec::new();
+        };
+        vec![Action::VerifyShardForkProof {
+            proof: Box::new(proof),
+            committees,
+        }]
     }
 
     /// Validate in-flight before letting shard ingest a received header.
@@ -400,10 +481,12 @@ mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
     use hyperscale_types::test_utils::{certify, make_live_block, test_transaction};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp,
-        MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
-        Round, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WitnessSources,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
+        BlockManifest, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+        CommitProof, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, MerkleInclusionProof,
+        ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
+        RETENTION_HORIZON, Round, ShardForkProof, ShardId, StateRoot, TransactionRoot,
+        TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WitnessSources,
     };
 
     use crate::state::test_support::TestNode;
@@ -508,6 +591,106 @@ mod tests {
             node.provisions_coordinator().verified_remote_header_count(),
             1,
             "the commit-proven header must be recorded for provision verification",
+        );
+    }
+
+    /// A minimal certified header (dummy QC) on `shard` — enough for the
+    /// orchestration paths that read only `shard`/`height`, not the crypto.
+    fn dummy_header(
+        shard: ShardId,
+        height: u64,
+        round: u64,
+        parent: BlockHash,
+        salt: u64,
+    ) -> CertifiedBlockHeader {
+        let h = BlockHeight::new(height);
+        let header = BlockHeader::new(
+            shard,
+            h,
+            parent,
+            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(salt),
+            Round::new(round),
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            None,
+            None,
+        );
+        CertifiedBlockHeader::new(header, QuorumCertificate::genesis(shard, ChainOrigin::ROOT))
+    }
+
+    /// A `ConflictingCommits` on `shard` forked at height 5. The dummy QCs
+    /// do not verify — sufficient for the `ShardForkDetected` path, which
+    /// trusts locally-assembled evidence.
+    fn make_fork_proof(shard: ShardId) -> ShardForkProof {
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"fork-parent"));
+        ShardForkProof::ConflictingCommits {
+            a: CommitProof::direct(
+                dummy_header(shard, 5, 5, parent, 1),
+                dummy_header(
+                    shard,
+                    6,
+                    6,
+                    dummy_header(shard, 5, 5, parent, 1).block_hash(),
+                    2,
+                ),
+            ),
+            b: CommitProof::direct(
+                dummy_header(shard, 5, 7, parent, 3),
+                dummy_header(
+                    shard,
+                    6,
+                    8,
+                    dummy_header(shard, 5, 7, parent, 3).block_hash(),
+                    4,
+                ),
+            ),
+        }
+    }
+
+    /// A locally-assembled fork engages the fence and re-gossips exactly
+    /// once per forked shard.
+    #[test]
+    fn shard_fork_detected_engages_fence_and_regossips_once() {
+        let TestNode { mut node, .. } = TestNode::builder().build();
+        let forked = ShardId::leaf(1, 1);
+        let proof = make_fork_proof(forked);
+
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ShardForkDetected {
+                proof: Box::new(proof.clone()),
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
+            "a newly proven fork must re-gossip",
+        );
+
+        let again = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ShardForkDetected {
+                proof: Box::new(proof),
+            },
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
+            "an already-fenced shard is not re-gossiped",
         );
     }
 

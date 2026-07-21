@@ -27,8 +27,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, Signed, SignedContext,
-    ValidatorId, Verifiable,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, ShardForkProof, Signed,
+    SignedContext, ValidatorId, Verifiable,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -56,6 +56,19 @@ where
         if self.io.consensus.certified_header_batch.push(item, now) {
             self.flush_certified_header_verifications();
         }
+    }
+
+    /// A self-authenticating fork proof arrived over gossip. No sender
+    /// signature to batch — hand the proof straight to the state machine,
+    /// which re-verifies it against the local topology and fences.
+    pub(crate) fn handle_shard_fork_proof_gossip_received(&self, proof: &ShardForkProof) {
+        push_protocol_event(
+            self.event_sender(),
+            self.shard,
+            ProtocolEvent::UnverifiedShardForkProofReceived {
+                proof: Box::new(proof.clone()),
+            },
+        );
     }
 
     /// Flush accumulated certified header sender-signature verifications.

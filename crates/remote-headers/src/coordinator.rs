@@ -138,6 +138,15 @@ pub struct RemoteHeaderCoordinator {
     /// genuine forks (a Byzantine event), so it is not WT-pruned.
     forks_emitted: HashSet<(ShardId, BlockHeight)>,
 
+    /// Gossip-timed local fork fences, `shard → frontier`. A verified fork
+    /// proof engages one at `fork_height − 1`, stopping the
+    /// `RemoteHeaderCommitted` promotion for that shard *at or above* the
+    /// forked height — so no consumer opens a fenced block's provisions or
+    /// execution certificates. Provisional: cleared once the attested
+    /// recovery for the shard folds, which then governs. Empty under honest
+    /// operation.
+    fork_fences: HashMap<ShardId, BlockHeight>,
+
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
@@ -188,6 +197,7 @@ impl RemoteHeaderCoordinator {
             proven: HashSet::new(),
             fork_siblings: HashMap::new(),
             forks_emitted: HashSet::new(),
+            fork_fences: HashMap::new(),
             tips: HashMap::new(),
             expected: BTreeMap::new(),
             local_committed_height: BlockHeight::new(0),
@@ -570,6 +580,13 @@ impl RemoteHeaderCoordinator {
 
         self.refresh_expected(topology_schedule);
 
+        // Gossip-timed fork fences self-clear once the attested recovery for
+        // their shard folds — the attested `lookup_for_shard_certified_fenced`
+        // admission gate then governs.
+        let head = topology_schedule.head();
+        self.fork_fences
+            .retain(|shard, _| !head.pending_recoveries().contains_key(shard));
+
         // Check for timed-out remote shards.
         let mut actions = vec![];
         let now = self.local_committed_ts;
@@ -870,6 +887,30 @@ impl RemoteHeaderCoordinator {
         }
     }
 
+    /// Engage the gossip-timed fork fence for `shard`: stop promoting its
+    /// blocks *at or above* `fork_height` — no `RemoteHeaderCommitted`, so
+    /// no consumer opens a fenced block's provisions or execution
+    /// certificates. The frontier sits one below the fork height so the
+    /// `> frontier` check covers the forked height itself (both conflicting
+    /// blocks live there). Idempotent; never loosens an existing fence.
+    pub fn engage_fork_fence(&mut self, shard: ShardId, fork_height: BlockHeight) {
+        let frontier = BlockHeight::new(fork_height.inner().saturating_sub(1));
+        match self.fork_fences.get(&shard) {
+            Some(&existing) if existing <= frontier => {}
+            _ => {
+                self.fork_fences.insert(shard, frontier);
+            }
+        }
+    }
+
+    /// Whether `(shard, height)` is under a local gossip-timed fork fence —
+    /// content at or above the forked height, held back from promotion.
+    fn fork_fenced(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.fork_fences
+            .get(&shard)
+            .is_some_and(|&frontier| height > frontier)
+    }
+
     /// Record a verified fork sibling and check whether it completes a fork
     /// proof. The sibling lost the canonical [`Self::verified`] slot to a
     /// first-seen different-hash header, so it lives here until both fork
@@ -1031,9 +1072,15 @@ impl RemoteHeaderCoordinator {
                 block_hash = %hash,
                 "Remote header commit-proven"
             );
-            actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
-                certified_header: Arc::clone(proven_header),
-            }));
+            // A locally fork-fenced height is proven but not promoted: no
+            // `RemoteHeaderCommitted`, so no consumer opens its provisions
+            // or execution certificates. The block stays tracked so the walk
+            // terminates; the attested recovery fence governs once it folds.
+            if !self.fork_fenced(shard, at) {
+                actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
+                    certified_header: Arc::clone(proven_header),
+                }));
+            }
 
             let Some(prev) = at.prev() else { break };
             if self.proven.contains(&(shard, prev)) {
@@ -1853,6 +1900,41 @@ mod tests {
         assert!(
             fork_proofs(&actions).is_empty(),
             "a certified sibling with no committing child is not a fork"
+        );
+    }
+
+    #[test]
+    fn fork_fence_stops_promotion_at_and_above_the_fork_height() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        // Fork at height 5: promotion stops at or above 5.
+        coord.engage_fork_fence(remote, BlockHeight::new(5));
+
+        // A commit-proven header AT the fork height is tracked but not
+        // promoted — no `RemoteHeaderCommitted`, so no consumer opens it.
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        assert!(
+            committed_heights(&actions).is_empty(),
+            "the fenced height must not promote"
+        );
+        assert!(
+            coord.has_commit_proof(remote, BlockHeight::new(5)),
+            "it is still tracked as commit-proven, just held back"
+        );
+
+        // A below-fork commit still promotes normally.
+        let b3 = chain_header(remote, 3, 3, None);
+        let b4 = chain_header(remote, 4, 4, Some(&b3));
+        coord.on_verified_remote_header_received(b3, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(b4, ValidatorId::new(1));
+        assert_eq!(
+            committed_heights(&actions),
+            vec![3],
+            "a below-fork commit promotes"
         );
     }
 }

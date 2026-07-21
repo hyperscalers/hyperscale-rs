@@ -10,7 +10,7 @@ use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage};
-use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
+use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
@@ -972,6 +972,15 @@ where
                 )),
                 sender: ctx.me,
                 sender_signature: sig,
+            };
+            ctx.network.broadcast_global(&gossip);
+        }
+
+        Action::BroadcastShardForkProof { proof } => {
+            // Self-authenticating: gossip the proof unsigned; every recipient
+            // re-verifies it against its own topology.
+            let gossip = ShardForkProofGossip {
+                proof: Arc::from(proof),
             };
             ctx.network.broadcast_global(&gossip);
         }

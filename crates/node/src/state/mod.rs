@@ -338,7 +338,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::FinalizedWavesAdmitted { .. }
             | ProtocolEvent::ReadySignalReceived { .. }
             | ProtocolEvent::ShardForkDetected { .. }
-            | ProtocolEvent::ShardForkProofVerified { .. }) => {
+            | ProtocolEvent::ShardForkProofVerified { .. }
+            | ProtocolEvent::UnverifiedShardForkProofReceived { .. }) => {
                 self.with_shard(move |s, sched| s.handle_shard(sched, evt))
             }
 
