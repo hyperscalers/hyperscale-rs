@@ -1864,14 +1864,10 @@ mod tests {
             1,
             "the completing sibling child assembles the fork"
         );
-        match forks[0] {
-            ShardForkProof::ConflictingCommits { a, b } => {
-                assert_eq!(a.proven_height(), BlockHeight::new(5));
-                assert_eq!(b.proven_height(), BlockHeight::new(5));
-                assert_ne!(a.proven_block_hash(), b.proven_block_hash());
-            }
-            ShardForkProof::BoundaryConflict { .. } => panic!("expected ConflictingCommits"),
-        }
+        let ShardForkProof::ConflictingCommits { a, b } = forks[0];
+        assert_eq!(a.proven_height(), BlockHeight::new(5));
+        assert_eq!(b.proven_height(), BlockHeight::new(5));
+        assert_ne!(a.proven_block_hash(), b.proven_block_hash());
 
         // Re-observing the same conflict does not re-emit — one proof per
         // forked height.
