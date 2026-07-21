@@ -500,6 +500,11 @@ where
                 sender_signature,
             ),
 
+            // ── Shard fork proof (self-authenticating gossip → verify) ──
+            ShardScopedInput::ShardForkProofGossipReceived { proof } => {
+                self.handle_shard_fork_proof_gossip_received(&proof);
+            }
+
             // ── Periodic fetch / sync tick ─────────────────────────────
             ShardScopedInput::FetchTick => self.handle_fetch_tick(),
 

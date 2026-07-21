@@ -10,6 +10,7 @@
 //! headers, then dispatches `VerifyProvisions` to verify the QC signature
 //! once and merkle proofs per state entry against the committed state root.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -130,6 +131,16 @@ pub struct ProvisionCoordinator {
     /// This validator's home shard. Used to gate inbound provisions:
     /// only batches whose target shard matches ours are admitted.
     local_shard: ShardId,
+
+    /// Gossip-timed local fork fences, `source_shard → frontier`. A verified
+    /// [`ShardForkProof`](hyperscale_types::ShardForkProof) engages one at
+    /// `fork_height − 1`, so provisions from that shard *at or above* the
+    /// forked height are dropped like the attested recovery fence — but
+    /// engaged on gossip, not the beacon record. Provisional: cleared once
+    /// the attested [`recovery_fences`](hyperscale_types::TopologySchedule::recovery_fences)
+    /// for the shard folds, which then governs. Empty under honest
+    /// operation.
+    fork_fences: HashMap<ShardId, BlockHeight>,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -178,6 +189,7 @@ impl ProvisionCoordinator {
             queue,
             committed_tombstones: CommittedProvisionTombstones::new(),
             local_shard,
+            fork_fences: HashMap::new(),
         }
     }
 
@@ -283,21 +295,31 @@ impl ProvisionCoordinator {
         // pre-admitted headers must not keep anchoring verification, and
         // queued provisions would only burn proposal rounds. Idempotent —
         // re-running against an already-purged shard removes nothing.
-        for (&shard, recovery) in topology_schedule.head().pending_recoveries() {
-            let frontier = recovery.attested_frontier;
-            self.headers.remove_above(shard, frontier);
-            self.queue.purge_fenced(shard, frontier);
-            let evicted = self.pipeline.purge_fenced(shard, frontier);
-            if !evicted.is_empty() {
-                actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                    hashes: evicted,
-                }));
-            }
-            for (source_shard, block_height) in self.expected.purge_fenced(shard, frontier) {
-                actions.push(Action::AbandonFetch(FetchAbandon::RemoteProvisions {
-                    source_shard,
-                    block_height,
-                }));
+        let recovery_frontiers: Vec<(ShardId, BlockHeight)> = topology_schedule
+            .head()
+            .pending_recoveries()
+            .iter()
+            .map(|(&shard, recovery)| (shard, recovery.attested_frontier))
+            .collect();
+        for (shard, frontier) in recovery_frontiers {
+            actions.extend(self.purge_fenced_shard(shard, frontier));
+        }
+
+        // Gossip-timed fork fences self-clear the moment the attested
+        // recovery for their shard folds — the attested fence then governs.
+        // Until then re-purge idempotently so a late arrival can't slip in
+        // above the fork frontier.
+        let head = topology_schedule.head();
+        let fenced: Vec<(ShardId, BlockHeight)> = self
+            .fork_fences
+            .iter()
+            .map(|(&shard, &frontier)| (shard, frontier))
+            .collect();
+        for (shard, frontier) in fenced {
+            if head.pending_recoveries().contains_key(&shard) {
+                self.fork_fences.remove(&shard);
+            } else {
+                actions.extend(self.purge_fenced_shard(shard, frontier));
             }
         }
 
@@ -310,6 +332,63 @@ impl ProvisionCoordinator {
                 .map(TimeoutEffect::into_fetch_action),
         );
         actions
+    }
+
+    /// Drop every held artifact from `shard` strictly above `frontier` —
+    /// headers, queued provisions, parked bundles, and expectations —
+    /// returning the `AbandonFetch`es for any in-flight fetches this
+    /// stranded. Idempotent; shared by the attested recovery fence and the
+    /// gossip-timed fork fence.
+    fn purge_fenced_shard(&mut self, shard: ShardId, frontier: BlockHeight) -> Vec<Action> {
+        let mut actions = Vec::new();
+        self.headers.remove_above(shard, frontier);
+        self.queue.purge_fenced(shard, frontier);
+        let evicted = self.pipeline.purge_fenced(shard, frontier);
+        if !evicted.is_empty() {
+            actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
+                hashes: evicted,
+            }));
+        }
+        for (source_shard, block_height) in self.expected.purge_fenced(shard, frontier) {
+            actions.push(Action::AbandonFetch(FetchAbandon::RemoteProvisions {
+                source_shard,
+                block_height,
+            }));
+        }
+        actions
+    }
+
+    /// Engage the gossip-timed fork fence for `shard`: content at or above
+    /// `fork_height` is dropped like the attested recovery fence, purging
+    /// what already got through. The frontier is stored one below the fork
+    /// height so the shared `> frontier` checks reject the forked height
+    /// itself (both conflicting blocks live there). Idempotent; a
+    /// lower-or-equal fork height never loosens an existing fence.
+    pub fn engage_fork_fence(&mut self, shard: ShardId, fork_height: BlockHeight) -> Vec<Action> {
+        let frontier = BlockHeight::new(fork_height.inner().saturating_sub(1));
+        match self.fork_fences.get(&shard) {
+            Some(&existing) if existing <= frontier => return Vec::new(),
+            _ => {}
+        }
+        self.fork_fences.insert(shard, frontier);
+        self.purge_fenced_shard(shard, frontier)
+    }
+
+    /// Whether a provision from `(shard, height)` is fenced — by the
+    /// attested recovery record (validity, resolved from the head) or the
+    /// local gossip-timed fork fence (quiesce). Either drops it before
+    /// admission so no block depending on it can assemble.
+    fn is_fenced(
+        &self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> bool {
+        topology_schedule.recovery_fences(shard, height)
+            || self
+                .fork_fences
+                .get(&shard)
+                .is_some_and(|&frontier| height > frontier)
     }
 
     /// Drop every artefact whose deadline has passed `local_committed_ts`.
@@ -439,7 +518,7 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        if topology_schedule.recovery_fences(shard, height) {
+        if self.is_fenced(topology_schedule, shard, height) {
             let hashes = self.pipeline.drain_pending_for_key(key);
             warn!(
                 shard = shard.inner(),
@@ -567,7 +646,7 @@ impl ProvisionCoordinator {
 
         // Recovery fence: provisions from a recovering shard above its
         // attested frontier are rejected network-wide.
-        if topology_schedule.recovery_fences(source_shard, block_height) {
+        if self.is_fenced(topology_schedule, source_shard, block_height) {
             warn!(
                 source_shard = source_shard.inner(),
                 block_height = block_height.inner(),
@@ -669,7 +748,7 @@ impl ProvisionCoordinator {
         // Recovery fence: provisions from a recovering shard above its
         // attested frontier are rejected network-wide — buffering them
         // would park garbage that can never verify.
-        if topology_schedule.recovery_fences(source_shard, block_height) {
+        if self.is_fenced(topology_schedule, source_shard, block_height) {
             warn!(
                 source_shard = source_shard.inner(),
                 block_height = block_height.inner(),
@@ -1200,6 +1279,137 @@ mod tests {
             actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))),
             "purged fetches must be abandoned"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Gossip-timed fork fence
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn fork_fence_drops_at_and_above_fork_and_admits_below() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let source = ShardId::leaf(2, 1);
+        // Fork at height 5: content at or above 5 is fenced.
+        assert!(
+            coordinator
+                .engage_fork_fence(source, BlockHeight::new(5))
+                .is_empty(),
+            "nothing held yet to purge"
+        );
+
+        // At the fork height → dropped (abstention: a block depending on it
+        // can never assemble, so the replica never votes on it).
+        let at_fork = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"at_fork")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(5),
+        );
+        assert!(
+            coordinator
+                .on_state_provisions_received(&sched(), at_fork)
+                .is_empty()
+        );
+        // Above the fork → dropped.
+        let above = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"above")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(9),
+        );
+        assert!(
+            coordinator
+                .on_state_provisions_received(&sched(), above)
+                .is_empty()
+        );
+        assert_eq!(coordinator.memory_stats().pending_provisions, 0);
+
+        // Below the fork — pre-fork history, unaffected — parks normally.
+        let below = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"below")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(4),
+        );
+        coordinator.on_state_provisions_received(&sched(), below);
+        assert_eq!(coordinator.memory_stats().pending_provisions, 1);
+
+        // A different shard is untouched.
+        let other = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"other")),
+            ShardId::leaf(2, 2),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(9),
+        );
+        coordinator.on_state_provisions_received(&sched(), other);
+        assert_eq!(coordinator.memory_stats().pending_provisions, 2);
+    }
+
+    #[test]
+    fn engaging_fork_fence_purges_already_admitted_content() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let source = ShardId::leaf(2, 1);
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"purge_tx"));
+        let header = make_certified_header_committing(
+            source,
+            BlockHeight::new(9),
+            ShardId::leaf(2, 0),
+            &[tx_hash],
+        );
+
+        // A header opened and a bundle parked before the fence engages.
+        deliver_committed_header(&mut coordinator, &header);
+        let parked = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"parked")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(8),
+        );
+        coordinator.on_state_provisions_received(&sched(), parked);
+        assert_eq!(coordinator.verified_remote_header_count(), 1);
+        assert_eq!(coordinator.memory_stats().pending_provisions, 1);
+
+        // Engaging the fence purges everything above the fork frontier.
+        let actions = coordinator.engage_fork_fence(source, BlockHeight::new(5));
+        assert_eq!(coordinator.verified_remote_header_count(), 0);
+        assert_eq!(coordinator.memory_stats().pending_provisions, 0);
+        assert!(actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))));
+    }
+
+    #[test]
+    fn fork_fence_lifts_when_the_attested_recovery_folds() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let source = ShardId::leaf(2, 1);
+        coordinator.engage_fork_fence(source, BlockHeight::new(5));
+
+        // While fenced, an above-fork provision is dropped.
+        let during = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"during")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(6),
+        );
+        assert!(
+            coordinator
+                .on_state_provisions_received(&sched(), during)
+                .is_empty()
+        );
+
+        // The attested recovery for the shard folds — the commit sweep drops
+        // the local fork fence; the attested fence governs thereafter.
+        let recovering = sched_recovering(source, BlockHeight::new(4));
+        coordinator.on_block_committed(&recovering, &make_block(BlockHeight::new(1)));
+
+        // Under a plain schedule (no attested record), the local fence is
+        // gone: the same height now parks instead of being dropped.
+        let after = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"after")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(6),
+        );
+        coordinator.on_state_provisions_received(&sched(), after);
+        assert_eq!(coordinator.memory_stats().pending_provisions, 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

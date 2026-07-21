@@ -309,6 +309,18 @@ pub enum Action {
         certified_header: Verified<CertifiedBlockHeader>,
     },
 
+    /// Broadcast a shard fork proof globally on first local verification.
+    ///
+    /// The proof self-authenticates (it carries the accused committee's own
+    /// QCs), so no signing is needed — the handler wraps it in a
+    /// `ShardForkProofGossip` and gossips it; every recipient re-verifies
+    /// locally. Broadcast once per forked shard so the network converges on
+    /// the fence.
+    BroadcastShardForkProof {
+        /// The self-proving fork evidence to gossip.
+        proof: Box<ShardForkProof>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -1472,6 +1484,7 @@ impl Action {
             | Self::SignAndBroadcastTimeout { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
+            | Self::BroadcastShardForkProof { .. }
             | Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }
             | Self::SignAndBroadcastPcVote3 { .. }
@@ -1545,6 +1558,7 @@ impl Action {
             | Self::BroadcastExecutionCertificate { .. }
             | Self::FetchAndBroadcastProvisions { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
+            | Self::BroadcastShardForkProof { .. }
             | Self::SetTimer { .. }
             | Self::CancelTimer { .. }
             | Self::Continuation(_)
@@ -1653,7 +1667,8 @@ impl Action {
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
             | Self::SignAndBroadcastReadySignal { .. }
-            | Self::BroadcastCertifiedBlockHeader { .. } => ActionOwner::Shard,
+            | Self::BroadcastCertifiedBlockHeader { .. }
+            | Self::BroadcastShardForkProof { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }

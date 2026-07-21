@@ -7,7 +7,9 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
+use hyperscale_types::network::gossip::{
+    CertifiedBlockHeaderGossip, ShardForkProofGossip, TransactionGossip,
+};
 use hyperscale_types::network::notification::beacon::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
@@ -131,6 +133,36 @@ where
                             sender,
                             public_key,
                             sender_signature: gossip.sender_signature,
+                        },
+                    );
+                    GossipVerdict::Accept
+                },
+            );
+
+        // ── shard.fork_proof → ShardScopedInput::ShardForkProofGossipReceived ─
+        //
+        // A self-authenticating fork proof: no sender trust to resolve. The
+        // framework filters out the forked shard, so `target_shard` is a
+        // hosted consumer that fences against it.
+
+        let senders = self.process.shard_event_senders.clone();
+        self.process
+            .network
+            .register_gossip_handler::<ShardForkProofGossip>(
+                move |gossip: ShardForkProofGossip, target_shard: ShardId| -> GossipVerdict {
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&target_shard) else {
+                        warn!(
+                            target_shard = target_shard.inner(),
+                            "Dropping fork proof gossip: shard not hosted"
+                        );
+                        return GossipVerdict::Reject;
+                    };
+                    push_shard_input(
+                        tx,
+                        target_shard,
+                        ShardScopedInput::ShardForkProofGossipReceived {
+                            proof: gossip.proof,
                         },
                     );
                     GossipVerdict::Accept
