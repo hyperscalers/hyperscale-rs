@@ -859,6 +859,7 @@ impl CoordinatorSim {
                 epoch,
                 boundary_qcs,
                 mut equivocations,
+                fork_proofs,
                 recipients,
             } => {
                 // Splice in any test-scheduled equivocations for this epoch
@@ -873,6 +874,7 @@ impl CoordinatorSim {
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
+                    fork_proofs,
                     vrf_proof,
                 )));
                 for rcpt in &recipients {
@@ -910,9 +912,13 @@ impl CoordinatorSim {
                 ) {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
-                    let conflicting = Arc::new(Verified::new_unchecked_for_test(
-                        BeaconProposal::new(BTreeMap::new(), Vec::new(), vrf_proof),
-                    ));
+                    let conflicting =
+                        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                            BTreeMap::new(),
+                            Vec::new(),
+                            BTreeMap::new(),
+                            vrf_proof,
+                        )));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);
                         self.network_q.push_back(Envelope {

@@ -897,6 +897,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     let proposal = BeaconProposal::new(
         std::iter::once((ShardId::ROOT, None)).collect(),
         Vec::new(),
+        std::collections::BTreeMap::new(),
         VrfProof::ZERO,
     );
     let candidate = Arc::new(Verified::<CandidateBeaconBlock>::new_unchecked_for_test(

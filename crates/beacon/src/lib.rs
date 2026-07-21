@@ -16,6 +16,7 @@ pub mod boundary;
 pub mod commit_assembly;
 pub mod coordinator;
 pub mod equivocations;
+pub mod fork_observations;
 pub mod genesis;
 pub mod pc;
 pub mod proposal_pool;

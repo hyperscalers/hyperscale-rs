@@ -176,13 +176,25 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 /// still `OnShard` when the pool derives), and is retained in the
 /// shard's routing view via [`ShardRecovery`] so the incomers can fetch
 /// the halted tip from nodes that hold it.
-pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
+pub(super) fn recover_committees(
+    state: &mut BeaconState,
+    halted: &BTreeSet<ShardId>,
+    forked: &BTreeSet<ShardId>,
+) {
+    // Forked shards re-draw under `Fork` provenance; a shard that both
+    // forked and halted this pass recovers once, as a fork.
+    for &shard in forked {
+        recover_committee(state, shard, RecoveryCause::Fork);
+    }
     for &shard in halted {
-        recover_committee(state, shard);
+        if forked.contains(&shard) {
+            continue;
+        }
+        recover_committee(state, shard, RecoveryCause::Halt);
     }
 }
 
-fn recover_committee(state: &mut BeaconState, shard: ShardId) {
+fn recover_committee(state: &mut BeaconState, shard: ShardId, requested_cause: RecoveryCause) {
     let size = state.chain_config.shard_size as usize;
     // A genesis-born shard that never produced still carries its ZERO
     // placeholder, which the topology snapshot omits — so a fresh committee
@@ -267,22 +279,29 @@ fn recover_committee(state: &mut BeaconState, shard: ShardId) {
 
     // A recovery that itself stalled folds its retention into the new
     // record: every committee that might hold the halted tip stays
-    // routable until the shard commits again.
+    // routable until the shard commits again. Fork provenance is sticky —
+    // a fork recovery that re-stalls and re-draws under a halt trigger
+    // keeps its `Fork` cause, so a proven fork is never downgraded.
     let mut retained = replaced;
+    let mut cause = requested_cause;
     if let Some(prior) = state.pending_recoveries.remove(&shard) {
         retained.extend(prior.retained);
+        if prior.cause == RecoveryCause::Fork {
+            cause = RecoveryCause::Fork;
+        }
     }
     retained.sort_unstable();
     retained.dedup();
     tracing::info!(
         ?shard,
         fresh = ?fresh,
-        "halted shard recovered: committee fully re-drawn from the pool"
+        ?cause,
+        "shard committee fully re-drawn from the pool"
     );
     state.pending_recoveries.insert(
         shard,
         ShardRecovery {
-            cause: RecoveryCause::Halt,
+            cause,
             rotated_at: state.current_epoch,
             retained,
             attested_frontier,
@@ -1631,7 +1650,7 @@ mod tests {
             .copied()
             .collect();
 
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
         let fresh1: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
             .members
             .iter()
@@ -1640,7 +1659,7 @@ mod tests {
         assert!(fresh1.is_disjoint(&old));
 
         state.current_epoch = Epoch::new(40);
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
         let recovery = &state.pending_recoveries[&s0];
         assert_eq!(recovery.rotated_at, Epoch::new(40));
         assert_eq!(
@@ -1703,5 +1722,131 @@ mod tests {
             apply_next_epoch(state, &[]);
         }
         assert_eq!(a, b);
+    }
+
+    // ─── fork-caused recovery ───────────────────────────────────────────────
+
+    /// A fork-caused recovery re-draws the committee under `Fork`
+    /// provenance, retains the replaced committee for routing, and fences at
+    /// the last folded boundary height.
+    #[test]
+    fn fork_recovery_stamps_fork_cause_and_retains_committee() {
+        use hyperscale_types::RecoveryCause;
+
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 4);
+        state.current_epoch = Epoch::new(10);
+        state.boundaries.insert(s0, live_boundary(0));
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        recover_committees(&mut state, &BTreeSet::new(), &BTreeSet::from([s0]));
+
+        let recovery = &state.pending_recoveries[&s0];
+        assert_eq!(recovery.cause, RecoveryCause::Fork);
+        // `live_boundary` sits at height 5 — the last folded boundary.
+        assert_eq!(recovery.attested_frontier, BlockHeight::new(5));
+        assert_eq!(
+            recovery.retained.iter().copied().collect::<BTreeSet<_>>(),
+            old,
+        );
+        let fresh: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+        assert!(fresh.is_disjoint(&old));
+    }
+
+    /// A shard that both forked and halted this pass recovers once, as a
+    /// fork: the fork loop re-draws it and the halt loop skips it.
+    #[test]
+    fn fork_recovery_takes_precedence_over_a_simultaneous_halt() {
+        use hyperscale_types::RecoveryCause;
+
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 4);
+        state.current_epoch = Epoch::new(10);
+        state.boundaries.insert(s0, live_boundary(0));
+        let old: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
+            .members
+            .iter()
+            .copied()
+            .collect();
+
+        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::from([s0]));
+
+        assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
+        // A single re-draw: retention holds exactly the one replaced committee.
+        assert_eq!(
+            state.pending_recoveries[&s0]
+                .retained
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            old,
+        );
+    }
+
+    /// A fork recovery that itself stalls and re-draws under a halt trigger
+    /// keeps its `Fork` provenance — a proven fork is never downgraded.
+    #[test]
+    fn fork_cause_survives_a_stalled_halt_redraw() {
+        use hyperscale_types::RecoveryCause;
+
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 4);
+        state.current_epoch = Epoch::new(10);
+        state.boundaries.insert(s0, live_boundary(0));
+
+        recover_committees(&mut state, &BTreeSet::new(), &BTreeSet::from([s0]));
+        assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
+
+        // Refill the pool so the stalled recovery can re-draw again.
+        for i in 100..104u64 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        state.current_epoch = Epoch::new(20);
+        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
+        assert_eq!(
+            state.pending_recoveries[&s0].cause,
+            RecoveryCause::Fork,
+            "fork provenance is sticky across a stalled halt re-draw",
+        );
+    }
+
+    /// Two replicas fold the same committed fork proof into byte-identical
+    /// fork recoveries.
+    #[test]
+    fn fork_recovery_is_deterministic_across_replicas() {
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        use hyperscale_types::{BeaconProposal, RecoveryCause, VrfProof};
+
+        let s0 = ShardId::leaf(1, 0);
+        let committee = TestCommittee::new(4, 1);
+        let proof = shard_fork_proof(&committee, s0, BlockHeight::new(5));
+        let proposal = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            std::iter::once((s0, proof)).collect(),
+            VrfProof::ZERO,
+        );
+        let proposals = [(ValidatorId::new(0), proposal)];
+
+        let mut a = multi_shard_state(1, 4, 8);
+        let mut b = multi_shard_state(1, 4, 8);
+        for state in [&mut a, &mut b] {
+            state.current_epoch = Epoch::new(10);
+            state.boundaries.insert(s0, live_boundary(0));
+            apply_next_epoch(state, &proposals);
+        }
+        assert_eq!(a, b);
+        assert_eq!(a.pending_recoveries[&s0].cause, RecoveryCause::Fork);
     }
 }
