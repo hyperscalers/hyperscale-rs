@@ -187,6 +187,7 @@ mod tests {
         BeaconProposal::new(
             BTreeMap::new(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::new([seed; VRF_PROOF_BYTES]),
         )
     }

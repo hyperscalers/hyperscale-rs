@@ -337,9 +337,25 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BlockPersisted { .. }
             | ProtocolEvent::FinalizedWavesAdmitted { .. }
             | ProtocolEvent::ReadySignalReceived { .. }
-            | ProtocolEvent::ShardForkDetected { .. }
-            | ProtocolEvent::ShardForkProofVerified { .. }
             | ProtocolEvent::UnverifiedShardForkProofReceived { .. }) => {
+                self.with_shard(move |s, sched| s.handle_shard(sched, evt))
+            }
+
+            // A fork is proven — locally assembled from verified headers, or
+            // a peer's proof that just verified. Feed the proof into the
+            // beacon observation buffer so the next beacon proposal funnels
+            // it into a fork-caused recovery, then let the shard layer engage
+            // its local provisional fence and re-gossip.
+            ProtocolEvent::ShardForkDetected { proof } => {
+                self.beacon_coordinator.observe_fork_proof((*proof).clone());
+                let evt = ProtocolEvent::ShardForkDetected { proof };
+                self.with_shard(move |s, sched| s.handle_shard(sched, evt))
+            }
+            ProtocolEvent::ShardForkProofVerified { proof, verified } => {
+                if verified {
+                    self.beacon_coordinator.observe_fork_proof((*proof).clone());
+                }
+                let evt = ProtocolEvent::ShardForkProofVerified { proof, verified };
                 self.with_shard(move |s, sched| s.handle_shard(sched, evt))
             }
 

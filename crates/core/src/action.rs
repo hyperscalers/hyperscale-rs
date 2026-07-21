@@ -1246,6 +1246,9 @@ pub enum Action {
         /// Equivocation evidence to embed. Raw — built locally from
         /// verified PC votes.
         equivocations: Vec<PcVoteEquivocation>,
+        /// Fork proofs to embed, one per forked shard. Raw — drained from
+        /// the local observation buffer of verified proofs.
+        fork_proofs: BTreeMap<ShardId, ShardForkProof>,
         /// Beacon-committee members the proposal ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,

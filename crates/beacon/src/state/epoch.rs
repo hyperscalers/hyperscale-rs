@@ -9,8 +9,9 @@ use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
     CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
     PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
-    ShardBoundary, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, SlotEffects,
-    SplitChildRoots, TransitionCause, ValidatorId, ValidatorStatus, VrfOutput, WeightedTimestamp,
+    RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
+    ShardWitnessPayload, SlotEffects, SplitChildRoots, TransitionCause, ValidatorId,
+    ValidatorStatus, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -106,6 +107,7 @@ pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
 /// GENESIS` and the first apply is `epoch > GENESIS`, so strict `>` is
 /// the right bound. Tests sometimes skip slots, so we don't require
 /// strict-linear `epoch == current_epoch + 1`.
+#[allow(clippy::too_many_lines)] // sequential epoch-fold pipeline; each step is already a helper
 pub fn apply_epoch(
     state: &mut BeaconState,
     network: &NetworkDefinition,
@@ -184,17 +186,27 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => (&[], TransitionCause::Skip),
     };
 
-    // Fold this epoch's per-shard boundaries and apply their witness
-    // chunks. A `Skip` carries every prior boundary forward untouched (no
-    // record, no miss bump, no witnesses); a Normal epoch records fresh
-    // boundaries, applies each chunk, and bumps the miss counter for any
+    // Ingest fork proofs before the boundary fold; the returned shards are
+    // fenced out of it and re-drawn this pass (see `ingest_fork_proofs`).
+    let fork_recovered = ingest_fork_proofs(state, committed);
+
+    // Fold this epoch's per-shard boundaries and apply their witness chunks.
+    // A `Skip` carries every prior boundary forward untouched; a Normal
+    // epoch records fresh boundaries and bumps the miss counter for any
     // active shard with no qualifying contribution.
     let (mut witness, reveals) = if let ApplyEpochInput::Normal {
         committed,
         shard_contributions,
     } = input
     {
-        record_boundaries(state, network, epoch, committed, shard_contributions)
+        record_boundaries(
+            state,
+            network,
+            epoch,
+            committed,
+            shard_contributions,
+            &fork_recovered,
+        )
     } else {
         (WitnessOutcome::default(), BTreeMap::new())
     };
@@ -252,7 +264,7 @@ pub fn apply_epoch(
             "shard halted: no boundary crossing within the halt threshold"
         );
     }
-    recover_committees(state, &halted_shards);
+    recover_committees(state, &halted_shards, &fork_recovered);
     // Grow any committee a short cohort draw left under `shard_size` back to
     // full strength, now that dissolved predecessors have freed their members.
     top_up_committees(state);
@@ -607,12 +619,60 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
     }
 }
 
+/// Ingest the fork proofs riding this epoch's committed proposals and
+/// mark each forked shard for a fork-caused recovery.
+///
+/// A committed proof is trusted (proposal admission verified it against
+/// the topology schedule, and SPC commits only a 2f+1 quorum, so ≥ f+1
+/// honest verifiers stood behind it), exactly as boundary QCs fold on
+/// trust. Per forked shard, one of two things happens:
+///
+/// - **No recovery pending** — the shard joins the returned set, and the
+///   `recover_committees` pass re-draws its committee and stamps a
+///   `RecoveryCause::Fork` record this same epoch.
+/// - **A recovery already pending** — a `Halt` cause is upgraded to
+///   `Fork` in place (fork provenance dominates); a `Fork` cause is left
+///   as-is, so a repeat proof for an already-recovering shard is
+///   idempotent.
+///
+/// Runs before `record_boundaries`; the returned set fences the forked
+/// shards' own crossings out of the boundary fold this pass so the
+/// retained committee can neither advance the boundary nor clear the
+/// recovery.
+fn ingest_fork_proofs(
+    state: &mut BeaconState,
+    committed: &[(ValidatorId, BeaconProposal)],
+) -> BTreeSet<ShardId> {
+    let mut fresh = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    for (_, proposal) in committed {
+        for shard in proposal.fork_proofs().keys() {
+            if !seen.insert(*shard) {
+                continue;
+            }
+            match state.pending_recoveries.get_mut(shard) {
+                Some(recovery) => {
+                    if recovery.cause == RecoveryCause::Halt {
+                        recovery.cause = RecoveryCause::Fork;
+                    }
+                }
+                None => {
+                    fresh.insert(*shard);
+                }
+            }
+        }
+    }
+    fresh
+}
+
+#[allow(clippy::too_many_lines)] // one pass folding every shard's boundary contribution
 fn record_boundaries(
     state: &mut BeaconState,
     network: &NetworkDefinition,
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
+    fork_recovered: &BTreeSet<ShardId>,
 ) -> (WitnessOutcome, BTreeMap<ShardId, Vec<VrfOutput>>) {
     let windows = state.chain_config.epoch_windows();
     // Bind each contribution to its shard's canonical committed QC — the
@@ -632,6 +692,12 @@ fn record_boundaries(
     // pair.
     let mut terminal_recorded: BTreeSet<ShardId> = BTreeSet::new();
     for (shard, contribution) in shard_contributions {
+        // A shard fork-recovered this pass is frozen: the retained
+        // committee's crossing must not advance the boundary or clear the
+        // recovery. The re-drawn committee's next crossing completes it.
+        if fork_recovered.contains(shard) {
+            continue;
+        }
         let header = &contribution.boundary_header;
         let block_hash = header.hash();
         let Some(qc) = canonical
@@ -766,7 +832,10 @@ fn record_boundaries(
     // boundary belongs to an active shard — except terminal records,
     // whose chains stopped on purpose and are never "missing".
     for (shard, boundary) in &mut state.boundaries {
-        if !refreshed.contains(shard) && boundary.terminal_epoch.is_none() {
+        if !refreshed.contains(shard)
+            && boundary.terminal_epoch.is_none()
+            && !fork_recovered.contains(shard)
+        {
             boundary.consecutive_misses = boundary.consecutive_misses.saturating_add(1);
         }
     }
@@ -1063,9 +1132,10 @@ mod tests {
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee, ShardId,
-        ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots,
-        Stake, StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
-        WeightedTimestamp, compute_merkle_root_with_proof, zero_bls_signature,
+        ShardRecovery, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
+        SplitChildRoots, Stake, StakePoolId, StateRoot, TransactionRoot, TransitionCause,
+        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -1268,6 +1338,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1286,6 +1357,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let recorded = state.boundaries.get(&shard).expect("boundary recorded");
@@ -1303,6 +1375,148 @@ mod tests {
         // Folding the shard's own crossing marks it produced past genesis —
         // the successor-liveness signal the reshape handoff reads.
         assert!(state.advanced.contains(&shard));
+    }
+
+    // ─── fork-caused recovery ───────────────────────────────────────────────
+
+    /// A committed proposal carrying a fork proof for `shard`. The fold
+    /// trusts committed proofs (admission verified them), so the proof need
+    /// not re-verify here; only its shard key drives the recovery.
+    fn fork_committed(shard: ShardId) -> (ValidatorId, BeaconProposal) {
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        let committee = TestCommittee::new(4, 1);
+        let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
+        let fork_proofs = std::iter::once((shard, proof)).collect();
+        let proposal =
+            BeaconProposal::new(BTreeMap::new(), Vec::new(), fork_proofs, VrfProof::ZERO);
+        (ValidatorId::new(0), proposal)
+    }
+
+    fn pending_recovery(cause: RecoveryCause) -> ShardRecovery {
+        ShardRecovery {
+            cause,
+            rotated_at: Epoch::GENESIS,
+            retained: vec![ValidatorId::new(9)],
+            attested_frontier: BlockHeight::GENESIS,
+        }
+    }
+
+    /// A shard with no recovery pending joins the fresh set — the pass that
+    /// re-draws its committee this same epoch. Ingest itself stamps nothing.
+    #[test]
+    fn ingest_fork_proofs_marks_shard_without_recovery_as_fresh() {
+        let mut state = single_pool_state(4);
+        let shard = ShardId::leaf(1, 0);
+        let committed = [fork_committed(shard)];
+        let fresh = ingest_fork_proofs(&mut state, &committed);
+        assert!(fresh.contains(&shard));
+        assert!(state.pending_recoveries.is_empty());
+    }
+
+    /// A fork proof for a shard already under a halt recovery upgrades its
+    /// cause to `Fork` in place — no second re-draw, so the shard is not in
+    /// the fresh set and the record's retention and rotation stand.
+    #[test]
+    fn ingest_fork_proofs_upgrades_pending_halt_to_fork() {
+        let mut state = single_pool_state(4);
+        let shard = ShardId::leaf(1, 0);
+        state
+            .pending_recoveries
+            .insert(shard, pending_recovery(RecoveryCause::Halt));
+        let committed = [fork_committed(shard)];
+        let fresh = ingest_fork_proofs(&mut state, &committed);
+        assert!(!fresh.contains(&shard));
+        let recovery = &state.pending_recoveries[&shard];
+        assert_eq!(recovery.cause, RecoveryCause::Fork);
+        assert_eq!(recovery.retained, vec![ValidatorId::new(9)]);
+        assert_eq!(recovery.rotated_at, Epoch::GENESIS);
+    }
+
+    /// A repeat fork proof for a shard already recovering as a fork is a
+    /// no-op: not fresh, cause unchanged.
+    #[test]
+    fn ingest_fork_proofs_is_idempotent_for_a_pending_fork() {
+        let mut state = single_pool_state(4);
+        let shard = ShardId::leaf(1, 0);
+        state
+            .pending_recoveries
+            .insert(shard, pending_recovery(RecoveryCause::Fork));
+        let committed = [fork_committed(shard)];
+        let fresh = ingest_fork_proofs(&mut state, &committed);
+        assert!(!fresh.contains(&shard));
+        assert_eq!(state.pending_recoveries[&shard].cause, RecoveryCause::Fork);
+    }
+
+    /// A shard fork-recovered this pass has its crossing skipped entirely:
+    /// the retained committee's boundary is not recorded, and the recovery
+    /// it triggered is neither advanced nor cleared. The fresh committee's
+    /// first crossing next epoch is what completes it.
+    #[test]
+    fn record_boundaries_skips_a_fork_recovered_shard() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        // A prior boundary at height 3 backs the pending recovery (so the
+        // horizon GC keeps it) and lets us assert the crossing didn't advance
+        // it.
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"prior")),
+                height: BlockHeight::new(3),
+                weighted_timestamp: WeightedTimestamp::ZERO,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::new(1),
+                consecutive_misses: 0,
+                terminal_epoch: None,
+                terminal_qc_wt: None,
+                settled_waves_root: None,
+                reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
+            },
+        );
+        state
+            .pending_recoveries
+            .insert(shard, pending_recovery(RecoveryCause::Fork));
+
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
+        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
+        let qc = qc_over(&b, 1_500);
+        let proposal = BeaconProposal::new(
+            std::iter::once((shard, Some(qc))).collect(),
+            Vec::new(),
+            BTreeMap::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
+            shard,
+            ShardEpochContribution {
+                boundary_header: b,
+                witnesses: witnesses.into(),
+            },
+        ))
+        .collect();
+
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+            &BTreeSet::from([shard]),
+        );
+
+        // The crossing at height 5 was skipped: the boundary stays at 3.
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(3));
+        assert!(!state.advanced.contains(&shard));
+        assert!(
+            state.pending_recoveries.contains_key(&shard),
+            "the recovery is not cleared by the forked committee's own crossing",
+        );
+        assert!(!state.completed_recoveries.contains_key(&shard));
     }
 
     /// The boundary fold hands the epoch's reveal-leaf outputs to the
@@ -1332,6 +1546,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1350,6 +1565,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let chunk = reveals.get(&shard).expect("reveals collected");
@@ -1379,6 +1595,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1390,7 +1607,14 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, &net(), Epoch::new(1), &committed, &fresh);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            &committed,
+            &fresh,
+            &BTreeSet::new(),
+        );
         assert_eq!(state.boundaries[&shard].consecutive_misses, 0);
 
         state.pending_recoveries.insert(
@@ -1413,7 +1637,14 @@ mod tests {
             },
         ))
         .collect();
-        record_boundaries(&mut state, &net(), Epoch::new(2), &committed, &refold);
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &refold,
+            &BTreeSet::new(),
+        );
 
         let recorded = &state.boundaries[&shard];
         assert_eq!(
@@ -1465,6 +1696,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1548,6 +1780,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1565,6 +1798,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let projected = state.derive_topology_snapshot(net()).boundary(shard);
@@ -1610,6 +1844,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1628,6 +1863,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         assert_eq!(state.boundaries.get(&shard).unwrap().consecutive_misses, 1,);
@@ -1663,6 +1899,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1688,6 +1925,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contribution_with(&witnesses[..cap]),
+            &BTreeSet::new(),
         );
         let after_1 = state.boundaries.get(&shard).expect("boundary recorded");
         assert_eq!(
@@ -1720,6 +1958,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contribution_with(&witnesses[cap..2 * cap]),
+            &BTreeSet::new(),
         );
         let after_2 = state
             .boundaries
@@ -1742,6 +1981,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contribution_with(&witnesses[2 * cap..]),
+            &BTreeSet::new(),
         );
         let after_3 = state
             .boundaries
@@ -1815,6 +2055,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(reveals.is_empty(), "completing chunk is fenced");
         assert!(!state.pending_recoveries.contains_key(&shard));
@@ -1834,6 +2075,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(reveals.is_empty(), "drain chunk is fenced");
         let record = state.boundaries.get(&shard).expect("boundary kept");
@@ -1859,6 +2101,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert_eq!(
             reveals.get(&shard),
@@ -1885,6 +2128,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         assert_eq!(
@@ -1920,6 +2164,7 @@ mod tests {
             Epoch::new(1),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(reveals.is_empty());
         assert_eq!(
@@ -1946,6 +2191,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(reveals.is_empty(), "carried fence covers the band");
         let record = state.boundaries.get(&shard).expect("record refreshed");
@@ -1961,6 +2207,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert_eq!(
             reveals.get(&shard),
@@ -2057,6 +2304,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2329,6 +2577,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2363,6 +2612,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         for (child, child_root) in [(left, pair.left), (right, pair.right)] {
@@ -2407,6 +2657,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         for child in <[ShardId; 2]>::from(parent.children()) {
@@ -2436,6 +2687,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let record = state.boundaries.get(&parent).expect("record kept");
@@ -2457,7 +2709,14 @@ mod tests {
     fn terminal_records_do_not_bump_misses() {
         let (mut state, parent, _, _) = terminating_state();
 
-        record_boundaries(&mut state, &net(), Epoch::new(2), &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
 
         assert_eq!(state.boundaries.get(&parent).unwrap().consecutive_misses, 0);
     }
@@ -2484,6 +2743,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let record = state.boundaries.get(&parent).expect("lingers mid-drain");
@@ -2506,6 +2766,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let record = state
@@ -2534,6 +2795,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(
             state.boundaries.contains_key(&parent),
@@ -2549,7 +2811,14 @@ mod tests {
         // Advance to an epoch whose window opens past the terminal cut
         // (2000ms at epoch_duration 1000) plus `RETENTION_HORIZON`.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            past,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert!(
             !state.boundaries.contains_key(&parent),
             "terminal record drops past the retention horizon once its children are live",
@@ -2593,7 +2862,14 @@ mod tests {
         // The beacon commits empty well past the horizon: no terminal fold
         // yet, so both children stay on their placeholder anchors.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            past,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert!(
             state.boundaries.contains_key(&parent),
             "an unseeded split parent is held past the horizon",
@@ -2611,7 +2887,14 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
-        record_boundaries(&mut state, &net(), later, &committed, &contributions);
+        record_boundaries(
+            &mut state,
+            &net(),
+            later,
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
 
         for child in <[ShardId; 2]>::from(parent.children()) {
             assert_ne!(
@@ -2634,7 +2917,14 @@ mod tests {
             state.advanced.insert(child);
         }
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
-        record_boundaries(&mut state, &net(), even_later, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            even_later,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         assert!(
             !state.boundaries.contains_key(&parent),
             "the parent drops once its children are live",
@@ -2708,7 +2998,14 @@ mod tests {
         // The beacon commits empty well past the horizon: the parent hasn't
         // composed, so both children's terminal records must be held.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
-        record_boundaries(&mut state, &net(), past, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            past,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         for child in [left, right] {
             assert!(
                 state.boundaries.contains_key(&child),
@@ -2725,7 +3022,14 @@ mod tests {
             .expect("parent placeholder")
             .block_hash = BlockHash::from_raw(Hash::from_bytes(b"composed parent"));
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
-        record_boundaries(&mut state, &net(), later, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            later,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         for child in [left, right] {
             assert!(
                 state.boundaries.contains_key(&child),
@@ -2737,7 +3041,14 @@ mod tests {
         // so the children drop on the next horizon sweep.
         state.advanced.insert(parent);
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
-        record_boundaries(&mut state, &net(), even_later, &[], &BTreeMap::new());
+        record_boundaries(
+            &mut state,
+            &net(),
+            even_later,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
         for child in [left, right] {
             assert!(
                 !state.boundaries.contains_key(&child),
@@ -2768,6 +3079,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
@@ -2878,6 +3190,7 @@ mod tests {
             .into_iter()
             .collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2906,6 +3219,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
@@ -2948,6 +3262,7 @@ mod tests {
             .into_iter()
             .collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2975,6 +3290,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         // The spanning refresh recorded — but as a live refresh, not a
@@ -2997,6 +3313,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((left, Some(qc_over(&coast_header, 2_100)))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3014,6 +3331,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
 
         let anchor = expected_merge_anchor(parent, &coast_header, &rh, 2_000);
@@ -3045,6 +3363,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 Vec::new(),
+                BTreeMap::new(),
                 VrfProof::ZERO,
             );
             let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3078,6 +3397,7 @@ mod tests {
             Epoch::new(2),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(state.boundaries.contains_key(&left), "left held");
         assert_eq!(
@@ -3097,6 +3417,7 @@ mod tests {
             Epoch::new(3),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         let anchor = expected_merge_anchor(parent, &lh, &rh, 2_000);
         assert_eq!(state.boundaries[&parent].block_hash, anchor.hash());
@@ -3115,6 +3436,7 @@ mod tests {
             Epoch::new(4),
             &committed,
             &contributions,
+            &BTreeSet::new(),
         );
         assert!(state.boundaries.contains_key(&left), "left lingers");
         assert!(state.boundaries.contains_key(&right), "right lingers");

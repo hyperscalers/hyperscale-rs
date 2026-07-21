@@ -47,7 +47,7 @@ pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
 pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let sk = keypair(id);
     let proof = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(BTreeMap::new(), Vec::new(), proof)
+    BeaconProposal::new(BTreeMap::new(), Vec::new(), BTreeMap::new(), proof)
 }
 
 /// Build a `BeaconProposal` whose VRF proof has been tampered with so
@@ -57,7 +57,12 @@ pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let p = vrf_proposal(id, epoch);
     let mut bytes = *p.vrf_proof().as_bytes();
     bytes[0] ^= 1;
-    BeaconProposal::new(BTreeMap::new(), Vec::new(), VrfProof::new(bytes))
+    BeaconProposal::new(
+        BTreeMap::new(),
+        Vec::new(),
+        BTreeMap::new(),
+        VrfProof::new(bytes),
+    )
 }
 
 pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
@@ -155,7 +160,7 @@ pub fn vrf_proposal_with_equivocations(
 ) -> BeaconProposal {
     let sk = keypair(id);
     let proof = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(BTreeMap::new(), equivocations, proof)
+    BeaconProposal::new(BTreeMap::new(), equivocations, BTreeMap::new(), proof)
 }
 
 /// Build shard `shard_n`'s boundary block `B` and the witness chunk
@@ -264,6 +269,7 @@ pub fn apply_witness_chunk(
                 BeaconProposal::new(
                     boundary_qcs.clone(),
                     Vec::new(),
+                    BTreeMap::new(),
                     vrf_sign(&keypair(id.inner()), &net(), next_epoch),
                 ),
             )

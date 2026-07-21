@@ -33,16 +33,17 @@ use hyperscale_types::{
     PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
     RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteRecord,
-    RatifyVoteVerifyError, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee,
-    ShardId, ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
-    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
-    SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
-    Verified, Verify, WeightedTimestamp,
+    RatifyVoteVerifyError, RecoveryCause, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT,
+    ShardCommittee, ShardForkProof, ShardId, ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot, ValidatorId,
+    ValidatorStatus, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
 use crate::commit_assembly::{AssemblyDecision, CommitAssembler};
 use crate::equivocations::EquivocationObservations;
+use crate::fork_observations::ForkProofObservations;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::ratify::{RatifyEffect, RatifyTracker};
 use crate::shard_source::ShardSourceTracker;
@@ -203,6 +204,12 @@ pub struct BeaconCoordinator {
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
     equivocations: EquivocationObservations,
+
+    /// Shard fork proofs the local vnode has verified but not yet
+    /// carried into a proposal. Fed from the shard layer's fork
+    /// detection; drained into the next proposal so the fold can stamp a
+    /// fork-caused `ShardRecovery`.
+    fork_proofs: ForkProofObservations,
 
     /// Per-epoch cache of committee members' `BeaconProposal`s.
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
@@ -371,6 +378,7 @@ impl BeaconCoordinator {
             ratify,
             pending_candidate: None,
             equivocations: EquivocationObservations::new(),
+            fork_proofs: ForkProofObservations::new(),
             proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
@@ -926,6 +934,14 @@ impl BeaconCoordinator {
                 );
                 return Vec::new();
             }
+            if !self.fork_proofs_admissible(&upgraded) {
+                trace!(
+                    ?from,
+                    epoch = epoch.inner(),
+                    "BeaconProposalReceived carries an unverifiable fork proof — dropping",
+                );
+                return Vec::new();
+            }
             Arc::new(upgraded)
         };
         if !self.proposal_pool.admit(from, epoch, proposal) {
@@ -986,6 +1002,22 @@ impl BeaconCoordinator {
             .ok()
     }
 
+    /// Every fork proof in `proposal` verifies against the local topology
+    /// schedule. A proof self-authenticates (each side carries the accused
+    /// committee's aggregated signatures), so this re-verifies from scratch
+    /// — the `Verifiable` marker is never trusted to skip the gate, exactly
+    /// as [`boundary::proposal_boundary_qcs_admissible`] treats boundary
+    /// QCs. A proposal carrying an unverifiable or unresolvable proof is
+    /// inadmissible, so the vnode abstains rather than folds it.
+    fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
+        proposal.fork_proofs().iter().all(|(_, proof)| {
+            proof
+                .as_unverified()
+                .verify(&self.topology_schedule)
+                .is_ok()
+        })
+    }
+
     /// Build view 1's local input vector from the current pool view and
     /// drive it into SPC. Caller gates on
     /// [`SpcDriver::should_feed_view_one_input`]; lifts the effects.
@@ -1044,12 +1076,23 @@ impl BeaconCoordinator {
         let recipients = self.spc_recipients();
         let boundary_qcs = boundary::source_boundary_qcs(&self.state, &self.shard_source);
         let equivocations = self.drain_equivocations_for();
+        let fork_proofs = self.fork_proofs.drain_for_proposal();
         vec![Action::BuildAndBroadcastBeaconProposal {
             epoch,
             boundary_qcs,
             equivocations,
+            fork_proofs,
             recipients,
         }]
+    }
+
+    /// Buffer a verified shard fork proof so the next proposal carries it
+    /// into the fold. The proof is already verified by the shard layer
+    /// (assembled locally from verified headers, or checked off-thread on
+    /// gossip receipt); first-wins per shard, so a repeat for an
+    /// already-buffered shard is dropped.
+    pub fn observe_fork_proof(&mut self, proof: ShardForkProof) {
+        self.fork_proofs.observe(proof);
     }
 
     /// Drain observed equivocations for the next proposal, capped at
@@ -1812,6 +1855,15 @@ impl BeaconCoordinator {
                     ..
                 })
             )
+        });
+
+        // A fork proof whose recovery the fold now holds has done its job —
+        // re-proposing it can't advance the recovery further, so drop it.
+        let pending = &self.state.pending_recoveries;
+        self.fork_proofs.prune(|shard| {
+            pending
+                .get(&shard)
+                .is_some_and(|r| r.cause == RecoveryCause::Fork)
         });
 
         // Refresh the head and record the active snapshot for the just-applied
@@ -2778,6 +2830,7 @@ mod tests {
         BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         )
     }
@@ -3519,6 +3572,60 @@ mod tests {
         assert!(coord.proposal_pool.contains(from));
     }
 
+    /// A verified fork proof observed from the shard layer drains into the
+    /// next proposal the coordinator builds.
+    #[test]
+    fn observed_fork_proof_drains_into_the_next_proposal() {
+        use hyperscale_types::BlockHeight;
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+
+        let mut coord = fresh_coord();
+        let committee = TestCommittee::new(4, 1);
+        coord.observe_fork_proof(shard_fork_proof(
+            &committee,
+            ShardId::ROOT,
+            BlockHeight::new(5),
+        ));
+        coord.bootstrap_spc_for_next_epoch();
+
+        let actions = coord.try_propose();
+        let [Action::BuildAndBroadcastBeaconProposal { fork_proofs, .. }] = actions.as_slice()
+        else {
+            panic!("expected BuildAndBroadcastBeaconProposal, got {actions:?}");
+        };
+        assert!(fork_proofs.contains_key(&ShardId::ROOT));
+    }
+
+    /// A peer proposal carrying a fork proof that doesn't verify against the
+    /// local schedule is inadmissible — the vnode abstains rather than pool
+    /// it and fold garbage.
+    #[test]
+    fn proposal_with_an_unverifiable_fork_proof_is_dropped() {
+        use std::collections::BTreeMap;
+
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        use hyperscale_types::{BlockHeight, ShardForkProof, VrfProof};
+
+        let mut coord = fresh_coord();
+        let from = ValidatorId::new(1);
+        // Signed by a committee unrelated to the genesis schedule, so the
+        // QCs fail to authenticate against the resolved committee.
+        let committee = TestCommittee::new(4, 999);
+        let proof = shard_fork_proof(&committee, ShardId::ROOT, BlockHeight::new(5));
+        let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
+            std::iter::once((ShardId::ROOT, proof)).collect();
+        let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            fork_proofs,
+            VrfProof::ZERO,
+        )));
+
+        let actions = coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal);
+        assert!(actions.is_empty());
+        assert!(!coord.proposal_pool.contains(from));
+    }
+
     #[test]
     fn on_proposal_received_drops_non_committee_sender() {
         let mut coord = fresh_coord();
@@ -3554,6 +3661,7 @@ mod tests {
                 epoch,
                 boundary_qcs,
                 equivocations,
+                fork_proofs,
                 recipients,
             },
         ] = actions.as_slice()
@@ -3565,6 +3673,7 @@ mod tests {
         // proposer reports no crossings.
         assert!(boundary_qcs.is_empty());
         assert!(equivocations.is_empty());
+        assert!(fork_proofs.is_empty());
         // Three peers in the n=4 committee (self filtered out).
         assert_eq!(recipients.len(), 3);
         assert!(!recipients.contains(&coord.me));
@@ -3857,6 +3966,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             std::iter::once((ShardId::ROOT, None)).collect(),
             Vec::new(),
+            BTreeMap::new(),
             VrfProof::ZERO,
         );
         let mut elements = vec![PcValueElement::BOTTOM; n];

@@ -18,12 +18,13 @@ use radix_transactions::prelude::PreparationSettings;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
-    CertifiedBlock, ChainOrigin, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-    GlobalReceiptHash, GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition,
-    NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-    ShardId, SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, bls_keypair_from_seed,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof, ExecutionCertificate,
+    ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
+    LocalReceiptRoot, NetworkDefinition, NodeId, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Round, RoutableTransaction, ShardForkProof, ShardId, SignerBitfield,
+    StateRoot, TimestampRange, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash,
+    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate,
+    WaveId, WeightedTimestamp, WitnessSources, block_vote_message, bls_keypair_from_seed,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -413,6 +414,128 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     // commit path stores a verified QC — consumers of committed blocks
     // (e.g. `certified_header()`) rely on that invariant.
     CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(qc))
+}
+
+/// Build a real-BLS [`ShardForkProof::ConflictingCommits`] for `shard` at
+/// `height`, signed by `committee`.
+///
+/// Two direct-commit branches with distinct block hashes (their proposer
+/// timestamps differ), each a round-contiguous two-chain — a self-proving
+/// committee-level fork that verifies against a schedule built from
+/// `committee` (`TopologySchedule::single(committee.topology_snapshot(..))`).
+/// The branches sit at distinct rounds, so no seat signs twice at one
+/// `(height, round)` — a round-invariant proof with no same-round sub-pair.
+#[must_use]
+pub fn shard_fork_proof(
+    committee: &TestCommittee,
+    shard: ShardId,
+    height: BlockHeight,
+) -> ShardForkProof {
+    let parent = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-fixture-parent"));
+    let round_a = Round::new(height.inner().saturating_add(4));
+    let round_b = Round::new(height.inner().saturating_add(6));
+    ShardForkProof::ConflictingCommits {
+        a: direct_commit_proof(committee, shard, height, round_a, parent, 1),
+        b: direct_commit_proof(committee, shard, height, round_b, parent, 2),
+    }
+}
+
+/// A direct-commit [`CommitProof`] for a block at `(height, round)` on
+/// `shard` with a round-contiguous child, signed by `committee`. `salt`
+/// distinguishes sibling branches by varying the proposer timestamp (and
+/// so the block hash).
+#[must_use]
+fn direct_commit_proof(
+    committee: &TestCommittee,
+    shard: ShardId,
+    height: BlockHeight,
+    round: Round,
+    parent: BlockHash,
+    salt: u64,
+) -> CommitProof {
+    let block = certify_header(committee, fork_header(shard, height, round, parent, salt));
+    let child = certify_header(
+        committee,
+        fork_header(
+            shard,
+            height.next(),
+            round.next(),
+            block.block_hash(),
+            salt + 500,
+        ),
+    );
+    CommitProof::direct(block, child)
+}
+
+/// A minimal `BlockHeader` on `shard` distinguished by `salt` (varies the
+/// proposer timestamp, and so the hash). The genesis parent QC carries the
+/// anchor weighted timestamp the fork verifier reads.
+fn fork_header(
+    shard: ShardId,
+    height: BlockHeight,
+    round: Round,
+    parent_block_hash: BlockHash,
+    salt: u64,
+) -> BlockHeader {
+    BlockHeader::new(
+        shard,
+        height,
+        parent_block_hash,
+        QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+        ValidatorId::new(0),
+        ProposerTimestamp::from_millis(salt),
+        round,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        std::collections::BTreeMap::new(),
+        InFlightCount::ZERO,
+        BeaconWitnessRoot::ZERO,
+        BeaconWitnessLeafCount::ZERO,
+        BeaconWitnessLeafCount::ZERO,
+        None,
+        None,
+    )
+}
+
+/// Pair a fork-fixture header with a genuine quorum QC signed by
+/// `committee`, so the resulting two-chain BLS-verifies.
+fn certify_header(committee: &TestCommittee, header: BlockHeader) -> CertifiedBlockHeader {
+    let net = NetworkDefinition::simulator();
+    let block_hash = header.hash();
+    let msg = block_vote_message(
+        &net,
+        header.shard_id(),
+        header.height(),
+        header.round(),
+        &block_hash,
+        &header.parent_block_hash(),
+    );
+    let quorum = committee.quorum_indices();
+    let sigs: Vec<Bls12381G2Signature> = quorum
+        .iter()
+        .map(|&i| committee.keypair(i).sign_v1(&msg))
+        .collect();
+    let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
+    let mut signers = SignerBitfield::new(committee.size());
+    for &i in &quorum {
+        signers.set(i);
+    }
+    let qc = QuorumCertificate::new(
+        block_hash,
+        header.shard_id(),
+        header.height(),
+        header.parent_block_hash(),
+        header.round(),
+        signers,
+        agg,
+        WeightedTimestamp::from_millis(header.height().inner() * 1_000),
+    );
+    CertifiedBlockHeader::new(header, qc)
 }
 
 /// Re-stamp a block's `parent_qc` weighted timestamp, keeping the QC

@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedBTreeMap, BoundedVec, Epoch,
     MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES,
-    PcValueElement, PcVoteEquivocation, QuorumCertificate, ShardId, Verifiable, Verified, Verify,
-    VrfOutput, VrfProof, vrf_output_from_proof, vrf_sign, vrf_verify,
+    PcValueElement, PcVoteEquivocation, QuorumCertificate, ShardForkProof, ShardId, Verifiable,
+    Verified, Verify, VrfOutput, VrfProof, vrf_output_from_proof, vrf_sign, vrf_verify,
 };
 
 /// One committee member's slot submission.
@@ -33,6 +33,12 @@ pub struct BeaconProposal {
     /// coverage is fine.
     boundary_qcs: BoundedBTreeMap<ShardId, Option<Verifiable<QuorumCertificate>>, MAX_SHARDS>,
     equivocations: BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER>,
+    /// Self-authenticating fork proofs the proposer has observed, one per
+    /// forked shard. Each rides as `Verifiable<Box<ShardForkProof>>`:
+    /// wire-decoded proposals land `Unverified`; admission re-verifies
+    /// against the topology schedule and the fold stamps a fork-caused
+    /// `ShardRecovery` for each shard named here.
+    fork_proofs: BoundedBTreeMap<ShardId, Verifiable<Box<ShardForkProof>>, MAX_SHARDS>,
     /// The VRF proof for this slot. The output is `vrf_output()`, a pure
     /// function of the proof — never stored, so it can't disagree.
     vrf_proof: VrfProof,
@@ -48,6 +54,7 @@ impl BeaconProposal {
     pub fn new(
         boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>>,
         equivocations: Vec<PcVoteEquivocation>,
+        fork_proofs: BTreeMap<ShardId, ShardForkProof>,
         vrf_proof: VrfProof,
     ) -> Self {
         Self {
@@ -61,6 +68,11 @@ impl BeaconProposal {
                 .map(Verifiable::from)
                 .collect::<Vec<_>>()
                 .into(),
+            fork_proofs: fork_proofs
+                .into_iter()
+                .map(|(shard, proof)| (shard, Verifiable::from(Box::new(proof))))
+                .collect::<BTreeMap<_, _>>()
+                .into(),
             vrf_proof,
         }
     }
@@ -73,6 +85,7 @@ impl BeaconProposal {
         Self {
             boundary_qcs: BoundedBTreeMap::new(),
             equivocations: BoundedVec::new(),
+            fork_proofs: BoundedBTreeMap::new(),
             vrf_proof,
         }
     }
@@ -96,6 +109,18 @@ impl BeaconProposal {
         &self,
     ) -> &BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
         &self.equivocations
+    }
+
+    /// Fork proofs observed this slot, keyed by forked shard. Each carries
+    /// a `Verifiable` marker; admission re-verifies against the topology
+    /// schedule before the proposal enters the pool, and the fold trusts
+    /// the committed proof (≥ f+1 honest verifiers stood behind it) to
+    /// stamp a fork-caused `ShardRecovery`.
+    #[must_use]
+    pub const fn fork_proofs(
+        &self,
+    ) -> &BoundedBTreeMap<ShardId, Verifiable<Box<ShardForkProof>>, MAX_SHARDS> {
+        &self.fork_proofs
     }
 
     /// VRF output for this slot — `BLAKE3` of the proof, mixed into
@@ -212,9 +237,15 @@ impl Verified<BeaconProposal> {
         epoch: Epoch,
         boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>>,
         equivocations: Vec<PcVoteEquivocation>,
+        fork_proofs: BTreeMap<ShardId, ShardForkProof>,
     ) -> Self {
         let vrf_proof = vrf_sign(sk, network, epoch);
-        Self::new_unchecked(BeaconProposal::new(boundary_qcs, equivocations, vrf_proof))
+        Self::new_unchecked(BeaconProposal::new(
+            boundary_qcs,
+            equivocations,
+            fork_proofs,
+            vrf_proof,
+        ))
     }
 
     /// Rebind the proposal's equivocation list to its marker-upgraded
@@ -281,7 +312,12 @@ mod tests {
     }
 
     fn sample_proposal() -> BeaconProposal {
-        BeaconProposal::new(sample_boundary_qcs(), Vec::new(), VrfProof::new([0xCD; 96]))
+        BeaconProposal::new(
+            sample_boundary_qcs(),
+            Vec::new(),
+            BTreeMap::new(),
+            VrfProof::new([0xCD; 96]),
+        )
     }
 
     #[test]
@@ -320,6 +356,7 @@ mod tests {
         let proposal = BeaconProposal::new(
             sample_boundary_qcs(),
             vec![sample_equivocation()],
+            BTreeMap::new(),
             VrfProof::new([0xCD; 96]),
         );
         let verified = Verified::new_unchecked_for_test(proposal);
