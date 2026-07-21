@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-    CertifiedBeaconBlock, Epoch, EpochWindows, KeptSeat, NetworkDefinition, ObserverSeat,
-    PendingReshape, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON,
-    RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
-    ShardWitnessPayload, SlotEffects, SplitChildRoots, TransitionCause, ValidatorId,
-    ValidatorStatus, VrfOutput, WeightedTimestamp,
+    CertifiedBeaconBlock, Epoch, EpochWindows, JailReason, KeptSeat, NetworkDefinition,
+    ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
+    RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
+    ShardWitnessPayload, SlotEffects, SplitChildRoots, TopologySnapshot, TransitionCause,
+    ValidatorId, ValidatorStatus, Verify, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -24,7 +24,7 @@ use crate::state::committee::{
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
-use crate::state::vrf::filter_and_roll_randomness;
+use crate::state::vrf::{filter_and_roll_randomness, jail_validator};
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
@@ -188,7 +188,7 @@ pub fn apply_epoch(
 
     // Ingest fork proofs before the boundary fold; the returned shards are
     // fenced out of it and re-drawn this pass (see `ingest_fork_proofs`).
-    let fork_recovered = ingest_fork_proofs(state, committed);
+    let fork_recovered = ingest_fork_proofs(state, network, epoch, committed);
 
     // Fold this epoch's per-shard boundaries and apply their witness chunks.
     // A `Skip` carries every prior boundary forward untouched; a Normal
@@ -639,14 +639,33 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 /// shards' own crossings out of the boundary fold this pass so the
 /// retained committee can neither advance the boundary nor clear the
 /// recovery.
+///
+/// A proof carrying a same-round sub-pair also jails the equivocators when
+/// the forked committee is resolvable from current state (the bonus path;
+/// see [`jail_fork_equivocators`]). Fence and re-draw are the reliable,
+/// round-invariant consequence; jailing lands only against an attacker who
+/// left a same-round double-sign.
 fn ingest_fork_proofs(
     state: &mut BeaconState,
+    network: &NetworkDefinition,
+    epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
 ) -> BTreeSet<ShardId> {
     let mut fresh = BTreeSet::new();
     let mut seen = BTreeSet::new();
+    // The pre-recovery snapshot resolves each forked committee's ordering
+    // for jailing; derived once (lazily, only if a same-round pair appears)
+    // so its committee is the one that signed, not the re-drawn successor.
+    let mut snapshot: Option<TopologySnapshot> = None;
     for (_, proposal) in committed {
-        for shard in proposal.fork_proofs().keys() {
+        for (shard, proof) in proposal.fork_proofs().iter() {
+            let proof = proof.as_unverified();
+            if let Some((qc_a, qc_b)) = proof.same_round_conflict() {
+                let snap =
+                    snapshot.get_or_insert_with(|| state.derive_topology_snapshot(network.clone()));
+                jail_fork_equivocators(state, snap, network, *shard, epoch, qc_a, qc_b);
+            }
+            // Recovery classification runs once per shard.
             if !seen.insert(*shard) {
                 continue;
             }
@@ -663,6 +682,69 @@ fn ingest_fork_proofs(
         }
     }
     fresh
+}
+
+/// Jail the seats that double-signed at one `(height, round)` — the
+/// optional, PoP-gated attribution over a fork proof.
+///
+/// `same_round_conflict` hands over two QCs at the same slot with
+/// different block hashes; the intersection of their signer bitfields is
+/// the set of seats that signed both, i.e. equivocated. Bitfield
+/// membership is attributable only under proof of possession (the branch
+/// this codebase enforces at registration), which forecloses the rogue-key
+/// cancellation that would let the intersection name an innocent seat.
+///
+/// The bitfield indexes the shard's consensus committee. That ordering is
+/// resolved from `snapshot` (derived from pre-recovery state) and confirmed
+/// by re-verifying both QCs against it: a pass proves the resolved
+/// committee is the signing committee, so `committee[i]` is the validator
+/// behind bit `i`. A committee that has rotated beyond what current state
+/// resolves fails the re-verify and is left fence-only. The jail is
+/// permanent ([`JailReason::Equivocation`]) and idempotent.
+fn jail_fork_equivocators(
+    state: &mut BeaconState,
+    snapshot: &TopologySnapshot,
+    network: &NetworkDefinition,
+    shard: ShardId,
+    epoch: Epoch,
+    qc_a: &QuorumCertificate,
+    qc_b: &QuorumCertificate,
+) {
+    let committee = snapshot.consensus_committee_for_shard(shard);
+    let Some(public_keys) = committee
+        .iter()
+        .map(|v| snapshot.public_key(*v))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let ctx = QcContext {
+        network,
+        public_keys: &public_keys,
+        quorum_threshold: snapshot.quorum_threshold_for_shard(shard),
+    };
+    if qc_a.verify(&ctx).is_err() || qc_b.verify(&ctx).is_err() {
+        return;
+    }
+    for pos in qc_a
+        .signers()
+        .set_indices()
+        .filter(|&i| qc_b.signers().is_set(i))
+    {
+        let Some(&victim) = committee.get(pos) else {
+            continue;
+        };
+        let already_permanent = matches!(
+            state.validators.get(&victim).map(|r| r.status),
+            Some(ValidatorStatus::Jailed {
+                reason: JailReason::Equivocation,
+                ..
+            })
+        );
+        if !already_permanent {
+            jail_validator(state, victim, JailReason::Equivocation, epoch);
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // one pass folding every shard's boundary contribution
@@ -1127,14 +1209,15 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
         LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee, ShardId,
-        ShardRecovery, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
-        SplitChildRoots, Stake, StakePoolId, StateRoot, TransactionRoot, TransitionCause,
-        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
+        QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee, ShardForkProof,
+        ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+        SignerBitfield, SplitChildRoots, Stake, StakePoolId, StateRoot, TransactionRoot,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
         zero_bls_signature,
     };
 
@@ -1383,7 +1466,7 @@ mod tests {
     /// trusts committed proofs (admission verified them), so the proof need
     /// not re-verify here; only its shard key drives the recovery.
     fn fork_committed(shard: ShardId) -> (ValidatorId, BeaconProposal) {
-        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        use hyperscale_types::test_utils::shard_fork_proof;
         let committee = TestCommittee::new(4, 1);
         let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
         let fork_proofs = std::iter::once((shard, proof)).collect();
@@ -1408,7 +1491,7 @@ mod tests {
         let mut state = single_pool_state(4);
         let shard = ShardId::leaf(1, 0);
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &committed);
+        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
         assert!(fresh.contains(&shard));
         assert!(state.pending_recoveries.is_empty());
     }
@@ -1424,7 +1507,7 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Halt));
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &committed);
+        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
         assert!(!fresh.contains(&shard));
         let recovery = &state.pending_recoveries[&shard];
         assert_eq!(recovery.cause, RecoveryCause::Fork);
@@ -1442,7 +1525,7 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Fork));
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &committed);
+        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
         assert!(!fresh.contains(&shard));
         assert_eq!(state.pending_recoveries[&shard].cause, RecoveryCause::Fork);
     }
@@ -1517,6 +1600,127 @@ mod tests {
             "the recovery is not cleared by the forked committee's own crossing",
         );
         assert!(!state.completed_recoveries.contains_key(&shard));
+    }
+
+    /// A beacon state whose shard-`leaf(1,0)` consensus committee is
+    /// exactly `committee` (matching pubkeys), so a fork proof signed by
+    /// `committee` re-verifies against the state-derived snapshot.
+    fn state_with_shard_committee(committee: &TestCommittee) -> BeaconState {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(committee.size() as u64);
+        let members: Vec<ValidatorId> = (0..committee.size())
+            .map(|i| committee.validator_id(i))
+            .collect();
+        for i in 0..committee.size() {
+            if let Some(rec) = state.validators.get_mut(&committee.validator_id(i)) {
+                rec.pubkey = *committee.public_key(i);
+            }
+        }
+        state.shard_committees.insert(
+            shard,
+            ShardCommittee {
+                members: members.clone(),
+            },
+        );
+        state.shard_consensus_members.insert(shard, members);
+        state
+    }
+
+    fn committed_with(shard: ShardId, proof: ShardForkProof) -> [(ValidatorId, BeaconProposal); 1] {
+        let proposal = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            std::iter::once((shard, proof)).collect(),
+            VrfProof::ZERO,
+        );
+        [(ValidatorId::new(0), proposal)]
+    }
+
+    fn equivocation_jailed(state: &BeaconState, v: u64) -> bool {
+        matches!(
+            state.validators.get(&ValidatorId::new(v)).map(|r| r.status),
+            Some(ValidatorStatus::Jailed {
+                reason: JailReason::Equivocation,
+                ..
+            })
+        )
+    }
+
+    /// A same-round double-sign jails exactly the bitfield intersection —
+    /// seats that signed both branches — and spares the seats that signed
+    /// only one.
+    #[test]
+    fn same_round_fork_jails_exactly_the_bitfield_intersection() {
+        use hyperscale_types::test_utils::shard_fork_proof_same_round;
+
+        let shard = ShardId::leaf(1, 0);
+        let committee = TestCommittee::new(4, 1);
+        let mut state = state_with_shard_committee(&committee);
+        // Branch a signed by {0,1,2}, branch b by {1,2,3}: intersection {1,2}.
+        let proof = shard_fork_proof_same_round(
+            &committee,
+            shard,
+            BlockHeight::new(5),
+            &[0, 1, 2],
+            &[1, 2, 3],
+        );
+        let proposals = committed_with(shard, proof);
+
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+
+        assert!(equivocation_jailed(&state, 1));
+        assert!(equivocation_jailed(&state, 2));
+        assert!(!equivocation_jailed(&state, 0), "signed only branch a");
+        assert!(!equivocation_jailed(&state, 3), "signed only branch b");
+    }
+
+    /// A round-spaced proof leaves no seat signing twice at one round, so it
+    /// fences and re-draws but jails nobody.
+    #[test]
+    fn round_spaced_fork_fences_without_jailing() {
+        use hyperscale_types::test_utils::shard_fork_proof;
+
+        let shard = ShardId::leaf(1, 0);
+        let committee = TestCommittee::new(4, 2);
+        let mut state = state_with_shard_committee(&committee);
+        let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
+        let proposals = committed_with(shard, proof);
+
+        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+
+        assert!(fresh.contains(&shard), "still fences and re-draws");
+        for v in 0..4 {
+            assert!(!equivocation_jailed(&state, v));
+        }
+    }
+
+    /// A same-round proof whose signing committee the current state cannot
+    /// resolve (here, the resolved keys don't authenticate the QCs) fails
+    /// the re-verify and is fence-only — no innocent seat is jailed.
+    #[test]
+    fn same_round_fork_against_unresolvable_committee_is_fence_only() {
+        use hyperscale_types::test_utils::shard_fork_proof_same_round;
+
+        let shard = ShardId::leaf(1, 0);
+        let signing = TestCommittee::new(4, 3);
+        // State resolves the shard to a committee with different keys.
+        let resolved = TestCommittee::new(4, 999);
+        let mut state = state_with_shard_committee(&resolved);
+        let proof = shard_fork_proof_same_round(
+            &signing,
+            shard,
+            BlockHeight::new(5),
+            &[0, 1, 2],
+            &[1, 2, 3],
+        );
+        let proposals = committed_with(shard, proof);
+
+        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+
+        assert!(fresh.contains(&shard), "recovers regardless");
+        for v in 0..4 {
+            assert!(!equivocation_jailed(&state, v));
+        }
     }
 
     /// The boundary fold hands the epoch's reveal-leaf outputs to the

@@ -440,10 +440,35 @@ pub fn shard_fork_proof(
     }
 }
 
+/// Build a real-BLS same-round [`ShardForkProof::ConflictingCommits`] for
+/// `shard` at `height`, with each branch signed by a distinct signer set.
+///
+/// Both branches' certified blocks sit at the same `(height, round)` with
+/// different hashes, so [`ShardForkProof::same_round_conflict`] extracts
+/// the pair and the intersection `signers_a ∩ signers_b` names the seats
+/// that double-signed. `signers_a`/`signers_b` are committee indices; each
+/// must be a valid quorum (`>= committee.quorum_threshold()`) or its QC
+/// won't authenticate.
+#[must_use]
+pub fn shard_fork_proof_same_round(
+    committee: &TestCommittee,
+    shard: ShardId,
+    height: BlockHeight,
+    signers_a: &[usize],
+    signers_b: &[usize],
+) -> ShardForkProof {
+    let parent = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-fixture-parent"));
+    let round = Round::new(height.inner().saturating_add(4));
+    ShardForkProof::ConflictingCommits {
+        a: direct_commit_proof_signed(committee, shard, height, round, parent, 1, signers_a),
+        b: direct_commit_proof_signed(committee, shard, height, round, parent, 2, signers_b),
+    }
+}
+
 /// A direct-commit [`CommitProof`] for a block at `(height, round)` on
-/// `shard` with a round-contiguous child, signed by `committee`. `salt`
-/// distinguishes sibling branches by varying the proposer timestamp (and
-/// so the block hash).
+/// `shard` with a round-contiguous child, signed by `committee`'s minimal
+/// quorum. `salt` distinguishes sibling branches by varying the proposer
+/// timestamp (and so the block hash).
 #[must_use]
 fn direct_commit_proof(
     committee: &TestCommittee,
@@ -453,7 +478,34 @@ fn direct_commit_proof(
     parent: BlockHash,
     salt: u64,
 ) -> CommitProof {
-    let block = certify_header(committee, fork_header(shard, height, round, parent, salt));
+    direct_commit_proof_signed(
+        committee,
+        shard,
+        height,
+        round,
+        parent,
+        salt,
+        &committee.quorum_indices(),
+    )
+}
+
+/// [`direct_commit_proof`] with an explicit signer set for the certified
+/// block (its round-contiguous child keeps the same quorum).
+#[must_use]
+fn direct_commit_proof_signed(
+    committee: &TestCommittee,
+    shard: ShardId,
+    height: BlockHeight,
+    round: Round,
+    parent: BlockHash,
+    salt: u64,
+    signers: &[usize],
+) -> CommitProof {
+    let block = certify_header(
+        committee,
+        fork_header(shard, height, round, parent, salt),
+        signers,
+    );
     let child = certify_header(
         committee,
         fork_header(
@@ -463,6 +515,7 @@ fn direct_commit_proof(
             block.block_hash(),
             salt + 500,
         ),
+        &committee.quorum_indices(),
     );
     CommitProof::direct(block, child)
 }
@@ -502,9 +555,13 @@ fn fork_header(
     )
 }
 
-/// Pair a fork-fixture header with a genuine quorum QC signed by
-/// `committee`, so the resulting two-chain BLS-verifies.
-fn certify_header(committee: &TestCommittee, header: BlockHeader) -> CertifiedBlockHeader {
+/// Pair a fork-fixture header with a genuine QC signed by `committee`'s
+/// `signers` (committee indices), so the resulting two-chain BLS-verifies.
+fn certify_header(
+    committee: &TestCommittee,
+    header: BlockHeader,
+    signers: &[usize],
+) -> CertifiedBlockHeader {
     let net = NetworkDefinition::simulator();
     let block_hash = header.hash();
     let msg = block_vote_message(
@@ -515,15 +572,14 @@ fn certify_header(committee: &TestCommittee, header: BlockHeader) -> CertifiedBl
         &block_hash,
         &header.parent_block_hash(),
     );
-    let quorum = committee.quorum_indices();
-    let sigs: Vec<Bls12381G2Signature> = quorum
+    let sigs: Vec<Bls12381G2Signature> = signers
         .iter()
         .map(|&i| committee.keypair(i).sign_v1(&msg))
         .collect();
     let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
-    let mut signers = SignerBitfield::new(committee.size());
-    for &i in &quorum {
-        signers.set(i);
+    let mut signer_bits = SignerBitfield::new(committee.size());
+    for &i in signers {
+        signer_bits.set(i);
     }
     let qc = QuorumCertificate::new(
         block_hash,
@@ -531,7 +587,7 @@ fn certify_header(committee: &TestCommittee, header: BlockHeader) -> CertifiedBl
         header.height(),
         header.parent_block_hash(),
         header.round(),
-        signers,
+        signer_bits,
         agg,
         WeightedTimestamp::from_millis(header.height().inner() * 1_000),
     );
