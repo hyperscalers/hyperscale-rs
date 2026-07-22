@@ -5,24 +5,26 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
+    Cluster, FaultableCluster, ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
     cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
     cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
-    cross_shard_transaction_da_fetch_fallback, cross_shard_tx, gossip_drop_engages_fetch_fallback,
-    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
-    halted_shard_recovers_by_committee_redraw, halted_shard_straddler_atomic,
-    inter_shard_partition_aborts_waves_at_deadline, isolated_validator_still_settles,
-    livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_seats_full_keeper_committee, merge_straddler_atomic,
+    cross_shard_transaction_da_fetch_fallback, cross_shard_tx, epochs,
+    gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
+    grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
+    halted_shard_straddler_atomic, inter_shard_partition_aborts_waves_at_deadline,
+    isolated_validator_still_settles, livelock_resolves_promptly, liveness_baseline,
+    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
@@ -32,6 +34,9 @@ use hyperscale_scenarios::{
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates,
 };
+use hyperscale_storage::ShardChainReader;
+use hyperscale_types::test_utils::shard_fork_proof_signed_by;
+use hyperscale_types::{BlockHash, BlockHeight, RecoveryCause, ShardId};
 use support::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -225,6 +230,165 @@ fn halted_shard_straddler_atomic_sim() {
         );
         cluster.run_faultable(halted_shard_straddler_atomic);
     }
+}
+
+/// A provable committee-level fork drives the same full re-draw a halt does.
+///
+/// There is no Byzantine consensus stack in the harness to run two live heads
+/// (deferred, as the halt plan defers its local-orphan gap), so the loud path
+/// is exercised by synthesizing a `ConflictingCommits` proof — signed by the
+/// shard's *live* committee keys so it authenticates against the running
+/// topology exactly as an organically assembled one would — and injecting it
+/// on the real gossip ingress. From there it rides the production pipeline:
+/// verify, engage the local fences, re-gossip, the beacon buffers and folds
+/// it, and `RecoveryCause::Fork` re-draws the committee. The fresh committee
+/// resumes and its first crossing clears the record — the same completion a
+/// halt recovery reaches, reached from the fork cause.
+///
+/// The scenario is a forking committee that then goes quiet (the shape the
+/// plan notes collapses into the halt signature): the forked committee is
+/// silenced before the proof lands, so the re-draw's fresh committee resumes a
+/// settled tip rather than racing a still-live honest one — the synthetic
+/// proof stands in for the Byzantine committee a live fork would need, which
+/// stays deferred.
+#[test]
+fn shard_fork_drives_committee_recovery_sim() {
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        11,
+        &halt_recovery_genesis_balances(),
+    );
+    // Grow to two children before injecting the fork. Recovering the sole
+    // ROOT committee would starve beacon epoch production: in a single-shard
+    // topology the beacon committee *is* the ROOT committee, so re-drawing it
+    // leaves no seated validator to ratify the next epoch and the whole chain
+    // wedges. A child fork keeps the beacon — seated across the other active
+    // validators — live to drive the recovery to completion, and is the
+    // realistic shape besides (the loud path funnels a child's fork proof).
+    split_lifecycle(&mut cluster);
+    let (shard, _sibling) = ShardId::ROOT.children();
+
+    // Warm up until the beacon has folded a real boundary for the shard, not
+    // just until it commits a few blocks. The fork-caused re-draw seats the
+    // fresh committee against the shard's attested boundary anchor and skips a
+    // shard still on its genesis ZERO placeholder (a shard that never
+    // produced needs an operator, not a rotation). A committed-height check
+    // alone races ahead of the first epoch crossing's fold, so the proof would
+    // fold while the boundary is still ZERO and the recovery would never arm.
+    assert!(
+        cluster.run_until(epochs(8), |c| c.beacon_state().is_some_and(|s| s
+            .boundaries
+            .get(&shard)
+            .is_some_and(|b| b.block_hash != BlockHash::ZERO))),
+        "the shard must fold a real boundary before the fork is injected"
+    );
+    let frozen = cluster
+        .committed_height(shard)
+        .expect("root committed")
+        .inner();
+    let member = cluster
+        .committee_hosts(shard)
+        .into_iter()
+        .next()
+        .expect("root has a committee host");
+    let member = u32::try_from(member).expect("host index fits a node index");
+
+    // Build a proof that authenticates against the live committee: resolve the
+    // seated committee (and the anchor weighted timestamp that resolves it)
+    // from a real committed tip, sign both branches with those seats' keys,
+    // and confirm it verifies against the running schedule before injecting —
+    // a wrong committee or timestamp would silently never fold.
+    let proof = {
+        let runner = cluster.runner();
+        let vnode = runner
+            .first_vnode_state(member)
+            .expect("committee host runs a vnode");
+        let schedule = vnode.beacon_coordinator().topology_schedule();
+        let storage = runner
+            .hosts_shard(member, shard)
+            .expect("committee host serves the shard");
+        let tip = storage
+            .get_certified_header(storage.committed_height())
+            .expect("committed tip header");
+        let wt = tip.header().parent_qc().weighted_timestamp();
+        let (snapshot, _bridged) = schedule
+            .at_for_shard_certified(shard, wt, wt)
+            .expect("the committed tip's committee resolves");
+        let keys: Vec<_> = snapshot
+            .consensus_committee_for_shard(shard)
+            .iter()
+            .map(|v| {
+                runner
+                    .validator_signing_key(*v)
+                    .expect("seated validator has a signing key")
+            })
+            .collect();
+        let proof = shard_fork_proof_signed_by(&keys, shard, BlockHeight::new(frozen + 1), wt);
+        proof
+            .verify(schedule)
+            .expect("synthesized fork proof verifies against the live schedule");
+        proof
+    };
+
+    // Silence the forked committee before injecting. The synthetic proof
+    // stands in for a Byzantine committee; a live *honest* committee would
+    // keep extending its own chain, and the re-draw seating a second committee
+    // over a still-advancing tip forks the chain for real (a `commit linkage
+    // broken` panic). A forking attacker that then goes quiet — the shape the
+    // plan notes collapses into the halt signature — lets the fresh committee
+    // resume a settled tip, exactly the handover the halt recovery completes.
+    // Cut the committee in half on the consensus channels so neither half
+    // reaches quorum; the global fork-proof gossip below is untouched.
+    let committee = cluster.committee_hosts(shard);
+    let withholding: Vec<usize> = committee[..2].to_vec();
+    let others: Vec<usize> = (0..cluster.host_count())
+        .filter(|h| !withholding.contains(h))
+        .collect();
+    cluster.drop_type_between(&others, &withholding, "block.vote");
+    cluster.run_until(epochs(1), |_| false);
+    cluster.drop_type_between(&withholding, &others, "block.vote");
+    cluster.drop_type_between(&withholding, &others, "block.header");
+    cluster.drop_type_between(&withholding, &others, "shard.timeout");
+    cluster.run_until(epochs(1), |_| false);
+
+    // Inject on the real gossip ingress of a committee member. The fork-proof
+    // gossip is global scope, so the silenced committee still relays it to the
+    // beacon proposers that fold the recovery.
+    cluster.runner_mut().schedule_initial_event(
+        member,
+        Duration::ZERO,
+        HostEvent::shard(
+            shard,
+            ShardScopedInput::ShardForkProofGossipReceived {
+                proof: Arc::new(proof),
+            },
+        ),
+    );
+
+    // The beacon folds a fork-caused recovery.
+    assert!(
+        cluster.run_until(epochs(30), |c| c.beacon_state().is_some_and(|s| s
+            .pending_recoveries
+            .get(&shard)
+            .map(|r| r.cause)
+            == Some(RecoveryCause::Fork))),
+        "the fork proof must fold a RecoveryCause::Fork recovery"
+    );
+
+    // The fresh committee resumes past the fork height, and its first crossing
+    // clears the record.
+    assert!(
+        cluster.run_until(epochs(40), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() > frozen + 1)),
+        "the recovered shard must resume committing under its fresh committee"
+    );
+    assert!(
+        cluster.run_until(epochs(30), |c| c
+            .beacon_state()
+            .is_some_and(|s| !s.pending_recoveries.contains_key(&shard))),
+        "the fresh committee's crossing must clear the fork recovery"
+    );
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's

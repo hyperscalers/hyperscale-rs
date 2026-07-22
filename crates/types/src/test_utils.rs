@@ -594,6 +594,162 @@ fn certify_header(
     CertifiedBlockHeader::new(header, qc)
 }
 
+/// Build a real-BLS [`ShardForkProof::ConflictingCommits`] for `shard` at
+/// `height`, signed by an explicit seated committee.
+///
+/// `committee_keys` are the private keys of the shard's
+/// `consensus_committee_for_shard`, in bitfield order (`committee_keys[p]` is
+/// the seat at bitfield position `p`); every seat signs each branch's
+/// two-chain. Every QC — and both headers' `parent_qc` — carries weighted
+/// timestamp `wt`, so the fork verifier resolves the seated committee
+/// (committee resolution keys on the anchor `parent_qc().weighted_timestamp()`).
+/// The branches sit at distinct rounds: a round-invariant proof with no
+/// same-round sub-pair.
+///
+/// Unlike [`shard_fork_proof`], which signs with a self-contained
+/// [`TestCommittee`], this signs with caller-supplied keys — so a harness can
+/// forge a proof that authenticates against a *running* committee, whose keys
+/// a `TestCommittee` cannot reproduce. `wt` must resolve that committee in the
+/// verifier's schedule; sourcing it from the shard's committed-tip anchor
+/// timestamp guarantees it.
+#[must_use]
+pub fn shard_fork_proof_signed_by(
+    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    shard: ShardId,
+    height: BlockHeight,
+    wt: WeightedTimestamp,
+) -> ShardForkProof {
+    let parent = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-live-parent"));
+    let round_a = Round::new(height.inner().saturating_add(4));
+    let round_b = Round::new(height.inner().saturating_add(6));
+    ShardForkProof::ConflictingCommits {
+        a: live_commit_proof(committee_keys, shard, height, round_a, parent, wt, 1),
+        b: live_commit_proof(committee_keys, shard, height, round_b, parent, wt, 2),
+    }
+}
+
+/// A direct-commit [`CommitProof`] whose two-chain is signed by
+/// `committee_keys` (all seats) at `wt`.
+fn live_commit_proof(
+    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    shard: ShardId,
+    height: BlockHeight,
+    round: Round,
+    parent: BlockHash,
+    wt: WeightedTimestamp,
+    salt: u64,
+) -> CommitProof {
+    let block = live_certify(
+        committee_keys,
+        live_fork_header(shard, height, round, parent, wt, salt),
+        wt,
+    );
+    let child = live_certify(
+        committee_keys,
+        live_fork_header(
+            shard,
+            height.next(),
+            round.next(),
+            block.block_hash(),
+            wt,
+            salt + 500,
+        ),
+        wt,
+    );
+    CommitProof::direct(block, child)
+}
+
+/// A minimal `BlockHeader` on `shard` whose `parent_qc` carries weighted
+/// timestamp `wt` — the anchor the fork verifier resolves the committee by.
+/// `salt` varies the proposer timestamp (and so the hash).
+fn live_fork_header(
+    shard: ShardId,
+    height: BlockHeight,
+    round: Round,
+    parent_block_hash: BlockHash,
+    wt: WeightedTimestamp,
+    salt: u64,
+) -> BlockHeader {
+    BlockHeader::new(
+        shard,
+        height,
+        parent_block_hash,
+        anchor_qc(shard, wt),
+        ValidatorId::new(0),
+        ProposerTimestamp::from_millis(salt),
+        round,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        std::collections::BTreeMap::new(),
+        InFlightCount::ZERO,
+        BeaconWitnessRoot::ZERO,
+        BeaconWitnessLeafCount::ZERO,
+        BeaconWitnessLeafCount::ZERO,
+        None,
+        None,
+    )
+}
+
+/// A placeholder `parent_qc` carrying only a weighted timestamp. The fork
+/// verifier reads `parent_qc().weighted_timestamp()` as the committee anchor
+/// and never authenticates the parent QC itself, so its other fields are
+/// inert.
+fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
+    let zero = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-live-anchor"));
+    QuorumCertificate::new(
+        zero,
+        shard,
+        BlockHeight::new(0),
+        zero,
+        Round::new(0),
+        SignerBitfield::new(0),
+        Bls12381G2Signature([0u8; 96]),
+        wt,
+    )
+}
+
+/// Pair a header with a genuine QC signed by every key in `committee_keys`
+/// (bitfield position `p` set to `committee_keys[p]`'s signature), stamped at
+/// `wt`, so the two-chain BLS-verifies against the seated committee.
+fn live_certify(
+    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    header: BlockHeader,
+    wt: WeightedTimestamp,
+) -> CertifiedBlockHeader {
+    let net = NetworkDefinition::simulator();
+    let block_hash = header.hash();
+    let msg = block_vote_message(
+        &net,
+        header.shard_id(),
+        header.height(),
+        header.round(),
+        &block_hash,
+        &header.parent_block_hash(),
+    );
+    let sigs: Vec<Bls12381G2Signature> = committee_keys.iter().map(|k| k.sign_v1(&msg)).collect();
+    let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
+    let mut signer_bits = SignerBitfield::new(committee_keys.len());
+    for p in 0..committee_keys.len() {
+        signer_bits.set(p);
+    }
+    let qc = QuorumCertificate::new(
+        block_hash,
+        header.shard_id(),
+        header.height(),
+        header.parent_block_hash(),
+        header.round(),
+        signer_bits,
+        agg,
+        wt,
+    );
+    CertifiedBlockHeader::new(header, qc)
+}
+
 /// Re-stamp a block's `parent_qc` weighted timestamp, keeping the QC
 /// genesis-shaped. The commit clock anchors on `parent_qc().weighted_timestamp()`,
 /// so fixtures that want a committed block "at time T" must carry T there.
