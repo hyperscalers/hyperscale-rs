@@ -442,6 +442,19 @@ where
             } => {
                 self.handle_remote_headers_fetch_failed(source_shard, from_height, count, kind);
             }
+            ShardScopedInput::CommitProofResponseReceived {
+                source_shard,
+                from_height,
+                count,
+                headers,
+            } => {
+                self.handle_commit_proof_response_received(
+                    source_shard,
+                    from_height,
+                    count,
+                    headers,
+                );
+            }
             ShardScopedInput::SettledWavesResponseReceived {
                 source_shard,
                 waves,

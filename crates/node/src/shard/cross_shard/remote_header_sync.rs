@@ -80,14 +80,37 @@ where
         count: HeaderFetchCount,
         headers: Vec<CertifiedBlockHeader>,
     ) {
-        // Filter to in-range, in-shard deliveries; deliver each to the
-        // existing verification path and collect the heights for the FSM.
-        // `saturating_add` prevents the `from_height + count` overflow path
-        // when an attacker (or a future caller) supplies values near
-        // `u64::MAX`. The shard filter rejects responses where the
-        // responder served headers from the wrong shard — the responder
-        // gates this too, but defending in depth on the receiver lets us
-        // surface peer misbehavior even if a future serve change drops it.
+        let delivered_heights =
+            self.deliver_fetched_headers(source_shard, from_height, count, headers);
+        let outputs =
+            self.io
+                .cross_shard
+                .remote_header_sync
+                .handle(RemoteHeaderSyncInput::FetchSucceeded {
+                    scope: source_shard,
+                    from: from_height,
+                    count: count.inner(),
+                    delivered_heights,
+                    now: self.now,
+                });
+        self.process_remote_header_sync_outputs(outputs);
+    }
+
+    /// Filter a header-range response to in-range, in-shard deliveries and
+    /// feed each to the existing verification path, returning the heights
+    /// that arrived. `saturating_add` prevents the `from_height + count`
+    /// overflow path when an attacker (or a future caller) supplies values
+    /// near `u64::MAX`. The shard filter rejects responses where the
+    /// responder served headers from the wrong shard — the responder gates
+    /// this too, but defending in depth on the receiver lets us surface
+    /// peer misbehavior even if a future serve change drops it.
+    fn deliver_fetched_headers(
+        &mut self,
+        source_shard: ShardId,
+        from_height: BlockHeight,
+        count: HeaderFetchCount,
+        headers: Vec<CertifiedBlockHeader>,
+    ) -> Vec<BlockHeight> {
         let upper_bound = from_height.inner().saturating_add(count.inner());
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
@@ -119,19 +142,75 @@ where
                 sender: ValidatorId::new(u64::MAX),
             });
         }
+        delivered_heights
+    }
 
-        let outputs =
-            self.io
-                .cross_shard
-                .remote_header_sync
-                .handle(RemoteHeaderSyncInput::FetchSucceeded {
-                    scope: source_shard,
-                    from: from_height,
-                    count: count.inner(),
-                    delivered_heights,
-                    now: self.now,
-                });
-        self.process_remote_header_sync_outputs(outputs);
+    /// Handle `Action::FetchCommitProof`: one targeted range fetch for a
+    /// height the forward sync never reaches (at or below the source
+    /// shard's attested boundary). Stateless on the runner side — a
+    /// transport failure pushes nothing, and the coordinator's commit
+    /// sweep re-issues the fetch until the height proves or ages out.
+    pub(crate) fn process_fetch_commit_proof(
+        &self,
+        source_shard: ShardId,
+        from_height: BlockHeight,
+        count: HeaderFetchCount,
+    ) {
+        let es = self.event_sender().clone();
+        let local_shard = self.shard;
+        let request = GetRemoteHeadersRequest {
+            source_shard,
+            from_height,
+            count,
+        };
+        record_sync_round_started("commit_proof");
+        self.process.network.request(
+            source_shard,
+            None,
+            request,
+            None,
+            Box::new(move |result: Result<GetRemoteHeadersResponse, _>| {
+                match result {
+                    Ok(resp) => {
+                        record_sync_round_completed("commit_proof");
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::CommitProofResponseReceived {
+                                source_shard,
+                                from_height,
+                                count,
+                                headers: resp.headers,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        record_sync_round_retried("commit_proof");
+                        tracing::debug!(
+                            source_shard = source_shard.inner(),
+                            from_height = from_height.inner(),
+                            error = %err,
+                            "commit-proof fetch failed; the commit sweep re-issues it"
+                        );
+                    }
+                }
+                ResponseVerdict::Accept
+            }),
+        );
+    }
+
+    /// A commit-proof range response arrived: feed the headers through the
+    /// shared delivery path. No FSM to notify — proof establishment is
+    /// observed by the remote-header coordinator itself (`try_prove`), and
+    /// its commit sweep stops re-issuing once the height proves.
+    pub(crate) fn handle_commit_proof_response_received(
+        &mut self,
+        source_shard: ShardId,
+        from_height: BlockHeight,
+        count: HeaderFetchCount,
+        headers: Vec<CertifiedBlockHeader>,
+    ) {
+        let _ = self.deliver_fetched_headers(source_shard, from_height, count, headers);
     }
 
     /// Network callback: a range fetch failed.

@@ -1271,14 +1271,32 @@ impl ExecutionCoordinator {
                 .proven_remote
                 .contains_key(&(shard, cert.block_height()))
         {
+            let height = cert.block_height();
             tracing::debug!(
                 shard = shard.inner(),
                 wave = %cert.wave_id(),
-                height = cert.block_height().inner(),
+                height = height.inner(),
                 "Deferring EC until its source block is commit-proven"
             );
             self.pending_ec_verifications.remove(&wire_hash);
             self.unproven_ecs.push(shard, cert);
+            // At or below the shard's attested boundary the height sits
+            // under the remote-header sync anchor — a joiner or a fresh
+            // recovery committee anchors there and syncs only forward, so
+            // no range fetch ever delivers this block's committing
+            // structure. Ask the remote-header coordinator for the commit
+            // proof explicitly; above the boundary the forward sync (or
+            // gossip) delivers it in the ordinary course.
+            if topology_schedule
+                .head()
+                .boundary(shard)
+                .is_some_and(|anchor| height <= anchor.height)
+            {
+                return vec![Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard: shard,
+                    block_height: height,
+                })];
+            }
             return vec![];
         }
 
@@ -3565,6 +3583,58 @@ mod tests {
         );
     }
 
+    /// An EC parked at or below the source shard's attested boundary sits
+    /// under a joiner's remote-header sync anchor, where forward sync
+    /// never delivers the committing structure — parking must request the
+    /// commit proof explicitly. Above the boundary it stays a silent
+    /// defer: gossip or forward sync proves it in the ordinary course.
+    #[test]
+    fn deferred_ec_below_the_attested_boundary_requests_its_commit_proof() {
+        let remote_shard = ShardId::leaf(1, 1);
+        let boundary = BlockHeight::new(10);
+        let topo = make_two_shard_topology_with_boundary(remote_shard, boundary);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+
+        let cert_at = |height: u64| {
+            ExecutionCertificate::new(
+                WaveId::new(
+                    remote_shard,
+                    BlockHeight::new(height),
+                    std::iter::once(ShardId::leaf(1, 0)).collect(),
+                ),
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(
+                    TxHash::from_raw(Hash::from_bytes(&height.to_le_bytes())),
+                    ExecutionOutcome::Aborted,
+                )],
+                zero_bls_signature(),
+                SignerBitfield::new(4),
+            )
+        };
+
+        // At the boundary: below the sync anchor — the defer asks for the
+        // commit proof.
+        let actions = state.on_wave_certificate(&topo, cert_at(10).into());
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard,
+                    block_height,
+                })] if *source_shard == remote_shard && *block_height == boundary
+            ),
+            "a below-anchor defer must request its commit proof, got {actions:?}"
+        );
+
+        // Above the boundary: an ordinary silent defer.
+        let actions = state.on_wave_certificate(&topo, cert_at(11).into());
+        assert!(
+            actions.is_empty(),
+            "an above-anchor defer needs no explicit request, got {actions:?}"
+        );
+    }
+
     /// No pending recovery for the shard: the fence is inert, an EC at any
     /// height dispatches as usual.
     #[test]
@@ -3950,6 +4020,59 @@ mod tests {
             NetworkDefinition::simulator(),
             2,
             ValidatorSet::new(validators),
+        )))
+    }
+
+    /// A two-shard schedule whose head attests `shard`'s boundary at
+    /// `height` — the anchor a joiner's remote-header sync starts from.
+    fn make_two_shard_topology_with_boundary(
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> TopologySchedule {
+        use hyperscale_types::{BeaconWitnessLeafCount, BlockHash, ShardAnchor, StateRoot};
+
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let mut committees = HashMap::new();
+        committees.insert(
+            ShardId::leaf(1, 0),
+            vec![ValidatorId::new(0), ValidatorId::new(1)],
+        );
+        committees.insert(
+            ShardId::leaf(1, 1),
+            vec![ValidatorId::new(2), ValidatorId::new(3)],
+        );
+        let mut boundaries = HashMap::new();
+        boundaries.insert(
+            shard,
+            ShardAnchor {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+                height,
+                weighted_timestamp: WeightedTimestamp::from_millis(1),
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                settled_waves_root: None,
+            },
+        );
+        TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &validator_set,
+            committees.clone(),
+            committees,
+            boundaries,
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
         )))
     }
 
