@@ -1,6 +1,6 @@
-# Hyperscale System Documentation
+# Hyperscale system documentation
 
-Architecture documentation for hyperscale-rs: what the system is, the technical qualities that make it distinctive, and the properties it guarantees. These docs are written to serve three consumers:
+Architecture documentation for hyperscale-rs: what the system is, the technical qualities that make it distinctive, and the properties it guarantees. These docs serve three consumers:
 
 1. **Technical readers** who want the real design without reading the code — each doc is a self-contained narrative with light code anchoring (crate and type names, no line numbers).
 2. **Distillation** — a faithful source from which further-simplified explainers and graphics can be produced.
@@ -24,6 +24,6 @@ Start with the overview; it tells the whole story in five pages and links down.
 
 ## Conventions
 
-- **Invariant IDs** (`INV-<AREA>-<n>`) are stable references. They appear inline in each doc where the property arises and are consolidated in [08-invariants.md](08-invariants.md). Cite them rather than restating properties.
-- **Code anchors** name crates and load-bearing types (e.g. `QuorumCertificate` in `crates/types`, `ReshapeOrchestrator` in `crates/node`). They are entry points for a code dive, not line-precise references.
-- The docs describe the system as designed and built on `main`; known interim gaps are flagged explicitly where they exist (e.g. [04 §5](04-atomic-commitment.md), the register's "known deliberate gaps").
+- **Invariant IDs** (`INV-<AREA>-<n>`) are stable references. They appear inline in each doc where the property arises; the precise statements live once, in [08-invariants.md](08-invariants.md). Cite them rather than restating properties.
+- **Code anchors** name crates and load-bearing types (for example `QuorumCertificate` in `crates/types`, `ReshapeOrchestrator` in `crates/node`). They are entry points for a code dive, not line-precise references.
+- The docs describe the system as designed and built on `main`; known interim gaps are flagged explicitly where they exist (for example [04-atomic-commitment.md](04-atomic-commitment.md) §5, the register's "known deliberate gaps").
