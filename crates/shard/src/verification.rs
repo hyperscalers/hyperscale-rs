@@ -2157,6 +2157,7 @@ mod tests {
             committed_height,
             committed_hash,
             StateRoot::ZERO,
+            None,
             latest_qc,
             pending,
             empty_certified(),

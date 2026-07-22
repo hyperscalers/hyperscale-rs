@@ -86,7 +86,7 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, SafeVoteRegisters,
+    QcVerifyError, QuorumCertificate, RecoveryCause, Round, RoutableTransaction, SafeVoteRegisters,
     ShardVoteEquivocation, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
     TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
     Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
@@ -234,9 +234,25 @@ pub struct ShardCoordinator {
     /// verification delta. Feeds reshape-trigger derivation.
     substate_bytes_frontier: (BlockHeight, u64),
 
+    /// In-flight count carried by the committed tip's header, retained so
+    /// the vote path can check a block extending the pruned tip. `None`
+    /// when the tip's header was never observed (an ordinary restart);
+    /// a snap-synced joiner seeds it from the boundary header so its
+    /// fresh committee's first block is votable.
+    committed_in_flight: Option<InFlightCount>,
+
     /// Latest QC (certifies the latest certified block). Verified at
     /// every adoption gate; the typestate makes that invariant local.
     latest_qc: Option<Verified<QuorumCertificate>>,
+
+    /// The snap-synced boundary anchor's QC, structurally bound to the
+    /// beacon-attested anchor by the bootstrap but not yet BLS-verified.
+    /// Verified against the schedule-resolved committee and adopted as
+    /// `latest_qc` on the first opportunity — the parent QC the fresh
+    /// committee's first block past the anchor extends. Cleared on
+    /// adoption, on verification failure (a Byzantine serving peer's
+    /// forgery), or when any higher QC adopts first.
+    anchor_qc: Option<QuorumCertificate>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
     /// Adopted in `on_block_header` when the header arrives.
@@ -407,7 +423,9 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
+            committed_in_flight: recovered.committed_in_flight,
             latest_qc: recovered.latest_qc,
+            anchor_qc: recovered.anchor_qc,
             deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
             votes: VoteKeeper::new(),
@@ -461,6 +479,7 @@ impl ShardCoordinator {
             self.committed_height,
             self.committed_hash,
             self.committed_state_root,
+            self.committed_in_flight,
             self.latest_qc.as_ref(),
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
@@ -1125,6 +1144,7 @@ impl ShardCoordinator {
 
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
+        self.committed_in_flight = Some(genesis.header().in_flight());
         // A chain's genesis height and clock are per-chain properties: a
         // split child's genesis continues the parent's height line and
         // anchors at its final canonical weighted timestamp (ZERO and
@@ -1839,7 +1859,7 @@ impl ShardCoordinator {
         // from the returned action, so every drop path below must still
         // return `sync_actions` — discarding them leaves the flag set with
         // no fetch ever issued, and the flag blocks any retrigger.
-        let sync_actions = self.absorb_parent_qc_from_header(header);
+        let sync_actions = self.absorb_parent_qc_from_header(topology_schedule, header);
 
         if self.reject_invalid_header(topology_schedule, header) {
             return sync_actions;
@@ -1958,7 +1978,11 @@ impl ShardCoordinator {
     /// Crucially this does NOT return early when sync is needed — we keep
     /// processing the header so the validator can still participate in
     /// consensus at the tip while catching up on historical blocks.
-    fn absorb_parent_qc_from_header(&mut self, header: &BlockHeader) -> Vec<Action> {
+    fn absorb_parent_qc_from_header(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        header: &BlockHeader,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         if header.parent_qc().is_genesis() {
             return actions;
@@ -1970,7 +1994,8 @@ impl ShardCoordinator {
         // requires sync for the full data.
         let have_parent = self.has_complete_block_at_height(parent_height);
 
-        if !have_parent {
+        if !have_parent && !self.fork_refuses_retained_suffix(topology_schedule, header.parent_qc())
+        {
             info!(
                 validator = ?self.me,
                 committed_height = self.committed_height.inner(),
@@ -2006,6 +2031,71 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Verify and adopt the snap-synced anchor QC once the schedule
+    /// resolves its committee. The bootstrap bound the QC to the
+    /// beacon-attested anchor structurally (it certifies the anchor's
+    /// `block_hash`); this closes the aggregate-signature gap before the
+    /// QC becomes `latest_qc` — and thereby the parent QC the fresh
+    /// committee's first block past the anchor extends. An unresolvable
+    /// committee retries on a later call; a verification failure
+    /// discards the QC (a Byzantine serving peer's forgery — a higher
+    /// adopted QC or the halt harvest routes around it); any QC adopted
+    /// first makes it moot.
+    fn try_adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        if self.latest_qc.is_some() {
+            self.anchor_qc = None;
+            return Vec::new();
+        }
+        let Some(qc) = self.anchor_qc.clone() else {
+            return Vec::new();
+        };
+        if qc.is_genesis() {
+            // A genesis anchor needs no adoption: `proposal_parent`'s
+            // chain-origin fallback reconstructs the genesis QC exactly.
+            self.anchor_qc = None;
+            return Vec::new();
+        }
+        // Fork-cause recoveries only. A halt recovery (and any ordinary
+        // anchored join) seeds from the retained committee's signals — the
+        // harvest carries the unique certified tip, and adopting the anchor
+        // QC first would let the fresh committee certify a sibling of real
+        // committed history above the anchor and break commit linkage when
+        // the suffix then syncs in. A forked shard refuses that suffix
+        // wholesale, so the anchor is its one legitimate parent. The QC
+        // stays buffered: a halt recovery upgraded to fork provenance by a
+        // later fold becomes adoptable then.
+        if topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_none_or(|recovery| recovery.cause != RecoveryCause::Fork)
+        {
+            return Vec::new();
+        }
+        let Some(verified) = self.verify_qc_sync(topology_schedule, &qc) else {
+            // Either the committee is unresolvable (beacon behind — keep
+            // the QC and retry) or the signature failed (discard). Split
+            // the cases so a forgery cannot pin retries forever.
+            if self.committee_of_qc(topology_schedule, &qc).is_some() {
+                warn!(
+                    validator = ?self.me,
+                    height = qc.height().inner(),
+                    "Snap-synced anchor QC failed verification — discarding"
+                );
+                self.anchor_qc = None;
+            }
+            return Vec::new();
+        };
+        info!(
+            validator = ?self.me,
+            height = qc.height().inner(),
+            round = qc.round().inner(),
+            "Adopted the snap-synced anchor QC"
+        );
+        self.anchor_qc = None;
+        self.try_adopt_verified_qc(&verified)
     }
 
     /// Adopt `qc` as the new `high_qc` (`latest_qc`) if it sits in a higher
@@ -2523,9 +2613,7 @@ impl ShardCoordinator {
                 let parent_in_flight = if block.header().parent_qc().is_genesis() {
                     Some(InFlightCount::ZERO)
                 } else {
-                    chain
-                        .get_header(block.header().parent_block_hash())
-                        .map(BlockHeader::in_flight)
+                    chain.parent_in_flight_checked(block.header().parent_block_hash())
                 };
                 let finalized_tx_count: u32 = chain.get_pending(block_hash).map_or(0, |p| {
                     p.finalized_waves()
@@ -3914,6 +4002,7 @@ impl ShardCoordinator {
         // committee after it is pruned from `pending_blocks`.
         self.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
+        self.committed_in_flight = Some(block.header().in_flight());
         self.gc_settled_sets();
 
         // Retire the committed block's substate delta into the count
@@ -4217,6 +4306,34 @@ impl ShardCoordinator {
             let (block, _) = certified.into_parts();
             let verified_qc = Verified::<QuorumCertificate>::genesis(shard, self.chain_origin);
             return self.apply_synced_block(block, verified_qc);
+        }
+
+        // A fork-caused recovery pins the seed to the beacon-attested
+        // frontier: the replaced committee provably committed two branches,
+        // so any of its certified blocks above the frontier — anchored and
+        // certified below the recovery bridge — may be either branch, and
+        // admitting one seeds this replica onto an unattestable chain.
+        // Blocks at or below the frontier are common attested history and
+        // stay admissible, as do the fresh committee's own blocks (certified
+        // past the bridge). A halt's unique suffix keeps today's admission.
+        if let Some(recovery) = topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            && recovery.cause == RecoveryCause::Fork
+            && certified.block().height() > recovery.attested_frontier
+            && topology_schedule.recovery_suffix_band(
+                self.local_shard,
+                certified.block().header().parent_qc().weighted_timestamp(),
+                certified.qc().weighted_timestamp(),
+            )
+        {
+            warn!(
+                height = certified.block().height().inner(),
+                frontier = recovery.attested_frontier.inner(),
+                "Rejecting a retained suffix block above the fork recovery frontier"
+            );
+            return vec![];
         }
 
         // The synced block's QC was signed by its own committee,
@@ -4747,6 +4864,32 @@ impl ShardCoordinator {
         }]
     }
 
+    /// Whether a fork-caused recovery refuses `qc` as a sync source: the
+    /// QC names a block above the beacon-attested frontier that the
+    /// replaced committee certified before the re-draw (its weighted
+    /// timestamp resolves below the recovery bridge). A forked retained
+    /// committee provably committed two branches, so such a block may be
+    /// either branch and must not seed this replica; the fresh chain's
+    /// own blocks certify at post-bridge timestamps and pass. Halt
+    /// recoveries keep the full suffix admissible — their retained tip is
+    /// unique.
+    fn fork_refuses_retained_suffix(
+        &self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        let wt = qc.weighted_timestamp();
+        topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_some_and(|recovery| {
+                recovery.cause == RecoveryCause::Fork
+                    && qc.height() > recovery.attested_frontier
+                    && topology_schedule.recovery_suffix_band(self.local_shard, wt, wt)
+            })
+    }
+
     /// Harvest the halted tip from a retained ex-member's timeout while a
     /// recovery is pending on this shard, or `None` when the sender holds
     /// no retained seat (the ordinary outsider drop applies).
@@ -4761,12 +4904,23 @@ impl ShardCoordinator {
     /// target — sync admits the real certified blocks through the normal
     /// verified pipeline, so a fabricated height costs a bounded fetch
     /// round, never state.
+    ///
+    /// The harvest is halt-only. A fork-caused recovery's retained
+    /// committee provably committed two branches, so no retained tip is
+    /// unique: a carried QC may name either branch (above the attested
+    /// frontier, or a losing-branch sibling below it), and adopting one
+    /// would seed the incomers onto divergent chains — the fresh committee
+    /// forks at seed time, or its minority breaks commit linkage. The
+    /// recovery's `attested_frontier` is the one beacon-attested anchor,
+    /// and the relocation snap-sync already seeds it, so a forked shard
+    /// refuses every retained suffix and its first fresh block extends the
+    /// frontier.
     fn harvest_retained_tip(
         &mut self,
         topology_schedule: &TopologySchedule,
         timeout: &Timeout,
     ) -> Option<Vec<Action>> {
-        topology_schedule
+        let recovery = topology_schedule
             .head()
             .pending_recoveries()
             .get(&self.local_shard)
@@ -4775,6 +4929,16 @@ impl ShardCoordinator {
         if carried.height() <= self.committed_height
             || qc_weighted_timestamp_too_far_ahead(carried, self.now)
         {
+            return Some(Vec::new());
+        }
+        if recovery.cause == RecoveryCause::Fork {
+            info!(
+                validator = ?self.me,
+                voter = ?timeout.voter(),
+                carried_height = carried.height().inner(),
+                frontier = recovery.attested_frontier.inner(),
+                "Refusing a retained ex-member's tip on a forked shard; seeding from the attested frontier"
+            );
             return Some(Vec::new());
         }
         info!(
@@ -5150,10 +5314,16 @@ impl ShardCoordinator {
     /// [`BlockSyncManager::health_check`] and translates a trigger into a
     /// `start_sync`.
     pub fn check_sync_health(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        // A snap-synced joiner adopts its anchor QC here — the periodic
+        // entry that always has the schedule in hand — so the fresh
+        // committee holds the parent QC for its first block even when no
+        // peer signal ever supplies a higher one.
+        let mut actions = self.try_adopt_anchor_qc(topology_schedule);
+
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
 
-        match self.block_sync.health_check(
+        let sync_actions = match self.block_sync.health_check(
             self.me,
             self.committed_height,
             self.latest_qc.as_deref(),
@@ -5176,11 +5346,14 @@ impl ShardCoordinator {
                     .is_some()
                     && self.block_sync.sync_applied_height() >= target_height
                 {
-                    return vec![];
+                    vec![]
+                } else {
+                    self.start_block_sync(target_height)
                 }
-                self.start_block_sync(target_height)
             }
-        }
+        };
+        actions.extend(sync_actions);
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -7056,6 +7229,125 @@ mod tests {
             state
                 .on_unverified_timeout(&topology_schedule, &mk(2, round))
                 .is_empty()
+        );
+    }
+
+    /// A retained ex-member's timeout is harvested on a halted shard —
+    /// its carried QC names the tip the fresh committee must extend — but
+    /// refused on a forked one: a forked retained committee has no unique
+    /// tip, so the incomer seeds from the attested frontier alone.
+    #[test]
+    fn retained_tip_harvest_is_refused_for_a_fork_recovery() {
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
+
+        let harvest = |cause: RecoveryCause| {
+            let (mut state, schedule) = make_test_state();
+            let head = schedule.head().as_ref().clone().with_pending_recoveries(
+                std::iter::once((
+                    ShardId::ROOT,
+                    ShardRecovery {
+                        cause,
+                        rotated_at: Epoch::new(2),
+                        retained: vec![ValidatorId::new(9)],
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                ))
+                .collect(),
+            );
+            let schedule = TopologySchedule::single(Arc::new(head));
+            let carried = QuorumCertificate::new(
+                BlockHash::from_raw(Hash::from_bytes(b"retained-tip")),
+                ShardId::ROOT,
+                BlockHeight::new(5),
+                BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
+                Round::new(1),
+                SignerBitfield::new(4),
+                zero_bls_signature(),
+                WeightedTimestamp::ZERO,
+            );
+            let timeout = Timeout::new(
+                &NetworkDefinition::simulator(),
+                ShardId::ROOT,
+                Round::new(2),
+                carried,
+                ValidatorId::new(9),
+                &generate_bls_keypair(),
+            );
+            state.on_unverified_timeout(&schedule, &timeout)
+        };
+
+        assert!(
+            harvest(RecoveryCause::Halt)
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "a halt recovery harvests the retained tip into a sync",
+        );
+        assert!(
+            harvest(RecoveryCause::Fork).is_empty(),
+            "a fork recovery must refuse the retained suffix",
+        );
+    }
+
+    /// A sync-delivered certified block above the fork recovery's attested
+    /// frontier — anchored and certified below the recovery bridge — is
+    /// rejected at admission: the forked retained committee's suffix may
+    /// be either branch. The same block admits for QC verification under a
+    /// halt recovery, whose retained suffix is unique.
+    #[test]
+    fn sync_admission_rejects_the_retained_suffix_above_the_fork_frontier() {
+        use hyperscale_types::test_utils::make_live_block;
+        use hyperscale_types::{CertifiedBlock, RecoveryCause, ShardRecovery};
+
+        let admit = |cause: RecoveryCause| {
+            let (mut state, schedule) = make_test_state();
+            let head = schedule.head().as_ref().clone().with_pending_recoveries(
+                std::iter::once((
+                    ShardId::ROOT,
+                    ShardRecovery {
+                        cause,
+                        rotated_at: Epoch::new(2),
+                        retained: vec![ValidatorId::new(9)],
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                ))
+                .collect(),
+            );
+            let schedule = TopologySchedule::single(Arc::new(head));
+            let block = make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(5),
+                1_000,
+                ValidatorId::new(1),
+                vec![],
+                vec![],
+            );
+            let mut signers = SignerBitfield::new(4);
+            for i in 0..3 {
+                signers.set(i);
+            }
+            let qc = QuorumCertificate::new(
+                block.hash(),
+                ShardId::ROOT,
+                block.height(),
+                block.header().parent_block_hash(),
+                Round::new(5),
+                signers,
+                zero_bls_signature(),
+                WeightedTimestamp::ZERO,
+            );
+            let certified = CertifiedBlock::new_unchecked(block, qc);
+            state.submit_synced_block_for_verification(&schedule, certified)
+        };
+
+        assert!(
+            admit(RecoveryCause::Halt)
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "a halt recovery admits the retained suffix for QC verification",
+        );
+        assert!(
+            admit(RecoveryCause::Fork).is_empty(),
+            "a fork recovery must reject the retained suffix at admission",
         );
     }
 
