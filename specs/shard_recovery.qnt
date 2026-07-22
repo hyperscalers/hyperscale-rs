@@ -2,7 +2,10 @@
 // committee re-draw. The `halt_detection` module checks INV-SEC-9 (halt
 // detection and recovery) and the recovery clause of INV-SEC-2 (rotation
 // never touches a recovering shard); INV-SEC-8, the recovery bridge, is
-// the register row's other half.
+// the register row's other half. The `fork_detection` module checks the
+// active-fork reach: commit-proof consumption (INV-SEC-11), fork-proof
+// soundness (INV-SEC-12), and the commit-level fork fence (INV-SEC-13) for
+// a retained f+1..2f committee running two heads.
 //
 // One subject shard, folded by the committed beacon epoch sequence. The
 // environment plays that sequence: per epoch the shard either contributes
@@ -1225,5 +1228,414 @@ module cross_shard_no_freeze {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
     MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = false
+  ).*
+}
+
+// Active-fork detection and the commit-proof consumption gate — the
+// loud-attacker reach of the fork work, and the fix for the certified-
+// sibling vector docs/05 §1.4 names. A retained f+1..2f committee runs two
+// internally consistent heads and serves each to a different consumer
+// audience; nothing in the halt detector (which watches the quiet
+// watermark) flags it, and pre-spine consumption trusted a bare QC as if
+// it were canonical, so two victims could settle against two mere
+// certifications and never compare them.
+//
+// The spine closes it on the consuming side. Cross-shard consumption
+// requires a COMMIT PROOF of the source block — its committing
+// round-contiguous two-chain, not a bare QC — so a merely-certified
+// sibling is unconsumable and the attacker must actually double-commit to
+// reach two audiences. Two committed chains at one height cannot exist
+// below f+1 corrupt seats (INV-SHARD-1 at the commit level: the two
+// committing quorums intersect in at least 2·QUORUM − SHARD_SIZE seats, and
+// every shared seat co-signed conflicting commits — a lock violation only a
+// corrupt seat commits). The two victims' commit proofs then ARE the
+// evidence: assembled as a `ConflictingCommits`, gossiped network-wide, and
+// folded by the beacon into a fork-caused `ShardRecovery` whose fence is
+// commit-level — no victim consumes either branch's provisions above the
+// attested frontier once it folds the record.
+//
+// This module models the producer (the retained committee emitting commit
+// proofs and bare certs for two branches), the assembly (two committed
+// heads at one height), the arming (the beacon stamps the recovery at the
+// attested frontier), and the consumer fence — the trust surface the
+// commit-proof gate and the fork fence govern. It does NOT re-model shard
+// consensus (Module B derives INV-SHARD-1); the lock discipline appears
+// only as the per-signer guard that makes a conflicting commit pair
+// reachable exactly when the committee is beyond f.
+//
+// Code anchors:
+//   - Evidence: crates/types/src/shard/evidence.rs `ShardForkProof`
+//     (`ConflictingCommits`) over `CommitProof` (a round-contiguous
+//     two-chain plus the parent-hash ancestry link); `verify_resolved`
+//     resolves each QC's committee by WT and BLS-checks it.
+//   - Commit-proof consumption: the remote-header `proven` set and the
+//     `RemoteHeaderCommitted` continuation (crates/remote-headers/src)
+//     gate provision and EC consumption on the source's committing
+//     two-chain; a bare QC alone defers.
+//   - Assembly: crates/remote-headers/src/coordinator.rs `check_fork_at` /
+//     `try_assemble_fork` build a `ConflictingCommits` from two distinct
+//     commit-proven two-chains at one height.
+//   - Fence: crates/node/src/state/participation/shard.rs `on_fork_proven`
+//     engages the provisions/remote-header/mempool fences and re-gossips.
+//   - Funnel: crates/beacon/src/coordinator.rs `fork_proofs_admissible`
+//     re-verifies each proof against the topology schedule at proposal
+//     admission; crates/beacon/src/state/epoch.rs `ingest_fork_proofs`
+//     folds committed proofs into a `RecoveryCause::Fork` record before
+//     `record_boundaries`. The fence cutoff is the record's
+//     `attested_frontier` (crates/types/src/beacon/state.rs) = the last
+//     folded boundary.
+//
+// Properties:
+//   invHonestNoProof — a `ConflictingCommits` assembles only from a
+//                      beyond-f committee: two committed heads at one height
+//                      force at least 2·QUORUM − SHARD_SIZE corrupt seats,
+//                      so an honest-majority committee never generates a
+//                      fork proof (INV-SEC-12; INV-SHARD-1 at the commit
+//                      level). The `fork_detection_honest` control has ≤ f
+//                      corrupt and never arms a recovery.
+//   invNoCertifiedSibling — no victim consumes a merely-certified sibling
+//                      (a bare QC with no committing two-chain): the
+//                      certified-sibling vector is empty under commit-proof
+//                      consumption (INV-SEC-11). The `fork_detection_bare_qc`
+//                      twin consumes against a bare QC and violates it.
+//   invForkFenceHolds — once a victim has folded the recovery it consumes
+//                      neither branch's provisions above the attested
+//                      frontier: the fork fence is commit-level and never
+//                      retreats (INV-SEC-13, extending `cross_shard_freeze`
+//                      from finalization to commit). The
+//                      `fork_detection_no_fence` twin violates it.
+//   invArmingIdempotent — the fork recovery is stamped once at the attested
+//                      frontier and never moves, however many proofs arrive
+//                      (INV-SEC-14, cause-neutral arming).
+//
+// Modeling assumptions:
+//   - Honest signers obey the safe-vote lock (INV-SHARD-3): a seat never
+//     co-signs committed blocks on two branches at one height. This is the
+//     only consensus rule imported; whether the corrupt set suffices to
+//     span the quorum intersection is left to the checker, so
+//     invHonestNoProof is a reachability result, not a definitional guard.
+//   - The retained committee is an oracle for its own branches: it emits
+//     any commit proof or bare cert its corruption level allows. Consumer
+//     fold lag is free — a victim that has not folded the record still
+//     consumes above the frontier, so the residual is exactly the detection
+//     window (the accepted post-hoc suppressor bound, one epoch).
+//   - The attested frontier is the last folded boundary and does not
+//     retreat; the fork fence caps consumption there, so a pre-fold
+//     consumption is the irreducible residual and no new consumption
+//     crosses the cut post-fold.
+//
+// Run:
+//   quint typecheck specs/shard_recovery.qnt
+//   quint test --main=fork_detection_ok specs/shard_recovery.qnt
+//   quint verify --main=fork_detection_ok --invariant=invAll --max-steps=8 specs/shard_recovery.qnt
+//     (holds: a fork assembles only beyond f, the certified sibling is
+//      unconsumable, the commit-level fence holds, and arming is idempotent)
+//   quint verify --main=fork_detection_bare_qc --invariant=invNoCertifiedSibling --max-steps=8 specs/shard_recovery.qnt
+//     (bare-QC consumption; expect a counterexample — a merely-certified
+//      sibling that never commits is consumed)
+//   quint verify --main=fork_detection_no_fence --invariant=invForkFenceHolds --max-steps=8 specs/shard_recovery.qnt
+//     (the unfenced counterfactual; expect a counterexample — a folded
+//      victim consumes a branch above the attested frontier)
+//   quint verify --main=fork_detection_honest --invariant=invAll --max-steps=8 specs/shard_recovery.qnt
+//     (the honest-majority control; no fork assembles, no recovery arms)
+
+module fork_detection {
+  // Committee size (production 128; model scale). SHARD_SIZE = 3f + 1.
+  const SHARD_SIZE: int
+  // Quorum threshold (2f + 1).
+  const QUORUM: int
+  // The retained committee and its corrupt subset. In the attack instance
+  // the corrupt subset is f+1..2f — enough to span the quorum intersection
+  // and double-commit; in the control it is at most f.
+  const OLD: Set[int]
+  const OLD_BYZ: Set[int]
+  // The beacon-attested frontier = the last folded boundary. Provisions
+  // above it are fenced once a victim folds the recovery.
+  const FRONTIER: int
+  const MAX_HEIGHT: int
+  // Broken twin: consume against a bare QC, not a commit proof — the
+  // pre-spine gate. True is the shipped commit-proof consumption.
+  const COMMIT_PROOF_CONSUMPTION: bool
+  // Broken twin: no commit-level fork fence. True is the shipped fence.
+  const FORK_FENCE: bool
+
+  val OLD_HONEST: Set[int] = OLD.exclude(OLD_BYZ)
+  // Two committing quorums share at least this many seats (pigeonhole over
+  // a committee of SHARD_SIZE). A conflicting commit pair makes every shared
+  // seat a lock violator, so a fork needs this many corrupt seats — f+1 at
+  // SHARD_SIZE = 3f+1, QUORUM = 2f+1.
+  val INTERSECTION: int = 2 * QUORUM - SHARD_SIZE
+
+  // A committed block: a branch head at a height, with its committing
+  // quorum — the signers of the commit proof's two-chain.
+  type Commit = { branch: int, h: int, signers: Set[int] }
+  // A merely-certified block: a bare QC with no committing two-chain. The
+  // certified sibling the commit-proof gate makes unconsumable.
+  type Cert = { branch: int, h: int }
+
+  // Commit proofs the retained committee has produced.
+  var commits: Set[Commit]
+  // Bare certifications the retained committee has produced.
+  var certs: Set[Cert]
+  // The beacon folded a `ConflictingCommits` into a `ShardRecovery`.
+  var forkArmed: bool
+  // The fence cutoff stamped at arming (the attested frontier).
+  var frozenAt: int
+  // A victim folded the recovery — the fence governs from here.
+  var consumerFolded: bool
+  // A victim consumed a merely-certified sibling (no commit proof) — the
+  // certified-sibling vector, which commit-proof consumption closes.
+  var consumedUncommitted: bool
+  // A folded victim consumed a branch's provisions above the frontier — a
+  // commit-level fence breach.
+  var fenceBreached: bool
+
+  // The `ConflictingCommits` assembly: two committed heads at one height on
+  // different branches.
+  val forkAssembled: bool =
+    commits.exists(a => commits.exists(b => and {
+      a.branch != b.branch,
+      a.h == b.h,
+    }))
+
+  // Whether a commit proof (committing two-chain) exists for a branch head.
+  def hasCommitProof(branch: int, h: int): bool =
+    commits.exists(c => c.branch == branch and c.h == h)
+
+  // Whether a victim may consume a branch's provisions at height h. The
+  // commit-proof gate: only against a committing two-chain, never a bare
+  // QC. The twin drops the gate — a merely-certified sibling is consumable.
+  def consumable(branch: int, h: int): bool =
+    if (COMMIT_PROOF_CONSUMPTION) hasCommitProof(branch, h)
+    else hasCommitProof(branch, h) or certs.exists(c => c.branch == branch and c.h == h)
+
+  // The retained committee commits a branch at a height. Honest signers
+  // obey the safe-vote lock: none may already back a committed block at h
+  // on the other branch, so a conflicting pair forms only if the quorum
+  // intersection is entirely corrupt.
+  action commitBranch(branch: int, h: int, signers: Set[int]): bool = all {
+    branch >= 0, branch <= 1,
+    h >= 0, h <= MAX_HEIGHT,
+    signers.subseteq(OLD),
+    signers.size() >= QUORUM,
+    signers.intersect(OLD_HONEST).forall(v =>
+      not(commits.exists(c => and { c.h == h, c.branch != branch, v.in(c.signers) }))),
+    commits' = commits.union(Set({ branch: branch, h: h, signers: signers })),
+    certs' = certs,
+    forkArmed' = forkArmed,
+    frozenAt' = frozenAt,
+    consumerFolded' = consumerFolded,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+  }
+
+  // The retained committee emits a bare QC — a merely-certified sibling
+  // with no committing two-chain.
+  action certifyBranch(branch: int, h: int): bool = all {
+    branch >= 0, branch <= 1,
+    h >= 0, h <= MAX_HEIGHT,
+    certs' = certs.union(Set({ branch: branch, h: h })),
+    commits' = commits,
+    forkArmed' = forkArmed,
+    frozenAt' = frozenAt,
+    consumerFolded' = consumerFolded,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+  }
+
+  // The beacon folds the assembled `ConflictingCommits` into a
+  // `ShardRecovery`, stamping the fence at the attested frontier.
+  // Idempotent: a second proof at the same shard finds the record already
+  // stamped and does nothing.
+  action armFork: bool = all {
+    forkAssembled,
+    not(forkArmed),
+    forkArmed' = true,
+    frozenAt' = FRONTIER,
+    commits' = commits,
+    certs' = certs,
+    consumerFolded' = consumerFolded,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+  }
+
+  // A victim folds the committed recovery — the fence governs from here.
+  action consumerFold: bool = all {
+    forkArmed,
+    not(consumerFolded),
+    consumerFolded' = true,
+    commits' = commits,
+    certs' = certs,
+    forkArmed' = forkArmed,
+    frozenAt' = frozenAt,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+  }
+
+  // A victim consumes a branch's provisions at height h. Requires
+  // consumability (the commit-proof gate) and, once the victim has folded
+  // the recovery, respects the fence: no consumption above the frontier.
+  action consume(branch: int, h: int): bool = all {
+    branch >= 0, branch <= 1,
+    h >= 0, h <= MAX_HEIGHT,
+    consumable(branch, h),
+    not(FORK_FENCE and consumerFolded and h > frozenAt),
+    consumedUncommitted' = (consumedUncommitted or not(hasCommitProof(branch, h))),
+    fenceBreached' = (fenceBreached or (consumerFolded and h > frozenAt)),
+    commits' = commits,
+    certs' = certs,
+    forkArmed' = forkArmed,
+    frozenAt' = frozenAt,
+    consumerFolded' = consumerFolded,
+  }
+
+  // ── Nondet wrappers ──
+
+  action commitAny = {
+    nondet branch = 0.to(1).oneOf()
+    nondet h = 0.to(MAX_HEIGHT).oneOf()
+    nondet signers = OLD.powerset().oneOf()
+    commitBranch(branch, h, signers)
+  }
+
+  action certifyAny = {
+    nondet branch = 0.to(1).oneOf()
+    nondet h = 0.to(MAX_HEIGHT).oneOf()
+    certifyBranch(branch, h)
+  }
+
+  action consumeAny = {
+    nondet branch = 0.to(1).oneOf()
+    nondet h = 0.to(MAX_HEIGHT).oneOf()
+    consume(branch, h)
+  }
+
+  action init = all {
+    commits' = Set(),
+    certs' = Set(),
+    forkArmed' = false,
+    frozenAt' = 0,
+    consumerFolded' = false,
+    consumedUncommitted' = false,
+    fenceBreached' = false,
+  }
+
+  action step = any {
+    commitAny,
+    certifyAny,
+    armFork,
+    consumerFold,
+    consumeAny,
+  }
+
+  // ── Invariants ──
+
+  // A fork proof assembles only from a beyond-f committee: two committed
+  // heads at one height force the quorum intersection to be all lock
+  // violators, so at least INTERSECTION (= f+1) corrupt seats. An
+  // honest-majority committee never generates one.
+  val invHonestNoProof =
+    forkAssembled implies (OLD_BYZ.size() >= INTERSECTION)
+
+  // Commit-proof consumption keeps the certified-sibling vector empty: a
+  // victim never consumes a merely-certified sibling.
+  val invNoCertifiedSibling = not(consumedUncommitted)
+
+  // The fork fence is commit-level and monotone: once a victim has folded
+  // the recovery, it consumes neither branch's provisions above the
+  // attested frontier.
+  val invForkFenceHolds = not(fenceBreached)
+
+  // Arming is idempotent: the recovery record is stamped once at the
+  // attested frontier and never moves.
+  val invArmingIdempotent =
+    forkArmed implies (frozenAt == FRONTIER)
+
+  val invAll = and {
+    invHonestNoProof,
+    invNoCertifiedSibling,
+    invForkFenceHolds,
+    invArmingIdempotent,
+  }
+
+  // ── Scripted witnesses (valid under the shipped instance) ──
+
+  // The retained beyond-f committee double-commits at a contested height
+  // (two heads, quorums intersecting exactly in the corrupt pair), the
+  // proof assembles, the beacon arms the recovery at the frontier, a victim
+  // folds it, and the fence holds: a below-frontier committed branch stays
+  // consumable (the residual), while an above-frontier one is disabled
+  // under the fence (the fence working — the no_fence twin exhibits that
+  // firing as a breach).
+  run forkArmsAndFencesTest =
+    init
+      .then(commitBranch(0, 1, Set(1, 2, 3)))
+      .then(commitBranch(0, 3, Set(1, 2, 3)))
+      .then(commitBranch(1, 3, Set(1, 2, 4)))
+      .expect(forkAssembled and not(forkArmed))
+      .then(armFork)
+      .expect(forkArmed and frozenAt == 2)
+      .then(consume(0, 1))
+      .expect(not(fenceBreached))
+      .then(consumerFold)
+      .then(consume(0, 1))
+      .expect(consumerFolded and not(fenceBreached) and not(consumedUncommitted))
+
+  // A branch commits at a height; the sibling is merely certified (a bare
+  // QC). Under commit-proof consumption the committed head is consumable
+  // but the certified sibling is not — `consume(1, 2)` is disabled, so the
+  // certified-sibling vector stays empty. The bare_qc twin fires it.
+  run certifiedSiblingUnconsumableTest =
+    init
+      .then(commitBranch(0, 2, Set(1, 2, 3)))
+      .then(certifyBranch(1, 2))
+      .then(consume(0, 2))
+      .expect(not(consumedUncommitted))
+}
+
+// The shipped rules: consume only against a commit proof, fence at the
+// attested frontier, checked under the beyond-f retained committee (the
+// corrupt pair spans the quorum intersection, so a fork can assemble).
+module fork_detection_ok {
+  import fork_detection(
+    SHARD_SIZE = 4, QUORUM = 3,
+    OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
+    FRONTIER = 2, MAX_HEIGHT = 4,
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true
+  ).*
+}
+
+// Broken twin: consume against a bare QC — the pre-spine gate. A victim
+// consumes a merely-certified sibling that never commits, reopening the
+// certified-sibling vector — invNoCertifiedSibling fails.
+module fork_detection_bare_qc {
+  import fork_detection(
+    SHARD_SIZE = 4, QUORUM = 3,
+    OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
+    FRONTIER = 2, MAX_HEIGHT = 4,
+    COMMIT_PROOF_CONSUMPTION = false, FORK_FENCE = true
+  ).*
+}
+
+// Broken twin: no commit-level fork fence. A folded victim keeps consuming
+// a branch above the attested frontier — invForkFenceHolds fails.
+module fork_detection_no_fence {
+  import fork_detection(
+    SHARD_SIZE = 4, QUORUM = 3,
+    OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
+    FRONTIER = 2, MAX_HEIGHT = 4,
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = false
+  ).*
+}
+
+// Control: an honest-majority committee (≤ f corrupt). The lock discipline
+// makes a conflicting commit pair unreachable, so no fork proof ever
+// assembles and no recovery is spuriously armed — invAll holds.
+module fork_detection_honest {
+  import fork_detection(
+    SHARD_SIZE = 4, QUORUM = 3,
+    OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1),
+    FRONTIER = 2, MAX_HEIGHT = 4,
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true
   ).*
 }
