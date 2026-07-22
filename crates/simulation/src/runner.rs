@@ -659,6 +659,22 @@ impl SimulationRunner {
         )
     }
 
+    /// The signing key of a registered validator, by id. Validator ids index
+    /// the registration order, so this is a direct lookup. Fault scenarios
+    /// use it to forge Byzantine artifacts that must authenticate against the
+    /// live committee — a synthesized shard fork proof, say — where a
+    /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
+    /// the seated committee.
+    #[must_use]
+    pub fn validator_signing_key(
+        &self,
+        validator: ValidatorId,
+    ) -> Option<Arc<Bls12381G1PrivateKey>> {
+        self.signing_keys
+            .get(usize::try_from(validator.inner()).ok()?)
+            .map(Arc::clone)
+    }
+
     /// Get a reference to the network.
     #[must_use]
     pub const fn network(&self) -> &SimulatedNetwork {
