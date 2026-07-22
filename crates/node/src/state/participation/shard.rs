@@ -244,6 +244,12 @@ impl ShardParticipation {
             ProtocolEvent::UnverifiedShardForkProofReceived { proof } => {
                 self.on_unverified_fork_proof(topology_schedule, *proof)
             }
+            ProtocolEvent::CommitProofNeeded {
+                source_shard,
+                block_height,
+            } => self
+                .remote_headers_coordinator
+                .request_commit_proof(source_shard, block_height),
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }

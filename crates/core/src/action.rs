@@ -10,15 +10,16 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector,
-    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, Round,
-    RoutableTransaction, RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardForkProof,
-    ShardId, ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
+    GlobalReceiptRoot, Hash, HeaderFetchCount, InFlightCount, LocalReceiptRoot, NodeId, PcQc1,
+    PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase,
+    RatifyRound, RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
+    Round, RoutableTransaction, RoutingCommittees, SafeVoteRegisters, SettledWavesRoot,
+    ShardForkProof, ShardId, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
+    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
+    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -1092,6 +1093,25 @@ pub enum Action {
         floor: BlockHeight,
     },
 
+    /// Fetch the certified-header run that commit-proves one remote block.
+    ///
+    /// Emitted by `RemoteHeaderCoordinator` when a cross-shard consumer is
+    /// parked on a source height at or below the shard's attested boundary —
+    /// below the remote-header sync anchor, where forward sync never
+    /// reaches. The runner issues one range fetch starting at the height;
+    /// the returned headers feed the normal QC-verification path and the
+    /// commit-proof walk promotes the block, draining the parked consumer.
+    FetchCommitProof {
+        /// Remote shard whose block needs commit-proving.
+        source_shard: ShardId,
+        /// The parked source height — the fetch range start.
+        from_height: BlockHeight,
+        /// Range length. Grows across retries so a round-gapped run (the
+        /// committing two-chain sits several certified blocks above the
+        /// height) is eventually covered.
+        count: HeaderFetchCount,
+    },
+
     /// Acquire a terminated shard's settled-wave set `S_P` for the
     /// split-boundary fence in one beacon-attested shot.
     ///
@@ -1593,6 +1613,7 @@ impl Action {
             | Self::StartBlockSync { .. }
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
+            | Self::FetchCommitProof { .. }
             | Self::StartSettledWavesAcquisition { .. }
             | Self::RestoreCommittedState { .. }
             | Self::Fetch(_)

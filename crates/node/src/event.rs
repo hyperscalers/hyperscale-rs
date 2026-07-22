@@ -269,6 +269,22 @@ pub enum ShardScopedInput {
         kind: FetchFailureKind,
     },
 
+    /// Response to a one-shot commit-proof fetch: the certified-header run
+    /// starting at the wanted height. Headers feed the same
+    /// QC-verification path gossip-arrived headers take; the commit-proof
+    /// walk does the rest. Transport failures push nothing — the
+    /// coordinator's commit sweep re-issues the fetch.
+    CommitProofResponseReceived {
+        /// Source shard the fetch targeted.
+        source_shard: ShardId,
+        /// First height of the requested range — the wanted height.
+        from_height: BlockHeight,
+        /// Number of heights the request covered.
+        count: HeaderFetchCount,
+        /// Headers the responder returned.
+        headers: Vec<CertifiedBlockHeader>,
+    },
+
     /// A past-terminal shard's complete settled-wave window list, `None`
     /// when the peer didn't hold the terminal block. The acquisition host
     /// verifies it against the beacon-attested root before recording.
@@ -476,6 +492,7 @@ impl ShardScopedInput {
             | Self::SyncBlockValidationFailed { .. }
             | Self::RemoteHeadersResponseReceived { .. }
             | Self::RemoteHeadersFetchFailed { .. }
+            | Self::CommitProofResponseReceived { .. }
             | Self::SettledWavesResponseReceived { .. }
             | Self::SettledWavesFetchFailed { .. }
             | Self::TransactionsFetchFailed { .. }

@@ -15,11 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, Epoch, ForkFence, InFlightCount,
-    REMOTE_HEADER_RETENTION, ScheduleLookup, ShardForkProof, ShardId, TopologySchedule,
-    TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, Epoch, ForkFence, HeaderFetchCount,
+    InFlightCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
+    ShardId, TopologySchedule, TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -38,6 +39,17 @@ const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// batch size, so a single round-trip can close a long gap without
 /// requiring repeated target bumps.
 const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
+
+/// How long a wanted commit proof waits before its fetch re-issues.
+/// Measured against the local committed weighted timestamp, like the
+/// header liveness timeout.
+const COMMIT_PROOF_RETRY: Duration = Duration::from_secs(5);
+
+/// First fetch length for a wanted commit proof. A direct commit needs
+/// only the block and its round-contiguous child; the slack covers a
+/// short view-change run. Doubled on every retry up to the wire cap, so
+/// a deep round-gapped run is eventually covered.
+const COMMIT_PROOF_INITIAL_COUNT: u64 = 4;
 
 /// Remote header coordinator memory statistics for monitoring collection sizes.
 #[allow(missing_docs)] // flat counters; field names are the documentation
@@ -79,6 +91,19 @@ struct ExpectedHeader {
     /// remote shard, rather than comparing heights across independent
     /// counters. `None` until the first header is verified.
     last_verified_at: Option<WeightedTimestamp>,
+}
+
+/// One wanted commit proof: a targeted header fetch re-driven until its
+/// height proves or the entry ages out.
+struct WantedProof {
+    /// Local committed weighted timestamp at registration. The entry
+    /// expires one retention horizon later — by then the parked consumer
+    /// has aborted and nothing is waiting on the proof.
+    registered_at: WeightedTimestamp,
+    /// When the last fetch was issued; paces the retry.
+    requested_at: WeightedTimestamp,
+    /// Fetches issued so far; sizes the doubling range.
+    attempts: u32,
 }
 
 /// Centralized remote block header coordination.
@@ -168,6 +193,14 @@ pub struct RemoteHeaderCoordinator {
     /// which a repeated sweep would clobber.
     recoveries_evicted: BTreeMap<ShardId, Epoch>,
 
+    /// Commit proofs a cross-shard consumer is parked on for a height the
+    /// forward header sync never reaches — at or below the shard's
+    /// attested boundary, under a joiner's (or a fresh recovery
+    /// committee's) sync anchor. Each entry drives a targeted
+    /// [`Action::FetchCommitProof`], re-issued on the commit sweep with a
+    /// doubling range until the height proves or the entry ages out.
+    wanted_proofs: BTreeMap<(ShardId, BlockHeight), WantedProof>,
+
     /// Gossip-timed fork fences: a verified fork proof stops the
     /// `RemoteHeaderCommitted` promotion for that shard at or above the
     /// forked height — so no consumer opens a fenced block's provisions or
@@ -229,6 +262,7 @@ impl RemoteHeaderCoordinator {
             forks_emitted: HashSet::new(),
             recovery_frontiers: BTreeMap::new(),
             recoveries_evicted: BTreeMap::new(),
+            wanted_proofs: BTreeMap::new(),
             fork_fence: ForkFence::new(),
             tips: HashMap::new(),
             expected: BTreeMap::new(),
@@ -630,6 +664,12 @@ impl RemoteHeaderCoordinator {
                     expected.last_verified_at = Some(new_ts);
                 }
             }
+            for wanted in self.wanted_proofs.values_mut() {
+                if wanted.registered_at == WeightedTimestamp::ZERO {
+                    wanted.registered_at = new_ts;
+                    wanted.requested_at = new_ts;
+                }
+            }
         }
 
         self.refresh_expected(topology_schedule);
@@ -646,6 +686,7 @@ impl RemoteHeaderCoordinator {
             .fork_fence
             .clear_completed(topology_schedule.head().completed_recoveries());
         let mut actions = self.promote_withheld(&cleared);
+        actions.extend(self.retry_wanted_proofs());
 
         // Check for timed-out remote shards.
         let now = self.local_committed_ts;
@@ -972,6 +1013,86 @@ impl RemoteHeaderCoordinator {
         self.fork_fence.engage(shard, fork_height, completed);
     }
 
+    /// A cross-shard consumer is parked on `(shard, height)` awaiting its
+    /// commit proof, for a height at or below the shard's attested
+    /// boundary — under the forward sync anchor, where no range fetch
+    /// will ever land. Register the want and issue the first targeted
+    /// fetch; the commit sweep re-issues it until the height proves or
+    /// the entry ages out.
+    pub fn request_commit_proof(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+        if shard == self.local_shard {
+            return Vec::new();
+        }
+        let key = (shard, height);
+        // Already promoted: the consumer raced the promotion — re-emit it
+        // so its proven view catches up. Proven-but-unpromoted stays
+        // withheld by the fork fence; the fence-clear sweep releases it.
+        if self.promoted.contains(&key)
+            && let Some(header) = self.verified.get(&key)
+        {
+            return vec![Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
+                certified_header: Arc::clone(header),
+            })];
+        }
+        if self.proven.contains(&key) || self.wanted_proofs.contains_key(&key) {
+            return Vec::new();
+        }
+        let now = self.local_committed_ts;
+        self.wanted_proofs.insert(
+            key,
+            WantedProof {
+                registered_at: now,
+                requested_at: now,
+                attempts: 1,
+            },
+        );
+        info!(
+            shard = shard.inner(),
+            height = height.inner(),
+            "Below-anchor source block wanted — fetching its commit proof"
+        );
+        vec![Self::fetch_commit_proof(shard, height, 1)]
+    }
+
+    /// The fetch for one wanted commit proof: a header range starting at
+    /// the height, doubled per attempt so a committing two-chain that
+    /// sits several round-gapped blocks above it is eventually covered.
+    fn fetch_commit_proof(shard: ShardId, height: BlockHeight, attempts: u32) -> Action {
+        let count = COMMIT_PROOF_INITIAL_COUNT
+            .saturating_mul(1_u64 << (attempts - 1).min(31))
+            .min(MAX_REMOTE_HEADERS_PER_REQUEST.inner());
+        Action::FetchCommitProof {
+            source_shard: shard,
+            from_height: height,
+            count: HeaderFetchCount::new(count),
+        }
+    }
+
+    /// Re-drive the wanted commit proofs: drop entries whose height has
+    /// proven (the fetch delivered, or gossip beat it) or whose parked
+    /// consumer has aged out, then re-issue stale fetches with a doubled
+    /// range.
+    fn retry_wanted_proofs(&mut self) -> Vec<Action> {
+        if self.wanted_proofs.is_empty() {
+            return Vec::new();
+        }
+        let now = self.local_committed_ts;
+        let proven = &self.proven;
+        self.wanted_proofs.retain(|key, wanted| {
+            !proven.contains(key) && now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON
+        });
+        let mut actions = Vec::new();
+        for (&(shard, height), wanted) in &mut self.wanted_proofs {
+            if now.elapsed_since(wanted.requested_at) < COMMIT_PROOF_RETRY {
+                continue;
+            }
+            wanted.attempts += 1;
+            wanted.requested_at = now;
+            actions.push(Self::fetch_commit_proof(shard, height, wanted.attempts));
+        }
+        actions
+    }
+
     /// Fold each recovery record the beacon head carries into local state:
     /// remember the attested frontier (fork assembly is inert at or below
     /// it), and evict the superseded branch once per fold. The retained
@@ -1015,6 +1136,7 @@ impl RemoteHeaderCoordinator {
         self.proven.retain(|key| !above(key));
         self.promoted.retain(|key| !above(key));
         self.fork_siblings.retain(|key, _| !above(key));
+        self.wanted_proofs.retain(|key, _| !above(key));
         if let Some(expected) = self.expected.get_mut(&shard)
             && expected.last_verified_height > frontier
         {
@@ -2450,5 +2572,89 @@ mod tests {
             fork_proofs(&actions_a).is_empty() && fork_proofs(&actions_b).is_empty(),
             "a fork at or below the attested frontier was already answered"
         );
+    }
+
+    /// The `(from_height, count)` pairs of the `FetchCommitProof` actions
+    /// in a stream.
+    fn commit_proof_fetches(actions: &[Action]) -> Vec<(u64, u64)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::FetchCommitProof {
+                    from_height, count, ..
+                } => Some((from_height.inner(), count.inner())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wanted_commit_proof_retries_with_a_doubling_range_until_proven() {
+        use hyperscale_types::test_utils::{certify, make_live_block};
+
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let sched = TopologySchedule::single(Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)));
+        let local_block = |h: u64| {
+            certify(
+                make_live_block(
+                    local,
+                    BlockHeight::new(h),
+                    0,
+                    ValidatorId::new(0),
+                    vec![],
+                    vec![],
+                ),
+                h * 1_000,
+            )
+        };
+        coord.on_block_committed(&sched, &local_block(1));
+
+        // Registration issues the first fetch immediately; a duplicate
+        // registration is a no-op.
+        let actions = coord.request_commit_proof(remote, BlockHeight::new(5));
+        assert_eq!(commit_proof_fetches(&actions), vec![(5, 4)]);
+        assert!(
+            coord
+                .request_commit_proof(remote, BlockHeight::new(5))
+                .is_empty()
+        );
+
+        // Inside the retry interval nothing re-issues; past it the fetch
+        // re-issues with a doubled range.
+        let actions = coord.on_block_committed(&sched, &local_block(2));
+        assert!(commit_proof_fetches(&actions).is_empty());
+        let actions = coord.on_block_committed(&sched, &local_block(8));
+        assert_eq!(commit_proof_fetches(&actions), vec![(5, 8)]);
+
+        // The proof lands: the height promotes, the want clears, and no
+        // further fetch issues.
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        assert_eq!(committed_heights(&actions), vec![5]);
+        let actions = coord.on_block_committed(&sched, &local_block(20));
+        assert!(commit_proof_fetches(&actions).is_empty());
+    }
+
+    #[test]
+    fn requesting_an_already_promoted_height_reemits_its_promotion() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        coord.on_verified_remote_header_received(Arc::clone(&w), ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        assert_eq!(committed_heights(&actions), vec![5]);
+
+        // The consumer raced the promotion: answering the request with a
+        // fresh promotion (not a fetch) closes the race.
+        let actions = coord.request_commit_proof(remote, BlockHeight::new(5));
+        assert_eq!(committed_heights(&actions), vec![5]);
+        assert!(commit_proof_fetches(&actions).is_empty());
     }
 }

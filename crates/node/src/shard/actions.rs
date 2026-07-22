@@ -120,6 +120,11 @@ where
                 target,
                 floor,
             } => self.process_start_remote_header_sync(source_shard, target, floor),
+            Action::FetchCommitProof {
+                source_shard,
+                from_height,
+                count,
+            } => self.process_fetch_commit_proof(source_shard, from_height, count),
             Action::StartSettledWavesAcquisition {
                 shard,
                 terminal_height,

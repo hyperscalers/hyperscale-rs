@@ -726,6 +726,19 @@ pub enum ProtocolEvent {
         height: BlockHeight,
     },
 
+    /// A cross-shard consumer is parked on a source block whose height sits
+    /// at or below the shard's beacon-attested boundary — below the
+    /// remote-header sync anchor, where forward sync never delivers the
+    /// commit proof. `RemoteHeaderCoordinator` answers with a targeted
+    /// [`Action::FetchCommitProof`](crate::Action::FetchCommitProof),
+    /// retried until the height proves or ages out.
+    CommitProofNeeded {
+        /// Remote shard whose block needs commit-proving.
+        source_shard: ShardId,
+        /// The parked source height.
+        block_height: BlockHeight,
+    },
+
     /// The `io_loop`'s settled-waves acquisition verified a past-terminal
     /// shard's complete settled-wave set against its beacon-attested root.
     /// `ShardCoordinator` records it for the split-boundary fence and
