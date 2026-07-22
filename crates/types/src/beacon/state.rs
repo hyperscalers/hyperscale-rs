@@ -439,6 +439,26 @@ pub struct ShardRecovery {
     pub attested_frontier: BlockHeight,
 }
 
+/// The permanent record of a shard's most recent completed recovery.
+///
+/// Stamped when the pending [`ShardRecovery`] clears on the shard's
+/// first observed crossing under its fresh committee. One entry per
+/// recovered shard, overwritten by a later recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct CompletedRecovery {
+    /// Epoch the fresh committee was seated
+    /// ([`ShardRecovery::rotated_at`]). Certified resolution of the
+    /// recovery's bridge band reads it so blocks anchored below the
+    /// bridge keep binding to the fresh committee that produced them,
+    /// no matter when a replica commits them.
+    pub rotated_at: Epoch,
+    /// The recovery's beacon-attested frontier
+    /// ([`ShardRecovery::attested_frontier`]). A fork proof whose forked
+    /// height sits at or below it is a replay of already-recovered
+    /// history and must not re-arm a recovery.
+    pub attested_frontier: BlockHeight,
+}
+
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
 ///
 /// Cross-validator agreement on every field at every epoch follows from
@@ -623,15 +643,15 @@ pub struct BeaconState {
     /// drops on the shard's next observed crossing (the fresh committee
     /// produced) and is GC'd with the shard's boundary record.
     pub pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
-    /// The epoch each shard's most recent completed recovery seated
-    /// its fresh committee (`rotated_at`), stamped when the pending record
-    /// clears on the shard's first crossing. Permanent — one entry per
-    /// recovered shard, overwritten by a later recovery — so certified
-    /// resolution of the recovery's bridge band stays a pure function of
-    /// folded chain content: a bridge block re-derived after the pending
-    /// record clears still resolves the fresh committee it was produced
-    /// under, no matter when a replica commits it.
-    pub completed_recoveries: BTreeMap<ShardId, Epoch>,
+    /// Each shard's most recent completed recovery, stamped when the
+    /// pending record clears on the shard's first crossing. Permanent —
+    /// one entry per recovered shard, overwritten by a later recovery —
+    /// so certified resolution of the recovery's bridge band stays a
+    /// pure function of folded chain content (a bridge block re-derived
+    /// after the pending record clears still resolves the fresh
+    /// committee it was produced under), and a replayed fork proof at or
+    /// below the recovered frontier stays inert forever.
+    pub completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently

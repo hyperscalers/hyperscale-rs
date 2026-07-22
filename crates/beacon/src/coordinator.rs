@@ -1003,18 +1003,20 @@ impl BeaconCoordinator {
     }
 
     /// Every fork proof in `proposal` verifies against the local topology
-    /// schedule. A proof self-authenticates (each side carries the accused
-    /// committee's aggregated signatures), so this re-verifies from scratch
-    /// — the `Verifiable` marker is never trusted to skip the gate, exactly
-    /// as [`boundary::proposal_boundary_qcs_admissible`] treats boundary
-    /// QCs. A proposal carrying an unverifiable or unresolvable proof is
-    /// inadmissible, so the vnode abstains rather than folds it.
+    /// schedule and sits under its own shard's map key. A proof
+    /// self-authenticates (each side carries the accused committee's
+    /// aggregated signatures), so this re-verifies from scratch — the
+    /// `Verifiable` marker is never trusted to skip the gate, exactly as
+    /// [`boundary::proposal_boundary_qcs_admissible`] treats boundary QCs.
+    /// The key check authenticates the map's framing: without it, one
+    /// genuine proof re-keyed under other shard ids would nominate every
+    /// keyed shard for recovery. A proposal carrying an unverifiable,
+    /// unresolvable, or mis-keyed proof is inadmissible, so the vnode
+    /// abstains rather than folds it.
     fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
-        proposal.fork_proofs().iter().all(|(_, proof)| {
-            proof
-                .as_unverified()
-                .verify(&self.topology_schedule)
-                .is_ok()
+        proposal.fork_proofs().iter().all(|(shard, proof)| {
+            let proof = proof.as_unverified();
+            *shard == proof.shard() && proof.verify(&self.topology_schedule).is_ok()
         })
     }
 
@@ -3624,6 +3626,91 @@ mod tests {
         let actions = coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal);
         assert!(actions.is_empty());
         assert!(!coord.proposal_pool.contains(from));
+    }
+
+    /// A fork proof keyed under a shard other than its own is inadmissible
+    /// even when the proof itself verifies: the map key is unauthenticated
+    /// framing, and trusting it would let one genuine equivocation nominate
+    /// every keyed shard for recovery. The correctly keyed control proves
+    /// the rejection is the key check, not verification.
+    #[test]
+    fn proposal_with_a_rekeyed_fork_proof_is_dropped() {
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        use hyperscale_types::{BlockHeight, ShardForkProof, VrfProof};
+
+        // Genesis committee backed by the TestCommittee's keys, so a proof
+        // it signs resolves and verifies against the coordinator's schedule.
+        let committee = TestCommittee::new(4, 1);
+        let pool_id = StakePoolId::new(0);
+        let validators: Vec<GenesisValidator> = (0usize..4)
+            .map(|i| GenesisValidator {
+                id: ValidatorId::new(i as u64),
+                pool: pool_id,
+                pubkey: *committee.public_key(i),
+            })
+            .collect();
+        let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
+        let config = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
+            initial_validators: validators,
+            initial_pools: vec![GenesisPool {
+                id: pool_id,
+                total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+            }],
+            initial_beacon_committee: members.clone(),
+            initial_shard_committee: members,
+            initial_randomness: Randomness::new([0xAB; 32]),
+        };
+        let state = build_genesis_beacon_state(&config);
+        let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator());
+        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let mut coord = BeaconCoordinator::new(
+            block,
+            vec![state],
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            WeightedTimestamp::ZERO,
+            NetworkDefinition::simulator(),
+            config_hash,
+        );
+
+        let from = ValidatorId::new(1);
+        let proof = shard_fork_proof(&committee, ShardId::ROOT, BlockHeight::new(5));
+        let proposal = |key: ShardId| {
+            let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
+                std::iter::once((key, proof.clone())).collect();
+            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                BTreeMap::new(),
+                Vec::new(),
+                fork_proofs,
+                VrfProof::ZERO,
+            )))
+        };
+
+        // Control: keyed under its own shard, the proposal pools.
+        coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal(ShardId::ROOT));
+        assert!(coord.proposal_pool.contains(from));
+
+        // Re-keyed under a foreign shard: dropped.
+        let mut coord2 = {
+            let state = build_genesis_beacon_state(&config);
+            let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+            BeaconCoordinator::new(
+                block,
+                vec![state],
+                ValidatorId::new(0),
+                ShardId::ROOT,
+                WeightedTimestamp::ZERO,
+                NetworkDefinition::simulator(),
+                config_hash,
+            )
+        };
+        coord2.on_beacon_proposal_received(
+            from,
+            Epoch::GENESIS.next(),
+            proposal(ShardId::leaf(1, 0)),
+        );
+        assert!(!coord2.proposal_pool.contains(from));
     }
 
     #[test]

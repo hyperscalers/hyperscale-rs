@@ -11,10 +11,10 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, NetworkDefinition,
-    NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction, SettledWavesRoot,
-    ShardId, ShardRecovery, ShardTrie, StateRoot, ValidatorId, ValidatorSet, VoteCount,
-    WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, CompletedRecovery,
+    NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
+    SettledWavesRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, ValidatorId, ValidatorSet,
+    VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -173,13 +173,12 @@ pub struct TopologySnapshot {
     /// Cleared when the shard commits again and the beacon drops the
     /// record. Like `advanced`, a live head value.
     pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
-    /// The epoch each shard's most recent completed recovery seated
-    /// its fresh committee, projected from
+    /// Each shard's most recent completed recovery, projected from
     /// `BeaconState.completed_recoveries`. Permanent, unlike
     /// `pending_recoveries`: the schedule's certified resolution reads it
     /// so the recovery's bridge band keeps resolving the fresh committee
     /// after the pending record clears.
-    completed_recoveries: BTreeMap<ShardId, Epoch>,
+    completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
     /// Governable network parameters in force for this window, projected
     /// from `BeaconState.params` (head) or `next_params` (lookahead).
     /// Frozen one epoch ahead like the committee, so every member resolves
@@ -463,14 +462,14 @@ impl TopologySnapshot {
         self
     }
 
-    /// Set each shard's most recent completed recovery epoch (see
+    /// Set each shard's most recent completed recovery (see
     /// [`Self::completed_recoveries`]). Defaults empty; the beacon
     /// projection supplies the `BeaconState.completed_recoveries` value.
     /// Builder-set under the [`Self::with_advanced`] rationale.
     #[must_use]
     pub fn with_completed_recoveries(
         mut self,
-        completed_recoveries: BTreeMap<ShardId, Epoch>,
+        completed_recoveries: BTreeMap<ShardId, CompletedRecovery>,
     ) -> Self {
         self.completed_recoveries = completed_recoveries;
         self
@@ -671,12 +670,12 @@ impl TopologySnapshot {
             .is_some_and(|recovery| height > recovery.attested_frontier)
     }
 
-    /// The epoch each shard's most recent completed recovery seated
-    /// its fresh committee. Read by the schedule's certified resolution so
-    /// the recovery's bridge band binds stably after the pending record
-    /// clears.
+    /// Each shard's most recent completed recovery. The schedule's
+    /// certified resolution reads the seating epoch so the recovery's
+    /// bridge band binds stably after the pending record clears; the
+    /// attested frontier tombstones replayed fork proofs.
     #[must_use]
-    pub const fn completed_recoveries(&self) -> &BTreeMap<ShardId, Epoch> {
+    pub const fn completed_recoveries(&self) -> &BTreeMap<ShardId, CompletedRecovery> {
         &self.completed_recoveries
     }
 

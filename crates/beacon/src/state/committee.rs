@@ -1675,7 +1675,7 @@ mod tests {
     /// bridge band keeps resolving the fresh committee.
     #[test]
     fn recovery_clears_when_the_shard_commits_again() {
-        use hyperscale_types::{RecoveryCause, ShardRecovery};
+        use hyperscale_types::{CompletedRecovery, RecoveryCause, ShardRecovery};
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
@@ -1702,7 +1702,10 @@ mod tests {
         assert!(state.pending_recoveries.is_empty());
         assert_eq!(
             state.completed_recoveries.get(&ShardId::leaf(1, 0)),
-            Some(&rotated_at),
+            Some(&CompletedRecovery {
+                rotated_at,
+                attested_frontier: BlockHeight::GENESIS,
+            }),
         );
     }
 
