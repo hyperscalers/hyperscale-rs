@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
@@ -268,7 +268,7 @@ pub struct ExecutionCoordinator {
     /// commit and when a set is recorded; a wave leaves only on evidence —
     /// settled-set membership, the scheduled termination clearing, or the
     /// schedule evicting the shard — never on a clock. Keyed by `WaveId`.
-    gated_finalized: HashMap<WaveId, Arc<Verifiable<FinalizedWave>>>,
+    gated_finalized: BTreeMap<WaveId, Arc<Verifiable<FinalizedWave>>>,
 
     /// Past-terminal partner shards whose settled set is recorded but whose
     /// counterpart abort sweep is still awaiting the ingestion of every
@@ -339,7 +339,7 @@ impl ExecutionCoordinator {
             proven_remote: HashMap::new(),
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
-            gated_finalized: HashMap::new(),
+            gated_finalized: BTreeMap::new(),
             pending_counterpart_sweeps: HashMap::new(),
             gate_rejected_aborts: Vec::new(),
             me,
@@ -2195,8 +2195,9 @@ impl ExecutionCoordinator {
         if self.gated_finalized.is_empty() {
             return Vec::new();
         }
-        let gated: Vec<Arc<Verifiable<FinalizedWave>>> =
-            self.gated_finalized.drain().map(|(_, fw)| fw).collect();
+        let gated: Vec<Arc<Verifiable<FinalizedWave>>> = std::mem::take(&mut self.gated_finalized)
+            .into_values()
+            .collect();
         let mut actions = Vec::new();
         for finalized_arc in gated {
             actions.extend(self.emit_or_gate_finalized(topology_schedule, finalized_arc));

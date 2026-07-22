@@ -32,7 +32,7 @@
 //!   `EarlyArrivalBuffer::buffer_ec` / `clear_routed` and walks the affected
 //!   waves.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,39 +109,39 @@ pub struct PruneCounts {
 pub struct WaveRegistry {
     /// Per-wave state. The authoritative "wave exists" signal; every other
     /// field is keyed off this presence.
-    states: HashMap<WaveId, WaveState>,
+    states: BTreeMap<WaveId, WaveState>,
 
     /// Per-wave vote trackers. Only populated at the wave leader (primary
     /// or fallback via rotation) to collect execution votes for EC
     /// aggregation.
-    trackers: HashMap<WaveId, VoteTracker>,
+    trackers: BTreeMap<WaveId, VoteTracker>,
 
     /// Waves whose local EC aggregation has been dispatched OR whose local
     /// EC has already been received. Guards against creating a duplicate
     /// fallback tracker during the aggregation window — the
     /// `AggregateExecutionCertificate` action fires before
     /// `WaveState.local_ec_emitted` flips on receipt.
-    ec_dispatched: HashSet<WaveId>,
+    ec_dispatched: BTreeSet<WaveId>,
 
     /// Pending vote retries for waves whose leader hasn't produced an EC.
     /// Populated by non-leaders at vote emission. Cleared on EC receipt or
     /// wave removal.
-    retries: HashMap<WaveId, PendingVoteRetry>,
+    retries: BTreeMap<WaveId, PendingVoteRetry>,
 
     /// `tx_hash → wave_id` reverse index. The authoritative lookup for
     /// "what local wave does this tx belong to" — drives EC routing,
     /// `is_awaiting_provisioning`, `get_wave_assignment`.
-    assignments: HashMap<TxHash, WaveId>,
+    assignments: BTreeMap<TxHash, WaveId>,
 }
 
 impl WaveRegistry {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            states: HashMap::new(),
-            trackers: HashMap::new(),
-            ec_dispatched: HashSet::new(),
-            retries: HashMap::new(),
-            assignments: HashMap::new(),
+            states: BTreeMap::new(),
+            trackers: BTreeMap::new(),
+            ec_dispatched: BTreeSet::new(),
+            retries: BTreeMap::new(),
+            assignments: BTreeMap::new(),
         }
     }
 
