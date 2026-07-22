@@ -139,6 +139,13 @@ pub struct ProvisionCoordinator {
     /// [`recovery_fences`](hyperscale_types::TopologySchedule::recovery_fences)
     /// govern validity over the fold-to-completion window.
     fork_fence: ForkFence,
+
+    /// Each shard's effective fence frontier as of its last purge sweep —
+    /// the min of the attested recovery frontier and any engaged fork
+    /// fence. The commit sweep re-purges a shard only when this changes;
+    /// receipt-time fencing handles everything that arrives in between.
+    /// Entries drop when the shard leaves both fence sources.
+    purged_fences: BTreeMap<ShardId, BlockHeight>,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -188,6 +195,7 @@ impl ProvisionCoordinator {
             committed_tombstones: CommittedProvisionTombstones::new(),
             local_shard,
             fork_fence: ForkFence::new(),
+            purged_fences: BTreeMap::new(),
         }
     }
 
@@ -287,30 +295,35 @@ impl ProvisionCoordinator {
             actions.push(abandon);
         }
 
-        // Purge artifacts fenced by a pending recovery: above the attested
-        // frontier the retained committee's certified history is rejected
-        // network-wide (INV-SEC-8), so parked bundles can never verify,
-        // pre-admitted headers must not keep anchoring verification, and
-        // queued provisions would only burn proposal rounds. Idempotent —
-        // re-running against an already-purged shard removes nothing.
-        let recovery_frontiers: Vec<(ShardId, BlockHeight)> = topology_schedule
-            .head()
+        // Purge artifacts fenced by a pending recovery or a gossip-timed
+        // fork fence: above the effective frontier the fenced content can
+        // never verify (INV-SEC-8 for the attested fence; both conflicting
+        // branches for the fork fence), so parked bundles, pre-admitted
+        // headers, and queued provisions only burn proposal rounds.
+        // Watermarked per shard: receipt-time fencing already drops late
+        // arrivals, so the sweep re-runs only when a shard's effective
+        // frontier changes — a recovery folding, a fence engaging or
+        // tightening — not four retains per fence per commit.
+        let head = topology_schedule.head();
+        self.fork_fence.clear_completed(head.completed_recoveries());
+        let mut frontiers: BTreeMap<ShardId, BlockHeight> = head
             .pending_recoveries()
             .iter()
             .map(|(&shard, recovery)| (shard, recovery.attested_frontier))
             .collect();
-        for (shard, frontier) in recovery_frontiers {
-            actions.extend(self.purge_fenced_shard(shard, frontier));
+        for (shard, frontier) in self.fork_fence.iter() {
+            frontiers
+                .entry(shard)
+                .and_modify(|effective| *effective = (*effective).min(frontier))
+                .or_insert(frontier);
         }
-
-        // Gossip-timed fork fences hold until the attested recovery for
-        // their shard completes; until then re-purge idempotently so a late
-        // arrival can't slip in above the fork frontier.
-        let head = topology_schedule.head();
-        self.fork_fence.clear_completed(head.completed_recoveries());
-        let fenced: Vec<(ShardId, BlockHeight)> = self.fork_fence.iter().collect();
-        for (shard, frontier) in fenced {
-            actions.extend(self.purge_fenced_shard(shard, frontier));
+        self.purged_fences
+            .retain(|shard, _| frontiers.contains_key(shard));
+        for (shard, frontier) in frontiers {
+            if self.purged_fences.get(&shard) != Some(&frontier) {
+                self.purged_fences.insert(shard, frontier);
+                actions.extend(self.purge_fenced_shard(shard, frontier));
+            }
         }
 
         // Lift each timed-out expectation into a fallback fetch action,

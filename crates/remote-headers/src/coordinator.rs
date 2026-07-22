@@ -337,9 +337,18 @@ impl RemoteHeaderCoordinator {
         // candidate — a second committee-signed block at one height. Let it
         // through to QC verification rather than dropping it blind; on
         // success it feeds fork detection without taking the canonical
-        // `verified` slot.
+        // `verified` slot. A copy of an already-held fork sibling is just
+        // as verified as the canonical winner — re-verifying it would burn
+        // an off-thread aggregate check per re-gossip.
         if let Some(existing) = self.verified.get(&(shard, height))
             && existing.block_hash() == header_hash
+        {
+            return vec![];
+        }
+        if self
+            .fork_siblings
+            .get(&(shard, height))
+            .is_some_and(|held| held.iter().any(|s| s.block_hash() == header_hash))
         {
             return vec![];
         }
@@ -1183,10 +1192,16 @@ impl RemoteHeaderCoordinator {
     ) -> Vec<Action> {
         let shard = sibling.shard_id();
         let height = sibling.height();
-        self.fork_siblings
-            .entry((shard, height))
-            .or_default()
-            .push(sibling);
+        let held = self.fork_siblings.entry((shard, height)).or_default();
+        // A re-gossiped copy of an already-held sibling carries nothing
+        // new; holding it twice only grows the Vec and re-runs assembly.
+        if held
+            .iter()
+            .any(|existing| existing.block_hash() == sibling.block_hash())
+        {
+            return Vec::new();
+        }
+        held.push(sibling);
         let mut actions = self.check_fork_at(shard, height);
         actions.extend(self.reconcile_canonical(shard, height));
         actions
@@ -1289,6 +1304,17 @@ impl RemoteHeaderCoordinator {
         let recovered = self.recovery_frontiers.get(&shard).copied();
         let mut actions = Vec::new();
         for h in [Some(height), height.prev()].into_iter().flatten() {
+            // A fork at `h` needs two distinct blocks there; without a held
+            // sibling the canonical occupant stands alone and assembly
+            // cannot fire — skip before cloning headers into candidate
+            // proofs (this path runs on every admitted header).
+            if self
+                .fork_siblings
+                .get(&(shard, h))
+                .is_none_or(Vec::is_empty)
+            {
+                continue;
+            }
             if recovered.is_some_and(|frontier| h <= frontier) {
                 continue;
             }
@@ -2572,6 +2598,25 @@ mod tests {
             fork_proofs(&actions_a).is_empty() && fork_proofs(&actions_b).is_empty(),
             "a fork at or below the attested frontier was already answered"
         );
+    }
+
+    #[test]
+    fn duplicate_fork_siblings_are_held_once() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+
+        let canonical = chain_header(remote, 5, 5, None);
+        let sibling = chain_header(remote, 5, 7, None);
+        coord.on_verified_remote_header_received(canonical, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(Arc::clone(&sibling), ValidatorId::new(1));
+        assert_eq!(coord.memory_stats().fork_siblings, 1);
+
+        // A re-gossiped copy neither grows the buffer nor re-runs
+        // assembly.
+        let actions = coord.on_verified_remote_header_received(sibling, ValidatorId::new(2));
+        assert!(actions.is_empty());
+        assert_eq!(coord.memory_stats().fork_siblings, 1);
     }
 
     /// The `(from_height, count)` pairs of the `FetchCommitProof` actions
