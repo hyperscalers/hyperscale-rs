@@ -131,6 +131,7 @@ pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
 };
+pub use shard::fork_fence::ForkFence;
 pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{

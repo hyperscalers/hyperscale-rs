@@ -17,9 +17,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, InFlightCount, REMOTE_HEADER_RETENTION,
-    ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
-    Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ForkFence, InFlightCount,
+    REMOTE_HEADER_RETENTION, ScheduleLookup, ShardForkProof, ShardId, TopologySchedule,
+    TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -145,14 +145,13 @@ pub struct RemoteHeaderCoordinator {
     /// genuine forks (a Byzantine event), so it is not WT-pruned.
     forks_emitted: HashSet<(ShardId, BlockHeight)>,
 
-    /// Gossip-timed local fork fences, `shard → frontier`. A verified fork
-    /// proof engages one at `fork_height − 1`, stopping the
-    /// `RemoteHeaderCommitted` promotion for that shard *at or above* the
+    /// Gossip-timed fork fences: a verified fork proof stops the
+    /// `RemoteHeaderCommitted` promotion for that shard at or above the
     /// forked height — so no consumer opens a fenced block's provisions or
-    /// execution certificates. Provisional: cleared once the attested
-    /// recovery for the shard folds, which then governs. Empty under honest
-    /// operation.
-    fork_fences: HashMap<ShardId, BlockHeight>,
+    /// execution certificates. Held until the shard's recovery completes;
+    /// the attested recovery fence governs validity over the
+    /// fold-to-completion window.
+    fork_fence: ForkFence,
 
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
@@ -204,7 +203,7 @@ impl RemoteHeaderCoordinator {
             proven: HashSet::new(),
             fork_siblings: HashMap::new(),
             forks_emitted: HashSet::new(),
-            fork_fences: HashMap::new(),
+            fork_fence: ForkFence::new(),
             tips: HashMap::new(),
             expected: BTreeMap::new(),
             local_committed_height: BlockHeight::new(0),
@@ -607,12 +606,12 @@ impl RemoteHeaderCoordinator {
 
         self.refresh_expected(topology_schedule);
 
-        // Gossip-timed fork fences self-clear once the attested recovery for
-        // their shard folds — the attested `lookup_for_shard_certified_fenced`
-        // admission gate then governs.
-        let head = topology_schedule.head();
-        self.fork_fences
-            .retain(|shard, _| !head.pending_recoveries().contains_key(shard));
+        // Gossip-timed fork fences hold until the attested recovery for
+        // their shard completes; the attested
+        // `lookup_for_shard_certified_fenced` admission gate governs
+        // validity over the fold-to-completion window.
+        self.fork_fence
+            .clear_completed(topology_schedule.head().completed_recoveries());
 
         // Check for timed-out remote shards.
         let mut actions = vec![];
@@ -927,25 +926,15 @@ impl RemoteHeaderCoordinator {
     /// Engage the gossip-timed fork fence for `shard`: stop promoting its
     /// blocks *at or above* `fork_height` — no `RemoteHeaderCommitted`, so
     /// no consumer opens a fenced block's provisions or execution
-    /// certificates. The frontier sits one below the fork height so the
-    /// `> frontier` check covers the forked height itself (both conflicting
-    /// blocks live there). Idempotent; never loosens an existing fence.
-    pub fn engage_fork_fence(&mut self, shard: ShardId, fork_height: BlockHeight) {
-        let frontier = BlockHeight::new(fork_height.inner().saturating_sub(1));
-        match self.fork_fences.get(&shard) {
-            Some(&existing) if existing <= frontier => {}
-            _ => {
-                self.fork_fences.insert(shard, frontier);
-            }
-        }
-    }
-
-    /// Whether `(shard, height)` is under a local gossip-timed fork fence —
-    /// content at or above the forked height, held back from promotion.
-    fn fork_fenced(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.fork_fences
-            .get(&shard)
-            .is_some_and(|&frontier| height > frontier)
+    /// certificates. Idempotent; see [`ForkFence::engage`] for the
+    /// tightening and replay rules.
+    pub fn engage_fork_fence(
+        &mut self,
+        shard: ShardId,
+        fork_height: BlockHeight,
+        completed: &BTreeMap<ShardId, CompletedRecovery>,
+    ) {
+        self.fork_fence.engage(shard, fork_height, completed);
     }
 
     /// Record a verified fork sibling and check whether it completes a fork
@@ -1112,8 +1101,9 @@ impl RemoteHeaderCoordinator {
             // A locally fork-fenced height is proven but not promoted: no
             // `RemoteHeaderCommitted`, so no consumer opens its provisions
             // or execution certificates. The block stays tracked so the walk
-            // terminates; the attested recovery fence governs once it folds.
-            if !self.fork_fenced(shard, at) {
+            // terminates; the fence holds until the shard's recovery
+            // completes.
+            if !self.fork_fence.is_fenced(shard, at) {
                 actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
                     certified_header: Arc::clone(proven_header),
                 }));
@@ -1994,7 +1984,7 @@ mod tests {
         let remote = ShardId::leaf(2, 1);
         let mut coord = RemoteHeaderCoordinator::new(local);
         // Fork at height 5: promotion stops at or above 5.
-        coord.engage_fork_fence(remote, BlockHeight::new(5));
+        coord.engage_fork_fence(remote, BlockHeight::new(5), &BTreeMap::new());
 
         // A commit-proven header AT the fork height is tracked but not
         // promoted — no `RemoteHeaderCommitted`, so no consumer opens it.
@@ -2020,6 +2010,83 @@ mod tests {
             committed_heights(&actions),
             vec![3],
             "a below-fork commit promotes"
+        );
+    }
+
+    #[test]
+    fn fork_fence_holds_through_the_fold_and_lifts_on_completion() {
+        use hyperscale_types::test_utils::{certify, make_live_block};
+        use hyperscale_types::{CompletedRecovery, RecoveryCause, ShardRecovery};
+
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.engage_fork_fence(remote, BlockHeight::new(5), &BTreeMap::new());
+
+        let local_block = |h: u64| {
+            certify(
+                make_live_block(
+                    local,
+                    BlockHeight::new(h),
+                    0,
+                    ValidatorId::new(0),
+                    vec![],
+                    vec![],
+                ),
+                h * 1_000,
+            )
+        };
+
+        // The attested recovery folds — the fence holds through the
+        // recovery window, so a height proven mid-window stays unpromoted.
+        let recovering = TopologySchedule::single(Arc::new(
+            shard_snapshot(2, &[0, 1, 2, 3], 0).with_pending_recoveries(
+                std::iter::once((
+                    remote,
+                    ShardRecovery {
+                        cause: RecoveryCause::Fork,
+                        rotated_at: Epoch::new(2),
+                        retained: Vec::new(),
+                        attested_frontier: BlockHeight::new(4),
+                    },
+                ))
+                .collect(),
+            ),
+        ));
+        coord.on_block_committed(&recovering, &local_block(1));
+        let w = chain_header(remote, 5, 5, None);
+        let wc = chain_header(remote, 6, 6, Some(&w));
+        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        assert!(
+            committed_heights(&actions).is_empty(),
+            "a folded-but-incomplete recovery must keep the fence engaged"
+        );
+
+        // The recovery completes (the fresh committee's first crossing) —
+        // the fence clears and a newly proven height above the fork
+        // promotes again.
+        let recovered = TopologySchedule::single(Arc::new(
+            shard_snapshot(2, &[0, 1, 2, 3], 0).with_completed_recoveries(
+                std::iter::once((
+                    remote,
+                    CompletedRecovery {
+                        rotated_at: Epoch::new(2),
+                        attested_frontier: BlockHeight::new(4),
+                    },
+                ))
+                .collect(),
+            ),
+        ));
+        coord.on_block_committed(&recovered, &local_block(2));
+        let x = chain_header(remote, 8, 8, None);
+        let xc = chain_header(remote, 9, 9, Some(&x));
+        coord.on_verified_remote_header_received(x, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(xc, ValidatorId::new(1));
+        assert_eq!(
+            committed_heights(&actions),
+            vec![8],
+            "a completed recovery lifts the fence for newly proven heights"
         );
     }
 }

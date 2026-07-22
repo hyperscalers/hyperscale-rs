@@ -10,15 +10,15 @@
 //! headers, then dispatches `VerifyProvisions` to verify the QC signature
 //! once and merkle proofs per state entry against the committed state root.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, LocalTimestamp,
-    ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId, TopologySchedule,
-    Verified,
+    BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
+    LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
+    TopologySchedule, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -132,15 +132,13 @@ pub struct ProvisionCoordinator {
     /// only batches whose target shard matches ours are admitted.
     local_shard: ShardId,
 
-    /// Gossip-timed local fork fences, `source_shard → frontier`. A verified
-    /// [`ShardForkProof`](hyperscale_types::ShardForkProof) engages one at
-    /// `fork_height − 1`, so provisions from that shard *at or above* the
-    /// forked height are dropped like the attested recovery fence — but
-    /// engaged on gossip, not the beacon record. Provisional: cleared once
-    /// the attested [`recovery_fences`](hyperscale_types::TopologySchedule::recovery_fences)
-    /// for the shard folds, which then governs. Empty under honest
-    /// operation.
-    fork_fences: HashMap<ShardId, BlockHeight>,
+    /// Gossip-timed fork fences: provisions from a fenced shard at or above
+    /// its forked height are dropped like the attested recovery fence — but
+    /// engaged on gossip, not the beacon record. Held until the shard's
+    /// recovery completes; the attested
+    /// [`recovery_fences`](hyperscale_types::TopologySchedule::recovery_fences)
+    /// govern validity over the fold-to-completion window.
+    fork_fence: ForkFence,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -189,7 +187,7 @@ impl ProvisionCoordinator {
             queue,
             committed_tombstones: CommittedProvisionTombstones::new(),
             local_shard,
-            fork_fences: HashMap::new(),
+            fork_fence: ForkFence::new(),
         }
     }
 
@@ -305,22 +303,14 @@ impl ProvisionCoordinator {
             actions.extend(self.purge_fenced_shard(shard, frontier));
         }
 
-        // Gossip-timed fork fences self-clear the moment the attested
-        // recovery for their shard folds — the attested fence then governs.
-        // Until then re-purge idempotently so a late arrival can't slip in
-        // above the fork frontier.
+        // Gossip-timed fork fences hold until the attested recovery for
+        // their shard completes; until then re-purge idempotently so a late
+        // arrival can't slip in above the fork frontier.
         let head = topology_schedule.head();
-        let fenced: Vec<(ShardId, BlockHeight)> = self
-            .fork_fences
-            .iter()
-            .map(|(&shard, &frontier)| (shard, frontier))
-            .collect();
+        self.fork_fence.clear_completed(head.completed_recoveries());
+        let fenced: Vec<(ShardId, BlockHeight)> = self.fork_fence.iter().collect();
         for (shard, frontier) in fenced {
-            if head.pending_recoveries().contains_key(&shard) {
-                self.fork_fences.remove(&shard);
-            } else {
-                actions.extend(self.purge_fenced_shard(shard, frontier));
-            }
+            actions.extend(self.purge_fenced_shard(shard, frontier));
         }
 
         // Lift each timed-out expectation into a fallback fetch action,
@@ -360,18 +350,19 @@ impl ProvisionCoordinator {
 
     /// Engage the gossip-timed fork fence for `shard`: content at or above
     /// `fork_height` is dropped like the attested recovery fence, purging
-    /// what already got through. The frontier is stored one below the fork
-    /// height so the shared `> frontier` checks reject the forked height
-    /// itself (both conflicting blocks live there). Idempotent; a
-    /// lower-or-equal fork height never loosens an existing fence.
-    pub fn engage_fork_fence(&mut self, shard: ShardId, fork_height: BlockHeight) -> Vec<Action> {
-        let frontier = BlockHeight::new(fork_height.inner().saturating_sub(1));
-        match self.fork_fences.get(&shard) {
-            Some(&existing) if existing <= frontier => return Vec::new(),
-            _ => {}
-        }
-        self.fork_fences.insert(shard, frontier);
-        self.purge_fenced_shard(shard, frontier)
+    /// what already got through. Idempotent; see
+    /// [`ForkFence::engage`] for the tightening and replay rules.
+    pub fn engage_fork_fence(
+        &mut self,
+        shard: ShardId,
+        fork_height: BlockHeight,
+        completed: &BTreeMap<ShardId, CompletedRecovery>,
+    ) -> Vec<Action> {
+        self.fork_fence
+            .engage(shard, fork_height, completed)
+            .map_or_else(Vec::new, |frontier| {
+                self.purge_fenced_shard(shard, frontier)
+            })
     }
 
     /// Whether a provision from `(shard, height)` is fenced — by the
@@ -384,11 +375,7 @@ impl ProvisionCoordinator {
         shard: ShardId,
         height: BlockHeight,
     ) -> bool {
-        topology_schedule.recovery_fences(shard, height)
-            || self
-                .fork_fences
-                .get(&shard)
-                .is_some_and(|&frontier| height > frontier)
+        topology_schedule.recovery_fences(shard, height) || self.fork_fence.is_fenced(shard, height)
     }
 
     /// Drop every artefact whose deadline has passed `local_committed_ts`.
@@ -1292,7 +1279,7 @@ mod tests {
         // Fork at height 5: content at or above 5 is fenced.
         assert!(
             coordinator
-                .engage_fork_fence(source, BlockHeight::new(5))
+                .engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new())
                 .is_empty(),
             "nothing held yet to purge"
         );
@@ -1370,17 +1357,39 @@ mod tests {
         assert_eq!(coordinator.memory_stats().pending_provisions, 1);
 
         // Engaging the fence purges everything above the fork frontier.
-        let actions = coordinator.engage_fork_fence(source, BlockHeight::new(5));
+        let actions = coordinator.engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new());
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.memory_stats().pending_provisions, 0);
         assert!(actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))));
     }
 
+    /// A head-only schedule whose `shard` carries a completed recovery.
+    fn sched_recovered(shard: ShardId, frontier: BlockHeight) -> TopologySchedule {
+        use hyperscale_types::{CompletedRecovery, Epoch};
+        TopologySchedule::single(Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(Vec::new()),
+            )
+            .with_completed_recoveries(
+                std::iter::once((
+                    shard,
+                    CompletedRecovery {
+                        rotated_at: Epoch::new(2),
+                        attested_frontier: frontier,
+                    },
+                ))
+                .collect(),
+            ),
+        ))
+    }
+
     #[test]
-    fn fork_fence_lifts_when_the_attested_recovery_folds() {
+    fn fork_fence_holds_through_the_fold_and_lifts_on_completion() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
         let source = ShardId::leaf(2, 1);
-        coordinator.engage_fork_fence(source, BlockHeight::new(5));
+        coordinator.engage_fork_fence(source, BlockHeight::new(5), &BTreeMap::new());
 
         // While fenced, an above-fork provision is dropped.
         let during = make_provisions(
@@ -1395,13 +1404,26 @@ mod tests {
                 .is_empty()
         );
 
-        // The attested recovery for the shard folds — the commit sweep drops
-        // the local fork fence; the attested fence governs thereafter.
+        // The attested recovery folds — the local fence holds through the
+        // recovery window, so the same height is still dropped.
         let recovering = sched_recovering(source, BlockHeight::new(4));
         coordinator.on_block_committed(&recovering, &make_block(BlockHeight::new(1)));
+        let mid_window = make_provisions(
+            TxHash::from_raw(Hash::from_bytes(b"mid_window")),
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(6),
+        );
+        assert!(
+            coordinator
+                .on_state_provisions_received(&sched(), mid_window)
+                .is_empty()
+        );
 
-        // Under a plain schedule (no attested record), the local fence is
-        // gone: the same height now parks instead of being dropped.
+        // The recovery completes (the fresh committee's first crossing) —
+        // the fence clears and the same height parks normally.
+        let recovered = sched_recovered(source, BlockHeight::new(4));
+        coordinator.on_block_committed(&recovered, &make_block(BlockHeight::new(2)));
         let after = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"after")),
             source,
@@ -1893,7 +1915,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             waves,
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -1957,7 +1979,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -2266,7 +2288,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,

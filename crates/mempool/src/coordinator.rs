@@ -36,9 +36,10 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, MessageClass, NodeId,
-    QuiesceCut, RETENTION_HORIZON, RoutableTransaction, ShardId, TopologySnapshot,
-    TransactionDecision, TransactionStatus, TxHash, Verified, WAVE_TIMEOUT, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_TX_IN_FLIGHT,
+    MessageClass, NodeId, QuiesceCut, RETENTION_HORIZON, RoutableTransaction, ShardId,
+    TopologySnapshot, TransactionDecision, TransactionStatus, TxHash, Verified, WAVE_TIMEOUT,
+    WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -275,13 +276,13 @@ pub struct MempoolCoordinator {
     /// local nodes only at lock-tracking time.
     local_shard: ShardId,
 
-    /// Shards under a gossip-timed fork fence. While non-empty, admission
-    /// rejects any transaction touching a fenced shard — no point starting
-    /// cross-shard work bound to a committee that is provably forked. A
-    /// liveness quiesce only; safety rests on the provision fence. Cleared
-    /// per shard once its attested recovery folds. Empty under honest
-    /// operation.
-    fork_fenced_shards: std::collections::HashSet<ShardId>,
+    /// Gossip-timed fork fences. While engaged, admission rejects any
+    /// transaction touching a fenced shard — no point starting cross-shard
+    /// work bound to a committee that is provably forked. A liveness
+    /// quiesce only; safety rests on the provision fence. Held until the
+    /// shard's recovery completes, so mid-recovery txs can't flow back in,
+    /// take locks, and stall on fenced provisions.
+    fork_fence: ForkFence,
 }
 
 impl std::fmt::Debug for MempoolCoordinator {
@@ -334,7 +335,7 @@ impl MempoolCoordinator {
             expected_txs: ExpectedTxs::new(),
             config,
             local_shard,
-            fork_fenced_shards: std::collections::HashSet::new(),
+            fork_fence: ForkFence::new(),
         }
     }
 
@@ -380,11 +381,11 @@ impl MempoolCoordinator {
         // committee only wastes a round — the provisions it would need are
         // fenced anyway. Skipped entirely when no fence is engaged (the
         // ordinary case), so honest admission pays nothing.
-        if !self.fork_fenced_shards.is_empty()
+        if !self.fork_fence.is_empty()
             && self
-                .fork_fenced_shards
+                .fork_fence
                 .iter()
-                .any(|&s| topology_snapshot.involves_shard(s, tx))
+                .any(|(s, _)| topology_snapshot.involves_shard(s, tx))
         {
             tracing::debug!(
                 tx_hash = ?hash,
@@ -675,9 +676,15 @@ impl MempoolCoordinator {
     }
 
     /// Engage the gossip-timed fork-fence quiesce for `shard`: stop admitting
-    /// transactions that touch it. Idempotent; a liveness measure only.
-    pub fn engage_fork_fence(&mut self, shard: ShardId) {
-        self.fork_fenced_shards.insert(shard);
+    /// transactions that touch it. Idempotent; a liveness measure only. See
+    /// [`ForkFence::engage`] for the tightening and replay rules.
+    pub fn engage_fork_fence(
+        &mut self,
+        shard: ShardId,
+        fork_height: BlockHeight,
+        completed: &BTreeMap<ShardId, CompletedRecovery>,
+    ) {
+        self.fork_fence.engage(shard, fork_height, completed);
     }
 
     /// Process a committed block - update statuses and finalize transactions.
@@ -703,11 +710,13 @@ impl MempoolCoordinator {
         self.current_height = height;
         self.current_ts = block.header().parent_qc().weighted_timestamp();
 
-        // A gossip-timed fork fence self-clears once the attested recovery
-        // for its shard folds — the attested fence then governs admission.
-        if !self.fork_fenced_shards.is_empty() {
-            self.fork_fenced_shards
-                .retain(|shard| !topology_snapshot.pending_recoveries().contains_key(shard));
+        // A gossip-timed fork fence holds until the attested recovery for
+        // its shard completes — clearing on the fold would reopen admission
+        // for the whole recovery window, letting cross-shard txs take locks
+        // and stall on fenced provisions.
+        if !self.fork_fence.is_empty() {
+            self.fork_fence
+                .clear_completed(topology_snapshot.completed_recoveries());
         }
 
         // Ensure all committed transactions are in the mempool.
@@ -2676,7 +2685,7 @@ mod tests {
 
         // With the fence engaged for that shard, admission is rejected — no
         // point starting cross-shard work bound to a forked committee.
-        mempool.engage_fork_fence(fenced_shard);
+        mempool.engage_fork_fence(fenced_shard, BlockHeight::new(5), &BTreeMap::new());
         mempool.on_submit_transaction(
             &topology_snapshot,
             Arc::new(verified(tx)),
@@ -2707,6 +2716,85 @@ mod tests {
         assert!(
             mempool.status(&hash2).is_some(),
             "a tx off the fenced shard admits"
+        );
+    }
+
+    #[test]
+    fn fork_fence_holds_admission_until_the_recovery_completes() {
+        use hyperscale_types::{Epoch, RecoveryCause, ShardRecovery};
+
+        let topology_snapshot = make_cross_shard_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
+
+        let node = test_node(7);
+        let fenced_shard = topology_snapshot.shard_for_node_id(&node);
+        mempool.engage_fork_fence(fenced_shard, BlockHeight::new(5), &BTreeMap::new());
+
+        let submit = |mempool: &mut MempoolCoordinator, seed: u8| {
+            let tx = test_transaction_with_nodes(&[seed], vec![], vec![node]);
+            let hash = tx.hash();
+            mempool.on_submit_transaction(
+                &topology_snapshot,
+                Arc::new(verified(tx)),
+                LocalTimestamp::ZERO,
+            );
+            hash
+        };
+
+        // The recovery folds — the fence must hold through the whole
+        // recovery window, or txs flow back in, take locks, and stall on
+        // provisions the recovery fence still rejects.
+        let recovering = topology_snapshot.clone().with_pending_recoveries(
+            std::iter::once((
+                fenced_shard,
+                ShardRecovery {
+                    cause: RecoveryCause::Fork,
+                    rotated_at: Epoch::new(2),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(4),
+                },
+            ))
+            .collect(),
+        );
+        let block = make_live_block(
+            ShardId::leaf(1, 0),
+            BlockHeight::new(1),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        );
+        mempool.on_block_committed(&recovering, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        let mid_window = submit(&mut mempool, 7);
+        assert!(
+            mempool.status(&mid_window).is_none(),
+            "a folded-but-incomplete recovery must not reopen admission"
+        );
+
+        // The recovery completes — the fence clears and admission reopens.
+        let recovered = topology_snapshot.clone().with_completed_recoveries(
+            std::iter::once((
+                fenced_shard,
+                CompletedRecovery {
+                    rotated_at: Epoch::new(2),
+                    attested_frontier: BlockHeight::new(4),
+                },
+            ))
+            .collect(),
+        );
+        let block = make_live_block(
+            ShardId::leaf(1, 0),
+            BlockHeight::new(2),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        );
+        mempool.on_block_committed(&recovered, &certify(block, 2 * TEST_BLOCK_INTERVAL_MS));
+        let after = submit(&mut mempool, 8);
+        assert!(
+            mempool.status(&after).is_some(),
+            "a completed recovery reopens admission"
         );
     }
 }

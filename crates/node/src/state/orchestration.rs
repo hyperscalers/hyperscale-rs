@@ -110,13 +110,12 @@ impl NodeStateMachine {
 
         s.shard_coordinator.queue_ready_proposal();
 
-        // A gossip-timed fork fence's dedup slot clears once the attested
-        // recovery for its shard folds — the coordinators self-clear their
-        // own fences on the same fold, so a later re-fork can re-engage.
-        if !s.fork_fenced_shards.is_empty() {
+        // The fork-proof dedup fence clears once the attested recovery for
+        // its shard completes — the coordinators self-clear their own
+        // fences on the same edge, so a later re-fork can re-engage.
+        if !s.fork_fence.is_empty() {
             let head = self.beacon_coordinator.topology_schedule().head();
-            s.fork_fenced_shards
-                .retain(|shard, _| !head.pending_recoveries().contains_key(shard));
+            s.fork_fence.clear_completed(head.completed_recoveries());
         }
 
         actions
