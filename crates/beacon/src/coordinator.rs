@@ -1832,6 +1832,37 @@ impl BeaconCoordinator {
         self.pending_candidate = None;
     }
 
+    /// Drop locally buffered evidence the fold has consumed. Equivocations
+    /// for a validator now permanently jailed are dead weight — the jail
+    /// can't be upgraded further. A fork proof the fold has registered —
+    /// as the durable flag or a stamped fork-caused recovery — has done
+    /// its job: the beacon's own state retries the re-draw from there, so
+    /// re-proposing the proof only wastes proposal space. Anything else
+    /// still in flight rode a proposal this fold discarded (a Skip epoch
+    /// drops every member's drained copy at once); restore it for the
+    /// next build.
+    fn prune_folded_evidence(&mut self) {
+        let validators = &self.state.validators;
+        self.equivocations.prune(|v| {
+            matches!(
+                validators.get(&v).map(|r| r.status),
+                Some(ValidatorStatus::Jailed {
+                    reason: JailReason::Equivocation,
+                    ..
+                })
+            )
+        });
+        let pending = &self.state.pending_recoveries;
+        let flagged = &self.state.fork_flagged;
+        self.fork_proofs.prune(|shard| {
+            flagged.contains_key(&shard)
+                || pending
+                    .get(&shard)
+                    .is_some_and(|r| r.cause == RecoveryCause::Fork)
+        });
+        self.fork_proofs.restore_undelivered();
+    }
+
     fn adopt_block(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Vec<Action> {
         let was_on_committee = self.is_on_committee();
         // The sets governing the epoch being adopted, captured before
@@ -1844,29 +1875,7 @@ impl BeaconCoordinator {
         self.latest_block = Arc::clone(&block);
         self.spc.clear();
         self.restart_ratification();
-
-        // Evidence for a validator the fold now holds permanently jailed
-        // is dead weight in future proposals — the jail can't be upgraded
-        // further — so drop it from the local buffer.
-        let validators = &self.state.validators;
-        self.equivocations.prune(|v| {
-            matches!(
-                validators.get(&v).map(|r| r.status),
-                Some(ValidatorStatus::Jailed {
-                    reason: JailReason::Equivocation,
-                    ..
-                })
-            )
-        });
-
-        // A fork proof whose recovery the fold now holds has done its job —
-        // re-proposing it can't advance the recovery further, so drop it.
-        let pending = &self.state.pending_recoveries;
-        self.fork_proofs.prune(|shard| {
-            pending
-                .get(&shard)
-                .is_some_and(|r| r.cause == RecoveryCause::Fork)
-        });
+        self.prune_folded_evidence();
 
         // Refresh the head and record the active snapshot for the just-applied
         // epoch plus the lookahead for the next, then drop entries every

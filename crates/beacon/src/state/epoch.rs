@@ -187,9 +187,12 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => (&[], TransitionCause::Skip),
     };
 
-    // Ingest fork proofs before the boundary fold; the returned shards are
-    // fenced out of it and re-drawn this pass (see `ingest_fork_proofs`).
-    let fork_recovered = ingest_fork_proofs(state, network, epoch, committed);
+    // Ingest fork proofs before the boundary fold; every flagged shard —
+    // newly proven or carried from an earlier fold whose re-draw couldn't
+    // stamp — is fenced out of it and nominated for re-draw this pass
+    // (see `ingest_fork_proofs`).
+    ingest_fork_proofs(state, network, epoch, committed);
+    let fork_fenced: BTreeSet<ShardId> = state.fork_flagged.keys().copied().collect();
 
     // Fold this epoch's per-shard boundaries and apply their witness chunks.
     // A `Skip` carries every prior boundary forward untouched; a Normal
@@ -206,7 +209,7 @@ pub fn apply_epoch(
             epoch,
             committed,
             shard_contributions,
-            &fork_recovered,
+            &fork_fenced,
         )
     } else {
         (WitnessOutcome::default(), BTreeMap::new())
@@ -265,7 +268,7 @@ pub fn apply_epoch(
             "shard halted: no boundary crossing within the halt threshold"
         );
     }
-    recover_committees(state, &halted_shards, &fork_recovered);
+    recover_committees(state, &halted_shards);
     // Grow any committee a short cohort draw left under `shard_size` back to
     // full strength, now that dissolved predecessors have freed their members.
     top_up_committees(state);
@@ -621,16 +624,18 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 }
 
 /// Ingest the fork proofs riding this epoch's committed proposals and
-/// mark each forked shard for a fork-caused recovery.
+/// flag each forked shard for a fork-caused recovery.
 ///
 /// A committed proof is trusted (proposal admission verified it against
 /// the topology schedule, and SPC commits only a 2f+1 quorum, so ≥ f+1
 /// honest verifiers stood behind it), exactly as boundary QCs fold on
 /// trust. Per forked shard, one of two things happens:
 ///
-/// - **No recovery pending** — the shard joins the returned set, and the
-///   `recover_committees` pass re-draws its committee and stamps a
-///   `RecoveryCause::Fork` record this same epoch.
+/// - **No recovery pending** — the shard enters
+///   [`BeaconState::fork_flagged`], the durable trigger every fold's
+///   `recover_committees` pass consults until the re-draw is actually
+///   stamped; a fork that folds while the free pool is short retries
+///   once the pool refills.
 /// - **A recovery already pending** — a `Halt` cause is upgraded to
 ///   `Fork` in place (fork provenance dominates); a `Fork` cause is left
 ///   as-is, so a repeat proof for an already-recovering shard is
@@ -641,10 +646,9 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 /// and re-folding its evidence must not re-draw the innocent successor
 /// committee.
 ///
-/// Runs before `record_boundaries`; the returned set fences the forked
-/// shards' own crossings out of the boundary fold this pass so the
-/// retained committee can neither advance the boundary nor clear the
-/// recovery.
+/// Runs before `record_boundaries`; the flagged set fences the forked
+/// shards' own crossings out of the boundary fold so the retained
+/// committee can neither advance the boundary nor clear the recovery.
 ///
 /// A proof carrying a same-round sub-pair also jails the equivocators when
 /// the forked committee is resolvable from current state (the bonus path;
@@ -656,8 +660,7 @@ fn ingest_fork_proofs(
     network: &NetworkDefinition,
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
-) -> BTreeSet<ShardId> {
-    let mut fresh = BTreeSet::new();
+) {
     let mut seen = BTreeSet::new();
     // Evidence pairs already jailed this fold, content-keyed by the
     // conflicting QCs' block hashes: distinct evidence still jails, but
@@ -706,12 +709,14 @@ fn ingest_fork_proofs(
                     }
                 }
                 None => {
-                    fresh.insert(shard);
+                    state
+                        .fork_flagged
+                        .entry(shard)
+                        .or_insert_with(|| proof.height());
                 }
             }
         }
     }
-    fresh
 }
 
 /// Jail the seats that double-signed at one `(height, round)` — the
@@ -784,7 +789,7 @@ fn record_boundaries(
     epoch: Epoch,
     committed: &[(ValidatorId, BeaconProposal)],
     shard_contributions: &BTreeMap<ShardId, ShardEpochContribution>,
-    fork_recovered: &BTreeSet<ShardId>,
+    fork_fenced: &BTreeSet<ShardId>,
 ) -> (WitnessOutcome, BTreeMap<ShardId, Vec<VrfOutput>>) {
     let windows = state.chain_config.epoch_windows();
     // Bind each contribution to its shard's canonical committed QC — the
@@ -804,10 +809,11 @@ fn record_boundaries(
     // pair.
     let mut terminal_recorded: BTreeSet<ShardId> = BTreeSet::new();
     for (shard, contribution) in shard_contributions {
-        // A shard fork-recovered this pass is frozen: the retained
-        // committee's crossing must not advance the boundary or clear the
-        // recovery. The re-drawn committee's next crossing completes it.
-        if fork_recovered.contains(shard) {
+        // A fork-flagged shard is frozen: the retained committee's
+        // crossing must not advance the boundary or clear the recovery,
+        // whether the re-draw stamps this pass or waits on the pool. The
+        // re-drawn committee's next crossing completes it.
+        if fork_fenced.contains(shard) {
             continue;
         }
         let header = &contribution.boundary_header;
@@ -951,7 +957,7 @@ fn record_boundaries(
     for (shard, boundary) in &mut state.boundaries {
         if !refreshed.contains(shard)
             && boundary.terminal_epoch.is_none()
-            && !fork_recovered.contains(shard)
+            && !fork_fenced.contains(shard)
         {
             boundary.consecutive_misses = boundary.consecutive_misses.saturating_add(1);
         }
@@ -1520,21 +1526,22 @@ mod tests {
         }
     }
 
-    /// A shard with no recovery pending joins the fresh set — the pass that
-    /// re-draws its committee this same epoch. Ingest itself stamps nothing.
+    /// A shard with no recovery pending gains a durable fork flag at the
+    /// proven height — the trigger every fold's recovery pass consults
+    /// until the re-draw stamps. Ingest itself stamps nothing.
     #[test]
-    fn ingest_fork_proofs_marks_shard_without_recovery_as_fresh() {
+    fn ingest_fork_proofs_flags_a_shard_without_a_pending_recovery() {
         let mut state = single_pool_state(4);
         let shard = ShardId::leaf(1, 0);
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
-        assert!(fresh.contains(&shard));
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        assert_eq!(state.fork_flagged.get(&shard), Some(&BlockHeight::new(5)));
         assert!(state.pending_recoveries.is_empty());
     }
 
     /// A fork proof for a shard already under a halt recovery upgrades its
-    /// cause to `Fork` in place — no second re-draw, so the shard is not in
-    /// the fresh set and the record's retention and rotation stand.
+    /// cause to `Fork` in place — no second re-draw, so the shard is not
+    /// flagged and the record's retention and rotation stand.
     #[test]
     fn ingest_fork_proofs_upgrades_pending_halt_to_fork() {
         let mut state = single_pool_state(4);
@@ -1543,8 +1550,8 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Halt));
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
-        assert!(!fresh.contains(&shard));
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        assert!(!state.fork_flagged.contains_key(&shard));
         let recovery = &state.pending_recoveries[&shard];
         assert_eq!(recovery.cause, RecoveryCause::Fork);
         assert_eq!(recovery.retained, vec![ValidatorId::new(9)]);
@@ -1552,7 +1559,7 @@ mod tests {
     }
 
     /// A repeat fork proof for a shard already recovering as a fork is a
-    /// no-op: not fresh, cause unchanged.
+    /// no-op: not flagged, cause unchanged.
     #[test]
     fn ingest_fork_proofs_is_idempotent_for_a_pending_fork() {
         let mut state = single_pool_state(4);
@@ -1561,8 +1568,8 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Fork));
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
-        assert!(!fresh.contains(&shard));
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        assert!(!state.fork_flagged.contains_key(&shard));
         assert_eq!(state.pending_recoveries[&shard].cause, RecoveryCause::Fork);
     }
 
@@ -1586,8 +1593,9 @@ mod tests {
             VrfProof::ZERO,
         );
         let proposals = [(ValidatorId::new(0), proposal)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
-        assert_eq!(fresh, BTreeSet::from([proof_shard]));
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        assert!(state.fork_flagged.contains_key(&proof_shard));
+        assert!(!state.fork_flagged.contains_key(&wrong_key));
     }
 
     /// A replayed proof whose forked height sits at or below the shard's
@@ -1607,8 +1615,8 @@ mod tests {
             },
         );
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
-        assert!(fresh.is_empty());
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
+        assert!(state.fork_flagged.is_empty());
         assert!(state.pending_recoveries.is_empty());
     }
 
@@ -1626,8 +1634,58 @@ mod tests {
             },
         );
         let committed = [fork_committed(shard)];
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
-        assert_eq!(fresh, BTreeSet::from([shard]));
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
+        assert!(state.fork_flagged.contains_key(&shard));
+    }
+
+    /// A Skip epoch cannot drop an armed fork: the recovery pass runs on
+    /// Skip folds too, so a standing flag stamps the re-draw with no
+    /// committed proposal in sight.
+    #[test]
+    fn skip_epoch_stamps_a_flagged_fork_recovery() {
+        use hyperscale_types::ValidatorStatus;
+
+        use crate::state::test_fixtures::validator_record;
+
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let shard = ShardId::leaf(1, 0);
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+                height: BlockHeight::new(5),
+                weighted_timestamp: WeightedTimestamp::ZERO,
+                witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                last_live_epoch: Epoch::new(1),
+                consecutive_misses: 0,
+                terminal_epoch: None,
+                terminal_qc_wt: None,
+                settled_waves_root: None,
+                reshape_admitted_epoch: None,
+                reveals_fenced_below: None,
+            },
+        );
+        // A free pool for the re-draw — the flagged shard's own members
+        // are still `OnShard` and excluded from their replacement.
+        for i in 100..104u64 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        state.fork_flagged.insert(shard, BlockHeight::new(6));
+
+        apply_epoch(&mut state, &net(), Epoch::new(1), ApplyEpochInput::Skip);
+
+        let recovery = state
+            .pending_recoveries
+            .get(&shard)
+            .expect("the Skip fold stamps the flagged recovery");
+        assert_eq!(recovery.cause, RecoveryCause::Fork);
+        assert!(!state.fork_flagged.contains_key(&shard));
     }
 
     /// A shard fork-recovered this pass has its crossing skipped entirely:
@@ -1786,9 +1844,12 @@ mod tests {
         let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
         let proposals = committed_with(shard, proof);
 
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
 
-        assert!(fresh.contains(&shard), "still fences and re-draws");
+        assert!(
+            state.fork_flagged.contains_key(&shard),
+            "still fences and re-draws"
+        );
         for v in 0..4 {
             assert!(!equivocation_jailed(&state, v));
         }
@@ -1815,9 +1876,12 @@ mod tests {
         );
         let proposals = committed_with(shard, proof);
 
-        let fresh = ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
 
-        assert!(fresh.contains(&shard), "recovers regardless");
+        assert!(
+            state.fork_flagged.contains_key(&shard),
+            "recovers regardless"
+        );
         for v in 0..4 {
             assert!(!equivocation_jailed(&state, v));
         }

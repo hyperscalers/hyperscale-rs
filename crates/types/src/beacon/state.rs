@@ -638,6 +638,17 @@ pub struct BeaconState {
     /// fold's trigger admission; pruned by the per-epoch staleness
     /// sweep when assertions go quiet.
     pub pending_reshapes: BTreeMap<ShardId, PendingReshape>,
+    /// Shards with a folded-but-unanswered fork proof, mapped to the
+    /// proven fork height. Set the moment `ingest_fork_proofs` observes a
+    /// committed proof and consulted by every fold's recovery pass —
+    /// exactly as the halt trigger re-derives from the boundary record
+    /// each fold — so a fork that folds while the free pool is short of a
+    /// full committee retries until the re-draw is actually stamped.
+    /// Cleared only when the shard's fork-caused recovery enters
+    /// [`Self::pending_recoveries`]. While a shard is flagged, the
+    /// boundary fold fences its crossings, so the forked committee can
+    /// neither advance the boundary nor accumulate halt misses.
+    pub fork_flagged: BTreeMap<ShardId, BlockHeight>,
     /// In-flight shard recoveries, keyed by the recovered shard.
     /// Written when the fold re-draws a failed committee; an entry
     /// drops on the shard's next observed crossing (the fresh committee
@@ -956,6 +967,7 @@ impl BeaconState {
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             pending_reshapes: BTreeMap::new(),
+            fork_flagged: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             miss_counters: BTreeMap::new(),

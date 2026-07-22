@@ -176,15 +176,17 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 /// still `OnShard` when the pool derives), and is retained in the
 /// shard's routing view via [`ShardRecovery`] so the incomers can fetch
 /// the halted tip from nodes that hold it.
-pub(super) fn recover_committees(
-    state: &mut BeaconState,
-    halted: &BTreeSet<ShardId>,
-    forked: &BTreeSet<ShardId>,
-) {
-    // Forked shards re-draw under `Fork` provenance; a shard that both
-    // forked and halted this pass recovers once, as a fork.
-    for &shard in forked {
-        recover_committee(state, shard, RecoveryCause::Fork);
+pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
+    // Fork-flagged shards re-draw under `Fork` provenance; a shard that
+    // both forked and halted recovers once, as a fork. The flag is the
+    // durable trigger: it clears only when the re-draw actually stamps a
+    // pending recovery, so a fold that declines (short pool) retries on
+    // every later fold, Skip epochs included.
+    let forked: BTreeSet<ShardId> = state.fork_flagged.keys().copied().collect();
+    for &shard in &forked {
+        if recover_committee(state, shard, RecoveryCause::Fork) {
+            state.fork_flagged.remove(&shard);
+        }
     }
     for &shard in halted {
         if forked.contains(&shard) {
@@ -194,7 +196,14 @@ pub(super) fn recover_committees(
     }
 }
 
-fn recover_committee(state: &mut BeaconState, shard: ShardId, requested_cause: RecoveryCause) {
+/// Whether the re-draw stamped a pending recovery for `shard`. `false`
+/// when it declined — no attested anchor, or a free pool short of a full
+/// committee — in which case the caller's trigger stays armed.
+fn recover_committee(
+    state: &mut BeaconState,
+    shard: ShardId,
+    requested_cause: RecoveryCause,
+) -> bool {
     let size = state.chain_config.shard_size as usize;
     // A genesis-born shard that never produced still carries its ZERO
     // placeholder, which the topology snapshot omits — so a fresh committee
@@ -211,7 +220,7 @@ fn recover_committee(state: &mut BeaconState, shard: ShardId, requested_cause: R
             ?shard,
             "halted shard never produced: no attested anchor to recover against, redraw skipped"
         );
-        return;
+        return false;
     }
     // The beacon-authenticated frontier: the last boundary height folded
     // for the shard. A halted shard folds no new crossing, so this is
@@ -230,7 +239,7 @@ fn recover_committee(state: &mut BeaconState, shard: ShardId, requested_cause: R
             committee_size = size,
             "halted shard awaits recovery: free pool below a full committee"
         );
-        return;
+        return false;
     }
     let mut h = Hasher::new();
     h.update(DOMAIN_SHARD_RECOVERY);
@@ -307,6 +316,7 @@ fn recover_committee(state: &mut BeaconState, shard: ShardId, requested_cause: R
             attested_frontier,
         },
     );
+    true
 }
 
 /// Fill any live shard committee below `shard_size` from the pool.
@@ -1650,7 +1660,7 @@ mod tests {
             .copied()
             .collect();
 
-        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
+        recover_committees(&mut state, &BTreeSet::from([s0]));
         let fresh1: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
             .members
             .iter()
@@ -1659,7 +1669,7 @@ mod tests {
         assert!(fresh1.is_disjoint(&old));
 
         state.current_epoch = Epoch::new(40);
-        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
+        recover_committees(&mut state, &BTreeSet::from([s0]));
         let recovery = &state.pending_recoveries[&s0];
         assert_eq!(recovery.rotated_at, Epoch::new(40));
         assert_eq!(
@@ -1729,6 +1739,43 @@ mod tests {
 
     // ─── fork-caused recovery ───────────────────────────────────────────────
 
+    /// A fork that folds while the free pool is short of a full committee
+    /// is not dropped: the durable flag survives the declined re-draw and
+    /// the next pass stamps the recovery once the pool refills.
+    #[test]
+    fn fork_flag_defers_on_a_short_pool_and_retries_when_it_refills() {
+        use hyperscale_types::RecoveryCause;
+
+        let s0 = ShardId::leaf(1, 0);
+        // One 4-member committee, no pool surplus: the re-draw must decline.
+        let mut state = multi_shard_state(1, 4, 0);
+        state.current_epoch = Epoch::new(10);
+        state.boundaries.insert(s0, live_boundary(0));
+        state.fork_flagged.insert(s0, BlockHeight::new(6));
+
+        recover_committees(&mut state, &BTreeSet::new());
+        assert!(
+            state.pending_recoveries.is_empty(),
+            "a short pool defers the re-draw",
+        );
+        assert!(
+            state.fork_flagged.contains_key(&s0),
+            "the flag survives the declined fold",
+        );
+
+        // The pool refills; the standing flag re-draws on the next pass.
+        for i in 100..104u64 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        state.current_epoch = Epoch::new(11);
+        recover_committees(&mut state, &BTreeSet::new());
+        assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
+        assert!(!state.fork_flagged.contains_key(&s0));
+    }
+
     /// A fork-caused recovery re-draws the committee under `Fork`
     /// provenance, retains the replaced committee for routing, and fences at
     /// the last folded boundary height.
@@ -1746,8 +1793,13 @@ mod tests {
             .copied()
             .collect();
 
-        recover_committees(&mut state, &BTreeSet::new(), &BTreeSet::from([s0]));
+        state.fork_flagged.insert(s0, BlockHeight::new(6));
+        recover_committees(&mut state, &BTreeSet::new());
 
+        assert!(
+            !state.fork_flagged.contains_key(&s0),
+            "a stamped fork recovery clears the durable flag",
+        );
         let recovery = &state.pending_recoveries[&s0];
         assert_eq!(recovery.cause, RecoveryCause::Fork);
         // `live_boundary` sits at height 5 — the last folded boundary.
@@ -1780,7 +1832,8 @@ mod tests {
             .copied()
             .collect();
 
-        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::from([s0]));
+        state.fork_flagged.insert(s0, BlockHeight::new(6));
+        recover_committees(&mut state, &BTreeSet::from([s0]));
 
         assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
         // A single re-draw: retention holds exactly the one replaced committee.
@@ -1805,7 +1858,8 @@ mod tests {
         state.current_epoch = Epoch::new(10);
         state.boundaries.insert(s0, live_boundary(0));
 
-        recover_committees(&mut state, &BTreeSet::new(), &BTreeSet::from([s0]));
+        state.fork_flagged.insert(s0, BlockHeight::new(6));
+        recover_committees(&mut state, &BTreeSet::new());
         assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
 
         // Refill the pool so the stalled recovery can re-draw again.
@@ -1816,7 +1870,7 @@ mod tests {
             );
         }
         state.current_epoch = Epoch::new(20);
-        recover_committees(&mut state, &BTreeSet::from([s0]), &BTreeSet::new());
+        recover_committees(&mut state, &BTreeSet::from([s0]));
         assert_eq!(
             state.pending_recoveries[&s0].cause,
             RecoveryCause::Fork,
