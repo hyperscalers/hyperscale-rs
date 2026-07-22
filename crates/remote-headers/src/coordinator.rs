@@ -939,30 +939,18 @@ impl RemoteHeaderCoordinator {
 
     /// Periodic cleanup of old headers.
     ///
-    /// Called on cleanup timer. Prunes verified headers that are far below
-    /// each shard's tip. Pending entries are pruned on ingestion via
-    /// `update_tip_and_prune`.
+    /// Called on cleanup timer. Runs the shared retention pass against
+    /// each shard's tip, catching entries that aged out since the last
+    /// ingestion-driven prune.
     pub fn cleanup(&mut self) {
-        for (&shard, &(_, tip_ts)) in &self.tips {
-            let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
+        let cutoffs: Vec<(ShardId, WeightedTimestamp)> = self
+            .tips
+            .iter()
+            .map(|(&shard, &(_, tip_ts))| (shard, tip_ts.minus(REMOTE_HEADER_RETENTION)))
+            .collect();
+        for (shard, cutoff) in cutoffs {
             if cutoff > WeightedTimestamp::ZERO {
-                self.verified.retain(|&(s, _), hdr| {
-                    s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
-                });
-            }
-        }
-        self.proven.retain(|key| self.verified.contains_key(key));
-        self.promoted.retain(|key| self.proven.contains(key));
-        for (&shard, &(_, tip_ts)) in &self.tips {
-            let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
-            if cutoff > WeightedTimestamp::ZERO {
-                self.fork_siblings.retain(|&(s, _), sibs| {
-                    if s != shard {
-                        return true;
-                    }
-                    sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
-                    !sibs.is_empty()
-                });
+                self.prune_shard_below(shard, cutoff);
             }
         }
     }
@@ -987,25 +975,33 @@ impl RemoteHeaderCoordinator {
         }
         let cutoff = tip.1.minus(REMOTE_HEADER_RETENTION);
         if cutoff > WeightedTimestamp::ZERO {
-            self.pending.retain(|&(s, _), sender_map| {
-                s != shard
-                    || sender_map
-                        .values()
-                        .any(|h| h.header().parent_qc().weighted_timestamp() >= cutoff)
-            });
-            self.verified.retain(|&(s, _), hdr| {
-                s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
-            });
-            self.proven.retain(|key| self.verified.contains_key(key));
-            self.promoted.retain(|key| self.proven.contains(key));
-            self.fork_siblings.retain(|&(s, _), sibs| {
-                if s != shard {
-                    return true;
-                }
-                sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
-                !sibs.is_empty()
-            });
+            self.prune_shard_below(shard, cutoff);
         }
+    }
+
+    /// Drop every held artifact of `shard` whose parent-QC weighted
+    /// timestamp sits below `cutoff` — the retention pass shared by
+    /// ingestion pruning and the cleanup timer. `proven` and `promoted`
+    /// follow `verified` (always subsets of it).
+    fn prune_shard_below(&mut self, shard: ShardId, cutoff: WeightedTimestamp) {
+        self.pending.retain(|&(s, _), sender_map| {
+            s != shard
+                || sender_map
+                    .values()
+                    .any(|h| h.header().parent_qc().weighted_timestamp() >= cutoff)
+        });
+        self.verified.retain(|&(s, _), hdr| {
+            s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
+        });
+        self.proven.retain(|key| self.verified.contains_key(key));
+        self.promoted.retain(|key| self.proven.contains(key));
+        self.fork_siblings.retain(|&(s, _), sibs| {
+            if s != shard {
+                return true;
+            }
+            sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
+            !sibs.is_empty()
+        });
     }
 
     /// Engage the gossip-timed fork fence for `shard`: stop promoting its
