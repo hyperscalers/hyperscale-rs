@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     BlockHeader, BoundedVec, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage,
-    ShardWitnessPayload,
+    QuorumCertificate, ShardWitnessPayload,
 };
 
 /// One page of a shard's beacon-witness history at a boundary anchor.
@@ -32,6 +32,13 @@ pub struct WitnessHistoryChunk {
     /// `parent_qc` carries the committee-anchor weighted timestamp the
     /// joiner seeds its recovered state with.
     pub header: BlockHeader,
+    /// The QC certifying the boundary block — the parent QC the joiner's
+    /// first block past the anchor extends. The joiner binds it
+    /// structurally (it must certify the anchor `block_hash`, which pins
+    /// every certified field through the vote message) but cannot check
+    /// the aggregate signature here; the shard coordinator verifies it
+    /// against its resolved committee before adopting it as `latest_qc`.
+    pub qc: QuorumCertificate,
     /// Leaf payloads from the requested `start_index`, in leaf-index
     /// order.
     pub payloads: BoundedVec<ShardWitnessPayload, MAX_WITNESSES_PER_FETCH>,
@@ -71,8 +78,8 @@ mod tests {
     use crate::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId,
+        QuorumCertificate, Round, ShardId, SignerBitfield, Stake, StakePoolId, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     fn make_header() -> BlockHeader {
@@ -112,9 +119,21 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip_chunk() {
+        let header = make_header();
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            ShardId::ROOT,
+            header.height(),
+            header.parent_block_hash(),
+            Round::INITIAL,
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let response = GetWitnessHistoryResponse {
             history: Some(WitnessHistoryChunk {
-                header: make_header(),
+                header,
+                qc,
                 payloads: vec![
                     ShardWitnessPayload::StakeDeposit {
                         pool_id: StakePoolId::new(1),

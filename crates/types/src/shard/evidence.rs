@@ -234,6 +234,13 @@ impl CommitProof {
         self.certified.shard_id()
     }
 
+    /// Lower block of the committing two-chain — the branch head this
+    /// proof commits (the proven block itself for a direct commit).
+    #[must_use]
+    pub const fn certified(&self) -> &CertifiedBlockHeader {
+        &self.certified
+    }
+
     /// Hash of the proven block — `certified`'s hash for a direct commit,
     /// or the bottom of the ancestry link for a prefix commit.
     #[must_use]

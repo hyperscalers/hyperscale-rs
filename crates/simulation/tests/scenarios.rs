@@ -8,6 +8,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_core::ProtocolEvent;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
@@ -36,7 +37,10 @@ use hyperscale_scenarios::{
 };
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::shard_fork_proof_signed_by;
-use hyperscale_types::{BlockHash, BlockHeight, RecoveryCause, ShardId};
+use hyperscale_types::{
+    BlockHash, BlockHeight, NetworkDefinition, RecoveryCause, Round, ShardForkProof, ShardId,
+    Timeout,
+};
 use support::SimCluster;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -232,7 +236,9 @@ fn halted_shard_straddler_atomic_sim() {
     }
 }
 
-/// A provable committee-level fork drives the same full re-draw a halt does.
+/// A provable committee-level fork drives the same full re-draw a halt does,
+/// and the fresh committee seeds from the beacon-attested frontier while both
+/// branches' retained signals stay live.
 ///
 /// There is no Byzantine consensus stack in the harness to run two live heads
 /// (deferred, as the halt plan defers its local-orphan gap), so the loud path
@@ -241,17 +247,20 @@ fn halted_shard_straddler_atomic_sim() {
 /// topology exactly as an organically assembled one would — and injecting it
 /// on the real gossip ingress. From there it rides the production pipeline:
 /// verify, engage the local fences, re-gossip, the beacon buffers and folds
-/// it, and `RecoveryCause::Fork` re-draws the committee. The fresh committee
-/// resumes and its first crossing clears the record — the same completion a
-/// halt recovery reaches, reached from the fork cause.
+/// it, and `RecoveryCause::Fork` re-draws the committee.
 ///
-/// The scenario is a forking committee that then goes quiet (the shape the
-/// plan notes collapses into the halt signature): the forked committee is
-/// silenced before the proof lands, so the re-draw's fresh committee resumes a
-/// settled tip rather than racing a still-live honest one — the synthetic
-/// proof stands in for the Byzantine committee a live fork would need, which
-/// stays deferred.
+/// The forked committee is *not* silenced. Its halves are vote-partitioned so
+/// neither can certify (the fork's real aftermath — a committee split across
+/// two branches makes no further progress), but every member keeps gossiping
+/// timeouts, and after the re-draw the retained members' timeouts are
+/// re-injected carrying the two branch-head QCs from the proof itself — the
+/// divergent retained tips a real fork leaves behind. The incomers must
+/// refuse both (a forked retained committee has no unique tip), seed from the
+/// attested frontier, and converge: the fresh chain's first block extends the
+/// beacon-attested anchor, not either branch and not the unattested retained
+/// suffix above the frontier.
 #[test]
+#[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(
         &halt_recovery_config(),
@@ -329,26 +338,25 @@ fn shard_fork_drives_committee_recovery_sim() {
             .expect("synthesized fork proof verifies against the live schedule");
         proof
     };
+    // The proof's two branch heads are the divergent retained tips the
+    // ex-members' timeouts will carry after the re-draw.
+    let branch_qcs = {
+        let ShardForkProof::ConflictingCommits { a, b } = &proof;
+        [a.certified().qc().clone(), b.certified().qc().clone()]
+    };
 
-    // Silence the forked committee before injecting. The synthetic proof
-    // stands in for a Byzantine committee; a live *honest* committee would
-    // keep extending its own chain, and the re-draw seating a second committee
-    // over a still-advancing tip forks the chain for real (a `commit linkage
-    // broken` panic). A forking attacker that then goes quiet — the shape the
-    // plan notes collapses into the halt signature — lets the fresh committee
-    // resume a settled tip, exactly the handover the halt recovery completes.
-    // Cut the committee in half on the consensus channels so neither half
-    // reaches quorum; the global fork-proof gossip below is untouched.
+    // Split the committee's votes down the middle so neither half reaches
+    // quorum — the fork's aftermath, a committee whose halves back different
+    // branches and can certify on neither. Nothing else is cut: headers,
+    // timeouts, and the global fork-proof gossip keep flowing, so the forked
+    // committee stays loud while the recovery runs.
     let committee = cluster.committee_hosts(shard);
-    let withholding: Vec<usize> = committee[..2].to_vec();
-    let others: Vec<usize> = (0..cluster.host_count())
-        .filter(|h| !withholding.contains(h))
+    let half_a: Vec<usize> = committee[..2].to_vec();
+    let rest: Vec<usize> = (0..cluster.host_count())
+        .filter(|h| !half_a.contains(h))
         .collect();
-    cluster.drop_type_between(&others, &withholding, "block.vote");
-    cluster.run_until(epochs(1), |_| false);
-    cluster.drop_type_between(&withholding, &others, "block.vote");
-    cluster.drop_type_between(&withholding, &others, "block.header");
-    cluster.drop_type_between(&withholding, &others, "shard.timeout");
+    cluster.drop_type_between(&rest, &half_a, "block.vote");
+    cluster.drop_type_between(&half_a, &rest, "block.vote");
     cluster.run_until(epochs(1), |_| false);
 
     // Inject on the real gossip ingress of a committee member. The fork-proof
@@ -375,12 +383,71 @@ fn shard_fork_drives_committee_recovery_sim() {
         "the fork proof must fold a RecoveryCause::Fork recovery"
     );
 
-    // The fresh committee resumes past the fork height, and its first crossing
-    // clears the record.
+    // The fold pinned the recovery to the beacon-attested frontier. Capture
+    // the anchor the fresh chain must extend and the retained membership the
+    // incomers' refusal is keyed on.
+    let (frontier, anchor, retained) = {
+        let state = cluster.beacon_state().expect("beacon state committed");
+        let recovery = state
+            .pending_recoveries
+            .get(&shard)
+            .expect("fork recovery pending");
+        let boundary = state.boundaries.get(&shard).expect("boundary recorded");
+        assert_eq!(
+            boundary.height, recovery.attested_frontier,
+            "the fork fence must hold the boundary at the attested frontier",
+        );
+        (
+            recovery.attested_frontier,
+            boundary.block_hash,
+            recovery.retained.clone(),
+        )
+    };
+
+    // Keep the forked committee loud through the seeding window: every epoch,
+    // re-deliver retained-member timeouts carrying the two branch-head QCs on
+    // the production gossip ingress — the divergent tips a real fork leaves
+    // in its ex-members' pacemakers. Delivery is audience-separated (each
+    // host hears only one branch's carriers), the split-audience shape in
+    // which harvesting a retained tip would seed the incomers onto divergent
+    // branches. The incomers must refuse the retained suffix wholesale and
+    // still resume past the frozen suffix from the frontier alone.
+    let net = NetworkDefinition::simulator();
+    let timeouts: Vec<Timeout> = retained
+        .iter()
+        .zip(branch_qcs.iter().cycle())
+        .map(|(&voter, qc)| {
+            let key = cluster
+                .runner()
+                .validator_signing_key(voter)
+                .expect("retained validator has a signing key");
+            Timeout::new(&net, shard, Round::new(1), qc.clone(), voter, &key)
+        })
+        .collect();
+    let resumed = (0..10).any(|_| {
+        for (branch, timeout) in timeouts.iter().enumerate() {
+            for host in (0..cluster.host_count()).filter(|host| host % 2 == branch % 2) {
+                cluster.runner_mut().schedule_initial_event(
+                    u32::try_from(host).expect("host index fits a node index"),
+                    Duration::ZERO,
+                    HostEvent::shard(
+                        shard,
+                        ShardScopedInput::Protocol(Box::new(
+                            ProtocolEvent::UnverifiedTimeoutReceived {
+                                timeout: timeout.clone(),
+                            },
+                        )),
+                    ),
+                );
+            }
+        }
+        cluster.run_until(epochs(4), |c| {
+            c.committed_height(shard)
+                .is_some_and(|h| h.inner() > frozen + 1)
+        })
+    });
     assert!(
-        cluster.run_until(epochs(40), |c| c
-            .committed_height(shard)
-            .is_some_and(|h| h.inner() > frozen + 1)),
+        resumed,
         "the recovered shard must resume committing under its fresh committee"
     );
     assert!(
@@ -388,6 +455,51 @@ fn shard_fork_drives_committee_recovery_sim() {
             .beacon_state()
             .is_some_and(|s| !s.pending_recoveries.contains_key(&shard))),
         "the fresh committee's crossing must clear the fork recovery"
+    );
+
+    // The fresh chain's first block extends the beacon-attested anchor — not
+    // either branch head, and not the retained committee's unattested suffix
+    // above the frontier.
+    let fresh_host = cluster
+        .committee_hosts(shard)
+        .into_iter()
+        .next()
+        .expect("recovered shard has a live committee host");
+    let storage = cluster
+        .runner()
+        .hosts_shard(
+            u32::try_from(fresh_host).expect("host index fits a node index"),
+            shard,
+        )
+        .expect("fresh committee host serves the shard");
+    let bridge = storage
+        .get_certified_header(BlockHeight::new(frontier.inner() + 1))
+        .expect("fresh chain holds its first block past the frontier");
+    assert_eq!(
+        bridge.header().parent_block_hash(),
+        anchor,
+        "the fresh chain must extend the beacon-attested anchor"
+    );
+
+    // The retained committee's own real suffix above the frontier is refused
+    // like the branch heads: the fresh chain re-produces `frontier + 1`
+    // rather than adopting the old committee's block there. A retained head
+    // above the beacon-attested anchor is unattestable — the incomers cannot
+    // know it is the branches' common prefix rather than one side's forgery.
+    let old_storage = cluster
+        .runner()
+        .hosts_shard(
+            u32::try_from(committee[0]).expect("host index fits a node index"),
+            shard,
+        )
+        .expect("old committee host still serves its stalled chain");
+    let old_block = old_storage
+        .get_certified_header(BlockHeight::new(frontier.inner() + 1))
+        .expect("the old chain committed past the frontier before the fork");
+    assert_ne!(
+        old_block.block_hash(),
+        bridge.block_hash(),
+        "the fresh chain must not adopt the retained suffix above the frontier"
     );
 }
 

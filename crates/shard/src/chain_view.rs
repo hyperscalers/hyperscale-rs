@@ -27,6 +27,7 @@ pub struct ChainView<'a> {
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
+    committed_in_flight: Option<InFlightCount>,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
     pending: &'a PendingBlocks,
     certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -40,6 +41,7 @@ impl<'a> ChainView<'a> {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
+        committed_in_flight: Option<InFlightCount>,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
         pending: &'a PendingBlocks,
         certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -50,6 +52,7 @@ impl<'a> ChainView<'a> {
             committed_height,
             committed_hash,
             committed_state_root,
+            committed_in_flight,
             latest_qc,
             pending,
             certified,
@@ -100,11 +103,26 @@ impl<'a> ChainView<'a> {
         )
     }
 
-    /// In-flight count on the parent header. Returns zero if the header is
-    /// missing (parent pruned from `pending`).
+    /// In-flight count on the parent header, or `None` when the parent is
+    /// unresolvable: pruned from `pending` and — when the parent is the
+    /// committed tip itself — the committed-tip scalar wasn't recovered.
+    /// A snap-synced joiner extending its boundary anchor resolves through
+    /// the scalar (the anchor header never enters `pending`); a `None`
+    /// skips the vote, since the claimed in-flight count can't be checked.
+    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<InFlightCount> {
+        if let Some(header) = self.get_header(parent_block_hash) {
+            return Some(header.in_flight());
+        }
+        (parent_block_hash == self.committed_hash)
+            .then_some(self.committed_in_flight)
+            .flatten()
+    }
+
+    /// In-flight count on the parent header. Returns zero if the parent is
+    /// unresolvable (see [`Self::parent_in_flight_checked`]).
     pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> InFlightCount {
-        self.get_header(parent_block_hash)
-            .map_or(InFlightCount::ZERO, BlockHeader::in_flight)
+        self.parent_in_flight_checked(parent_block_hash)
+            .unwrap_or(InFlightCount::ZERO)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -233,6 +251,7 @@ mod tests {
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
+            committed_in_flight: None,
             latest_qc,
             pending,
             certified: &certified,

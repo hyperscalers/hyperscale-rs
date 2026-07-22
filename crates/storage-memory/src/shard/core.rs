@@ -170,6 +170,8 @@ impl SimShardStorage {
             committed_height,
             committed_hash,
             latest_qc,
+            anchor_qc: None,
+            committed_in_flight: None,
             committed_anchor_ts,
             jmt_root: Some(self.state_root()),
             beacon_witness_start,

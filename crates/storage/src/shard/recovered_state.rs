@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash, InFlightCount,
     QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot, ValidatorId, Verified,
     WeightedTimestamp,
 };
@@ -27,6 +27,26 @@ pub struct RecoveredState {
     /// storage adapter; the trust source is the persistence invariant
     /// that QCs only land in storage after verification at admission.
     pub latest_qc: Option<Verified<QuorumCertificate>>,
+
+    /// The QC certifying a snap-synced boundary anchor, served alongside
+    /// the witness history and structurally bound by the fetch path (it
+    /// certifies exactly the beacon-attested anchor `block_hash`, which
+    /// pins every certified field through the vote message). Its
+    /// aggregate signature is *not* yet verified — the coordinator
+    /// resolves the anchor's committee from its topology schedule and
+    /// verifies before adopting it as `latest_qc`, giving the fresh
+    /// committee the parent QC its first block past the anchor extends.
+    /// `None` on an ordinary restart, where `latest_qc` recovers from
+    /// storage directly.
+    pub anchor_qc: Option<QuorumCertificate>,
+
+    /// In-flight count carried by the committed tip's header. `None` on
+    /// an ordinary restart (peers' headers repopulate the window as the
+    /// chain advances); a snap-synced bootstrap seeds it from the
+    /// boundary header so the fresh committee's first block past the
+    /// anchor is votable — the vote path checks the claimed in-flight
+    /// count against the parent's.
+    pub committed_in_flight: Option<InFlightCount>,
 
     /// Weighted timestamp of the committed tip's *parent* QC — the anchor
     /// its committee was keyed on (`committee = at(committed_anchor_ts)`).
@@ -93,13 +113,16 @@ impl RecoveredState {
     /// weighted timestamp is the tip's committee anchor, and
     /// `witness_leaf_hashes` is its verified accumulator window —
     /// starting at the header's `beacon_witness_base`. `latest_qc`
-    /// stays `None` — the store holds no QC for the boundary block,
-    /// and the first tail-synced block's QC adopts through the normal
-    /// round-monotonic path.
+    /// stays `None` — the boundary block's own QC arrives structurally
+    /// bound in [`anchor_qc`](Self::anchor_qc), and the coordinator
+    /// adopts it only after verifying it against the anchor's resolved
+    /// committee; a higher tail-synced QC still adopts through the
+    /// normal round-monotonic path.
     #[must_use]
     pub fn from_snap_synced_boundary(
         anchor: &ShardAnchor,
         boundary_header: &BlockHeader,
+        anchor_qc: QuorumCertificate,
         witness_leaf_hashes: Vec<Hash>,
         substate_bytes: u64,
     ) -> Self {
@@ -107,6 +130,8 @@ impl RecoveredState {
             committed_height: anchor.height,
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,
+            anchor_qc: Some(anchor_qc),
+            committed_in_flight: Some(boundary_header.in_flight()),
             committed_anchor_ts: Some(boundary_header.parent_qc().weighted_timestamp()),
             jmt_root: Some(anchor.state_root),
             beacon_witness_start: boundary_header.beacon_witness_base(),

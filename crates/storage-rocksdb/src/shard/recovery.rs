@@ -70,6 +70,8 @@ impl RocksDbShardStorage {
             committed_height,
             committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
+            anchor_qc: None,
+            committed_in_flight: None,
             committed_anchor_ts: self.committed_anchor_ts(committed_height),
             jmt_root: jmt_root_opt,
             beacon_witness_start,

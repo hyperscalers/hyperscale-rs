@@ -29,7 +29,8 @@
 use hyperscale_types::network::request::GetWitnessHistoryRequest;
 use hyperscale_types::network::response::GetWitnessHistoryResponse;
 use hyperscale_types::{
-    BeaconWitnessRoot, BlockHeader, Hash, ShardAnchor, ShardWitnessPayload, compute_merkle_root,
+    BeaconWitnessRoot, BlockHeader, Hash, QuorumCertificate, ShardAnchor, ShardWitnessPayload,
+    compute_merkle_root,
 };
 
 use super::BootstrapOutcome;
@@ -50,6 +51,7 @@ pub struct WitnessHistorySync {
     limit: u32,
     state: SyncState,
     header: Option<BlockHeader>,
+    qc: Option<QuorumCertificate>,
     payloads: Vec<ShardWitnessPayload>,
 }
 
@@ -63,6 +65,7 @@ impl WitnessHistorySync {
             limit: limit.max(1),
             state: SyncState::Idle,
             header: None,
+            qc: None,
             payloads: Vec::new(),
         }
     }
@@ -112,6 +115,16 @@ impl WitnessHistorySync {
         if chunk.header.hash() != self.anchor.block_hash {
             return BootstrapOutcome::Rejected("served header does not hash to the anchor");
         }
+        // The served QC must certify the anchor block. This pins every
+        // certified field (the vote message binds them through the hash);
+        // the aggregate signature itself is only checkable against the
+        // resolved committee, which the seeded coordinator verifies
+        // before adopting the QC as its `latest_qc`.
+        if chunk.qc.block_hash() != self.anchor.block_hash
+            || chunk.qc.height() != self.anchor.height
+        {
+            return BootstrapOutcome::Rejected("served QC does not certify the anchor");
+        }
         // The header's commitment spans its window `[base, count)`; the
         // assembly is the window's hashes only.
         let window_len = chunk
@@ -135,6 +148,7 @@ impl WitnessHistorySync {
         }
 
         self.header = Some(chunk.header.clone());
+        self.qc = Some(chunk.qc.clone());
         self.payloads.extend(chunk.payloads.iter().cloned());
         if chunk.more {
             return BootstrapOutcome::Accepted;
@@ -162,16 +176,18 @@ impl WitnessHistorySync {
         self.state == SyncState::Complete
     }
 
-    /// Take the verified boundary header and leaf-payload history:
-    /// the derived hashes seed a `RecoveredState`'s accumulator and the
-    /// payloads seed the store's witness window at the boundary import.
+    /// Take the verified boundary header, its anchor-bound QC, and the
+    /// leaf-payload history: the derived hashes seed a `RecoveredState`'s
+    /// accumulator, the payloads seed the store's witness window at the
+    /// boundary import, and the QC seeds the coordinator's verify-then-
+    /// adopt path for its first proposal past the anchor.
     ///
     /// # Panics
     ///
     /// Panics unless [`Self::is_complete`] — a partial history would
     /// seed an accumulator whose roots can never match.
     #[must_use]
-    pub fn take_parts(&mut self) -> (BlockHeader, Vec<ShardWitnessPayload>) {
+    pub fn take_parts(&mut self) -> (BlockHeader, QuorumCertificate, Vec<ShardWitnessPayload>) {
         assert!(
             self.is_complete(),
             "witness history taken before assembly completed",
@@ -180,6 +196,7 @@ impl WitnessHistorySync {
             self.header
                 .take()
                 .expect("complete assembly stored its header"),
+            self.qc.take().expect("complete assembly stored its QC"),
             std::mem::take(&mut self.payloads),
         )
     }
@@ -191,6 +208,7 @@ impl WitnessHistorySync {
     fn reject(&mut self, reason: &'static str) -> BootstrapOutcome {
         self.payloads.clear();
         self.header = None;
+        self.qc = None;
         self.state = SyncState::Idle;
         BootstrapOutcome::Rejected(reason)
     }
@@ -251,8 +269,9 @@ mod tests {
         assert!(sync.is_complete());
         assert!(sync.next_request().is_none());
 
-        let (header, payloads) = sync.take_parts();
+        let (header, qc, payloads) = sync.take_parts();
         assert_eq!(header.hash(), anchor.block_hash);
+        assert_eq!(qc.block_hash(), anchor.block_hash);
         assert_eq!(payloads, leaves);
         let expected: Vec<Hash> = leaves.iter().map(ShardWitnessPayload::leaf_hash).collect();
 
@@ -261,7 +280,8 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, hashes, 0);
+        let recovered =
+            RecoveredState::from_snap_synced_boundary(&anchor, &header, qc.clone(), hashes, 0);
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -270,6 +290,7 @@ mod tests {
             Some(header.parent_qc().weighted_timestamp()),
         );
         assert!(recovered.latest_qc.is_none());
+        assert_eq!(recovered.anchor_qc, Some(qc));
         assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
     }
 
@@ -279,7 +300,7 @@ mod tests {
         let mut sync = WitnessHistorySync::new(anchor, 16);
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
-        let (_, hashes) = sync.take_parts();
+        let (_, _, hashes) = sync.take_parts();
         assert!(hashes.is_empty());
     }
 
@@ -316,7 +337,7 @@ mod tests {
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
 
-        let (header, payloads) = sync.take_parts();
+        let (header, qc, payloads) = sync.take_parts();
         assert_eq!(header.beacon_witness_base(), BeaconWitnessLeafCount::new(3));
         assert_eq!(payloads, window);
 
@@ -324,7 +345,7 @@ mod tests {
             .iter()
             .map(ShardWitnessPayload::leaf_hash)
             .collect();
-        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, hashes, 0);
+        let recovered = RecoveredState::from_snap_synced_boundary(&anchor, &header, qc, hashes, 0);
         assert_eq!(
             recovered.beacon_witness_start,
             BeaconWitnessLeafCount::new(3)
@@ -435,7 +456,7 @@ mod tests {
             let _ = sync.on_response(&response);
         }
         assert!(sync.is_complete());
-        let (_, payloads) = sync.take_parts();
+        let (_, _, payloads) = sync.take_parts();
         assert_eq!(payloads, leaves);
     }
 

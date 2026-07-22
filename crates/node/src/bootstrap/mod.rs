@@ -34,8 +34,8 @@ use hyperscale_types::network::response::{
     GetStateRangeResponse, GetWitnessHistoryResponse, MAX_LEAVES_PER_STATE_RANGE,
 };
 use hyperscale_types::{
-    BlockHeader, BlockHeight, Hash, MAX_WITNESSES_PER_FETCH, NetworkDefinition, ShardAnchor,
-    ShardId, ShardWitnessPayload, StateRoot, shard_prefix_path,
+    BlockHeader, BlockHeight, Hash, MAX_WITNESSES_PER_FETCH, NetworkDefinition, QuorumCertificate,
+    ShardAnchor, ShardId, ShardWitnessPayload, StateRoot, shard_prefix_path,
 };
 
 use self::snap_sync::SnapSync;
@@ -148,10 +148,12 @@ enum Phase {
 }
 
 /// The witness phase's verified output: the anchor-bound boundary
-/// header, the derived leaf hashes that seed the accumulator, and the
-/// payloads the store import seeds — taken by [`ShardBootstrap::take_import`].
+/// header, its anchor-bound QC, the derived leaf hashes that seed the
+/// accumulator, and the payloads the store import seeds — taken by
+/// [`ShardBootstrap::take_import`].
 struct VerifiedWitnessWindow {
     header: Box<BlockHeader>,
+    qc: Box<QuorumCertificate>,
     hashes: Vec<Hash>,
     payloads: Vec<ShardWitnessPayload>,
 }
@@ -318,13 +320,14 @@ impl ShardBootstrap {
         };
         let outcome = witness.on_response(response);
         if witness.is_complete() {
-            let (header, payloads) = witness.take_parts();
+            let (header, qc, payloads) = witness.take_parts();
             self.witness = Some(VerifiedWitnessWindow {
                 hashes: payloads
                     .iter()
                     .map(ShardWitnessPayload::leaf_hash)
                     .collect(),
                 header: Box::new(header),
+                qc: Box::new(qc),
                 payloads,
             });
             self.phase = Phase::State(SnapSync::new(
@@ -377,6 +380,7 @@ impl ShardBootstrap {
         RecoveredState::from_snap_synced_boundary(
             &self.anchor,
             &window.header,
+            *window.qc,
             window.hashes,
             self.imported_substate_bytes,
         )
