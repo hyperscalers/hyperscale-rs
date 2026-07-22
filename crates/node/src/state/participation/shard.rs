@@ -486,14 +486,15 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
-    use hyperscale_types::test_utils::{certify, make_live_block, test_transaction};
+    use hyperscale_types::test_utils::{
+        TestCommittee, certify, make_live_block, shard_fork_proof, test_transaction,
+    };
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        BlockManifest, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-        CommitProof, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, MerkleInclusionProof,
-        ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
-        RETENTION_HORIZON, Round, ShardForkProof, ShardId, StateRoot, TransactionRoot,
-        TransactionStatus, TxHash, ValidatorId, Verified, WaveId, WitnessSources,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
+        CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp,
+        MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
+        Round, ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
+        WitnessSources,
     };
 
     use crate::state::test_support::TestNode;
@@ -601,69 +602,11 @@ mod tests {
         );
     }
 
-    /// A minimal certified header (dummy QC) on `shard` — enough for the
-    /// orchestration paths that read only `shard`/`height`, not the crypto.
-    fn dummy_header(
-        shard: ShardId,
-        height: u64,
-        round: u64,
-        parent: BlockHash,
-        salt: u64,
-    ) -> CertifiedBlockHeader {
-        let h = BlockHeight::new(height);
-        let header = BlockHeader::new(
-            shard,
-            h,
-            parent,
-            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(salt),
-            Round::new(round),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            None,
-            None,
-        );
-        CertifiedBlockHeader::new(header, QuorumCertificate::genesis(shard, ChainOrigin::ROOT))
-    }
-
-    /// A `ConflictingCommits` on `shard` forked at height 5. The dummy QCs
-    /// do not verify — sufficient for the `ShardForkDetected` path, which
-    /// trusts locally-assembled evidence.
+    /// A `ConflictingCommits` on `shard` forked at height 5. Signed by a
+    /// throwaway committee the node does not know — sufficient for the
+    /// `ShardForkDetected` path, which trusts locally-assembled evidence.
     fn make_fork_proof(shard: ShardId) -> ShardForkProof {
-        let parent = BlockHash::from_raw(Hash::from_bytes(b"fork-parent"));
-        ShardForkProof::ConflictingCommits {
-            a: CommitProof::direct(
-                dummy_header(shard, 5, 5, parent, 1),
-                dummy_header(
-                    shard,
-                    6,
-                    6,
-                    dummy_header(shard, 5, 5, parent, 1).block_hash(),
-                    2,
-                ),
-            ),
-            b: CommitProof::direct(
-                dummy_header(shard, 5, 7, parent, 3),
-                dummy_header(
-                    shard,
-                    6,
-                    8,
-                    dummy_header(shard, 5, 7, parent, 3).block_hash(),
-                    4,
-                ),
-            ),
-        }
+        shard_fork_proof(&TestCommittee::new(4, 7), shard, BlockHeight::new(5))
     }
 
     /// A locally-assembled fork engages the fence and re-gossips exactly

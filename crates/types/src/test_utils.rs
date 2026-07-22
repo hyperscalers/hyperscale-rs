@@ -470,7 +470,7 @@ pub fn shard_fork_proof_same_round(
 /// quorum. `salt` distinguishes sibling branches by varying the proposer
 /// timestamp (and so the block hash).
 #[must_use]
-fn direct_commit_proof(
+pub(crate) fn direct_commit_proof(
     committee: &TestCommittee,
     shard: ShardId,
     height: BlockHeight,
@@ -523,7 +523,7 @@ fn direct_commit_proof_signed(
 /// A minimal `BlockHeader` on `shard` distinguished by `salt` (varies the
 /// proposer timestamp, and so the hash). The genesis parent QC carries the
 /// anchor weighted timestamp the fork verifier reads.
-fn fork_header(
+pub(crate) fn fork_header(
     shard: ShardId,
     height: BlockHeight,
     round: Round,
@@ -557,7 +557,7 @@ fn fork_header(
 
 /// Pair a fork-fixture header with a genuine QC signed by `committee`'s
 /// `signers` (committee indices), so the resulting two-chain BLS-verifies.
-fn certify_header(
+pub(crate) fn certify_header(
     committee: &TestCommittee,
     header: BlockHeader,
     signers: &[usize],

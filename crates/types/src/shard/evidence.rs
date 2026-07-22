@@ -691,22 +691,13 @@ mod tests {
     // ─── Fork-proof fixtures and tests ──────────────────────────────────
 
     mod fork {
-        use std::collections::BTreeMap;
         use std::sync::Arc;
 
         use super::super::*;
-        use crate::test_utils::TestCommittee;
-        use crate::{
-            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, CertificateRoot, ChainOrigin,
-            Epoch, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-            SignerBitfield, StateRoot, TopologySchedule, TransactionRoot, WeightedTimestamp,
-        };
+        use crate::test_utils::{TestCommittee, certify_header, direct_commit_proof, fork_header};
+        use crate::{BlockHeader, Epoch, Hash, TopologySchedule};
 
         const SHARD: ShardId = ShardId::ROOT;
-
-        fn network() -> NetworkDefinition {
-            NetworkDefinition::simulator()
-        }
 
         /// One committee for every window, so any QC's WT resolves to it.
         fn schedule(committee: &TestCommittee) -> TopologySchedule {
@@ -722,64 +713,12 @@ mod tests {
             parent_block_hash: BlockHash,
             salt: u64,
         ) -> BlockHeader {
-            BlockHeader::new(
-                SHARD,
-                height,
-                parent_block_hash,
-                QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
-                ValidatorId::new(0),
-                ProposerTimestamp::from_millis(salt),
-                round,
-                false,
-                StateRoot::ZERO,
-                TransactionRoot::ZERO,
-                CertificateRoot::ZERO,
-                LocalReceiptRoot::ZERO,
-                ProvisionsRoot::ZERO,
-                Vec::new(),
-                BTreeMap::new(),
-                InFlightCount::ZERO,
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                None,
-                None,
-            )
+            fork_header(SHARD, height, round, parent_block_hash, salt)
         }
 
         /// Pair a header with a genuine quorum QC signed by `committee`.
         fn certify(committee: &TestCommittee, header: BlockHeader) -> CertifiedBlockHeader {
-            let net = network();
-            let block_hash = header.hash();
-            let msg = block_vote_message(
-                &net,
-                header.shard_id(),
-                header.height(),
-                header.round(),
-                &block_hash,
-                &header.parent_block_hash(),
-            );
-            let quorum = committee.quorum_indices();
-            let sigs: Vec<Bls12381G2Signature> = quorum
-                .iter()
-                .map(|&i| committee.keypair(i).sign_v1(&msg))
-                .collect();
-            let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
-            let mut signers = SignerBitfield::new(committee.size());
-            for &i in &quorum {
-                signers.set(i);
-            }
-            let qc = QuorumCertificate::new(
-                block_hash,
-                header.shard_id(),
-                header.height(),
-                header.parent_block_hash(),
-                header.round(),
-                signers,
-                agg,
-                WeightedTimestamp::from_millis(header.height().inner() * 1_000),
-            );
-            CertifiedBlockHeader::new(header, qc)
+            certify_header(committee, header, &committee.quorum_indices())
         }
 
         /// A direct-commit proof for a block at `(height, round)` with a
@@ -791,12 +730,7 @@ mod tests {
             parent: BlockHash,
             salt: u64,
         ) -> CommitProof {
-            let block = certify(committee, header(height, round, parent, salt));
-            let child = certify(
-                committee,
-                header(height.next(), round.next(), block.block_hash(), salt + 500),
-            );
-            CommitProof::direct(block, child)
+            direct_commit_proof(committee, SHARD, height, round, parent, salt)
         }
 
         /// Two committed branches at one height with distinct hashes.

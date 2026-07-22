@@ -89,8 +89,7 @@ impl ForkProofObservations {
     }
 }
 
-// Flat accessors over both buffers; names are the documentation.
-#[allow(missing_docs)]
+#[allow(missing_docs)] // flat accessors over both buffers; names are the documentation
 impl ForkProofObservations {
     #[must_use]
     pub fn len(&self) -> usize {

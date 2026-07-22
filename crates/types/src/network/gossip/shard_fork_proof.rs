@@ -57,84 +57,15 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::test_utils::TestCommittee;
-    use crate::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-        Bls12381G2Signature, CertificateRoot, CertifiedBlockHeader, ChainOrigin, CommitProof, Hash,
-        InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp, block_vote_message,
-    };
-
-    fn certify(
-        committee: &TestCommittee,
-        height: u64,
-        round: u64,
-        parent: BlockHash,
-        salt: u64,
-    ) -> CertifiedBlockHeader {
-        let net = NetworkDefinition::simulator();
-        let shard = ShardId::ROOT;
-        let h = BlockHeight::new(height);
-        let header = BlockHeader::new(
-            shard,
-            h,
-            parent,
-            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(salt),
-            Round::new(round),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            None,
-            None,
-        );
-        let block_hash = header.hash();
-        let msg = block_vote_message(&net, shard, h, Round::new(round), &block_hash, &parent);
-        let quorum = committee.quorum_indices();
-        let sigs: Vec<_> = quorum
-            .iter()
-            .map(|&i| committee.keypair(i).sign_v1(&msg))
-            .collect();
-        let agg = Bls12381G2Signature::aggregate(&sigs, true).unwrap();
-        let mut signers = SignerBitfield::new(committee.size());
-        for &i in &quorum {
-            signers.set(i);
-        }
-        let qc = QuorumCertificate::new(
-            block_hash,
-            shard,
-            h,
-            parent,
-            Round::new(round),
-            signers,
-            agg,
-            WeightedTimestamp::from_millis(height * 1_000),
-        );
-        CertifiedBlockHeader::new(header, qc)
-    }
+    use crate::BlockHeight;
+    use crate::test_utils::{TestCommittee, shard_fork_proof};
 
     fn sample_proof() -> ShardForkProof {
-        let committee = TestCommittee::new(4, 1);
-        let parent = BlockHash::from_raw(Hash::from_bytes(b"p"));
-        let a_block = certify(&committee, 5, 5, parent, 1);
-        let a_child = certify(&committee, 6, 6, a_block.block_hash(), 2);
-        let b_block = certify(&committee, 5, 7, parent, 3);
-        let b_child = certify(&committee, 6, 8, b_block.block_hash(), 4);
-        ShardForkProof::ConflictingCommits {
-            a: CommitProof::direct(a_block, a_child),
-            b: CommitProof::direct(b_block, b_child),
-        }
+        shard_fork_proof(
+            &TestCommittee::new(4, 1),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+        )
     }
 
     #[test]
