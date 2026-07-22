@@ -173,7 +173,7 @@ where
                     ProtocolEvent::BeaconBlockPersisted { epoch },
                 );
             }
-            Action::Continuation(pe) => self.handle_continuation(pe),
+            Action::Continuation(pe) => self.handle_continuation(vnode_idx, pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock {
                 certified,
@@ -255,7 +255,7 @@ where
     // a typed cache reference onto `ActionContext` per arm, with no
     // architectural payoff.
 
-    fn handle_continuation(&mut self, pe: ProtocolEvent) {
+    fn handle_continuation(&mut self, vnode_idx: usize, pe: ProtocolEvent) {
         self.drive_fetch_admission(&pe);
 
         // Serving-cache insertion is `ShardLoop`'s own state, not an
@@ -276,11 +276,25 @@ where
         // Tell the remote-header-sync FSM about admitted headers so it can
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
+        //
+        // Advance the watermark by the coordinator's contiguous verified
+        // frontier, not this header's own height: a provision- or
+        // execution-certificate-bundled source header lands above the
+        // frontier when `block.committed` gossip is suppressed, and jumping
+        // `committed` to it would strand the intervening heights below —
+        // the sync queues from `committed + 1`, so it would never fetch the
+        // gap the commit-proof walk needs contiguous.
         if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
-            let outputs = self.io.cross_shard.on_remote_header_admitted(
-                certified_header.shard_id(),
-                certified_header.header().height(),
-            );
+            let source_shard = certified_header.shard_id();
+            let frontier = self.vnodes[vnode_idx]
+                .state
+                .remote_headers_coordinator()
+                .verified_frontier(source_shard)
+                .unwrap_or_else(|| certified_header.header().height());
+            let outputs = self
+                .io
+                .cross_shard
+                .on_remote_header_admitted(source_shard, frontier);
             self.process_remote_header_sync_outputs(outputs);
         }
 

@@ -64,7 +64,14 @@ struct ExpectedHeader {
     /// Local weighted timestamp when we first expected a header from
     /// this shard. Used as the liveness baseline until we verify a header.
     discovered_at: WeightedTimestamp,
-    /// Highest height we've verified from this shard (0 if none).
+    /// The sync frontier: the highest height up to which we hold a
+    /// contiguous run of verified headers from this shard (0 if none). Only
+    /// a header that extends this run advances it — an out-of-band admission
+    /// above the frontier (a provision- or EC-bundled source header fetched
+    /// for a single block) is held in `verified` but does not slide the
+    /// frontier past the gap below it. This keeps the liveness probe and the
+    /// sync watermark aligned with contiguous coverage, which the
+    /// commit-proof walk needs.
     last_verified_height: BlockHeight,
     /// Local weighted timestamp when we last verified a header from
     /// this shard. Liveness baseline once set — the timeout measures how
@@ -526,11 +533,31 @@ impl RemoteHeaderCoordinator {
         }
         self.verified.insert(key, Arc::clone(&verified));
 
-        if let Some(expected) = self.expected.get_mut(&shard)
-            && height > expected.last_verified_height
+        // Advance the sync frontier only over a contiguous run of verified
+        // heights. A header admitted above the frontier — a provision- or
+        // execution-certificate-bundled source header fetched for a single
+        // block, arriving while `block.committed` gossip is suppressed —
+        // populates `verified` but is not sync progress: counting it would
+        // refresh the liveness baseline and slide the frontier past the gap
+        // below it, leaving the intervening heights unfetched. The
+        // commit-proof walk a cross-shard consumer runs needs a source block
+        // and its committing child held contiguously, so only a header that
+        // extends the frontier — walking up over any already-held successors —
+        // advances it and re-arms the liveness clock.
+        if self
+            .expected
+            .get(&shard)
+            .is_some_and(|e| height == e.last_verified_height.next())
         {
-            expected.last_verified_height = height;
-            expected.last_verified_at = Some(self.local_committed_ts);
+            let mut frontier = height;
+            while self.verified.contains_key(&(shard, frontier.next())) {
+                frontier = frontier.next();
+            }
+            let now = self.local_committed_ts;
+            if let Some(expected) = self.expected.get_mut(&shard) {
+                expected.last_verified_height = frontier;
+                expected.last_verified_at = Some(now);
+            }
         }
 
         let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
@@ -784,6 +811,16 @@ impl RemoteHeaderCoordinator {
     #[must_use]
     pub fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
         self.proven.contains(&(shard, height))
+    }
+
+    /// The highest contiguously-verified height for `shard` — the sync
+    /// frontier. The remote-header-sync FSM advances its watermark to this,
+    /// not to a header's own height, so an out-of-band admission above the
+    /// frontier never jumps the watermark past a gap the sync must still
+    /// fetch. `None` if the shard isn't tracked.
+    #[must_use]
+    pub fn verified_frontier(&self, shard: ShardId) -> Option<BlockHeight> {
+        self.expected.get(&shard).map(|e| e.last_verified_height)
     }
 
     /// Get the in-flight count from the tip header of each remote shard.
@@ -1450,6 +1487,58 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::StartRemoteHeaderSync { .. })),
             "a stale committed clock below the retained windows must not probe",
+        );
+    }
+
+    #[test]
+    fn out_of_band_admit_holds_the_frontier_until_the_gap_fills() {
+        // A source header admitted above the sync frontier — the shape a
+        // provision- or execution-certificate-bundled `source_header` takes
+        // while `block.committed` gossip is dropped — populates `verified`
+        // but must not advance the frontier past the gap below it. If it did,
+        // the liveness probe would stop fetching the intervening heights and
+        // the commit-proof walk (which needs a source block and its committing
+        // child held contiguously) would never complete.
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(5),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+
+        // A sparse admit at height 8 (gap at 6, 7) leaves the frontier at 5.
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 8, 8, None),
+            ValidatorId::new(0),
+        );
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(5)),
+            "a header above the frontier does not slide it past the gap",
+        );
+
+        // Filling 6 advances the frontier one step; it cannot yet reach the
+        // held 8 across the still-missing 7.
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 6, 6, None),
+            ValidatorId::new(0),
+        );
+        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(6)));
+
+        // Filling 7 closes the gap and walks the frontier up over the held 8.
+        coord.on_verified_remote_header_received(
+            chain_header(remote, 7, 7, None),
+            ValidatorId::new(0),
+        );
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(8)),
+            "filling the gap walks the frontier up over the already-held successor",
         );
     }
 
