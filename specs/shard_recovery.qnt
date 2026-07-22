@@ -1307,6 +1307,16 @@ module cross_shard_no_freeze {
 //   invArmingIdempotent — the fork recovery is stamped once at the attested
 //                      frontier and never moves, however many proofs arrive
 //                      (INV-SEC-14, cause-neutral arming).
+//   invNoReplayRearm — a proof replayed after the recovery completes is
+//                      inert: the completed record's frontier tombstones
+//                      every proof at or below it, so re-gossiped evidence
+//                      of the answered fork never re-draws the innocent
+//                      fresh committee (INV-FORK-NOREPLAY). Replays above
+//                      the frontier are out of the tombstone's scope — the
+//                      recovery bridge resolves the fresh committee there,
+//                      so an old-committee QC fails verification at
+//                      admission. The `fork_detection_replay` twin drops
+//                      the tombstone and violates it.
 //
 // Modeling assumptions:
 //   - Honest signers obey the safe-vote lock (INV-SHARD-3): a seat never
@@ -1338,6 +1348,9 @@ module cross_shard_no_freeze {
 //      victim consumes a branch above the attested frontier)
 //   quint verify --main=fork_detection_honest --invariant=invAll --max-steps=8 specs/shard_recovery.qnt
 //     (the honest-majority control; no fork assembles, no recovery arms)
+//   quint verify --main=fork_detection_replay --invariant=invNoReplayRearm --max-steps=8 specs/shard_recovery.qnt
+//     (no completed-recovery tombstone; expect a counterexample — the
+//      replayed proof re-arms the recovery after completion)
 
 module fork_detection {
   // Committee size (production 128; model scale). SHARD_SIZE = 3f + 1.
@@ -1358,6 +1371,10 @@ module fork_detection {
   const COMMIT_PROOF_CONSUMPTION: bool
   // Broken twin: no commit-level fork fence. True is the shipped fence.
   const FORK_FENCE: bool
+  // Broken twin: no completed-recovery tombstone — a replayed proof at or
+  // below the completed frontier re-folds and re-draws the fresh
+  // committee. True is the shipped tombstone.
+  const REPLAY_TOMBSTONE: bool
 
   val OLD_HONEST: Set[int] = OLD.exclude(OLD_BYZ)
   // Two committing quorums share at least this many seats (pigeonhole over
@@ -1389,6 +1406,12 @@ module fork_detection {
   // A folded victim consumed a branch's provisions above the frontier — a
   // commit-level fence breach.
   var fenceBreached: bool
+  // The fresh committee's first crossing cleared the pending record; the
+  // permanent completed record keeps the frontier as a tombstone.
+  var recoveryCompleted: bool
+  // A replayed proof re-armed a recovery after completion — the repeatable
+  // re-draw of the innocent fresh committee the tombstone closes.
+  var rearmed: bool
 
   // The `ConflictingCommits` assembly: two committed heads at one height on
   // different branches.
@@ -1427,6 +1450,8 @@ module fork_detection {
     consumerFolded' = consumerFolded,
     consumedUncommitted' = consumedUncommitted,
     fenceBreached' = fenceBreached,
+    recoveryCompleted' = recoveryCompleted,
+    rearmed' = rearmed,
   }
 
   // The retained committee emits a bare QC — a merely-certified sibling
@@ -1441,15 +1466,21 @@ module fork_detection {
     consumerFolded' = consumerFolded,
     consumedUncommitted' = consumedUncommitted,
     fenceBreached' = fenceBreached,
+    recoveryCompleted' = recoveryCompleted,
+    rearmed' = rearmed,
   }
 
   // The beacon folds the assembled `ConflictingCommits` into a
   // `ShardRecovery`, stamping the fence at the attested frontier.
   // Idempotent: a second proof at the same shard finds the record already
-  // stamped and does nothing.
+  // stamped and does nothing. Guarded to the pre-completion life of the
+  // fork: post-completion re-folds of the answered fork go through
+  // `replayProof` (the old committee is this model's only producer, so
+  // every post-completion proof is a replay).
   action armFork: bool = all {
     forkAssembled,
     not(forkArmed),
+    not(recoveryCompleted),
     forkArmed' = true,
     frozenAt' = FRONTIER,
     commits' = commits,
@@ -1457,6 +1488,8 @@ module fork_detection {
     consumerFolded' = consumerFolded,
     consumedUncommitted' = consumedUncommitted,
     fenceBreached' = fenceBreached,
+    recoveryCompleted' = recoveryCompleted,
+    rearmed' = rearmed,
   }
 
   // A victim folds the committed recovery — the fence governs from here.
@@ -1470,6 +1503,51 @@ module fork_detection {
     frozenAt' = frozenAt,
     consumedUncommitted' = consumedUncommitted,
     fenceBreached' = fenceBreached,
+    recoveryCompleted' = recoveryCompleted,
+    rearmed' = rearmed,
+  }
+
+  // The fresh committee's first crossing completes the recovery: the
+  // pending record clears, and the permanent completed record retains the
+  // attested frontier as the replay tombstone.
+  action completeRecovery: bool = all {
+    forkArmed,
+    not(recoveryCompleted),
+    forkArmed' = false,
+    recoveryCompleted' = true,
+    commits' = commits,
+    certs' = certs,
+    frozenAt' = frozenAt,
+    consumerFolded' = consumerFolded,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+    rearmed' = rearmed,
+  }
+
+  // The original proof re-gossips after the recovery completed. Scoped to
+  // a conflicting pair at or below the completed frontier — the band whose
+  // old-committee QCs verify forever (certified resolution keeps resolving
+  // them below the bridge); a replay above the frontier already fails
+  // verification at admission, since the bridge resolves the fresh
+  // committee there. The shipped tombstone drops the proof at the fold;
+  // the twin re-folds it and re-draws the innocent fresh committee.
+  action replayProof(h: int): bool = all {
+    recoveryCompleted,
+    h <= frozenAt,
+    commits.exists(a => commits.exists(b => and {
+      a.branch != b.branch,
+      a.h == h,
+      b.h == h,
+    })),
+    forkArmed' = (forkArmed or not(REPLAY_TOMBSTONE)),
+    rearmed' = (rearmed or not(REPLAY_TOMBSTONE)),
+    commits' = commits,
+    certs' = certs,
+    frozenAt' = frozenAt,
+    consumerFolded' = consumerFolded,
+    consumedUncommitted' = consumedUncommitted,
+    fenceBreached' = fenceBreached,
+    recoveryCompleted' = recoveryCompleted,
   }
 
   // A victim consumes a branch's provisions at height h. Requires
@@ -1487,6 +1565,8 @@ module fork_detection {
     forkArmed' = forkArmed,
     frozenAt' = frozenAt,
     consumerFolded' = consumerFolded,
+    recoveryCompleted' = recoveryCompleted,
+    rearmed' = rearmed,
   }
 
   // ── Nondet wrappers ──
@@ -1510,6 +1590,11 @@ module fork_detection {
     consume(branch, h)
   }
 
+  action replayAny = {
+    nondet h = 0.to(MAX_HEIGHT).oneOf()
+    replayProof(h)
+  }
+
   action init = all {
     commits' = Set(),
     certs' = Set(),
@@ -1518,6 +1603,8 @@ module fork_detection {
     consumerFolded' = false,
     consumedUncommitted' = false,
     fenceBreached' = false,
+    recoveryCompleted' = false,
+    rearmed' = false,
   }
 
   action step = any {
@@ -1525,6 +1612,8 @@ module fork_detection {
     certifyAny,
     armFork,
     consumerFold,
+    completeRecovery,
+    replayAny,
     consumeAny,
   }
 
@@ -1551,11 +1640,17 @@ module fork_detection {
   val invArmingIdempotent =
     forkArmed implies (frozenAt == FRONTIER)
 
+  // A proof replayed after the recovery completes is inert: the completed
+  // record's frontier tombstones it, so the answered fork never re-draws
+  // the innocent fresh committee.
+  val invNoReplayRearm = not(rearmed)
+
   val invAll = and {
     invHonestNoProof,
     invNoCertifiedSibling,
     invForkFenceHolds,
     invArmingIdempotent,
+    invNoReplayRearm,
   }
 
   // ── Scripted witnesses (valid under the shipped instance) ──
@@ -1591,6 +1686,19 @@ module fork_detection {
       .then(certifyBranch(1, 2))
       .then(consume(0, 2))
       .expect(not(consumedUncommitted))
+
+  // The old committee double-commits below the frontier, the recovery arms
+  // and completes, and the original proof re-gossips: the tombstone keeps
+  // it inert — no re-arm, no re-draw. The replay twin re-folds it.
+  run replayedProofInertTest =
+    init
+      .then(commitBranch(0, 1, Set(1, 2, 3)))
+      .then(commitBranch(1, 1, Set(1, 2, 4)))
+      .then(armFork)
+      .then(completeRecovery)
+      .expect(recoveryCompleted and not(forkArmed))
+      .then(replayProof(1))
+      .expect(not(forkArmed) and not(rearmed))
 }
 
 // The shipped rules: consume only against a commit proof, fence at the
@@ -1601,7 +1709,8 @@ module fork_detection_ok {
     SHARD_SIZE = 4, QUORUM = 3,
     OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
     FRONTIER = 2, MAX_HEIGHT = 4,
-    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true,
+    REPLAY_TOMBSTONE = true
   ).*
 }
 
@@ -1613,7 +1722,8 @@ module fork_detection_bare_qc {
     SHARD_SIZE = 4, QUORUM = 3,
     OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
     FRONTIER = 2, MAX_HEIGHT = 4,
-    COMMIT_PROOF_CONSUMPTION = false, FORK_FENCE = true
+    COMMIT_PROOF_CONSUMPTION = false, FORK_FENCE = true,
+    REPLAY_TOMBSTONE = true
   ).*
 }
 
@@ -1624,7 +1734,8 @@ module fork_detection_no_fence {
     SHARD_SIZE = 4, QUORUM = 3,
     OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
     FRONTIER = 2, MAX_HEIGHT = 4,
-    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = false
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = false,
+    REPLAY_TOMBSTONE = true
   ).*
 }
 
@@ -1636,6 +1747,20 @@ module fork_detection_honest {
     SHARD_SIZE = 4, QUORUM = 3,
     OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1),
     FRONTIER = 2, MAX_HEIGHT = 4,
-    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true,
+    REPLAY_TOMBSTONE = true
+  ).*
+}
+
+// Broken twin: no completed-recovery tombstone. The original proof
+// re-gossips after the recovery completes and re-folds, re-drawing the
+// innocent fresh committee — invNoReplayRearm fails.
+module fork_detection_replay {
+  import fork_detection(
+    SHARD_SIZE = 4, QUORUM = 3,
+    OLD = Set(1, 2, 3, 4), OLD_BYZ = Set(1, 2),
+    FRONTIER = 2, MAX_HEIGHT = 4,
+    COMMIT_PROOF_CONSUMPTION = true, FORK_FENCE = true,
+    REPLAY_TOMBSTONE = false
   ).*
 }

@@ -475,7 +475,7 @@ impl TopologySchedule {
             self.head
                 .completed_recoveries()
                 .get(&shard)
-                .map(|rotated_at| rotated_at.next())
+                .map(|completed| completed.rotated_at.next())
         })
     }
 
@@ -821,7 +821,10 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use super::*;
-    use crate::{BlockHeight, NetworkDefinition, RecoveryCause, ShardRecovery, ValidatorSet};
+    use crate::{
+        BlockHeight, CompletedRecovery, NetworkDefinition, RecoveryCause, ShardRecovery,
+        ValidatorSet,
+    };
 
     fn snapshot() -> Arc<TopologySnapshot> {
         Arc::new(TopologySnapshot::new(
@@ -1416,10 +1419,16 @@ mod tests {
         };
         let completed = |committee: &[ValidatorId]| {
             Arc::new(
-                snap(committee)
-                    .as_ref()
-                    .clone()
-                    .with_completed_recoveries(std::iter::once((shard, Epoch::new(20))).collect()),
+                snap(committee).as_ref().clone().with_completed_recoveries(
+                    std::iter::once((
+                        shard,
+                        CompletedRecovery {
+                            rotated_at: Epoch::new(20),
+                            attested_frontier: BlockHeight::GENESIS,
+                        },
+                    ))
+                    .collect(),
+                ),
             )
         };
 
