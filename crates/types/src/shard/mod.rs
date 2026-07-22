@@ -4,6 +4,8 @@
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
 //! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
+//! - [`fork_fence`]: [`ForkFence`](fork_fence::ForkFence) — the gossip-timed
+//!   quiesce every cross-shard consumer engages against a proven fork.
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
@@ -26,6 +28,7 @@ pub mod certified;
 pub mod certified_header;
 pub mod chain_origin;
 pub mod evidence;
+pub mod fork_fence;
 pub mod header;
 pub mod inventory;
 pub mod limits;

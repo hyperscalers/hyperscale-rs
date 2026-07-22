@@ -251,7 +251,8 @@ impl ShardParticipation {
     /// A shard fork is locally proven (assembled here, or a peer's proof
     /// verified). Engage the local provisional fence on every consuming
     /// coordinator and re-gossip the proof — once per forked shard. A
-    /// second proof for an already-fenced shard is a no-op.
+    /// second proof for an already-fenced shard is a no-op, as is a proof
+    /// replaying a fork the shard already recovered from.
     ///
     /// The fence is gossip-timed, so it may not touch block validity (an
     /// honest committee whose replicas hear the proof at different times
@@ -259,7 +260,8 @@ impl ShardParticipation {
     /// from the forked shard above the fork height are dropped so no block
     /// depending on them assembles (the replica abstains), the mempool
     /// stops admitting transactions bound to it, and its headers stop
-    /// promoting. The beacon-attested `ShardRecovery` fold supersedes it.
+    /// promoting. Every fence holds until the beacon-attested recovery the
+    /// proof arms completes.
     fn on_fork_proven(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -267,17 +269,15 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         let shard = proof.shard();
         let fork_height = proof.height();
+        let completed = topology_schedule.head().completed_recoveries();
 
-        // One fence per forked shard; a later proof only re-engages if it
-        // fences a strictly lower height.
         if self
-            .fork_fenced_shards
-            .get(&shard)
-            .is_some_and(|&existing| existing <= fork_height)
+            .fork_fence
+            .engage(shard, fork_height, completed)
+            .is_none()
         {
             return Vec::new();
         }
-        self.fork_fenced_shards.insert(shard, fork_height);
 
         tracing::error!(
             shard = shard.inner(),
@@ -285,16 +285,16 @@ impl ShardParticipation {
             "shard fork proven — engaging local fence and re-gossiping"
         );
 
-        let mut actions = self
-            .provisions_coordinator
-            .engage_fork_fence(shard, fork_height);
+        let mut actions =
+            self.provisions_coordinator
+                .engage_fork_fence(shard, fork_height, completed);
         self.remote_headers_coordinator
-            .engage_fork_fence(shard, fork_height);
-        self.mempool_coordinator.engage_fork_fence(shard);
+            .engage_fork_fence(shard, fork_height, completed);
+        self.mempool_coordinator
+            .engage_fork_fence(shard, fork_height, completed);
         // A fenced provision might already sit in a proposal the shard is
         // waiting to complete; nudge the proposer to re-evaluate without it.
         self.shard_coordinator.queue_ready_proposal();
-        let _ = topology_schedule;
 
         actions.push(Action::BroadcastShardForkProof {
             proof: Box::new(proof),
@@ -303,19 +303,20 @@ impl ShardParticipation {
     }
 
     /// A fork proof arrived over gossip. Dedup against the already-fenced
-    /// shards, then resolve committees from the local schedule and dispatch
-    /// off-thread verification (the proof self-authenticates — no sender
-    /// trust). An unresolvable epoch drops the proof; a re-gossip retries.
+    /// shards (and already-recovered forks), then resolve committees from
+    /// the local schedule and dispatch off-thread verification (the proof
+    /// self-authenticates — no sender trust). An unresolvable epoch drops
+    /// the proof; a re-gossip retries.
     fn on_unverified_fork_proof(
         &self,
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
     ) -> Vec<Action> {
-        if self
-            .fork_fenced_shards
-            .get(&proof.shard())
-            .is_some_and(|&existing| existing <= proof.height())
-        {
+        if !self.fork_fence.engages(
+            proof.shard(),
+            proof.height(),
+            topology_schedule.head().completed_recoveries(),
+        ) {
             return Vec::new();
         }
         let Some(committees) = proof.resolve_committees(topology_schedule) else {
