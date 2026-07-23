@@ -4993,6 +4993,26 @@ impl ShardCoordinator {
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         };
+        // A verified committee timeout at a higher round nudges the view
+        // toward it, exactly as headers and votes do — and it is the one
+        // signal an idle chain still emits. A view split thinner than f+1
+        // per round produces nothing but timeout shares: amplification
+        // needs f+1 in one round, carried adoption needs a QC to carry,
+        // and no leader stands in its own round to header one. Without
+        // this nudge no mechanism moves a view toward the shares and the
+        // split is permanent.
+        let high_qc_round = self.high_qc_round();
+        if self
+            .view_change
+            .sync_to_observed_round(round, high_qc_round)
+        {
+            info!(
+                validator = ?self.me,
+                new_view = self.view_change.view.inner(),
+                voter = ?timeout.voter(),
+                "View synced forward to observed timeout round"
+            );
+        }
         let carried_high_qc = timeout.high_qc().clone();
         if !self.timeouts.record(timeout, power) {
             return Vec::new();

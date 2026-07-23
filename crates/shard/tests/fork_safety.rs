@@ -108,8 +108,15 @@ fn safe_vote_and_contiguous_commit_close_the_fork() {
     // A round-1 timeout quorum (V0/V2/V3) advances them to round 2; V2 then
     // auto-proposes B@round 2 in `enter_round`. Both siblings extend genesis,
     // so the safe-vote rule lets V0/V3 vote B (routed to V2); V2 forms QC_B.
+    // V1's timer stays quiet here: it already sits at round 2 behind QC_A,
+    // and its round-2 share would sync the swing voters' views past round 1
+    // before their own timeout quorum forms — V2 would then enter round 2 by
+    // view sync, which does not auto-propose, and B would never exist. V1
+    // joins the pacemaker from the next phase on.
     sim.advance_clock(PAST_TIMEOUT);
-    sim.fire_view_change_timer_all();
+    sim.fire_view_change_timer(v[0]);
+    sim.fire_view_change_timer(v[2]);
+    sim.fire_view_change_timer(v[3]);
     sim.run_for_at_most(MAX_STEPS);
 
     // Two honest replicas hold QCs for different sibling blocks at one height —
