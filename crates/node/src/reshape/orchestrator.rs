@@ -98,7 +98,8 @@ pub enum ReshapeRequest {
         kind: FetchKind,
     },
     /// Durably stage one verified snap-sync chunk into `shard`'s store.
-    /// Answered by [`ReshapeEvent::Staged`].
+    /// Answered by [`ReshapeEvent::Staged`], or by
+    /// [`ReshapeEvent::StageFailed`] handing the chunk back.
     StageChunk {
         /// The duty's store shard.
         shard: ShardId,
@@ -209,6 +210,16 @@ pub enum ReshapeEvent {
     Staged {
         /// The store shard.
         shard: ShardId,
+    },
+    /// A staged chunk's durable write failed; the chunk comes back for
+    /// re-staging on the next advance.
+    StageFailed {
+        /// The store shard.
+        shard: ShardId,
+        /// The assembly's progress after the chunk.
+        progress: ImportProgress,
+        /// The chunk's verified leaves.
+        leaves: Vec<ImportLeaf>,
     },
     /// A boundary import completed with the resulting store root.
     Imported {
@@ -523,6 +534,23 @@ impl ReshapeOrchestrator {
                     duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
                 } else if let Some(duty) = self.keepers.get_mut(&shard) {
                     duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                }
+            }
+            ReshapeEvent::StageFailed {
+                shard,
+                progress,
+                leaves,
+            } => {
+                // Hand the chunk back to the front of the queue: the next
+                // advance re-emits it, so a transient write failure retries
+                // instead of pinning `stages_unacked` above zero forever.
+                // With no live duty for the shard the chunk is dropped.
+                if let Some(duty) = self.observers.get_mut(&shard) {
+                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                    duty.pending_stage.insert(0, (progress, leaves));
+                } else if let Some(duty) = self.keepers.get_mut(&shard) {
+                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                    duty.pending_stage.insert(0, (progress, leaves));
                 }
             }
             ReshapeEvent::Imported { shard, root } => self.apply_imported(shard, root),
@@ -1386,6 +1414,61 @@ mod tests {
             )),
             "a syncing duty must forward the bootstrap's state ranges; got {requests:?}",
         );
+    }
+
+    #[test]
+    fn a_failed_stage_re_queues_and_re_emits_the_chunk() {
+        use hyperscale_storage::ImportLeaf;
+        use hyperscale_storage::test_helpers::completed_import_progress;
+
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[], &[parent]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let mut duty = observer_duty(
+            parent,
+            child,
+            5,
+            ObserverPhase::Syncing(Box::new(ObserverBootstrap::new(parent, anchor(), child))),
+        );
+        let progress = completed_import_progress(BlockHeight::new(1), 0);
+        let leaves = vec![ImportLeaf {
+            leaf_key: [7u8; 32],
+            storage_key: vec![7],
+            value: vec![7],
+        }];
+        duty.pending_stage.push((progress.clone(), leaves.clone()));
+        orch.observers.insert(child, duty);
+
+        let requests = orch.step(&ReshapeView::new(&snap), Vec::new());
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::StageChunk { shard, .. } if *shard == child)),
+            "a pending chunk must emit; got {requests:?}",
+        );
+        assert_eq!(orch.observers[&child].stages_unacked, 1);
+
+        // The durable write failed: the chunk comes back and the same
+        // step's advance re-emits it, leaving it unacked again — the
+        // finalize gate stays closed until a Staged ack lands.
+        let requests = orch.step(
+            &ReshapeView::new(&snap),
+            vec![ReshapeEvent::StageFailed {
+                shard: child,
+                progress,
+                leaves,
+            }],
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::StageChunk { shard, .. } if *shard == child)),
+            "a failed stage must re-emit its chunk; got {requests:?}",
+        );
+        let duty = &orch.observers[&child];
+        assert_eq!(duty.stages_unacked, 1);
+        assert!(duty.pending_stage.is_empty());
     }
 
     #[test]
