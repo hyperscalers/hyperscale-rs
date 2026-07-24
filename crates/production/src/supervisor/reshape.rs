@@ -74,6 +74,16 @@ pub enum ReshapeIo {
         /// The store shard.
         shard: ShardId,
     },
+    /// A staged chunk's durable write failed; hands the chunk back for
+    /// re-staging.
+    StageFailed {
+        /// The store shard.
+        shard: ShardId,
+        /// The assembly's progress after the chunk.
+        progress: ImportProgress,
+        /// The chunk's verified leaves.
+        leaves: Vec<ImportLeaf>,
+    },
     /// A boundary import completed with the resulting store root.
     Imported {
         /// The store shard.
@@ -430,14 +440,23 @@ impl ShardSupervisor {
     }
 
     /// Durably stage one verified chunk into a reshape duty's store off
-    /// the loop, answering with [`ReshapeIo::Staged`].
+    /// the loop, answering with [`ReshapeIo::Staged`] — or handing the
+    /// chunk back via [`ReshapeIo::StageFailed`] so the duty re-stages it
+    /// instead of waiting forever on an ack that will never come.
     fn reshape_stage(&self, shard: ShardId, progress: ImportProgress, leaves: Vec<ImportLeaf>) {
         let Some(storage) = self
             .reshape_stores
             .get(&shard)
             .map(|s| Arc::clone(&s.storage))
         else {
-            warn!(shard = ?shard, "Reshape stage for an unopened store; dropped");
+            warn!(shard = ?shard, "Reshape stage for an unopened store; re-queued");
+            let _ = self
+                .events_tx
+                .send(SupervisorEvent::Reshape(ReshapeIo::StageFailed {
+                    shard,
+                    progress,
+                    leaves,
+                }));
             return;
         };
         let events = self.events_tx.clone();
@@ -446,7 +465,14 @@ impl ShardSupervisor {
                 Ok(()) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Staged { shard }));
                 }
-                Err(error) => warn!(shard = ?shard, %error, "Reshape chunk staging failed"),
+                Err(error) => {
+                    warn!(shard = ?shard, %error, "Reshape chunk staging failed; re-queued");
+                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::StageFailed {
+                        shard,
+                        progress,
+                        leaves,
+                    }));
+                }
             }
         });
     }
@@ -631,6 +657,15 @@ impl ShardSupervisor {
                 ReshapeEvent::FetchFailed { duty, from, kind }
             }
             ReshapeIo::Staged { shard } => ReshapeEvent::Staged { shard },
+            ReshapeIo::StageFailed {
+                shard,
+                progress,
+                leaves,
+            } => ReshapeEvent::StageFailed {
+                shard,
+                progress,
+                leaves,
+            },
             ReshapeIo::Imported { shard, root } => ReshapeEvent::Imported { shard, root },
             ReshapeIo::Applied { shard, root } => ReshapeEvent::Applied { shard, root },
             ReshapeIo::Adopted { shard, recovered } => {
