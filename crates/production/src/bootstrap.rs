@@ -24,6 +24,7 @@ use hyperscale_node::bootstrap::{
 use hyperscale_storage::{RecoveredState, ShardStorage};
 use hyperscale_types::{Request, ShardId};
 use tokio::sync::oneshot;
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -93,9 +94,15 @@ where
         while !lock(&bootstrap).is_complete() {
             let finalize = lock(&bootstrap).take_finalize();
             if let Some((height, witnesses)) = finalize {
-                let root = storage
-                    .finalize_boundary_import(height, witnesses)
-                    .map_err(|error| format!("boundary import failed: {error}"))?;
+                // The batched JMT build runs for minutes at large state
+                // sizes; a blocking thread keeps it off the runtime
+                // workers shared with the host's live shards.
+                let import = Arc::clone(storage);
+                let root =
+                    spawn_blocking(move || import.finalize_boundary_import(height, witnesses))
+                        .await
+                        .map_err(|error| format!("boundary import task died: {error}"))?
+                        .map_err(|error| format!("boundary import failed: {error}"))?;
                 lock(&bootstrap).on_imported(root)?;
                 continue;
             }

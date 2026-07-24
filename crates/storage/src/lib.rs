@@ -71,6 +71,7 @@ pub trait ShardStorage:
     + SafeVoteRegisterStore
     + Send
     + Sync
+    + 'static
 {
 }
 
@@ -84,6 +85,7 @@ impl<S> ShardStorage for S where
         + SafeVoteRegisterStore
         + Send
         + Sync
+        + 'static
 {
 }
 
