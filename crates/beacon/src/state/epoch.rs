@@ -7,12 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-    CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, JailReason, KeptSeat,
-    NetworkDefinition, ObserverSeat, PendingReshape, QcContext, QuorumCertificate,
-    RESHAPE_HANDOFF_TTL_EPOCHS, RETENTION_HORIZON, RecoveryCause, ShardBoundary,
-    ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, SlotEffects,
-    SplitChildRoots, TopologySnapshot, TransitionCause, ValidatorId, ValidatorStatus, Verify,
-    VrfOutput, WeightedTimestamp,
+    CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
+    ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
+    RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
+    ShardWitnessPayload, SlotEffects, SplitChildRoots, TopologySnapshot, TransitionCause,
+    ValidatorId, ValidatorStatus, Verify, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -25,7 +24,7 @@ use crate::state::committee::{
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
-use crate::state::vrf::{filter_and_roll_randomness, jail_validator};
+use crate::state::vrf::{filter_and_roll_randomness, revoke_validator};
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
@@ -301,6 +300,7 @@ pub fn apply_epoch(
         registered: witness.registered,
         deactivated,
         jailed,
+        revoked: witness.revoked,
         unjailed: witness.unjailed,
         reactivated,
         readied,
@@ -652,7 +652,7 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 ///
 /// A proof carrying a same-round sub-pair also jails the equivocators when
 /// the forked committee is resolvable from current state (the bonus path;
-/// see [`jail_fork_equivocators`]). Fence and re-draw are the reliable,
+/// see [`revoke_fork_equivocators`]). Fence and re-draw are the reliable,
 /// round-invariant consequence; jailing lands only against an attacker who
 /// left a same-round double-sign.
 fn ingest_fork_proofs(
@@ -666,7 +666,7 @@ fn ingest_fork_proofs(
     // conflicting QCs' block hashes: distinct evidence still jails, but
     // duplicate copies across committed proposals verify their aggregate
     // signatures once.
-    let mut jailed_pairs: BTreeSet<(BlockHash, BlockHash)> = BTreeSet::new();
+    let mut revoked_pairs: BTreeSet<(BlockHash, BlockHash)> = BTreeSet::new();
     // The pre-recovery snapshot resolves each forked committee's ordering
     // for jailing; derived once (lazily, only if a same-round pair appears)
     // so its committee is the one that signed, not the re-drawn successor.
@@ -692,11 +692,11 @@ fn ingest_fork_proofs(
                 continue;
             }
             if let Some((qc_a, qc_b)) = proof.same_round_conflict()
-                && jailed_pairs.insert((qc_a.block_hash(), qc_b.block_hash()))
+                && revoked_pairs.insert((qc_a.block_hash(), qc_b.block_hash()))
             {
                 let snap =
                     snapshot.get_or_insert_with(|| state.derive_topology_snapshot(network.clone()));
-                jail_fork_equivocators(state, snap, network, shard, epoch, qc_a, qc_b);
+                revoke_fork_equivocators(state, snap, network, shard, epoch, qc_a, qc_b);
             }
             // Recovery classification runs once per shard.
             if !seen.insert(shard) {
@@ -734,9 +734,9 @@ fn ingest_fork_proofs(
 /// by re-verifying both QCs against it: a pass proves the resolved
 /// committee is the signing committee, so `committee[i]` is the validator
 /// behind bit `i`. A committee that has rotated beyond what current state
-/// resolves fails the re-verify and is left fence-only. The jail is
-/// permanent ([`JailReason::Equivocation`]) and idempotent.
-fn jail_fork_equivocators(
+/// resolves fails the re-verify and is left fence-only. The revocation is
+/// permanent and idempotent.
+fn revoke_fork_equivocators(
     state: &mut BeaconState,
     snapshot: &TopologySnapshot,
     network: &NetworkDefinition,
@@ -769,16 +769,7 @@ fn jail_fork_equivocators(
         let Some(&victim) = committee.get(pos) else {
             continue;
         };
-        let already_permanent = matches!(
-            state.validators.get(&victim).map(|r| r.status),
-            Some(ValidatorStatus::Jailed {
-                reason: JailReason::Equivocation,
-                ..
-            })
-        );
-        if !already_permanent {
-            jail_validator(state, victim, JailReason::Equivocation, epoch);
-        }
+        revoke_validator(state, victim, epoch);
     }
 }
 
@@ -1797,10 +1788,7 @@ mod tests {
     fn equivocation_jailed(state: &BeaconState, v: u64) -> bool {
         matches!(
             state.validators.get(&ValidatorId::new(v)).map(|r| r.status),
-            Some(ValidatorStatus::Jailed {
-                reason: JailReason::Equivocation,
-                ..
-            })
+            Some(ValidatorStatus::Revoked { .. })
         )
     }
 

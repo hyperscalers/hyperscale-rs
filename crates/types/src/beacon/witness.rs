@@ -92,7 +92,7 @@ pub enum ShardWitnessPayload {
     /// the cooldown has elapsed, and the pool can still support the
     /// additional active epoch at the current dynamic `min_stake`,
     /// transition back to the pool. Otherwise silently dropped.
-    /// Equivocation jails are never unjailed.
+    /// A revoked key is never restored.
     Unjail {
         /// Validator requesting unjail.
         id: ValidatorId,
@@ -183,8 +183,8 @@ pub enum ShardWitnessPayload {
     /// the embedded BLS signatures, so the leaf carries the whole evidence.
     /// The shard committee verified it as a block-validity condition before
     /// the QC formed (like the randomness reveal), so the QC-attested root
-    /// vouches for it and the beacon jails on it without re-verifying —
-    /// permanent `JailReason::Equivocation`, regardless of the offender's
+    /// vouches for it and the beacon revokes on it without re-verifying —
+    /// permanent [`ValidatorStatus::Revoked`], regardless of the offender's
     /// current placement.
     ///
     /// Boxed: the evidence's two BLS signatures dwarf every other variant,

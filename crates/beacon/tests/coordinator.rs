@@ -522,8 +522,11 @@ fn forged_equivocation_witness_cannot_jail_or_fork() {
             .get(&victim)
             .expect("victim is still a registered validator");
         assert!(
-            !matches!(record.status, ValidatorStatus::Jailed { .. }),
-            "replica {r} jailed an honest validator on a forged equivocation witness",
+            !matches!(
+                record.status,
+                ValidatorStatus::Jailed { .. } | ValidatorStatus::Revoked { .. }
+            ),
+            "replica {r} punished an honest validator on a forged equivocation witness",
         );
         assert_eq!(
             state, reference,

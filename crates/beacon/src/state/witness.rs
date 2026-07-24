@@ -13,7 +13,7 @@ use hyperscale_types::{
 
 use crate::rules;
 use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
-use crate::state::vrf::jail_validator;
+use crate::state::vrf::{jail_validator, revoke_validator};
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
 /// Outcome of the epoch's witness application —
@@ -29,6 +29,7 @@ pub(super) struct WitnessOutcome {
     pub(super) registered: Vec<ValidatorId>,
     pub(super) deactivated: Vec<ValidatorId>,
     pub(super) jailed: Vec<ValidatorId>,
+    pub(super) revoked: Vec<ValidatorId>,
     pub(super) unjailed: Vec<ValidatorId>,
     pub(super) readied: Vec<ValidatorId>,
 }
@@ -40,6 +41,7 @@ impl WitnessOutcome {
             HostEvent::Registered(id) => self.registered.push(id),
             HostEvent::Deactivated(id) => self.deactivated.push(id),
             HostEvent::Jailed(id) => self.jailed.push(id),
+            HostEvent::Revoked(id) => self.revoked.push(id),
             HostEvent::Unjailed(id) => self.unjailed.push(id),
             HostEvent::Readied(id) => self.readied.push(id),
         }
@@ -50,6 +52,7 @@ impl WitnessOutcome {
         self.registered.extend(other.registered);
         self.deactivated.extend(other.deactivated);
         self.jailed.extend(other.jailed);
+        self.revoked.extend(other.revoked);
         self.unjailed.extend(other.unjailed);
         self.readied.extend(other.readied);
     }
@@ -64,6 +67,7 @@ pub(super) enum HostEvent {
     Registered(ValidatorId),
     Deactivated(ValidatorId),
     Jailed(ValidatorId),
+    Revoked(ValidatorId),
     Unjailed(ValidatorId),
     Readied(ValidatorId),
 }
@@ -72,9 +76,9 @@ pub(super) enum HostEvent {
 /// proposals.
 ///
 /// Evidence is applied without dedup — re-application is idempotent once
-/// the validator is `Jailed { Equivocation }`. Each entry re-verifies
-/// against the registry unless it carries a `Verified` marker upgraded at
-/// the admission gate, so apply stays fail-closed on the gossip path
+/// the validator is `Revoked`. Each entry re-verifies against the
+/// registry unless it carries a `Verified` marker upgraded at the
+/// admission gate, so apply stays fail-closed on the gossip path
 /// (which decodes `Unverified`). Committed evidence is threshold-vouched:
 /// a 2f+1 commit implies ≥ f+1 honest verifiers behind every entry.
 pub(super) fn ingest_equivocations(
@@ -96,28 +100,16 @@ pub(super) fn ingest_equivocations(
             {
                 continue;
             }
-            // Equivocation supersedes every status except an existing
-            // permanent equivocation jail. The race-exit defence covers
+            // Revocation supersedes every status except an existing
+            // revocation. The race-exit defence covers
             // `InsufficientStake` (operator tried to escape via
             // `DeactivateValidator`) and fault-cause `Jailed` (the
             // existing jail is upgraded to permanent).
-            let already_permanent = matches!(
-                rec.status,
-                ValidatorStatus::Jailed {
-                    reason: JailReason::Equivocation,
-                    ..
-                }
-            );
-            if already_permanent {
+            if matches!(rec.status, ValidatorStatus::Revoked { .. }) {
                 continue;
             }
-            jail_validator(
-                state,
-                validator_id,
-                JailReason::Equivocation,
-                state.current_epoch,
-            );
-            outcome.jailed.push(validator_id);
+            revoke_validator(state, validator_id, state.current_epoch);
+            outcome.revoked.push(validator_id);
         }
     }
     outcome
@@ -267,19 +259,15 @@ pub(super) fn apply_shard_payload(
             // Operator-initiated retirement. Flips to
             // `InsufficientStake` from every status except those that
             // already represent "not consuming an epoch" or "permanently
-            // out": `InsufficientStake` itself and
-            // `Jailed { Equivocation }`. Fault-cause jails
-            // (`Performance`) can still be deactivated — the operator
-            // chooses to retire a jailed validator rather than wait
-            // out the cooldown.
+            // out": `InsufficientStake` itself and `Revoked` (a
+            // deactivation must never downgrade a revocation to a
+            // reactivatable status). Fault-cause jails can still be
+            // deactivated — the operator chooses to retire a jailed
+            // validator rather than wait out the cooldown.
             let rec = state.validators.get(validator_id)?;
             let should_deactivate = !matches!(
                 rec.status,
-                ValidatorStatus::InsufficientStake
-                    | ValidatorStatus::Jailed {
-                        reason: JailReason::Equivocation,
-                        ..
-                    }
+                ValidatorStatus::InsufficientStake | ValidatorStatus::Revoked { .. }
             );
             if !should_deactivate {
                 return None;
@@ -288,17 +276,17 @@ pub(super) fn apply_shard_payload(
             Some(HostEvent::Deactivated(*validator_id))
         }
         ShardWitnessPayload::Unjail { id } => {
-            // Fault-cause jails return to `Pooled` once cooldown has
+            // Every jail returns to `Pooled` once its cooldown has
             // elapsed AND the pool can still support the additional
             // active epoch at the current dynamic `min_stake`. A pool
             // that over-committed while the validator was jailed
             // strands them — operator recourse is to deactivate
             // another validator or deposit more stake before lifting.
-            // Equivocation jails are permanent regardless. A withholding
-            // jail holds for a full recency period — long enough that a
-            // grinder cannot return inside the window its resample weight
-            // would still suppress it — where a plain performance jail
-            // lifts after the short fixed cooldown.
+            // A withholding jail holds for a full recency period —
+            // long enough that a grinder cannot return inside the
+            // window its resample weight would still suppress it —
+            // where a plain performance jail lifts after the short
+            // fixed cooldown.
             let rec = state.validators.get(id)?;
             let ValidatorStatus::Jailed {
                 since_epoch,
@@ -308,7 +296,6 @@ pub(super) fn apply_shard_payload(
                 return None;
             };
             let cooldown = match reason {
-                JailReason::Equivocation => return None,
                 JailReason::Withholding => state.beacon_recency_period(),
                 JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
             };
@@ -591,30 +578,19 @@ pub(super) fn apply_shard_payload(
         ShardWitnessPayload::VoteEquivocation(ev) => {
             // The shard committee verified the double-sign as a
             // block-validity condition before its QC formed, so the
-            // QC-attested witness root vouches for it — jail without
+            // QC-attested witness root vouches for it — revoke without
             // re-verifying, exactly as every other witness payload is
             // trusted (a byzantine majority that could forge this could
             // already forge arbitrary state; that is the terminal tier).
             // Permanent, superseding every status but an existing
-            // permanent equivocation jail, so a second leaf naming the
-            // same key is idempotent.
+            // revocation, so a second leaf naming the same key is
+            // idempotent.
             let rec = state.validators.get(&ev.validator)?;
-            if matches!(
-                rec.status,
-                ValidatorStatus::Jailed {
-                    reason: JailReason::Equivocation,
-                    ..
-                }
-            ) {
+            if matches!(rec.status, ValidatorStatus::Revoked { .. }) {
                 return None;
             }
-            jail_validator(
-                state,
-                ev.validator,
-                JailReason::Equivocation,
-                state.current_epoch,
-            );
-            Some(HostEvent::Jailed(ev.validator))
+            revoke_validator(state, ev.validator, state.current_epoch);
+            Some(HostEvent::Revoked(ev.validator))
         }
     }
 }
@@ -1155,9 +1131,8 @@ mod tests {
             validator_record(
                 11,
                 0,
-                ValidatorStatus::Jailed {
-                    since_epoch: Epoch::GENESIS,
-                    reason: JailReason::Equivocation,
+                ValidatorStatus::Revoked {
+                    at_epoch: Epoch::GENESIS,
                 },
             ),
         );
@@ -1182,9 +1157,8 @@ mod tests {
         );
         assert_eq!(
             state.validators.get(&ValidatorId::new(11)).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: Epoch::GENESIS,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: Epoch::GENESIS
             },
         );
     }
@@ -1401,11 +1375,17 @@ mod tests {
         ));
     }
 
-    /// Equivocation jails never unjail, even past the cooldown.
+    /// A revoked validator never unjails — it isn't `Jailed`, so the
+    /// lift falls through regardless of how much time has passed.
     #[test]
-    fn unjail_of_equivocation_jail_is_permanent_no_op() {
+    fn unjail_of_revoked_validator_is_a_no_op() {
         let since = Epoch::new(5);
-        let mut state = state_with_jailed(since, JailReason::Equivocation);
+        let mut state = state_with_jailed(since, JailReason::Performance);
+        state
+            .validators
+            .get_mut(&ValidatorId::new(10))
+            .unwrap()
+            .status = ValidatorStatus::Revoked { at_epoch: since };
         state.current_epoch = Epoch::new(since.inner() + 10 * JAIL_COOLDOWN_EPOCHS);
 
         let effects = apply_witness_chunk(
@@ -1419,10 +1399,7 @@ mod tests {
         assert!(effects.unjailed.is_empty());
         assert_eq!(
             state.validators.get(&ValidatorId::new(10)).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: since,
-                reason: JailReason::Equivocation,
-            },
+            ValidatorStatus::Revoked { at_epoch: since },
         );
     }
 
@@ -1779,7 +1756,7 @@ mod tests {
         }))
     }
 
-    /// A `VoteEquivocation` leaf permanently jails the named validator
+    /// A `VoteEquivocation` leaf permanently revokes the named validator
     /// under `Equivocation` and cascades the committee removal + pool
     /// refill — applied on the QC-attested leaf alone, no signature
     /// re-check.
@@ -1804,12 +1781,11 @@ mod tests {
         let target = ValidatorId::new(1);
         let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
 
-        assert_eq!(effects.jailed, vec![target]);
+        assert_eq!(effects.revoked, vec![target]);
         assert_eq!(
             state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: state.current_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: state.current_epoch
             },
         );
         let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
@@ -1833,16 +1809,15 @@ mod tests {
         assert!(effects.jailed.is_empty());
     }
 
-    /// A second `VoteEquivocation` against an already permanently-jailed
+    /// A second `VoteEquivocation` against an already revoked
     /// key is idempotent: no duplicate jail event, `since_epoch` unchanged.
     #[test]
     fn vote_equivocation_leaf_idempotent_when_already_jailed() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let target = ValidatorId::new(1);
-        state.validators.get_mut(&target).unwrap().status = ValidatorStatus::Jailed {
-            since_epoch: Epoch::GENESIS,
-            reason: JailReason::Equivocation,
+        state.validators.get_mut(&target).unwrap().status = ValidatorStatus::Revoked {
+            at_epoch: Epoch::GENESIS,
         };
 
         let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
@@ -1850,9 +1825,8 @@ mod tests {
         assert!(effects.jailed.is_empty());
         assert_eq!(
             state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: Epoch::GENESIS,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: Epoch::GENESIS
             },
         );
     }
@@ -1900,11 +1874,11 @@ mod tests {
 
     /// The exact leaf a shard proposer produces — two genuine conflicting
     /// signatures under the double-signer's key — verifies as a block-validity
-    /// condition and, folded on QC trust, permanently jails the signer and
+    /// condition and, folded on QC trust, permanently revokes the signer and
     /// refills its committee seat. This is the beacon end of the pipeline the
     /// shard `vote_equivocation` integration test drives to a committed block.
     #[test]
-    fn genuine_vote_equivocation_leaf_verifies_and_jails() {
+    fn genuine_vote_equivocation_leaf_verifies_and_revokes() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
@@ -1935,12 +1909,11 @@ mod tests {
             vec![ShardWitnessPayload::VoteEquivocation(Box::new(ev))],
         );
 
-        assert_eq!(effects.jailed, vec![target]);
+        assert_eq!(effects.revoked, vec![target]);
         assert_eq!(
             state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: state.current_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: state.current_epoch
             },
         );
         let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
@@ -2051,12 +2024,11 @@ mod tests {
         committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
-        assert_eq!(effects.jailed, vec![target]);
+        assert_eq!(effects.revoked, vec![target]);
         assert_eq!(
             state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: state.current_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: state.current_epoch
             },
         );
         let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
@@ -2068,7 +2040,7 @@ mod tests {
     /// Verified equivocation against a `Pooled` validator flips status to
     /// permanent `Jailed { Equivocation }`; no cascade.
     #[test]
-    fn vote_equivocation_jails_pooled_validator_in_place() {
+    fn vote_equivocation_revokes_pooled_validator_in_place() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.validators.insert(
@@ -2085,12 +2057,11 @@ mod tests {
         committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
-        assert_eq!(effects.jailed, vec![ValidatorId::new(10)]);
+        assert_eq!(effects.revoked, vec![ValidatorId::new(10)]);
         assert_eq!(
             state.validators.get(&ValidatorId::new(10)).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: state.current_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: state.current_epoch
             },
         );
     }
@@ -2098,7 +2069,7 @@ mod tests {
     /// Equivocation promotes a fault-cause `Jailed{Performance}` to
     /// permanent `Jailed{Equivocation}`.
     #[test]
-    fn vote_equivocation_promotes_performance_jail_to_equivocation() {
+    fn vote_equivocation_promotes_performance_jail_to_revocation() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.validators.insert(
@@ -2122,12 +2093,11 @@ mod tests {
         committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
         let effects = apply_next_epoch(&mut state, &committed);
 
-        assert_eq!(effects.jailed, vec![ValidatorId::new(10)]);
+        assert_eq!(effects.revoked, vec![ValidatorId::new(10)]);
         assert_eq!(
             state.validators.get(&ValidatorId::new(10)).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: state.current_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: state.current_epoch
             },
         );
     }
@@ -2144,9 +2114,8 @@ mod tests {
             validator_record(
                 10,
                 0,
-                ValidatorStatus::Jailed {
-                    since_epoch: prior_epoch,
-                    reason: JailReason::Equivocation,
+                ValidatorStatus::Revoked {
+                    at_epoch: prior_epoch,
                 },
             ),
         );
@@ -2163,9 +2132,8 @@ mod tests {
         assert!(effects.jailed.is_empty());
         assert_eq!(
             state.validators.get(&ValidatorId::new(10)).unwrap().status,
-            ValidatorStatus::Jailed {
-                since_epoch: prior_epoch,
-                reason: JailReason::Equivocation,
+            ValidatorStatus::Revoked {
+                at_epoch: prior_epoch
             },
         );
     }

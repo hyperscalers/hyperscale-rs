@@ -53,9 +53,9 @@ impl EquivocationObservations {
 
     /// Drop every buffered entry whose validator `obsolete` matches.
     /// The coordinator calls this after each `apply_epoch` with
-    /// "permanently jailed for equivocation" — once the fold holds that
-    /// status, re-proposing the evidence can't change anything, so it
-    /// only wastes proposal space.
+    /// "key already revoked" — once the fold holds that status,
+    /// re-proposing the evidence can't change anything, so it only
+    /// wastes proposal space.
     pub fn prune(&mut self, mut obsolete: impl FnMut(ValidatorId) -> bool) {
         self.by_validator.retain(|v, _| !obsolete(*v));
     }

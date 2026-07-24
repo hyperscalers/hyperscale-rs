@@ -91,9 +91,9 @@ pub struct StakePool {
 
 /// What caused a validator to be jailed.
 ///
-/// Determines unjail eligibility — fault-cause reasons unjail after
-/// a cooldown once an `Unjail` witness arrives; provable-byzantine
-/// reasons never unjail.
+/// Every jail is temporary: it determines the cooldown an `Unjail`
+/// witness must wait out. Provably byzantine signing is not a jail —
+/// it revokes the key permanently ([`ValidatorStatus::Revoked`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BasicSbor)]
 pub enum JailReason {
     /// Performance failure. Surfaces from a shard's local miss-counter
@@ -113,9 +113,6 @@ pub enum JailReason {
     /// service. Recoverable — an honest member cut off for a whole epoch
     /// unjails once the period elapses.
     Withholding,
-    /// Cryptographic proof of byzantine signing. Permanent — the key is
-    /// provably hostile, no cooldown unjails it.
-    Equivocation,
 }
 
 /// Operational status of one validator.
@@ -153,15 +150,25 @@ pub enum ValidatorStatus {
         /// Epoch the cohort draw placed the observer.
         placed_at_epoch: Epoch,
     },
-    /// Jailed and removed from any prior shard. `Unjail` (after
-    /// cooldown) returns the validator to `Pooled` iff the pool can
-    /// still support the additional active epoch; otherwise the unjail
-    /// is rejected. Equivocation jails are permanent regardless.
+    /// Jailed and removed from any prior shard. `Unjail` (after the
+    /// reason's cooldown) returns the validator to `Pooled` iff the
+    /// pool can still support the additional active epoch; otherwise
+    /// the unjail is rejected.
     Jailed {
         /// Epoch the jail entered.
         since_epoch: Epoch,
         /// Why.
         reason: JailReason,
+    },
+    /// The key is cryptographically proven byzantine — a double-signed
+    /// beacon ballot or shard vote — and permanently revoked. Removed
+    /// from any prior placement at the moment of transition; no
+    /// witness, cooldown, or capacity change ever transitions out. The
+    /// record persists so replayed evidence stays a no-op and the dead
+    /// id can never re-register.
+    Revoked {
+        /// Epoch the evidence folded.
+        at_epoch: Epoch,
     },
     /// The validator's pool no longer has effective stake to support
     /// them. Removed from any shard at the moment of transition. When
@@ -782,9 +789,11 @@ pub struct SlotEffects {
     /// auto-deactivation.
     pub deactivated: Vec<ValidatorId>,
     /// Validators jailed this epoch (`Jail` witness, malformed VRF
-    /// reveal, beacon-side `MissedProposal` threshold crossing, or
-    /// equivocation evidence).
+    /// reveal, or a beacon-side `MissedProposal` threshold crossing).
     pub jailed: Vec<ValidatorId>,
+    /// Validators permanently revoked this epoch on equivocation
+    /// evidence.
+    pub revoked: Vec<ValidatorId>,
     /// Validators returned from `Jailed` to `Pooled` via a successful
     /// `Unjail` lift.
     pub unjailed: Vec<ValidatorId>,
