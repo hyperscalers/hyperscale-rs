@@ -15,7 +15,13 @@ use hyperscale_types::{
     StoredReceipt,
 };
 
-/// How many boundary pins a backend retains before evicting the oldest.
+/// The default number of boundary pins a backend retains before
+/// evicting the oldest.
+///
+/// The memory backend's fixed retention and the `RocksDB` config
+/// default. Production serving retention must cover the join budget,
+/// so the validator overrides it with the genesis
+/// `ready_timeout_epochs`.
 pub const BOUNDARY_RETAIN: usize = 3;
 
 /// Resolve a JMT leaf back to the raw substate pair it represents.
@@ -109,8 +115,10 @@ pub trait BoundaryStore {
     type Boundary: TreeReader + ResolveLeaf + Send;
 
     /// Pin the committed state at `height` — the shard's epoch boundary
-    /// block — keeping the newest [`BOUNDARY_RETAIN`] pins. Idempotent
-    /// per height.
+    /// block — keeping a backend-configured number of recent pins
+    /// (default [`BOUNDARY_RETAIN`]). A pinned boundary must outlive
+    /// the join budget of a peer syncing against it. Idempotent per
+    /// height.
     ///
     /// # Errors
     ///

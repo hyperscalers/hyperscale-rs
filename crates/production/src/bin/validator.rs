@@ -855,8 +855,11 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         ))
 }
 
-/// Build `RocksDB` configuration from TOML config.
-fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
+/// Build `RocksDB` configuration from TOML config. Boundary retention
+/// is not an operator knob: it always covers the chain's
+/// `ready_timeout_epochs`, since a joiner's whole ready budget must fit
+/// inside the serving window of the boundary it syncs against.
+fn build_rocksdb_config(config: &StorageConfig, ready_timeout_epochs: u64) -> RocksDbConfig {
     RocksDbConfig {
         max_background_jobs: config.max_background_jobs,
         write_buffer_size: config.write_buffer_mb * 1024 * 1024,
@@ -871,6 +874,7 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
         jmt_history_length: config.jmt_history_length,
+        boundary_retain: usize::try_from(ready_timeout_epochs).unwrap_or(usize::MAX),
     }
 }
 
@@ -1119,7 +1123,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let thread_config = build_thread_pool_config(&config.threads);
     let shard_config = ShardConsensusConfig::default();
     let network_config = build_network_config(&config.network)?;
-    let rocksdb_config = build_rocksdb_config(&config.storage);
+    let beacon_chain_config = BeaconChainConfig::production();
+    let rocksdb_config =
+        build_rocksdb_config(&config.storage, beacon_chain_config.ready_timeout_epochs);
 
     let dispatch = Arc::new(
         PooledDispatch::new(thread_config, TokioHandle::current())
@@ -1220,7 +1226,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     .sync_status(rpc_sync_status.clone())
     .mempool_config(config.mempool.clone())
     .provision_config(config.provisions)
-    .beacon_chain_config(BeaconChainConfig::production());
+    .beacon_chain_config(beacon_chain_config);
 
     if !config.genesis.xrd_balances.is_empty() {
         let engine_genesis = build_engine_genesis_config(&config.genesis)
