@@ -43,10 +43,11 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId,
-    ShardWitnessPayload, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
-    TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
+    ShardVoteEquivocation, ShardWitnessPayload, StateRoot, StateRootContext, StateRootVerifyError,
+    StoredReceipt, Timeout, TimeoutContext, TopologySchedule, TransactionRoot,
+    TransactionRootContext, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify,
+    VoteCount, VrfProof, WeightedTimestamp, local_settled_wave_ids, ready_signal_message,
+    shard_reveal_sign,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -293,6 +294,10 @@ impl SimEvent {
 /// share, and the deterministic delivery queues that ferry events
 /// between them.
 pub struct ShardCoordinatorSim {
+    /// `ShardVoteEquivocationDetected` continuations replicas emitted —
+    /// `(emitter index, evidence)` — the pairs the real host would buffer
+    /// for the beacon and gossip.
+    pub detected_vote_equivocations: Vec<(usize, ShardVoteEquivocation)>,
     /// One coordinator per replica.
     pub coordinators: Vec<ShardCoordinator>,
     /// `(validator_id, pubkey)` per replica.
@@ -438,6 +443,7 @@ impl ShardCoordinatorSim {
             network,
             shard,
             commits: (0..n).map(|_| Vec::new()).collect(),
+            detected_vote_equivocations: Vec::new(),
             votes_cast: (0..n).map(|_| Vec::new()).collect(),
             drop_counters: vec![0; n],
             network_q: VecDeque::new(),
@@ -1338,7 +1344,6 @@ impl ShardCoordinatorSim {
                 parent_in_flight,
                 finalized_tx_count,
                 ready_signals,
-                equivocations,
                 reshape_trigger,
                 parent_witness_leaves,
                 beacon_witness_base,
@@ -1418,7 +1423,6 @@ impl ShardCoordinatorSim {
                     parent_in_flight,
                     finalized_tx_count,
                     ready_signals,
-                    equivocations,
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
                     // block's leaf 0 passes the BLS gate `verify` now runs;
@@ -1732,9 +1736,12 @@ impl ShardCoordinatorSim {
                     }
                     // Host-level plumbing: the real node buffers the pair
                     // for the beacon and gossips it globally. This harness
-                    // models neither; the detection the shard-side tests
-                    // assert on already sits in `detected_equivocations`.
-                    ProtocolEvent::ShardVoteEquivocationDetected { .. } => {}
+                    // models neither — it records the emission so tests can
+                    // assert the detection fired with the right evidence.
+                    ProtocolEvent::ShardVoteEquivocationDetected { evidence } => {
+                        self.detected_vote_equivocations
+                            .push((emitter_idx, *evidence));
+                    }
                     other => panic!(
                         "ShardCoordinatorSim: unmodelled Continuation event {}",
                         other.type_name()

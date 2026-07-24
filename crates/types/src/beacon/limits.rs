@@ -108,13 +108,3 @@ pub const MAX_BEACON_WITNESS_EVENTS_PER_TX: usize = 32;
 /// `OnShard { ready: false }` placement transitions; the cap covers burst
 /// scenarios (committee shuffle aftermath) with headroom.
 pub const MAX_READY_SIGNALS_PER_BLOCK: usize = 32;
-
-/// Cap on [`ShardVoteEquivocation`](crate::ShardVoteEquivocation) evidence
-/// entries a single block may carry.
-///
-/// Bounds proposer-included double-vote evidence per block at decode time.
-/// Emission is rare — one entry burns a validator's key, and the pool of
-/// jailable committee members is a fraction of a single shard's seats — so
-/// a small cap covers any realistic burst; a proposer stuffing more is
-/// rejected at decode before the two-BLS-per-entry verify runs.
-pub const MAX_EQUIVOCATIONS_PER_BLOCK: usize = 32;

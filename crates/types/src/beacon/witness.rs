@@ -15,8 +15,7 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec,
     CertifiedBlockHeader, Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId,
-    ShardVoteEquivocation, Stake, StakePoolId, ValidatorId, Verified, Verify, VrfOutput,
-    verify_merkle_inclusion,
+    Stake, StakePoolId, ValidatorId, Verified, Verify, VrfOutput, verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -178,18 +177,6 @@ pub enum ShardWitnessPayload {
         /// Digest of the proposer's VRF proof for this block's slot.
         output: VrfOutput,
     },
-    /// A committee member double-voted: two signed `BlockVote`s for
-    /// different blocks at one `(shard, height, round)`. Self-proving from
-    /// the embedded BLS signatures, so the leaf carries the whole evidence.
-    /// The shard committee verified it as a block-validity condition before
-    /// the QC formed (like the randomness reveal), so the QC-attested root
-    /// vouches for it and the beacon revokes on it without re-verifying —
-    /// permanent [`ValidatorStatus::Revoked`], regardless of the offender's
-    /// current placement.
-    ///
-    /// Boxed: the evidence's two BLS signatures dwarf every other variant,
-    /// so inlining it would bloat every `ShardWitnessPayload`.
-    VoteEquivocation(Box<ShardVoteEquivocation>),
 }
 
 impl ShardWitnessPayload {

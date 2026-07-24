@@ -831,10 +831,6 @@ pub enum Action {
         /// for inclusion in the block's manifest. Beacon's `Ready` witness
         /// derives one entry per included signal at block-assembly time.
         ready_signals: Vec<ReadySignal>,
-        /// Double-vote equivocation evidence the proposer drained for
-        /// inclusion in the block. Beacon's `VoteEquivocation` witness
-        /// derives one leaf per entry at block-assembly time.
-        equivocations: Vec<ShardVoteEquivocation>,
         /// The proposer's reshape assertion for the manifest, derived
         /// from the load predicate over the parent state's substate
         /// count.

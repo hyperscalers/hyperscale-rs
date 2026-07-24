@@ -37,14 +37,13 @@ pub(super) struct WitnessOutcome {
 
 impl WitnessOutcome {
     /// Route a per-witness validator-status event into the matching list.
-    fn record(&mut self, event: HostEvent) {
+    fn record(&mut self, event: &HostEvent) {
         match event {
-            HostEvent::Registered(id) => self.registered.push(id),
-            HostEvent::Deactivated(id) => self.deactivated.push(id),
-            HostEvent::Jailed(id) => self.jailed.push(id),
-            HostEvent::Convicted(ids) => self.revoked.extend(ids),
-            HostEvent::Unjailed(id) => self.unjailed.push(id),
-            HostEvent::Readied(id) => self.readied.push(id),
+            HostEvent::Registered(id) => self.registered.push(*id),
+            HostEvent::Deactivated(id) => self.deactivated.push(*id),
+            HostEvent::Jailed(id) => self.jailed.push(*id),
+            HostEvent::Unjailed(id) => self.unjailed.push(*id),
+            HostEvent::Readied(id) => self.readied.push(*id),
         }
     }
 
@@ -68,9 +67,6 @@ pub(super) enum HostEvent {
     Registered(ValidatorId),
     Deactivated(ValidatorId),
     Jailed(ValidatorId),
-    /// A pool conviction landed: every listed validator was revoked by
-    /// the cascade this payload triggered.
-    Convicted(Vec<ValidatorId>),
     Unjailed(ValidatorId),
     Readied(ValidatorId),
 }
@@ -160,7 +156,7 @@ pub(super) fn apply_contribution_witnesses(
         if let Some(event) =
             apply_shard_payload(state, network, witness.proof.shard_id, &witness.payload)
         {
-            outcome.record(event);
+            outcome.record(&event);
         }
     }
     true
@@ -610,24 +606,6 @@ pub(super) fn apply_shard_payload(
             // not applied as validator state. No host event.
             None
         }
-        ShardWitnessPayload::VoteEquivocation(ev) => {
-            // The shard committee verified the double-sign as a
-            // block-validity condition before its QC formed, so the
-            // QC-attested witness root vouches for it — convict without
-            // re-verifying, exactly as every other witness payload is
-            // trusted (a byzantine majority that could forge this could
-            // already forge arbitrary state; that is the terminal tier).
-            // One proven double-sign convicts the whole pool; the
-            // cascade's idempotence makes a second leaf naming the same
-            // key a no-op.
-            let rec = state.validators.get(&ev.validator)?;
-            let pool_id = rec.pool;
-            let revoked = convict_pool(state, pool_id, state.current_epoch);
-            if revoked.is_empty() {
-                return None;
-            }
-            Some(HostEvent::Convicted(revoked))
-        }
     }
 }
 
@@ -750,12 +728,11 @@ mod tests {
 
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
-        BlockHash, BlockHeight, BlockVote, Bls12381G2Signature, CohortSeat, EMISSIONS_PER_EPOCH,
-        Epoch, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
+        BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
+        JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
         MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, PoolConviction, ProposerTimestamp,
         Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
-        verify_shard_vote_equivocation, zero_bls_signature,
+        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus, zero_bls_signature,
     };
 
     use super::*;
@@ -918,13 +895,9 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(2);
         let pool_id = StakePoolId::new(0);
-        let effects = apply_witness_chunk(
-            &mut state,
-            0,
-            vec![equivocation_payload(ValidatorId::new(1))],
-        );
-        assert_eq!(effects.revoked.len(), 4, "whole pool cascades");
-        assert!(state.pools[&pool_id].conviction.is_some());
+        let epoch = state.current_epoch;
+        let revoked = convict_pool(&mut state, pool_id, epoch);
+        assert_eq!(revoked.len(), 4, "whole pool cascades");
 
         let new_id = ValidatorId::new(5);
         let effects = apply_witness_chunk(
@@ -1075,38 +1048,6 @@ mod tests {
         assert!(state.pools[&StakePoolId::new(0)].conviction.is_none());
     }
 
-    /// The same pair arriving through both channels — the witness leaf
-    /// first, the proposal lane an epoch later — convicts exactly once:
-    /// the second sighting is a cascade no-op and the impound never
-    /// restamps.
-    #[test]
-    fn leaf_and_lane_copies_of_one_pair_convict_once() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let target = ValidatorId::new(1);
-        isolate_in_own_pool(&mut state, target, 9);
-
-        let ev = genuine_equivocation(1);
-        let effects = apply_witness_chunk(
-            &mut state,
-            0,
-            vec![ShardWitnessPayload::VoteEquivocation(Box::new(ev.clone()))],
-        );
-        assert_eq!(effects.revoked, vec![target]);
-        let stamped = state.pools[&StakePoolId::new(9)].conviction;
-
-        let target_epoch = state.current_epoch.next();
-        let mut committed = vec![(
-            ValidatorId::new(0),
-            vrf_proposal_with_vote_equivocations(0, target_epoch, vec![ev]),
-        )];
-        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
-        let effects = apply_next_epoch(&mut state, &committed);
-
-        assert!(effects.revoked.is_empty());
-        assert_eq!(state.pools[&StakePoolId::new(9)].conviction, stamped);
-    }
-
     /// Stake ops fold uniformly on a convicted pool: deposits credit
     /// and withdrawal initiations queue. Conviction only retires
     /// validation and freezes maturation — a fold-side rejection the
@@ -1117,11 +1058,8 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
-        apply_witness_chunk(
-            &mut state,
-            0,
-            vec![equivocation_payload(ValidatorId::new(1))],
-        );
+        let epoch = state.current_epoch;
+        convict_pool(&mut state, pool_id, epoch);
         assert!(state.pools[&pool_id].conviction.is_some());
         let total = state.pools[&pool_id].total_stake;
 
@@ -1387,9 +1325,8 @@ mod tests {
         );
     }
 
-    /// `DeactivateValidator` against an already-`InsufficientStake` or an
-    /// already-permanent `Jailed { Equivocation }` validator is a silent
-    /// no-op.
+    /// `DeactivateValidator` against an already-`InsufficientStake` or a
+    /// `Revoked` validator is a silent no-op.
     #[test]
     fn deactivate_validator_no_op_for_insufficient_or_equivocation() {
         let mut state = single_pool_state(4);
@@ -2009,26 +1946,9 @@ mod tests {
         assert!(members.contains(&ValidatorId::new(4)));
     }
 
-    // ─── VoteEquivocation leaf (shard double-vote) ───────────────────────
+    // ─── Shard double-vote pairs (gossip-fed proposal lane) ─────────────
     // The shard-witness path, distinct from the PC-ballot equivocation
     // tests below (which drive `ingest_equivocations` via a proposal).
-
-    fn equivocation_payload(validator: ValidatorId) -> ShardWitnessPayload {
-        // The fold trusts the QC-attested leaf and does not re-verify, so
-        // placeholder signatures are faithful to the applied path.
-        ShardWitnessPayload::VoteEquivocation(Box::new(ShardVoteEquivocation {
-            validator,
-            shard: ShardId::leaf(1, 0),
-            height: BlockHeight::GENESIS,
-            round: Round::INITIAL,
-            block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"block-a")),
-            parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"parent-a")),
-            sig_a: Bls12381G2Signature([1u8; 96]),
-            block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"block-b")),
-            parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"parent-b")),
-            sig_b: Bls12381G2Signature([2u8; 96]),
-        }))
-    }
 
     /// Move `id` into its own single-validator pool so a conviction's
     /// cascade stops at its own seat — the shape that keeps the other
@@ -2048,81 +1968,6 @@ mod tests {
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,
                 conviction: None,
-            },
-        );
-    }
-
-    /// A `VoteEquivocation` leaf convicts the named validator's pool and
-    /// cascades the committee removal + pool refill — applied on the
-    /// QC-attested leaf alone, no signature re-check.
-    #[test]
-    fn vote_equivocation_leaf_convicts_permanently() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
-        state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
-        state
-            .pools
-            .get_mut(&pool_id)
-            .unwrap()
-            .validators
-            .insert(ValidatorId::new(4));
-        state.validators.insert(
-            ValidatorId::new(4),
-            validator_record(4, 0, ValidatorStatus::Pooled),
-        );
-
-        let target = ValidatorId::new(1);
-        isolate_in_own_pool(&mut state, target, 9);
-        let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
-
-        assert_eq!(effects.revoked, vec![target]);
-        assert_eq!(
-            state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Revoked {
-                at_epoch: state.current_epoch
-            },
-        );
-        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
-        assert!(!members.contains(&target));
-        assert!(members.contains(&ValidatorId::new(4)));
-    }
-
-    /// A `VoteEquivocation` naming a validator absent from the registry is
-    /// silently dropped — no panic, no jail.
-    #[test]
-    fn vote_equivocation_leaf_of_unknown_validator_dropped() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-
-        let effects = apply_witness_chunk(
-            &mut state,
-            0,
-            vec![equivocation_payload(ValidatorId::new(9_999))],
-        );
-
-        assert!(effects.jailed.is_empty());
-    }
-
-    /// A second `VoteEquivocation` against an already revoked
-    /// key is idempotent: no duplicate jail event, `since_epoch` unchanged.
-    #[test]
-    fn vote_equivocation_leaf_idempotent_when_already_jailed() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let target = ValidatorId::new(1);
-        state.validators.get_mut(&target).unwrap().status = ValidatorStatus::Revoked {
-            at_epoch: Epoch::GENESIS,
-        };
-
-        let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
-
-        assert!(effects.jailed.is_empty());
-        assert_eq!(
-            state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Revoked {
-                at_epoch: Epoch::GENESIS
             },
         );
     }
@@ -2166,62 +2011,6 @@ mod tests {
             parent_block_hash_b,
             sig_b,
         }
-    }
-
-    /// The exact leaf a shard proposer produces — two genuine conflicting
-    /// signatures under the double-signer's key — verifies as a block-validity
-    /// condition and, folded on QC trust, permanently revokes the signer and
-    /// refills its committee seat. This is the beacon end of the pipeline the
-    /// shard `vote_equivocation` integration test drives to a committed block.
-    #[test]
-    fn genuine_vote_equivocation_leaf_verifies_and_convicts() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        // The equivocator operates alone under its own pool, so the
-        // cascade's blast radius is its own seat; pool 0's spare
-        // (validator 4) backfills the freed slot.
-        let target = ValidatorId::new(1);
-        let own_pool = StakePoolId::new(9);
-        isolate_in_own_pool(&mut state, target, 9);
-        let pool_id = StakePoolId::new(0);
-        state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos());
-        state
-            .pools
-            .get_mut(&pool_id)
-            .unwrap()
-            .validators
-            .insert(ValidatorId::new(4));
-        state.validators.insert(
-            ValidatorId::new(4),
-            validator_record(4, 0, ValidatorStatus::Pooled),
-        );
-
-        let ev = genuine_equivocation(1);
-        // The soundness check a voter runs before its QC attests the leaf.
-        assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net(), &pubkey(1)),
-            Ok(())
-        );
-
-        let effects = apply_witness_chunk(
-            &mut state,
-            0,
-            vec![ShardWitnessPayload::VoteEquivocation(Box::new(ev))],
-        );
-
-        assert_eq!(effects.revoked, vec![target]);
-        assert_eq!(
-            state.validators.get(&target).unwrap().status,
-            ValidatorStatus::Revoked {
-                at_epoch: state.current_epoch
-            },
-        );
-        assert!(state.pools[&own_pool].conviction.is_some());
-        assert!(state.pools[&pool_id].conviction.is_none());
-        let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
-        assert!(!members.contains(&target));
-        assert!(members.contains(&ValidatorId::new(4)));
     }
 
     /// VRF jail cascade also clears the miss counter.
@@ -2408,8 +2197,8 @@ mod tests {
         );
     }
 
-    /// Equivocation against an already-permanent `Jailed{Equivocation}` is
-    /// a silent no-op.
+    /// Equivocation against an already-`Revoked` validator is a silent
+    /// no-op.
     #[test]
     fn vote_equivocation_against_already_equivocation_is_no_op() {
         let mut state = single_pool_state(4);

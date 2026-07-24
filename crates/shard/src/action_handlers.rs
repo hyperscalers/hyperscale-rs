@@ -21,13 +21,13 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, ShardVoteEquivocation,
-    SplitChildRoots, StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext,
-    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
-    block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
-    derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
-    ready_signal_message, shard_reveal_sign,
+    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
+    StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
+    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, block_header_message, block_vote_message,
+    certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
+    local_settled_wave_ids, missed_proposals_since_prev_commit, ready_signal_message,
+    shard_reveal_sign,
 };
 
 /// Result of QC verification and assembly.
@@ -203,7 +203,6 @@ pub fn build_proposal<S: ShardChainWriter>(
     parent_in_flight: InFlightCount,
     finalized_tx_count: u32,
     ready_signals: Vec<ReadySignal>,
-    equivocations: Vec<ShardVoteEquivocation>,
     reshape_trigger: Option<ReshapeTrigger>,
     randomness_reveal: VrfProof,
     parent_witness_leaves: &[Hash],
@@ -245,7 +244,6 @@ pub fn build_proposal<S: ShardChainWriter>(
     // helper and their leaf order can't drift.
     let witness_sources = Arc::new(WitnessSources::new(
         ready_signals,
-        equivocations,
         reshape_trigger,
         randomness_reveal,
     ));
@@ -750,7 +748,6 @@ where
             parent_in_flight,
             finalized_tx_count,
             ready_signals,
-            equivocations,
             reshape_trigger,
             parent_witness_leaves,
             beacon_witness_base,
@@ -806,7 +803,6 @@ where
                 parent_in_flight,
                 finalized_tx_count,
                 ready_signals,
-                equivocations,
                 reshape_trigger,
                 randomness_reveal,
                 &parent_witness_leaves,

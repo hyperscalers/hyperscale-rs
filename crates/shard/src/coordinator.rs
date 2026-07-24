@@ -87,10 +87,9 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
     QcVerifyError, QuorumCertificate, RecoveryCause, Round, RoutableTransaction, SafeVoteRegisters,
-    ShardVoteEquivocation, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
-    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    StateRoot, StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot,
+    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -314,12 +313,12 @@ pub struct ShardCoordinator {
     /// next proposed block. Drained at proposal time.
     ready_signal_pool: ReadySignalPool,
 
-    /// Double-vote equivocation evidence this replica detected among the
-    /// votes it received, first-wins per validator (one entry is enough —
-    /// the beacon jail is permanent). Cloned into every proposal until the
-    /// evidence lands in a committed block, then pruned; retained across
-    /// proposals so a lost or uncommitted block does not drop it.
-    detected_equivocations: std::collections::BTreeMap<ValidatorId, ShardVoteEquivocation>,
+    /// Validators whose double-vote this replica has already caught and
+    /// handed to the host (which buffers it for the beacon and gossips
+    /// it globally). One detection per key is enough — the conviction
+    /// is permanent — so this gates the detection continuation, nothing
+    /// more.
+    detected_equivocators: std::collections::BTreeSet<ValidatorId>,
 
     /// Per-shard beacon-witness accumulator. Previewed at proposal time
     /// to fill the new block's `(beacon_witness_root, beacon_witness_leaf_count)`;
@@ -447,7 +446,7 @@ impl ShardCoordinator {
             proposal: ProposalTracker::new(),
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
-            detected_equivocations: std::collections::BTreeMap::new(),
+            detected_equivocators: std::collections::BTreeSet::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
                 recovered.beacon_witness_start,
                 recovered.beacon_witness_leaf_hashes,
@@ -1763,7 +1762,6 @@ impl ShardCoordinator {
             self.now,
             kind,
             preview.ready_signals,
-            self.detected_equivocations.values().cloned().collect(),
             preview.reshape_trigger,
             preview.parent_window,
             preview.base,
@@ -3010,10 +3008,8 @@ impl ShardCoordinator {
             if let Some(evidence) =
                 self.votes
                     .track_verified_received_vote(block_hash, parent_block_hash, vote)
-                && let std::collections::btree_map::Entry::Vacant(slot) =
-                    self.detected_equivocations.entry(evidence.validator)
+                && self.detected_equivocators.insert(evidence.validator)
             {
-                slot.insert(evidence.clone());
                 // First sighting: hand the pair to the host, which
                 // buffers it for the beacon and gossips it globally —
                 // the lane that keeps the evidence alive after every
@@ -4006,11 +4002,6 @@ impl ShardCoordinator {
         self.committed_hash = block_hash;
         self.committed_ts = commit_ts;
 
-        // Evidence that reached a committed block is on-chain — the beacon
-        // will fold and jail on it — so drop it from the pending buffer.
-        for ev in block.witness_sources().equivocations().iter() {
-            self.detected_equivocations.remove(&ev.validator);
-        }
         // The committee that signed this block is `at(parent_qc weighted ts)`;
         // retain it so [`Self::committee_anchor`] can resolve the tip's
         // committee after it is pruned from `pending_blocks`.
@@ -5447,7 +5438,7 @@ impl ShardCoordinator {
     /// evidence lands on-chain.
     #[must_use]
     pub fn pending_equivocation_count(&self) -> usize {
-        self.detected_equivocations.len()
+        self.detected_equivocators.len()
     }
 
     /// Single chokepoint for dropping a pending block. All single-block
