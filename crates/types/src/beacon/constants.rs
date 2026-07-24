@@ -240,6 +240,14 @@ pub const RESHAPE_HANDOFF_TTL_EPOCHS: u64 = 12;
 /// escapes.
 pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
 
+/// Genesis default for the `impound_epochs` governance parameter: how
+/// long a convicted pool's withdrawals stay frozen past its conviction.
+///
+/// ~90 days at 5-minute epochs — long enough that the time-premium of
+/// the impounded capital is a material price for a caught equivocation,
+/// without confiscating principal.
+pub const IMPOUND_EPOCHS_DEFAULT: u64 = 26_000;
+
 /// Per-epoch `MissedProposal` count that trips a `JailReason::Performance`
 /// jail on a placed validator.
 ///

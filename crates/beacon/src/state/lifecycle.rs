@@ -56,6 +56,13 @@ pub(super) fn auto_reactivate(state: &mut BeaconState) -> Vec<ValidatorId> {
         for pool_id in pool_ids {
             let (cur, max) = {
                 let pool = state.pools.get(&pool_id).expect("just iterated");
+                // A convicted pool never reactivates: its zero actives
+                // against standing stake would otherwise pass the
+                // capacity check and re-pool members the conviction
+                // retired.
+                if pool.conviction.is_some() {
+                    continue;
+                }
                 (
                     pool.current_active_count(state),
                     pool.max_active_count_at(min_stake),
@@ -244,6 +251,7 @@ mod tests {
                 total_stake: Stake::from_attos(total_stake_attos),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state
@@ -347,6 +355,7 @@ mod tests {
                     total_stake: Stake::from_attos(1),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
+                    conviction: None,
                 },
             );
         }
@@ -422,6 +431,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         let pre_total = state.pools[&StakePoolId::new(0)].total_stake;
@@ -505,6 +515,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(10)).collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state.validators.insert(
@@ -530,6 +541,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: (20u64..23).map(ValidatorId::new).collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         for i in 20u64..23 {
@@ -582,6 +594,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(10)).collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state.pools.insert(
@@ -591,6 +604,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(20)).collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state.validators.insert(
@@ -654,6 +668,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             })
             .validators
             .insert(ValidatorId::new(id));
@@ -816,6 +831,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state.validators.insert(

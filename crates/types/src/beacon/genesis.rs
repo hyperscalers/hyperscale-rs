@@ -14,8 +14,8 @@ use sbor::prelude::*;
 
 use crate::{
     BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash,
-    Hash, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, ReshapeThresholds,
-    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, ValidatorId,
+    Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
+    ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -61,6 +61,11 @@ pub struct BeaconChainConfig {
     /// `epoch_duration_ms`: a dev sim syncs a shard in an epoch or two,
     /// while a production shard takes hours, so no single value fits both.
     pub ready_timeout_epochs: u64,
+    /// Genesis seed for the `impound_epochs` governance parameter —
+    /// epochs a convicted pool's withdrawals stay frozen. Governable
+    /// after genesis via [`NetworkParams`](crate::NetworkParams); the
+    /// live value is read from `BeaconState.params`, never from here.
+    pub impound_epochs: u64,
 }
 
 impl BeaconChainConfig {
@@ -135,6 +140,7 @@ impl Default for BeaconChainConfig {
             reshape_thresholds: ReshapeThresholds::DISABLED,
             genesis_timestamp_ms: 0,
             ready_timeout_epochs: 8,
+            impound_epochs: IMPOUND_EPOCHS_DEFAULT,
         }
     }
 }

@@ -228,6 +228,7 @@ fn mc_state(cell: &Cell) -> BeaconState {
             ),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),
+            conviction: None,
         },
     );
 

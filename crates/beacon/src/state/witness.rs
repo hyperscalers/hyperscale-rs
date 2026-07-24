@@ -12,8 +12,9 @@ use hyperscale_types::{
 };
 
 use crate::rules;
+use crate::state::conviction::convict_pool;
 use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
-use crate::state::vrf::{jail_validator, revoke_validator};
+use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
 /// Outcome of the epoch's witness application —
@@ -41,7 +42,7 @@ impl WitnessOutcome {
             HostEvent::Registered(id) => self.registered.push(id),
             HostEvent::Deactivated(id) => self.deactivated.push(id),
             HostEvent::Jailed(id) => self.jailed.push(id),
-            HostEvent::Revoked(id) => self.revoked.push(id),
+            HostEvent::Convicted(ids) => self.revoked.extend(ids),
             HostEvent::Unjailed(id) => self.unjailed.push(id),
             HostEvent::Readied(id) => self.readied.push(id),
         }
@@ -62,12 +63,14 @@ impl WitnessOutcome {
 ///
 /// `StakeDeposit` and `StakeWithdraw` payloads mutate pool state but
 /// produce no validator-level event (caller sees `None`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum HostEvent {
     Registered(ValidatorId),
     Deactivated(ValidatorId),
     Jailed(ValidatorId),
-    Revoked(ValidatorId),
+    /// A pool conviction landed: every listed validator was revoked by
+    /// the cascade this payload triggered.
+    Convicted(Vec<ValidatorId>),
     Unjailed(ValidatorId),
     Readied(ValidatorId),
 }
@@ -100,16 +103,16 @@ pub(super) fn ingest_equivocations(
             {
                 continue;
             }
-            // Revocation supersedes every status except an existing
-            // revocation. The race-exit defence covers
-            // `InsufficientStake` (operator tried to escape via
-            // `DeactivateValidator`) and fault-cause `Jailed` (the
-            // existing jail is upgraded to permanent).
-            if matches!(rec.status, ValidatorStatus::Revoked { .. }) {
-                continue;
-            }
-            revoke_validator(state, validator_id, state.current_epoch);
-            outcome.revoked.push(validator_id);
+            // One proven double-sign convicts the whole pool — the
+            // operator behind the key runs every seat the pool backs.
+            // The cascade covers the race-exit defence
+            // (`InsufficientStake` and fault-cause `Jailed` members
+            // revoke with the rest) and its idempotence makes replayed
+            // evidence a no-op.
+            let pool_id = rec.pool;
+            outcome
+                .revoked
+                .extend(convict_pool(state, pool_id, state.current_epoch));
         }
     }
     outcome
@@ -178,6 +181,7 @@ pub(super) fn apply_shard_payload(
                 total_stake: Stake::ZERO,
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             });
             pool.total_stake = pool.total_stake.saturating_add(*amount);
             None
@@ -217,9 +221,16 @@ pub(super) fn apply_shard_payload(
             if state.validators.contains_key(validator_id) {
                 return None;
             }
-            // Pool must exist and have capacity at the current dynamic
-            // `min_stake` for one more active validator.
+            // Pool must exist, be unconvicted, and have capacity at the
+            // current dynamic `min_stake` for one more active validator.
+            // The conviction gate is load-bearing, not defensive: a
+            // convicted pool has zero actives against positive stake, so
+            // the capacity check alone would wave a replacement seat
+            // straight back in.
             let pool = state.pools.get(pool_id)?;
+            if pool.conviction.is_some() {
+                return None;
+            }
             if pool.current_active_count(state) + 1 > pool.max_active_count(state) {
                 return None;
             }
@@ -304,6 +315,9 @@ pub(super) fn apply_shard_payload(
             }
             let pool_id = rec.pool;
             let pool = state.pools.get(&pool_id)?;
+            if pool.conviction.is_some() {
+                return None;
+            }
             if pool.current_active_count(state) + 1 > pool.max_active_count(state) {
                 return None;
             }
@@ -578,19 +592,20 @@ pub(super) fn apply_shard_payload(
         ShardWitnessPayload::VoteEquivocation(ev) => {
             // The shard committee verified the double-sign as a
             // block-validity condition before its QC formed, so the
-            // QC-attested witness root vouches for it — revoke without
+            // QC-attested witness root vouches for it — convict without
             // re-verifying, exactly as every other witness payload is
             // trusted (a byzantine majority that could forge this could
             // already forge arbitrary state; that is the terminal tier).
-            // Permanent, superseding every status but an existing
-            // revocation, so a second leaf naming the same key is
-            // idempotent.
+            // One proven double-sign convicts the whole pool; the
+            // cascade's idempotence makes a second leaf naming the same
+            // key a no-op.
             let rec = state.validators.get(&ev.validator)?;
-            if matches!(rec.status, ValidatorStatus::Revoked { .. }) {
+            let pool_id = rec.pool;
+            let revoked = convict_pool(state, pool_id, state.current_epoch);
+            if revoked.is_empty() {
                 return None;
             }
-            revoke_validator(state, ev.validator, state.current_epoch);
-            Some(HostEvent::Revoked(ev.validator))
+            Some(HostEvent::Convicted(revoked))
         }
     }
 }
@@ -716,10 +731,10 @@ mod tests {
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, Bls12381G2Signature, CohortSeat, EMISSIONS_PER_EPOCH,
         Epoch, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
-        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, ProposerTimestamp, Randomness, Round,
-        ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool,
-        StakePoolId, ValidatorId, ValidatorStatus, verify_shard_vote_equivocation,
-        zero_bls_signature,
+        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, PoolConviction, ProposerTimestamp,
+        Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
+        verify_shard_vote_equivocation, zero_bls_signature,
     };
 
     use super::*;
@@ -872,6 +887,107 @@ mod tests {
     }
 
     // ─── RegisterValidator + DeactivateValidator ─────────────────────────
+
+    /// A convicted pool registers nothing: zero actives against its
+    /// standing stake pass the capacity check, so the conviction gate
+    /// alone blocks the replacement seat.
+    #[test]
+    fn register_validator_rejected_on_convicted_pool() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(2);
+        let pool_id = StakePoolId::new(0);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![equivocation_payload(ValidatorId::new(1))],
+        );
+        assert_eq!(effects.revoked.len(), 4, "whole pool cascades");
+        assert!(state.pools[&pool_id].conviction.is_some());
+
+        let new_id = ValidatorId::new(5);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::RegisterValidator {
+                pool_id,
+                validator_id: new_id,
+                pubkey: pubkey(5),
+                possession_proof: possession_proof(5, new_id),
+            }],
+        );
+
+        assert!(effects.registered.is_empty());
+        assert!(!state.validators.contains_key(&new_id));
+    }
+
+    /// A convicted pool unjails nothing, even a fault-cause jail whose
+    /// cooldown has long elapsed.
+    #[test]
+    fn unjail_rejected_on_convicted_pool() {
+        let since = Epoch::new(5);
+        let mut state = state_with_jailed(since, JailReason::Performance);
+        state
+            .pools
+            .get_mut(&StakePoolId::new(0))
+            .unwrap()
+            .conviction = Some(PoolConviction {
+            convicted_at: since,
+            lifts_at: Epoch::new(since.inner() + 100),
+        });
+        state.current_epoch = Epoch::new(since.inner() + 10 * JAIL_COOLDOWN_EPOCHS);
+
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::Unjail {
+                id: ValidatorId::new(10),
+            }],
+        );
+
+        assert!(effects.unjailed.is_empty());
+        assert!(matches!(
+            state.validators.get(&ValidatorId::new(10)).unwrap().status,
+            ValidatorStatus::Jailed { .. },
+        ));
+    }
+
+    /// The race-exit defence: an operator deactivates the equivocator
+    /// before the evidence lands, and the conviction still catches the
+    /// whole pool — the fled `InsufficientStake` member included.
+    #[test]
+    fn conviction_catches_a_member_that_fled_to_insufficient_stake() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::DeactivateValidator {
+                validator_id: target,
+            }],
+        );
+        assert_eq!(effects.deactivated, vec![target]);
+
+        let w = vote_equivocation_witness(target.inner(), Epoch::new(5), SpcView::new(0));
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_equivocations(0, target_epoch, vec![w]),
+        )];
+        committed.extend((2u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert!(effects.revoked.contains(&target), "the fled member revokes");
+        assert_eq!(effects.revoked.len(), 4, "the whole pool revokes");
+        assert!(state.pools[&StakePoolId::new(0)].conviction.is_some());
+        for v in 0..4u64 {
+            assert!(matches!(
+                state.validators[&ValidatorId::new(v)].status,
+                ValidatorStatus::Revoked { .. },
+            ));
+        }
+    }
 
     /// Happy path: a `RegisterValidator` for an unknown id with a pool
     /// that has capacity adds the validator at `Pooled` with
@@ -1486,6 +1602,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state.validators.insert(
@@ -1756,12 +1873,32 @@ mod tests {
         }))
     }
 
-    /// A `VoteEquivocation` leaf permanently revokes the named validator
-    /// under `Equivocation` and cascades the committee removal + pool
-    /// refill — applied on the QC-attested leaf alone, no signature
-    /// re-check.
+    /// Move `id` into its own single-validator pool so a conviction's
+    /// cascade stops at its own seat — the shape that keeps the other
+    /// fixtures' members observable as unaffected bystanders.
+    fn isolate_in_own_pool(state: &mut BeaconState, id: ValidatorId, pool_no: u32) {
+        let pool_id = StakePoolId::new(pool_no);
+        for pool in state.pools.values_mut() {
+            pool.validators.remove(&id);
+        }
+        state.validators.get_mut(&id).unwrap().pool = pool_id;
+        state.pools.insert(
+            pool_id,
+            StakePool {
+                id: pool_id,
+                total_stake: MIN_STAKE_FLOOR,
+                validators: std::iter::once(id).collect(),
+                pending_withdrawals: Vec::new(),
+                conviction: None,
+            },
+        );
+    }
+
+    /// A `VoteEquivocation` leaf convicts the named validator's pool and
+    /// cascades the committee removal + pool refill — applied on the
+    /// QC-attested leaf alone, no signature re-check.
     #[test]
-    fn vote_equivocation_leaf_jails_permanently() {
+    fn vote_equivocation_leaf_convicts_permanently() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
@@ -1779,6 +1916,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
+        isolate_in_own_pool(&mut state, target, 9);
         let effects = apply_witness_chunk(&mut state, 0, vec![equivocation_payload(target)]);
 
         assert_eq!(effects.revoked, vec![target]);
@@ -1878,12 +2016,18 @@ mod tests {
     /// refills its committee seat. This is the beacon end of the pipeline the
     /// shard `vote_equivocation` integration test drives to a committed block.
     #[test]
-    fn genuine_vote_equivocation_leaf_verifies_and_revokes() {
+    fn genuine_vote_equivocation_leaf_verifies_and_convicts() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // The equivocator operates alone under its own pool, so the
+        // cascade's blast radius is its own seat; pool 0's spare
+        // (validator 4) backfills the freed slot.
+        let target = ValidatorId::new(1);
+        let own_pool = StakePoolId::new(9);
+        isolate_in_own_pool(&mut state, target, 9);
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos());
         state
             .pools
             .get_mut(&pool_id)
@@ -1895,7 +2039,6 @@ mod tests {
             validator_record(4, 0, ValidatorStatus::Pooled),
         );
 
-        let target = ValidatorId::new(1);
         let ev = genuine_equivocation(1);
         // The soundness check a voter runs before its QC attests the leaf.
         assert_eq!(
@@ -1916,6 +2059,8 @@ mod tests {
                 at_epoch: state.current_epoch
             },
         );
+        assert!(state.pools[&own_pool].conviction.is_some());
+        assert!(state.pools[&pool_id].conviction.is_none());
         let members = &state.next_shard_committees[&ShardId::leaf(1, 0)].members;
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -1994,10 +2139,10 @@ mod tests {
         build_vote_equivocation(equivocator, epoch, view)
     }
 
-    /// Verified PC vote equivocation against an `OnShard` validator jails
-    /// permanently under `Equivocation` and cascades.
+    /// Verified PC vote equivocation against an `OnShard` validator
+    /// convicts its pool and cascades the committee removal + refill.
     #[test]
-    fn vote_equivocation_jails_on_shard_validator_with_cascade() {
+    fn vote_equivocation_convicts_on_shard_validator_with_cascade() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
@@ -2015,6 +2160,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
+        isolate_in_own_pool(&mut state, target, 9);
         let w = vote_equivocation_witness(target.inner(), Epoch::new(5), SpcView::new(0));
         let target_epoch = state.current_epoch.next();
         let mut committed = vec![(
@@ -2037,8 +2183,8 @@ mod tests {
         assert!(members.contains(&ValidatorId::new(4)));
     }
 
-    /// Verified equivocation against a `Pooled` validator flips status to
-    /// permanent `Jailed { Equivocation }`; no cascade.
+    /// Verified equivocation against a `Pooled` validator revokes it in
+    /// place; no committee is touched.
     #[test]
     fn vote_equivocation_revokes_pooled_validator_in_place() {
         let mut state = single_pool_state(4);
@@ -2047,6 +2193,7 @@ mod tests {
             ValidatorId::new(10),
             validator_record(10, 0, ValidatorStatus::Pooled),
         );
+        isolate_in_own_pool(&mut state, ValidatorId::new(10), 9);
 
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
         let target_epoch = state.current_epoch.next();
@@ -2066,8 +2213,8 @@ mod tests {
         );
     }
 
-    /// Equivocation promotes a fault-cause `Jailed{Performance}` to
-    /// permanent `Jailed{Equivocation}`.
+    /// Equivocation promotes a fault-cause `Jailed{Performance}` to a
+    /// permanent revocation.
     #[test]
     fn vote_equivocation_promotes_performance_jail_to_revocation() {
         let mut state = single_pool_state(4);
@@ -2083,6 +2230,7 @@ mod tests {
                 },
             ),
         );
+        isolate_in_own_pool(&mut state, ValidatorId::new(10), 9);
 
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
         let target_epoch = state.current_epoch.next();

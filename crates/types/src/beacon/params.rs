@@ -23,7 +23,10 @@
 use sbor::prelude::*;
 use thiserror::Error;
 
-use crate::{BeaconChainConfig, Epoch, ReshapeThresholds, StakePoolId};
+use crate::{
+    BeaconChainConfig, Epoch, IMPOUND_EPOCHS_DEFAULT, ReshapeThresholds, StakePoolId,
+    UNBONDING_WINDOW_EPOCHS,
+};
 
 /// The governable subset of a chain's parameters — the live values
 /// every runtime read resolves against.
@@ -32,12 +35,16 @@ use crate::{BeaconChainConfig, Epoch, ReshapeThresholds, StakePoolId};
 /// [`Self::from_genesis`]) and mutated only by the fold. New rows are
 /// added one at a time as each parameter's activation semantics are
 /// worked out; today the set is `reshape_thresholds` alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BasicSbor)]
 pub struct NetworkParams {
     /// Substate-byte thresholds driving automatic shard reshaping. The
     /// live source for the split/merge predicate; the genesis copy on
     /// `chain_config` is only the seed.
     pub reshape_thresholds: ReshapeThresholds,
+    /// Epochs a convicted pool's withdrawals stay frozen past its
+    /// conviction. Read at conviction time to stamp `lifts_at`; a
+    /// later change never shortens an in-force impound.
+    pub impound_epochs: u64,
 }
 
 impl NetworkParams {
@@ -47,6 +54,7 @@ impl NetworkParams {
     pub const fn from_genesis(config: &BeaconChainConfig) -> Self {
         Self {
             reshape_thresholds: config.reshape_thresholds,
+            impound_epochs: config.impound_epochs,
         }
     }
 
@@ -67,7 +75,21 @@ impl NetworkParams {
         if self.reshape_thresholds.split_bytes == 0 {
             return Err(ParamBoundsError::ZeroSplitThreshold);
         }
+        if self.impound_epochs < UNBONDING_WINDOW_EPOCHS {
+            return Err(ParamBoundsError::ImpoundBelowUnbonding);
+        }
         Ok(())
+    }
+}
+
+impl Default for NetworkParams {
+    /// The genesis-shaped defaults — every row's seed value, so a
+    /// default params set always passes [`Self::validate`].
+    fn default() -> Self {
+        Self {
+            reshape_thresholds: ReshapeThresholds::default(),
+            impound_epochs: IMPOUND_EPOCHS_DEFAULT,
+        }
     }
 }
 
@@ -78,6 +100,10 @@ pub enum ParamBoundsError {
     /// on its first byte and never merge back.
     #[error("reshape split_bytes is zero; every shard would split unboundedly")]
     ZeroSplitThreshold,
+    /// `impound_epochs` is below the unbonding window — a conviction
+    /// would then be cheaper than a voluntary exit.
+    #[error("impound_epochs is below the unbonding window")]
+    ImpoundBelowUnbonding,
 }
 
 /// A proposed parameter change: the target [`NetworkParams`] and the
@@ -141,6 +167,7 @@ mod tests {
     fn validate_rejects_zero_split_threshold() {
         let zero = NetworkParams {
             reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+            ..NetworkParams::default()
         };
         assert_eq!(zero.validate(), Err(ParamBoundsError::ZeroSplitThreshold));
 
@@ -149,6 +176,7 @@ mod tests {
         assert!(
             NetworkParams {
                 reshape_thresholds: ReshapeThresholds { split_bytes: 1 },
+                ..NetworkParams::default()
             }
             .validate()
             .is_ok()
@@ -159,6 +187,7 @@ mod tests {
     fn sbor_round_trip() {
         let params = NetworkParams {
             reshape_thresholds: ReshapeThresholds { split_bytes: 1_234 },
+            ..NetworkParams::default()
         };
         let bytes = basic_encode(&params).unwrap();
         assert_eq!(basic_decode::<NetworkParams>(&bytes).unwrap(), params);
@@ -172,6 +201,7 @@ mod tests {
                 proposal: Some(ParamProposal {
                     params: NetworkParams {
                         reshape_thresholds: ReshapeThresholds { split_bytes: 7_000 },
+                        ..NetworkParams::default()
                     },
                     activate_at: Epoch::new(12),
                 }),

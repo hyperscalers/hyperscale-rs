@@ -21,10 +21,11 @@ use crate::state::committee::{
     diff_shard_committees, recover_committees, resample_beacon_committee, run_shuffle_step,
     top_up_committees,
 };
+use crate::state::conviction::convict_pool;
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
 use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
-use crate::state::vrf::{filter_and_roll_randomness, revoke_validator};
+use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
     WitnessOutcome, apply_contribution_witnesses, defer_reshape_ttls, ingest_equivocations,
@@ -734,8 +735,8 @@ fn ingest_fork_proofs(
 /// by re-verifying both QCs against it: a pass proves the resolved
 /// committee is the signing committee, so `committee[i]` is the validator
 /// behind bit `i`. A committee that has rotated beyond what current state
-/// resolves fails the re-verify and is left fence-only. The revocation is
-/// permanent and idempotent.
+/// resolves fails the re-verify and is left fence-only. Each signer's
+/// pool is convicted — permanent and idempotent.
 fn revoke_fork_equivocators(
     state: &mut BeaconState,
     snapshot: &TopologySnapshot,
@@ -769,7 +770,10 @@ fn revoke_fork_equivocators(
         let Some(&victim) = committee.get(pos) else {
             continue;
         };
-        revoke_validator(state, victim, epoch);
+        let Some(pool_id) = state.validators.get(&victim).map(|r| r.pool) else {
+            continue;
+        };
+        convict_pool(state, pool_id, epoch);
     }
 }
 
@@ -1245,12 +1249,12 @@ mod tests {
     use hyperscale_types::{
         BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
-        LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee, ShardForkProof,
-        ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        SignerBitfield, SplitChildRoots, Stake, StakePoolId, StateRoot, TransactionRoot,
-        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root_with_proof,
-        zero_bls_signature,
+        LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee,
+        ShardForkProof, ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload,
+        ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
+        StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
+        compute_merkle_root_with_proof, zero_bls_signature,
     };
 
     use super::*;
@@ -1785,23 +1789,47 @@ mod tests {
         [(ValidatorId::new(0), proposal)]
     }
 
-    fn equivocation_jailed(state: &BeaconState, v: u64) -> bool {
+    fn revoked(state: &BeaconState, v: u64) -> bool {
         matches!(
             state.validators.get(&ValidatorId::new(v)).map(|r| r.status),
             Some(ValidatorStatus::Revoked { .. })
         )
     }
 
-    /// A same-round double-sign jails exactly the bitfield intersection —
-    /// seats that signed both branches — and spares the seats that signed
-    /// only one.
+    /// Rebuild `state.pools` so every validator operates under its own
+    /// single-validator pool — the shape that makes conviction
+    /// attribution observable per seat.
+    fn split_into_single_validator_pools(state: &mut BeaconState) {
+        let ids: Vec<ValidatorId> = state.validators.keys().copied().collect();
+        state.pools.clear();
+        for (i, id) in ids.iter().enumerate() {
+            let pool_id = StakePoolId::new(u32::try_from(i).unwrap());
+            state.validators.get_mut(id).unwrap().pool = pool_id;
+            state.pools.insert(
+                pool_id,
+                StakePool {
+                    id: pool_id,
+                    total_stake: MIN_STAKE_FLOOR,
+                    validators: std::iter::once(*id).collect(),
+                    pending_withdrawals: Vec::new(),
+                    conviction: None,
+                },
+            );
+        }
+    }
+
+    /// A same-round double-sign convicts exactly the bitfield
+    /// intersection's pools — seats that signed both branches — and
+    /// spares the seats that signed only one (each seat under its own
+    /// pool, so attribution is per-seat).
     #[test]
-    fn same_round_fork_jails_exactly_the_bitfield_intersection() {
+    fn same_round_fork_convicts_exactly_the_bitfield_intersection() {
         use hyperscale_types::test_utils::shard_fork_proof_same_round;
 
         let shard = ShardId::leaf(1, 0);
         let committee = TestCommittee::new(4, 1);
         let mut state = state_with_shard_committee(&committee);
+        split_into_single_validator_pools(&mut state);
         // Branch a signed by {0,1,2}, branch b by {1,2,3}: intersection {1,2}.
         let proof = shard_fork_proof_same_round(
             &committee,
@@ -1814,10 +1842,43 @@ mod tests {
 
         ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
 
-        assert!(equivocation_jailed(&state, 1));
-        assert!(equivocation_jailed(&state, 2));
-        assert!(!equivocation_jailed(&state, 0), "signed only branch a");
-        assert!(!equivocation_jailed(&state, 3), "signed only branch b");
+        assert!(revoked(&state, 1));
+        assert!(revoked(&state, 2));
+        assert!(!revoked(&state, 0), "signed only branch a");
+        assert!(!revoked(&state, 3), "signed only branch b");
+    }
+
+    /// Seats sharing a pool with a double-signer are revoked with it —
+    /// the conviction cascade treats the pool as the operator.
+    #[test]
+    fn same_round_fork_convicts_pool_siblings_of_the_equivocators() {
+        use hyperscale_types::test_utils::shard_fork_proof_same_round;
+
+        let shard = ShardId::leaf(1, 0);
+        let committee = TestCommittee::new(4, 1);
+        // The default fixture keeps all four seats in one pool.
+        let mut state = state_with_shard_committee(&committee);
+        let proof = shard_fork_proof_same_round(
+            &committee,
+            shard,
+            BlockHeight::new(5),
+            &[0, 1, 2],
+            &[1, 2, 3],
+        );
+        let proposals = committed_with(shard, proof);
+
+        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+
+        for v in 0..4 {
+            assert!(
+                revoked(&state, v),
+                "pool sibling {v} revokes with the signers"
+            );
+        }
+        assert!(
+            state.pools[&StakePoolId::new(0)].conviction.is_some(),
+            "one conviction for the shared pool",
+        );
     }
 
     /// A round-spaced proof leaves no seat signing twice at one round, so it
@@ -1839,7 +1900,7 @@ mod tests {
             "still fences and re-draws"
         );
         for v in 0..4 {
-            assert!(!equivocation_jailed(&state, v));
+            assert!(!revoked(&state, v));
         }
     }
 
@@ -1871,7 +1932,7 @@ mod tests {
             "recovers regardless"
         );
         for v in 0..4 {
-            assert!(!equivocation_jailed(&state, v));
+            assert!(!revoked(&state, v));
         }
     }
 

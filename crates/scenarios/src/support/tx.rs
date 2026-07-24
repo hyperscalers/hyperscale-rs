@@ -556,6 +556,7 @@ pub fn build_reshape_threshold_vote_tx(
         proposal: Some(ParamProposal {
             params: NetworkParams {
                 reshape_thresholds: ReshapeThresholds { split_bytes },
+                ..NetworkParams::default()
             },
             activate_at,
         }),

@@ -88,6 +88,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                 total_stake: p.total_stake,
                 validators: per_pool_validators.remove(&p.id).unwrap_or_default(),
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
     }

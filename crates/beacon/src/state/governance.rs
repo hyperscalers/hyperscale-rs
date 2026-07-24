@@ -90,6 +90,7 @@ mod tests {
         ParamProposal {
             params: NetworkParams {
                 reshape_thresholds: ReshapeThresholds { split_bytes },
+                ..NetworkParams::default()
             },
             activate_at: Epoch::new(activate_at),
         }
@@ -107,6 +108,7 @@ mod tests {
                     total_stake: Stake::from_attos(stake),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
+                    conviction: None,
                 },
             );
         }

@@ -444,6 +444,7 @@ mod tests {
             proposal: Some(ParamProposal {
                 params: NetworkParams {
                     reshape_thresholds: ReshapeThresholds { split_bytes: 4_096 },
+                    ..NetworkParams::default()
                 },
                 activate_at: Epoch::new(9),
             }),

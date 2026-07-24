@@ -161,6 +161,7 @@ mod tests {
                 total_stake: Stake::from_attos(u128::from(n) * MIN_STAKE_FLOOR.attos()),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state

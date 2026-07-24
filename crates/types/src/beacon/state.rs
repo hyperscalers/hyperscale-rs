@@ -62,6 +62,25 @@ pub struct PendingWithdrawal {
     pub initiated_at_epoch: Epoch,
 }
 
+/// A pool-level byzantine conviction: equivocation evidence against any
+/// of the pool's validators convicts the whole pool, since one operator
+/// runs them all.
+///
+/// Set at most once and never cleared. A convicted pool is permanently
+/// retired from validation — registration, unjail, and reactivation all
+/// reject — and its withdrawals are impounded until `lifts_at`, after
+/// which the stake exits whole through the normal unbonding path. The
+/// punishment is the time-premium of the capital, never the capital.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct PoolConviction {
+    /// Epoch the convicting evidence folded.
+    pub convicted_at: Epoch,
+    /// First epoch withdrawals mature again — `convicted_at` plus the
+    /// `impound_epochs` governance parameter as it stood at conviction.
+    /// Later governance changes never shorten an in-force impound.
+    pub lifts_at: Epoch,
+}
+
 /// Aggregate stake-pool record.
 ///
 /// Delegator-level accounting lives in the staking contract on the
@@ -85,6 +104,10 @@ pub struct StakePool {
     pub validators: BTreeSet<ValidatorId>,
     /// Withdrawals waiting out the unbonding window.
     pub pending_withdrawals: Vec<PendingWithdrawal>,
+    /// The pool's byzantine conviction, if any. `Some` permanently
+    /// retires the pool from validation and impounds its stake until
+    /// the recorded lift epoch.
+    pub conviction: Option<PoolConviction>,
 }
 
 // ─── validator types ─────────────────────────────────────────────────────────
@@ -1701,6 +1724,7 @@ mod tests {
                 total_stake: Stake::from_attos(u128::from(n_active) * MIN_STAKE_FLOOR.attos()),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state
@@ -1906,6 +1930,7 @@ mod tests {
                     initiated_at_epoch: Epoch::new(2),
                 },
             ],
+            conviction: None,
         };
         assert_eq!(pool.effective_stake(), Stake::from_whole_tokens(650));
     }
@@ -1922,6 +1947,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(500),
                 initiated_at_epoch: Epoch::GENESIS,
             }],
+            conviction: None,
         };
         assert_eq!(pool.effective_stake(), Stake::ZERO);
     }
