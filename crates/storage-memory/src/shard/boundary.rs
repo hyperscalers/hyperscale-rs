@@ -147,7 +147,8 @@ impl BoundaryStore for SimShardStorage {
         }
 
         let root_path = state.tree_store.root_path();
-        let (root, result) = import_leaf_updates(&state.tree_store, &root_path, height, &leaves)?;
+        let (root, result) =
+            import_leaf_updates(&state.tree_store, &root_path, None, height.inner(), &leaves)?;
         for (key, node) in result.batch.new_nodes {
             state.tree_store.insert(key, Arc::new(node));
         }
