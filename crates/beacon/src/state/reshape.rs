@@ -1074,6 +1074,7 @@ mod tests {
                 total_stake: Stake::from_attos(count * MIN_STAKE_FLOOR.attos()),
                 validators,
                 pending_withdrawals: Vec::new(),
+                conviction: None,
             },
         );
         state

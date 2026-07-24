@@ -27,6 +27,7 @@
 //! - [`witness`]: shard-lift dispatch and equivocation re-verification.
 
 mod committee;
+mod conviction;
 mod epoch;
 mod governance;
 mod lifecycle;
