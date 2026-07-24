@@ -36,8 +36,8 @@ use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
-    ImportProgressEntry, TypedCf, batch_put, batch_put_raw, get, iter_all, meta_delete, meta_read,
-    meta_write,
+    ImportProgressEntry, TypedCf, batch_delete, batch_put, batch_put_raw, get, iter_all,
+    meta_delete, meta_read, meta_write,
 };
 
 /// Queue the staging CF's full range and the progress record for
@@ -46,6 +46,216 @@ use crate::typed_cf::{
 fn wipe_staging_into(batch: &mut WriteBatch, staging_cf: &ColumnFamily) {
     batch.delete_range_cf(staging_cf, &[][..], &[0xFF; 33][..]);
     meta_delete::<ImportProgressEntry>(batch);
+}
+
+/// Leaf-value weight applied per finalize batch: the JMT build for one
+/// batch holds its leaves in memory, so this bounds finalize peak memory
+/// independent of state size.
+const IMPORT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Fixed per-leaf weight component (keys, hashes, allocator overhead),
+/// so a run of tiny values still bounds a batch's leaf count.
+const IMPORT_LEAF_OVERHEAD: u64 = 64;
+
+/// The batching weight of one staged leaf.
+const fn leaf_weight(storage_key: &[u8], value: &[u8]) -> u64 {
+    IMPORT_LEAF_OVERHEAD + storage_key.len() as u64 + value.len() as u64
+}
+
+/// Walk the staged leaves with the greedy batch rule — close a batch
+/// once its accumulated weight reaches `limit` — returning the batch
+/// count (at least 1; an empty staging area is one empty batch) and the
+/// total staged weight. The apply pass repeats this exact walk, so the
+/// count fixes its version numbering.
+fn count_staged_batches(db: &DB, staging_cf: &ColumnFamily, limit: u64) -> (u64, u64) {
+    let mut batches = 0u64;
+    let mut batch_weight = 0u64;
+    let mut total_weight = 0u64;
+    for (_, (storage_key, value)) in iter_all::<ImportStagingCf>(db, staging_cf) {
+        let weight = leaf_weight(&storage_key, &value);
+        batch_weight += weight;
+        total_weight += weight;
+        if batch_weight >= limit {
+            batches += 1;
+            batch_weight = 0;
+        }
+    }
+    if batch_weight > 0 || batches == 0 {
+        batches += 1;
+    }
+    (batches, total_weight)
+}
+
+/// Seal the final import batch: the anchor window's witness payloads at
+/// their absolute leaf indices (exactly where a store that committed
+/// through the boundary would hold them — the accumulator rebuilds from
+/// this column on restart, and the beacon fold's witness fetches answer
+/// from it), the accumulated substate byte total (a fresh-tree import's
+/// byte delta IS the imported leaves' value bytes), the JMT metadata —
+/// the completion marker — and the staging wipe riding the same batch so
+/// a finalized store never carries staged bytes.
+fn seal_final_batch(
+    batch: &mut WriteBatch,
+    cf: &CfHandles<'_>,
+    height: BlockHeight,
+    witnesses: &WitnessSeed,
+    bytes_total: i64,
+    root: StateRoot,
+) -> Result<(), String> {
+    let witness_cf = BeaconWitnessesCf::handle(cf);
+    for (offset, payload) in witnesses.payloads.iter().enumerate() {
+        batch_put::<BeaconWitnessesCf>(
+            batch,
+            witness_cf,
+            &(witnesses.base.inner() + offset as u64),
+            payload,
+        );
+    }
+    let bytes = u64::try_from(bytes_total)
+        .map_err(|_| "snap-sync import produced a negative byte total".to_string())?;
+    batch_put::<SubstateBytesCf>(batch, SubstateBytesCf::handle(cf), &height.inner(), &bytes);
+    write_jmt_metadata(batch, height.inner(), root);
+    wipe_staging_into(batch, ImportStagingCf::handle(cf));
+    Ok(())
+}
+
+impl RocksDbShardStorage {
+    /// Build the staged boundary state in JMT batches of at most
+    /// `batch_limit` leaf weight, versions `height − K + 1 ..= height`
+    /// (K = batch count), each persisted as one `WriteBatch` chaining on
+    /// the previous batch's version. The final batch alone carries the
+    /// witness seed, the accumulated substate byte total, the JMT
+    /// metadata (the completion marker), and the staging wipe. When the
+    /// chain is shallower than the batch count the limit grows so
+    /// `K ≤ max(height, 1)`.
+    ///
+    /// `stop_after` truncates the build after that many batches with no
+    /// completion marker — the crash-mid-finalize shape the re-run
+    /// idempotence test exercises.
+    fn finalize_staged(
+        &self,
+        height: BlockHeight,
+        witnesses: &WitnessSeed,
+        batch_limit: u64,
+        stop_after: Option<u64>,
+    ) -> Result<StateRoot, String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        let (version, root) = self.read_jmt_metadata();
+        if version != 0 || root != StateRoot::ZERO {
+            return Err("snap-sync import requires an empty store".to_string());
+        }
+
+        let cf = CfHandles::resolve(&self.db);
+        let staging_cf = ImportStagingCf::handle(&cf);
+
+        let k_max = height.inner().max(1);
+        let (mut batches, total_weight) = count_staged_batches(&self.db, staging_cf, batch_limit);
+        let mut limit = batch_limit;
+        if batches > k_max {
+            // A chain shallower than the batch count: grow the batches
+            // to fit. With `limit ≥ ⌈total/k_max⌉` every closed batch
+            // carries at least `limit` weight, so at most `k_max`
+            // batches form.
+            limit = batch_limit.max(total_weight.div_ceil(k_max));
+            (batches, _) = count_staged_batches(&self.db, staging_cf, limit);
+            assert!(
+                batches <= k_max,
+                "grown batch limit must fit the chain height",
+            );
+        }
+
+        let mut parent: Option<u64> = None;
+        let mut batch_version = height.inner() + 1 - batches;
+        let mut applied = 0u64;
+        let mut bytes_total: i64 = 0;
+        let mut batch_leaves: Vec<ImportLeaf> = Vec::new();
+        let mut batch_weight = 0u64;
+
+        let mut pending = iter_all::<ImportStagingCf>(&self.db, staging_cf).peekable();
+        let imported_root = loop {
+            let leaf = pending.next();
+            if let Some((leaf_key, (storage_key, value))) = leaf {
+                batch_weight += leaf_weight(&storage_key, &value);
+                batch_leaves.push(ImportLeaf {
+                    leaf_key: *leaf_key.as_bytes(),
+                    storage_key,
+                    value,
+                });
+                if batch_weight < limit && pending.peek().is_some() {
+                    continue;
+                }
+            }
+            // Close the batch: on reaching the weight limit, on the final
+            // partial batch, or — for an empty staging area — as the one
+            // empty batch that still lands the metadata.
+            let is_final = pending.peek().is_none();
+            let (root, result) = {
+                let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
+                import_leaf_updates(
+                    &snapshot_store,
+                    &self.root_path,
+                    parent,
+                    batch_version,
+                    &batch_leaves,
+                )?
+            };
+
+            let mut batch = WriteBatch::default();
+            for (node_key, node) in &result.batch.new_nodes {
+                batch_put::<JmtNodesCf>(
+                    &mut batch,
+                    JmtNodesCf::handle(&cf),
+                    &StoredNodeKey::from_jmt(node_key),
+                    &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
+                );
+            }
+            // Boundary-path nodes superseded across batches are dead the
+            // moment this batch lands; deleting them here (instead of
+            // routing through GC) keeps a finalized store orphan-free.
+            for stale in &result.batch.stale_nodes {
+                batch_delete::<JmtNodesCf>(
+                    &mut batch,
+                    JmtNodesCf::handle(&cf),
+                    &StoredNodeKey::from_jmt(&stale.node_key),
+                );
+            }
+            let state_cf = StateCf::handle(&cf);
+            let assoc_cf = LeafAssociationsCf::handle(&cf);
+            for leaf in &batch_leaves {
+                // The raw storage key IS the state CF key encoding
+                // (`SubstateKeyCodec` is a raw concatenation).
+                batch.put_cf(state_cf, &leaf.storage_key, &leaf.value);
+                batch_put::<LeafAssociationsCf>(
+                    &mut batch,
+                    assoc_cf,
+                    &Hash::from_hash_bytes(&leaf.leaf_key),
+                    &leaf.storage_key,
+                );
+            }
+            bytes_total += result.batch.bytes_delta;
+
+            if is_final {
+                seal_final_batch(&mut batch, &cf, height, witnesses, bytes_total, root)?;
+            }
+
+            self.db
+                .write(batch)
+                .map_err(|e| format!("snap-sync import write: {e}"))?;
+
+            parent = Some(batch_version);
+            batch_version += 1;
+            applied += 1;
+            batch_leaves.clear();
+            batch_weight = 0;
+            if is_final || stop_after.is_some_and(|stop| applied >= stop) {
+                break root;
+            }
+        };
+        Ok(imported_root)
+    }
 }
 
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
@@ -299,85 +509,7 @@ impl BoundaryStore for RocksDbShardStorage {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
-        let _commit_guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| "commit lock poisoned".to_string())?;
-        let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
-            return Err("snap-sync import requires an empty store".to_string());
-        }
-
-        let cf = CfHandles::resolve(&self.db);
-        let staging_cf = ImportStagingCf::handle(&cf);
-        let leaves: Vec<ImportLeaf> = iter_all::<ImportStagingCf>(&self.db, staging_cf)
-            .map(|(leaf_key, (storage_key, value))| ImportLeaf {
-                leaf_key: *leaf_key.as_bytes(),
-                storage_key,
-                value,
-            })
-            .collect();
-
-        let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
-        let (imported_root, result) =
-            import_leaf_updates(&snapshot_store, &self.root_path, height, &leaves)?;
-
-        let mut batch = WriteBatch::default();
-        for (node_key, node) in &result.batch.new_nodes {
-            batch_put::<JmtNodesCf>(
-                &mut batch,
-                JmtNodesCf::handle(&cf),
-                &StoredNodeKey::from_jmt(node_key),
-                &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
-            );
-        }
-        let state_cf = StateCf::handle(&cf);
-        let assoc_cf = LeafAssociationsCf::handle(&cf);
-        for leaf in &leaves {
-            // The raw storage key IS the state CF key encoding
-            // (`SubstateKeyCodec` is a raw concatenation).
-            batch.put_cf(state_cf, &leaf.storage_key, &leaf.value);
-            batch_put::<LeafAssociationsCf>(
-                &mut batch,
-                assoc_cf,
-                &Hash::from_hash_bytes(&leaf.leaf_key),
-                &leaf.storage_key,
-            );
-        }
-        // Seed the anchor window's witness payloads at their absolute leaf
-        // indices, exactly where a store that committed through the
-        // boundary would hold them: the accumulator rebuilds from this
-        // column on restart, and the beacon fold's witness fetches answer
-        // from it.
-        let witness_cf = BeaconWitnessesCf::handle(&cf);
-        for (offset, payload) in witnesses.payloads.iter().enumerate() {
-            batch_put::<BeaconWitnessesCf>(
-                &mut batch,
-                witness_cf,
-                &(witnesses.base.inner() + offset as u64),
-                payload,
-            );
-        }
-        // Seed the substate byte total: a fresh-tree import's byte delta IS
-        // the imported leaves' value bytes.
-        let bytes = u64::try_from(result.batch.bytes_delta)
-            .map_err(|_| "snap-sync import produced a negative byte total".to_string())?;
-        batch_put::<SubstateBytesCf>(
-            &mut batch,
-            SubstateBytesCf::handle(&cf),
-            &height.inner(),
-            &bytes,
-        );
-        write_jmt_metadata(&mut batch, height.inner(), imported_root);
-        // The metadata write is the completion marker; the staging
-        // range-delete rides the same batch so a finalized store never
-        // carries staged bytes.
-        wipe_staging_into(&mut batch, staging_cf);
-
-        self.db
-            .write(batch)
-            .map_err(|e| format!("snap-sync import write: {e}"))?;
-        Ok(imported_root)
+        self.finalize_staged(height, &witnesses, IMPORT_BATCH_BYTES, None)
     }
 
     fn follow_block_writes(
@@ -482,6 +614,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::shard::column_families::{
+        IMPORT_STAGING_CF, JMT_NODES_CF, LEAF_ASSOCIATIONS_CF, STATE_CF,
+    };
 
     type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -688,6 +823,189 @@ mod tests {
             .finalize_boundary_import(BlockHeight::new(3), WitnessSeed::default())
             .unwrap();
         assert_eq!(root, StateRoot::ZERO);
+    }
+
+    /// Deterministic pseudorandom import leaves with distinct keys and
+    /// varied value lengths.
+    fn random_leaves(n: usize, seed: u64) -> Vec<ImportLeaf> {
+        let mut state = seed.max(1);
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut by_key: std::collections::BTreeMap<[u8; 32], ImportLeaf> =
+            std::collections::BTreeMap::new();
+        while by_key.len() < n {
+            let mut key = [0u8; 32];
+            for chunk in key.chunks_mut(8) {
+                chunk.copy_from_slice(&next().to_be_bytes());
+            }
+            #[allow(clippy::cast_possible_truncation)] // deliberate low-byte take
+            let value: Vec<u8> = (0..=next() % 200).map(|_| next() as u8).collect();
+            by_key.insert(
+                key,
+                ImportLeaf {
+                    leaf_key: key,
+                    storage_key: key.to_vec(),
+                    value,
+                },
+            );
+        }
+        by_key.into_values().collect()
+    }
+
+    /// Stage `leaves` in fixed-size chunks under a completed progress
+    /// record.
+    fn stage_in_chunks(storage: &RocksDbShardStorage, height: BlockHeight, leaves: &[ImportLeaf]) {
+        let bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
+        let progress = completed_import_progress(height, bytes);
+        for chunk in leaves.chunks(37) {
+            storage.stage_import_chunk(&progress, chunk).unwrap();
+        }
+    }
+
+    /// Raw entry count of a column family.
+    fn count_cf_entries(storage: &RocksDbShardStorage, name: &str) -> usize {
+        let cf = storage.db.cf_handle(name).expect("cf exists");
+        let mut iter = storage.db.raw_iterator_cf(cf);
+        iter.seek_to_first();
+        let mut count = 0;
+        while iter.valid() {
+            count += 1;
+            iter.next();
+        }
+        count
+    }
+
+    /// The chunked build converges to the single-shot build exactly:
+    /// same root, same metadata, same byte total, and the same stored
+    /// node count — a missed cross-batch stale deletion would leave the
+    /// batched store with orphan nodes and a higher count.
+    #[test]
+    fn batched_finalize_matches_the_single_shot_build() {
+        let leaves = random_leaves(300, 7);
+        let height = BlockHeight::new(200);
+        let value_bytes: u64 = leaves.iter().map(|l| l.value.len() as u64).sum();
+
+        let one_shot_dir = TempDir::new().unwrap();
+        let one_shot = open_storage(one_shot_dir.path());
+        stage_in_chunks(&one_shot, height, &leaves);
+        let expected = one_shot
+            .finalize_boundary_import(height, WitnessSeed::default())
+            .unwrap();
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = open_storage(batched_dir.path());
+        stage_in_chunks(&batched, height, &leaves);
+        let root = batched
+            .finalize_staged(height, &WitnessSeed::default(), 512, None)
+            .unwrap();
+
+        assert_eq!(root, expected);
+        assert_eq!(batched.read_jmt_metadata(), (200, expected));
+        assert_eq!(batched.substate_bytes_at_version(200), Some(value_bytes));
+        assert_eq!(batched.read_import_progress(), None);
+        for cf in [
+            JMT_NODES_CF,
+            STATE_CF,
+            LEAF_ASSOCIATIONS_CF,
+            IMPORT_STAGING_CF,
+        ] {
+            assert_eq!(
+                count_cf_entries(&batched, cf),
+                count_cf_entries(&one_shot, cf),
+                "column family {cf} diverged between the batched and single-shot builds",
+            );
+        }
+    }
+
+    /// A finalize interrupted at a batch boundary re-runs to the
+    /// identical root and node set: the metadata marker never landed, so
+    /// the re-run deterministically overwrites the partial build.
+    #[test]
+    fn interrupted_finalize_reruns_to_the_identical_root() {
+        let leaves = random_leaves(200, 11);
+        let height = BlockHeight::new(150);
+
+        let reference_dir = TempDir::new().unwrap();
+        let reference = open_storage(reference_dir.path());
+        stage_in_chunks(&reference, height, &leaves);
+        let expected = reference
+            .finalize_staged(height, &WitnessSeed::default(), 512, None)
+            .unwrap();
+
+        let interrupted_dir = TempDir::new().unwrap();
+        let interrupted = open_storage(interrupted_dir.path());
+        stage_in_chunks(&interrupted, height, &leaves);
+        let partial = interrupted
+            .finalize_staged(height, &WitnessSeed::default(), 512, Some(2))
+            .unwrap();
+        assert_ne!(partial, expected);
+        // No completion marker, staging intact: the store still reads as
+        // an un-imported bootstrap target.
+        assert_eq!(interrupted.read_jmt_metadata(), (0, StateRoot::ZERO));
+        assert!(interrupted.read_import_progress().is_some());
+
+        let root = interrupted
+            .finalize_staged(height, &WitnessSeed::default(), 512, None)
+            .unwrap();
+        assert_eq!(root, expected);
+        assert_eq!(interrupted.read_jmt_metadata(), (150, expected));
+        for cf in [JMT_NODES_CF, STATE_CF, LEAF_ASSOCIATIONS_CF] {
+            assert_eq!(
+                count_cf_entries(&interrupted, cf),
+                count_cf_entries(&reference, cf),
+                "column family {cf} diverged after the interrupted re-run",
+            );
+        }
+    }
+
+    /// A chain shallower than the batch count grows the batches so the
+    /// version chain fits under the anchor height.
+    #[test]
+    fn shallow_chain_grows_batches_to_fit_the_height() {
+        let leaves = random_leaves(50, 13);
+        let height = BlockHeight::new(2);
+
+        let one_shot_dir = TempDir::new().unwrap();
+        let one_shot = open_storage(one_shot_dir.path());
+        stage_in_chunks(&one_shot, height, &leaves);
+        let expected = one_shot
+            .finalize_boundary_import(height, WitnessSeed::default())
+            .unwrap();
+
+        let shallow_dir = TempDir::new().unwrap();
+        let shallow = open_storage(shallow_dir.path());
+        stage_in_chunks(&shallow, height, &leaves);
+        // A 64-byte limit would form ~50 batches; the height admits 2.
+        let root = shallow
+            .finalize_staged(height, &WitnessSeed::default(), 64, None)
+            .unwrap();
+        assert_eq!(root, expected);
+        assert_eq!(shallow.read_jmt_metadata(), (2, expected));
+    }
+
+    /// GC over a batched import is a no-op: the finalize deletes
+    /// superseded nodes inline and records nothing for the collector, so
+    /// the version chain below the anchor survives intact.
+    #[test]
+    fn gc_leaves_a_batched_import_intact() {
+        let leaves = random_leaves(120, 17);
+        let height = BlockHeight::new(100);
+        let storage_dir = TempDir::new().unwrap();
+        let storage = open_storage(storage_dir.path());
+        stage_in_chunks(&storage, height, &leaves);
+        let root = storage
+            .finalize_staged(height, &WitnessSeed::default(), 512, None)
+            .unwrap();
+        let nodes = count_cf_entries(&storage, JMT_NODES_CF);
+
+        assert_eq!(storage.run_jmt_gc(), 0);
+        assert_eq!(storage.run_state_history_gc(), 0);
+        assert_eq!(storage.read_jmt_metadata(), (100, root));
+        assert_eq!(count_cf_entries(&storage, JMT_NODES_CF), nodes);
     }
 
     /// Staging into a store that already holds state is rejected — the

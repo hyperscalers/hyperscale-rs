@@ -116,14 +116,18 @@ pub fn state_root_from_jmt(root_hash: [u8; 32]) -> StateRoot {
     }
 }
 
-/// Rebuild a JMT at `height` from snap-synced import leaves.
+/// Apply one batch of snap-synced import leaves to the JMT at
+/// `version`, on top of `parent_version` (`None` for the first batch of
+/// an import into an empty store).
 ///
 /// The shipped leaf keys are already owner-prefixed, so the tree is
 /// rebuilt from them directly instead of re-deriving through
 /// [`put_at_version`], which would need the owner map. The caller
 /// persists the result's node batch plus whatever raw-pair and
-/// leaf-association records its backend keeps, and stores the returned
-/// root as the imported state root.
+/// leaf-association records its backend keeps; a single-batch import
+/// stores the returned root as the imported state root, a chunked one
+/// chains batches through `parent_version` and keeps only the final
+/// root.
 ///
 /// # Errors
 ///
@@ -131,7 +135,8 @@ pub fn state_root_from_jmt(root_hash: [u8; 32]) -> StateRoot {
 pub fn import_leaf_updates<S: TreeReader>(
     store: &S,
     root_path: &NibblePath,
-    height: BlockHeight,
+    parent_version: Option<u64>,
+    version: u64,
     leaves: &[ImportLeaf],
 ) -> Result<(StateRoot, UpdateResult), String> {
     let updates: BTreeMap<Key, Option<LeafValue>> = leaves
@@ -144,7 +149,7 @@ pub fn import_leaf_updates<S: TreeReader>(
             )
         })
         .collect();
-    let result = Jmt::apply_updates_at(store, None, height.inner(), root_path, &updates)
+    let result = Jmt::apply_updates_at(store, parent_version, version, root_path, &updates)
         .map_err(|e| format!("snap-sync JMT import: {e}"))?;
     Ok((state_root_from_jmt(result.root_hash), result))
 }
