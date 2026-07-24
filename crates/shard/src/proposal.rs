@@ -21,8 +21,8 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, FinalizedWave, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, Round,
-    RoutableTransaction, ShardId, ShardVoteEquivocation, TopologySnapshot, TxHash, ValidatorId,
-    Verifiable, Verified, WaveId, WeightedTimestamp,
+    RoutableTransaction, ShardId, TopologySnapshot, TxHash, ValidatorId, Verifiable, Verified,
+    WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -312,7 +312,6 @@ pub fn assemble_build_action(
     now: LocalTimestamp,
     kind: ProposalKind,
     ready_signals: Vec<ReadySignal>,
-    equivocations: Vec<ShardVoteEquivocation>,
     reshape_trigger: Option<ReshapeTrigger>,
     parent_witness_leaves: Vec<Hash>,
     beacon_witness_base: BeaconWitnessLeafCount,
@@ -394,7 +393,6 @@ pub fn assemble_build_action(
         parent_in_flight,
         finalized_tx_count,
         ready_signals,
-        equivocations,
         reshape_trigger,
         parent_witness_leaves,
         beacon_witness_base,

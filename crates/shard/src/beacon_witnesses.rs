@@ -472,12 +472,7 @@ mod tests {
 
         // Validator 2 holds an observer seat: its signal classifies as
         // `ReshapeReady` in the same ascending-id position.
-        let sources = WitnessSources::new(
-            ready,
-            Vec::new(),
-            Some(ReshapeTrigger::Split),
-            VrfProof::ZERO,
-        );
+        let sources = WitnessSources::new(ready, Some(ReshapeTrigger::Split), VrfProof::ZERO);
         let leaves = derive_leaves(
             ShardId::ROOT,
             &topology_with_observer(2),
@@ -528,7 +523,7 @@ mod tests {
         let ready = ready_signals(&[7, 2]);
         let receipts: Vec<StoredReceipt> = Vec::new();
 
-        let sources = WitnessSources::new(ready, Vec::new(), None, VrfProof::ZERO);
+        let sources = WitnessSources::new(ready, None, VrfProof::ZERO);
         let a = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
         let b = derive_leaves(ShardId::ROOT, &topo, &receipts, &missed, &sources);
         assert_eq!(a, b);

@@ -11,10 +11,10 @@ use crate::state::pool::exit_placement;
 /// [`exit_placement`]'s shared cleanup (drop from the shard committee +
 /// pool refill if `OnShard`; clear miss counters). Other statuses
 /// (`Pooled`, fault-cause `Jailed`) flip in place with no committee
-/// change. Already-`InsufficientStake` and already-permanent
-/// `Jailed { Equivocation }` callers should not invoke this — there's
-/// no transition to make. Callers gate on those cases at the variant
-/// dispatch level (see `DeactivateValidator`).
+/// change. Already-`InsufficientStake` and `Revoked` callers should
+/// not invoke this — there's no transition to make. Callers gate on
+/// those cases at the variant dispatch level (see
+/// `DeactivateValidator`).
 pub(super) fn deactivate_to_insufficient_stake(state: &mut BeaconState, victim_id: ValidatorId) {
     let Some(rec) = state.validators.get_mut(&victim_id) else {
         return;

@@ -333,10 +333,6 @@ impl CoordinatorSim {
             .extend(equivocations);
     }
 
-    /// Splice shard double-vote pairs into the next
-    /// `BuildAndBroadcastBeaconProposal` at `epoch` — the harness stand-in
-    /// for a pair arriving over gossip and sitting in a member's
-    /// observation buffer. Drained on first fire.
     /// The signing key of the replica at `idx` — lets tests forge
     /// genuine double-signs from a registered validator's own key.
     #[must_use]
@@ -344,6 +340,10 @@ impl CoordinatorSim {
         &self.sks[idx]
     }
 
+    /// Splice shard double-vote pairs into the next
+    /// `BuildAndBroadcastBeaconProposal` at `epoch` — the harness stand-in
+    /// for a pair arriving over gossip and sitting in a member's
+    /// observation buffer. Drained on first fire.
     pub fn inject_vote_equivocations(
         &mut self,
         epoch: Epoch,
