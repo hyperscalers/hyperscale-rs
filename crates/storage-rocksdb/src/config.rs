@@ -74,8 +74,8 @@ pub struct RocksDbConfig {
     /// Serving retention must cover the join budget: a joiner syncing a
     /// large shard needs its target boundary pinned at the serving
     /// peers for the whole assembly, so the validator sets this to the
-    /// genesis `ready_timeout_epochs` — deliberately not an operator
-    /// knob, since lowering it starves long joins. Hard-link
+    /// chain-derived `boundary_retention_epochs` — deliberately not an
+    /// operator knob, since lowering it starves long joins. Hard-link
     /// checkpoints pin superseded SSTs, so the disk overhead scales
     /// with churn across the window, not with state size.
     ///

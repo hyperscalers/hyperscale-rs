@@ -125,6 +125,22 @@ impl BeaconChainConfig {
             .div_ceil(shard_size);
         if interval == 0 { 1 } else { interval }
     }
+
+    /// Boundary checkpoints a serving store retains, derived rather than
+    /// stored: `ready_timeout_epochs + 2`.
+    ///
+    /// A joiner's whole ready budget must fit inside the serving window
+    /// of the boundary it syncs against, and retaining exactly the
+    /// budget falls short twice over: the anchor a joiner selects at
+    /// placement is typically attested one epoch behind (its boundary QC
+    /// rides a later beacon block), and a retention ring that evicts at
+    /// exactly the deadline leaves zero slack for the join that consumes
+    /// its full budget. One extra epoch absorbs the attestation lag; the
+    /// other keeps the anchor serving through the deadline itself.
+    #[must_use]
+    pub const fn boundary_retention_epochs(&self) -> u64 {
+        self.ready_timeout_epochs + 2
+    }
 }
 
 impl Default for BeaconChainConfig {
@@ -328,6 +344,18 @@ mod tests {
         // Degenerate sizes clamp rather than divide by zero or stall.
         assert_eq!(at(0, 8), 64);
         assert_eq!(at(4, 0), 1);
+    }
+
+    /// Serving retention outlives the ready budget: one epoch for the
+    /// attestation lag of the anchor a joiner selects, one so eviction
+    /// never lands exactly on the deadline.
+    #[test]
+    fn boundary_retention_outlives_the_ready_budget() {
+        let production = BeaconChainConfig::production();
+        assert_eq!(
+            production.boundary_retention_epochs(),
+            production.ready_timeout_epochs + 2,
+        );
     }
 
     fn net() -> NetworkDefinition {
