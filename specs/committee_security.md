@@ -133,7 +133,7 @@ n=32 to n=256 (8× the seats, and the message-complexity price that implies)
 only moves tolerable corruption from 3% to 17% at the 10⁻⁶ budget. With the
 practical ceiling at 128, the pool must stay under ~12% corrupt seats — under
 ~10% if 96 is the operating point. Every mechanism that suppresses pool
-corruption (the stake price, jailing, expulsion, the sybil floor) buys more
+corruption (the stake price, jailing, conviction, the sybil floor) buys more
 security per unit than seats do; committee size is the dial, pool hygiene is
 the lever, and the ceiling on n turns "keep β low" from advice into a
 requirement.
@@ -331,7 +331,7 @@ without re-derivation.
 **Rider 2 — β ≲ 0.12 is load-bearing**: at the derived operating interval
 the 10⁻⁶ budget dies at β = 0.123, five points of β cost four orders of
 magnitude, and nothing on the candidate grid rescues β ≥ 0.2 — pool hygiene
-(pricing, jailing, expulsion) is where the security actually lives. (The
+(pricing, jailing, conviction) is where the security actually lives. (The
 beacon committee's own compromise rate is a severity question, not a fork
 line — §1, §10.5.)
 
@@ -395,12 +395,16 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   operators and infrastructure is an operational premise the protocol cannot
   verify, the identity-only-selection fault-domain gap already noted at
   [06 §4](../docs/06-resource-economics.md). Accountability does not price this out:
-  there is no slashing anywhere — a jailed validator's stake is preserved and
-  withdrawable (INV-SEC-3 jails; it does not confiscate), so provable
-  equivocation — a beacon ballot or a shard double-vote — revokes the *key*
-  (permanent jail, no unjail) but not the capital, which redeploys under a
-  fresh identity (docs/05 §3). That is
-  a re-registration tax, not a bribe floor. So the defense against a bribed
+  there is no slashing anywhere — principal is preserved (INV-SEC-3
+  convicts; it does not confiscate), but provable equivocation — a beacon
+  ballot or a shard double-vote — convicts the signer's whole *pool*: every
+  key it operates permanently revoked, the pool retired, and its stake
+  impounded for a governed span before it exits whole (docs/05 §3). That
+  prices a floor of the capital's time-premium per caught pool — a bribe
+  must cover it — though an adversary structured one seat per pool pays it
+  per conviction and redeploys fresh capital freely, so it is a rental
+  floor, not a burn; re-pricing this floor into the corruption march below
+  is pending. So the defense against a bribed
   or hacked committee is structural, not economic: quorum intersection
   forces any fork through self-proving double-signed votes (INV-SHARD-1's
   mechanism, INV-STATE-5 halt-loudly), biasing a safety attack toward a loud
@@ -532,8 +536,8 @@ double-signed votes in each of two consecutive rounds: the honest locks
 force the attack through self-proving equivocation — biasing it toward the
 halt above — but do not preclude the double-commit. Those double-votes are
 prosecuted: a replica holding both assembles self-proving evidence that
-rides a `VoteEquivocation` witness leaf to the beacon and permanently
-revokes the key (docs/05 §3) — best-effort, since an equivocator splitting
+rides self-authenticating global gossip to the beacon's proposal lane and
+permanently convicts the signer's pool (docs/05 §3) — best-effort, since an equivocator splitting
 its votes across separate collectors leaves no single replica with the
 pair. What nothing flags is the *fork itself*: the §10.6 trigger watches
 for a *quiet* watermark an actively forking shard never shows, and the
