@@ -188,6 +188,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::new([seed; VRF_PROOF_BYTES]),
         )
     }

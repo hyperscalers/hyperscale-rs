@@ -24,8 +24,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
     BoundedVec, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ElidedCertifiedBlock,
     Epoch, HeaderFetchCount, LeafIndex, MAX_FINALIZED_TX_PER_BLOCK, ProvisionHash,
-    RoutableTransaction, ShardForkProof, ShardId, TxHash, ValidatorId, Verifiable, Verified,
-    WaveId,
+    RoutableTransaction, ShardForkProof, ShardId, ShardVoteEquivocation, TxHash, ValidatorId,
+    Verifiable, Verified, WaveId,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -360,6 +360,11 @@ pub enum ShardScopedInput {
         /// The fork evidence off the wire.
         proof: Arc<ShardForkProof>,
     },
+    /// A shard double-vote pair arrived over global gossip.
+    ShardVoteEquivocationGossipReceived {
+        /// The self-proving pair off the wire.
+        evidence: Arc<ShardVoteEquivocation>,
+    },
 
     /// A provision fetch request failed (network error or peer returned None).
     /// The envelope shard is the consumer (target) shard whose cross-shard
@@ -479,7 +484,8 @@ impl ShardScopedInput {
                 EventPriority::Network
             }
             Self::CommittedBlockGossipReceived { .. }
-            | Self::ShardForkProofGossipReceived { .. } => EventPriority::Network,
+            | Self::ShardForkProofGossipReceived { .. }
+            | Self::ShardVoteEquivocationGossipReceived { .. } => EventPriority::Network,
             Self::AdmitTransaction { .. }
             | Self::AdmitAndGossipTransaction { .. }
             | Self::GossipTransaction { .. } => EventPriority::Client,

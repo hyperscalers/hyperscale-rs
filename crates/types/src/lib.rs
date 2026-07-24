@@ -128,7 +128,7 @@ pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyErr
 pub use shard::chain_origin::ChainOrigin;
 pub use shard::evidence::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
-    ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation,
+    ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
 };
 pub use shard::fork_fence::ForkFence;

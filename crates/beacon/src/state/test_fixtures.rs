@@ -14,9 +14,9 @@ use hyperscale_types::{
     Bls12381G2Signature, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
     MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake,
-    StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord,
-    ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
+    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
+    SlotEffects, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId,
+    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
     compute_merkle_root_with_proof, validator_possession_proof_sign, vrf_sign, zero_bls_signature,
 };
 
@@ -47,7 +47,13 @@ pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
 pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let sk = keypair(id);
     let proof = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(BTreeMap::new(), Vec::new(), BTreeMap::new(), proof)
+    BeaconProposal::new(
+        BTreeMap::new(),
+        Vec::new(),
+        BTreeMap::new(),
+        Vec::new(),
+        proof,
+    )
 }
 
 /// Build a `BeaconProposal` whose VRF proof has been tampered with so
@@ -61,6 +67,7 @@ pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
         BTreeMap::new(),
         Vec::new(),
         BTreeMap::new(),
+        Vec::new(),
         VrfProof::new(bytes),
     )
 }
@@ -162,7 +169,31 @@ pub fn vrf_proposal_with_equivocations(
 ) -> BeaconProposal {
     let sk = keypair(id);
     let proof = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(BTreeMap::new(), equivocations, BTreeMap::new(), proof)
+    BeaconProposal::new(
+        BTreeMap::new(),
+        equivocations,
+        BTreeMap::new(),
+        Vec::new(),
+        proof,
+    )
+}
+
+/// Build a valid `BeaconProposal` carrying shard double-vote pairs on
+/// the gossip-fed lane.
+pub fn vrf_proposal_with_vote_equivocations(
+    id: u64,
+    epoch: Epoch,
+    vote_equivocations: Vec<ShardVoteEquivocation>,
+) -> BeaconProposal {
+    let sk = keypair(id);
+    let proof = vrf_sign(&sk, &net(), epoch);
+    BeaconProposal::new(
+        BTreeMap::new(),
+        Vec::new(),
+        BTreeMap::new(),
+        vote_equivocations,
+        proof,
+    )
 }
 
 /// Build shard `shard_n`'s boundary block `B` and the witness chunk
@@ -272,6 +303,7 @@ pub fn apply_witness_chunk(
                     boundary_qcs.clone(),
                     Vec::new(),
                     BTreeMap::new(),
+                    Vec::new(),
                     vrf_sign(&keypair(id.inner()), &net(), next_epoch),
                 ),
             )

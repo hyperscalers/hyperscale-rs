@@ -34,10 +34,11 @@ use hyperscale_types::{
     PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
     RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteRecord,
     RatifyVoteVerifyError, RecoveryCause, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT,
-    ShardCommittee, ShardForkProof, ShardId, ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, TopologySchedule, TopologySnapshot, ValidatorId,
-    ValidatorStatus, Verifiable, Verified, Verify, WeightedTimestamp,
+    ShardCommittee, ShardForkProof, ShardId, ShardVoteEquivocation, ShardVoteEquivocationContext,
+    ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -51,6 +52,7 @@ use crate::spc::SpcEffect;
 use crate::spc_driver::SpcDriver;
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
+use crate::vote_equivocation_observations::VoteEquivocationObservations;
 use crate::{boundary, rules};
 
 /// How many times the view-1 input dwell re-arms while waiting for full
@@ -210,6 +212,10 @@ pub struct BeaconCoordinator {
     /// detection; drained into the next proposal so the fold can stamp a
     /// fork-caused `ShardRecovery`.
     fork_proofs: ForkProofObservations,
+    /// Locally verified shard double-vote pairs awaiting a proposal
+    /// slot — the gossip-fed recovery lane for evidence whose holders
+    /// left the source committee.
+    vote_equivocations_observed: VoteEquivocationObservations,
 
     /// Per-epoch cache of committee members' `BeaconProposal`s.
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
@@ -379,6 +385,7 @@ impl BeaconCoordinator {
             pending_candidate: None,
             equivocations: EquivocationObservations::new(),
             fork_proofs: ForkProofObservations::new(),
+            vote_equivocations_observed: VoteEquivocationObservations::new(),
             proposal_pool: BeaconProposalPool::new(latest_epoch.next()),
             evaluated_proposers: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
@@ -920,6 +927,14 @@ impl BeaconCoordinator {
                 );
                 return Vec::new();
             };
+            let Some(upgraded) = self.upgrade_proposal_vote_equivocations(&upgraded) else {
+                trace!(
+                    ?from,
+                    epoch = epoch.inner(),
+                    "BeaconProposalReceived carries an unverifiable double-vote pair — dropping",
+                );
+                return Vec::new();
+            };
             if !boundary::proposal_boundary_qcs_admissible(
                 &upgraded,
                 &self.state,
@@ -1002,6 +1017,32 @@ impl BeaconCoordinator {
             .ok()
     }
 
+    /// Marker-upgrade every shard double-vote pair in `proposal`, or
+    /// `None` if any entry names an unregistered validator or fails
+    /// signature verification under the registered key. The registry
+    /// resolves ex-members and revoked keys alike, so evidence about a
+    /// rotated-out signer still admits.
+    fn upgrade_proposal_vote_equivocations(
+        &self,
+        proposal: &Verified<BeaconProposal>,
+    ) -> Option<Verified<BeaconProposal>> {
+        let mut vote_equivocations = Vec::with_capacity(proposal.vote_equivocations().len());
+        for ev in proposal.vote_equivocations().iter() {
+            let rec = self.state.validators.get(&ev.validator)?;
+            let mut ev = ev.clone();
+            ev.upgrade_in_place(&ShardVoteEquivocationContext {
+                network: &self.network,
+                pubkey: &rec.pubkey,
+            })
+            .ok()?;
+            vote_equivocations.push(ev);
+        }
+        proposal
+            .clone()
+            .with_verified_vote_equivocations(vote_equivocations.into())
+            .ok()
+    }
+
     /// Every fork proof in `proposal` verifies against the local topology
     /// schedule and sits under its own shard's map key. A proof
     /// self-authenticates (each side carries the accused committee's
@@ -1079,11 +1120,13 @@ impl BeaconCoordinator {
         let boundary_qcs = boundary::source_boundary_qcs(&self.state, &self.shard_source);
         let equivocations = self.drain_equivocations_for();
         let fork_proofs = self.fork_proofs.drain_for_proposal();
+        let vote_equivocations = self.drain_vote_equivocations_for();
         vec![Action::BuildAndBroadcastBeaconProposal {
             epoch,
             boundary_qcs,
             equivocations,
             fork_proofs,
+            vote_equivocations,
             recipients,
         }]
     }
@@ -1095,6 +1138,33 @@ impl BeaconCoordinator {
     /// already-buffered shard is dropped.
     pub fn observe_fork_proof(&mut self, proof: ShardForkProof) {
         self.fork_proofs.observe(proof);
+    }
+
+    /// Buffer a verified shard double-vote pair so the next proposal
+    /// carries it into the fold. Verified by the shard layer (vote-keeper
+    /// detection, or checked off-thread on gossip receipt); first-wins
+    /// per accused validator.
+    pub fn observe_vote_equivocation(&mut self, evidence: ShardVoteEquivocation) -> bool {
+        self.vote_equivocations_observed.record(evidence)
+    }
+
+    /// The registered pubkey for `validator`, from the fold's permanent
+    /// registry. Resolves ex-members and revoked keys alike — exactly
+    /// what double-vote evidence about a rotated-out signer needs.
+    #[must_use]
+    pub fn validator_pubkey(&self, validator: ValidatorId) -> Option<Bls12381G1PublicKey> {
+        self.state.validators.get(&validator).map(|r| r.pubkey)
+    }
+
+    /// Drain observed shard double-vote pairs for the next proposal,
+    /// capped like the PC lane; overflow is re-recorded for a future
+    /// epoch's drain rather than dropped.
+    fn drain_vote_equivocations_for(&mut self) -> Vec<ShardVoteEquivocation> {
+        let mut pairs = self.vote_equivocations_observed.drain_for_proposal();
+        for overflow in pairs.split_off(pairs.len().min(MAX_EQUIVOCATIONS_PER_PROPOSER)) {
+            self.vote_equivocations_observed.record(overflow);
+        }
+        pairs
     }
 
     /// Drain observed equivocations for the next proposal, capped at
@@ -1844,6 +1914,12 @@ impl BeaconCoordinator {
     fn prune_folded_evidence(&mut self) {
         let validators = &self.state.validators;
         self.equivocations.prune(|v| {
+            matches!(
+                validators.get(&v).map(|r| r.status),
+                Some(ValidatorStatus::Revoked { .. })
+            )
+        });
+        self.vote_equivocations_observed.prune(|v| {
             matches!(
                 validators.get(&v).map(|r| r.status),
                 Some(ValidatorStatus::Revoked { .. })
@@ -2840,6 +2916,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         )
     }
@@ -3627,6 +3704,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             fork_proofs,
+            Vec::new(),
             VrfProof::ZERO,
         )));
 
@@ -3690,6 +3768,7 @@ mod tests {
                 BTreeMap::new(),
                 Vec::new(),
                 fork_proofs,
+                Vec::new(),
                 VrfProof::ZERO,
             )))
         };
@@ -3756,6 +3835,7 @@ mod tests {
                 boundary_qcs,
                 equivocations,
                 fork_proofs,
+                vote_equivocations: _,
                 recipients,
             },
         ] = actions.as_slice()
@@ -4061,6 +4141,7 @@ mod tests {
             std::iter::once((ShardId::ROOT, None)).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let mut elements = vec![PcValueElement::BOTTOM; n];

@@ -28,3 +28,4 @@ pub mod spc;
 pub mod spc_driver;
 pub mod state;
 pub mod verification;
+pub mod vote_equivocation_observations;

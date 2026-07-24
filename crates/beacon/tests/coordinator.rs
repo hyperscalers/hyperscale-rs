@@ -13,10 +13,11 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, Bls12381G2Signature,
-    CandidateBeaconBlock, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
-    PcVoteEquivocation, PcVoteRound, PcXpProof, ShardId, SignerBitfield, SpcCert, SpcView,
-    StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verified, VrfProof, zero_bls_signature,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash, BlockHeight,
+    Bls12381G2Signature, CandidateBeaconBlock, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths,
+    PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof, Round, ShardId,
+    ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView, StakePoolId, StateRoot, ValidatorId,
+    ValidatorStatus, Verified, VrfProof, zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -545,6 +546,116 @@ fn forged_equivocation_witness_cannot_jail_or_fork() {
     }
 }
 
+/// A genuine shard double-vote pair rides the gossip-fed proposal lane
+/// through a real SPC commit: every replica's fold convicts the
+/// signer's pool and revokes the key, and all replicas converge. The
+/// accused validator holds no committee seat anywhere in the sim — this
+/// is the ex-member evidence path end to end.
+#[test]
+fn gossiped_vote_equivocation_convicts_through_a_committed_proposal() {
+    use hyperscale_types::{BlockVote, NetworkDefinition, ProposerTimestamp};
+
+    let mut sim = CoordinatorSim::new(4, 0xE41D);
+    let accused_idx = 2;
+    let accused = ValidatorId::new(accused_idx as u64);
+    let shard = ShardId::leaf(1, 0);
+    let (height, round) = (BlockHeight::new(5), Round::new(2));
+    let sign = |blk: &[u8], parent: &[u8]| {
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(blk));
+        let parent_hash = BlockHash::from_raw(Hash::from_bytes(parent));
+        let vote = BlockVote::new(
+            &NetworkDefinition::simulator(),
+            block_hash,
+            parent_hash,
+            shard,
+            height,
+            round,
+            accused,
+            sim.sk_of(accused_idx),
+            ProposerTimestamp::ZERO,
+        );
+        (block_hash, parent_hash, vote.signature())
+    };
+    let (block_hash_a, parent_block_hash_a, sig_a) = sign(b"branch-a", b"parent-a");
+    let (block_hash_b, parent_block_hash_b, sig_b) = sign(b"branch-b", b"parent-b");
+    let pair = ShardVoteEquivocation {
+        validator: accused,
+        shard,
+        height,
+        round,
+        block_hash_a,
+        parent_block_hash_a,
+        sig_a,
+        block_hash_b,
+        parent_block_hash_b,
+        sig_b,
+    };
+    sim.inject_vote_equivocations(Epoch::new(1), vec![pair]);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let reference = &sim.commits[0][0].state;
+    for r in 0..sim.n() {
+        let state = &sim.commits[r][0].state;
+        let record = state
+            .validators
+            .get(&accused)
+            .expect("revoked record persists");
+        assert!(
+            matches!(record.status, ValidatorStatus::Revoked { .. }),
+            "replica {r} did not revoke the double-signer",
+        );
+        let pool = &state.pools[&record.pool];
+        assert!(
+            pool.conviction.is_some(),
+            "replica {r} did not convict the signer's pool",
+        );
+        assert_eq!(state, reference, "replica {r} diverged");
+    }
+}
+
+/// A forged double-vote pair (garbage sigs) on the proposal lane is
+/// rejected at admission: the carrying proposal never enters honest
+/// pools, nobody is punished, and every replica converges.
+#[test]
+fn forged_vote_equivocation_cannot_convict() {
+    let mut sim = CoordinatorSim::new(4, 0xF15E);
+    let victim = ValidatorId::new(1);
+    let forged = ShardVoteEquivocation {
+        validator: victim,
+        shard: ShardId::leaf(1, 0),
+        height: BlockHeight::new(5),
+        round: Round::new(2),
+        block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
+        parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
+        sig_a: zero_bls_signature(),
+        block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
+        parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
+        sig_b: zero_bls_signature(),
+    };
+    sim.inject_vote_equivocations(Epoch::new(1), vec![forged]);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let reference = &sim.commits[0][0].state;
+    for r in 0..sim.n() {
+        let state = &sim.commits[r][0].state;
+        let record = state.validators.get(&victim).expect("still registered");
+        assert!(
+            !matches!(
+                record.status,
+                ValidatorStatus::Jailed { .. } | ValidatorStatus::Revoked { .. }
+            ),
+            "replica {r} punished an honest validator on a forged pair",
+        );
+        assert!(
+            state.pools.values().all(|p| p.conviction.is_none()),
+            "replica {r} convicted a pool on a forged pair",
+        );
+        assert_eq!(state, reference, "replica {r} diverged on a forged pair");
+    }
+}
+
 // ─── Skip-path integration ─────────────────────────────────────────────
 
 /// Pool ratification drives the chain past an abandoned epoch on every
@@ -901,6 +1012,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
         std::iter::once((ShardId::ROOT, None)).collect(),
         Vec::new(),
         std::collections::BTreeMap::new(),
+        Vec::new(),
         VrfProof::ZERO,
     );
     let candidate = Arc::new(Verified::<CandidateBeaconBlock>::new_unchecked_for_test(

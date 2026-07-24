@@ -1894,6 +1894,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             std::iter::once((s0, proof)).collect(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let proposals = [(ValidatorId::new(0), proposal)];
