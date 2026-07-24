@@ -1730,6 +1730,11 @@ impl ShardCoordinatorSim {
                             event: SimEvent::BlockReadyToCommit { certified, source },
                         });
                     }
+                    // Host-level plumbing: the real node buffers the pair
+                    // for the beacon and gossips it globally. This harness
+                    // models neither; the detection the shard-side tests
+                    // assert on already sits in `detected_equivocations`.
+                    ProtocolEvent::ShardVoteEquivocationDetected { .. } => {}
                     other => panic!(
                         "ShardCoordinatorSim: unmodelled Continuation event {}",
                         other.type_name()

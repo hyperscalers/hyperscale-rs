@@ -27,8 +27,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, ShardForkProof, Signed,
-    SignedContext, ValidatorId, Verifiable,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, ShardForkProof,
+    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -67,6 +67,22 @@ where
             self.shard,
             ProtocolEvent::UnverifiedShardForkProofReceived {
                 proof: Box::new(proof.clone()),
+            },
+        );
+    }
+
+    /// A self-authenticating double-vote pair arrived over gossip. Hand
+    /// it straight to the state machine, which resolves the accused key
+    /// from its own registry and re-verifies.
+    pub(crate) fn handle_shard_vote_equivocation_gossip_received(
+        &self,
+        evidence: &ShardVoteEquivocation,
+    ) {
+        push_protocol_event(
+            self.event_sender(),
+            self.shard,
+            ProtocolEvent::UnverifiedShardVoteEquivocationReceived {
+                evidence: Box::new(evidence.clone()),
             },
         );
     }

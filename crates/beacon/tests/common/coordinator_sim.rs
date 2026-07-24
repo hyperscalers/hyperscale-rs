@@ -29,11 +29,12 @@ use hyperscale_types::{
     NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
     PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
     RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote, Round, SKIP_TIMEOUT, ShardId,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcEmptyViewMsg,
-    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
-    TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
-    compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_empty_view_msg,
-    sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign, zero_bls_signature,
+    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
+    SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake,
+    StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    bls_keypair_from_seed, compute_merkle_root_with_proof, genesis_config_hash, pc_context,
+    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
+    zero_bls_signature,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -146,6 +147,10 @@ pub struct CoordinatorSim {
     /// which replica emits it. Consumed (drained) the first time a proposal
     /// at that epoch is absorbed.
     pending_equivocations: BTreeMap<Epoch, Vec<PcVoteEquivocation>>,
+    /// Shard double-vote pairs a test schedules for splicing into the
+    /// next proposal a replica builds at the keyed epoch — the harness
+    /// analogue of the gossip-fed observation buffer.
+    pending_vote_equivocations: BTreeMap<Epoch, Vec<ShardVoteEquivocation>>,
     /// Single-shot per-pair filter: when `(sender, receiver)` is
     /// present, the next `BuildAndBroadcastBeaconProposal` from
     /// `sender` skips queuing the envelope addressed to `receiver`,
@@ -266,6 +271,7 @@ impl CoordinatorSim {
             byzantine: vec![None; pool_n],
             byzantine_fires: vec![0; pool_n],
             pending_equivocations: BTreeMap::new(),
+            pending_vote_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
             blocked_block_pairs: BTreeSet::new(),
         }
@@ -325,6 +331,28 @@ impl CoordinatorSim {
             .entry(epoch)
             .or_default()
             .extend(equivocations);
+    }
+
+    /// Splice shard double-vote pairs into the next
+    /// `BuildAndBroadcastBeaconProposal` at `epoch` — the harness stand-in
+    /// for a pair arriving over gossip and sitting in a member's
+    /// observation buffer. Drained on first fire.
+    /// The signing key of the replica at `idx` — lets tests forge
+    /// genuine double-signs from a registered validator's own key.
+    #[must_use]
+    pub fn sk_of(&self, idx: usize) -> &Bls12381G1PrivateKey {
+        &self.sks[idx]
+    }
+
+    pub fn inject_vote_equivocations(
+        &mut self,
+        epoch: Epoch,
+        vote_equivocations: Vec<ShardVoteEquivocation>,
+    ) {
+        self.pending_vote_equivocations
+            .entry(epoch)
+            .or_default()
+            .extend(vote_equivocations);
     }
 
     /// Deliver a two-block epoch-boundary crossing for `shard` to every
@@ -860,6 +888,7 @@ impl CoordinatorSim {
                 boundary_qcs,
                 mut equivocations,
                 fork_proofs,
+                mut vote_equivocations,
                 recipients,
             } => {
                 // Splice in any test-scheduled equivocations for this epoch
@@ -869,12 +898,16 @@ impl CoordinatorSim {
                 if let Some(extra_equiv) = self.pending_equivocations.remove(&epoch) {
                     equivocations.extend(extra_equiv);
                 }
+                if let Some(extra) = self.pending_vote_equivocations.remove(&epoch) {
+                    vote_equivocations.extend(extra);
+                }
                 let sk = &self.sks[emitter_idx];
                 let vrf_proof = vrf_sign(sk, &self.network, epoch);
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
                     fork_proofs,
+                    vote_equivocations,
                     vrf_proof,
                 )));
                 for rcpt in &recipients {
@@ -917,6 +950,7 @@ impl CoordinatorSim {
                             BTreeMap::new(),
                             Vec::new(),
                             BTreeMap::new(),
+                            Vec::new(),
                             vrf_proof,
                         )));
                     for rcpt in &recipients {

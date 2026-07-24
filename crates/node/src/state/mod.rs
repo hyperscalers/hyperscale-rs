@@ -360,6 +360,50 @@ impl StateMachine for NodeStateMachine {
                 self.with_shard(move |s, sched| s.handle_shard(sched, evt))
             }
 
+            // A double-vote pair is proven — caught by the local vote
+            // keeper, or a gossiped copy that just verified. Feed it into
+            // the beacon observation buffer so the next beacon proposal
+            // carries it to conviction, and re-gossip on first sight so
+            // the evidence reaches every buffer; a pair already held is
+            // not re-broadcast (the buffer's first-wins is the dedup).
+            ProtocolEvent::ShardVoteEquivocationDetected { evidence }
+            | ProtocolEvent::ShardVoteEquivocationVerified {
+                evidence,
+                verified: true,
+            } => {
+                if self
+                    .beacon_coordinator
+                    .observe_vote_equivocation((*evidence).clone())
+                {
+                    vec![Action::BroadcastShardVoteEquivocation { evidence }]
+                } else {
+                    Vec::new()
+                }
+            }
+            ProtocolEvent::ShardVoteEquivocationVerified {
+                verified: false, ..
+            } => {
+                tracing::warn!("discarding a shard double-vote pair that failed verification");
+                Vec::new()
+            }
+            // A gossiped pair: resolve the accused key from the beacon
+            // fold's permanent registry (the head snapshot may no longer
+            // carry a rotated-out signer) and dispatch off-thread
+            // verification — self-authenticating, no sender trust. An
+            // unknown validator drops the pair.
+            ProtocolEvent::UnverifiedShardVoteEquivocationReceived { evidence } => self
+                .beacon_coordinator
+                .validator_pubkey(evidence.validator)
+                .map_or_else(
+                    || {
+                        tracing::warn!(
+                            "dropping a double-vote pair naming an unregistered validator"
+                        );
+                        Vec::new()
+                    },
+                    |pubkey| vec![Action::VerifyShardVoteEquivocation { evidence, pubkey }],
+                ),
+
             // ── Provisions ───────────────────────────────────────────────
             evt @ (ProtocolEvent::VerifiedProvisionsReceived { .. }
             | ProtocolEvent::UnverifiedProvisionsReceived { .. }

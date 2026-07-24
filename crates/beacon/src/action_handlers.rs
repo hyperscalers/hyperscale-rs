@@ -157,6 +157,7 @@ where
             boundary_qcs,
             equivocations,
             fork_proofs,
+            vote_equivocations,
             recipients,
         } => {
             let verified = Verified::<BeaconProposal>::sign_local(
@@ -166,6 +167,7 @@ where
                 boundary_qcs,
                 equivocations,
                 fork_proofs,
+                vote_equivocations,
             );
             let proposal = Arc::new(verified);
             (ctx.cache_beacon_proposal)(me, epoch, Arc::clone(&proposal));

@@ -8,7 +8,8 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
-    CertifiedBlockHeaderGossip, ShardForkProofGossip, TransactionGossip,
+    CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
+    TransactionGossip,
 };
 use hyperscale_types::network::notification::beacon::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
@@ -163,6 +164,35 @@ where
                         target_shard,
                         ShardScopedInput::ShardForkProofGossipReceived {
                             proof: gossip.proof,
+                        },
+                    );
+                    GossipVerdict::Accept
+                },
+            );
+
+        // Shard double-vote evidence: same self-authenticating global
+        // gossip shape as fork proofs — any hosted vnode carries it to
+        // the state machine for off-thread verification.
+        let senders = self.process.shard_event_senders.clone();
+        self.process
+            .network
+            .register_gossip_handler::<ShardVoteEquivocationGossip>(
+                move |gossip: ShardVoteEquivocationGossip,
+                      target_shard: ShardId|
+                      -> GossipVerdict {
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&target_shard) else {
+                        warn!(
+                            target_shard = target_shard.inner(),
+                            "Dropping double-vote gossip: shard not hosted"
+                        );
+                        return GossipVerdict::Reject;
+                    };
+                    push_shard_input(
+                        tx,
+                        target_shard,
+                        ShardScopedInput::ShardVoteEquivocationGossipReceived {
+                            evidence: gossip.evidence,
                         },
                     );
                     GossipVerdict::Accept

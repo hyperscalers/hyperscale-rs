@@ -19,11 +19,11 @@ use hyperscale_types::{
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
     RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
-    RoutableTransaction, ShardForkProof, ShardId, ShardWitness, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
-    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, WaveId,
-    WeightedTimestamp,
+    RoutableTransaction, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitness,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError,
+    StoredReceipt, Timeout, TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -312,6 +312,31 @@ pub enum ProtocolEvent {
     UnverifiedShardForkProofReceived {
         /// The fork evidence off the wire.
         proof: Box<ShardForkProof>,
+    },
+
+    /// The local vote keeper caught a double-vote and built the pair.
+    /// Already verified (both votes passed signature verification on
+    /// receipt); downstream buffers it for the beacon and re-gossips.
+    ShardVoteEquivocationDetected {
+        /// The self-proving double-vote pair.
+        evidence: Box<ShardVoteEquivocation>,
+    },
+
+    /// A gossiped double-vote pair finished off-thread verification.
+    ShardVoteEquivocationVerified {
+        /// The pair that was checked.
+        evidence: Box<ShardVoteEquivocation>,
+        /// Whether both signatures verify under the accused key.
+        verified: bool,
+    },
+
+    /// A shard double-vote pair arrived over global gossip and still
+    /// needs verification. Self-authenticating — no sender trust; the
+    /// state machine resolves the accused pubkey from its topology and
+    /// dispatches `VerifyShardVoteEquivocation`.
+    UnverifiedShardVoteEquivocationReceived {
+        /// The pair off the wire.
+        evidence: Box<ShardVoteEquivocation>,
     },
 
     /// Transaction-root verification completed for a pending block.

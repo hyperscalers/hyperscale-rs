@@ -68,6 +68,7 @@ where
             | Action::VerifyTimeout { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyShardForkProof { .. }
+            | Action::VerifyShardVoteEquivocation { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyBeaconWitnessRoot { .. }
             | Action::VerifyTransactionRoot { .. }
@@ -84,6 +85,7 @@ where
             | Action::SignAndBroadcastReadySignal { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::BroadcastShardForkProof { .. }
+            | Action::BroadcastShardVoteEquivocation { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. }
             | Action::SignAndBroadcastPcVote1 { .. }

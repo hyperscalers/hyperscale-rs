@@ -322,6 +322,18 @@ pub enum Action {
         proof: Box<ShardForkProof>,
     },
 
+    /// Broadcast shard double-vote evidence over global gossip. The pair
+    /// is already locally verified and self-authenticating (both
+    /// signatures verify under the accused key), so no signing is needed
+    /// — the handler wraps it in a `ShardVoteEquivocationGossip`; every
+    /// recipient re-verifies locally. This is the recovery lane that
+    /// keeps the evidence reachable after its holders leave the source
+    /// committee.
+    BroadcastShardVoteEquivocation {
+        /// The self-proving double-vote pair to gossip.
+        evidence: Box<ShardVoteEquivocation>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -563,6 +575,16 @@ pub enum Action {
         /// Committees resolved for the proof's QCs, positionally aligned to
         /// its canonical QC order.
         committees: Vec<ResolvedCommittee>,
+    },
+
+    /// Delegated to the consensus crypto pool. Returns
+    /// `ProtocolEvent::ShardVoteEquivocationVerified`.
+    VerifyShardVoteEquivocation {
+        /// The double-vote pair to verify.
+        evidence: Box<ShardVoteEquivocation>,
+        /// The accused validator's registered pubkey, resolved by the
+        /// state machine from its topology.
+        pubkey: Bls12381G1PublicKey,
     },
 
     /// Verify a block's local-receipt root and state root against the JMT.
@@ -1269,6 +1291,9 @@ pub enum Action {
         /// Fork proofs to embed, one per forked shard. Raw — drained from
         /// the local observation buffer of verified proofs.
         fork_proofs: BTreeMap<ShardId, ShardForkProof>,
+        /// Shard double-vote pairs to embed. Raw — drained from the
+        /// local observation buffer of verified pairs.
+        vote_equivocations: Vec<ShardVoteEquivocation>,
         /// Beacon-committee members the proposal ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -1495,6 +1520,7 @@ impl Action {
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
+            | Self::VerifyShardVoteEquivocation { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
@@ -1508,6 +1534,7 @@ impl Action {
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }
+            | Self::BroadcastShardVoteEquivocation { .. }
             | Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }
             | Self::SignAndBroadcastPcVote3 { .. }
@@ -1582,6 +1609,7 @@ impl Action {
             | Self::FetchAndBroadcastProvisions { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }
+            | Self::BroadcastShardVoteEquivocation { .. }
             | Self::SetTimer { .. }
             | Self::CancelTimer { .. }
             | Self::Continuation(_)
@@ -1595,6 +1623,7 @@ impl Action {
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
+            | Self::VerifyShardVoteEquivocation { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::VerifyTransactionRoot { .. }

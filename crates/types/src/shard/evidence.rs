@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
     CertifiedBlockHeader, NetworkDefinition, QcContext, QcVerifyError, QuorumCertificate, Round,
-    ShardId, TopologySchedule, ValidatorId, Verify, VoteCount, block_vote_message,
+    ShardId, TopologySchedule, ValidatorId, Verified, Verify, VoteCount, block_vote_message,
     verify_bls12381_v1,
 };
 
@@ -129,6 +129,40 @@ pub fn verify_shard_vote_equivocation(
         Ok(())
     } else {
         Err(ShardVoteEquivocationVerifyError::BadSignature)
+    }
+}
+
+/// Everything [`verify_shard_vote_equivocation`] needs beyond the
+/// evidence itself: the network binding and the accused key.
+#[derive(Debug, Clone, Copy)]
+pub struct ShardVoteEquivocationContext<'a> {
+    /// Network the votes were bound to.
+    pub network: &'a NetworkDefinition,
+    /// The accused validator's registered pubkey.
+    pub pubkey: &'a Bls12381G1PublicKey,
+}
+
+impl Verify<&ShardVoteEquivocationContext<'_>> for ShardVoteEquivocation {
+    type Error = ShardVoteEquivocationVerifyError;
+
+    fn verify(
+        &self,
+        ctx: &ShardVoteEquivocationContext<'_>,
+    ) -> Result<Verified<Self>, Self::Error> {
+        verify_shard_vote_equivocation(self, ctx.network, ctx.pubkey)?;
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+impl Verify<&ShardVoteEquivocationContext<'_>> for Box<ShardVoteEquivocation> {
+    type Error = ShardVoteEquivocationVerifyError;
+
+    fn verify(
+        &self,
+        ctx: &ShardVoteEquivocationContext<'_>,
+    ) -> Result<Verified<Self>, Self::Error> {
+        verify_shard_vote_equivocation(self, ctx.network, ctx.pubkey)?;
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 

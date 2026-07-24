@@ -518,6 +518,11 @@ where
                 self.handle_shard_fork_proof_gossip_received(&proof);
             }
 
+            // ── Shard double-vote pair (self-authenticating gossip → verify) ──
+            ShardScopedInput::ShardVoteEquivocationGossipReceived { evidence } => {
+                self.handle_shard_vote_equivocation_gossip_received(&evidence);
+            }
+
             // ── Periodic fetch / sync tick ─────────────────────────────
             ShardScopedInput::FetchTick => self.handle_fetch_tick(),
 

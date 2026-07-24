@@ -8,7 +8,7 @@ use hyperscale_types::{
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
     RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitness,
     ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
-    validator_possession_proof_verify, verify_vote_equivocation,
+    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -109,6 +109,21 @@ pub(super) fn ingest_equivocations(
             // (`InsufficientStake` and fault-cause `Jailed` members
             // revoke with the rest) and its idempotence makes replayed
             // evidence a no-op.
+            let pool_id = rec.pool;
+            outcome
+                .revoked
+                .extend(convict_pool(state, pool_id, state.current_epoch));
+        }
+        for ev in prop.vote_equivocations().iter() {
+            let evidence = ev.as_unverified();
+            let Some(rec) = state.validators.get(&evidence.validator) else {
+                continue;
+            };
+            if ev.verified().is_none()
+                && verify_shard_vote_equivocation(evidence, network, &rec.pubkey).is_err()
+            {
+                continue;
+            }
             let pool_id = rec.pool;
             outcome
                 .revoked
@@ -748,7 +763,7 @@ mod tests {
     use crate::state::test_fixtures::{
         applied_count, apply_next_epoch, apply_witness_chunk, boundary_chunk, keypair,
         malformed_vrf_proposal, net, possession_proof, pubkey, single_pool_state, validator_record,
-        vrf_proposal, vrf_proposal_with_equivocations,
+        vrf_proposal, vrf_proposal_with_equivocations, vrf_proposal_with_vote_equivocations,
     };
 
     fn deposit(pool: u32, amount: u64) -> ShardWitnessPayload {
@@ -993,6 +1008,103 @@ mod tests {
                 ValidatorStatus::Revoked { .. },
             ));
         }
+    }
+
+    /// The gossip-fed proposal lane convicts even when the accused
+    /// validator sits on no current committee — the fold resolves the
+    /// key from its permanent registry, which is what rescues evidence
+    /// whose holders (and target) all left the source shard.
+    #[test]
+    fn proposal_carried_vote_equivocation_convicts_an_ex_member() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Registered but seated nowhere: the registry, not any
+        // committee, must resolve the key.
+        state.validators.insert(
+            ValidatorId::new(9),
+            validator_record(9, 0, ValidatorStatus::Pooled),
+        );
+        isolate_in_own_pool(&mut state, ValidatorId::new(9), 9);
+
+        let ev = genuine_equivocation(9);
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_vote_equivocations(0, target_epoch, vec![ev]),
+        )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert_eq!(effects.revoked, vec![ValidatorId::new(9)]);
+        assert!(state.pools[&StakePoolId::new(9)].conviction.is_some());
+        assert!(matches!(
+            state.validators[&ValidatorId::new(9)].status,
+            ValidatorStatus::Revoked { .. },
+        ));
+    }
+
+    /// A forged pair on the proposal lane is dropped at the fold's
+    /// fail-closed re-verify — unlike witness leaves, lane evidence
+    /// carries no shard QC attestation to trust.
+    #[test]
+    fn proposal_carried_vote_equivocation_fails_closed_on_a_forgery() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+
+        let forged = ShardVoteEquivocation {
+            validator: ValidatorId::new(1),
+            shard: ShardId::leaf(1, 0),
+            height: BlockHeight::new(5),
+            round: Round::new(2),
+            block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
+            parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
+            sig_a: zero_bls_signature(),
+            block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
+            parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
+            sig_b: zero_bls_signature(),
+        };
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_vote_equivocations(0, target_epoch, vec![forged]),
+        )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert!(effects.revoked.is_empty());
+        assert!(state.pools[&StakePoolId::new(0)].conviction.is_none());
+    }
+
+    /// The same pair arriving through both channels — the witness leaf
+    /// first, the proposal lane an epoch later — convicts exactly once:
+    /// the second sighting is a cascade no-op and the impound never
+    /// restamps.
+    #[test]
+    fn leaf_and_lane_copies_of_one_pair_convict_once() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+        isolate_in_own_pool(&mut state, target, 9);
+
+        let ev = genuine_equivocation(1);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::VoteEquivocation(Box::new(ev.clone()))],
+        );
+        assert_eq!(effects.revoked, vec![target]);
+        let stamped = state.pools[&StakePoolId::new(9)].conviction;
+
+        let target_epoch = state.current_epoch.next();
+        let mut committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_vote_equivocations(0, target_epoch, vec![ev]),
+        )];
+        committed.extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert!(effects.revoked.is_empty());
+        assert_eq!(state.pools[&StakePoolId::new(9)].conviction, stamped);
     }
 
     /// Stake ops fold uniformly on a convicted pool: deposits credit

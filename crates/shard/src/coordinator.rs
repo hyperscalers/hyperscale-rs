@@ -2991,6 +2991,7 @@ impl ShardCoordinator {
             .pending_blocks
             .get_header(block_hash)
             .map(BlockHeader::parent_block_hash);
+        let mut actions: Vec<Action> = Vec::new();
         for (_, vote) in &verified_votes {
             let old_view = self.view_change.view;
             if self
@@ -3009,10 +3010,19 @@ impl ShardCoordinator {
             if let Some(evidence) =
                 self.votes
                     .track_verified_received_vote(block_hash, parent_block_hash, vote)
+                && let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.detected_equivocations.entry(evidence.validator)
             {
-                self.detected_equivocations
-                    .entry(evidence.validator)
-                    .or_insert(evidence);
+                slot.insert(evidence.clone());
+                // First sighting: hand the pair to the host, which
+                // buffers it for the beacon and gossips it globally —
+                // the lane that keeps the evidence alive after every
+                // holder leaves this committee.
+                actions.push(Action::Continuation(
+                    ProtocolEvent::ShardVoteEquivocationDetected {
+                        evidence: Box::new(evidence),
+                    },
+                ));
             }
         }
 
@@ -3022,10 +3032,14 @@ impl ShardCoordinator {
         // header, so its committee resolves; `None` is a beacon-behind stall.
         match self.committee_of_block(topology_schedule, block_hash) {
             Some(committee) => {
-                self.votes
-                    .maybe_trigger_verification(committee, self.local_shard, block_hash)
+                actions.extend(self.votes.maybe_trigger_verification(
+                    committee,
+                    self.local_shard,
+                    block_hash,
+                ));
+                actions
             }
-            None => vec![],
+            None => actions,
         }
     }
 

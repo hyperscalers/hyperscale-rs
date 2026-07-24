@@ -1458,6 +1458,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1507,8 +1508,13 @@ mod tests {
         let committee = TestCommittee::new(4, 1);
         let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
         let fork_proofs = std::iter::once((shard, proof)).collect();
-        let proposal =
-            BeaconProposal::new(BTreeMap::new(), Vec::new(), fork_proofs, VrfProof::ZERO);
+        let proposal = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            fork_proofs,
+            Vec::new(),
+            VrfProof::ZERO,
+        );
         (ValidatorId::new(0), proposal)
     }
 
@@ -1585,6 +1591,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             std::iter::once((wrong_key, proof)).collect(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let proposals = [(ValidatorId::new(0), proposal)];
@@ -1724,6 +1731,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -1784,6 +1792,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             std::iter::once((shard, proof)).collect(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         [(ValidatorId::new(0), proposal)]
@@ -1965,6 +1974,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2014,6 +2024,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2115,6 +2126,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2199,6 +2211,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2263,6 +2276,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2318,6 +2332,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2723,6 +2738,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -2996,6 +3012,7 @@ mod tests {
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3609,6 +3626,7 @@ mod tests {
             .collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3681,6 +3699,7 @@ mod tests {
             .collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3732,6 +3751,7 @@ mod tests {
             std::iter::once((left, Some(qc_over(&coast_header, 2_100)))).collect(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
@@ -3782,6 +3802,7 @@ mod tests {
                 .collect(),
                 Vec::new(),
                 BTreeMap::new(),
+                Vec::new(),
                 VrfProof::ZERO,
             );
             let committed = vec![(ValidatorId::new(0), proposal)];
