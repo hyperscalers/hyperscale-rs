@@ -70,7 +70,10 @@ const IMPORT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
 /// so a run of tiny values still bounds a batch's leaf count.
 const IMPORT_LEAF_OVERHEAD: u64 = 64;
 
-/// The batching weight of one staged leaf.
+/// The batching weight of one staged leaf. Equal to the staged value's
+/// raw length minus its 4-byte key-length prefix, plus the fixed
+/// overhead — [`count_staged_batches`] relies on that identity to walk
+/// raw values without decoding.
 const fn leaf_weight(storage_key: &[u8], value: &[u8]) -> u64 {
     IMPORT_LEAF_OVERHEAD + storage_key.len() as u64 + value.len() as u64
 }
@@ -80,18 +83,27 @@ const fn leaf_weight(storage_key: &[u8], value: &[u8]) -> u64 {
 /// count (at least 1; an empty staging area is one empty batch) and the
 /// total staged weight. The apply pass repeats this exact walk, so the
 /// count fixes its version numbering.
+///
+/// The walk reads raw values only: a staged value is
+/// `[4-byte key length][storage key][value]`, so its
+/// [`leaf_weight`] is the raw length minus the prefix plus the fixed
+/// overhead — no decode, no per-leaf allocation.
 fn count_staged_batches(db: &DB, staging_cf: &ColumnFamily, limit: u64) -> (u64, u64) {
     let mut batches = 0u64;
     let mut batch_weight = 0u64;
     let mut total_weight = 0u64;
-    for (_, (storage_key, value)) in iter_all::<ImportStagingCf>(db, staging_cf) {
-        let weight = leaf_weight(&storage_key, &value);
+    let mut iter = db.raw_iterator_cf(staging_cf);
+    iter.seek_to_first();
+    while iter.valid() {
+        let raw_len = iter.value().map_or(0, <[u8]>::len) as u64;
+        let weight = IMPORT_LEAF_OVERHEAD + raw_len.saturating_sub(4);
         batch_weight += weight;
         total_weight += weight;
         if batch_weight >= limit {
             batches += 1;
             batch_weight = 0;
         }
+        iter.next();
     }
     if batch_weight > 0 || batches == 0 {
         batches += 1;
