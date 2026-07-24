@@ -89,6 +89,7 @@ fn initial_state() -> BeaconState {
             total_stake: Stake::from_attos(50 * MIN_STAKE_FLOOR.attos()),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),
+            released_cumulative: Stake::ZERO,
             conviction: None,
         },
     );

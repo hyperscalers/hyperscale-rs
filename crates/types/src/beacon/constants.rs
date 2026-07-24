@@ -235,9 +235,12 @@ pub const RESHAPE_HANDOFF_TTL_EPOCHS: u64 = 12;
 /// How long a stake-pool withdrawal request remains pending before its
 /// amount is released and any resulting auto-deactivations apply.
 ///
-/// Long enough that late-arriving equivocation evidence can still mark
-/// byzantine validators permanently before their pool's stake fully
-/// escapes.
+/// This is the network's evidence deadline: equivocation evidence that
+/// folds inside the window catches the pool's stake mid-exit — the
+/// conviction freezes every still-pending withdrawal until its impound
+/// lifts. Stake that has already matured out is beyond reach (nothing
+/// is slashed retroactively), so the window bounds how stale evidence
+/// can be and still carry economic weight.
 pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
 
 /// Genesis default for the `impound_epochs` governance parameter: how

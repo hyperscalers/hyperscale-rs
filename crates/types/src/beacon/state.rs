@@ -104,6 +104,14 @@ pub struct StakePool {
     pub validators: BTreeSet<ValidatorId>,
     /// Withdrawals waiting out the unbonding window.
     pub pending_withdrawals: Vec<PendingWithdrawal>,
+    /// Monotone lifetime sum of matured (released) withdrawals — the
+    /// beacon-side source of truth for the per-pool withdrawal
+    /// allowance the shard-layer staking component enforces (lifetime
+    /// payouts never exceed the projected allowance). Only withdrawal
+    /// maturation bumps it, so an impound reads as a plateau and the
+    /// component needs no unbonding clock or conviction knowledge of
+    /// its own.
+    pub released_cumulative: Stake,
     /// The pool's byzantine conviction, if any. `Some` permanently
     /// retires the pool from validation and impounds its stake until
     /// the recorded lift epoch.
@@ -1633,6 +1641,13 @@ impl BeaconState {
 
         let mut offerings: Vec<u128> = Vec::new();
         for pool in self.pools.values() {
+            // A convicted pool's stake is impounded, not productive:
+            // its offerings would price seats the network can never
+            // fill (registration rejects convicted pools), silently
+            // raising `min_stake` against every live pool.
+            if pool.conviction.is_some() {
+                continue;
+            }
             let e = pool.effective_stake().attos();
             if e == 0 {
                 continue;
@@ -1724,6 +1739,7 @@ mod tests {
                 total_stake: Stake::from_attos(u128::from(n_active) * MIN_STAKE_FLOOR.attos()),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -1930,6 +1946,7 @@ mod tests {
                     initiated_at_epoch: Epoch::new(2),
                 },
             ],
+            released_cumulative: Stake::ZERO,
             conviction: None,
         };
         assert_eq!(pool.effective_stake(), Stake::from_whole_tokens(650));
@@ -1947,6 +1964,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(500),
                 initiated_at_epoch: Epoch::GENESIS,
             }],
+            released_cumulative: Stake::ZERO,
             conviction: None,
         };
         assert_eq!(pool.effective_stake(), Stake::ZERO);

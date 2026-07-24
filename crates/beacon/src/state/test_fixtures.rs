@@ -114,6 +114,7 @@ pub fn single_pool_state(n_active: u64) -> BeaconState {
             total_stake: Stake::from_attos(u128::from(n_active) * MIN_STAKE_FLOOR.attos()),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),
+            released_cumulative: Stake::ZERO,
             conviction: None,
         },
     );
@@ -382,6 +383,7 @@ pub fn state_with_pending_withdrawal(
                 amount: withdrawal_amount,
                 initiated_at_epoch,
             }],
+            released_cumulative: Stake::ZERO,
             conviction: None,
         },
     );

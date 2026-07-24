@@ -251,6 +251,7 @@ mod tests {
                 total_stake: Stake::from_attos(total_stake_attos),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -355,6 +356,7 @@ mod tests {
                     total_stake: Stake::from_attos(1),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
+                    released_cumulative: Stake::ZERO,
                     conviction: None,
                 },
             );
@@ -431,6 +433,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -515,6 +518,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(10)).collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -541,6 +545,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: (20u64..23).map(ValidatorId::new).collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -594,6 +599,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(10)).collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -604,6 +610,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000),
                 validators: std::iter::once(ValidatorId::new(20)).collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -668,6 +675,7 @@ mod tests {
                 total_stake: Stake::from_whole_tokens(1_000_000),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             })
             .validators
@@ -831,6 +839,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
