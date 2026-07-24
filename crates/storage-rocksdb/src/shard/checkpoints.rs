@@ -48,6 +48,19 @@ fn wipe_staging_into(batch: &mut WriteBatch, staging_cf: &ColumnFamily) {
     meta_delete::<ImportProgressEntry>(batch);
 }
 
+/// Queue a full-range deletion of `cf` in `batch`. The exclusive upper
+/// bound is the successor of the CF's current last key, so the range
+/// covers every present entry regardless of key shape.
+fn wipe_cf_into(batch: &mut WriteBatch, db: &DB, cf: &ColumnFamily) {
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_to_last();
+    if let Some(last) = iter.key() {
+        let mut end = last.to_vec();
+        end.push(0x00);
+        batch.delete_range_cf(cf, &[][..], &end[..]);
+    }
+}
+
 /// Leaf-value weight applied per finalize batch: the JMT build for one
 /// batch holds its leaves in memory, so this bounds finalize peak memory
 /// independent of state size.
@@ -502,6 +515,19 @@ impl BoundaryStore for RocksDbShardStorage {
         let cf = CfHandles::resolve(&self.db);
         let mut batch = WriteBatch::default();
         wipe_staging_into(&mut batch, ImportStagingCf::handle(&cf));
+        // A finalize interrupted mid-build has already committed
+        // JMT-node, state, and leaf-association batches with no
+        // completion marker; a fresh assembly built on top of them would
+        // leave substates readable that its verified root does not
+        // attest. While the marker is unset those CFs hold nothing but
+        // abandoned import batches, so they are wiped with the staging
+        // area. (With the marker set the store is finalized and holds no
+        // staged bytes to begin with.)
+        if self.read_jmt_metadata() == (0, StateRoot::ZERO) {
+            wipe_cf_into(&mut batch, &self.db, StateCf::handle(&cf));
+            wipe_cf_into(&mut batch, &self.db, LeafAssociationsCf::handle(&cf));
+            wipe_cf_into(&mut batch, &self.db, JmtNodesCf::handle(&cf));
+        }
         self.db
             .write(batch)
             .map_err(|e| format!("snap-sync staging wipe: {e}"))
@@ -988,6 +1014,77 @@ mod tests {
                 count_cf_entries(&interrupted, cf),
                 count_cf_entries(&reference, cf),
                 "column family {cf} diverged after the interrupted re-run",
+            );
+        }
+    }
+
+    /// A wipe after an interrupted finalize clears the partial build's
+    /// residue: a fresh assembly against a different anchor must not
+    /// leave substates readable that its verified root does not attest.
+    #[test]
+    fn wipe_after_interrupted_finalize_clears_partial_build_residue() {
+        let leaves = random_leaves(200, 17);
+        let height_a = BlockHeight::new(150);
+
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        stage_in_chunks(&storage, height_a, &leaves);
+        storage
+            .finalize_staged(height_a, &WitnessSeed::default(), 512, Some(2))
+            .unwrap();
+        assert_eq!(storage.read_jmt_metadata(), (0, StateRoot::ZERO));
+        assert!(count_cf_entries(&storage, STATE_CF) > 0);
+
+        // The advanced-anchor rebind path: wipe, then assemble a
+        // different leaf set (dropping half of the first anchor's keys)
+        // against a new anchor.
+        storage.wipe_import_staging().unwrap();
+        assert_eq!(storage.read_import_progress(), None);
+        for cf in [
+            JMT_NODES_CF,
+            STATE_CF,
+            LEAF_ASSOCIATIONS_CF,
+            IMPORT_STAGING_CF,
+        ] {
+            assert_eq!(
+                count_cf_entries(&storage, cf),
+                0,
+                "column family {cf} carries residue past the wipe",
+            );
+        }
+
+        let height_b = BlockHeight::new(180);
+        let retained = &leaves[..100];
+        stage_in_chunks(&storage, height_b, retained);
+        let root = storage
+            .finalize_staged(height_b, &WitnessSeed::default(), 512, None)
+            .unwrap();
+
+        // The rebuilt store matches a fresh store importing the same set.
+        let reference_dir = TempDir::new().unwrap();
+        let reference = open_storage(reference_dir.path());
+        stage_in_chunks(&reference, height_b, retained);
+        let expected = reference
+            .finalize_staged(height_b, &WitnessSeed::default(), 512, None)
+            .unwrap();
+        assert_eq!(root, expected);
+        for cf in [JMT_NODES_CF, STATE_CF, LEAF_ASSOCIATIONS_CF] {
+            assert_eq!(
+                count_cf_entries(&storage, cf),
+                count_cf_entries(&reference, cf),
+                "column family {cf} diverged from the fresh-store build",
+            );
+        }
+        // The dropped keys read as absent.
+        let state_cf = storage.db.cf_handle(STATE_CF).expect("cf exists");
+        for leaf in &leaves[100..] {
+            assert!(
+                storage
+                    .db
+                    .get_cf(state_cf, &leaf.storage_key)
+                    .unwrap()
+                    .is_none(),
+                "a dropped leaf stayed readable after the rebind",
             );
         }
     }

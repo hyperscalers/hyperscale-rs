@@ -154,8 +154,11 @@ pub trait BoundaryStore {
     /// staged.
     fn read_import_progress(&self) -> Option<ImportProgress>;
 
-    /// Discard every staged chunk and the progress record. A no-op when
-    /// nothing is staged.
+    /// Discard every staged chunk, the progress record, and any partial
+    /// state a [`finalize_boundary_import`](Self::finalize_boundary_import)
+    /// interrupted before its completion marker left behind — the caller
+    /// may build a fresh assembly directly on top of the wiped store. A
+    /// no-op when nothing is staged.
     ///
     /// # Errors
     ///
