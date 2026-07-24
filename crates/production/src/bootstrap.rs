@@ -60,18 +60,35 @@ where
         let Some(anchor) = topology_snapshot.load().boundary(shard) else {
             return Err(format!("shard {shard:?} has no attested anchor"));
         };
-        info!(
-            ?shard,
-            height = anchor.height.inner(),
-            "Snap-sync bootstrap starting against attested anchor"
-        );
-        // A fresh assembly stages from scratch: discard whatever an
-        // earlier attempt left behind — its chunks were proven against
-        // an anchor this assembly no longer targets.
-        storage
-            .wipe_import_staging()
-            .map_err(|error| format!("import staging wipe failed: {error}"))?;
-        let bootstrap = Arc::new(Mutex::new(ShardBootstrap::new(shard, anchor)));
+        // Resume a staged assembly an earlier process left behind when
+        // its progress record binds the currently attested anchor and
+        // fetch geometry; anything else is staged data proven against a
+        // root this assembly no longer targets — wipe it and start
+        // fresh. The anchor-refresh restart lands back here, where the
+        // stale record fails the binding and is wiped the same way.
+        let resumed = storage
+            .read_import_progress()
+            .and_then(|progress| ShardBootstrap::resume(shard, anchor, progress));
+        let bootstrap = if let Some(bootstrap) = resumed {
+            info!(
+                ?shard,
+                height = anchor.height.inner(),
+                staged_bytes = bootstrap.imported_substate_bytes(),
+                "Snap-sync bootstrap resuming a staged assembly against attested anchor"
+            );
+            bootstrap
+        } else {
+            info!(
+                ?shard,
+                height = anchor.height.inner(),
+                "Snap-sync bootstrap starting against attested anchor"
+            );
+            storage
+                .wipe_import_staging()
+                .map_err(|error| format!("import staging wipe failed: {error}"))?;
+            ShardBootstrap::new(shard, anchor)
+        };
+        let bootstrap = Arc::new(Mutex::new(bootstrap));
         let mut fruitless = 0u32;
         while !lock(&bootstrap).is_complete() {
             let finalize = lock(&bootstrap).take_finalize();
@@ -270,8 +287,8 @@ mod tests {
     use arc_swap::ArcSwap;
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
     use hyperscale_node::{serve_state_range_request, serve_witness_history_request};
-    use hyperscale_storage::test_helpers::pin_snap_sync_replica;
-    use hyperscale_storage::{PendingChain, SubstateStore};
+    use hyperscale_storage::test_helpers::{completed_import_progress, pin_snap_sync_replica};
+    use hyperscale_storage::{BoundaryStore, ImportLeaf, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
     use hyperscale_types::{
@@ -301,6 +318,7 @@ mod tests {
         honest: Arc<SimShardStorage>,
         pending_chain: PendingChain<SimShardStorage>,
         flaky_failures: AtomicUsize,
+        state_ranges_served: AtomicUsize,
     }
 
     impl StubNetwork {
@@ -309,6 +327,7 @@ mod tests {
                 honest: Arc::clone(&storage),
                 pending_chain: PendingChain::new(storage),
                 flaky_failures: AtomicUsize::new(flaky_failures),
+                state_ranges_served: AtomicUsize::new(0),
             }
         }
     }
@@ -336,6 +355,7 @@ mod tests {
             let encoded = basic_encode(&request).expect("request encodes");
             let response = match R::message_type_id() {
                 "state_range.request" => {
+                    self.state_ranges_served.fetch_add(1, Ordering::Relaxed);
                     let req: GetStateRangeRequest = basic_decode(&encoded).expect("decode");
                     basic_encode(&serve_state_range_request(&self.honest, &req)).expect("encode")
                 }
@@ -424,5 +444,92 @@ mod tests {
         assert!(recovered.beacon_witness_leaf_hashes.is_empty());
         // The imported store reproduces the attested root.
         assert_eq!(fresh.state_root(), anchor.state_root);
+    }
+
+    /// The pump resumes a staged assembly a previous process left
+    /// behind: finished sub-ranges are not refetched, and the finalize
+    /// still reproduces the attested root.
+    #[tokio::test]
+    async fn pump_resumes_a_staged_assembly() {
+        let (serving, anchor) = replica();
+        let shard = ShardId::ROOT;
+        let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+
+        // The "previous process": witness, then stage three sub-ranges
+        // of the fan-out before dying.
+        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let mut first = ShardBootstrap::new(shard, anchor);
+        let mut staged = 0usize;
+        'outer: for _ in 0..1_000 {
+            for request in first.next_requests() {
+                match request {
+                    BootstrapRequest::WitnessHistory(request) => {
+                        let response = serve_witness_history_request(&pending_chain, &request);
+                        first.on_witness_history(&response);
+                    }
+                    BootstrapRequest::StateRange(id, request) => {
+                        if staged >= 3 {
+                            break 'outer;
+                        }
+                        let response = serve_state_range_request(&serving, &request);
+                        if let StateRangeOutcome::Staged { leaves, progress } =
+                            first.on_state_range(id, &response)
+                        {
+                            fresh.stage_import_chunk(&progress, &leaves).unwrap();
+                            staged += 1;
+                        }
+                    }
+                }
+            }
+        }
+        drop(first);
+        assert!(fresh.read_import_progress().is_some());
+
+        let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
+        let topology_snapshot = shared_topology(anchor, shard);
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
+            .await
+            .expect("bootstrap succeeds");
+
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        assert_eq!(fresh.state_root(), anchor.state_root);
+        assert_eq!(fresh.read_import_progress(), None);
+        // Only the unfinished sub-ranges were refetched.
+        assert_eq!(network.state_ranges_served.load(Ordering::Relaxed), 16 - 3);
+    }
+
+    /// A progress record from a different anchor is wiped, not resumed:
+    /// the join re-syncs from scratch and still verifies.
+    #[tokio::test]
+    async fn pump_wipes_a_mismatched_progress_record() {
+        let (serving, anchor) = replica();
+        let shard = ShardId::ROOT;
+        let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+
+        // A stale attempt against a different anchor left a poisoned
+        // chunk behind; its record binds neither this anchor's root nor
+        // the fetch geometry.
+        let poisoned = ImportLeaf {
+            leaf_key: [0x42; 32],
+            storage_key: vec![0x42; 40],
+            value: vec![0xEE; 8],
+        };
+        fresh
+            .stage_import_chunk(
+                &completed_import_progress(anchor.height, 8),
+                std::slice::from_ref(&poisoned),
+            )
+            .unwrap();
+
+        let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
+        let topology_snapshot = shared_topology(anchor, shard);
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard)
+            .await
+            .expect("bootstrap succeeds");
+
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        // The wipe removed the poisoned chunk; the full fan-out ran.
+        assert_eq!(fresh.state_root(), anchor.state_root);
+        assert_eq!(network.state_ranges_served.load(Ordering::Relaxed), 16);
     }
 }
