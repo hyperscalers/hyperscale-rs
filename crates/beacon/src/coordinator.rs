@@ -28,7 +28,7 @@ use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
     BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
-    CertifiedBlockHeader, Epoch, GenesisConfigHash, JailReason, LeafIndex, LocalTimestamp,
+    CertifiedBlockHeader, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
     MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement,
     PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
@@ -1060,7 +1060,7 @@ impl BeaconCoordinator {
     ///   can also supply (the witness-availability coupling).
     /// - Equivocations from [`drain_equivocations_for`](Self::drain_equivocations_for),
     ///   capped at [`MAX_EQUIVOCATIONS_PER_PROPOSER`] with overflow
-    ///   re-recorded for the next epoch — each permanently jails its
+    ///   re-recorded for the next epoch — each permanently revokes its
     ///   target. Shard witnesses ride the boundary contributions, not the
     ///   proposal.
     pub fn try_propose(&mut self) -> Vec<Action> {
@@ -1833,8 +1833,8 @@ impl BeaconCoordinator {
     }
 
     /// Drop locally buffered evidence the fold has consumed. Equivocations
-    /// for a validator now permanently jailed are dead weight — the jail
-    /// can't be upgraded further. A fork proof the fold has registered —
+    /// for a validator whose key is already revoked are dead weight — no
+    /// further punishment exists. A fork proof the fold has registered —
     /// as the durable flag or a stamped fork-caused recovery — has done
     /// its job: the beacon's own state retries the re-draw from there, so
     /// re-proposing the proof only wastes proposal space. Anything else
@@ -1846,10 +1846,7 @@ impl BeaconCoordinator {
         self.equivocations.prune(|v| {
             matches!(
                 validators.get(&v).map(|r| r.status),
-                Some(ValidatorStatus::Jailed {
-                    reason: JailReason::Equivocation,
-                    ..
-                })
+                Some(ValidatorStatus::Revoked { .. })
             )
         });
         let pending = &self.state.pending_recoveries;
@@ -2530,15 +2527,16 @@ mod tests {
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
-        GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, KeptSeat, LeafIndex,
-        LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
-        ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
-        Round, ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, build_ratify_cert,
-        compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_ratify_vote,
-        sign_vote1, sign_vote2, sign_vote3, spc_context, zero_bls_signature,
+        GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, JailReason,
+        KeptSeat, LeafIndex, LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
+        NetworkDefinition, ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
+        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
+        build_qc3, build_ratify_cert, compute_merkle_root_with_proof, genesis_config_hash,
+        pc_context, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -4415,11 +4413,11 @@ mod tests {
     }
 
     /// Adoption prunes buffered equivocation evidence for validators the
-    /// fold now holds permanently jailed — their jail can't be upgraded
+    /// fold now holds revoked — no further punishment exists
     /// further, so re-proposing the evidence would only waste block
     /// space. Evidence for other validators stays buffered.
     #[test]
-    fn adopt_prunes_evidence_for_permanently_jailed_validators() {
+    fn adopt_prunes_evidence_for_revoked_validators() {
         use hyperscale_types::{Bls12381G2Signature, PcVoteRound};
         let mut coord = fresh_coord();
         let evidence = |v: u64| PcVoteEquivocation {
@@ -4441,9 +4439,8 @@ mod tests {
             .validators
             .get_mut(&ValidatorId::new(1))
             .unwrap()
-            .status = ValidatorStatus::Jailed {
-            since_epoch: Epoch::GENESIS,
-            reason: JailReason::Equivocation,
+            .status = ValidatorStatus::Revoked {
+            at_epoch: Epoch::GENESIS,
         };
 
         let prev = coord.latest_block.block_hash();

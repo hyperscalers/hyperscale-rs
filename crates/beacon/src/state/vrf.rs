@@ -188,9 +188,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
 /// global pool).
 ///
 /// Silent no-op if `victim` isn't in `state.validators`. Callers that
-/// want to gate on the prior status (e.g. equivocation's "skip
-/// already-permanent `Equivocation` jails") must do that gate before
-/// calling.
+/// want to gate on the prior status must do that gate before calling.
 pub(super) fn jail_validator(
     state: &mut BeaconState,
     victim: ValidatorId,
@@ -205,6 +203,24 @@ pub(super) fn jail_validator(
         since_epoch,
         reason,
     };
+    exit_placement(state, victim, prior);
+}
+
+/// Permanently revoke `victim` on equivocation evidence: transition to
+/// [`ValidatorStatus::Revoked`], then run [`exit_placement`]'s shared
+/// cleanup. Idempotent — an already-`Revoked` victim is left untouched
+/// so replayed evidence never re-runs the placement teardown.
+///
+/// Silent no-op if `victim` isn't in `state.validators`.
+pub(super) fn revoke_validator(state: &mut BeaconState, victim: ValidatorId, at_epoch: Epoch) {
+    let Some(rec) = state.validators.get_mut(&victim) else {
+        return;
+    };
+    if matches!(rec.status, ValidatorStatus::Revoked { .. }) {
+        return;
+    }
+    let prior = rec.status;
+    rec.status = ValidatorStatus::Revoked { at_epoch };
     exit_placement(state, victim, prior);
 }
 

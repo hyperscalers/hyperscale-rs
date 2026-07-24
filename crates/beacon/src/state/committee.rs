@@ -1077,7 +1077,7 @@ mod tests {
     // ─── beacon_eligible + resample_beacon_committee ─────────────────────
 
     /// `beacon_eligible` returns exactly the `OnShard { ready: true }`
-    /// validators; `Pooled`, `Jailed`, `InsufficientStake`, and
+    /// validators; `Pooled`, `Jailed`, `Revoked`, `InsufficientStake`, and
     /// not-yet-ready `OnShard` validators are all excluded.
     #[test]
     fn beacon_eligible_filters_to_on_shard_ready() {
