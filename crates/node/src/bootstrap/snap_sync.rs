@@ -152,6 +152,41 @@ impl SnapSync {
         }
     }
 
+    /// Resume an assembly from the durable `progress` of an earlier one
+    /// against the same `anchor`: exhausted sub-ranges stay done, the
+    /// rest re-arm at their persisted cursors, and the byte tally
+    /// carries over. The caller has already matched the progress record
+    /// against the anchor and fetch geometry — staged chunks are
+    /// meaningless against any other `state_root`.
+    #[must_use]
+    pub fn with_cursors(
+        anchor: ShardAnchor,
+        root_path: NibblePath,
+        progress: &ImportProgress,
+    ) -> Self {
+        let sub_ranges = progress
+            .cursors
+            .iter()
+            .map(|cursor| SubRange {
+                cursor: cursor.next,
+                end: cursor.end,
+                state: if cursor.done {
+                    SubRangeState::Done
+                } else {
+                    SubRangeState::Idle
+                },
+            })
+            .collect();
+        Self {
+            anchor,
+            root_path,
+            split_bits: progress.split_bits,
+            chunk_limit: progress.chunk_limit.max(1),
+            sub_ranges,
+            staged_bytes: progress.staged_bytes,
+        }
+    }
+
     /// Emit a request for every idle sub-range, marking each in flight.
     /// Returned pairs are `(sub_range id, request)`; the driver answers
     /// through [`Self::on_response`] / [`Self::on_failure`] with the id.

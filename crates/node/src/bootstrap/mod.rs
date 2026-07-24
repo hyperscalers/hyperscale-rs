@@ -28,7 +28,9 @@ pub mod witness_history;
 pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
-use hyperscale_storage::{GenesisCommit, RecoveredState, ShardChainReader, WitnessSeed};
+use hyperscale_storage::{
+    GenesisCommit, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
+};
 use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
 use hyperscale_types::network::response::{
     GetStateRangeResponse, GetWitnessHistoryResponse, MAX_LEAVES_PER_STATE_RANGE,
@@ -168,6 +170,9 @@ pub struct ShardBootstrap {
     /// The verified witness window; set when the witness phase
     /// completes, its payloads move into the import.
     witness: Option<VerifiedWitnessWindow>,
+    /// A resumed assembly's restored progress, consumed when the
+    /// witness phase completes to seed the state fan-out's cursors.
+    resume: Option<ImportProgress>,
     /// Total value bytes across the chunks handed to the driver for
     /// staging — the imported substate byte total, identical to the
     /// total the store seeds at the anchor height. Seeds the recovered
@@ -189,8 +194,42 @@ impl ShardBootstrap {
                 WITNESS_PAGE_LIMIT,
             ))),
             witness: None,
+            resume: None,
             imported_substate_bytes: 0,
         }
+    }
+
+    /// Resume a bootstrap whose staged assembly carried through a
+    /// restart, or `None` when `progress` does not bind this anchor and
+    /// fetch geometry — staged chunks are proven against one exact
+    /// `state_root`, so a mismatched record must be wiped and the
+    /// assembly started fresh.
+    ///
+    /// The witness phase always re-runs: it is a bounded page fetch
+    /// whose verified window lives only in sequencer memory. The state
+    /// fan-out then re-arms at the restored cursors, refetching nothing
+    /// already staged.
+    #[must_use]
+    pub fn resume(shard: ShardId, anchor: ShardAnchor, progress: ImportProgress) -> Option<Self> {
+        let binds = progress.anchor_height == anchor.height
+            && progress.anchor_state_root == anchor.state_root
+            && progress.split_bits == SPLIT_BITS
+            && progress.chunk_limit == STATE_CHUNK_LIMIT
+            && progress.cursors.len() == 1usize << SPLIT_BITS;
+        if !binds {
+            return None;
+        }
+        Some(Self {
+            shard,
+            anchor,
+            phase: Phase::Witness(Box::new(WitnessHistorySync::new(
+                anchor,
+                WITNESS_PAGE_LIMIT,
+            ))),
+            witness: None,
+            imported_substate_bytes: progress.staged_bytes,
+            resume: Some(progress),
+        })
     }
 
     /// Start a state-only assembly against `anchor` — no witness
@@ -209,6 +248,7 @@ impl ShardBootstrap {
                 STATE_CHUNK_LIMIT,
             )),
             witness: None,
+            resume: None,
             imported_substate_bytes: 0,
         }
     }
@@ -217,6 +257,13 @@ impl ShardBootstrap {
     #[must_use]
     pub const fn anchor(&self) -> ShardAnchor {
         self.anchor
+    }
+
+    /// Total value bytes across the chunks staged so far — restored
+    /// staging included on a resumed assembly.
+    #[must_use]
+    pub const fn imported_substate_bytes(&self) -> u64 {
+        self.imported_substate_bytes
     }
 
     /// Every request the current phase wants in flight. Empty while
@@ -335,12 +382,26 @@ impl ShardBootstrap {
                 qc: Box::new(qc),
                 payloads,
             });
-            self.phase = Phase::State(SnapSync::new(
-                self.anchor,
-                shard_prefix_path(self.shard),
-                SPLIT_BITS,
-                STATE_CHUNK_LIMIT,
-            ));
+            let snap = match self.resume.take() {
+                Some(progress) => {
+                    SnapSync::with_cursors(self.anchor, shard_prefix_path(self.shard), &progress)
+                }
+                None => SnapSync::new(
+                    self.anchor,
+                    shard_prefix_path(self.shard),
+                    SPLIT_BITS,
+                    STATE_CHUNK_LIMIT,
+                ),
+            };
+            // A resumed assembly that had already staged every sub-range
+            // goes straight to the finalize — no state response will
+            // ever arrive to drive the transition.
+            if snap.is_complete() {
+                self.imported_substate_bytes = snap.staged_bytes();
+                self.phase = Phase::FinalizeReady;
+            } else {
+                self.phase = Phase::State(snap);
+            }
         }
         outcome
     }
@@ -407,7 +468,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_storage::test_helpers::{pin_snap_sync_replica, stake_deposit};
-    use hyperscale_storage::{BoundaryStore, PendingChain, SubstateStore};
+    use hyperscale_storage::{BoundaryStore, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::ShardWitnessPayload;
 
@@ -506,6 +567,183 @@ mod tests {
             fresh.load_recovered_state().beacon_witness_leaf_hashes,
             expected_hashes,
         );
+    }
+
+    /// Drive `bootstrap` until its witness phase completes and the
+    /// state fan-out's first round of requests is out, returning them.
+    fn drive_to_state_requests(
+        bootstrap: &mut ShardBootstrap,
+        pending_chain: &PendingChain<SimShardStorage>,
+    ) -> Vec<(usize, GetStateRangeRequest)> {
+        for _ in 0..1_000 {
+            let requests = bootstrap.next_requests();
+            if requests.is_empty() {
+                continue;
+            }
+            let mut state = Vec::new();
+            for request in requests {
+                match request {
+                    BootstrapRequest::WitnessHistory(request) => {
+                        let response = serve_witness_history_request(pending_chain, &request);
+                        assert_eq!(
+                            bootstrap.on_witness_history(&response),
+                            BootstrapOutcome::Accepted,
+                        );
+                    }
+                    BootstrapRequest::StateRange(id, request) => state.push((id, request)),
+                }
+            }
+            if !state.is_empty() {
+                return state;
+            }
+        }
+        panic!("state fan-out never opened");
+    }
+
+    /// A restart mid-assembly resumes from the durable progress record:
+    /// finished sub-ranges are not refetched, the byte tally carries
+    /// over, and the finalize reproduces the attested root.
+    #[test]
+    fn interrupted_assembly_resumes_without_refetching() {
+        let (serving, anchor) = replica(&[]);
+        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let fresh = Arc::new(SimShardStorage::default());
+
+        // First process: witness, then stage exactly two sub-ranges of
+        // the fan-out before "crashing" (the sequencer is dropped; the
+        // staged chunks and progress record survive in the store).
+        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor);
+        let requests = drive_to_state_requests(&mut first, &pending_chain);
+        assert_eq!(requests.len(), 1 << SPLIT_BITS);
+        for (id, request) in requests.into_iter().take(2) {
+            let response = serve_state_range_request(&serving, &request);
+            match first.on_state_range(id, &response) {
+                StateRangeOutcome::Staged { leaves, progress } => {
+                    fresh.stage_import_chunk(&progress, &leaves).unwrap();
+                }
+                StateRangeOutcome::Rejected(reason) => panic!("rejected: {reason}"),
+            }
+        }
+        drop(first);
+
+        let progress = fresh.read_import_progress().expect("progress persisted");
+        let done = progress.cursors.iter().filter(|c| c.done).count();
+        assert_eq!(done, 2, "each answered sub-range exhausted in one chunk");
+
+        // Second process: resume from the record. The witness re-runs;
+        // the state fan-out re-arms only the unfinished sub-ranges.
+        let mut resumed =
+            ShardBootstrap::resume(ShardId::ROOT, anchor, progress).expect("progress binds");
+        let requests = drive_to_state_requests(&mut resumed, &pending_chain);
+        assert_eq!(requests.len(), (1 << SPLIT_BITS) - 2);
+        for (id, request) in requests {
+            let response = serve_state_range_request(&serving, &request);
+            match resumed.on_state_range(id, &response) {
+                StateRangeOutcome::Staged { leaves, progress } => {
+                    fresh.stage_import_chunk(&progress, &leaves).unwrap();
+                }
+                StateRangeOutcome::Rejected(reason) => panic!("rejected: {reason}"),
+            }
+        }
+        let (height, witnesses) = resumed.take_finalize().expect("assembly complete");
+        let root = fresh.finalize_boundary_import(height, witnesses).unwrap();
+        resumed.on_imported(root).unwrap();
+
+        let recovered = resumed.into_recovered_state();
+        assert_eq!(recovered.jmt_root, Some(anchor.state_root));
+        assert_eq!(fresh.state_root(), anchor.state_root);
+        // The byte frontier covers the pre-crash chunks too.
+        assert_eq!(
+            recovered.substate_bytes,
+            fresh
+                .substate_bytes_at_version(anchor.height.inner())
+                .unwrap(),
+        );
+    }
+
+    /// A resumed assembly that had already staged every sub-range goes
+    /// straight to the finalize once the witness re-runs.
+    #[test]
+    fn fully_staged_assembly_resumes_straight_to_finalize() {
+        let (serving, anchor) = replica(&[]);
+        let pending_chain = PendingChain::new(Arc::clone(&serving));
+        let fresh = Arc::new(SimShardStorage::default());
+
+        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor);
+        let requests = drive_to_state_requests(&mut first, &pending_chain);
+        for (id, request) in requests {
+            let response = serve_state_range_request(&serving, &request);
+            if let StateRangeOutcome::Staged { leaves, progress } =
+                first.on_state_range(id, &response)
+            {
+                fresh.stage_import_chunk(&progress, &leaves).unwrap();
+            }
+        }
+        // Crash after the last chunk staged, before the finalize.
+        drop(first);
+
+        let progress = fresh.read_import_progress().expect("progress persisted");
+        let mut resumed =
+            ShardBootstrap::resume(ShardId::ROOT, anchor, progress).expect("progress binds");
+        // Witness re-runs; the completed fan-out surfaces the finalize
+        // without emitting a single state request.
+        for _ in 0..1_000 {
+            if let Some((height, witnesses)) = resumed.take_finalize() {
+                let root = fresh.finalize_boundary_import(height, witnesses).unwrap();
+                resumed.on_imported(root).unwrap();
+                break;
+            }
+            for request in resumed.next_requests() {
+                let BootstrapRequest::WitnessHistory(request) = request else {
+                    panic!("a fully staged resume must not refetch state");
+                };
+                let response = serve_witness_history_request(&pending_chain, &request);
+                resumed.on_witness_history(&response);
+            }
+        }
+        assert!(resumed.is_complete());
+        assert_eq!(fresh.state_root(), anchor.state_root);
+    }
+
+    /// A progress record that does not bind the attested anchor or the
+    /// current fetch geometry refuses to resume — the caller wipes.
+    #[test]
+    fn mismatched_progress_refuses_to_resume() {
+        let (_, anchor) = replica(&[]);
+        let binding = ImportProgress {
+            anchor_height: anchor.height,
+            anchor_state_root: anchor.state_root,
+            split_bits: SPLIT_BITS,
+            chunk_limit: STATE_CHUNK_LIMIT,
+            staged_bytes: 0,
+            cursors: vec![
+                ImportCursor {
+                    next: [0u8; 32],
+                    end: [0xFF; 32],
+                    done: false,
+                };
+                1 << SPLIT_BITS
+            ],
+        };
+        assert!(ShardBootstrap::resume(ShardId::ROOT, anchor, binding.clone()).is_some());
+
+        let stale_root = ImportProgress {
+            anchor_state_root: StateRoot::from_raw(Hash::from_bytes(b"older anchor")),
+            ..binding.clone()
+        };
+        assert!(ShardBootstrap::resume(ShardId::ROOT, anchor, stale_root).is_none());
+
+        let stale_height = ImportProgress {
+            anchor_height: BlockHeight::new(anchor.height.inner() + 1),
+            ..binding.clone()
+        };
+        assert!(ShardBootstrap::resume(ShardId::ROOT, anchor, stale_height).is_none());
+
+        let changed_geometry = ImportProgress {
+            chunk_limit: STATE_CHUNK_LIMIT + 1,
+            ..binding
+        };
+        assert!(ShardBootstrap::resume(ShardId::ROOT, anchor, changed_geometry).is_none());
     }
 
     /// A diverging import root is terminal: the store holds an import
