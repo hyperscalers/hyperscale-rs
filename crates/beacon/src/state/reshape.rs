@@ -1404,6 +1404,65 @@ mod tests {
         assert!(!state.miss_counters.contains_key(&keeper_ids[0]));
     }
 
+    /// Jailing a parent member of a splitting shard leaves the freed
+    /// slot open: a pool refill would seat `ready: false`, and the
+    /// split gate's parent-half filter would count it as a ready half
+    /// member — the same wedge rotation guards against. The gate then
+    /// runs on honest counts and still executes.
+    #[test]
+    fn jailed_parent_member_of_a_splitting_shard_is_not_refilled() {
+        use hyperscale_types::JailReason;
+
+        use crate::state::vrf::jail_validator;
+
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(6);
+        apply_shard_payload(
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        assert_eq!(state.pooled_validators().len(), 2);
+
+        jail_validator(
+            &mut state,
+            ValidatorId::new(0),
+            JailReason::Performance,
+            Epoch::new(5),
+        );
+
+        // The committee shrank, the spares stayed pooled, and no unready
+        // member was seated on the splitting parent.
+        let members = state.next_shard_committees[&p].members.clone();
+        assert_eq!(members.len(), 7);
+        assert!(!members.contains(&ValidatorId::new(0)));
+        assert_eq!(state.pooled_validators().len(), 2);
+        for id in &members {
+            let status = state.validators[id].status;
+            assert!(
+                !matches!(status, ValidatorStatus::OnShard { ready: false, .. }),
+                "unready refill seated on a splitting parent: {status:?}"
+            );
+        }
+
+        // Halves are 2 + 1 of the three remaining parent members; with
+        // every observer readied each child clears quorum (left 2 + 2,
+        // right 1 + 2 against 2f+1 = 3) and the split executes.
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for id in observers {
+            mark_ready(&mut state, p, id);
+        }
+        execute_ready_splits(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+        assert_eq!(
+            state.next_shard_committees[&left].members.len()
+                + state.next_shard_committees[&right].members.len(),
+            7,
+        );
+    }
+
     /// Jailing a keeper sheds its seat from the pending merge, so the
     /// dead seat neither counts toward the readiness quorum nor reaches
     /// the keeper move when the merge executes.

@@ -59,7 +59,9 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardId) -> Option<ValidatorId>
 /// Clean up after a validator leaves its prior placement: drop the
 /// per-placement [`BeaconState::miss_counters`] entry and, when they
 /// were `OnShard`, remove them from that shard's committee and draw a
-/// pool refill onto it via [`pool_draw`].
+/// pool refill onto it via [`pool_draw`] — unless the shard has a
+/// pending split, whose gate would miscount an unready refill as a
+/// ready parent-half member.
 ///
 /// The caller writes the validator's new status first and passes the
 /// status it held immediately before as `prior`. An `OnShard`
@@ -93,7 +95,19 @@ pub(super) fn exit_placement(
             {
                 keepers.remove(&validator);
             }
-            pool_draw(state, shard);
+            // A pending split's parent members all carry to its children
+            // as parent halves, ready by construction — the readiness the
+            // split gate trusts. A refill seats `ready: false`, which the
+            // parent-half filter would still count as a ready half member,
+            // so the slot stays open until the split executes or lapses
+            // (the next top-up refills it) — the same guard rotation
+            // applies to a splitting shard.
+            if !matches!(
+                state.pending_reshapes.get(&shard),
+                Some(PendingReshape::Split { .. })
+            ) {
+                pool_draw(state, shard);
+            }
         }
         ValidatorStatus::Observing { shard, .. } => {
             if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
