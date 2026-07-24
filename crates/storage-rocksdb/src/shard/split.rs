@@ -479,6 +479,7 @@ impl TreeReader for PreRootStore<'_> {
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher, Key, NibblePath};
+    use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{BoundaryStore, ImportLeaf, WitnessSeed};
     use hyperscale_types::{BlockHash, BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
     use tempfile::TempDir;
@@ -505,13 +506,13 @@ mod tests {
     /// one right-side leaf, committed at height 9.
     fn parent_store(dir: &Path) -> RocksDbShardStorage {
         let storage = RocksDbShardStorage::open(dir, NibblePath::empty()).unwrap();
-        storage
-            .import_boundary_state(
-                BlockHeight::new(9),
-                vec![leaf(0x00), leaf(0x01), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        import_boundary_state(
+            &storage,
+            BlockHeight::new(9),
+            &[leaf(0x00), leaf(0x01), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         storage
     }
 
@@ -669,13 +670,13 @@ mod tests {
         let parent = RocksDbShardStorage::open(parent_dir.path(), NibblePath::empty()).unwrap();
         // The committed version (12) sits above the child genesis height (10) —
         // the coast a make-before-break predecessor runs past its cut.
-        parent
-            .import_boundary_state(
-                BlockHeight::new(12),
-                vec![leaf(0x00), leaf(0x01), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        import_boundary_state(
+            &parent,
+            BlockHeight::new(12),
+            &[leaf(0x00), leaf(0x01), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         let (parent_version, _) = parent.read_jmt_metadata();
         assert_eq!(parent_version, 12);
 
@@ -736,13 +737,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDbShardStorage::open(dir.path(), NibblePath::empty()).unwrap();
         // One leaf on each half so the root is the merged internal node.
-        let root = storage
-            .import_boundary_state(
-                BlockHeight::new(10),
-                vec![leaf(0x00), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        let root = import_boundary_state(
+            &storage,
+            BlockHeight::new(10),
+            &[leaf(0x00), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         assert_ne!(root, StateRoot::ZERO);
 
         let genesis = merge_genesis(root);
@@ -762,13 +763,13 @@ mod tests {
         // A genesis claiming a different root fails closed.
         let dir2 = TempDir::new().unwrap();
         let other = RocksDbShardStorage::open(dir2.path(), NibblePath::empty()).unwrap();
-        other
-            .import_boundary_state(
-                BlockHeight::new(10),
-                vec![leaf(0x00), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        import_boundary_state(
+            &other,
+            BlockHeight::new(10),
+            &[leaf(0x00), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         let wrong = merge_genesis(StateRoot::from_raw(Hash::from_bytes(b"forged")));
         assert!(other.adopt_merge_parent(origin, &wrong).is_err());
     }
@@ -780,13 +781,13 @@ mod tests {
         let parent_dir = TempDir::new().unwrap();
         let storage = RocksDbShardStorage::open(parent_dir.path(), NibblePath::empty()).unwrap();
         // Both leaves on the left: the right child is empty.
-        storage
-            .import_boundary_state(
-                BlockHeight::new(9),
-                vec![leaf(0x00), leaf(0x01)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        import_boundary_state(
+            &storage,
+            BlockHeight::new(9),
+            &[leaf(0x00), leaf(0x01)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
 
         let child_dir = TempDir::new().unwrap();
         let target = child_dir.path().join("store");

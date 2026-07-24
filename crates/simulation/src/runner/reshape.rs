@@ -115,16 +115,24 @@ impl SimulationRunner {
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
             }
-            ReshapeRequest::ImportBoundary {
+            ReshapeRequest::StageChunk {
                 shard,
-                height,
+                progress,
                 leaves,
             } => {
+                self.reshape_stores
+                    .get(&(host, shard))?
+                    .storage
+                    .stage_import_chunk(&progress, &leaves)
+                    .expect("chunk staging into the opened store");
+                Some(ReshapeEvent::Staged { shard })
+            }
+            ReshapeRequest::FinalizeImport { shard, height } => {
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .import_boundary_state(height, leaves, WitnessSeed::default())
+                    .finalize_boundary_import(height, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
                 Some(ReshapeEvent::Imported { shard, root })
             }

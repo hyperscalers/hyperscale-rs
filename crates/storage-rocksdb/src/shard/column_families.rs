@@ -118,6 +118,17 @@ pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
 /// leaves the process.
 pub const SAFE_VOTE_REGISTERS_CF: &str = "safe_vote_registers";
 
+/// Column family staging verified snap-sync chunks before finalize.
+///
+/// Key: the 32-byte hashed JMT leaf key — the bytewise comparator makes
+/// a full scan leaf-sorted, which the chunked finalize build relies on.
+/// Value: `[storage_key_len_BE_4B][storage_key][value]` — the raw
+/// substate pair the leaf binds. Written one atomic batch per verified
+/// chunk together with the import progress record in the default CF;
+/// the store proper is untouched until `finalize_boundary_import`
+/// builds the state from the staged leaves and clears this CF.
+pub const IMPORT_STAGING_CF: &str = "import_staging";
+
 /// Column family mapping hashed JMT leaf keys back to raw substate
 /// storage keys.
 ///
@@ -156,6 +167,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     LEAF_ASSOCIATIONS_CF,
     SUBSTATE_BYTES_CF,
     SAFE_VOTE_REGISTERS_CF,
+    IMPORT_STAGING_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -182,6 +194,7 @@ pub struct CfHandles<'a> {
     leaf_associations: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
+    import_staging: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -210,6 +223,7 @@ impl<'a> CfHandles<'a> {
             leaf_associations: resolve(LEAF_ASSOCIATIONS_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
+            import_staging: resolve(IMPORT_STAGING_CF),
         }
     }
 }
@@ -310,6 +324,44 @@ impl TypedCf for LeafAssociationsCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.leaf_associations
+    }
+}
+
+/// Value codec for [`ImportStagingCf`]: the staged raw substate pair,
+/// packed as `[storage_key_len_BE_4B][storage_key][value]`.
+#[derive(Default)]
+pub struct StagedLeafCodec;
+
+impl DbEncode<(Vec<u8>, Vec<u8>)> for StagedLeafCodec {
+    fn encode_to(&self, value: &(Vec<u8>, Vec<u8>), buf: &mut Vec<u8>) {
+        let len = u32::try_from(value.0.len()).expect("storage key length fits in u32");
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&value.0);
+        buf.extend_from_slice(&value.1);
+    }
+}
+
+impl DbCodec<(Vec<u8>, Vec<u8>)> for StagedLeafCodec {
+    fn decode(&self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let len_bytes: [u8; 4] = bytes[..4]
+            .try_into()
+            .expect("staged leaf must carry a length prefix");
+        let split = 4 + u32::from_be_bytes(len_bytes) as usize;
+        (bytes[4..split].to_vec(), bytes[split..].to_vec())
+    }
+}
+
+/// Staged snap-sync leaves awaiting finalize; see [`IMPORT_STAGING_CF`].
+pub struct ImportStagingCf;
+impl TypedCf for ImportStagingCf {
+    const NAME: &'static str = IMPORT_STAGING_CF;
+    type Key = Hash; // 32-byte hashed JMT leaf key
+    type Value = (Vec<u8>, Vec<u8>); // (raw storage key, raw value)
+    type KeyCodec = HashCodec;
+    type ValueCodec = StagedLeafCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.import_staging
     }
 }
 

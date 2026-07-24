@@ -8,6 +8,7 @@
 
 use std::marker::PhantomData;
 
+use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::{
     BlockHeight, ChainOrigin, Hash, QuorumCertificate, StateRoot, WeightedTimestamp,
 };
@@ -591,6 +592,76 @@ impl MetadataEntry for ChainOriginEntry {
     const KEY: &'static [u8] = b"chain:origin";
     type Value = ChainOrigin;
     type Codec = ChainOriginCodec;
+}
+
+/// The staged snap-sync import's progress record, written atomically
+/// with every staged chunk and deleted by wipe / finalize.
+pub struct ImportProgressEntry;
+impl MetadataEntry for ImportProgressEntry {
+    const KEY: &'static [u8] = b"import:progress";
+    type Value = ImportProgress;
+    type Codec = ImportProgressCodec;
+}
+
+/// Import-progress codec — packed
+/// `[anchor_height_BE_8B][anchor_root_32B][split_bits_1B][chunk_limit_BE_4B]`
+/// `[staged_bytes_BE_8B]` then per cursor `[next_32B][end_32B][done_1B]`.
+#[derive(Default)]
+pub struct ImportProgressCodec;
+
+/// Fixed prefix ahead of the cursor list.
+const IMPORT_PROGRESS_HEADER: usize = 8 + 32 + 1 + 4 + 8;
+/// Packed size of one cursor record.
+const IMPORT_CURSOR_BYTES: usize = 32 + 32 + 1;
+
+impl DbEncode<ImportProgress> for ImportProgressCodec {
+    fn encode_to(&self, value: &ImportProgress, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.anchor_height.inner().to_be_bytes());
+        buf.extend_from_slice(&value.anchor_state_root.as_raw().to_bytes());
+        buf.push(value.split_bits);
+        buf.extend_from_slice(&value.chunk_limit.to_be_bytes());
+        buf.extend_from_slice(&value.staged_bytes.to_be_bytes());
+        for cursor in &value.cursors {
+            buf.extend_from_slice(&cursor.next);
+            buf.extend_from_slice(&cursor.end);
+            buf.push(u8::from(cursor.done));
+        }
+    }
+}
+
+impl DbCodec<ImportProgress> for ImportProgressCodec {
+    fn decode(&self, bytes: &[u8]) -> ImportProgress {
+        assert!(
+            bytes.len() >= IMPORT_PROGRESS_HEADER
+                && (bytes.len() - IMPORT_PROGRESS_HEADER).is_multiple_of(IMPORT_CURSOR_BYTES),
+            "import progress record has a malformed length",
+        );
+        let anchor_height = BlockHeight::new(u64::from_be_bytes(
+            bytes[..8].try_into().expect("length checked above"),
+        ));
+        let anchor_state_root = StateRoot::from_raw(Hash::from_hash_bytes(&bytes[8..40]));
+        let split_bits = bytes[40];
+        let chunk_limit =
+            u32::from_be_bytes(bytes[41..45].try_into().expect("length checked above"));
+        let staged_bytes =
+            u64::from_be_bytes(bytes[45..53].try_into().expect("length checked above"));
+        let cursors = bytes[IMPORT_PROGRESS_HEADER..]
+            .chunks_exact(IMPORT_CURSOR_BYTES)
+            .map(|chunk| ImportCursor {
+                next: chunk[..32].try_into().expect("chunk is 65 bytes"),
+                end: chunk[32..64].try_into().expect("chunk is 65 bytes"),
+                done: chunk[64] != 0,
+            })
+            .collect();
+        ImportProgress {
+            anchor_height,
+            anchor_state_root,
+            split_bits,
+            chunk_limit,
+            staged_bytes,
+            cursors,
+        }
+    }
 }
 
 /// Chain-origin codec — packed 16-byte format:

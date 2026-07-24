@@ -3,15 +3,21 @@
 //! A vnode joining a shard bootstraps the shard's committed state
 //! against its beacon-attested boundary anchor: the shard's key span is
 //! partitioned into disjoint sub-ranges fetched from serving peers in
-//! parallel, every chunk is verified against the anchor's `state_root`
-//! before it is kept, and the accumulated leaves feed
-//! `BoundaryStore::import_boundary_state` — whose returned root the
-//! driver compares against the anchor before trusting the store.
+//! parallel, and every chunk is verified against the anchor's
+//! `state_root` before it is kept. Verified chunks stream straight back
+//! to the driver ([`StateRangeOutcome::Staged`]) with a progress
+//! snapshot, to be persisted atomically via
+//! `BoundaryStore::stage_import_chunk` — the assembler holds no leaf
+//! buffer, so memory stays bounded by one wire chunk regardless of
+//! shard size. Once every sub-range is exhausted the driver finalizes
+//! the staged state and compares the resulting root against the anchor
+//! before trusting the store.
 //!
 //! Sans-io: [`SnapSync`] emits [`GetStateRangeRequest`]s and consumes
-//! responses; the driver owns peer selection, transport, and retry
-//! pacing. A rejected or failed chunk simply re-arms its sub-range, so
-//! retrying against a different peer is the driver rotating who it asks.
+//! responses; the driver owns peer selection, transport, retry pacing,
+//! and the staging writes. A rejected or failed chunk simply re-arms
+//! its sub-range, so retrying against a different peer is the driver
+//! rotating who it asks.
 //!
 //! # Chunk verification
 //!
@@ -29,15 +35,31 @@
 use hyperscale_jmt::{
     Blake3Hasher, Key, MultiProof, NibblePath, RangeChunk, Tree, next_key, subspan,
 };
-use hyperscale_storage::ImportLeaf;
+use hyperscale_storage::{ImportCursor, ImportLeaf, ImportProgress};
 use hyperscale_types::network::request::GetStateRangeRequest;
 use hyperscale_types::network::response::{GetStateRangeResponse, StateRangeChunk};
 use hyperscale_types::state_key::{jmt_value_hash, leaf_key_binds_storage_key};
 use hyperscale_types::{Hash, ShardAnchor};
 
-use super::BootstrapOutcome;
-
 type Jmt = Tree<Blake3Hasher, 1>;
+
+/// Outcome of feeding one state-range response into [`SnapSync`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum StateRangeOutcome {
+    /// Chunk verified; the driver persists it atomically via
+    /// `BoundaryStore::stage_import_chunk` before pumping further
+    /// responses — the progress snapshot already covers this chunk's
+    /// cursor advance and byte tally.
+    Staged {
+        /// The chunk's verified leaves.
+        leaves: Vec<ImportLeaf>,
+        /// The assembly's progress after absorbing this chunk.
+        progress: ImportProgress,
+    },
+    /// Response rejected; the sub-range re-arms and the driver should
+    /// penalize the peer and rotate.
+    Rejected(&'static str),
+}
 
 /// One partitioned sub-range of the shard's key span.
 #[derive(Debug)]
@@ -63,9 +85,12 @@ enum SubRangeState {
 pub struct SnapSync {
     anchor: ShardAnchor,
     root_path: NibblePath,
+    split_bits: u8,
     chunk_limit: u32,
     sub_ranges: Vec<SubRange>,
-    leaves: Vec<ImportLeaf>,
+    /// Leaf value bytes across every chunk handed to the driver for
+    /// staging — the imported substate byte total once complete.
+    staged_bytes: u64,
 }
 
 impl SnapSync {
@@ -120,9 +145,10 @@ impl SnapSync {
         Self {
             anchor,
             root_path,
+            split_bits,
             chunk_limit: chunk_limit.max(1),
             sub_ranges,
-            leaves: Vec::new(),
+            staged_bytes: 0,
         }
     }
 
@@ -162,7 +188,8 @@ impl SnapSync {
         }
     }
 
-    /// Verify and absorb one response for `sub_range`.
+    /// Verify one response for `sub_range`, returning its leaves and a
+    /// progress snapshot for the driver to persist.
     ///
     /// # Panics
     ///
@@ -171,15 +198,15 @@ impl SnapSync {
         &mut self,
         sub_range: usize,
         response: &GetStateRangeResponse,
-    ) -> BootstrapOutcome {
+    ) -> StateRangeOutcome {
         let sub = &mut self.sub_ranges[sub_range];
         if sub.state != SubRangeState::InFlight {
-            return BootstrapOutcome::Rejected("unsolicited response");
+            return StateRangeOutcome::Rejected("unsolicited response");
         }
         sub.state = SubRangeState::Idle;
 
         let Some(chunk) = &response.chunk else {
-            return BootstrapOutcome::Rejected("boundary unavailable at peer");
+            return StateRangeOutcome::Rejected("boundary unavailable at peer");
         };
         let verified = match verify_chunk(
             self.anchor.state_root.as_raw().as_bytes(),
@@ -189,7 +216,7 @@ impl SnapSync {
             chunk,
         ) {
             Ok(verified) => verified,
-            Err(reason) => return BootstrapOutcome::Rejected(reason),
+            Err(reason) => return StateRangeOutcome::Rejected(reason),
         };
 
         if chunk.more {
@@ -208,8 +235,11 @@ impl SnapSync {
         } else {
             sub.state = SubRangeState::Done;
         }
-        self.leaves.extend(verified);
-        BootstrapOutcome::Accepted
+        self.staged_bytes += verified.iter().map(|l| l.value.len() as u64).sum::<u64>();
+        StateRangeOutcome::Staged {
+            leaves: verified,
+            progress: self.progress(),
+        }
     }
 
     /// Whether every sub-range is exhausted.
@@ -220,20 +250,32 @@ impl SnapSync {
             .all(|sub| sub.state == SubRangeState::Done)
     }
 
-    /// Take the verified leaves, ready for
-    /// `BoundaryStore::import_boundary_state`.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless [`Self::is_complete`] — a partial import would
-    /// produce a root that can never match the anchor.
+    /// Leaf value bytes across every chunk handed to the driver for
+    /// staging.
     #[must_use]
-    pub fn take_leaves(&mut self) -> Vec<ImportLeaf> {
-        assert!(
-            self.is_complete(),
-            "snap-sync leaves taken before assembly completed",
-        );
-        std::mem::take(&mut self.leaves)
+    pub const fn staged_bytes(&self) -> u64 {
+        self.staged_bytes
+    }
+
+    /// The assembly's durable progress record: anchor binding, fetch
+    /// geometry, byte tally, and per-sub-range cursors.
+    fn progress(&self) -> ImportProgress {
+        ImportProgress {
+            anchor_height: self.anchor.height,
+            anchor_state_root: self.anchor.state_root,
+            split_bits: self.split_bits,
+            chunk_limit: self.chunk_limit,
+            staged_bytes: self.staged_bytes,
+            cursors: self
+                .sub_ranges
+                .iter()
+                .map(|sub| ImportCursor {
+                    next: sub.cursor,
+                    end: sub.end,
+                    done: sub.state == SubRangeState::Done,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -302,12 +344,15 @@ mod tests {
     }
 
     /// Drive the assembly to completion, serving each request from the
-    /// peer `pick` selects (by sub-range id and attempt count).
+    /// peer `pick` selects (by sub-range id and attempt count) and
+    /// staging every verified chunk into `fresh`. Returns how many
+    /// responses were rejected.
     fn drive(
         sync: &mut SnapSync,
+        fresh: &SimShardStorage,
         pick: impl Fn(usize, usize) -> Arc<SimShardStorage>,
-    ) -> Vec<BootstrapOutcome> {
-        let mut outcomes = Vec::new();
+    ) -> usize {
+        let mut rejected = 0;
         let mut attempts = vec![0usize; sync.sub_ranges.len()];
         for _ in 0..1_000 {
             let requests = sync.next_requests();
@@ -318,10 +363,15 @@ mod tests {
                 let peer = pick(id, attempts[id]);
                 attempts[id] += 1;
                 let response = serve_state_range_request(&peer, &request);
-                outcomes.push(sync.on_response(id, &response));
+                match sync.on_response(id, &response) {
+                    StateRangeOutcome::Staged { leaves, progress } => {
+                        fresh.stage_import_chunk(&progress, &leaves).unwrap();
+                    }
+                    StateRangeOutcome::Rejected(_) => rejected += 1,
+                }
             }
         }
-        outcomes
+        rejected
     }
 
     /// A joiner reconstructs the shard's full committed state from two
@@ -333,23 +383,22 @@ mod tests {
 
         // Four sub-ranges, chunks of two: pagination and fan-out both
         // exercised; requests alternate between the two peers.
+        let fresh = SimShardStorage::default();
         let mut sync = SnapSync::new(anchor, NibblePath::empty(), 2, 2);
-        let outcomes = drive(&mut sync, |id, attempt| {
+        let rejected = drive(&mut sync, &fresh, |id, attempt| {
             if (id + attempt) % 2 == 0 {
                 Arc::clone(&peer_a)
             } else {
                 Arc::clone(&peer_b)
             }
         });
-        assert!(outcomes.iter().all(|o| *o == BootstrapOutcome::Accepted));
+        assert_eq!(rejected, 0);
         assert!(sync.is_complete());
+        // Every replica entry staged: 3 value bytes per seed.
+        assert_eq!(sync.staged_bytes(), u64::from(ENTRIES) * 3);
 
-        let leaves = sync.take_leaves();
-        assert_eq!(leaves.len(), usize::from(ENTRIES));
-
-        let fresh = SimShardStorage::default();
         let imported_root = fresh
-            .import_boundary_state(anchor.height, leaves, WitnessSeed::default())
+            .finalize_boundary_import(anchor.height, WitnessSeed::default())
             .unwrap();
         assert_eq!(imported_root, anchor.state_root);
     }
@@ -376,24 +425,20 @@ mod tests {
             Arc::new(storage)
         };
 
+        let fresh = SimShardStorage::default();
         let mut sync = SnapSync::new(anchor, NibblePath::empty(), 1, 100);
-        let outcomes = drive(&mut sync, |_, attempt| {
+        let rejected = drive(&mut sync, &fresh, |_, attempt| {
             if attempt == 0 {
                 Arc::clone(&byzantine)
             } else {
                 Arc::clone(&honest)
             }
         });
-        assert!(
-            outcomes
-                .iter()
-                .any(|o| matches!(o, BootstrapOutcome::Rejected(_)))
-        );
+        assert!(rejected > 0);
         assert!(sync.is_complete());
 
-        let fresh = SimShardStorage::default();
         let imported_root = fresh
-            .import_boundary_state(anchor.height, sync.take_leaves(), WitnessSeed::default())
+            .finalize_boundary_import(anchor.height, WitnessSeed::default())
             .unwrap();
         assert_eq!(imported_root, anchor.state_root);
     }
@@ -410,7 +455,7 @@ mod tests {
 
         assert!(matches!(
             sync.on_response(id, &response),
-            BootstrapOutcome::Rejected(_)
+            StateRangeOutcome::Rejected(_)
         ));
         assert!(!sync.is_complete());
     }
@@ -430,7 +475,7 @@ mod tests {
 
         assert!(matches!(
             sync.on_response(id, &response),
-            BootstrapOutcome::Rejected(_)
+            StateRangeOutcome::Rejected(_)
         ));
     }
 
@@ -444,12 +489,12 @@ mod tests {
         let unavailable = GetStateRangeResponse { chunk: None };
         assert!(matches!(
             sync.on_response(id, &unavailable),
-            BootstrapOutcome::Rejected(_)
+            StateRangeOutcome::Rejected(_)
         ));
 
         // The retry against the live peer completes the assembly.
-        let outcomes = drive(&mut sync, |_, _| Arc::clone(&peer));
-        assert!(outcomes.iter().all(|o| *o == BootstrapOutcome::Accepted));
+        let fresh = SimShardStorage::default();
+        assert_eq!(drive(&mut sync, &fresh, |_, _| Arc::clone(&peer)), 0);
         assert!(sync.is_complete());
     }
 }

@@ -8,15 +8,15 @@
 //! `state_history` to find the smallest write after V; its prior value
 //! is the state at V.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::NibblePath;
+use hyperscale_jmt::{Key, NibblePath};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, PartitionEntry,
-    RecoveredState, SubstateDatabase, SubstateStore,
+    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, ImportProgress,
+    PartitionEntry, RecoveredState, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, NodeId, QuorumCertificate, StateRoot, Verified,
@@ -69,6 +69,18 @@ pub struct SimShardStorage {
     /// kept under the production ring's retention so eviction behaviour
     /// is observable in simulation too.
     pub(crate) boundary_pins: Arc<RwLock<BTreeSet<BlockHeight>>>,
+
+    /// Staged snap-sync chunks awaiting finalize, keyed by leaf key so
+    /// iteration is leaf-sorted, plus the import's progress record.
+    pub(crate) import_staging: Arc<RwLock<SimImportStaging>>,
+}
+
+/// Staged snap-sync import state: verified chunks and the progress
+/// record bound to them.
+#[derive(Default)]
+pub struct SimImportStaging {
+    pub(crate) progress: Option<ImportProgress>,
+    pub(crate) leaves: BTreeMap<Key, (Vec<u8>, Vec<u8>)>,
 }
 
 impl Default for SimShardStorage {
@@ -93,6 +105,7 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             jmt_history_length: u64::MAX,
             boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
+            import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
 
@@ -105,6 +118,7 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             jmt_history_length,
             boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
+            import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
 
@@ -117,6 +131,7 @@ impl SimShardStorage {
         *write_or_recover(&self.state) = SharedState::new();
         *write_or_recover(&self.consensus) = ConsensusState::new();
         write_or_recover(&self.boundary_pins).clear();
+        *write_or_recover(&self.import_staging) = SimImportStaging::default();
     }
 
     /// Load recovered state for restarting a state machine on this

@@ -31,10 +31,45 @@ use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPre
 
 use crate::tree::Jmt;
 use crate::{
-    BOUNDARY_RETAIN, BoundaryStore, DatabaseUpdates, DbSortKey, ImportLeaf, NodeDatabaseUpdates,
-    PartitionDatabaseUpdates, ResolveLeaf, ShardChainReader, ShardChainWriter, SubstateStore,
-    WitnessSeed,
+    BOUNDARY_RETAIN, BoundaryStore, DatabaseUpdates, DbSortKey, ImportCursor, ImportLeaf,
+    ImportProgress, NodeDatabaseUpdates, PartitionDatabaseUpdates, ResolveLeaf, ShardChainReader,
+    ShardChainWriter, SubstateStore, WitnessSeed,
 };
+
+/// A completed [`ImportProgress`] covering the whole key span as one
+/// exhausted sub-range — the record a one-shot staged import carries.
+#[must_use]
+pub fn completed_import_progress(height: BlockHeight, staged_bytes: u64) -> ImportProgress {
+    ImportProgress {
+        anchor_height: height,
+        anchor_state_root: StateRoot::ZERO,
+        split_bits: 0,
+        chunk_limit: 0,
+        staged_bytes,
+        cursors: vec![ImportCursor {
+            next: [0u8; 32],
+            end: [0xFF; 32],
+            done: true,
+        }],
+    }
+}
+
+/// Stage `leaves` as one chunk and finalize — the one-shot import shape
+/// for tests where streaming granularity is irrelevant.
+///
+/// # Errors
+///
+/// Propagates the staging or finalize failure.
+pub fn import_boundary_state<S: BoundaryStore>(
+    storage: &S,
+    height: BlockHeight,
+    leaves: &[ImportLeaf],
+    witnesses: WitnessSeed,
+) -> Result<StateRoot, String> {
+    let staged_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
+    storage.stage_import_chunk(&completed_import_progress(height, staged_bytes), leaves)?;
+    storage.finalize_boundary_import(height, witnesses)
+}
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
 #[must_use]
@@ -818,9 +853,8 @@ where
         .map(|l| (l.leaf_key, l.storage_key.clone()))
         .expect("seed-3 leaf present");
 
-    let imported_root = fresh
-        .import_boundary_state(BlockHeight::new(6), leaves, WitnessSeed::default())
-        .unwrap();
+    let imported_root =
+        import_boundary_state(fresh, BlockHeight::new(6), &leaves, WitnessSeed::default()).unwrap();
     assert_eq!(imported_root, source_root);
     assert_eq!(fresh.state_root(), source_root);
 
@@ -834,8 +868,6 @@ where
 
     // A second import is rejected — the store is no longer empty.
     assert!(
-        fresh
-            .import_boundary_state(BlockHeight::new(6), Vec::new(), WitnessSeed::default())
-            .is_err()
+        import_boundary_state(fresh, BlockHeight::new(6), &[], WitnessSeed::default()).is_err()
     );
 }

@@ -6,19 +6,21 @@
 //! 1. **Witness history** — [`WitnessHistorySync`] assembles the anchor
 //!    window's leaf payloads, bound to the anchor through the boundary
 //!    header;
-//! 2. **State** — [`SnapSync`] reconstructs the shard's committed state
-//!    from verified range chunks;
-//! 3. **Import** — the assembled leaves and the witness window surface
-//!    as data ([`ShardBootstrap::take_import`]); the driver writes both
-//!    through `BoundaryStore::import_boundary_state` in one atomic
-//!    import and feeds the resulting root back, which the sequencer
-//!    checks against the anchor;
+//! 2. **State** — [`SnapSync`] verifies range chunks and streams each
+//!    one back to the driver ([`StateRangeOutcome::Staged`]), which
+//!    persists it via `BoundaryStore::stage_import_chunk`;
+//! 3. **Finalize** — once every sub-range is exhausted the finalize
+//!    surfaces as data ([`ShardBootstrap::take_finalize`]); the driver
+//!    builds the state from the staged chunks through
+//!    `BoundaryStore::finalize_boundary_import` and feeds the resulting
+//!    root back, which the sequencer checks against the anchor;
 //! 4. **Complete** — the verified pieces assemble into the
 //!    [`RecoveredState`] the shard's state machines boot from.
 //!
-//! Sans-io: drivers own transport, pacing, and the import write. The
-//! production runner pumps it with async requests; the simulation steps
-//! it deterministically — both run this exact sequencing.
+//! Sans-io: drivers own transport, pacing, and the staging and finalize
+//! writes. The production runner pumps it with async requests; the
+//! simulation steps it deterministically — both run this exact
+//! sequencing.
 
 pub mod snap_sync;
 pub mod state_range_serve;
@@ -26,9 +28,7 @@ pub mod witness_history;
 pub mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
-use hyperscale_storage::{
-    GenesisCommit, ImportLeaf, RecoveredState, ShardChainReader, WitnessSeed,
-};
+use hyperscale_storage::{GenesisCommit, RecoveredState, ShardChainReader, WitnessSeed};
 use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
 use hyperscale_types::network::response::{
     GetStateRangeResponse, GetWitnessHistoryResponse, MAX_LEAVES_PER_STATE_RANGE,
@@ -39,6 +39,7 @@ use hyperscale_types::{
 };
 
 use self::snap_sync::SnapSync;
+pub use self::snap_sync::StateRangeOutcome;
 use self::witness_history::WitnessHistorySync;
 
 /// Replicate the network's engine bootstrap into a store created after
@@ -136,13 +137,14 @@ pub enum BootstrapOutcome {
 enum Phase {
     /// Assembling the beacon-witness history.
     Witness(Box<WitnessHistorySync>),
-    /// Assembling the shard's committed state.
+    /// Assembling the shard's committed state; every verified chunk is
+    /// staged by the driver as it arrives.
     State(SnapSync),
-    /// Leaves assembled and chunk-verified, waiting for the driver to
-    /// take them (with the witness window) for the store import.
-    ImportReady(Vec<ImportLeaf>),
-    /// Driver took the import; waiting for the imported root.
-    Importing,
+    /// Every sub-range staged, waiting for the driver to take the
+    /// finalize (with the witness window).
+    FinalizeReady,
+    /// Driver took the finalize; waiting for the imported root.
+    Finalizing,
     /// Everything verified against the anchor.
     Complete,
 }
@@ -150,7 +152,7 @@ enum Phase {
 /// The witness phase's verified output: the anchor-bound boundary
 /// header, its anchor-bound QC, the derived leaf hashes that seed the
 /// accumulator, and the payloads the store import seeds — taken by
-/// [`ShardBootstrap::take_import`].
+/// [`ShardBootstrap::take_finalize`].
 struct VerifiedWitnessWindow {
     header: Box<BlockHeader>,
     qc: Box<QuorumCertificate>,
@@ -166,8 +168,8 @@ pub struct ShardBootstrap {
     /// The verified witness window; set when the witness phase
     /// completes, its payloads move into the import.
     witness: Option<VerifiedWitnessWindow>,
-    /// Total value bytes across the leaves handed to the driver for the
-    /// store import — the imported substate byte total, identical to the
+    /// Total value bytes across the chunks handed to the driver for
+    /// staging — the imported substate byte total, identical to the
     /// total the store seeds at the anchor height. Seeds the recovered
     /// state's byte frontier.
     imported_substate_bytes: u64,
@@ -194,7 +196,7 @@ impl ShardBootstrap {
     /// Start a state-only assembly against `anchor` — no witness
     /// history. A merge keeper collects a terminating child's span this
     /// way: the reformed parent's witness domain starts fresh, so the
-    /// import seeds no window and [`Self::take_import`]'s seed is empty.
+    /// import seeds no window and [`Self::take_finalize`]'s seed is empty.
     #[must_use]
     pub fn state_only(shard: ShardId, anchor: ShardAnchor) -> Self {
         Self {
@@ -218,8 +220,8 @@ impl ShardBootstrap {
     }
 
     /// Every request the current phase wants in flight. Empty while
-    /// requests are outstanding, an import is pending, or the bootstrap
-    /// is complete.
+    /// requests are outstanding, a finalize is pending, or the
+    /// bootstrap is complete.
     pub fn next_requests(&mut self) -> Vec<BootstrapRequest> {
         match &mut self.phase {
             Phase::Witness(witness) => witness
@@ -232,24 +234,28 @@ impl ShardBootstrap {
                 .into_iter()
                 .map(|(id, request)| BootstrapRequest::StateRange(id, request))
                 .collect(),
-            Phase::ImportReady(_) | Phase::Importing | Phase::Complete => Vec::new(),
+            Phase::FinalizeReady | Phase::Finalizing | Phase::Complete => Vec::new(),
         }
     }
 
-    /// Feed one state range response for `sub_range`. After the final
-    /// chunk the assembled leaves become available via
-    /// [`Self::take_import`].
+    /// Feed one state range response for `sub_range`. A staged outcome
+    /// must be persisted by the driver before it pumps further
+    /// responses; after the final chunk the finalize becomes available
+    /// via [`Self::take_finalize`].
     pub fn on_state_range(
         &mut self,
         sub_range: usize,
         response: &GetStateRangeResponse,
-    ) -> BootstrapOutcome {
+    ) -> StateRangeOutcome {
         let Phase::State(snap) = &mut self.phase else {
-            return BootstrapOutcome::Rejected("state response outside the state phase");
+            return StateRangeOutcome::Rejected("state response outside the state phase");
         };
         let outcome = snap.on_response(sub_range, response);
-        if snap.is_complete() {
-            self.phase = Phase::ImportReady(snap.take_leaves());
+        if let StateRangeOutcome::Staged { .. } = &outcome {
+            self.imported_substate_bytes = snap.staged_bytes();
+            if snap.is_complete() {
+                self.phase = Phase::FinalizeReady;
+            }
         }
         outcome
     }
@@ -261,17 +267,16 @@ impl ShardBootstrap {
         }
     }
 
-    /// The fully assembled, chunk-verified leaves plus the verified
-    /// witness window, ready for `BoundaryStore::import_boundary_state`
-    /// at the anchor height. `Some` exactly once; the driver answers
-    /// with the imported root via [`Self::on_imported`].
-    pub fn take_import(&mut self) -> Option<(BlockHeight, Vec<ImportLeaf>, WitnessSeed)> {
-        let Phase::ImportReady(leaves) = &mut self.phase else {
+    /// The staged assembly's finalize — the anchor height plus the
+    /// verified witness window — ready for
+    /// `BoundaryStore::finalize_boundary_import`. `Some` exactly once;
+    /// the driver answers with the imported root via
+    /// [`Self::on_imported`].
+    pub fn take_finalize(&mut self) -> Option<(BlockHeight, WitnessSeed)> {
+        if !matches!(self.phase, Phase::FinalizeReady) {
             return None;
-        };
-        let leaves = std::mem::take(leaves);
-        self.phase = Phase::Importing;
-        self.imported_substate_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
+        }
+        self.phase = Phase::Finalizing;
         // A full bootstrap seeds the verified window; a state-only one
         // ([`Self::state_only`]) has none and seeds nothing.
         let seed = self
@@ -281,7 +286,7 @@ impl ShardBootstrap {
                 base: window.header.beacon_witness_base(),
                 payloads: std::mem::take(&mut window.payloads),
             });
-        Some((self.anchor.height, leaves, seed))
+        Some((self.anchor.height, seed))
     }
 
     /// Verify the imported root against the attested anchor and
@@ -295,11 +300,11 @@ impl ShardBootstrap {
     ///
     /// # Panics
     ///
-    /// Panics unless the import was taken via [`Self::take_import`].
+    /// Panics unless the finalize was taken via [`Self::take_finalize`].
     pub fn on_imported(&mut self, root: StateRoot) -> Result<(), String> {
         assert!(
-            matches!(self.phase, Phase::Importing),
-            "on_imported outside the import phase",
+            matches!(self.phase, Phase::Finalizing),
+            "on_imported outside the finalize phase",
         );
         if root != self.anchor.state_root {
             return Err(format!(
@@ -347,12 +352,22 @@ impl ShardBootstrap {
         }
     }
 
-    /// Whether nothing has been imported into the store yet — the
-    /// witness and state assemblies — the phases at which restarting
-    /// against a newer anchor is sound.
+    /// Whether the staged state has not been finalized into the store —
+    /// the witness and state assemblies — the phases at which restarting
+    /// against a newer anchor is sound, provided the driver wipes the
+    /// import staging first.
     #[must_use]
-    pub const fn pre_import(&self) -> bool {
+    pub const fn pre_finalize(&self) -> bool {
         matches!(self.phase, Phase::Witness(_) | Phase::State(_))
+    }
+
+    /// Whether every sub-range is staged and the finalize has not been
+    /// taken. A merge keeper's half collect parks here: the union
+    /// finalize is the duty's, at the reformed parent's genesis height,
+    /// not the half's.
+    #[must_use]
+    pub const fn is_staged(&self) -> bool {
+        matches!(self.phase, Phase::FinalizeReady)
     }
 
     /// Whether every phase has completed and verified.
@@ -427,10 +442,14 @@ mod tests {
                 match request {
                     BootstrapRequest::StateRange(id, request) => {
                         let response = serve_state_range_request(serving, &request);
-                        assert_eq!(
-                            bootstrap.on_state_range(id, &response),
-                            BootstrapOutcome::Accepted,
-                        );
+                        match bootstrap.on_state_range(id, &response) {
+                            StateRangeOutcome::Staged { leaves, progress } => {
+                                fresh.stage_import_chunk(&progress, &leaves).unwrap();
+                            }
+                            StateRangeOutcome::Rejected(reason) => {
+                                panic!("state range rejected: {reason}")
+                            }
+                        }
                     }
                     BootstrapRequest::WitnessHistory(request) => {
                         let response = serve_witness_history_request(pending_chain, &request);
@@ -441,10 +460,8 @@ mod tests {
                     }
                 }
             }
-            if let Some((height, leaves, witnesses)) = bootstrap.take_import() {
-                let root = fresh
-                    .import_boundary_state(height, leaves, witnesses)
-                    .unwrap();
+            if let Some((height, witnesses)) = bootstrap.take_finalize() {
+                let root = fresh.finalize_boundary_import(height, witnesses).unwrap();
                 bootstrap.on_imported(root).unwrap();
             }
         }
@@ -512,7 +529,7 @@ mod tests {
                     }
                 }
             }
-            if bootstrap.take_import().is_some() {
+            if bootstrap.take_finalize().is_some() {
                 imported = true;
                 break;
             }
@@ -545,7 +562,7 @@ mod tests {
         let response = serve_state_range_request(&serving, &state_request);
         assert!(matches!(
             bootstrap.on_state_range(0, &response),
-            BootstrapOutcome::Rejected(_),
+            StateRangeOutcome::Rejected(_),
         ));
         let _ = pending_chain;
         assert!(!bootstrap.next_requests().is_empty());

@@ -66,7 +66,7 @@ The assembler (`SnapSync`, sans-io, in `crates/node`) partitions the shard's key
 2. Each leaf key's low half must equal `blake3(storage_key)[16..]`. This binds the shipped raw key — and, through the high half, its claimed owner — without any ownership metadata.
 3. Claimed value hashes are recomputed from the shipped raw values.
 
-Import (`BoundaryStore::import_boundary_state`) rebuilds the subtree from verified leaves and returns the computed root, which the caller compares against the anchor one final time. An anchor that goes stale mid-sync (evicted from the serving ring) is handled by defer-and-retry rather than by failure.
+Verified chunks are staged durably as they arrive (`BoundaryStore::stage_import_chunk`), together with a progress record binding the staged data to its exact anchor; the store proper is untouched until every sub-range is exhausted. The finalize (`BoundaryStore::finalize_boundary_import`) then rebuilds the subtree from the staged leaves and returns the computed root, which the caller compares against the anchor one final time. Staging keeps the assembler's memory bounded by a single wire chunk regardless of shard size. An anchor that goes stale mid-sync (evicted from the serving ring) is handled by wipe-and-retry against the advanced anchor rather than by failure.
 
 Reshape children add a follow phase: after the bulk import, the observer tails the still-running parent chain and applies each block's child-prefix writes until the terminal crossing. The result is exactly the child's genesis state.
 

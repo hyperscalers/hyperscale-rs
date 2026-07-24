@@ -20,7 +20,7 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
 
-use super::core::SimShardStorage;
+use super::core::{SimImportStaging, SimShardStorage};
 use super::state::ConsensusState;
 
 impl SimShardStorage {
@@ -38,6 +38,7 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             jmt_history_length: self.jmt_history_length,
             boundary_pins: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
 
@@ -276,7 +277,8 @@ fn install_adoption(
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher};
-    use hyperscale_storage::{BoundaryStore, ImportLeaf, WitnessSeed};
+    use hyperscale_storage::test_helpers::import_boundary_state;
+    use hyperscale_storage::{ImportLeaf, WitnessSeed};
     use hyperscale_types::{
         Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot, ValidatorId,
         WeightedTimestamp,
@@ -300,13 +302,13 @@ mod tests {
     /// continue (`max(9, 8) + 1 = 10`).
     fn merged_store() -> (SimShardStorage, StateRoot) {
         let store = SimShardStorage::default();
-        let root = store
-            .import_boundary_state(
-                BlockHeight::new(10),
-                vec![leaf(0x00), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        let root = import_boundary_state(
+            &store,
+            BlockHeight::new(10),
+            &[leaf(0x00), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         (store, root)
     }
 
@@ -367,13 +369,13 @@ mod tests {
     /// one right-side leaf, committed at height 9, with its terminal root.
     fn split_parent() -> (SimShardStorage, StateRoot) {
         let store = SimShardStorage::default();
-        let root = store
-            .import_boundary_state(
-                BlockHeight::new(9),
-                vec![leaf(0x00), leaf(0x01), leaf(0x80)],
-                WitnessSeed::default(),
-            )
-            .unwrap();
+        let root = import_boundary_state(
+            &store,
+            BlockHeight::new(9),
+            &[leaf(0x00), leaf(0x01), leaf(0x80)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
         (store, root)
     }
 

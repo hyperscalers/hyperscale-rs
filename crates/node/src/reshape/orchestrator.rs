@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_storage::ImportLeaf;
+use hyperscale_storage::{ImportLeaf, ImportProgress};
 use hyperscale_types::network::request::{GetBlockRequest, GetStateRangeRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
@@ -29,7 +29,7 @@ use hyperscale_types::{
     StateRoot, StoredReceipt, ValidatorId,
 };
 
-use crate::bootstrap::{BootstrapRequest, ShardBootstrap};
+use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
 use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
 use crate::reshape::split_flip::split_genesis_from_terminal;
@@ -97,15 +97,24 @@ pub enum ReshapeRequest {
         /// What to fetch.
         kind: FetchKind,
     },
-    /// Write `leaves` into `shard`'s store at `height`. Answered by
-    /// [`ReshapeEvent::Imported`].
-    ImportBoundary {
+    /// Durably stage one verified snap-sync chunk into `shard`'s store.
+    /// Answered by [`ReshapeEvent::Staged`].
+    StageChunk {
         /// The duty's store shard.
         shard: ShardId,
-        /// The boundary height the leaves seed.
-        height: BlockHeight,
-        /// The assembled child-span leaves.
+        /// The assembly's progress after this chunk.
+        progress: ImportProgress,
+        /// The chunk's verified leaves.
         leaves: Vec<ImportLeaf>,
+    },
+    /// Build `shard`'s boundary state at `height` from its staged
+    /// chunks. Answered by [`ReshapeEvent::Imported`]. Emitted only
+    /// after every [`Self::StageChunk`] has been acknowledged.
+    FinalizeImport {
+        /// The duty's store shard.
+        shard: ShardId,
+        /// The boundary height the staged leaves seed.
+        height: BlockHeight,
     },
     /// Apply a followed parent block's child-prefix writes into `shard`'s store.
     /// Answered by [`ReshapeEvent::Applied`].
@@ -196,6 +205,11 @@ pub enum ReshapeEvent {
         /// What failed.
         kind: FetchKind,
     },
+    /// A staged chunk was durably written.
+    Staged {
+        /// The store shard.
+        shard: ShardId,
+    },
     /// A boundary import completed with the resulting store root.
     Imported {
         /// The store shard.
@@ -271,6 +285,12 @@ struct ObserverDuty {
     phase: ObserverPhase,
     open_requested: bool,
     store_opened: bool,
+    /// Verified chunks awaiting a [`ReshapeRequest::StageChunk`] emit on
+    /// the next advance.
+    pending_stage: Vec<(ImportProgress, Vec<ImportLeaf>)>,
+    /// Stage writes emitted but not yet acknowledged; the finalize waits
+    /// for zero so every staged chunk is durable first.
+    stages_unacked: usize,
 }
 
 /// One keeper seat this host runs in a pending merge.
@@ -279,12 +299,12 @@ struct KeeperMember {
     own_child: ShardId,
 }
 
-/// One child half's progress in a keeper's merged-store build: its snap-synced
-/// leaves and its certified terminal.
+/// One child half's progress in a keeper's merged-store build: its
+/// span assembly (staged into the parent store as chunks arrive) and
+/// its certified terminal.
 struct KeeperHalf {
     child: ShardId,
     bootstrap: Box<ShardBootstrap>,
-    leaves: Option<Vec<ImportLeaf>>,
     terminal: Option<(BlockHeader, QuorumCertificate)>,
     terminal_requested: bool,
 }
@@ -294,7 +314,6 @@ impl KeeperHalf {
         Self {
             child,
             bootstrap: Box::new(ShardBootstrap::state_only(child, anchor)),
-            leaves: None,
             terminal: None,
             terminal_requested: false,
         }
@@ -306,13 +325,13 @@ enum KeeperPhase {
     /// Re-asserting ready until the parent composes.
     ReassertingReady,
     /// The parent composed; collecting both halves and terminals, deriving the
-    /// merged genesis, and importing the union.
+    /// merged genesis, and finalizing the staged union.
     Building {
         parent_anchor: ShardAnchor,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
         derived: Option<(ChainOrigin, Box<Block>)>,
-        import_requested: bool,
+        finalize_requested: bool,
     },
     /// Union imported; awaiting the next advance to emit the adopt.
     Adopting {
@@ -331,6 +350,13 @@ struct KeeperDuty {
     phase: KeeperPhase,
     open_requested: bool,
     store_opened: bool,
+    /// Verified chunks (from either half — their spans are disjoint)
+    /// awaiting a [`ReshapeRequest::StageChunk`] emit on the next
+    /// advance.
+    pending_stage: Vec<(ImportProgress, Vec<ImportLeaf>)>,
+    /// Stage writes emitted but not yet acknowledged; the union
+    /// finalize waits for zero so every staged chunk is durable first.
+    stages_unacked: usize,
 }
 
 /// One parent half's progress through its split duty, keyed by the child it
@@ -492,6 +518,13 @@ impl ReshapeOrchestrator {
             ReshapeEvent::FetchFailed { duty, from, kind } => {
                 self.apply_fetch_failed(duty, from, kind);
             }
+            ReshapeEvent::Staged { shard } => {
+                if let Some(duty) = self.observers.get_mut(&shard) {
+                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                } else if let Some(duty) = self.keepers.get_mut(&shard) {
+                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                }
+            }
             ReshapeEvent::Imported { shard, root } => self.apply_imported(shard, root),
             ReshapeEvent::Applied { shard, root } => {
                 if let Some(duty) = self.observers.get_mut(&shard)
@@ -590,7 +623,11 @@ impl ReshapeOrchestrator {
                 sub_range,
                 response,
             } => {
-                let _ = half.bootstrap.on_state_range(sub_range, &response);
+                if let StateRangeOutcome::Staged { leaves, progress } =
+                    half.bootstrap.on_state_range(sub_range, &response)
+                {
+                    keeper.pending_stage.push((progress, leaves));
+                }
             }
             FetchedKind::Block { response } => {
                 if let Some(elided) = &response.certified {
@@ -617,7 +654,11 @@ impl ReshapeOrchestrator {
                     response,
                 },
             ) => {
-                let _ = bootstrap.on_state_range(sub_range, &response);
+                if let StateRangeOutcome::Staged { leaves, progress } =
+                    bootstrap.on_state_range(sub_range, &response)
+                {
+                    duty.pending_stage.push((progress, leaves));
+                }
             }
             (ObserverPhase::Following(tail), FetchedKind::Block { response }) => {
                 let _ = tail.on_response(&response);
@@ -686,6 +727,8 @@ impl ReshapeOrchestrator {
                     phase: ObserverPhase::Opening,
                     open_requested: false,
                     store_opened: false,
+                    pending_stage: Vec::new(),
+                    stages_unacked: 0,
                 });
                 if !duty.validators.contains(&validator) {
                     duty.validators.push(validator);
@@ -722,6 +765,14 @@ impl ReshapeOrchestrator {
                 }
             }
             ObserverPhase::Syncing(bootstrap) => {
+                for (progress, leaves) in duty.pending_stage.drain(..) {
+                    duty.stages_unacked += 1;
+                    out.push(ReshapeRequest::StageChunk {
+                        shard: child,
+                        progress,
+                        leaves,
+                    });
+                }
                 for request in bootstrap.next_requests() {
                     // The pending child's witness accumulator starts empty, so
                     // an observer bootstrap only ever emits state ranges.
@@ -734,11 +785,12 @@ impl ReshapeOrchestrator {
                         kind: FetchKind::StateRange { sub_range, request },
                     });
                 }
-                if let Some((height, leaves)) = bootstrap.take_import() {
-                    out.push(ReshapeRequest::ImportBoundary {
+                if duty.stages_unacked == 0
+                    && let Some(height) = bootstrap.take_finalize()
+                {
+                    out.push(ReshapeRequest::FinalizeImport {
                         shard: child,
                         height,
-                        leaves,
                     });
                 }
                 if let Some(root) = bootstrap.imported_root() {
@@ -852,6 +904,8 @@ impl ReshapeOrchestrator {
                     phase: KeeperPhase::ReassertingReady,
                     open_requested: false,
                     store_opened: false,
+                    pending_stage: Vec::new(),
+                    stages_unacked: 0,
                 });
                 if !duty
                     .members
@@ -897,7 +951,7 @@ impl ReshapeOrchestrator {
                         left: Box::new(KeeperHalf::new(left, left_anchor)),
                         right: Box::new(KeeperHalf::new(right, right_anchor)),
                         derived: None,
-                        import_requested: false,
+                        finalize_requested: false,
                     };
                     return;
                 }
@@ -917,14 +971,26 @@ impl ReshapeOrchestrator {
                 left,
                 right,
                 derived,
-                import_requested,
+                finalize_requested,
             } => {
                 if !duty.open_requested {
                     out.push(ReshapeRequest::OpenStore { shard: parent });
                     duty.open_requested = true;
                 }
-                advance_keeper_half(left, parent, view, out);
-                advance_keeper_half(right, parent, view, out);
+                for (progress, leaves) in duty.pending_stage.drain(..) {
+                    duty.stages_unacked += 1;
+                    out.push(ReshapeRequest::StageChunk {
+                        shard: parent,
+                        progress,
+                        leaves,
+                    });
+                }
+                // The halves stage straight into the parent store, so their
+                // fetches wait for it to open.
+                if duty.store_opened {
+                    advance_keeper_half(left, parent, view, out);
+                    advance_keeper_half(right, parent, view, out);
+                }
                 if derived.is_none()
                     && let (Some((left_h, left_qc)), Some((right_h, right_qc))) =
                         (&left.terminal, &right.terminal)
@@ -937,19 +1003,17 @@ impl ReshapeOrchestrator {
                 {
                     *derived = Some((origin, Box::new(genesis)));
                 }
-                if !*import_requested
-                    && duty.store_opened
-                    && let (Some(left_leaves), Some(right_leaves)) = (&left.leaves, &right.leaves)
+                if !*finalize_requested
+                    && duty.stages_unacked == 0
+                    && left.bootstrap.is_staged()
+                    && right.bootstrap.is_staged()
                     && let Some((origin, _)) = derived.as_ref()
                 {
-                    let mut union = left_leaves.clone();
-                    union.extend(right_leaves.iter().cloned());
-                    out.push(ReshapeRequest::ImportBoundary {
+                    out.push(ReshapeRequest::FinalizeImport {
                         shard: parent,
                         height: origin.genesis_height,
-                        leaves: union,
                     });
-                    *import_requested = true;
+                    *finalize_requested = true;
                 }
             }
             KeeperPhase::Adopting { .. } => {
@@ -1091,29 +1155,25 @@ fn recipients_for(view: &ReshapeView, shard: ShardId, validator: ValidatorId) ->
         .collect()
 }
 
-/// Advance one keeper half: forward its snap-sync state ranges and take the
-/// leaves once assembled, and fetch its certified terminal once.
+/// Advance one keeper half: forward its snap-sync state ranges (each
+/// verified chunk stages into the parent store through the duty's
+/// queue), and fetch its certified terminal once.
 fn advance_keeper_half(
     half: &mut KeeperHalf,
     duty: ShardId,
     view: &ReshapeView,
     out: &mut Vec<ReshapeRequest>,
 ) {
-    if half.leaves.is_none() {
-        for request in half.bootstrap.next_requests() {
-            // The half collect only assembles state, so only state ranges appear.
-            let BootstrapRequest::StateRange(sub_range, request) = request else {
-                continue;
-            };
-            out.push(ReshapeRequest::Fetch {
-                duty,
-                from: half.child,
-                kind: FetchKind::StateRange { sub_range, request },
-            });
-        }
-        if let Some((_, leaves, _)) = half.bootstrap.take_import() {
-            half.leaves = Some(leaves);
-        }
+    for request in half.bootstrap.next_requests() {
+        // The half collect only assembles state, so only state ranges appear.
+        let BootstrapRequest::StateRange(sub_range, request) = request else {
+            continue;
+        };
+        out.push(ReshapeRequest::Fetch {
+            duty,
+            from: half.child,
+            kind: FetchKind::StateRange { sub_range, request },
+        });
     }
     if half.terminal.is_none()
         && !half.terminal_requested
@@ -1271,6 +1331,8 @@ mod tests {
             phase,
             open_requested: true,
             store_opened: true,
+            pending_stage: Vec::new(),
+            stages_unacked: 0,
         }
     }
 
@@ -1471,7 +1533,8 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // First step fires the gate (ReassertingReady → Building); the second
-        // opens the parent store and collects both halves.
+        // opens the parent store. The halves stage straight into that store,
+        // so their fetches wait for the open to land.
         let _ = orch.step(&view, Vec::new());
         let requests = orch.step(&view, Vec::new());
 
@@ -1481,6 +1544,14 @@ mod tests {
                 .any(|r| matches!(r, ReshapeRequest::OpenStore { shard } if *shard == parent)),
             "the keeper gate must open the parent store; got {requests:?}",
         );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::Fetch { .. })),
+            "no half may fetch before the parent store opens; got {requests:?}",
+        );
+
+        let requests = orch.step(&view, vec![ReshapeEvent::Opened { shard: parent }]);
         for half in [left, right] {
             assert!(
                 requests.iter().any(|r| matches!(
@@ -1509,6 +1580,8 @@ mod tests {
                 phase: KeeperPhase::Prepared,
                 open_requested: true,
                 store_opened: true,
+                pending_stage: Vec::new(),
+                stages_unacked: 0,
             },
         );
 

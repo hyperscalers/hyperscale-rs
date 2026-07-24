@@ -23,7 +23,7 @@ use hyperscale_node::reshape::orchestrator::{
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::serve_state_range_request;
 use hyperscale_storage::{
-    BoundaryStore, ImportLeaf, RecoveredState, ShardChainReader, WitnessSeed,
+    BoundaryStore, ImportLeaf, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
@@ -68,6 +68,11 @@ pub enum ReshapeIo {
         from: ShardId,
         /// What failed, for re-arming.
         kind: FetchKind,
+    },
+    /// A staged chunk was durably written.
+    Staged {
+        /// The store shard.
+        shard: ShardId,
     },
     /// A boundary import completed with the resulting store root.
     Imported {
@@ -187,11 +192,14 @@ impl ShardSupervisor {
                 self.reshape_seed_from_parent(parent, child);
             }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
-            ReshapeRequest::ImportBoundary {
+            ReshapeRequest::StageChunk {
                 shard,
-                height,
+                progress,
                 leaves,
-            } => self.reshape_import(shard, height, leaves),
+            } => self.reshape_stage(shard, progress, leaves),
+            ReshapeRequest::FinalizeImport { shard, height } => {
+                self.reshape_finalize(shard, height);
+            }
             ReshapeRequest::ApplyFollow {
                 shard,
                 height,
@@ -421,20 +429,42 @@ impl ShardSupervisor {
         );
     }
 
-    /// Write a reshape duty's boundary leaves into its store off the loop,
-    /// answering with [`ReshapeIo::Imported`].
-    fn reshape_import(&self, shard: ShardId, height: BlockHeight, leaves: Vec<ImportLeaf>) {
+    /// Durably stage one verified chunk into a reshape duty's store off
+    /// the loop, answering with [`ReshapeIo::Staged`].
+    fn reshape_stage(&self, shard: ShardId, progress: ImportProgress, leaves: Vec<ImportLeaf>) {
         let Some(storage) = self
             .reshape_stores
             .get(&shard)
             .map(|s| Arc::clone(&s.storage))
         else {
-            warn!(shard = ?shard, "Reshape import for an unopened store; dropped");
+            warn!(shard = ?shard, "Reshape stage for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match storage.import_boundary_state(height, leaves, WitnessSeed::default()) {
+            match storage.stage_import_chunk(&progress, &leaves) {
+                Ok(()) => {
+                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Staged { shard }));
+                }
+                Err(error) => warn!(shard = ?shard, %error, "Reshape chunk staging failed"),
+            }
+        });
+    }
+
+    /// Build a reshape duty's boundary state from its staged chunks off
+    /// the loop, answering with [`ReshapeIo::Imported`].
+    fn reshape_finalize(&self, shard: ShardId, height: BlockHeight) {
+        let Some(storage) = self
+            .reshape_stores
+            .get(&shard)
+            .map(|s| Arc::clone(&s.storage))
+        else {
+            warn!(shard = ?shard, "Reshape finalize for an unopened store; dropped");
+            return;
+        };
+        let events = self.events_tx.clone();
+        self.tokio_handle.spawn_blocking(move || {
+            match storage.finalize_boundary_import(height, WitnessSeed::default()) {
                 Ok(root) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Imported {
                         shard,
@@ -600,6 +630,7 @@ impl ShardSupervisor {
             ReshapeIo::FetchFailed { duty, from, kind } => {
                 ReshapeEvent::FetchFailed { duty, from, kind }
             }
+            ReshapeIo::Staged { shard } => ReshapeEvent::Staged { shard },
             ReshapeIo::Imported { shard, root } => ReshapeEvent::Imported { shard, root },
             ReshapeIo::Applied { shard, root } => ReshapeEvent::Applied { shard, root },
             ReshapeIo::Adopted { shard, recovered } => {
