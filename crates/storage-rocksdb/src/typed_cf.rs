@@ -283,6 +283,20 @@ pub fn batch_put_raw<CF: TypedCf>(
     }
 }
 
+/// Typed-key put of pre-encoded value bytes into a `WriteBatch`. The
+/// caller vouches that `value_bytes` came from the CF's value codec —
+/// use this where the codec's borrowed encoding avoids materializing an
+/// owned `CF::Value` just to serialize it.
+pub fn batch_put_encoded<CF: TypedCf>(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &CF::Key,
+    value_bytes: &[u8],
+) {
+    let key_bytes = CF::KeyCodec::default().encode(key);
+    batch.put_cf(cf, &key_bytes, value_bytes);
+}
+
 /// Typed delete in a `WriteBatch`.
 pub fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key: &CF::Key) {
     let key_bytes = CF::KeyCodec::default().encode(key);
