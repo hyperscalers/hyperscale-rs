@@ -127,7 +127,14 @@ impl BoundaryStore for SimShardStorage {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
-        let staging = read_or_recover(&self.import_staging);
+        let mut state = write_or_recover(&self.state);
+        if state.current_block_height != BlockHeight::GENESIS
+            || state.current_root_hash != StateRoot::ZERO
+        {
+            return Err("snap-sync import requires an empty store".to_string());
+        }
+
+        let mut staging = write_or_recover(&self.import_staging);
         // The drivers gate finalize on assembly completeness; a progress
         // record still binding this height with open cursors means a
         // caller slipped past that gate. Refusing here beats sealing a
@@ -138,23 +145,20 @@ impl BoundaryStore for SimShardStorage {
         {
             return Err("snap-sync finalize on an incomplete assembly".to_string());
         }
-        let leaves: Vec<ImportLeaf> = staging
-            .leaves
-            .iter()
+        // The checks passed: the staging area empties into the build by
+        // move — the memory equivalent of the sealed final batch's
+        // staging wipe.
+        let staged = std::mem::take(&mut staging.leaves);
+        staging.progress = None;
+        drop(staging);
+        let leaves: Vec<ImportLeaf> = staged
+            .into_iter()
             .map(|(leaf_key, (storage_key, value))| ImportLeaf {
-                leaf_key: *leaf_key,
-                storage_key: storage_key.clone(),
-                value: value.clone(),
+                leaf_key,
+                storage_key,
+                value,
             })
             .collect();
-        drop(staging);
-
-        let mut state = write_or_recover(&self.state);
-        if state.current_block_height != BlockHeight::GENESIS
-            || state.current_root_hash != StateRoot::ZERO
-        {
-            return Err("snap-sync import requires an empty store".to_string());
-        }
 
         let root_path = state.tree_store.root_path();
         let (root, result) =
@@ -189,11 +193,6 @@ impl BoundaryStore for SimShardStorage {
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
         drop(consensus);
-
-        let mut staging = write_or_recover(&self.import_staging);
-        staging.leaves.clear();
-        staging.progress = None;
-        drop(staging);
         Ok(root)
     }
 
