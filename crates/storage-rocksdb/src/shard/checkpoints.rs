@@ -18,8 +18,8 @@ use std::sync::Arc;
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ImportProgress, JmtSnapshot, ResolveLeaf,
-    WitnessSeed, filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
+    BoundaryStore, ImportLeaf, ImportProgress, JmtSnapshot, ResolveLeaf, WitnessSeed,
+    filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, Hash, StateRoot, StoredReceipt};
 use rocksdb::checkpoint::Checkpoint;
@@ -261,20 +261,23 @@ impl RocksDbShardStorage {
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
 /// Owned by [`RocksDbShardStorage`] and driven through
-/// [`BoundaryStore`]. Holds the newest [`BOUNDARY_RETAIN`] checkpoints;
-/// creating a new one evicts the oldest beyond that. Entries are
+/// [`BoundaryStore`]. Holds the newest `retain` checkpoints (the
+/// backend config's `boundary_retain`); creating a new one evicts the
+/// oldest beyond that. Entries are
 /// discovered by scanning the ring directory, so the ring picks up
 /// where it left off after a restart.
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,
+    retain: usize,
 }
 
 impl CheckpointRing {
-    /// Create a ring over `db`, rooted at `dir`. The directory is
-    /// created lazily on first checkpoint.
-    pub(crate) const fn from_db(db: Arc<DB>, dir: PathBuf) -> Self {
-        Self { db, dir }
+    /// Create a ring over `db`, rooted at `dir`, retaining the newest
+    /// `retain` checkpoints. The directory is created lazily on first
+    /// checkpoint.
+    pub(crate) const fn from_db(db: Arc<DB>, dir: PathBuf, retain: usize) -> Self {
+        Self { db, dir, retain }
     }
 
     /// Create a checkpoint of the database's current state, labelled with
@@ -340,7 +343,7 @@ impl CheckpointRing {
     /// Remove the oldest entries beyond the ring size.
     fn evict(&self) {
         let entries = self.entries();
-        let excess = entries.len().saturating_sub(BOUNDARY_RETAIN);
+        let excess = entries.len().saturating_sub(self.retain);
         for (height, path) in entries.into_iter().take(excess) {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(%height, path = %path.display(), error = %e, "checkpoint eviction failed");
@@ -614,6 +617,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::RocksDbConfig;
     use crate::shard::column_families::{
         IMPORT_STAGING_CF, JMT_NODES_CF, LEAF_ASSOCIATIONS_CF, STATE_CF,
     };
@@ -687,6 +691,31 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         test_boundary_retention_evicts_oldest(&storage, |seed| commit_one(&storage, seed));
+    }
+
+    /// A configured `boundary_retain` widens the ring beyond the
+    /// default: the join budget's worth of boundaries stays served.
+    #[test]
+    fn configured_retention_widens_the_ring() {
+        let temp = TempDir::new().unwrap();
+        let config = RocksDbConfig {
+            boundary_retain: 5,
+            ..Default::default()
+        };
+        let storage =
+            RocksDbShardStorage::open_with_config(temp.path(), &config, NibblePath::empty())
+                .unwrap();
+        for height in 1..=6u64 {
+            commit_one(&storage, u8::try_from(height).unwrap());
+            storage.pin_boundary(BlockHeight::new(height)).unwrap();
+        }
+        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
+        for height in 2..=6u64 {
+            assert!(
+                storage.open_boundary(BlockHeight::new(height)).is_some(),
+                "boundary {height} must stay inside the widened ring",
+            );
+        }
     }
 
     /// Eviction removes the checkpoint's on-disk directory, not just

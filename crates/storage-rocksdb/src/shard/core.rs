@@ -244,8 +244,11 @@ impl RocksDbShardStorage {
         CfHandles::resolve(&db);
 
         let db = Arc::new(db);
-        let checkpoints =
-            super::checkpoints::CheckpointRing::from_db(Arc::clone(&db), dir.join("checkpoints"));
+        let checkpoints = super::checkpoints::CheckpointRing::from_db(
+            Arc::clone(&db),
+            dir.join("checkpoints"),
+            config.boundary_retain,
+        );
 
         Ok(Self {
             db,
