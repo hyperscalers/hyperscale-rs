@@ -19,9 +19,10 @@ use hyperscale_types::{
 /// evicting the oldest.
 ///
 /// The memory backend's fixed retention and the `RocksDB` config
-/// default. Production serving retention must cover the join budget,
-/// so the validator overrides it with the genesis
-/// `ready_timeout_epochs`.
+/// default. Production serving retention must cover the join budget
+/// plus the attestation lag of the anchor a joiner selects, so the
+/// validator overrides it with the chain-derived
+/// `boundary_retention_epochs`.
 pub const BOUNDARY_RETAIN: usize = 3;
 
 /// Resolve a JMT leaf back to the raw substate pair it represents.
