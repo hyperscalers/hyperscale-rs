@@ -28,7 +28,7 @@ use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, ImportStagingCf, JmtNodesCf,
-    LeafAssociationsCf, StateCf, SubstateBytesCf,
+    LeafAssociationsCf, StagedLeafCodec, StateCf, SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -36,7 +36,7 @@ use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
-    ImportProgressEntry, TypedCf, batch_delete, batch_put, batch_put_raw, get, iter_all,
+    ImportProgressEntry, TypedCf, batch_delete, batch_put, batch_put_encoded, get, iter_all,
     meta_delete, meta_read, meta_write,
 };
 
@@ -514,17 +514,12 @@ impl BoundaryStore for RocksDbShardStorage {
         let mut batch = WriteBatch::default();
         for leaf in leaves {
             let mut value = Vec::with_capacity(4 + leaf.storage_key.len() + leaf.value.len());
-            let key_len =
-                u32::try_from(leaf.storage_key.len()).map_err(|_| "oversized storage key")?;
-            value.extend_from_slice(&key_len.to_be_bytes());
-            value.extend_from_slice(&leaf.storage_key);
-            value.extend_from_slice(&leaf.value);
-            batch_put_raw::<ImportStagingCf>(
+            StagedLeafCodec::encode_parts(&leaf.storage_key, &leaf.value, &mut value)?;
+            batch_put_encoded::<ImportStagingCf>(
                 &mut batch,
                 staging_cf,
                 &Hash::from_hash_bytes(&leaf.leaf_key),
-                &(Vec::new(), Vec::new()),
-                Some(&value),
+                &value,
             );
         }
         meta_write::<ImportProgressEntry>(&mut batch, progress);

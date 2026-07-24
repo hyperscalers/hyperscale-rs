@@ -332,12 +332,27 @@ impl TypedCf for LeafAssociationsCf {
 #[derive(Default)]
 pub struct StagedLeafCodec;
 
+impl StagedLeafCodec {
+    /// Pack a borrowed pair into `buf` — the single definition of the
+    /// staged byte layout, shared by the trait encode and the zero-copy
+    /// staging write.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the storage key's length overflows the 4-byte prefix.
+    pub fn encode_parts(storage_key: &[u8], value: &[u8], buf: &mut Vec<u8>) -> Result<(), String> {
+        let len =
+            u32::try_from(storage_key.len()).map_err(|_| "oversized storage key".to_string())?;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(storage_key);
+        buf.extend_from_slice(value);
+        Ok(())
+    }
+}
+
 impl DbEncode<(Vec<u8>, Vec<u8>)> for StagedLeafCodec {
     fn encode_to(&self, value: &(Vec<u8>, Vec<u8>), buf: &mut Vec<u8>) {
-        let len = u32::try_from(value.0.len()).expect("storage key length fits in u32");
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(&value.0);
-        buf.extend_from_slice(&value.1);
+        Self::encode_parts(&value.0, &value.1, buf).expect("storage key length fits in u32");
     }
 }
 
