@@ -4,8 +4,9 @@
 //! span out of the splitting shard's beacon-attested boundary anchor:
 //! the child span is partitioned into parallel sub-range fetches served
 //! by the splitting shard's committee, every chunk is verified into the
-//! parent's attested `state_root`, and the assembled leaves import into
-//! the observer's child-rooted store.
+//! parent's attested `state_root` and staged into the observer's
+//! child-rooted store as it arrives, and the finalize builds the child
+//! subtree from the staged leaves.
 //!
 //! There is no anchor to compare the imported root against — the beacon
 //! holds only the parent's root, a one-way hash over the child
@@ -16,11 +17,11 @@
 //! tree's subtree node at that prefix by construction.
 //!
 //! Sans-io like [`ShardBootstrap`](crate::bootstrap::ShardBootstrap): drivers own
-//! transport, peer selection, and the import write, and pump it through
-//! the same [`BootstrapRequest`] surface (the witness-history variant
-//! never appears — the pending child's accumulator starts empty).
+//! transport, peer selection, and the staging and finalize writes, and
+//! pump it through the same [`BootstrapRequest`] surface (the
+//! witness-history variant never appears — the pending child's
+//! accumulator starts empty).
 
-use hyperscale_storage::ImportLeaf;
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
@@ -29,8 +30,8 @@ use hyperscale_types::{
     shard_prefix_path,
 };
 
-use crate::bootstrap::snap_sync::SnapSync;
-use crate::bootstrap::{BootstrapOutcome, BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
+use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
+use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
 
 /// The self-signed ready signal an observer broadcasts to the
 /// splitting shard's committee on completing its child-span bootstrap.
@@ -59,13 +60,14 @@ pub fn observer_ready_signal(
 }
 
 enum Phase {
-    /// Assembling the child span of the parent's committed state.
+    /// Assembling the child span of the parent's committed state; every
+    /// verified chunk is staged by the driver as it arrives.
     State(SnapSync),
-    /// Leaves assembled and chunk-verified, waiting for the driver to
-    /// take them for the child store import.
-    ImportReady(Vec<ImportLeaf>),
-    /// Driver took the leaves; waiting for the imported root.
-    Importing,
+    /// Every sub-range staged, waiting for the driver to take the
+    /// finalize.
+    FinalizeReady,
+    /// Driver took the finalize; waiting for the imported root.
+    Finalizing,
     /// Imported: the child store holds the parent tree's child subtree.
     Complete(StateRoot),
 }
@@ -75,8 +77,8 @@ pub struct ObserverBootstrap {
     anchor: ShardAnchor,
     child: ShardId,
     phase: Phase,
-    /// Total value bytes across the leaves handed to the driver for the
-    /// store import — the child half's substate byte total, seeding the
+    /// Total value bytes across the chunks handed to the driver for
+    /// staging — the child half's substate byte total, seeding the
     /// byte frontier the child chain starts from.
     imported_substate_bytes: u64,
 }
@@ -123,8 +125,9 @@ impl ObserverBootstrap {
     }
 
     /// Every request the current phase wants in flight. Empty while
-    /// requests are outstanding, an import is pending, or the bootstrap
-    /// is complete. Only [`BootstrapRequest::StateRange`] ever appears.
+    /// requests are outstanding, a finalize is pending, or the
+    /// bootstrap is complete. Only [`BootstrapRequest::StateRange`]
+    /// ever appears.
     pub fn next_requests(&mut self) -> Vec<BootstrapRequest> {
         match &mut self.phase {
             Phase::State(snap) => snap
@@ -132,24 +135,28 @@ impl ObserverBootstrap {
                 .into_iter()
                 .map(|(id, request)| BootstrapRequest::StateRange(id, request))
                 .collect(),
-            Phase::ImportReady(_) | Phase::Importing | Phase::Complete(_) => Vec::new(),
+            Phase::FinalizeReady | Phase::Finalizing | Phase::Complete(_) => Vec::new(),
         }
     }
 
-    /// Feed one state range response for `sub_range`. After the final
-    /// chunk the assembled leaves become available via
-    /// [`Self::take_import`].
+    /// Feed one state range response for `sub_range`. A staged outcome
+    /// must be persisted by the driver before it pumps further
+    /// responses; after the final chunk the finalize becomes available
+    /// via [`Self::take_finalize`].
     pub fn on_state_range(
         &mut self,
         sub_range: usize,
         response: &GetStateRangeResponse,
-    ) -> BootstrapOutcome {
+    ) -> StateRangeOutcome {
         let Phase::State(snap) = &mut self.phase else {
-            return BootstrapOutcome::Rejected("state response outside the state phase");
+            return StateRangeOutcome::Rejected("state response outside the state phase");
         };
         let outcome = snap.on_response(sub_range, response);
-        if snap.is_complete() {
-            self.phase = Phase::ImportReady(snap.take_leaves());
+        if let StateRangeOutcome::Staged { .. } = &outcome {
+            self.imported_substate_bytes = snap.staged_bytes();
+            if snap.is_complete() {
+                self.phase = Phase::FinalizeReady;
+            }
         }
         outcome
     }
@@ -161,29 +168,27 @@ impl ObserverBootstrap {
         }
     }
 
-    /// The fully assembled, chunk-verified child-span leaves, ready for
-    /// `BoundaryStore::import_boundary_state` at the anchor height on
-    /// the observer's child-rooted store. `Some` exactly once; the
-    /// driver answers with the imported root via [`Self::on_imported`].
-    pub fn take_import(&mut self) -> Option<(BlockHeight, Vec<ImportLeaf>)> {
-        let Phase::ImportReady(leaves) = &mut self.phase else {
+    /// The staged assembly's finalize height, ready for
+    /// `BoundaryStore::finalize_boundary_import` on the observer's
+    /// child-rooted store. `Some` exactly once; the driver answers with
+    /// the imported root via [`Self::on_imported`].
+    pub fn take_finalize(&mut self) -> Option<BlockHeight> {
+        if !matches!(self.phase, Phase::FinalizeReady) {
             return None;
-        };
-        let leaves = std::mem::take(leaves);
-        self.phase = Phase::Importing;
-        self.imported_substate_bytes = leaves.iter().map(|l| l.value.len() as u64).sum();
-        Some((self.anchor.height, leaves))
+        }
+        self.phase = Phase::Finalizing;
+        Some(self.anchor.height)
     }
 
     /// Record the imported child-subtree root and complete.
     ///
     /// # Panics
     ///
-    /// Panics unless the import was taken via [`Self::take_import`].
+    /// Panics unless the finalize was taken via [`Self::take_finalize`].
     pub fn on_imported(&mut self, root: StateRoot) {
         assert!(
-            matches!(self.phase, Phase::Importing),
-            "on_imported outside the import phase",
+            matches!(self.phase, Phase::Finalizing),
+            "on_imported outside the finalize phase",
         );
         self.phase = Phase::Complete(root);
     }
@@ -214,8 +219,7 @@ impl ObserverBootstrap {
     }
 
     /// The imported substate byte total of the child half — the byte
-    /// frontier the child chain starts from. Zero until the import is
-    /// taken.
+    /// frontier the child chain starts from. Accrues per staged chunk.
     #[must_use]
     pub const fn imported_substate_bytes(&self) -> u64 {
         self.imported_substate_bytes
@@ -461,14 +465,18 @@ mod tests {
                     panic!("observer bootstrap emitted a non-state request");
                 };
                 let response = serve_state_range_request(serving, &request);
-                assert_eq!(
-                    bootstrap.on_state_range(id, &response),
-                    BootstrapOutcome::Accepted,
-                );
+                match bootstrap.on_state_range(id, &response) {
+                    StateRangeOutcome::Staged { leaves, progress } => {
+                        store.stage_import_chunk(&progress, &leaves).unwrap();
+                    }
+                    StateRangeOutcome::Rejected(reason) => {
+                        panic!("state range rejected: {reason}")
+                    }
+                }
             }
-            if let Some((height, leaves)) = bootstrap.take_import() {
+            if let Some(height) = bootstrap.take_finalize() {
                 let root = store
-                    .import_boundary_state(height, leaves, WitnessSeed::default())
+                    .finalize_boundary_import(height, WitnessSeed::default())
                     .unwrap();
                 bootstrap.on_imported(root);
             }
@@ -510,7 +518,7 @@ mod tests {
         for child in children {
             let mut bootstrap = ObserverBootstrap::new(ShardId::ROOT, anchor, child);
             for _ in 0..1_000 {
-                if bootstrap.take_import().is_some() {
+                if bootstrap.take_finalize().is_some() {
                     break;
                 }
                 for request in bootstrap.next_requests() {
@@ -560,7 +568,7 @@ mod tests {
                     chunk.leaves = leaves.into();
                     rejected = matches!(
                         bootstrap.on_state_range(id, &response),
-                        BootstrapOutcome::Rejected(_),
+                        StateRangeOutcome::Rejected(_),
                     );
                     break 'outer;
                 }

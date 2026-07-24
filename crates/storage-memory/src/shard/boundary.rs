@@ -12,8 +12,8 @@ use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, WitnessSeed, filter_updates_to_prefix,
-    merge_owned_nodes, merge_updates_from_receipts,
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ImportProgress, ResolveLeaf, WitnessSeed,
+    filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
 
@@ -85,12 +85,60 @@ impl BoundaryStore for SimShardStorage {
             })
     }
 
-    fn import_boundary_state(
+    fn stage_import_chunk(
+        &self,
+        progress: &ImportProgress,
+        leaves: &[ImportLeaf],
+    ) -> Result<(), String> {
+        let state = read_or_recover(&self.state);
+        if state.current_block_height != BlockHeight::GENESIS
+            || state.current_root_hash != StateRoot::ZERO
+        {
+            return Err("snap-sync staging requires an empty store".to_string());
+        }
+        drop(state);
+
+        let mut staging = write_or_recover(&self.import_staging);
+        for leaf in leaves {
+            staging.leaves.insert(
+                leaf.leaf_key,
+                (leaf.storage_key.clone(), leaf.value.clone()),
+            );
+        }
+        staging.progress = Some(progress.clone());
+        drop(staging);
+        Ok(())
+    }
+
+    fn read_import_progress(&self) -> Option<ImportProgress> {
+        read_or_recover(&self.import_staging).progress.clone()
+    }
+
+    fn wipe_import_staging(&self) -> Result<(), String> {
+        let mut staging = write_or_recover(&self.import_staging);
+        staging.leaves.clear();
+        staging.progress = None;
+        drop(staging);
+        Ok(())
+    }
+
+    fn finalize_boundary_import(
         &self,
         height: BlockHeight,
-        leaves: Vec<ImportLeaf>,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
+        let staging = read_or_recover(&self.import_staging);
+        let leaves: Vec<ImportLeaf> = staging
+            .leaves
+            .iter()
+            .map(|(leaf_key, (storage_key, value))| ImportLeaf {
+                leaf_key: *leaf_key,
+                storage_key: storage_key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        drop(staging);
+
         let mut state = write_or_recover(&self.state);
         if state.current_block_height != BlockHeight::GENESIS
             || state.current_root_hash != StateRoot::ZERO
@@ -130,6 +178,11 @@ impl BoundaryStore for SimShardStorage {
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
         drop(consensus);
+
+        let mut staging = write_or_recover(&self.import_staging);
+        staging.leaves.clear();
+        staging.progress = None;
+        drop(staging);
         Ok(root)
     }
 

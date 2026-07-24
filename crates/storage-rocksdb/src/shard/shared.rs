@@ -15,9 +15,9 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, ImportLeaf, JmtSnapshot, PartitionEntry, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
-    WitnessSeed,
+    DbSubstateValue, GenesisCommit, ImportLeaf, ImportProgress, JmtSnapshot, PartitionEntry,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
+    VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
@@ -172,13 +172,28 @@ impl BoundaryStore for SharedStorage {
         self.0.open_boundary(height)
     }
 
-    fn import_boundary_state(
+    fn stage_import_chunk(
+        &self,
+        progress: &ImportProgress,
+        leaves: &[ImportLeaf],
+    ) -> Result<(), String> {
+        self.0.stage_import_chunk(progress, leaves)
+    }
+
+    fn read_import_progress(&self) -> Option<ImportProgress> {
+        self.0.read_import_progress()
+    }
+
+    fn wipe_import_staging(&self) -> Result<(), String> {
+        self.0.wipe_import_staging()
+    }
+
+    fn finalize_boundary_import(
         &self,
         height: BlockHeight,
-        leaves: Vec<ImportLeaf>,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
-        self.0.import_boundary_state(height, leaves, witnesses)
+        self.0.finalize_boundary_import(height, witnesses)
     }
 
     fn follow_block_writes(

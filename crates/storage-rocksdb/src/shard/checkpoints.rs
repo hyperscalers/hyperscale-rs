@@ -18,24 +18,35 @@ use std::sync::Arc;
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, JmtSnapshot, ResolveLeaf, WitnessSeed,
-    filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
+    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ImportProgress, JmtSnapshot, ResolveLeaf,
+    WitnessSeed, filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, Hash, StateRoot, StoredReceipt};
 use rocksdb::checkpoint::Checkpoint;
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
-    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, JmtNodesCf, LeafAssociationsCf, StateCf,
-    SubstateBytesCf,
+    ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, ImportStagingCf, JmtNodesCf,
+    LeafAssociationsCf, StateCf, SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
-use crate::typed_cf::{TypedCf, batch_put, get};
+use crate::typed_cf::{
+    ImportProgressEntry, TypedCf, batch_put, batch_put_raw, get, iter_all, meta_delete, meta_read,
+    meta_write,
+};
+
+/// Queue the staging CF's full range and the progress record for
+/// deletion in `batch`. Staged keys are exactly 32 bytes, so a 33-byte
+/// `0xFF` bound covers every possible key.
+fn wipe_staging_into(batch: &mut WriteBatch, staging_cf: &ColumnFamily) {
+    batch.delete_range_cf(staging_cf, &[][..], &[0xFF; 33][..]);
+    meta_delete::<ImportProgressEntry>(batch);
+}
 
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
@@ -228,10 +239,64 @@ impl BoundaryStore for RocksDbShardStorage {
             .flatten()
     }
 
-    fn import_boundary_state(
+    fn stage_import_chunk(
+        &self,
+        progress: &ImportProgress,
+        leaves: &[ImportLeaf],
+    ) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        let (version, root) = self.read_jmt_metadata();
+        if version != 0 || root != StateRoot::ZERO {
+            return Err("snap-sync staging requires an empty store".to_string());
+        }
+
+        let cf = CfHandles::resolve(&self.db);
+        let staging_cf = ImportStagingCf::handle(&cf);
+        let mut batch = WriteBatch::default();
+        for leaf in leaves {
+            let mut value = Vec::with_capacity(4 + leaf.storage_key.len() + leaf.value.len());
+            let key_len =
+                u32::try_from(leaf.storage_key.len()).map_err(|_| "oversized storage key")?;
+            value.extend_from_slice(&key_len.to_be_bytes());
+            value.extend_from_slice(&leaf.storage_key);
+            value.extend_from_slice(&leaf.value);
+            batch_put_raw::<ImportStagingCf>(
+                &mut batch,
+                staging_cf,
+                &Hash::from_hash_bytes(&leaf.leaf_key),
+                &(Vec::new(), Vec::new()),
+                Some(&value),
+            );
+        }
+        meta_write::<ImportProgressEntry>(&mut batch, progress);
+        self.db
+            .write(batch)
+            .map_err(|e| format!("snap-sync staging write: {e}"))
+    }
+
+    fn read_import_progress(&self) -> Option<ImportProgress> {
+        meta_read::<ImportProgressEntry>(&*self.db)
+    }
+
+    fn wipe_import_staging(&self) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        let cf = CfHandles::resolve(&self.db);
+        let mut batch = WriteBatch::default();
+        wipe_staging_into(&mut batch, ImportStagingCf::handle(&cf));
+        self.db
+            .write(batch)
+            .map_err(|e| format!("snap-sync staging wipe: {e}"))
+    }
+
+    fn finalize_boundary_import(
         &self,
         height: BlockHeight,
-        leaves: Vec<ImportLeaf>,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let _commit_guard = self
@@ -243,11 +308,20 @@ impl BoundaryStore for RocksDbShardStorage {
             return Err("snap-sync import requires an empty store".to_string());
         }
 
+        let cf = CfHandles::resolve(&self.db);
+        let staging_cf = ImportStagingCf::handle(&cf);
+        let leaves: Vec<ImportLeaf> = iter_all::<ImportStagingCf>(&self.db, staging_cf)
+            .map(|(leaf_key, (storage_key, value))| ImportLeaf {
+                leaf_key: *leaf_key.as_bytes(),
+                storage_key,
+                value,
+            })
+            .collect();
+
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
         let (imported_root, result) =
             import_leaf_updates(&snapshot_store, &self.root_path, height, &leaves)?;
 
-        let cf = CfHandles::resolve(&self.db);
         let mut batch = WriteBatch::default();
         for (node_key, node) in &result.batch.new_nodes {
             batch_put::<JmtNodesCf>(
@@ -295,6 +369,10 @@ impl BoundaryStore for RocksDbShardStorage {
             &bytes,
         );
         write_jmt_metadata(&mut batch, height.inner(), imported_root);
+        // The metadata write is the completion marker; the staging
+        // range-delete rides the same batch so a finalized store never
+        // carries staged bytes.
+        wipe_staging_into(&mut batch, staging_cf);
 
         self.db
             .write(batch)
@@ -396,8 +474,9 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Tree};
     use hyperscale_storage::test_helpers::{
-        make_database_update, test_boundary_import_roundtrip,
-        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        completed_import_progress, import_boundary_state, make_database_update,
+        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
+        test_boundary_unpinned_height_not_served,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
     use tempfile::TempDir;
@@ -543,5 +622,86 @@ mod tests {
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
         test_boundary_import_roundtrip(&storage, &fresh, |seed| commit_one(&storage, seed));
+    }
+
+    /// An import leaf whose top byte places it under one trie half.
+    fn staged_leaf(top: u8) -> ImportLeaf {
+        let mut key = [0u8; 32];
+        key[0] = top;
+        ImportLeaf {
+            leaf_key: key,
+            storage_key: vec![top; 40],
+            value: vec![top; 3],
+        }
+    }
+
+    /// Chunk-by-chunk staging finalizes to the same root as a one-shot
+    /// import of the identical leaf set, clears the staging area, and
+    /// keeps the latest progress record until then.
+    #[test]
+    fn staged_chunks_finalize_to_the_one_shot_root() {
+        let leaves = [
+            staged_leaf(0x00),
+            staged_leaf(0x11),
+            staged_leaf(0x80),
+            staged_leaf(0xEE),
+        ];
+        let height = BlockHeight::new(7);
+
+        let one_shot_dir = TempDir::new().unwrap();
+        let one_shot = open_storage(one_shot_dir.path());
+        let expected =
+            import_boundary_state(&one_shot, height, &leaves, WitnessSeed::default()).unwrap();
+
+        let staged_dir = TempDir::new().unwrap();
+        let staged = open_storage(staged_dir.path());
+        // Stage out of leaf order across two chunks: the leaf-keyed CF
+        // hands finalize a sorted scan regardless.
+        let progress = completed_import_progress(height, 12);
+        staged.stage_import_chunk(&progress, &leaves[2..]).unwrap();
+        staged.stage_import_chunk(&progress, &leaves[..2]).unwrap();
+        assert_eq!(staged.read_import_progress(), Some(progress));
+
+        let root = staged
+            .finalize_boundary_import(height, WitnessSeed::default())
+            .unwrap();
+        assert_eq!(root, expected);
+        assert_eq!(staged.read_jmt_metadata(), (7, expected));
+        assert_eq!(staged.read_import_progress(), None);
+    }
+
+    /// A wipe discards the staged chunks and the progress record.
+    #[test]
+    fn wipe_discards_staged_chunks_and_progress() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        let progress = completed_import_progress(BlockHeight::new(3), 3);
+        storage
+            .stage_import_chunk(&progress, &[staged_leaf(0x42)])
+            .unwrap();
+        assert!(storage.read_import_progress().is_some());
+
+        storage.wipe_import_staging().unwrap();
+        assert_eq!(storage.read_import_progress(), None);
+        // Nothing staged: the finalize builds an empty tree.
+        let root = storage
+            .finalize_boundary_import(BlockHeight::new(3), WitnessSeed::default())
+            .unwrap();
+        assert_eq!(root, StateRoot::ZERO);
+    }
+
+    /// Staging into a store that already holds state is rejected — the
+    /// import is a bootstrap, not a merge.
+    #[test]
+    fn staging_into_a_non_empty_store_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        commit_one(&storage, 1);
+        let progress = completed_import_progress(BlockHeight::new(2), 3);
+        assert!(
+            storage
+                .stage_import_chunk(&progress, &[staged_leaf(0x42)])
+                .is_err()
+        );
     }
 }

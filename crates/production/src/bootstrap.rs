@@ -1,15 +1,16 @@
 //! Async pump for the sans-io shard bootstrap sequencer.
 //!
-//! [`ShardBootstrap`] owns the sequencing — state assembly, import +
-//! anchor verification, witness history, recovery seeding. This driver
-//! owns what the sequencer can't: dispatching its requests through
-//! [`Network::request`] (verification verdicts feed the peer-health
-//! tracker from inside the response callbacks), writing the import into
-//! the joiner's store, wall-clock pacing between fruitless rounds, and
-//! re-reading the anchor from the live topology when the state assembly
-//! starves (serving peers may have evicted the boundary it targets).
-//! It never gives up on its own; the join stands until the supervisor
-//! tears it down.
+//! [`ShardBootstrap`] owns the sequencing — state assembly, staged
+//! import + anchor verification, witness history, recovery seeding.
+//! This driver owns what the sequencer can't: dispatching its requests
+//! through [`Network::request`] (verification verdicts feed the
+//! peer-health tracker from inside the response callbacks), staging
+//! each verified chunk and finalizing the import into the joiner's
+//! store, wall-clock pacing between fruitless rounds, and re-reading
+//! the anchor from the live topology when the state assembly starves
+//! (serving peers may have evicted the boundary it targets). It never
+//! gives up on its own; the join stands until the supervisor tears it
+//! down.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,9 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::bootstrap::{BootstrapOutcome, BootstrapRequest, ShardBootstrap};
+use hyperscale_node::bootstrap::{
+    BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome,
+};
 use hyperscale_storage::{RecoveredState, ShardStorage};
 use hyperscale_types::{Request, ShardId};
 use tokio::sync::oneshot;
@@ -62,31 +65,38 @@ where
             height = anchor.height.inner(),
             "Snap-sync bootstrap starting against attested anchor"
         );
+        // A fresh assembly stages from scratch: discard whatever an
+        // earlier attempt left behind — its chunks were proven against
+        // an anchor this assembly no longer targets.
+        storage
+            .wipe_import_staging()
+            .map_err(|error| format!("import staging wipe failed: {error}"))?;
         let bootstrap = Arc::new(Mutex::new(ShardBootstrap::new(shard, anchor)));
         let mut fruitless = 0u32;
         while !lock(&bootstrap).is_complete() {
-            let import = lock(&bootstrap).take_import();
-            if let Some((height, leaves, witnesses)) = import {
+            let finalize = lock(&bootstrap).take_finalize();
+            if let Some((height, witnesses)) = finalize {
                 let root = storage
-                    .import_boundary_state(height, leaves, witnesses)
+                    .finalize_boundary_import(height, witnesses)
                     .map_err(|error| format!("boundary import failed: {error}"))?;
                 lock(&bootstrap).on_imported(root)?;
                 continue;
             }
 
             let requests = lock(&bootstrap).next_requests();
-            let accepted = run_round(network, shard, &bootstrap, requests).await;
+            let accepted = run_round(network, shard, storage, &bootstrap, requests).await?;
             if accepted == 0 {
                 fruitless += 1;
                 if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
                     fruitless = 0;
-                    // Restart is sound in either pre-import assembly —
-                    // nothing has been written into the store yet. The
+                    // Restart is sound in either pre-finalize assembly —
+                    // the store proper is untouched, and the staging
+                    // area is wiped before the new assembly begins. The
                     // state ranges depend on peers still pinning the
                     // targeted boundary; the witness history binds to the
                     // anchor header, which peers may equally have pruned
                     // past.
-                    if lock(&bootstrap).pre_import()
+                    if lock(&bootstrap).pre_finalize()
                         && topology_snapshot
                             .load()
                             .boundary(shard)
@@ -125,21 +135,33 @@ where
     }
 }
 
-/// Dispatch one round of requests and await every response callback.
-/// Returns how many responses the sequencer accepted.
-async fn run_round<N: Network>(
+/// Dispatch one round of requests and await every response callback,
+/// staging each verified state chunk into `storage` from inside its
+/// callback (under the sequencer lock, so chunk and progress writes
+/// land in cursor order). Returns how many responses the sequencer
+/// accepted.
+///
+/// # Errors
+///
+/// Returns a description when a staging write failed — the join cannot
+/// make durable progress on this store.
+async fn run_round<S: ShardStorage, N: Network>(
     network: &Arc<N>,
     shard: ShardId,
+    storage: &Arc<S>,
     bootstrap: &Arc<Mutex<ShardBootstrap>>,
     requests: Vec<BootstrapRequest>,
-) -> usize {
+) -> Result<usize, String> {
     let accepted = Arc::new(AtomicUsize::new(0));
+    let stage_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut waiters = Vec::with_capacity(requests.len());
     for request in requests {
         let sequencer = Arc::clone(bootstrap);
         let accepted = Arc::clone(&accepted);
         let waiter = match request {
             BootstrapRequest::StateRange(id, request) => {
+                let storage = Arc::clone(storage);
+                let stage_error = Arc::clone(&stage_error);
                 send(network, shard, request, move |result| {
                     result.map_or_else(
                         |_| {
@@ -149,11 +171,22 @@ async fn run_round<N: Network>(
                             ResponseVerdict::Accept
                         },
                         |response| {
-                            judge(
-                                &lock(&sequencer).on_state_range(id, &response),
-                                &accepted,
-                                shard,
-                            )
+                            let mut sequencer = lock(&sequencer);
+                            match sequencer.on_state_range(id, &response) {
+                                StateRangeOutcome::Staged { leaves, progress } => {
+                                    if let Err(error) =
+                                        storage.stage_import_chunk(&progress, &leaves)
+                                    {
+                                        *lock(&stage_error) = Some(error);
+                                    }
+                                    accepted.fetch_add(1, Ordering::Relaxed);
+                                    ResponseVerdict::Accept
+                                }
+                                StateRangeOutcome::Rejected(reason) => {
+                                    debug!(?shard, reason, "Bootstrap response rejected");
+                                    ResponseVerdict::Reject
+                                }
+                            }
                         },
                     )
                 })
@@ -181,7 +214,11 @@ async fn run_round<N: Network>(
     for waiter in waiters {
         let _ = waiter.await;
     }
-    accepted.load(Ordering::Relaxed)
+    let stage_error = lock(&stage_error).take();
+    if let Some(error) = stage_error {
+        return Err(format!("staging write failed: {error}"));
+    }
+    Ok(accepted.load(Ordering::Relaxed))
 }
 
 /// Issue one request whose verdict `judge_response` decides; the

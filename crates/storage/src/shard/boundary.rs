@@ -47,6 +47,44 @@ pub struct WitnessSeed {
     pub payloads: Vec<ShardWitnessPayload>,
 }
 
+/// One sub-range's fetch cursor within a staged import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportCursor {
+    /// Next un-fetched key (inclusive). Meaningless when `done`.
+    pub next: Key,
+    /// Last key of the sub-range (inclusive).
+    pub end: Key,
+    /// Whether the sub-range is exhausted through `end`.
+    pub done: bool,
+}
+
+/// The durable progress record of a streamed boundary import, written
+/// atomically with every staged chunk.
+///
+/// Binds the staged data to the exact anchor its chunks were proven
+/// against: staged leaves are meaningless against any other
+/// `state_root`, so a resume whose attested anchor (or fetch geometry)
+/// differs must wipe the staging area and start fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportProgress {
+    /// The anchor height the chunks verify at — the height finalize
+    /// installs.
+    pub anchor_height: BlockHeight,
+    /// The attested state root every staged chunk was proven into.
+    pub anchor_state_root: StateRoot,
+    /// The sub-range fan-out the cursors were partitioned under.
+    pub split_bits: u8,
+    /// The per-request leaf limit the cursors advanced by.
+    pub chunk_limit: u32,
+    /// Accumulated leaf value bytes across every staged chunk — the
+    /// imported substate byte total once the assembly completes. Restored
+    /// on resume so the recovered state's byte frontier covers chunks
+    /// staged before the restart.
+    pub staged_bytes: u64,
+    /// Per-sub-range fetch cursors.
+    pub cursors: Vec<ImportCursor>,
+}
+
 /// One verified snap-sync leaf ready for import: the hashed JMT key and
 /// the raw substate pair it binds.
 ///
@@ -54,7 +92,7 @@ pub struct WitnessSeed {
 /// shard's owner-prefixed routing half, which the importer cannot derive
 /// from the raw key alone. The assembler has already proven it into the
 /// attested `state_root` and bound both halves of the pair to it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportLeaf {
     /// The 32-byte hashed JMT leaf key.
     pub leaf_key: Key,
@@ -85,24 +123,57 @@ pub trait BoundaryStore {
     /// pinned or has been evicted from the ring.
     fn open_boundary(&self, height: BlockHeight) -> Option<Self::Boundary>;
 
-    /// Install a snap-synced boundary state at `height` into this
-    /// (empty) store: raw substates, the JMT rebuilt from the shipped
-    /// leaf keys, the leaf associations, and the anchor window's witness
-    /// payloads — the state-level image of a store that committed through
-    /// the boundary. Chain metadata is not touched; tail block-sync from
-    /// `height + 1` layers on top.
-    ///
-    /// Returns the resulting state root, which the caller must compare
-    /// against the beacon-attested anchor before trusting the store.
+    /// Durably stage one verified snap-sync chunk together with the
+    /// import's progress record, in one atomic write. The store proper is
+    /// untouched — staged bytes are not an import until
+    /// [`Self::finalize_boundary_import`] builds the state from them —
+    /// so the empty-store gate keeps its meaning throughout the
+    /// assembly. Chunks may stage under different progress snapshots
+    /// (a merge keeper stages both terminating children's disjoint
+    /// spans into one store); the record reflects the latest write.
     ///
     /// # Errors
     ///
-    /// Returns a description of the failure. Importing into a non-empty
+    /// Returns a description of the failure. Staging into a non-empty
     /// store is an error — the import is a bootstrap, not a merge.
-    fn import_boundary_state(
+    fn stage_import_chunk(
+        &self,
+        progress: &ImportProgress,
+        leaves: &[ImportLeaf],
+    ) -> Result<(), String>;
+
+    /// The staged import's progress record, or `None` when nothing is
+    /// staged.
+    fn read_import_progress(&self) -> Option<ImportProgress>;
+
+    /// Discard every staged chunk and the progress record. A no-op when
+    /// nothing is staged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure (backend write error).
+    fn wipe_import_staging(&self) -> Result<(), String>;
+
+    /// Install the staged boundary state at `height` into this (empty)
+    /// store: raw substates, the JMT rebuilt from the staged leaf keys,
+    /// the leaf associations, and the anchor window's witness payloads —
+    /// the state-level image of a store that committed through the
+    /// boundary. The staging area is cleared on success. Chain metadata
+    /// is not touched; tail block-sync from `height + 1` layers on top.
+    ///
+    /// Returns the resulting state root, which the caller must compare
+    /// against the beacon-attested anchor before trusting the store.
+    /// Idempotent under re-runs after a crash mid-finalize: the JMT
+    /// metadata write is the completion marker, and re-applying the same
+    /// staged leaves overwrites deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the failure. Finalizing a non-empty
+    /// store is an error — the import is a bootstrap, not a merge.
+    fn finalize_boundary_import(
         &self,
         height: BlockHeight,
-        leaves: Vec<ImportLeaf>,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String>;
 

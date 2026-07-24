@@ -35,7 +35,10 @@ pub use beacon::chain_writer::BeaconChainWriter;
 pub use beacon::ratify_registers::RatifyRegisterStore;
 pub use beacon::storage::BeaconStorage;
 use hyperscale_jmt::TreeReader;
-pub use shard::boundary::{BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ResolveLeaf, WitnessSeed};
+pub use shard::boundary::{
+    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportLeaf, ImportProgress, ResolveLeaf,
+    WitnessSeed,
+};
 pub use shard::chain_reader::{BlockForSync, ShardChainReader};
 pub use shard::chain_writer::ShardChainWriter;
 pub use shard::genesis::GenesisCommit;

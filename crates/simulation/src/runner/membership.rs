@@ -4,8 +4,8 @@
 //! Hosted vnodes surface [`ParticipationChange`]s through `StepOutput`;
 //! the committed projection drives the actual joins and leaves — a join
 //! runs the same sans-io [`ShardBootstrap`] sequencer production drives
-//! (state assembly → import + anchor verification → witness history →
-//! recovered state), served straight from the target committee's hosts'
+//! (state assembly with per-chunk staging → finalize + anchor
+//! verification → witness history → recovered state), served straight from the target committee's hosts'
 //! storages, then seats the vnode via `NodeHost::add_shard`; a leave
 //! tears the shard down via `NodeHost::remove_shard`, handing back a
 //! shared storage handle so a later rejoin exercises the
@@ -24,7 +24,9 @@ use hyperscale_core::ParticipationChange;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::{BootstrapRequest, ShardBootstrap, replicate_engine_bootstrap};
+use hyperscale_node::bootstrap::{
+    BootstrapRequest, ShardBootstrap, StateRangeOutcome, replicate_engine_bootstrap,
+};
 use hyperscale_node::{
     SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
     serve_state_range_request, serve_witness_history_request,
@@ -355,9 +357,9 @@ impl SimulationRunner {
             if bootstrap.is_complete() {
                 break;
             }
-            if let Some((height, leaves, witnesses)) = bootstrap.take_import() {
+            if let Some((height, witnesses)) = bootstrap.take_finalize() {
                 let root = storage
-                    .import_boundary_state(height, leaves, witnesses)
+                    .finalize_boundary_import(height, witnesses)
                     .expect("boundary import into a fresh store");
                 bootstrap
                     .on_imported(root)
@@ -371,7 +373,13 @@ impl SimulationRunner {
                     BootstrapRequest::StateRange(id, request) => {
                         let response =
                             serve_state_range_request(server.shard_io(shard).storage(), &request);
-                        bootstrap.on_state_range(id, &response);
+                        if let StateRangeOutcome::Staged { leaves, progress } =
+                            bootstrap.on_state_range(id, &response)
+                        {
+                            storage
+                                .stage_import_chunk(&progress, &leaves)
+                                .expect("chunk staging into a fresh store");
+                        }
                     }
                     BootstrapRequest::WitnessHistory(request) => {
                         let response = serve_witness_history_request(
