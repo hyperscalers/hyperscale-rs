@@ -62,7 +62,12 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardId) -> Option<ValidatorId>
 /// pool refill onto it via [`pool_draw`].
 ///
 /// The caller writes the validator's new status first and passes the
-/// status it held immediately before as `prior`. An `Observing`
+/// status it held immediately before as `prior`. An `OnShard`
+/// validator on a merging child also sheds any keeper seat it holds
+/// on the parent's pending merge — the merge absorbs the attrition
+/// like a split cohort does (execution gate, staleness cancel,
+/// readiness TTL), and a stale seat must never count toward the merge
+/// quorum or reach the keeper move. An `Observing`
 /// validator leaves the committee and sheds its cohort seat instead —
 /// with no refill, since a cohort seat is not a committee slot;
 /// attrition is absorbed by the execution gate, the staleness cancel,
@@ -81,6 +86,12 @@ pub(super) fn exit_placement(
         ValidatorStatus::OnShard { shard, .. } => {
             if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
                 committee.members.retain(|v| *v != validator);
+            }
+            if let Some(parent) = shard.parent()
+                && let Some(PendingReshape::Merge { keepers, .. }) =
+                    state.pending_reshapes.get_mut(&parent)
+            {
+                keepers.remove(&validator);
             }
             pool_draw(state, shard);
         }

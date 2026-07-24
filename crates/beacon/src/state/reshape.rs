@@ -1404,6 +1404,71 @@ mod tests {
         assert!(!state.miss_counters.contains_key(&keeper_ids[0]));
     }
 
+    /// Jailing a keeper sheds its seat from the pending merge, so the
+    /// dead seat neither counts toward the readiness quorum nor reaches
+    /// the keeper move when the merge executes.
+    #[test]
+    fn jailed_keeper_sheds_its_seat_and_the_merge_executes_past_it() {
+        use hyperscale_types::JailReason;
+
+        use crate::state::vrf::jail_validator;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&mut state, &net(), left, &merge);
+        apply_shard_payload(&mut state, &net(), right, &merge);
+        let keepers = keepers_of(&state, parent);
+        let keeper_ids: Vec<ValidatorId> = keepers.keys().copied().collect();
+
+        let jailed = keeper_ids[0];
+        let jailed_child = keepers[&jailed].child;
+        jail_validator(&mut state, jailed, JailReason::Performance, Epoch::new(5));
+
+        // The seat is gone and the child committee no longer lists the
+        // keeper.
+        let remaining = keepers_of(&state, parent);
+        assert_eq!(remaining.len(), 3);
+        assert!(!remaining.contains_key(&jailed));
+        assert!(
+            !state.next_shard_committees[&jailed_child]
+                .members
+                .contains(&jailed)
+        );
+
+        // The three surviving keepers ready up: quorum is 2f+1 = 3, met
+        // without the dead seat, and the move walks only live keepers.
+        for id in &keeper_ids[1..] {
+            let child = remaining[id].child;
+            apply_shard_payload(
+                &mut state,
+                &net(),
+                child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: *id,
+                    child,
+                },
+            );
+        }
+        execute_ready_merges(&mut state);
+
+        assert!(state.pending_reshapes.is_empty());
+        let merged = state.next_shard_committees[&parent].members.clone();
+        assert_eq!(merged.len(), 3);
+        assert!(!merged.contains(&jailed));
+        for id in &keeper_ids[1..] {
+            assert!(merged.contains(id));
+        }
+        assert_eq!(
+            state.validators[&jailed].status,
+            ValidatorStatus::Jailed {
+                since_epoch: Epoch::new(5),
+                reason: JailReason::Performance,
+            },
+        );
+    }
+
     /// Two replicas with byte-identical state execute byte-identically —
     /// the keeper draw and the merged committee are seeded, not
     /// incidental.

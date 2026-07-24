@@ -379,6 +379,7 @@ pub enum PendingReshape {
         /// committee from each child, each seat the child it runs and
         /// whether it has synced the sibling half. The execution gate
         /// reads ready seats; rotation on the children skips keepers.
+        /// Seats drop with the validator's jail or deactivation.
         /// Empty until paired.
         keepers: BTreeMap<ValidatorId, KeeperSeat>,
         /// Epoch the merge paired and drew its keepers — starts the
