@@ -607,6 +607,7 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 
 #[cfg(test)]
 mod tests {
+    use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, Tree};
     use hyperscale_storage::test_helpers::{
         completed_import_progress, import_boundary_state, make_database_update,
@@ -1035,6 +1036,70 @@ mod tests {
         assert_eq!(storage.run_state_history_gc(), 0);
         assert_eq!(storage.read_jmt_metadata(), (100, root));
         assert_eq!(count_cf_entries(&storage, JMT_NODES_CF), nodes);
+    }
+
+    /// GB-scale import: two different batch limits over the same
+    /// generated leaf set converge to the identical root and node set,
+    /// and the byte total matches — the small-tree equivalence
+    /// guarantees hold where the batching actually engages.
+    #[test]
+    #[ignore = "GB-scale stress (minutes, ~4GB disk) — run with --ignored"]
+    fn gb_scale_import_is_batch_limit_invariant() {
+        const TOTAL: u64 = 2_000_000;
+        const VALUE_BYTES: usize = 512;
+        const STAGE_CHUNK: usize = 8_192;
+        let height = BlockHeight::new(1_000);
+
+        let import = |batch_limit: u64| {
+            let dir = TempDir::new().unwrap();
+            let storage = open_storage(dir.path());
+            let progress = completed_import_progress(height, TOTAL * VALUE_BYTES as u64);
+            let mut chunk = Vec::with_capacity(STAGE_CHUNK);
+            for index in 0..TOTAL {
+                let mut seed = [0u8; 32];
+                seed[..8].copy_from_slice(&index.to_be_bytes());
+                // Hashed keys spread paths uniformly, like real
+                // `jmt_leaf_key` output.
+                let key = *blake3_hash(&seed).as_bytes();
+                let mut storage_key = vec![0u8; 40];
+                storage_key[..32].copy_from_slice(&key);
+                storage_key[32..].copy_from_slice(&index.to_be_bytes());
+                chunk.push(ImportLeaf {
+                    leaf_key: key,
+                    storage_key,
+                    value: seed.repeat(VALUE_BYTES / 32),
+                });
+                if chunk.len() == STAGE_CHUNK {
+                    storage.stage_import_chunk(&progress, &chunk).unwrap();
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                storage.stage_import_chunk(&progress, &chunk).unwrap();
+            }
+            let root = storage
+                .finalize_staged(height, &WitnessSeed::default(), batch_limit, None)
+                .unwrap();
+            (dir, storage, root)
+        };
+
+        let (_wide_dir, wide, wide_root) = import(IMPORT_BATCH_BYTES);
+        let (_narrow_dir, narrow, narrow_root) = import(32 * 1024 * 1024);
+
+        assert_eq!(wide_root, narrow_root);
+        assert_eq!(wide.read_jmt_metadata(), (1_000, wide_root));
+        assert_eq!(narrow.read_jmt_metadata(), (1_000, narrow_root));
+        assert_eq!(
+            wide.substate_bytes_at_version(1_000),
+            Some(TOTAL * VALUE_BYTES as u64),
+        );
+        for cf in [JMT_NODES_CF, STATE_CF, LEAF_ASSOCIATIONS_CF] {
+            assert_eq!(
+                count_cf_entries(&wide, cf),
+                count_cf_entries(&narrow, cf),
+                "column family {cf} diverged between batch limits",
+            );
+        }
     }
 
     /// Staging into a store that already holds state is rejected — the
