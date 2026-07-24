@@ -145,6 +145,27 @@ impl RocksDbShardStorage {
     /// `stop_after` truncates the build after that many batches with no
     /// completion marker — the crash-mid-finalize shape the re-run
     /// idempotence test exercises.
+    /// Refuse a finalize the drivers should never request: a store that
+    /// already holds state, or an assembly whose progress record binds
+    /// `height` with open cursors. The drivers gate finalize on assembly
+    /// completeness; a record that still claims this height while a
+    /// cursor is open means a caller slipped past that gate, and
+    /// refusing beats sealing a root that can never verify — that would
+    /// poison the store for every later import attempt.
+    fn check_finalize_preconditions(&self, height: BlockHeight) -> Result<(), String> {
+        let (version, root) = self.read_jmt_metadata();
+        if version != 0 || root != StateRoot::ZERO {
+            return Err("snap-sync import requires an empty store".to_string());
+        }
+        if let Some(progress) = self.read_import_progress()
+            && progress.anchor_height == height
+            && !progress.cursors.iter().all(|cursor| cursor.done)
+        {
+            return Err("snap-sync finalize on an incomplete assembly".to_string());
+        }
+        Ok(())
+    }
+
     fn finalize_staged(
         &self,
         height: BlockHeight,
@@ -156,10 +177,7 @@ impl RocksDbShardStorage {
             .commit_lock
             .lock()
             .map_err(|_| "commit lock poisoned".to_string())?;
-        let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
-            return Err("snap-sync import requires an empty store".to_string());
-        }
+        self.check_finalize_preconditions(height)?;
 
         let cf = CfHandles::resolve(&self.db);
         let staging_cf = ImportStagingCf::handle(&cf);
@@ -879,6 +897,29 @@ mod tests {
             .finalize_boundary_import(BlockHeight::new(3), WitnessSeed::default())
             .unwrap();
         assert_eq!(root, StateRoot::ZERO);
+    }
+
+    /// Finalize refuses a progress record that binds the target height
+    /// with open cursors — a partial assembly must never seal.
+    #[test]
+    fn finalize_refuses_an_incomplete_assembly_bound_to_the_height() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        let mut progress = completed_import_progress(BlockHeight::new(3), 3);
+        progress.cursors[0].done = false;
+        storage
+            .stage_import_chunk(&progress, &[staged_leaf(0x42)])
+            .unwrap();
+
+        let err = storage
+            .finalize_boundary_import(BlockHeight::new(3), WitnessSeed::default())
+            .unwrap_err();
+        assert!(err.contains("incomplete assembly"), "{err}");
+        // Nothing sealed and staging intact: a completed re-stage can
+        // still finalize this store.
+        assert_eq!(storage.read_jmt_metadata(), (0, StateRoot::ZERO));
+        assert!(storage.read_import_progress().is_some());
+        assert_eq!(count_cf_entries(&storage, STATE_CF), 0);
     }
 
     /// Deterministic pseudorandom import leaves with distinct keys and

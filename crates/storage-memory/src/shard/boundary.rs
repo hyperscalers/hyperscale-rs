@@ -128,6 +128,16 @@ impl BoundaryStore for SimShardStorage {
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let staging = read_or_recover(&self.import_staging);
+        // The drivers gate finalize on assembly completeness; a progress
+        // record still binding this height with open cursors means a
+        // caller slipped past that gate. Refusing here beats sealing a
+        // root that can never verify.
+        if let Some(progress) = &staging.progress
+            && progress.anchor_height == height
+            && !progress.cursors.iter().all(|cursor| cursor.done)
+        {
+            return Err("snap-sync finalize on an incomplete assembly".to_string());
+        }
         let leaves: Vec<ImportLeaf> = staging
             .leaves
             .iter()
@@ -256,6 +266,29 @@ mod tests {
     fn commit_one(storage: &SimShardStorage, seed: u8) {
         let updates = make_database_update(vec![seed; 50], 0, vec![seed], vec![seed, seed, seed]);
         storage.commit_shared(&updates);
+    }
+
+    #[test]
+    fn finalize_refuses_an_incomplete_assembly_bound_to_the_height() {
+        use hyperscale_storage::test_helpers::completed_import_progress;
+
+        let storage = SimShardStorage::default();
+        let mut progress = completed_import_progress(BlockHeight::new(3), 1);
+        progress.cursors[0].done = false;
+        let leaf = ImportLeaf {
+            leaf_key: [0x42; 32],
+            storage_key: vec![0x42],
+            value: vec![1],
+        };
+        storage.stage_import_chunk(&progress, &[leaf]).unwrap();
+
+        let err = storage
+            .finalize_boundary_import(BlockHeight::new(3), WitnessSeed::default())
+            .unwrap_err();
+        assert!(err.contains("incomplete assembly"), "{err}");
+        // Staging survives and nothing landed in the store.
+        assert!(storage.read_import_progress().is_some());
+        assert_eq!(storage.state_root(), StateRoot::ZERO);
     }
 
     #[test]
