@@ -51,14 +51,22 @@ pub(super) fn tally_param_votes(state: &mut BeaconState) {
         *bucket = bucket.saturating_add(weight);
     }
 
-    // Total pool stake is the denominator; a bucket wins iff it holds
-    // strictly more than the rest of the stake combined. Each backing
-    // vote validated its params when recorded; a final bounds check keeps
-    // an invalid value out even if that gate ever loosens. Absent a valid
-    // winner the next epoch carries the current params forward.
-    let total = state.pools.values().fold(0u128, |acc, pool| {
-        acc.saturating_add(pool.total_stake.attos())
-    });
+    // Total unconvicted pool stake is the denominator; a bucket wins iff
+    // it holds strictly more than the rest of the stake combined.
+    // Impounded stake carries no governance weight in either direction —
+    // a convicted pool's standing vote was dropped at conviction and new
+    // casts are rejected at the fold, and counting its dead stake here
+    // would only dilute live proposals. Each backing vote validated its
+    // params when recorded; a final bounds check keeps an invalid value
+    // out even if that gate ever loosens. Absent a valid winner the next
+    // epoch carries the current params forward.
+    let total = state
+        .pools
+        .values()
+        .filter(|pool| pool.conviction.is_none())
+        .fold(0u128, |acc, pool| {
+            acc.saturating_add(pool.total_stake.attos())
+        });
     let winner = buckets
         .into_iter()
         .find(|&(_, backing)| backing > total.saturating_sub(backing))
@@ -108,6 +116,7 @@ mod tests {
                     total_stake: Stake::from_attos(stake),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
+                    released_cumulative: Stake::ZERO,
                     conviction: None,
                 },
             );
@@ -125,6 +134,43 @@ mod tests {
                 proposal,
             }),
         );
+    }
+
+    fn convict(state: &mut BeaconState, pool: u32) {
+        use hyperscale_types::PoolConviction;
+        state
+            .pools
+            .get_mut(&StakePoolId::new(pool))
+            .unwrap()
+            .conviction = Some(PoolConviction {
+            convicted_at: state.current_epoch,
+            lifts_at: Epoch::new(state.current_epoch.inner() + 1_000),
+        });
+    }
+
+    /// Impounded stake carries no governance weight: it sits outside
+    /// the majority denominator, so a live minority-by-raw-stake
+    /// proposal clears.
+    #[test]
+    fn impounded_stake_carries_no_governance_weight() {
+        let mut state = state_with_pools(4, &[(0, 60), (1, 40)]);
+        convict(&mut state, 0);
+        cast(&mut state, 1, Some(proposal(HIGH, 5)));
+
+        tally_param_votes(&mut state);
+
+        assert_eq!(state.next_params.reshape_thresholds.split_bytes, HIGH);
+    }
+
+    /// A convicted pool casts nothing — the fold rejects its votes.
+    #[test]
+    fn convicted_pool_casts_no_votes() {
+        let mut state = state_with_pools(3, &[(0, 100)]);
+        convict(&mut state, 0);
+
+        cast(&mut state, 0, Some(proposal(HIGH, 5)));
+
+        assert!(state.param_votes.is_empty());
     }
 
     // ─── fold arm: record / replace / clear / reject ─────────────────────

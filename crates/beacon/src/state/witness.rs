@@ -181,6 +181,7 @@ pub(super) fn apply_shard_payload(
                 total_stake: Stake::ZERO,
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             });
             pool.total_stake = pool.total_stake.saturating_add(*amount);
@@ -345,7 +346,12 @@ pub(super) fn apply_shard_payload(
                     // (`tally_param_votes` at `activate_at - 1`), so a vote
                     // naming this epoch or earlier can never be tallied —
                     // drop it on arrival rather than carrying dead weight.
-                    if state.pools.contains_key(&vote.pool)
+                    // A convicted pool casts nothing: its stake is
+                    // impounded and it holds no governance weight.
+                    if state
+                        .pools
+                        .get(&vote.pool)
+                        .is_some_and(|p| p.conviction.is_none())
                         && proposal.activate_at > state.current_epoch
                         && proposal.params.validate().is_ok()
                     {
@@ -989,6 +995,44 @@ mod tests {
         }
     }
 
+    /// Stake ops fold uniformly on a convicted pool: deposits credit
+    /// and withdrawal initiations queue. Conviction only retires
+    /// validation and freezes maturation — a fold-side rejection the
+    /// shard-layer staking contract doesn't mirror would skew the two
+    /// ledgers once custody lands there.
+    #[test]
+    fn stake_ops_fold_uniformly_on_a_convicted_pool() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        apply_witness_chunk(
+            &mut state,
+            0,
+            vec![equivocation_payload(ValidatorId::new(1))],
+        );
+        assert!(state.pools[&pool_id].conviction.is_some());
+        let total = state.pools[&pool_id].total_stake;
+
+        apply_witness_chunk(
+            &mut state,
+            0,
+            vec![
+                ShardWitnessPayload::StakeDeposit {
+                    pool_id,
+                    amount: MIN_STAKE_FLOOR,
+                },
+                ShardWitnessPayload::StakeWithdraw {
+                    pool_id,
+                    amount: MIN_STAKE_FLOOR,
+                },
+            ],
+        );
+
+        let pool = &state.pools[&pool_id];
+        assert_eq!(pool.total_stake, total.saturating_add(MIN_STAKE_FLOOR));
+        assert_eq!(pool.pending_withdrawals.len(), 1);
+    }
+
     /// Happy path: a `RegisterValidator` for an unknown id with a pool
     /// that has capacity adds the validator at `Pooled` with
     /// `registered_at_epoch = state.current_epoch`, and the pool's
@@ -1602,6 +1646,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );
@@ -1889,6 +1934,7 @@ mod tests {
                 total_stake: MIN_STAKE_FLOOR,
                 validators: std::iter::once(id).collect(),
                 pending_withdrawals: Vec::new(),
+                released_cumulative: Stake::ZERO,
                 conviction: None,
             },
         );

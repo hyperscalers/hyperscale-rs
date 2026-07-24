@@ -40,6 +40,11 @@ pub(super) fn convict_pool(
         convicted_at: epoch,
         lifts_at,
     });
+    // The pool's governance weight dies with it. Dropping the standing
+    // vote here (not just gating new casts) matters for ordering: a
+    // vote recorded earlier in this same fold would otherwise still
+    // carry the impounded stake into this epoch's tally.
+    state.param_votes.remove(&pool_id);
     let members: Vec<ValidatorId> = pool.validators.iter().copied().collect();
     let mut revoked = Vec::new();
     for id in members {
@@ -58,13 +63,15 @@ pub(super) fn convict_pool(
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, ShardCommittee, ShardId, Stake, StakePool,
-        ValidatorId,
+        BeaconState, EMISSIONS_PER_EPOCH, Epoch, JailReason, MIN_STAKE_FLOOR, NetworkParams,
+        ParamProposal, PendingWithdrawal, ShardCommittee, ShardId, Stake, StakePool,
+        UNBONDING_WINDOW_EPOCHS, ValidatorId,
     };
 
     use super::*;
-    use crate::state::lifecycle::auto_reactivate;
+    use crate::state::lifecycle::{auto_reactivate, distribute_epoch_rewards};
     use crate::state::test_fixtures::{empty_state, validator_record};
+    use crate::state::withdrawals::complete_pending_withdrawals;
 
     /// Pool 0: validator 0 `OnShard`, 1 `Pooled`, 2 `Jailed`, 3
     /// `InsufficientStake`. Pool 1: validator 10 `OnShard`, 11 `Pooled`.
@@ -108,6 +115,7 @@ mod tests {
                     total_stake: Stake::from_attos(stake_multiple * MIN_STAKE_FLOOR.attos()),
                     validators: ids.into_iter().map(ValidatorId::new).collect(),
                     pending_withdrawals: Vec::new(),
+                    released_cumulative: Stake::ZERO,
                     conviction: None,
                 },
             );
@@ -191,6 +199,90 @@ mod tests {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
         assert!(convict_pool(&mut state, StakePoolId::new(9), epoch).is_empty());
+    }
+
+    /// The impound freezes maturation outright — a withdrawal whose
+    /// unbonding window elapsed long ago still waits out the lift —
+    /// and afterwards the stake exits whole through the normal path.
+    /// `total_stake` moves only at maturation: conviction and the
+    /// frozen span leave it byte-identical (nothing is slashed), and
+    /// `released_cumulative` plateaus over the impound.
+    #[test]
+    fn impound_freezes_maturation_and_releases_whole_after_lift() {
+        let mut state = two_pool_state();
+        state.params.impound_epochs = UNBONDING_WINDOW_EPOCHS;
+        let pool_id = StakePoolId::new(0);
+        let amount = MIN_STAKE_FLOOR;
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .pending_withdrawals
+            .push(PendingWithdrawal {
+                amount,
+                initiated_at_epoch: Epoch::new(0),
+            });
+        let epoch = state.current_epoch;
+        let total_before = state.pools[&pool_id].total_stake;
+
+        convict_pool(&mut state, pool_id, epoch);
+        assert_eq!(state.pools[&pool_id].total_stake, total_before);
+        let lifts_at = state.pools[&pool_id].conviction.unwrap().lifts_at;
+
+        // Window long elapsed, impound in force: nothing matures.
+        state.current_epoch = Epoch::new(lifts_at.inner() - 1);
+        complete_pending_withdrawals(&mut state);
+        let pool = &state.pools[&pool_id];
+        assert_eq!(pool.total_stake, total_before);
+        assert_eq!(pool.released_cumulative, Stake::ZERO);
+        assert_eq!(pool.pending_withdrawals.len(), 1);
+
+        // At the lift the frozen withdrawal releases in full.
+        state.current_epoch = lifts_at;
+        complete_pending_withdrawals(&mut state);
+        let pool = &state.pools[&pool_id];
+        assert_eq!(pool.total_stake, total_before.saturating_sub(amount));
+        assert_eq!(pool.released_cumulative, amount);
+        assert!(pool.pending_withdrawals.is_empty());
+    }
+
+    /// A convicted pool earns no emissions — it has no ready actives to
+    /// key a share off — while live pools keep their full flow.
+    #[test]
+    fn convicted_pool_earns_no_emissions() {
+        let mut state = two_pool_state();
+        let epoch = state.current_epoch;
+        convict_pool(&mut state, StakePoolId::new(0), epoch);
+        let total0 = state.pools[&StakePoolId::new(0)].total_stake;
+
+        let credits = distribute_epoch_rewards(&mut state);
+
+        assert!(!credits.contains_key(&StakePoolId::new(0)));
+        assert_eq!(
+            credits.get(&StakePoolId::new(1)).copied(),
+            Some(EMISSIONS_PER_EPOCH),
+        );
+        assert_eq!(state.pools[&StakePoolId::new(0)].total_stake, total0);
+    }
+
+    /// Conviction drops the pool's standing parameter vote — a vote
+    /// recorded earlier in the same fold must not carry impounded
+    /// stake into this epoch's tally.
+    #[test]
+    fn conviction_drops_the_standing_param_vote() {
+        let mut state = two_pool_state();
+        let epoch = state.current_epoch;
+        state.param_votes.insert(
+            StakePoolId::new(0),
+            ParamProposal {
+                params: NetworkParams::default(),
+                activate_at: Epoch::new(epoch.inner() + 2),
+            },
+        );
+
+        convict_pool(&mut state, StakePoolId::new(0), epoch);
+
+        assert!(!state.param_votes.contains_key(&StakePoolId::new(0)));
     }
 
     /// The reactivation sweep never resurrects a convicted pool's

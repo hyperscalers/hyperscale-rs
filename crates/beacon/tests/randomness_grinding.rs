@@ -274,6 +274,7 @@ fn build_state(
             total_stake: Stake::from_attos(u128::from(population) * 5 * MIN_STAKE_FLOOR.attos()),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),
+            released_cumulative: Stake::ZERO,
             conviction: None,
         },
     );

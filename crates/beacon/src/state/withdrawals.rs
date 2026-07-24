@@ -67,6 +67,18 @@ pub(super) fn complete_pending_withdrawals(state: &mut BeaconState) -> Withdrawa
     let current_epoch = state.current_epoch.inner();
     let pool_ids: Vec<StakePoolId> = state.pools.keys().copied().collect();
     for pool_id in pool_ids {
+        // An impound freezes maturation outright: conviction holds
+        // every pending withdrawal — including ones initiated before
+        // the evidence landed — until `lifts_at`, then the normal
+        // window check resumes and the stake exits whole.
+        if state
+            .pools
+            .get(&pool_id)
+            .and_then(|p| p.conviction)
+            .is_some_and(|c| current_epoch < c.lifts_at.inner())
+        {
+            continue;
+        }
         let released = {
             let pool = state.pools.get_mut(&pool_id).expect("just iterated");
             let mut sum = Stake::ZERO;
@@ -88,6 +100,7 @@ pub(super) fn complete_pending_withdrawals(state: &mut BeaconState) -> Withdrawa
         {
             let pool = state.pools.get_mut(&pool_id).expect("present");
             pool.total_stake = pool.total_stake.saturating_sub(released);
+            pool.released_cumulative = pool.released_cumulative.saturating_add(released);
         }
         // Auto-deactivate highest-id active validators until balanced.
         // `min_stake` is re-evaluated each iteration because dropping

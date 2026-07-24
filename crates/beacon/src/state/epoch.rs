@@ -1812,6 +1812,7 @@ mod tests {
                     total_stake: MIN_STAKE_FLOOR,
                     validators: std::iter::once(*id).collect(),
                     pending_withdrawals: Vec::new(),
+                    released_cumulative: Stake::ZERO,
                     conviction: None,
                 },
             );
