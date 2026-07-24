@@ -191,11 +191,21 @@ async fn run_round<S: ShardStorage, N: Network>(
                             let mut sequencer = lock(&sequencer);
                             match sequencer.on_state_range(id, &response) {
                                 StateRangeOutcome::Staged { leaves, progress } => {
-                                    if let Err(error) =
-                                        storage.stage_import_chunk(&progress, &leaves)
+                                    // Once one staging write has failed, stop
+                                    // persisting: each progress snapshot covers
+                                    // every cursor, so a later write would
+                                    // durably claim the failed chunk's span
+                                    // whose leaves never landed. The record on
+                                    // disk must never run ahead of the staged
+                                    // leaves.
+                                    let mut stage_error = lock(&stage_error);
+                                    if stage_error.is_none()
+                                        && let Err(error) =
+                                            storage.stage_import_chunk(&progress, &leaves)
                                     {
-                                        *lock(&stage_error) = Some(error);
+                                        *stage_error = Some(error);
                                     }
+                                    drop(stage_error);
                                     accepted.fetch_add(1, Ordering::Relaxed);
                                     ResponseVerdict::Accept
                                 }
