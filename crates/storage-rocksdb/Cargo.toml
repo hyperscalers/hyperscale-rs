@@ -18,8 +18,14 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
+criterion = { version = "0.8.2", features = ["html_reports"] }
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "import_throughput"
+harness = false
 
 [lints]
 workspace = true
