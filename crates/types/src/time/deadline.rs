@@ -180,7 +180,7 @@ impl Window {
 /// answer: absent, a sibling may still be pending, and the committed
 /// cell says whether it ever will be. A delivery's claim cell is written
 /// by a member that awaits nobody, so both readings answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Probed {
     /// A core member's committed cell, past the transaction's deadline:
     /// absent where the member never included the transaction, or
@@ -194,10 +194,6 @@ pub enum Probed {
 }
 
 impl Probed {
-    /// Every cell a probe asks about, in the order a block carries their
-    /// records.
-    pub const ALL: [Self; 3] = [Self::Core, Self::Delivery, Self::Claim];
-
     /// The window an *absence* of this cell is read in, `None` where an
     /// absence never answers.
     #[must_use]

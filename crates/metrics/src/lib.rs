@@ -353,7 +353,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// replica counting these where its peers count none is one whose
     /// rebuild did not reach the transaction's own block, and the record
     /// is what puts it back in step with them.
-    fn record_rebuilt_verdict_entry(&self) {}
+    fn record_rebuilt_record_entry(&self) {}
 
     /// Record a counterpart cell a committed proof answered for, as
     /// `present` or absent — the fold every replica of a shard reaches
@@ -837,8 +837,8 @@ pub fn record_unresolvable_tx(cause: &str) {
 
 /// Record an entry rebuilt from a committed boundary record.
 #[inline]
-pub fn record_rebuilt_verdict_entry() {
-    recorder().record_rebuilt_verdict_entry();
+pub fn record_rebuilt_record_entry() {
+    recorder().record_rebuilt_record_entry();
 }
 
 /// Record a counterpart cell a committed proof answered for.
