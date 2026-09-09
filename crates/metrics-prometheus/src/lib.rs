@@ -153,7 +153,7 @@ pub struct Metrics {
     /// Ledger entries rebuilt from a committed boundary record. Read
     /// across a shard's replicas: an outlier is one whose rebuild missed
     /// the transaction's own block.
-    pub rebuilt_verdict_entries: Counter,
+    pub rebuilt_record_entries: Counter,
     /// Counterpart cells a committed proof answered for, by whether the
     /// cell was present. An absent answer is what licenses a reclaim.
     pub reclaim_probes_answered: CounterVec,
@@ -751,9 +751,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            rebuilt_verdict_entries: register_counter!(
-                "hyperscale_rebuilt_verdict_entries_total",
-                "Ledger entries rebuilt from a committed boundary record"
+            rebuilt_record_entries: register_counter!(
+                "hyperscale_rebuilt_record_entries_total",
+                "Ledger entries rebuilt from a committed abandonment record"
             )
             .unwrap(),
 
@@ -1081,8 +1081,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_rebuilt_verdict_entry(&self) {
-        self.metrics.rebuilt_verdict_entries.inc();
+    fn record_rebuilt_record_entry(&self) {
+        self.metrics.rebuilt_record_entries.inc();
     }
 
     fn record_reclaim_probe_answered(&self, present: bool) {

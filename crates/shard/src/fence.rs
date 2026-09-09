@@ -154,7 +154,7 @@ impl VoteFence<'_> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|verdict| self.departure_stands(verdict))
+            .try_for_each(|record| self.departure_stands(record))
     }
 
     /// Whether a departure record stands: this validator's own ledger
@@ -171,11 +171,11 @@ impl VoteFence<'_> {
     /// ignorance; a voter that has not acquired it defers, since the
     /// record is only proposable inside the window the set can be read
     /// in, so a voter inside it either has the set or is about to.
-    fn departure_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
-        let shard = verdict.shard();
+    fn departure_stands(&self, record: &AbandonmentRecord) -> Result<(), Withheld> {
+        let shard = record.shard();
         let stranger = self.evidence.with_parties(shard, |parties| {
             parties.map(|parties| {
-                verdict
+                record
                     .tx_hashes()
                     .find(|tx_hash| !parties.contains(tx_hash))
             })
@@ -196,7 +196,7 @@ impl VoteFence<'_> {
         }
         let settled = self.evidence.with_settled(|sets| {
             sets.get(&shard).map(|settled| {
-                verdict
+                record
                     .tx_hashes()
                     .find(|tx_hash| settled.txs.contains(tx_hash))
             })

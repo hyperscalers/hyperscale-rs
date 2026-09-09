@@ -1172,12 +1172,12 @@ impl UnresolvedTxs {
     /// reconstructed entry is the entry: the record restates every figure
     /// the transaction fixes and the reach it touches, so what this
     /// derives from it is what a replica that held the block derives.
-    pub fn record_abandonment_records(&mut self, verdicts: &[AbandonmentRecord]) -> usize {
+    pub fn record_abandonment_records(&mut self, records: &[AbandonmentRecord]) -> usize {
         let mut reconstructed = 0usize;
-        for verdict in verdicts {
-            for entry in verdict.unsettled() {
+        for record in records {
+            for entry in record.unsettled() {
                 if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
-                    owed.departed_by = Some(verdict.shard());
+                    owed.departed_by = Some(record.shard());
                     continue;
                 }
                 reconstructed = reconstructed.saturating_add(1);
@@ -1187,7 +1187,7 @@ impl UnresolvedTxs {
                         figures: entry.clone(),
                         certified: true,
                         part: Part::whole(),
-                        departed_by: Some(verdict.shard()),
+                        departed_by: Some(record.shard()),
                         cued: None,
                         asked: Asked::default(),
                     },

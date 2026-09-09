@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
-    record_rebuilt_verdict_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
+    record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
@@ -294,7 +294,7 @@ impl Counterparts {
             .ledger
             .record_abandonment_records(block.abandonment_records());
         for _ in 0..rebuilt {
-            record_rebuilt_verdict_entry();
+            record_rebuilt_record_entry();
         }
         self.cover_recorded(block);
         self.stamp_departures(topology_schedule, now);

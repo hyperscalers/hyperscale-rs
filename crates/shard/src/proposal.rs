@@ -307,23 +307,23 @@ pub fn select_finalizations(
 pub fn select_abandonment_records(
     ctx: &Admission<'_>,
     fold: &mut RecordsFold<'_>,
-    verdicts: Vec<AbandonmentRecord>,
+    records: Vec<AbandonmentRecord>,
 ) -> Vec<AbandonmentRecord> {
-    let mut trimmed: Vec<AbandonmentRecord> = verdicts
+    let mut trimmed: Vec<AbandonmentRecord> = records
         .into_iter()
-        .filter_map(|verdict| {
-            let kept: Vec<UnsettledTx> = verdict
+        .filter_map(|record| {
+            let kept: Vec<UnsettledTx> = record
                 .unsettled()
                 .iter()
                 .filter(|entry| RecordsSection::name_stands(ctx, fold, entry.tx_hash).is_ok())
                 .cloned()
                 .collect();
             (!kept.is_empty())
-                .then(|| AbandonmentRecord::new(verdict.shard(), verdict.terminal_wt(), kept))
+                .then(|| AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept))
         })
         .collect();
     trimmed.sort_by_key(AbandonmentRecord::shard);
-    admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |verdict| verdict).0
+    admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |record| record).0
 }
 
 /// The proofs a block may carry of counterparts' cells: what
