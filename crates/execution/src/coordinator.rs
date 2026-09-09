@@ -8977,7 +8977,7 @@ mod tests {
     #[test]
     fn a_consumers_acceptance_cues_the_probe_and_the_presence_retires() {
         let schedule = two_shard_topology();
-        let (transaction, figures, _, mut state) = consumer_claim_fixture();
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -9015,7 +9015,13 @@ mod tests {
 
         // The probe answers present, which the committed claim writes
         // to the ledger.
-        state.counterparts.ledger.record_claimed(tx_hash, PEER);
+        state.counterparts.ledger.close_question(
+            tx_hash,
+            PEER,
+            claim,
+            Probed::Claim,
+            Inclusion::Present([7; 32]),
+        );
         let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
         let request = actions
             .iter()

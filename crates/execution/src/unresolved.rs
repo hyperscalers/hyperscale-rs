@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization,
+    AbandonmentRecord, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization, Inclusion,
     MAX_VALIDITY_RANGE, Probed, Question, Role, RoutePrefix, ShardId, ShardTrie, SubstateKey,
     Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window, Word,
@@ -35,20 +35,16 @@ use hyperscale_types::{
 ///
 /// A probe is the fetch and nothing more. Its answer is read off the
 /// block that carries the claim, by every replica alike, so the
-/// standing is kept only so one header is asked once: a question in
-/// flight is left alone, one whose fetch returned a reading that
-/// answered nothing is moved on to a newer header, one whose reading
-/// answered is held to offer, and one the chain has answered is never
-/// asked again.
+/// standing is kept so one header is asked once — a question in flight
+/// is left alone, one whose fetch returned a reading that answered
+/// nothing is moved on to a newer header, one whose reading answered is
+/// held to offer — and, once the chain has answered, to hold what it
+/// said: the reading is what licenses the settlement of the crossing
+/// the cell was asked about, and it is never asked again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
-    /// A fetch of `key` against `anchor` is out.
-    Asked {
-        /// The commit-proven state the proof is asked against.
-        anchor: Anchor,
-        /// The cell asked about.
-        key: SubstateKey,
-    },
+    /// A fetch against `anchor` is out.
+    Asked(Anchor),
     /// The fetch against `anchor` returned, and its reading answered
     /// nothing — an absence outside its window, or one the core's
     /// arity says nothing about — so the question is put again at a
@@ -58,8 +54,16 @@ pub enum Standing {
     /// the question for this validator, held to offer in a block it
     /// proposes. Nothing is asked again until the chain answers.
     Verified(Anchor),
-    /// The chain answered.
-    Closed,
+    /// The chain answered, and this is what it read.
+    Closed(Inclusion),
+}
+
+/// One cell a counterpart was asked about: which question it answers,
+/// and where the question stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Probe {
+    probed: Probed,
+    standing: Standing,
 }
 
 /// What closing a question released: the fetch still out for it, if
@@ -72,10 +76,10 @@ pub struct Released(pub Option<(Anchor, SubstateKey)>);
 fn outstanding_fetches(owed: &Owed) -> impl Iterator<Item = (Anchor, SubstateKey)> + '_ {
     owed.asked
         .cells
-        .values()
-        .filter_map(|standing| match standing {
-            Standing::Asked { anchor, key } => Some((*anchor, *key)),
-            Standing::Answered(_) | Standing::Verified(_) | Standing::Closed => None,
+        .iter()
+        .filter_map(|(&(_, key), probe)| match probe.standing {
+            Standing::Asked(anchor) => Some((anchor, key)),
+            Standing::Answered(_) | Standing::Verified(_) | Standing::Closed(_) => None,
         })
 }
 
@@ -132,10 +136,6 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     covered: Option<(ShardId, CounterpartEvidence)>,
-    /// The consumer shards a committed record says claimed what this
-    /// entry issued. Once every consumer has, the records here have
-    /// nothing left to hold and the retirement is licensed.
-    claimed_by: BTreeSet<ShardId>,
     /// Where a consumer's certificate spoke a claiming success for this
     /// transaction, if one has.
     ///
@@ -173,10 +173,20 @@ struct Asked {
     /// saying it succeeded is not the transaction accepted — that is
     /// every core shard saying so, and this is the count.
     accepted: BTreeSet<ShardId>,
-    /// Where each question this validator has put to a counterpart
-    /// about a cell stands. What the answer *was* is the mirror's to
-    /// say.
-    cells: BTreeMap<(ShardId, Probed), Standing>,
+    /// Each cell asked of a counterpart, by the shard it was asked of
+    /// and the cell: which question it answers, and where the question
+    /// stands — including, once the chain has answered, what it read.
+    cells: BTreeMap<(ShardId, SubstateKey), Probe>,
+}
+
+impl Asked {
+    /// Whether the chain read `claim` present on some shard: the
+    /// consumer holds the crossing the cell was asked about.
+    fn claimed(&self, claim: SubstateKey) -> bool {
+        self.cells.iter().any(|(&(_, key), probe)| {
+            key == claim && matches!(probe.standing, Standing::Closed(Inclusion::Present(_)))
+        })
+    }
 }
 
 impl Owed {
@@ -698,7 +708,6 @@ impl UnresolvedTxs {
                 part: Part::of(self.local, tx, classified),
                 taken: None,
                 covered: None,
-                claimed_by: BTreeSet::new(),
                 cued: None,
                 asked: Asked::default(),
             };
@@ -744,19 +753,6 @@ impl UnresolvedTxs {
             .is_some_and(|core| core.contains(&shard))
     }
 
-    /// Record that a committed claim read `shard`'s claim cell for
-    /// `tx_hash` present: the consumer holds the crossing a leg here
-    /// issued. Once every consumer has, the retirement is licensed.
-    ///
-    /// Fed from the committed claim itself, which every replica folds at
-    /// the same block, so the retirements two replicas compose agree
-    /// without the reading being restated as a record.
-    pub fn record_claimed(&mut self, tx_hash: TxHash, shard: ShardId) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.claimed_by.insert(shard);
-        }
-    }
-
     /// Whether `shard` consumes a crossing this shard issued for the
     /// transaction — a core consumer's or a delivery's — so that its
     /// acceptance is the claim the record here was held for.
@@ -795,9 +791,9 @@ impl UnresolvedTxs {
         })
     }
 
-    /// Whether a probe of that cell is already out, already answered by
-    /// this validator's own fetch or by the chain, or returned a reading
-    /// that answered nothing at `height` or newer.
+    /// Whether a probe of `key` on `shard` is already out, already
+    /// answered by this validator's own fetch or by the chain, or
+    /// returned a reading that answered nothing at `height` or newer.
     ///
     /// A question in flight is left alone: a core's header lands every
     /// block, and moving the probe to each new one abandons the fetch
@@ -810,32 +806,36 @@ impl UnresolvedTxs {
         &self,
         tx_hash: TxHash,
         shard: ShardId,
-        probed: Probed,
+        key: SubstateKey,
         height: BlockHeight,
     ) -> bool {
         self.owed
             .get(&tx_hash)
-            .and_then(|owed| owed.asked.cells.get(&(shard, probed)))
-            .is_some_and(|standing| match standing {
-                Standing::Asked { .. } | Standing::Verified(_) | Standing::Closed => true,
+            .and_then(|owed| owed.asked.cells.get(&(shard, key)))
+            .is_some_and(|probe| match probe.standing {
+                Standing::Asked(_) | Standing::Verified(_) | Standing::Closed(_) => true,
                 Standing::Answered(anchor) => anchor.height >= height,
             })
     }
 
     /// Put a question to a counterpart, replacing whatever stood: a
-    /// fetch of `key` against `anchor`.
+    /// fetch of `key` against `anchor`, asking `probed`.
     pub fn record_probe(
         &mut self,
         tx_hash: TxHash,
         shard: ShardId,
+        key: SubstateKey,
         probed: Probed,
         anchor: Anchor,
-        key: SubstateKey,
     ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.asked
-                .cells
-                .insert((shard, probed), Standing::Asked { anchor, key });
+            owed.asked.cells.insert(
+                (shard, key),
+                Probe {
+                    probed,
+                    standing: Standing::Asked(anchor),
+                },
+            );
         }
     }
 
@@ -848,16 +848,16 @@ impl UnresolvedTxs {
     pub fn mark_probes_answered(&mut self, anchor: Anchor, keys: &[SubstateKey]) -> Vec<Answered> {
         let mut answered = Vec::new();
         for (&tx_hash, owed) in &mut self.owed {
-            for (&(shard, probed), standing) in &mut owed.asked.cells {
-                let Standing::Asked { anchor: asked, key } = *standing else {
+            for (&(shard, key), probe) in &mut owed.asked.cells {
+                let Standing::Asked(asked) = probe.standing else {
                     continue;
                 };
                 if asked == anchor && keys.contains(&key) {
-                    *standing = Standing::Answered(anchor);
+                    probe.standing = Standing::Answered(anchor);
                     answered.push(Answered {
                         tx_hash,
                         shard,
-                        probed,
+                        probed: probe.probed,
                         key,
                         deadline: owed.figures.deadline,
                         core: owed.part.kept().map_or(0, |kept| kept.core().len()),
@@ -868,39 +868,51 @@ impl UnresolvedTxs {
         answered
     }
 
-    /// Record that the reading this validator's fetch took answers what
-    /// `probed` asks of `shard` about `tx_hash`, so the question is not
-    /// put to a counterpart again for an answer already in hand.
+    /// Record that the reading this validator's fetch took of `key` on
+    /// `shard` answers its question about `tx_hash`, so the question is
+    /// not put to a counterpart again for an answer already in hand.
     ///
     /// Kept apart from the mirror, which stays fed by committed content
     /// alone so two validators at one committed height compose the
     /// same records. What this licenses is narrower: not asking again.
-    pub fn verify_probe(&mut self, tx_hash: TxHash, shard: ShardId, probed: Probed) {
+    pub fn verify_probe(&mut self, tx_hash: TxHash, shard: ShardId, key: SubstateKey) {
         if let Some(owed) = self.owed.get_mut(&tx_hash)
-            && let Some(standing) = owed.asked.cells.get_mut(&(shard, probed))
-            && let Standing::Answered(anchor) = *standing
+            && let Some(probe) = owed.asked.cells.get_mut(&(shard, key))
+            && let Standing::Answered(anchor) = probe.standing
         {
-            *standing = Standing::Verified(anchor);
+            probe.standing = Standing::Verified(anchor);
         }
     }
 
-    /// Close the question `probed` asks of `shard` about `tx_hash`,
-    /// naming any fetch of this validator's still out for it so the
-    /// caller can let it go.
+    /// Close the question `probed` asks of `key` on `shard` about
+    /// `tx_hash` with what the chain read, naming any fetch of this
+    /// validator's still out for it so the caller can let it go.
     ///
-    /// First proof wins: `None` says the cell was already answered, and
-    /// a later proof adds nothing.
+    /// First claim wins: `None` says the cell was already answered, and
+    /// a later claim adds nothing.
     pub fn close_question(
         &mut self,
         tx_hash: TxHash,
         shard: ShardId,
+        key: SubstateKey,
         probed: Probed,
+        inclusion: Inclusion,
     ) -> Option<Released> {
         let owed = self.owed.get_mut(&tx_hash)?;
-        let released = match owed.asked.cells.insert((shard, probed), Standing::Closed) {
-            Some(Standing::Closed) => return None,
-            Some(Standing::Asked { anchor, key }) => Some((anchor, key)),
-            Some(Standing::Answered(_) | Standing::Verified(_)) | None => None,
+        let closed = Probe {
+            probed,
+            standing: Standing::Closed(inclusion),
+        };
+        let released = match owed.asked.cells.insert((shard, key), closed) {
+            Some(Probe {
+                standing: Standing::Closed(_),
+                ..
+            }) => return None,
+            Some(Probe {
+                standing: Standing::Asked(anchor),
+                ..
+            }) => Some((anchor, key)),
+            Some(_) | None => None,
         };
         Some(Released(released))
     }
@@ -1029,38 +1041,35 @@ impl UnresolvedTxs {
         }
     }
 
-    /// The leg entries committed records have licensed the retirement of
-    /// and no tick has taken yet: every crossing this shard issued has a
-    /// claim some shard on record owns the prefix of, no record covers
-    /// the entry as unsettled, and nothing is taking it back. Read off
+    /// The leg entries committed claims have licensed the retirement of
+    /// and no tick has taken yet: every crossing this shard issued has
+    /// its claim cell read present on some shard, no record covers the
+    /// entry as unsettled, and nothing is taking it back. Read off
     /// committed content alone, like [`Self::reclaimable`], so every
     /// replica composes the same.
     ///
     /// A claim is answered by whoever holds its prefix, which after a
     /// cut is the frozen consumer's successor — the same widening
-    /// [`Self::consumer_holds`] makes, and for the same reason.
+    /// [`Self::consumer_holds`] makes, and for the same reason — so the
+    /// cell is what is held to, not the shard it was read on.
     #[must_use]
     pub fn retirable(&self) -> Vec<Settleable> {
         self.untaken_legs()
-            .filter(|(_, owed, _)| owed.covered.is_none() && !owed.claimed_by.is_empty())
+            .filter(|(_, owed, _)| owed.covered.is_none())
             .filter_map(|(tx_hash, owed, kept)| {
                 let claims: Vec<SubstateKey> = kept
                     .every_claim(self.local)
                     .into_iter()
                     .map(|(_, claim)| claim)
                     .collect();
-                (!claims.is_empty()
-                    && claims.iter().all(|claim| {
-                        owed.claimed_by
-                            .iter()
-                            .any(|shard| ShardTrie::shard_owns_prefix(*shard, claim.owner))
-                    }))
-                .then(|| Settleable {
-                    tx_hash,
-                    body: Arc::clone(&kept.body),
-                    classified: kept.classified.clone(),
-                    charged: owed.charged,
-                })
+                (!claims.is_empty() && claims.iter().all(|claim| owed.asked.claimed(*claim))).then(
+                    || Settleable {
+                        tx_hash,
+                        body: Arc::clone(&kept.body),
+                        classified: kept.classified.clone(),
+                        charged: owed.charged,
+                    },
+                )
             })
             .collect()
     }
@@ -1149,7 +1158,6 @@ impl UnresolvedTxs {
                         },
                         taken: None,
                         covered: Some((verdict.shard(), verdict.evidence())),
-                        claimed_by: BTreeSet::new(),
                         cued: None,
                         asked: Asked::default(),
                     },
@@ -2793,7 +2801,14 @@ mod tests {
             "the shard holding the claim's prefix consumes what the leg issued",
         );
 
-        ledger.record_claimed(tx.hash(), SUCCESSOR);
+        let (_, claim) = core_claim(&classified());
+        ledger.close_question(
+            tx.hash(),
+            SUCCESSOR,
+            claim,
+            Probed::Claim,
+            Inclusion::Present([7; 32]),
+        );
         let retirable = ledger.retirable();
         assert_eq!(
             retirable.len(),
@@ -2816,7 +2831,14 @@ mod tests {
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
-        ledger.record_claimed(tx.hash(), PARTNER);
+        let (_, claim) = core_claim(&classified());
+        ledger.close_question(
+            tx.hash(),
+            PARTNER,
+            claim,
+            Probed::Claim,
+            Inclusion::Present([7; 32]),
+        );
         let retirable = ledger.retirable();
         assert_eq!(retirable.len(), 1, "every consumer claimed");
         assert_eq!(retirable[0].tx_hash, tx.hash());
