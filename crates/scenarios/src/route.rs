@@ -199,11 +199,11 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     let paid = held(c, trader.address(), *XRD);
 
     // Past the anchor a probe of the core is licensed at, and held there
-    // until the probe has been answered: the answer is `Present` — the
-    // core's block is on its chain — and that is what refuses the
-    // reclaim. Read off the probe rather than off a settling delay, so
-    // the scenario fails where the evidence is instead of wherever a
-    // timer happened to land.
+    // until the probe has read the core's cell: the reading is `Present`
+    // — the core's block is on its chain, its member still pending — and
+    // that answers nothing, so the reclaim is not licensed. Read off the
+    // probe rather than off a settling delay, so the scenario fails where
+    // the evidence is instead of wherever a timer happened to land.
     let validity_end = validity.end_timestamp_exclusive;
     let anchor = Deadline::of(validity_end).at();
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
@@ -211,14 +211,13 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         c.run_until(epochs(8), |c| clock(c) >= anchor),
         "the cut must stand past the reclaim probe's anchor",
     );
-    let probed = c.metric("reclaim_probes_answered", Some("present"));
+    let probed = c.metric("reclaim_probes_pending", None);
     let reclaimed = c.metric("reclaims_admitted", None);
     assert!(
-        c.run_until(epochs(8), |c| c
-            .metric("reclaim_probes_answered", Some("present"))
+        c.run_until(epochs(8), |c| c.metric("reclaim_probes_pending", None)
             > probed),
-        "the trader's leg must probe the core past its deadline and be \
-         answered that the core's block is there",
+        "the trader's leg must probe the core past its deadline and read \
+         that the core's block is there",
     );
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),

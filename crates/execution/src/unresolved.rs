@@ -45,8 +45,8 @@ pub enum Standing {
     /// A fetch against `anchor` is out.
     Asked(Anchor),
     /// The fetch against `anchor` returned, and its reading answered
-    /// nothing — an absence outside its window, or one the core's
-    /// arity says nothing about — so the question is put again at a
+    /// nothing — an absence outside its window, a claim absent, or a
+    /// committed cell present — so the question is put again at a
     /// newer header.
     Answered(Anchor),
     /// The fetch against `anchor` returned with a reading that answers
@@ -205,17 +205,16 @@ impl Owed {
     }
 
     /// What the evidence covering the entry established of the
-    /// transaction, where it established a verdict at all: a departure,
-    /// a core's committed cell absent or a one-shard core's claim absent
-    /// says the core never took it, which aborts the transaction; a
-    /// delivery's claim absent says only that the delivery lapsed, and
-    /// the core decided.
+    /// transaction, where it established a verdict at all: a departure
+    /// or a core's committed cell absent says the core never took it,
+    /// which aborts the transaction; a delivery's claim absent says only
+    /// that the delivery lapsed, and the core decided.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
         (self.departed_by.is_some()
             || self
                 .asked
                 .absences()
-                .any(|probed| matches!(probed, Probed::Core | Probed::Claim)))
+                .any(|probed| matches!(probed, Probed::Core)))
         .then_some(TransactionDecision::Aborted)
     }
 
@@ -465,11 +464,11 @@ pub struct Kept {
 }
 
 impl Kept {
-    /// Whose refusal is the transaction's, and the arity an absent
-    /// committed cell is read against. An issuer in the core holds the
-    /// core it is part of, itself included; the prober skips this shard,
-    /// since what it has committed is not something it fetches a proof
-    /// of. Empty for a shape with no core.
+    /// Whose refusal is the transaction's, and whose committed cells a
+    /// probe asks about. An issuer in the core holds the core it is
+    /// part of, itself included; the prober skips this shard, since
+    /// what it has committed is not something it fetches a proof of.
+    /// Empty for a shape with no core.
     const fn core(&self) -> &BTreeSet<ShardId> {
         self.classified.core()
     }
@@ -486,9 +485,10 @@ impl Kept {
 
     /// The claim cells core consumers write for the crossings a leg on
     /// `local` issued, each under the shard holding the consumer's
-    /// target — what a probe asks the core about past the deadline.
-    /// Empty for a core shard: a leg beside the core is the core's, so
-    /// nothing a core shard produces is claimed by a core it is not in.
+    /// target — what a probe asks the core about, and whose presence
+    /// licenses the retirement. Empty for a core shard: a leg beside the
+    /// core is the core's, so nothing a core shard produces is claimed
+    /// by a core it is not in.
     fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.classified.core_claims(local)
     }
@@ -543,10 +543,10 @@ pub struct Probeable {
     /// The core set, every shard of which is asked. Any one core shard's
     /// absence is the whole answer — no core shard finalizes without
     /// every other's certificate — while one that did include says only
-    /// that a sibling is pending, so a probe of a single shard strands
-    /// the crossing whenever that shard is the one that included. Also
-    /// the arity an absent cell is read against. Empty for a shape with
-    /// no core, whose counterparts are deliveries alone.
+    /// that a member is pending, so a probe of a single shard strands
+    /// the crossing whenever that shard is the one that included. Empty
+    /// for a shape with no core, whose counterparts are deliveries
+    /// alone.
     pub core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for what this leg
     /// issued, each under the shard that was to deliver it at commit.
@@ -556,8 +556,7 @@ pub struct Probeable {
     /// The claim cells core consumers write for what this leg issued,
     /// each under the shard holding the consumer's target. Asked about
     /// past the deadline, there and on whatever shard holds the cell's
-    /// prefix by then: present says the core took it, and absent, where
-    /// the core is one shard, that it never will.
+    /// prefix by then: present says the core took it.
     pub claims: Vec<(ShardId, SubstateKey)>,
     /// Where a consumer's claiming success was spoken, if one has been
     /// heard: the anchor that opens the probe ahead of the deadline, and
@@ -566,13 +565,12 @@ pub struct Probeable {
     pub cued_at: Option<WeightedTimestamp>,
 }
 
-/// A question a fetch of this validator's just spoke to, with the terms
+/// A question a fetch of this validator's just spoke to, with the term
 /// the answer is read against.
 ///
 /// Carried out of the ledger rather than looked up again, because the
-/// two terms a reading needs — the entry's deadline and the arity of the
-/// core it asks about — are the entry's own and the caller holds no
-/// entry.
+/// term a reading needs — the entry's deadline — is the entry's own and
+/// the caller holds no entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Answered {
     /// The transaction the question was asked for.
@@ -585,9 +583,6 @@ pub struct Answered {
     pub key: SubstateKey,
     /// The entry's deadline, which an absence is licensed inside.
     pub deadline: Deadline,
-    /// How many shards the core spans, which decides whether an absent
-    /// committed cell answers at all.
-    pub core: usize,
 }
 
 /// What one name on a committed finalization means for the entry it
@@ -858,7 +853,6 @@ impl UnresolvedTxs {
                         probed: probe.probed,
                         key,
                         deadline: owed.figures.deadline,
-                        core: owed.part.kept().map_or(0, |kept| kept.core().len()),
                     });
                 }
             }
@@ -1598,6 +1592,7 @@ impl UnresolvedTxs {
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
         make_finalization, make_leg_finalization, make_undecided_finalization, stub_transaction,
         test_prefix, test_principal,
@@ -1649,6 +1644,15 @@ mod tests {
             "the fixture issues one crossing to the core"
         );
         claims[0]
+    }
+
+    /// The committed cell `shard` writes for `tx`.
+    fn core_cell(shard: ShardId, tx: &Arc<Verifiable<Transaction>>) -> SubstateKey {
+        committed_tx_cell_key(
+            shard,
+            tx.hash(),
+            tx.validity_range().end_timestamp_exclusive,
+        )
     }
 
     /// The claim cell a delivery writes for what `classified` says
@@ -2435,8 +2439,13 @@ mod tests {
             "at the deadline the leg is probeable and the whole entry is not"
         );
 
-        let (_, claim) = core_claim(&classified());
-        ledger.close_question(leg.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
+        ledger.close_question(
+            leg.hash(),
+            PARTNER,
+            core_cell(PARTNER, &leg),
+            Probed::Core,
+            Inclusion::Absent,
+        );
         assert!(
             ledger.probeable(deadline).is_empty(),
             "a covered entry is asked about once"
@@ -2657,8 +2666,13 @@ mod tests {
             fw(&ledger, reclaim.clone()).is_empty(),
             "a deciding success on a leg entry nothing covers says nothing"
         );
-        let (_, claim) = core_claim(&classified());
-        ledger.close_question(leg.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
+        ledger.close_question(
+            leg.hash(),
+            PARTNER,
+            core_cell(PARTNER, &leg),
+            Probed::Core,
+            Inclusion::Absent,
+        );
         assert_eq!(
             fw(&ledger, reclaim),
             decided(&leg, TransactionDecision::Aborted),
@@ -2952,8 +2966,6 @@ mod tests {
     /// strand at the next commit, since the sibling never departed.
     #[test]
     fn a_core_member_covered_by_a_siblings_absence_lives_to_its_horizon() {
-        use hyperscale_storage::committed_tx_cell_key;
-
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(8, 60_000);
         commit_as(&mut ledger, &tx, &two_shard_core());
@@ -2966,7 +2978,7 @@ mod tests {
             "past the abandon window the shard no longer speaks for it on its own clock"
         );
 
-        let sibling = committed_tx_cell_key(SIBLING, tx.hash(), ms(60_000));
+        let sibling = core_cell(SIBLING, &tx);
         ledger.close_question(tx.hash(), SIBLING, sibling, Probed::Core, Inclusion::Absent);
         assert!(ledger.is_unsettleable(tx.hash()));
         assert_eq!(

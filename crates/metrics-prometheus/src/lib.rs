@@ -160,6 +160,7 @@ pub struct Metrics {
     /// Reclaims admitted into a tick — escrowed value taken back on
     /// committed evidence.
     pub reclaims_admitted: Counter,
+    pub reclaim_probes_pending: Counter,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -769,6 +770,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            reclaim_probes_pending: register_counter!(
+                "hyperscale_reclaim_probes_pending_total",
+                "Counterpart cells a fetch read as answering nothing yet, asked again at a newer header"
+            )
+            .unwrap(),
+
             fetch_responses_refused: register_counter_vec!(
                 "hyperscale_fetch_responses_refused_total",
                 "Fetch responses refused by the requester's own check",
@@ -1088,6 +1095,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_admitted(&self) {
         self.metrics.reclaims_admitted.inc();
+    }
+
+    fn record_reclaim_probe_pending(&self) {
+        self.metrics.reclaim_probes_pending.inc();
     }
 
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {

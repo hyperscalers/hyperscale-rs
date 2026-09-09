@@ -485,7 +485,7 @@ fn submit_probe<C: Cluster>(
         recipient: *to,
         records,
         delivery_closes: window.end_timestamp_exclusive.plus(MAX_VALIDITY_RANGE),
-        claim_closes: Window::Claim
+        claim_closes: Window::LegEntry
             .of(Deadline::of(window.end_timestamp_exclusive))
             .end,
     }

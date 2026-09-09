@@ -15,11 +15,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
-use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answered};
+use hyperscale_metrics::{
+    record_rebuilt_verdict_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
+};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CLAIM_VISIBILITY_LAG,
-    CounterpartMirror, Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
+    Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie,
     Spoken, StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision,
@@ -41,30 +43,21 @@ type CounterpartCell = (ShardId, SubstateKey, Probed);
 /// are the same cells.
 ///
 /// `local` is never asked about: a core member holds the core it is part
-/// of, itself included, because the arity an absent committed cell is
-/// read against is the core's own — but what it has committed is not
-/// something it fetches a proof of.
+/// of, itself included, but what it has committed is not something it
+/// fetches a proof of.
 fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec<CounterpartCell> {
-    // The committed cell is asked about only where its absence would
-    // answer: a core of more than one shard, whose shards settle on each
-    // other's certificates with no clock. A core of one shard answers
-    // through its claim, which the deadline fences.
-    //
     // Every core shard is asked, because any one of them absent is the
     // whole answer — a core that one of its shards never included, or
     // that one of its shards refused and retracted its cell for, can
     // never settle — while the shards that still hold theirs say only
-    // that a sibling is pending. Asking the lowest alone leaves the
+    // that a member is pending. Asking the lowest alone leaves the
     // crossing stranded whenever that shard is the one that included.
     // Nothing is asked before the deadline, so a core that settles pays
     // for none of this.
-    let core_answers = Probed::Core
-        .read(Inclusion::Absent, entry.core.len())
-        .is_some();
     let core = entry
         .core
         .iter()
-        .filter(move |&&shard| core_answers && shard != local)
+        .filter(move |&&shard| shard != local)
         .map(|&shard| {
             (
                 shard,
@@ -429,21 +422,21 @@ impl Counterparts {
     ///
     /// The deadline gates the probe and never the reclaim: absence at a
     /// block past the floor is the evidence, and before it the
-    /// counterpart may still legitimately act. A core of more than one
-    /// shard is asked about the transaction's committed cell past the
-    /// deadline, and every core shard is asked: any one of them absent
-    /// is the whole answer, while the shards that did include say only
-    /// that a sibling is pending, so asking one alone strands the
-    /// crossing whenever that shard is the one that included. A core of
-    /// one shard writes no cell and is asked about its consumer's claim
-    /// instead. A delivering shard is asked about the crossing's claim
-    /// cell past the lapse, the delivery window's close plus the
-    /// finalization delay, since a delivery admitted under the close has
-    /// claimed by then or never will. Each is asked against that shard's
-    /// newest commit-proven header inside its window — at or past its
-    /// floor and short of the probed cell's own sweep, since a proof
-    /// against a swept cell is a true proof of nothing — of those
-    /// standing at `now`, the chain's committed clock.
+    /// counterpart may still legitimately act. Every core shard is asked
+    /// about the transaction's committed cell past the deadline: any one
+    /// of them absent is the whole answer, while a shard that still
+    /// holds its cell says only that a member is pending — its refusal
+    /// may yet retract it — and is asked again at each newer header. The
+    /// shard holding the core consumer's target is asked about the
+    /// consumer's claim, whose presence is what licenses the retirement.
+    /// A delivering shard is asked about the crossing's claim cell past
+    /// the lapse, the delivery window's close plus the finalization
+    /// delay, since a delivery admitted under the close has claimed by
+    /// then or never will. Each is asked against that shard's newest
+    /// commit-proven header the question stands at — inside the window
+    /// an absence answers in, at or past its floor and short of the
+    /// probed cell's own sweep, or past the point a presence is asked
+    /// from — of those standing at `now`, the chain's committed clock.
     ///
     /// That ceiling is what makes a committee ask one question rather
     /// than four. The answer is held to each voter's own reading, so a
@@ -471,26 +464,13 @@ impl Counterparts {
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.ledger.probeable(now) {
             for (shard, key, probed) in counterpart_cells(&entry, self.local_shard, trie) {
-                // The newest header an absence would answer at, of those
+                // The newest header the question stands at, of those
                 // standing at the chain's clock: the one the shard is
                 // likeliest to still serve, and the one every member of
-                // this committee is asking of. Where no header answers
-                // one — the cue fired before the window opened — the
-                // newest standing past the cue's own visibility will do,
-                // because the reading the cue is after is a presence,
-                // and a presence answers wherever it was taken.
-                let readable = entry.cued_at.map(|at| at.plus(CLAIM_VISIBILITY_LAG));
-                let Some(anchor) = self
-                    .proven_anchors
-                    .newest_licensed(shard, now, |ts| {
-                        probed.absence_answers_at(ts, entry.deadline)
-                    })
-                    .or_else(|| {
-                        self.proven_anchors.newest_licensed(shard, now, |ts| {
-                            readable.is_none_or(|readable| ts >= readable)
-                        })
-                    })
-                else {
+                // this committee is asking of.
+                let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |ts| {
+                    probed.asks_at(ts, entry.deadline, entry.cued_at)
+                }) else {
                     continue;
                 };
                 // A question in flight, one this validator's own fetch
@@ -598,13 +578,15 @@ impl Counterparts {
             };
             if entry
                 .probed
-                .answer(anchor.ts, entry.deadline, inclusion, entry.core)
+                .answer(anchor.ts, entry.deadline, inclusion)
                 .is_some()
             {
                 self.ledger
                     .verify_probe(entry.tx_hash, entry.shard, entry.key);
                 answering.insert(entry.key);
                 speaks_for.insert(entry.tx_hash);
+            } else {
+                record_reclaim_probe_pending();
             }
         }
         // An inherited record names no transaction, so what it wants is
@@ -635,13 +617,12 @@ impl Counterparts {
     /// whose window the anchor's clock sits inside — whether or not this
     /// replica had a probe out, and wherever its own probe sat — so a
     /// replica that never fetched reads the same answer as the one that
-    /// did. A key found present means the counterpart took the
-    /// transaction: a claim cell present is the consumer holding the
-    /// crossing, which is written straight to the ledger and licenses
-    /// the retirement, and the counterpart's own certificate speaks for
-    /// the verdict next. A core consumer's claim absent on a core of
-    /// more than one shard says only that a sibling is pending, and is
-    /// asked again at the next header.
+    /// did. A claim cell present is the consumer holding the crossing,
+    /// which is written straight to the ledger and licenses the
+    /// retirement, and the counterpart's own certificate speaks for the
+    /// verdict next. A core consumer's claim absent says only that a
+    /// sibling is pending, and a committed cell present that a member
+    /// is; either is asked again at the next header.
     /// The first proof to answer a cell is the answer; a later one adds
     /// nothing. The hand-off is a continuation emitted here rather than
     /// a map the fence reads later, so an answer is never collected
@@ -690,7 +671,7 @@ impl Counterparts {
                 continue;
             };
             let Some(inclusion) =
-                Probed::Delivery.answer(stated.anchor.ts, record.deadline(), inclusion, 0)
+                Probed::Delivery.answer(stated.anchor.ts, record.deadline(), inclusion)
             else {
                 continue;
             };
@@ -714,23 +695,20 @@ impl Counterparts {
                 let Some(inclusion) = claim.reading(key) else {
                     continue;
                 };
-                // Judged per word and by the one arity rule, whoever
-                // fetched the proof: an absence is read only inside
-                // its window and only for the arity that writes the
-                // cell, a presence wherever it was taken — and a probe
-                // never sent may still be answered by a claim a block
-                // carries.
-                let Some(inclusion) =
-                    probed.answer(claim.anchor.ts, entry.deadline, inclusion, entry.core.len())
+                // Judged per cell by the one rule, whoever fetched the
+                // proof: an absence is read only inside its window and
+                // only for the cell a refusal leaves absent, a presence
+                // wherever it was taken and only for the cell a claim
+                // writes — and a probe never sent may still be answered
+                // by a claim a block carries.
+                let Some(inclusion) = probed.answer(claim.anchor.ts, entry.deadline, inclusion)
                 else {
                     continue;
                 };
                 // The question is answered with what the chain read,
                 // and a fetch still out for it is released with it. A
                 // claim cell present is the consumer holding the
-                // crossing, which is what licenses the retirement; a
-                // committed cell present says only that the core
-                // committed the transaction, and settles nothing.
+                // crossing, which is what licenses the retirement.
                 let Some(Released(released)) =
                     self.ledger
                         .close_question(entry.tx_hash, shard, key, probed, inclusion)
