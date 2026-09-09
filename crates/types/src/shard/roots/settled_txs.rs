@@ -32,7 +32,7 @@ use crate::{
 ///
 /// A verdict this shard reached alone and did not complete is excluded:
 /// a refusal or an abort names nothing a counterpart may treat as
-/// settled, and the departure record composed against this set is what
+/// settled, and the abandonment record composed against this set is what
 /// licenses the counterpart's own answer to it. **Single-shard
 /// transactions are excluded** too: nothing elsewhere ever asks about
 /// them, so the set stays proportional to cross-shard traffic rather

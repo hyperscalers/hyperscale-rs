@@ -105,7 +105,7 @@ impl Membership {
     /// derivation, in the shape a tick carries.
     ///
     /// Classifies **one member**, and so reads the side it runs on. Not
-    /// the same question as [`Part::of`](crate::unresolved::Part), which
+    /// the same question as [`Part::of`](crate::ledger::Part), which
     /// classifies a shard's one ledger entry and reads
     /// [`Classified::only_delivers_at`]: the branches look alike and
     /// answer differently for a shard with legs on both sides of the

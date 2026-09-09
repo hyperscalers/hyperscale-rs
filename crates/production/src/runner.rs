@@ -452,7 +452,7 @@ impl ProductionRunnerBuilder {
         }
         let mut local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
         // A shard this host ran before a cut still holds what its
-        // counterparts read from it — the settled sets a departure record
+        // counterparts read from it — the settled sets an abandonment record
         // is held to, the terminal evidence a successor derives from —
         // and routing names its ex-members for as long as the beacon
         // keeps its boundary. Seating is a placement question and the

@@ -38,7 +38,7 @@
 //! probes the silent counterpart's cells through a state proof, and what
 //! comes back licenses a reclaim, a retirement, or an abandonment
 //! record. The ledger of what is still owed is
-//! [`UnresolvedTxs`](crate::unresolved::UnresolvedTxs); what counterparts
+//! [`Ledger`](crate::ledger::Ledger); what counterparts
 //! were heard to say is the [`CounterpartMirror`], shared with the vote
 //! fence so a record passes exactly where its composer would have
 //! offered it.
@@ -73,6 +73,7 @@ use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
+use crate::ledger::{Ledger, Settleable, Unanswerable};
 use crate::lookups::{
     assign_participants, build_provision_requests, ec_has_shard_quorum_power, fetch_keys_covered,
     peers_excluding_self,
@@ -83,7 +84,6 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{Settleable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -3520,7 +3520,7 @@ impl ExecutionCoordinator {
         }
 
         // What this shard's ledger says the departed shard was party to,
-        // taken beside the set: a departure record may name only these,
+        // taken beside the set: an abandonment record may name only these,
         // and the fence reads it from the same mirror.
         self.counterparts.on_settled(shard, settled);
         self.release(topology_schedule, Wake::SettledSet(shard))
@@ -3782,7 +3782,7 @@ impl ExecutionCoordinator {
         // compose a tick to abandon them in — on a coast block, under a
         // committee it no longer has. Nothing here can reach a verdict
         // either way, which is the same reason the ticks above go.
-        self.counterparts.ledger = UnresolvedTxs::new(self.local_shard);
+        self.counterparts.ledger = Ledger::new(self.local_shard);
         // The terminated chain's tick outputs die with it: successors seed
         // from settled state, and pending resolutions have nothing left to
         // resolve against. A tick still in flight lands on a cleared
@@ -3968,7 +3968,7 @@ mod tests {
 
     use super::*;
     use crate::counterparts::Inherited;
-    use crate::unresolved::Part;
+    use crate::ledger::Part;
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
