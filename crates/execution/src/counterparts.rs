@@ -28,7 +28,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::CrossingCell;
 
-use crate::ledger::{Ledger, Question, Released, Unanswerable};
+use crate::ledger::{Ledger, Question, Unanswerable};
 
 /// What one block's abandonment records may still spend.
 ///
@@ -87,10 +87,10 @@ impl Budget {
 /// An inherited escrow record, and where its one question stands.
 ///
 /// One question, to one shard: is the claim cell this record names
-/// present? So the bookkeeping is one height rather than the ledger's
-/// `Asked` — there is no set of counterparts to track, no fetch release
-/// to sequence, and no record to compose, because the answer is a
-/// reading and a reading is block content already.
+/// present? So the bookkeeping is one height rather than a probe —
+/// there is no set of counterparts to track, no fetch release to
+/// sequence, and no record to compose, because the answer is a reading
+/// and a reading is block content already.
 #[derive(Debug, Clone)]
 pub struct Inherited {
     /// The record leaf, which carries the claim key, the issuing
@@ -132,6 +132,15 @@ fn awaited_by(inherited: &BTreeMap<SubstateKey, Inherited>, key: SubstateKey) ->
     inherited
         .values()
         .any(|record| record.answer.is_none() && record.cell.consumer_claim == key)
+}
+
+/// A question this validator put to a counterpart: the question, the
+/// header it was asked at, and whether the fetch has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Probe {
+    question: Question,
+    anchor: Anchor,
+    returned: bool,
 }
 
 /// What a commit folded, and what it could not answer for.
@@ -218,11 +227,14 @@ pub struct Counterparts {
     /// than beside the tick machine because the question is a
     /// counterpart's to answer, like every other question in this file.
     pub(crate) inherited: BTreeMap<SubstateKey, Inherited>,
-    /// Fetches the ledger let go of since the last commit — a question
-    /// the chain answered first, or one whose entry is gone — released
-    /// as one abandon at the commit, so a counterpart that never serves
-    /// the height does not pin the slot.
-    released_fetches: Vec<(Anchor, SubstateKey)>,
+    /// The questions this validator has put to counterparts, by the
+    /// shard asked and the cell: the header each was asked at, and
+    /// whether the fetch returned. A probe lives while its question is
+    /// open — one the chain has answered, or whose entry is gone, is
+    /// dropped at the commit and any fetch still out for it released,
+    /// so a counterpart that never serves the height does not pin the
+    /// slot.
+    probes: BTreeMap<(ShardId, SubstateKey), Probe>,
 }
 
 impl Counterparts {
@@ -240,7 +252,7 @@ impl Counterparts {
             proven_cells,
             fetched: BTreeMap::new(),
             inherited: BTreeMap::new(),
-            released_fetches: Vec::new(),
+            probes: BTreeMap::new(),
         }
     }
 
@@ -290,8 +302,7 @@ impl Counterparts {
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
-        let released = self.ledger.release_resolved(block.certificates());
-        self.released_fetches.extend(released);
+        self.ledger.release_resolved(block.certificates());
         // What the block writes down about departed shards, before the
         // prune below reads what is still answerable.
         let rebuilt = self
@@ -302,15 +313,14 @@ impl Counterparts {
         }
         self.cover_recorded(block);
         self.stamp_departures(topology_schedule, now);
-        let pruned = self.ledger.prune(now);
-        self.released_fetches.extend(pruned.released);
-        actions.extend(self.release_answered_fetches());
+        let unanswerable = self.ledger.prune(now);
+        actions.extend(self.release_answered_fetches(trie));
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
         actions.extend(self.probe(trie, now));
         Committed {
             actions,
-            unanswerable: pruned.unanswerable,
+            unanswerable,
         }
     }
 
@@ -420,12 +430,12 @@ impl Counterparts {
                 continue;
             }
             let Question {
-                tx_hash,
                 shard,
                 key,
                 probed,
                 deadline,
                 cued,
+                ..
             } = question;
             // The newest header the question stands at, of those
             // standing at the chain's clock: the one the shard is
@@ -446,12 +456,21 @@ impl Counterparts {
             // outside its window is asked again — at a newer header,
             // not of the same one every block.
             if self.holds_answer(shard, key)
-                || self.ledger.probe_stands(tx_hash, shard, key, anchor.height)
+                || self
+                    .probes
+                    .get(&(shard, key))
+                    .is_some_and(|probe| !probe.returned || probe.anchor.height >= anchor.height)
             {
                 continue;
             }
-            self.ledger
-                .record_probe(tx_hash, shard, key, probed, anchor);
+            self.probes.insert(
+                (shard, key),
+                Probe {
+                    question,
+                    anchor,
+                    returned: false,
+                },
+            );
             wanted.entry(anchor).or_default().push(key);
         }
         // The records this shard inherited ask one question each, of
@@ -520,7 +539,17 @@ impl Counterparts {
         keys: Vec<SubstateKey>,
         proof: MerkleInclusionProof,
     ) {
-        let answered = self.ledger.mark_probes_answered(anchor, &keys);
+        let answered: Vec<Question> = self
+            .probes
+            .values_mut()
+            .filter(|probe| {
+                !probe.returned && probe.anchor == anchor && keys.contains(&probe.question.key)
+            })
+            .map(|probe| {
+                probe.returned = true;
+                probe.question
+            })
+            .collect();
         let Some(inclusions) = self.proven_cells.record(anchor, keys, proof) else {
             tracing::warn!(
                 shard = ?anchor.shard,
@@ -669,17 +698,15 @@ impl Counterparts {
             let Some(inclusion) = probed.answer(claim.anchor.ts, deadline, inclusion) else {
                 continue;
             };
-            // The question is answered with what the chain read, and a
-            // fetch still out for it is released with it. A claim cell
-            // present is the consumer holding the crossing, which is
-            // what licenses the retirement.
-            let Some(Released(released)) = self
+            // The question is answered with what the chain read. A
+            // claim cell present is the consumer holding the crossing,
+            // which is what licenses the retirement.
+            if !self
                 .ledger
-                .close_question(tx_hash, shard, key, probed, inclusion)
-            else {
+                .record_reading(tx_hash, shard, key, probed, inclusion)
+            {
                 continue;
-            };
-            self.released_fetches.extend(released);
+            }
             record_reclaim_probe_answered(inclusion.is_present());
             // The counterpart took it, and its certificate says how.
             // Its broadcast may have missed this shard, so it is fetched
@@ -770,10 +797,11 @@ impl Counterparts {
     }
 
     /// Drop the claims no transaction they answered for still needs,
-    /// and release every fetch the ledger let go — a question the chain
-    /// answered first, or one whose entry is gone — so a counterpart
-    /// that never serves the height does not pin the slot.
-    fn release_answered_fetches(&mut self) -> Vec<Action> {
+    /// and the probes whose question is no longer open — one the chain
+    /// answered first, or one whose entry is gone — releasing every
+    /// fetch still out for one, so a counterpart that never serves the
+    /// height does not pin the slot.
+    fn release_answered_fetches(&mut self, trie: &ShardTrie) -> Vec<Action> {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an
@@ -792,11 +820,27 @@ impl Counterparts {
         // there speaks for a transaction this ledger still owes an
         // outcome for, and the ledger is here.
         self.mirror.retain(&|tx_hash| unresolved.contains(tx_hash));
-        let ids = std::mem::take(&mut self.released_fetches);
-        if ids.is_empty() {
+        // A probe lives while its question is open, and the ledger says
+        // which those are.
+        let open: BTreeSet<(ShardId, SubstateKey)> = unresolved
+            .questions(trie)
+            .into_iter()
+            .map(|question| (question.shard, question.key))
+            .collect();
+        let mut released = Vec::new();
+        self.probes.retain(|cell, probe| {
+            if open.contains(cell) {
+                return true;
+            }
+            if !probe.returned {
+                released.push((probe.anchor, probe.question.key));
+            }
+            false
+        });
+        if released.is_empty() {
             Vec::new()
         } else {
-            vec![Action::AbandonFetch(FetchIds::StateProofs(ids))]
+            vec![Action::AbandonFetch(FetchIds::StateProofs(released))]
         }
     }
 

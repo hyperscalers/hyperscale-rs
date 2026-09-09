@@ -8906,7 +8906,7 @@ mod tests {
 
         // The probe answers present, which the committed claim writes
         // to the ledger.
-        state.counterparts.ledger.close_question(
+        state.counterparts.ledger.record_reading(
             tx_hash,
             PEER,
             claim,
@@ -10254,7 +10254,6 @@ mod tests {
                 .counterparts
                 .ledger
                 .prune(expiry.plus(Duration::from_millis(1)))
-                .unanswerable
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "and the covered entry retires past it"
@@ -10278,7 +10277,6 @@ mod tests {
                 .counterparts
                 .ledger
                 .prune(state.committed_ts.plus(Duration::from_millis(1)))
-                .unanswerable
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "an unreadable departure closes at once"
