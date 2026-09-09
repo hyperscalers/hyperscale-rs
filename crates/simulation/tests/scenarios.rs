@@ -43,6 +43,7 @@ use hyperscale_scenarios::{
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
+    a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
@@ -1299,6 +1300,26 @@ fn a_departing_venues_terminal_hands_on_what_it_never_took_sim() {
     a_departing_venues_terminal_hands_on_what_it_never_took(&mut cluster, epochs(24));
 }
 
+#[test]
+fn a_swap_committed_after_the_venues_cut_is_disposed_once_sim() {
+    let mut accounts = departing_venue_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SPLITTER,
+        &[STRADDLER_SURVIVOR],
+    ));
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(a_swap_committed_after_the_venues_cut_is_disposed_once);
+}
+
+// TEMPSWEEP
+// TEMPSWEEP
+// TEMPSWEEP
+// TEMPSWEEP
 #[test]
 fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     let mut cluster = departing_route_cluster();

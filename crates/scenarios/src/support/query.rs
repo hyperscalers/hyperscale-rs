@@ -184,6 +184,30 @@ pub fn chain_fate(
     (committed, finalized)
 }
 
+/// Walk `store`'s committed chain for every abandonment record naming
+/// `tx`: the height each committed at and the departed shard it speaks
+/// for.
+#[must_use]
+pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
+    let tip = store.committed_height();
+    let mut named = Vec::new();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height) {
+            named.extend(
+                certified
+                    .block()
+                    .abandonment_records()
+                    .iter()
+                    .filter(|record| record.tx_hashes().any(|named| named == tx))
+                    .map(|record| (height, record.shard())),
+            );
+        }
+        height = height.next();
+    }
+    named
+}
+
 /// One thing a shard's own certificate said it ran of a transaction.
 ///
 /// Read off the local execution certificate's outcome, so it is the

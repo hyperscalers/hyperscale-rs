@@ -81,6 +81,7 @@ pub use route_reshape::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
+    a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
     departing_caller_ballast, departing_route_genesis_accounts, departing_venue_ballast,
     departing_venue_split_bytes, merge_train_genesis_accounts, merging_caller_genesis_accounts,

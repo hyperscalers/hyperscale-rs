@@ -299,6 +299,10 @@ impl Cluster for ProdCluster {
         self.inner.ran(shard, tx)
     }
 
+    fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
+        self.inner.named_unsettled(shard, tx)
+    }
+
     fn chain_fate(
         &self,
         shard: ShardId,

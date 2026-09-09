@@ -24,7 +24,7 @@ use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
-use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership};
+use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, records_naming};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
@@ -379,6 +379,13 @@ impl Harness {
     pub fn ran(&self, shard: ShardId, hash: TxHash) -> Vec<RanAs> {
         self.store_for(shard)
             .map_or_else(Vec::new, |store| chain_membership(store.as_ref(), hash))
+    }
+
+    /// [`records_naming`] over the live store — every record on `shard`'s
+    /// chain naming `hash`. Empty if no host serves `shard`.
+    pub fn named_unsettled(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, ShardId)> {
+        self.store_for(shard)
+            .map_or_else(Vec::new, |store| records_naming(store.as_ref(), hash))
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

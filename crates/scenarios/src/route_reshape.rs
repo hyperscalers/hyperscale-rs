@@ -13,10 +13,13 @@
 //! shard keeps clearing from admission through the cut and from the
 //! successor after it.
 
+use std::time::Duration;
+
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window, WorkInFlight,
+    BlockHeight, Deadline, Ed25519PrivateKey, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    WorkInFlight,
 };
 
 use crate::reshape::split_lifecycle;
@@ -27,7 +30,8 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, held, held_at, merge_keeper_count, split_admitted,
+    anchored_genesis_height, epoch_duration_ms, held, held_at, merge_keeper_count,
+    scheduled_terminal_epoch, split_admitted,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER, STRADDLER_SURVIVOR,
@@ -650,6 +654,206 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
         &Charges::default(),
         budget,
         "swaps across the venue's terminal",
+    );
+}
+
+/// How far before the venue's cut the post-cut swap's window opens, and
+/// how far past it the window closes: together one validity range less
+/// a margin, so the swap is admissible on the caller's shard after the
+/// cut while its window opened before it.
+const OPENS_BEFORE_THE_CUT: Duration = Duration::from_secs(10);
+const CLOSES_AFTER_THE_CUT: Duration = Duration::from_secs(110);
+
+/// The latest the post-cut swap may go and still leave the child that
+/// holds the venue's prefix room to include it before its window
+/// closes.
+const LATEST_SUBMISSION_AFTER_THE_CUT: Duration = Duration::from_secs(70);
+
+/// How long past the children's anchor the caller's shard is given to
+/// fetch the departed venue's settled set and write a record from it:
+/// the set is wanted on the first beacon fold that attests the terminal
+/// and a record is offered at the next proposal.
+const SETTLED_SET_SLACK: Duration = Duration::from_secs(60);
+
+/// The cluster's clock as the weighted timestamp a block anchored now
+/// carries.
+fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
+    WeightedTimestamp::ZERO.plus(c.now())
+}
+
+/// Stand the venue up on the departing shard with its callers on the
+/// survivor, and read the cut its reshape is scheduled for.
+///
+/// The cut is an epoch boundary the beacon fixes ahead of time, which is
+/// what lets a transaction be built to straddle it.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, and if the beacon never
+/// schedules the cut, or schedules it too near for a window to open
+/// before it.
+fn callers_against_a_scheduled_cut<C: Cluster>(
+    c: &mut C,
+    venue_shard: ShardId,
+    caller_shard: ShardId,
+    budget: Budget,
+) -> (DepartingCallers, WeightedTimestamp) {
+    let set = departing_callers(c, venue_shard, caller_shard);
+    assert!(
+        c.run_until(budget, |c| scheduled_terminal_epoch(c, venue_shard)
+            .is_some()),
+        "the beacon must schedule the venue's cut",
+    );
+    let terminal = scheduled_terminal_epoch(c, venue_shard).expect("scheduled above");
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let cut = EpochWindows::new(epoch_ms).window_of(terminal).end;
+    assert!(
+        clock(c) < cut.minus(OPENS_BEFORE_THE_CUT),
+        "the cut must still be ahead when the swap's window opens; now {:?}, cut {cut:?}",
+        clock(c),
+    );
+    (set, cut)
+}
+
+/// A swap committed after the venue's cut is disposed of exactly once.
+///
+/// Its window opened before the cut and its commit fell after it, so
+/// the child holding the venue's prefix claims the input — and no
+/// record of the departed venue may name it, since naming it would
+/// hand that same input back.
+///
+/// The venue sits on the splitter and the caller on the survivor. The
+/// cut is an epoch boundary the beacon schedules ahead of time, so the
+/// swap is built against it: its window opens before the cut and closes
+/// after, and it goes once the cut has landed. The caller's shard
+/// commits it against a trie in which the venue's prefix is the child's,
+/// the leg pays, the crossing reaches the child, and the child runs the
+/// core and claims the input. The departed venue never held the swap,
+/// so its settled set cannot name it — and a record reading that
+/// absence as the venue leaving the swap unsettled would license the
+/// leg to take back a crossing the child holds.
+///
+/// The record is only ever composed once the beacon attests the
+/// venue's terminal, an epoch fold after the cut, by which time a swap
+/// the child settled has ordinarily been read back and retired. What
+/// the fault holds open is that window: once the child has claimed, the
+/// state proofs and remote headers a claim is read through are cut, so
+/// the leg entry still stands when the settled set arrives and a record
+/// naming it would be honoured.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, and if the beacon never
+/// schedules the cut, if the caller's shard does not commit the swap
+/// after the cut, if the child does not claim the input, if a record
+/// on the caller's shard names the swap, if the input comes back to the
+/// caller once the cut lifts, or if either side of the pair is not
+/// conserved.
+pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluster>(c: &mut C) {
+    let (venue_shard, caller_shard) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let budget = epochs(24);
+    let (set, cut) = callers_against_a_scheduled_cut(c, venue_shard, caller_shard, budget);
+    let mut charges = Charges::default();
+    let (key, caller) = &set.swappers[0];
+    let swap = build_swap_tx(
+        key,
+        *caller,
+        &set.venue.meta,
+        *XRD,
+        SWAP_INPUT,
+        0,
+        TimestampRange::new(
+            cut.minus(OPENS_BEFORE_THE_CUT),
+            cut.plus(CLOSES_AFTER_THE_CUT),
+        ),
+    );
+    // The cut: both children seated, so the venue's prefix is a child's
+    // and the swap can reach it.
+    let (left, right) = venue_shard.children();
+    assert!(
+        c.run_until(budget, |c| c.serves_shard(left) && c.serves_shard(right)),
+        "both splitter children must be served within budget",
+    );
+    assert!(
+        clock(c) > cut && clock(c) <= cut.plus(LATEST_SUBMISSION_AFTER_THE_CUT),
+        "the children must seat inside the swap's window; now {:?}, cut {cut:?}",
+        clock(c),
+    );
+
+    let paid_before = held(c, caller.address(), *XRD);
+    let hash = charges.submit(c, swap);
+    assert!(
+        c.run_until(epochs(2), |c| c.chain_fate(caller_shard, hash).0.is_some()),
+        "the caller's shard must commit the swap inside its window",
+    );
+    assert!(
+        c.chain_fate(venue_shard, hash).0.is_none(),
+        "the departed venue must never have seen the swap",
+    );
+    let claimed = set.stocked + SWAP_INPUT;
+    let child_claimed = c.run_until(epochs(4), |c| held_at(c, set.reserve) == claimed);
+    assert!(
+        child_claimed,
+        "the child holding the venue's prefix must claim the input: reserve {} against \
+         {claimed}",
+        held_at(c, set.reserve),
+    );
+
+    // The child holds the crossing. From here the caller's shard may not
+    // read that it does: the claim cell sits on the child, and a proof of
+    // it travels as a state proof against a header the caller fetches, so
+    // cutting both leaves the leg entry standing where a record can still
+    // speak for it. Cut by message class rather than between committees,
+    // because a split child seats on a host its parent shared and a rule
+    // keyed on hosts would cut that host's other shard with it — and
+    // neither class carries anything a shard needs from itself.
+    let held_back = [
+        c.drop_type("state_proof.request"),
+        c.drop_type("remote_header.request"),
+    ];
+
+    // The settled set lands: the beacon anchors the children on the fold
+    // that attests the venue's terminal, and the caller's shard fetches
+    // the set on reading it.
+    assert!(
+        c.run_until(budget, |c| anchored_genesis_height(c, left).is_some()),
+        "the beacon must anchor the split children",
+    );
+    let landed = clock(c).plus(SETTLED_SET_SLACK);
+    let _ = c.run_until(budget, |c| {
+        clock(c) >= landed || !c.named_unsettled(caller_shard, hash).is_empty()
+    });
+    assert!(
+        c.named_unsettled(caller_shard, hash).is_empty(),
+        "no record of the departed venue may name a swap it never held; named by {:?}",
+        c.named_unsettled(caller_shard, hash),
+    );
+    assert!(
+        held_back.iter().any(|handle| handle.fired() > 0),
+        "the claim must actually have been made unreadable, or the leg was read and \
+         retired before any record could speak",
+    );
+    c.clear_drops();
+
+    // The input is the child's, and stays so once the caller's shard can
+    // read the claim: the leg retires, and nothing licenses it to take
+    // the crossing back.
+    set.xrd.assert_settles_within(
+        c,
+        &charges,
+        budget,
+        "a swap committed after the venue's cut",
+    );
+    assert_eq!(
+        held(c, caller.address(), *XRD),
+        paid_before - SWAP_INPUT - charges.burned(c),
+        "the caller's input must not come back: the child claimed it",
+    );
+    set.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "a swap committed after the venue's cut",
     );
 }
 

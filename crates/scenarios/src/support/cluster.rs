@@ -160,6 +160,15 @@ pub trait Cluster {
     /// transaction reports both.
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs>;
 
+    /// Every abandonment record on `shard`'s chain naming `tx`: the
+    /// height each committed at and the departed shard it speaks for.
+    ///
+    /// An observation seam like [`Self::ran`]: a record licenses a
+    /// reclaim, and whether a chain wrote one for a transaction is a
+    /// fact about its blocks that no balance reads back once the
+    /// reclaim and the settlement it races have both landed.
+    fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)>;
+
     /// Where `tx` landed on `shard`: the height it committed at (if any), and
     /// the height plus decision of its execution outcome (if any).
     fn chain_fate(

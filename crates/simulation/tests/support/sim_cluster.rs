@@ -17,7 +17,9 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, status_rank};
+use hyperscale_scenarios::query::{
+    RanAs, chain_fate, chain_membership, records_naming, status_rank,
+};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -631,6 +633,14 @@ impl Cluster for SimCluster {
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .map(|store| chain_membership(store, tx))
             .find(|ran| !ran.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| records_naming(store, tx))
+            .find(|named| !named.is_empty())
             .unwrap_or_default()
     }
 
