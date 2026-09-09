@@ -854,7 +854,7 @@ fn await_departed<C: Cluster>(c: &mut C) {
 /// at its deadline and terminates having settled nothing, and the
 /// survivor's tick — fenced on the departing shard's settled set from
 /// the admission — stays engaged against the survivor's drain until that
-/// set arrives. Then the departure record speaks: the survivor abandons
+/// set arrives. Then the abandonment record speaks: the survivor abandons
 /// the core member, the drain returns to its baseline, and the trader's
 /// crossing is reclaimed. Neither reserve moves.
 ///
@@ -887,7 +887,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
          set has answered; holds {:?} against {baseline:?}",
         c.committed_work_in_flight(survivor),
     );
-    // The departure record licenses the trader's reclaim, which reads the
+    // The abandonment record licenses the trader's reclaim, which reads the
     // record cell the trader's leg wrote — and reads it whenever the
     // record lands, because a record is value and value is not swept on
     // a clock. The licence is the record itself rather than a probe, so
@@ -896,7 +896,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     assert!(
         c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
             == paid + ROUTE_INPUT),
-        "the trader must get the route's input back on the departure record; holds {} \
+        "the trader must get the route's input back on the abandonment record; holds {} \
          against {}",
         held(c, route.trader.address(), *XRD),
         paid + ROUTE_INPUT,

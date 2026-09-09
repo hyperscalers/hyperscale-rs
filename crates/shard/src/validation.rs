@@ -468,7 +468,7 @@ mod tests {
     }
 
     /// Admission anchored after a cut at which both of `ROOT`'s children
-    /// departed with their handoffs open, so a departure record naming
+    /// departed with their handoffs open, so an abandonment record naming
     /// either at that cut is one the schedule attests.
     fn after_departures() -> Against {
         let (left, right) = ShardId::ROOT.children();

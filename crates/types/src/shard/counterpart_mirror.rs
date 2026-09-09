@@ -52,7 +52,7 @@ struct Mirrored {
     /// from a set is proof, not ignorance.
     settled: HashMap<ShardId, SettledTxSet>,
     /// What this shard's own ledger says each departed shard was party
-    /// to, taken when its set arrived: a departure record may name only
+    /// to, taken when its set arrived: an abandonment record may name only
     /// these, since one naming a stranger would abandon business the
     /// departed shard never had here.
     parties: HashMap<ShardId, BTreeSet<TxHash>>,

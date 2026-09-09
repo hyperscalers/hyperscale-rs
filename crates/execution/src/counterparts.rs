@@ -28,7 +28,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::CrossingCell;
 
-use crate::unresolved::{Question, Released, Unanswerable, UnresolvedTxs};
+use crate::ledger::{Ledger, Question, Released, Unanswerable};
 
 /// What one block's abandonment records may still spend.
 ///
@@ -157,7 +157,7 @@ pub struct Counterparts {
     /// chain rather than read off live tick state — the only account of
     /// what this shard has in flight that can be rebuilt after losing
     /// that state.
-    pub(crate) ledger: UnresolvedTxs,
+    pub(crate) ledger: Ledger,
 
     /// The departed shards' settled sets and what committed records
     /// cover, shared with the shard coordinator's vote fence. This
@@ -234,7 +234,7 @@ impl Counterparts {
         mirror: Arc<CounterpartMirror>,
     ) -> Self {
         Self {
-            ledger: UnresolvedTxs::new(local_shard),
+            ledger: Ledger::new(local_shard),
             mirror,
             proven_anchors,
             proven_cells,
@@ -315,7 +315,7 @@ impl Counterparts {
     }
 
     /// Record a departed shard's settled set beside what this ledger
-    /// says the shard was party to: a departure record may name only
+    /// says the shard was party to: an abandonment record may name only
     /// these, and the fence reads it from the same mirror.
     pub fn on_settled(&self, shard: ShardId, settled: SettledTxSet) {
         let parties = self.ledger.party_to(shard, settled.terminal_wt);

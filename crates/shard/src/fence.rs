@@ -154,10 +154,10 @@ impl VoteFence<'_> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|record| self.departure_stands(record))
+            .try_for_each(|record| self.record_stands(record))
     }
 
-    /// Whether a departure record stands: this validator's own ledger
+    /// Whether an abandonment record stands: this validator's own ledger
     /// says the departed shard was party to every name, and the shard's
     /// settled set names none of them. That the schedule attests the
     /// cut it names, inside the evidence window, is admission's rule.
@@ -171,7 +171,7 @@ impl VoteFence<'_> {
     /// ignorance; a voter that has not acquired it defers, since the
     /// record is only proposable inside the window the set can be read
     /// in, so a voter inside it either has the set or is about to.
-    fn departure_stands(&self, record: &AbandonmentRecord) -> Result<(), Withheld> {
+    fn record_stands(&self, record: &AbandonmentRecord) -> Result<(), Withheld> {
         let shard = record.shard();
         let stranger = self.mirror.with_parties(shard, |parties| {
             parties.map(|parties| {
@@ -183,7 +183,7 @@ impl VoteFence<'_> {
         match stranger {
             None => {
                 return Err(Withheld::deferred(format!(
-                    "departure record's parties for {shard:?} not yet mirrored"
+                    "abandonment record's parties for {shard:?} not yet mirrored"
                 )));
             }
             Some(Some(stranger)) => {
