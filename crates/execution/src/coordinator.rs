@@ -745,7 +745,6 @@ impl ExecutionCoordinator {
         // rebuild reads the same account off the same blocks however
         // long after.
         self.counterparts.ledger.register_committed(
-            local_shard,
             members
                 .iter()
                 .map(|committed| (&committed.tx, committed.member.classified())),
@@ -3766,7 +3765,7 @@ impl ExecutionCoordinator {
         // compose a tick to abandon them in — on a coast block, under a
         // committee it no longer has. Nothing here can reach a verdict
         // either way, which is the same reason the ticks above go.
-        self.counterparts.ledger = UnresolvedTxs::default();
+        self.counterparts.ledger = UnresolvedTxs::new(self.local_shard);
         // The terminated chain's tick outputs die with it: successors seed
         // from settled state, and pending resolutions have nothing left to
         // resolve against. A tick still in flight lands on a cleared
@@ -6650,7 +6649,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(local, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.ticks.assign_tx(tx_hash, tick_id);
 
         let dropped = state.emit_or_gate_finalized(&sched, tick);
@@ -7469,7 +7468,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
 
         let block = make_live_block_on_shard(
             HOME,
@@ -7520,7 +7519,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -7538,14 +7537,14 @@ mod tests {
                 BlockHeight::new(1),
                 tx_hash,
             )))]);
-        state.counterparts.ledger.record_abandonment_records(
-            HOME,
-            &[AbandonmentRecord::departed(
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(1_000),
                 [UnsettledTx::for_transaction(&transaction)],
-            )],
-        );
+            )]);
 
         let block = make_live_block_on_shard(
             HOME,
@@ -7612,7 +7611,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -7673,7 +7672,7 @@ mod tests {
         fresh
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         assert!(
             fresh
                 .counterparts
@@ -7699,7 +7698,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -7790,7 +7789,7 @@ mod tests {
         accepting
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         accepting.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -7858,7 +7857,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(transaction, &Classified::whole())]);
+            .register_committed([(transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             transaction.hash(),
             leg_part(
@@ -8054,7 +8053,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -8123,7 +8122,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -8183,7 +8182,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -8250,7 +8249,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
@@ -8519,7 +8518,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(CORE, [(&transaction, &two_shard_core_classified())]);
+            .register_committed([(&transaction, &two_shard_core_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = deadline;
 
@@ -8560,7 +8559,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .record_abandonment_records(HOME, &records);
+            .record_abandonment_records(&records);
         assert!(state.counterparts.ledger.is_unsettled_by_departed(tx_hash));
         assert_eq!(
             state
@@ -8672,7 +8671,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(transaction, &Classified::whole())]);
+            .register_committed([(transaction, &Classified::whole())]);
         state.counterparts.ledger.seed(
             transaction.hash(),
             leg_part(
@@ -9608,9 +9607,10 @@ mod tests {
     /// unsettled — the evidence composition requires before it will spend
     /// a tick on an abort.
     fn record_peer_left_unsettled(state: &mut ExecutionCoordinator, tx_hash: TxHash) {
-        state.counterparts.ledger.record_abandonment_records(
-            HOME,
-            &[AbandonmentRecord::departed(
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(60_000),
                 vec![UnsettledTx {
@@ -9626,8 +9626,7 @@ mod tests {
                     },
                     reach: Vec::new(),
                 }],
-            )],
-        );
+            )]);
     }
 
     fn state_stranded_on(
@@ -9666,7 +9665,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(local, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         state
@@ -9758,7 +9757,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+            .register_committed([(&transaction, &Classified::whole())]);
         state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(200_000);
         state
@@ -9822,7 +9821,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .record_abandonment_records(HOME, &records);
+            .record_abandonment_records(&records);
         assert!(state.counterparts.ledger.is_unsettled_by_departed(tx_hash));
 
         // And what it does not offer twice.
@@ -10082,7 +10081,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(local, [(&sibling, &Classified::whole())]);
+            .register_committed([(&sibling, &Classified::whole())]);
         state.counterparts.ledger.certify(sibling_hash);
 
         // The commit that composes the abandonment, on the shard that
@@ -10213,7 +10212,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed(local, [(transaction, &Classified::whole())]);
+            .register_committed([(transaction, &Classified::whole())]);
         state
             .counterparts
             .stamp_departures(topology_schedule, state.committed_ts);

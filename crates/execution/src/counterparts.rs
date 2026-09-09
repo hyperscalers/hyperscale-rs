@@ -286,7 +286,7 @@ pub struct Counterparts {
 
 impl Counterparts {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
@@ -294,7 +294,7 @@ impl Counterparts {
     ) -> Self {
         Self {
             local_shard,
-            ledger: UnresolvedTxs::default(),
+            ledger: UnresolvedTxs::new(local_shard),
             mirror,
             proven_anchors,
             proven_cells,
@@ -357,7 +357,7 @@ impl Counterparts {
         // prune below reads what is still answerable.
         let rebuilt = self
             .ledger
-            .record_abandonment_records(self.local_shard, block.abandonment_records());
+            .record_abandonment_records(block.abandonment_records());
         for _ in 0..rebuilt {
             record_rebuilt_verdict_entry();
         }
