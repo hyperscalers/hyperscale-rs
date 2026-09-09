@@ -1574,7 +1574,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 /// successor's store arrives as a prefix of leaves and its ledger begins
 /// empty, so the leaf is the whole of what a reclaim has to work from.
 #[test]
-#[allow(clippy::too_many_lines)] // one member over one fixture, in its three states
+#[allow(clippy::too_many_lines)] // one member over one fixture, in both its states
 fn an_inherited_record_decides_itself_against_its_claim() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
@@ -1649,11 +1649,12 @@ fn an_inherited_record_decides_itself_against_its_claim() {
         &Substates::cell(&unclaimed, edge.record.key()).expect("the record is written"),
     )
     .expect("a record decodes");
-    // The window opens where the consumer can no longer claim and closes
-    // where the claim cell it names is swept.
+    // The engine reads the claim cell alone; that the reading is taken
+    // inside the lapse, where an absence means something, is admission's
+    // business, and this clock sits inside it.
     let inside = record.expiry_ms - 1;
     assert!(
-        Window::Claim
+        Window::Lapse
             .of(Deadline::from_expiry(record.expiry_ms))
             .contains(&WeightedTimestamp::from_millis(inside))
     );
@@ -1662,7 +1663,6 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     // cell, so the two runs differ in nothing else.
     let mut claimed = MapDb(unclaimed.0.clone());
     claimed.0.insert(record.consumer_claim, vec![0xAA]);
-    let early_store = MapDb(unclaimed.0.clone());
 
     let taken_back = settle(&unclaimed, inside);
     let ConsensusReceipt::Succeeded { writes, .. } = &taken_back.consensus else {
@@ -1696,15 +1696,6 @@ fn an_inherited_record_decides_itself_against_its_claim() {
         Substates::cell(&claimed, vault_key(alice(), *XRD)),
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
-    );
-
-    // Outside the window an absent claim says nothing, so the member is
-    // refused rather than crediting on a clock.
-    let early = settle(&early_store, 1_000);
-    assert!(
-        matches!(early.consensus, ConsensusReceipt::Failed),
-        "a record read before its window answers nothing: {:?}",
-        early.metadata
     );
 }
 

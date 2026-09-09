@@ -28,10 +28,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Deadline, Derivation, EscrowedValue,
-    Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, Window, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
@@ -526,10 +526,10 @@ impl Executor {
     /// is not there was retired or taken back already. On this shard's
     /// own leaf each record takes the arm its claim cell decides —
     /// present means the crossing was taken and the record is a balance
-    /// for a claim that happened, which is deleted; absent, inside the
-    /// claim window its expiry reads back to, means no consumer can
-    /// still take it and none did, which is credited back — and a
-    /// record already gone is skipped rather than refused, since a
+    /// for a claim that happened, which is deleted; absent means no
+    /// consumer took it, and none can now, since the member is admitted
+    /// only past the lapse, which is credited back — and a record
+    /// already gone is skipped rather than refused, since a
     /// member admitted for several records is one member, and one of
     /// them having been settled by the shard's own evidence path in
     /// between is not a reason to strand the rest.
@@ -576,7 +576,7 @@ impl Executor {
             // reclaim writes, and what holds either settlement to the
             // record's edge.
             let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
-            let disposition = if takes_back(on, *key, &record, ctx, snapshot)? {
+            let disposition = if takes_back(on, &record, snapshot) {
                 let origin = record
                     .origin
                     .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
@@ -1230,33 +1230,16 @@ struct BatchMember {
 /// Whether the settlement of `record` under `on` takes the crossing
 /// back rather than deleting a record whose claim happened: what the
 /// licence says, or for a record on this shard's own leaf what its
-/// claim cell says — present is a claim that happened; absent inside
-/// the claim window its expiry reads back to is one that never will,
-/// and absent outside it is a cell this shard may not read.
-fn takes_back(
-    on: Licence,
-    key: SubstateKey,
-    record: &CrossingCell,
-    ctx: &TickBatchContext<'_>,
-    snapshot: &(dyn Substates + Sync),
-) -> Result<bool, String> {
+/// claim cell says — present is a claim that happened, absent is one
+/// that never will. That the absence is read inside the window it
+/// means something in is the licence's business: a member is admitted
+/// on this shard's own leaf only inside the lapse, as it is admitted on
+/// a counterpart's evidence only once that evidence stands.
+fn takes_back(on: Licence, record: &CrossingCell, snapshot: &(dyn Substates + Sync)) -> bool {
     match on {
-        Licence::Accepted => Ok(false),
-        Licence::Unclaimed => Ok(true),
-        Licence::OwnLeaf => {
-            if snapshot.cell(record.consumer_claim).is_some() {
-                Ok(false)
-            } else if Window::Claim
-                .of(Deadline::from_expiry(record.expiry_ms))
-                .contains(&ctx.tick_ts)
-            {
-                Ok(true)
-            } else {
-                Err(format!(
-                    "record {key:?} is read outside the window its claim answers in"
-                ))
-            }
-        }
+        Licence::Accepted => false,
+        Licence::Unclaimed => true,
+        Licence::OwnLeaf => snapshot.cell(record.consumer_claim).is_none(),
     }
 }
 
