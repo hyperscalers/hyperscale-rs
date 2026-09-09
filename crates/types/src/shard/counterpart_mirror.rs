@@ -1,7 +1,6 @@
 //! What this node holds of departed counterparts, as one mirror: their
-//! settled sets, what its own ledger said each was party to, and which
-//! transactions a committed record has established no counterpart can
-//! settle.
+//! settled sets, and which transactions a committed record has
+//! established no counterpart can settle.
 //!
 //! Each fact is asked about twice — once by the execution coordinator,
 //! composing the record to offer, and once by the vote fence, checking a
@@ -36,7 +35,7 @@
 //! moved since the last drain, so no writer has to know which votes
 //! were waiting on it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,11 +50,6 @@ struct Mirrored {
     /// each verified against its beacon-attested terminal root. Absence
     /// from a set is proof, not ignorance.
     settled: HashMap<ShardId, SettledTxSet>,
-    /// What this shard's own ledger says each departed shard was party
-    /// to, taken when its set arrived: an abandonment record may name only
-    /// these, since one naming a stranger would abandon business the
-    /// departed shard never had here.
-    parties: HashMap<ShardId, BTreeSet<TxHash>>,
     /// Transactions a committed record has established no counterpart
     /// can settle. An abandonment of one makes no claim on any settled
     /// set: the record answered in a form that outlives the set.
@@ -90,18 +84,13 @@ impl CounterpartMirror {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Record a terminated shard's settled set, with what this shard's
-    /// ledger says it was party to.
+    /// Record a terminated shard's settled set.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
-    pub fn record_settled(&self, shard: ShardId, settled: SettledTxSet, parties: BTreeSet<TxHash>) {
-        {
-            let mut mirrored = self.write();
-            mirrored.settled.insert(shard, settled);
-            mirrored.parties.insert(shard, parties);
-        }
+    pub fn record_settled(&self, shard: ShardId, settled: SettledTxSet) {
+        self.write().settled.insert(shard, settled);
         self.advance();
     }
 
@@ -140,30 +129,13 @@ impl CounterpartMirror {
         read(&self.read().settled)
     }
 
-    /// Read in place what this shard's ledger said `shard` was party to
-    /// when its set arrived. `None` where no set is held, which is the
-    /// caller's cue to defer.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    pub fn with_parties<R>(
-        &self,
-        shard: ShardId,
-        read: impl FnOnce(Option<&BTreeSet<TxHash>>) -> R,
-    ) -> R {
-        read(self.read().parties.get(&shard))
-    }
-
     /// Drop the settled sets of shards `readable` no longer attests.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
     pub fn retain_departures(&self, readable: &dyn Fn(ShardId) -> bool) {
-        let mut mirrored = self.write();
-        mirrored.settled.retain(|&shard, _| readable(shard));
-        mirrored.parties.retain(|&shard, _| readable(shard));
+        self.write().settled.retain(|&shard, _| readable(shard));
     }
 
     /// Drop the coverage of every transaction `held` does not name.

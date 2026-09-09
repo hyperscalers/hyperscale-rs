@@ -324,12 +324,9 @@ impl Counterparts {
         }
     }
 
-    /// Record a departed shard's settled set beside what this ledger
-    /// says the shard was party to: an abandonment record may name only
-    /// these, and the fence reads it from the same mirror.
+    /// Record a departed shard's settled set where the fence reads it.
     pub fn on_settled(&self, shard: ShardId, settled: SettledTxSet) {
-        let parties = self.ledger.party_to(shard, settled.terminal_wt);
-        self.mirror.record_settled(shard, settled, parties);
+        self.mirror.record_settled(shard, settled);
     }
 
     /// The departed shards whose settled sets the fence will need and

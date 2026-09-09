@@ -36,8 +36,8 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     ABANDONMENT_RECORD_BYTES, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VALIDITY_RANGE, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, SubstateKey, Transaction, TxHash,
-    UNSETTLED_TX_BYTES, WeightedTimestamp,
+    MAX_VALIDITY_RANGE, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey,
+    Transaction, TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -127,6 +127,49 @@ impl UnsettledTx {
     #[must_use]
     pub const fn wire_weight(&self) -> usize {
         UNSETTLED_TX_BYTES + self.reach.len() * ROUTE_PREFIX_BYTES
+    }
+
+    /// Whether `shard`, leaving at `cut`, was party to this transaction
+    /// as seen from `local`: it held one of the transaction's remote
+    /// routes when the transaction committed, and left afterwards.
+    ///
+    /// `departures` is every departure the reader can see, as the shard
+    /// and the cut its chain ended at. Owning the route and leaving
+    /// after the commit is not enough: a successor owns its
+    /// predecessor's keyspace, so two cuts over one route inside one
+    /// transaction's life would name it to both, and the second
+    /// departure would abandon what the first already settled. The
+    /// shard a record may name is the one that held the route then,
+    /// which is the earliest departure over it after the commit.
+    ///
+    /// Read off the figures a record restates and the departures alone,
+    /// so the ledger composing a record and the admission judging it
+    /// answer alike — and a replica holding no entry for the name
+    /// answers as one that does, which is what lets it rebuild the entry
+    /// from the record.
+    #[must_use]
+    pub fn party(
+        &self,
+        local: ShardId,
+        shard: ShardId,
+        cut: WeightedTimestamp,
+        departures: &[(ShardId, WeightedTimestamp)],
+    ) -> bool {
+        let first_commit = self.first_commit();
+        cut > first_commit
+            && self.reach.iter().any(|&route| {
+                !ShardTrie::shard_owns_route(local, route)
+                    && ShardTrie::shard_owns_route(shard, route)
+                    && departures
+                        .iter()
+                        .filter(|(departed, departed_at)| {
+                            ShardTrie::shard_owns_route(*departed, route)
+                                && *departed_at > first_commit
+                        })
+                        .map(|(_, departed_at)| *departed_at)
+                        .min()
+                        .is_none_or(|first| first >= cut)
+            })
     }
 
     /// The earliest instant any shard could have committed the

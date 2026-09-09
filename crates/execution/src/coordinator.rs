@@ -3519,9 +3519,6 @@ impl ExecutionCoordinator {
             self.expected_certs.register(shard, tx_hash, now_ts);
         }
 
-        // What this shard's ledger says the departed shard was party to,
-        // taken beside the set: an abandonment record may name only these,
-        // and the fence reads it from the same mirror.
         self.counterparts.on_settled(shard, settled);
         self.release(topology_schedule, Wake::SettledSet(shard))
     }

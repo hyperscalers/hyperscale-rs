@@ -309,13 +309,22 @@ pub fn select_abandonment_records(
     fold: &mut RecordsFold<'_>,
     records: Vec<AbandonmentRecord>,
 ) -> Vec<AbandonmentRecord> {
+    let departures: Vec<(ShardId, WeightedTimestamp)> =
+        ctx.schedule.departures_at(ctx.anchor).collect();
     let mut trimmed: Vec<AbandonmentRecord> = records
         .into_iter()
         .filter_map(|record| {
             let kept: Vec<UnsettledTx> = record
                 .unsettled()
                 .iter()
-                .filter(|entry| RecordsSection::name_stands(ctx, fold, entry.tx_hash).is_ok())
+                .filter(|entry| {
+                    entry.party(
+                        ctx.local_shard,
+                        record.shard(),
+                        record.terminal_wt(),
+                        &departures,
+                    ) && RecordsSection::name_stands(ctx, fold, entry.tx_hash).is_ok()
+                })
                 .cloned()
                 .collect();
             (!kept.is_empty())
@@ -540,9 +549,10 @@ mod tests {
         test_transaction_running,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, NetworkDefinition, PredecessorTerminal, TimestampRange,
-        TransactionDecision, UnsettledTx, ValidatorSet,
+        Address, AddressClass, CommittedTxsRoot, Hash, MAX_SUBINTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
+        ValidatorSet,
     };
 
     use super::*;
@@ -587,14 +597,18 @@ mod tests {
         departures(&[DEPARTED], &[SURVIVOR], handoff_complete)
     }
 
-    /// The one name the record fixtures carry.
+    /// The one name the record fixtures carry: it reaches a route
+    /// `DEPARTED` held, remote to `SURVIVOR`.
     fn stranded() -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
             deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
             declared_work: 3,
             charge: stub_abort_charge(3),
-            reach: Vec::new(),
+            reach: vec![RoutePrefix::of(Address::new(
+                [0x00; 31],
+                AddressClass::Principal,
+            ))],
         }
     }
 
@@ -614,6 +628,7 @@ mod tests {
             let mut against =
                 Against::schedule(TopologySnapshot::clone(sched.head()), sched.clone());
             against.anchor = anchor;
+            against.local_shard = SURVIVOR;
             let ctx = against.ctx();
             let finalizations = FinalizationsFold::from(&ctx);
             select_abandonment_records(
@@ -657,6 +672,7 @@ mod tests {
         let mut against =
             Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
         against.anchor = inside;
+        against.local_shard = SURVIVOR;
         let ctx = against.ctx();
         let none = FinalizationsFold::from(&ctx);
         assert_eq!(
