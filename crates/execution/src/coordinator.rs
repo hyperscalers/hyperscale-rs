@@ -8477,12 +8477,15 @@ mod tests {
             .ledger
             .register_committed([(transaction, classified)]);
         assert_eq!(
-            state.counterparts.ledger.cells()[0]
-                .claims
+            state
+                .counterparts
+                .ledger
+                .questions(&ShardTrie::uniform(1))
                 .iter()
-                .map(|(_, key)| *key)
-                .collect::<Vec<_>>(),
-            vec![claim],
+                .filter(|question| question.probed == Probed::Claim)
+                .map(|question| question.key)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([claim]),
             "the claim the fixture asks about is the one the shape derives",
         );
         state.counterparts.ledger.certify(transaction.hash());

@@ -18,7 +18,6 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_verdict_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
-use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
@@ -29,54 +28,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::CrossingCell;
 
-use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
-
-/// One counterpart cell a leg entry asks about: the shard holding it,
-/// the cell, the anchor an answer is held to, and which question it is.
-type CounterpartCell = (ShardId, SubstateKey, Probed);
-
-/// Every cell `entry` asks a counterpart about, under `trie`: each other
-/// core shard's committed cell, each delivery's claim on the shard that
-/// was to deliver it and on whatever shard holds the cell's prefix now,
-/// and each core consumer's claim. The one enumeration the prober and
-/// the commit-time fold both read, so what is asked and what is answered
-/// are the same cells.
-///
-/// `local` is never asked about: a core member holds the core it is part
-/// of, itself included, but what it has committed is not something it
-/// fetches a proof of.
-fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec<CounterpartCell> {
-    // Every core shard is asked, because any one of them absent is the
-    // whole answer — a core that one of its shards never included, or
-    // that one of its shards refused and retracted its cell for, can
-    // never settle — while the shards that still hold theirs say only
-    // that a member is pending. Asking the lowest alone leaves the
-    // crossing stranded whenever that shard is the one that included.
-    // Nothing is asked before the deadline, so a core that settles pays
-    // for none of this.
-    let core = entry
-        .core
-        .iter()
-        .filter(move |&&shard| shard != local)
-        .map(|&shard| {
-            (
-                shard,
-                committed_tx_cell_key(shard, entry.tx_hash, entry.deadline.validity_end()),
-                Probed::Core,
-            )
-        });
-    let deliveries = entry.deliveries.iter().flat_map(|&(delivered_by, claim)| {
-        BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
-            .into_iter()
-            .map(move |shard| (shard, claim, Probed::Delivery))
-    });
-    let claims = entry.claims.iter().flat_map(|&(shard, claim)| {
-        BTreeSet::from([shard, trie.shard_for_prefix(claim.owner)])
-            .into_iter()
-            .map(move |shard| (shard, claim, Probed::Claim))
-    });
-    core.chain(deliveries).chain(claims).collect()
-}
+use crate::unresolved::{Question, Released, Unanswerable, UnresolvedTxs};
 
 /// What one block's abandonment records may still spend.
 ///
@@ -201,8 +153,6 @@ pub struct Offers {
 }
 
 pub struct Counterparts {
-    local_shard: ShardId,
-
     /// Committed transactions still owed an outcome, folded from the
     /// chain rather than read off live tick state — the only account of
     /// what this shard has in flight that can be rebuilt after losing
@@ -280,7 +230,6 @@ impl Counterparts {
         mirror: Arc<CounterpartMirror>,
     ) -> Self {
         Self {
-            local_shard,
             ledger: UnresolvedTxs::new(local_shard),
             mirror,
             proven_anchors,
@@ -386,7 +335,7 @@ impl Counterparts {
         topology_schedule
             .routable_shards()
             .into_iter()
-            .filter(|&shard| shard != self.local_shard)
+            .filter(|&shard| shard != self.ledger.local())
             .filter(|&shard| !self.mirror.with_settled(|sets| sets.contains_key(&shard)))
             .filter(|&shard| {
                 topology_schedule
@@ -462,35 +411,42 @@ impl Counterparts {
     /// alone, so nothing but the header and the proof is fetched.
     pub fn probe(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Vec<Action> {
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
-        for entry in self.ledger.probeable(now) {
-            for (shard, key, probed) in counterpart_cells(&entry, self.local_shard, trie) {
-                // The newest header the question stands at, of those
-                // standing at the chain's clock: the one the shard is
-                // likeliest to still serve, and the one every member of
-                // this committee is asking of.
-                let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |ts| {
-                    probed.asks_at(ts, entry.deadline, entry.cued_at)
-                }) else {
-                    continue;
-                };
-                // A question in flight, one this validator's own fetch
-                // answered and one the chain answered are left alone: a
-                // core's header lands every block, and moving a probe
-                // to each new one abandons the fetch before its answer
-                // returns. A probe whose fetch returned a reading that
-                // answered nothing is moved on, which is how a cell
-                // read outside its window is asked again — at a newer
-                // header, not of the same one every block.
-                if self
-                    .ledger
-                    .probe_stands(entry.tx_hash, shard, key, anchor.height)
-                {
-                    continue;
-                }
-                self.ledger
-                    .record_probe(entry.tx_hash, shard, key, probed, anchor);
-                wanted.entry(anchor).or_default().push(key);
+        for question in self.ledger.questions(trie) {
+            if !question.open_at(now) {
+                continue;
             }
+            let Question {
+                tx_hash,
+                shard,
+                key,
+                probed,
+                deadline,
+                cued,
+            } = question;
+            // The newest header the question stands at, of those
+            // standing at the chain's clock: the one the shard is
+            // likeliest to still serve, and the one every member of
+            // this committee is asking of.
+            let Some(anchor) = self
+                .proven_anchors
+                .newest_licensed(shard, now, |ts| probed.asks_at(ts, deadline, cued))
+            else {
+                continue;
+            };
+            // A question in flight, one this validator's own fetch
+            // answered and one the chain answered are left alone: a
+            // core's header lands every block, and moving a probe to
+            // each new one abandons the fetch before its answer
+            // returns. A probe whose fetch returned a reading that
+            // answered nothing is moved on, which is how a cell read
+            // outside its window is asked again — at a newer header,
+            // not of the same one every block.
+            if self.ledger.probe_stands(tx_hash, shard, key, anchor.height) {
+                continue;
+            }
+            self.ledger
+                .record_probe(tx_hash, shard, key, probed, anchor);
+            wanted.entry(anchor).or_default().push(key);
         }
         // The records this shard inherited ask one question each, of
         // whoever holds the claim's prefix now. Nothing is asked of a
@@ -502,7 +458,7 @@ impl Counterparts {
             }
             let claim = record.cell.consumer_claim;
             let shard = trie.shard_for_prefix(claim.owner);
-            if shard == self.local_shard {
+            if shard == self.ledger.local() {
                 continue;
             }
             let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
@@ -572,19 +528,20 @@ impl Counterparts {
         // voter to a non-answer taken at one height.
         let mut answering: BTreeSet<SubstateKey> = BTreeSet::new();
         let mut speaks_for: BTreeSet<TxHash> = BTreeSet::new();
-        for entry in &answered {
-            let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key) else {
+        for question in &answered {
+            let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == question.key)
+            else {
                 continue;
             };
-            if entry
+            if question
                 .probed
-                .answer(anchor.ts, entry.deadline, inclusion)
+                .answer(anchor.ts, question.deadline, inclusion)
                 .is_some()
             {
                 self.ledger
-                    .verify_probe(entry.tx_hash, entry.shard, entry.key);
-                answering.insert(entry.key);
-                speaks_for.insert(entry.tx_hash);
+                    .verify_probe(question.tx_hash, question.shard, question.key);
+                answering.insert(question.key);
+                speaks_for.insert(question.tx_hash);
             } else {
                 record_reclaim_probe_pending();
             }
@@ -631,18 +588,10 @@ impl Counterparts {
         if block.state_claims().is_empty() {
             return Vec::new();
         }
-        let cells: Vec<(Probeable, Vec<CounterpartCell>)> = self
-            .ledger
-            .cells()
-            .into_iter()
-            .map(|entry| {
-                let cells = counterpart_cells(&entry, self.local_shard, trie);
-                (entry, cells)
-            })
-            .collect();
+        let questions = self.ledger.questions(trie);
         let mut actions = Vec::new();
         for claim in block.state_claims() {
-            actions.extend(self.fold_cells(claim, &cells));
+            actions.extend(self.fold_cells(claim, &questions));
             self.fold_inherited(claim, trie);
         }
         actions
@@ -681,53 +630,54 @@ impl Counterparts {
 
     /// Fold one claim's answers into the questions the ledger is
     /// waiting on.
-    fn fold_cells(
-        &mut self,
-        claim: &StateClaim,
-        cells: &[(Probeable, Vec<CounterpartCell>)],
-    ) -> Vec<Action> {
+    fn fold_cells(&mut self, claim: &StateClaim, questions: &[Question]) -> Vec<Action> {
         let mut actions = Vec::new();
-        for (entry, cells) in cells {
-            for &(shard, key, probed) in cells {
-                if shard != claim.anchor.shard {
-                    continue;
-                }
-                let Some(inclusion) = claim.reading(key) else {
-                    continue;
-                };
-                // Judged per cell by the one rule, whoever fetched the
-                // proof: an absence is read only inside its window and
-                // only for the cell a refusal leaves absent, a presence
-                // wherever it was taken and only for the cell a claim
-                // writes — and a probe never sent may still be answered
-                // by a claim a block carries.
-                let Some(inclusion) = probed.answer(claim.anchor.ts, entry.deadline, inclusion)
-                else {
-                    continue;
-                };
-                // The question is answered with what the chain read,
-                // and a fetch still out for it is released with it. A
-                // claim cell present is the consumer holding the
-                // crossing, which is what licenses the retirement.
-                let Some(Released(released)) =
-                    self.ledger
-                        .close_question(entry.tx_hash, shard, key, probed, inclusion)
-                else {
-                    continue;
-                };
-                self.released_fetches.extend(released);
-                record_reclaim_probe_answered(inclusion.is_present());
-                // The counterpart took it, and its certificate says
-                // how. Its broadcast may have missed this shard, so it
-                // is fetched rather than waited for.
-                if inclusion.is_present() {
-                    actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                        source_shard: shard,
-                        tx_hash: entry.tx_hash,
-                        preferred: None,
-                        class: None,
-                    }));
-                }
+        for &Question {
+            tx_hash,
+            shard,
+            key,
+            probed,
+            deadline,
+            ..
+        } in questions
+        {
+            if shard != claim.anchor.shard {
+                continue;
+            }
+            let Some(inclusion) = claim.reading(key) else {
+                continue;
+            };
+            // Judged per cell by the one rule, whoever fetched the
+            // proof: an absence is read only inside its window and only
+            // for the cell a refusal leaves absent, a presence wherever
+            // it was taken and only for the cell a claim writes — and a
+            // probe never sent may still be answered by a claim a block
+            // carries.
+            let Some(inclusion) = probed.answer(claim.anchor.ts, deadline, inclusion) else {
+                continue;
+            };
+            // The question is answered with what the chain read, and a
+            // fetch still out for it is released with it. A claim cell
+            // present is the consumer holding the crossing, which is
+            // what licenses the retirement.
+            let Some(Released(released)) = self
+                .ledger
+                .close_question(tx_hash, shard, key, probed, inclusion)
+            else {
+                continue;
+            };
+            self.released_fetches.extend(released);
+            record_reclaim_probe_answered(inclusion.is_present());
+            // The counterpart took it, and its certificate says how.
+            // Its broadcast may have missed this shard, so it is fetched
+            // rather than waited for.
+            if inclusion.is_present() {
+                actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
+                    source_shard: shard,
+                    tx_hash,
+                    preferred: None,
+                    class: None,
+                }));
             }
         }
         actions
@@ -756,7 +706,7 @@ impl Counterparts {
         tx_hash: TxHash,
         decision: TransactionDecision,
     ) -> Vec<Action> {
-        if shard == self.local_shard || !self.ledger.core_holds(tx_hash, shard) {
+        if shard == self.ledger.local() || !self.ledger.core_holds(tx_hash, shard) {
             return Vec::new();
         }
         vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -778,7 +728,7 @@ impl Counterparts {
         tx_hash: TxHash,
         at: WeightedTimestamp,
     ) -> Vec<Action> {
-        if shard == self.local_shard {
+        if shard == self.ledger.local() {
             return Vec::new();
         }
         if self.ledger.consumer_holds(tx_hash, shard) {
@@ -906,7 +856,7 @@ impl Counterparts {
         now: WeightedTimestamp,
     ) {
         for (shard, cut) in topology_schedule.departures_at(now) {
-            if shard != self.local_shard {
+            if shard != self.ledger.local() {
                 self.ledger.record_terminal(
                     shard,
                     cut,
