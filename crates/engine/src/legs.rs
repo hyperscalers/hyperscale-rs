@@ -561,7 +561,7 @@ impl Member {
 pub enum Licence {
     /// Every consumer claimed, on the evidence of its claim cell proved
     /// present: the records are deleted.
-    Accepted,
+    Claimed,
     /// No consumer ever claimed, on the evidence of a committed record:
     /// the crossings are credited back and the records deleted.
     Unclaimed,
@@ -655,7 +655,7 @@ impl Runs {
                 ..
             } => *charged,
             Self::Settle {
-                on: Licence::Accepted | Licence::OwnLeaf,
+                on: Licence::Claimed | Licence::OwnLeaf,
                 ..
             } => true,
         }

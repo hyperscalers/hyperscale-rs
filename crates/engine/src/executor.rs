@@ -556,7 +556,7 @@ impl Executor {
             let record = match (read_record(snapshot, *key), on) {
                 (Some(record), _) => record,
                 (None, Licence::OwnLeaf) => continue,
-                (None, Licence::Accepted | Licence::Unclaimed) => {
+                (None, Licence::Claimed | Licence::Unclaimed) => {
                     return Err(format!("settlement of record {key:?} reads no record"));
                 }
             };
@@ -1237,7 +1237,7 @@ struct BatchMember {
 /// a counterpart's evidence only once that evidence stands.
 fn takes_back(on: Licence, record: &CrossingCell, snapshot: &(dyn Substates + Sync)) -> bool {
     match on {
-        Licence::Accepted => false,
+        Licence::Claimed => false,
         Licence::Unclaimed => true,
         Licence::OwnLeaf => snapshot.cell(record.consumer_claim).is_none(),
     }

@@ -295,7 +295,7 @@ pub enum Part {
     /// A leg outside the core, held for the settlement of what it
     /// issued: never abandoned, probed past the deadline, released by
     /// the reclaim or the retirement.
-    Leg(Held),
+    Leg(LegEntry),
     /// A member of the core, whose verdict is its own and which issues
     /// crossings deliveries elsewhere consume.
     Core(Kept),
@@ -304,13 +304,13 @@ pub enum Part {
     /// reclaim of what its deliveries never claimed — and named by no
     /// departure record: a departed deliverer's successor still
     /// delivers, and only the lapse says a delivery never will.
-    Remainder(Held),
+    Remainder(LegEntry),
 }
 
 /// What a leg entry holds for the settlement of what it issued: what
 /// the settlement is composed from, and where it stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Held {
+pub struct LegEntry {
     /// The body and the classification the settlement derives from.
     kept: Kept,
     /// Which tick of this shard's has taken the entry's records — a
@@ -328,7 +328,7 @@ pub struct Held {
     charged: bool,
 }
 
-impl Held {
+impl LegEntry {
     const fn unsettled(kept: Kept, charged: bool) -> Self {
         Self {
             kept,
@@ -352,7 +352,7 @@ impl Part {
     /// A leg outside the core, with the body and classification its
     /// settlement is composed from and its price still owed.
     pub(crate) const fn leg(kept: Kept) -> Self {
-        Self::Leg(Held::unsettled(kept, false))
+        Self::Leg(LegEntry::unsettled(kept, false))
     }
 
     /// A member of the core, with the body and classification the
@@ -393,7 +393,7 @@ impl Part {
     /// and settled the price.
     fn resolve(&mut self) {
         *self = match std::mem::replace(self, Self::Whole) {
-            Self::Core(kept) => Self::Remainder(Held::unsettled(kept, true)),
+            Self::Core(kept) => Self::Remainder(LegEntry::unsettled(kept, true)),
             part => part,
         };
     }
@@ -424,14 +424,14 @@ impl Part {
     }
 
     /// What a leg entry holds, where the entry is one.
-    const fn held(&self) -> Option<&Held> {
+    const fn held(&self) -> Option<&LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
             Self::Whole | Self::Delivery | Self::Core(_) => None,
         }
     }
 
-    const fn held_mut(&mut self) -> Option<&mut Held> {
+    const fn held_mut(&mut self) -> Option<&mut LegEntry> {
         match self {
             Self::Leg(held) | Self::Remainder(held) => Some(held),
             Self::Whole | Self::Delivery | Self::Core(_) => None,
@@ -637,7 +637,7 @@ enum Meaning {
 fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -> Meaning {
     let accepted = decision == TransactionDecision::Accept;
     match owed {
-        Some(owed) if owed.part.taken() == Some(Licence::Accepted) => Meaning::Retired,
+        Some(owed) if owed.part.taken() == Some(Licence::Claimed) => Meaning::Retired,
         _ if !deciding => {
             if accepted && owed.is_some_and(|owed| owed.part.is_delivery()) {
                 Meaning::Delivered
@@ -1022,7 +1022,7 @@ impl UnresolvedTxs {
     /// them adds is its own licence and nothing else: a reclaim needs the
     /// entry covered, a retirement needs every claim read present and
     /// nothing covering it.
-    fn untaken_legs(&self) -> impl Iterator<Item = (TxHash, &Owed, &Held)> {
+    fn untaken_legs(&self) -> impl Iterator<Item = (TxHash, &Owed, &LegEntry)> {
         self.owed.iter().filter_map(|(tx_hash, owed)| {
             let held = owed.part.held()?;
             held.taken.is_none().then_some((*tx_hash, owed, held))
@@ -1105,7 +1105,7 @@ impl UnresolvedTxs {
     /// is the retirement's and releases the entry.
     pub fn admit_retire(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.part.take(Licence::Accepted);
+            owed.part.take(Licence::Claimed);
         }
     }
 
@@ -1232,7 +1232,7 @@ impl UnresolvedTxs {
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.
     #[must_use]
-    pub fn is_unsettleable(&self, tx_hash: TxHash) -> bool {
+    pub fn is_covered(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(Owed::covered)
     }
 
@@ -2116,7 +2116,7 @@ mod tests {
             "neither was held, so both are rebuilt",
         );
         assert_eq!(ledger.len(), 2);
-        assert!(ledger.is_unsettleable(one.hash()));
+        assert!(ledger.is_covered(one.hash()));
 
         // And each is abandonable on the record's own terms, which is the
         // whole point of it carrying them.
@@ -2187,7 +2187,7 @@ mod tests {
             vec![abandons(&tx)],
             "the record says nothing can settle it, so the shard may",
         );
-        assert!(ledger.is_unsettleable(tx.hash()));
+        assert!(ledger.is_covered(tx.hash()));
     }
 
     /// A record still opens nothing before the transaction's own
@@ -3022,7 +3022,7 @@ mod tests {
         ledger.certify(tx.hash());
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let past = deadline.plus(MAX_VALIDITY_RANGE);
-        assert!(!ledger.is_unsettleable(tx.hash()));
+        assert!(!ledger.is_covered(tx.hash()));
         assert!(
             ledger.past_deadline(past).is_empty(),
             "past the abandon window the shard no longer speaks for it on its own clock"
@@ -3030,7 +3030,7 @@ mod tests {
 
         let sibling = core_cell(SIBLING, &tx);
         ledger.close_question(tx.hash(), SIBLING, sibling, Probed::Core, Inclusion::Absent);
-        assert!(ledger.is_unsettleable(tx.hash()));
+        assert!(ledger.is_covered(tx.hash()));
         assert_eq!(
             ledger.past_deadline(past),
             vec![abandons(&tx)],

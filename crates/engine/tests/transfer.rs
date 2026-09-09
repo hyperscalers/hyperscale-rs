@@ -1530,7 +1530,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         Runs::Settle {
             member: Member::whole(near_shard),
             records: classified.records_issued(near_shard),
-            on: Licence::Accepted,
+            on: Licence::Claimed,
             charged: true,
         },
     );
@@ -1555,7 +1555,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         Runs::Settle {
             member: Member::whole(near_shard),
             records: classified.records_issued(near_shard),
-            on: Licence::Accepted,
+            on: Licence::Claimed,
             charged: true,
         },
     );

@@ -57,7 +57,7 @@ impl Withheld {
 /// one judgment.
 pub struct VoteFence<'a> {
     /// The departed shards' settled sets, and what committed records cover.
-    pub evidence: &'a CounterpartMirror,
+    pub mirror: &'a CounterpartMirror,
     /// The commit-proven remote headers.
     pub proven_anchors: &'a ProvenAnchors,
     /// The counterpart cells this validator has proven for itself.
@@ -123,8 +123,8 @@ impl VoteFence<'_> {
         let claims = block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.claims(self.local_shard, |tx_hash| self.evidence.covers(tx_hash)));
-        let verdict = self.evidence.with_settled(|settled| {
+            .flat_map(|fw| fw.claims(self.local_shard, |tx_hash| self.mirror.covers(tx_hash)));
+        let verdict = self.mirror.with_settled(|settled| {
             settled_set_verdict(settled, schedule, self.local_shard, anchored_wt, claims)
         });
         match verdict {
@@ -173,7 +173,7 @@ impl VoteFence<'_> {
     /// in, so a voter inside it either has the set or is about to.
     fn departure_stands(&self, record: &AbandonmentRecord) -> Result<(), Withheld> {
         let shard = record.shard();
-        let stranger = self.evidence.with_parties(shard, |parties| {
+        let stranger = self.mirror.with_parties(shard, |parties| {
             parties.map(|parties| {
                 record
                     .tx_hashes()
@@ -194,7 +194,7 @@ impl VoteFence<'_> {
             }
             Some(None) => {}
         }
-        let settled = self.evidence.with_settled(|sets| {
+        let settled = self.mirror.with_settled(|sets| {
             sets.get(&shard).map(|settled| {
                 record
                     .tx_hashes()
@@ -440,7 +440,7 @@ mod tests {
 
     /// The evidence one validator holds, and the fence over it.
     struct Held {
-        evidence: CounterpartMirror,
+        mirror: CounterpartMirror,
         proven_anchors: ProvenAnchors,
         proven_cells: ProvenCells,
         precut: Precut,
@@ -449,7 +449,7 @@ mod tests {
     impl Held {
         fn nothing() -> Self {
             Self {
-                evidence: CounterpartMirror::new(),
+                mirror: CounterpartMirror::new(),
                 proven_anchors: ProvenAnchors::new(),
                 proven_cells: ProvenCells::new(),
                 precut: Precut::default(),
@@ -470,7 +470,7 @@ mod tests {
 
         fn judge(&self, block: &Block) -> Result<(), Withheld> {
             VoteFence {
-                evidence: &self.evidence,
+                mirror: &self.mirror,
                 proven_anchors: &self.proven_anchors,
                 proven_cells: &self.proven_cells,
                 precut: &self.precut,
