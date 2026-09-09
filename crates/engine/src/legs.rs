@@ -222,8 +222,8 @@ impl Classified {
 
     /// The claim cells core consumers write for the crossings a leg on
     /// `local` issued. What a probe asks the core about once the
-    /// transaction's deadline has passed: a claim absent there, on a
-    /// core of one shard, says the core never took the crossing.
+    /// transaction's deadline has passed: a claim present there says
+    /// the core took the crossing.
     #[must_use]
     pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         self.claims_issued(local, false)

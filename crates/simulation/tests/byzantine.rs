@@ -76,27 +76,34 @@ fn a_forged_state_proof_convinces_nobody() {
             Some("state_proof:unusable_proof"),
         );
 
-        // One host of the shard the proof is asked of answers with a
-        // well-formed response carrying a proof that reconstructs
+        // Every host but one of the shard the proof is asked of answers
+        // with a well-formed response carrying a proof that reconstructs
         // nothing. Well-formed is the whole point: rubbish bytes are
         // refused at the decode as an unusable *answer*, which says
         // nothing about the proof check, so the forgery is built as the
         // response type and the rubbish put where the multiproof goes.
-        // Its peers answer honestly, which is what makes this a rotation
-        // rather than an outage.
-        let liar = *c
-            .committee_hosts(recipient_shard)
-            .first()
+        // One peer answers honestly, which is what makes this a rotation
+        // rather than an outage — and all but one lie so the rotation is
+        // exercised whichever probe's fetch lands first.
+        let hosts = c.committee_hosts(recipient_shard);
+        let (_honest, liars) = hosts
+            .split_last()
             .expect("the recipient's shard has a seated committee");
         let unreconstructable = hbor_to_vec(&GetStateProofResponse::found(
             MerkleInclusionProof::new(vec![0xFF; 64]),
         ))
         .expect("a state-proof response encodes");
-        let forged = c.rewrite_responses(
-            liar,
-            "state_proof.request",
-            Arc::new(move |_asked: &[u8], _honest: &[u8]| unreconstructable.clone()),
-        );
+        let forged: Vec<_> = liars
+            .iter()
+            .map(|&liar| {
+                let unreconstructable = unreconstructable.clone();
+                c.rewrite_responses(
+                    liar,
+                    "state_proof.request",
+                    Arc::new(move |_asked: &[u8], _honest: &[u8]| unreconstructable.clone()),
+                )
+            })
+            .collect();
 
         // The bundle never reaches the recipient, so the delivery lapses
         // and the payer asks the recipient's chain about the claim cell.
@@ -144,7 +151,7 @@ fn a_forged_state_proof_convinces_nobody() {
             vault_balance(c, payer_shard, from),
         );
         assert!(
-            forged.fired() > 0,
+            forged.iter().any(|handle| handle.fired() > 0),
             "the forgery has to have been served, or nothing was attacked",
         );
         // What the reclaim landing shows is a value arriving, which an

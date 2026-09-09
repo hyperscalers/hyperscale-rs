@@ -369,6 +369,12 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// chain committed.
     fn record_reclaim_admitted(&self) {}
 
+    /// Record a counterpart cell this validator's own fetch read as
+    /// answering nothing — a committed cell present while its member is
+    /// still pending, or an absence outside its window — so the question
+    /// is put again at a newer header.
+    fn record_reclaim_probe_pending(&self) {}
+
     /// A fetch response the requester's own check refused, by fetch kind
     /// and the check that refused it.
     ///
@@ -845,6 +851,12 @@ pub fn record_reclaim_probe_answered(present: bool) {
 #[inline]
 pub fn record_reclaim_admitted() {
     recorder().record_reclaim_admitted();
+}
+
+/// Record a counterpart cell a fetch read as answering nothing yet.
+#[inline]
+pub fn record_reclaim_probe_pending() {
+    recorder().record_reclaim_probe_pending();
 }
 
 /// Record a fetch response refused by the requester's own check.

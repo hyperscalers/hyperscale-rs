@@ -16,8 +16,8 @@ use std::time::Duration;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON,
-    TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
+    CLAIM_VISIBILITY_LAG, EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
+    RETENTION_HORIZON, TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
 };
 
 /// The span past the deadline in which the claim cell a crossing's
@@ -137,20 +137,16 @@ pub enum Window {
     /// [`MAX_VALIDITY_RANGE`] on, past which a proof is a true proof of
     /// a cell that was present.
     Core,
-    /// Where a core consumer's claim cell being absent proves a core of
-    /// one shard never took the crossing: from the deadline, since a
-    /// block carrying that core's success past it is refused, to the
-    /// claim cell's sweep one [`CLAIM_WINDOW`] on.
-    Claim,
     /// Where a delivery's claim cell being absent proves the crossing
     /// lapsed: from the delivery window's close plus
     /// [`MAX_FINALIZATION_DELAY`] — a delivery admitted under the close
     /// has committed its claim by then or never will — to the claim
     /// cell's sweep.
     Lapse,
-    /// Where a leg entry stands: to the claim cell both its members are
-    /// proved against being swept, past which no evidence that could
-    /// decide the leg can still be taken.
+    /// Where a leg entry stands: from the deadline to the claim cell
+    /// both its members are proved against being swept, one
+    /// [`CLAIM_WINDOW`] on, past which no evidence that could decide
+    /// the leg can still be taken.
     LegEntry,
 }
 
@@ -165,32 +161,35 @@ impl Window {
                 validity_end..validity_end.plus(MAX_VALIDITY_RANGE)
             }
             Self::Core => at..at.plus(MAX_VALIDITY_RANGE),
-            // Two questions, one span, and the coincidence is meant: a
-            // leg entry stands exactly as long as the claim cell its
-            // members are proved against, so neither outlives evidence
-            // the other could still be decided by.
-            Self::Claim | Self::LegEntry => at..at.plus(CLAIM_WINDOW),
+            Self::LegEntry => at..at.plus(CLAIM_WINDOW),
             Self::Lapse => at.plus(MAX_VALIDITY_RANGE)..at.plus(CLAIM_WINDOW),
         }
     }
 }
 
-/// Which counterpart a probe asks, and so which record its absence is
-/// offered as.
+/// Which counterpart cell a probe asks about, and so which reading of
+/// it answers.
+///
+/// Each cell is written by one execution and by nothing else, so what
+/// a reading says is a property of the cell. A committed cell is
+/// written at a core member's inclusion and retracted by its refusal,
+/// so only its absence is an answer: present, the member is still
+/// pending, and the cell is asked again at a newer header. A core
+/// consumer's claim cell is written by the consuming finalization, and
+/// only once every core member certified, so only its presence is an
+/// answer: absent, a sibling may still be pending, and the committed
+/// cell says whether it ever will be. A delivery's claim cell is written
+/// by a member that awaits nobody, so both readings answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Probed {
-    /// A core's committed cell, past the transaction's deadline: absent
-    /// where the core never included the transaction, or included it
-    /// and refused.
+    /// A core member's committed cell, past the transaction's deadline:
+    /// absent where the member never included the transaction, or
+    /// included it and refused.
     Core,
     /// A delivering shard's claim cell, past the crossing's lapse.
     Delivery,
-    /// A core consumer's claim cell, past the transaction's deadline:
-    /// present says the core took the crossing, and its certificate
-    /// speaks next. Absent says the core never took it where the core
-    /// is one shard, whose one execution wrote the claim by the deadline
-    /// or never will; where the core is more, only that a sibling is
-    /// pending, and the committed cell answers instead.
+    /// A core consumer's claim cell: present says the core took the
+    /// crossing, and its certificate speaks next.
     Claim,
 }
 
@@ -199,13 +198,14 @@ impl Probed {
     /// records.
     pub const ALL: [Self; 3] = [Self::Core, Self::Delivery, Self::Claim];
 
-    /// The window an answer to this question is read in.
+    /// The window an *absence* of this cell is read in, `None` where an
+    /// absence never answers.
     #[must_use]
-    pub const fn window(self) -> Window {
+    pub const fn absence_window(self) -> Option<Window> {
         match self {
-            Self::Core => Window::Core,
-            Self::Delivery => Window::Lapse,
-            Self::Claim => Window::Claim,
+            Self::Core => Some(Window::Core),
+            Self::Delivery => Some(Window::Lapse),
+            Self::Claim => None,
         }
     }
 
@@ -217,56 +217,91 @@ impl Probed {
     /// that was there, so an absence outside says nothing either way.
     #[must_use]
     pub fn absence_answers_at(self, probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
-        self.window().of(deadline).contains(&probed_wt)
+        self.absence_window()
+            .is_some_and(|window| window.of(deadline).contains(&probed_wt))
+    }
+
+    /// The earliest anchor a *presence* of this cell is asked at, for a
+    /// transaction with this `deadline`, `None` where a presence never
+    /// answers.
+    ///
+    /// A presence answers wherever it was taken, so this bounds only
+    /// when the question is worth putting: a core consumer's claim is
+    /// there by the deadline or a sibling is pending, and a delivery's
+    /// by the lapse or never. A consumer's claiming success opens the
+    /// question earlier, and that cue is the prober's to read.
+    #[must_use]
+    pub fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
+        match self {
+            Self::Core => None,
+            Self::Claim => Some(deadline.at()),
+            Self::Delivery => Some(Window::Lapse.of(deadline).start),
+        }
+    }
+
+    /// Whether a header at `anchor_wt` is one to ask this question at,
+    /// for a transaction with this `deadline` whose consumer's claiming
+    /// success, if one was heard, was spoken at `cued`: inside the
+    /// window an absence answers in, or past the point a presence is
+    /// asked from — the question's own, or one
+    /// [`CLAIM_VISIBILITY_LAG`] past the cue, whichever is earlier,
+    /// since the reading a cue is after is a presence and a presence
+    /// answers wherever it was taken.
+    #[must_use]
+    pub fn asks_at(
+        self,
+        anchor_wt: WeightedTimestamp,
+        deadline: Deadline,
+        cued: Option<WeightedTimestamp>,
+    ) -> bool {
+        self.absence_answers_at(anchor_wt, deadline)
+            || self.presence_asked_from(deadline).is_some_and(|from| {
+                anchor_wt >= from
+                    || cued.is_some_and(|cued| anchor_wt >= cued.plus(CLAIM_VISIBILITY_LAG))
+            })
     }
 
     /// What `inclusion` of the probed cell, read at `probed_wt`, says
-    /// for a transaction with this `deadline` on a core of `core_len`
-    /// shards: the inclusion itself, or `None` where it says nothing.
+    /// for a transaction with this `deadline`: the inclusion itself, or
+    /// `None` where it says nothing.
     ///
-    /// A presence is bounded by neither end of the window: these cells
-    /// are written by the one execution that consumes the crossing and
-    /// by nothing else, so a cell that is there was written by it,
-    /// whenever the reading was taken — and a swept one reads absent
-    /// rather than present. That asymmetry is the whole of why a
-    /// retirement can be licensed across a cut and a reclaim cannot. An
-    /// absence answers only inside the window and only for the arity
-    /// that writes the cell, as [`Self::read`] says.
+    /// A presence is bounded by neither end of a window: the cell was
+    /// written by the one execution that writes it, whenever the reading
+    /// was taken, and a swept one reads absent rather than present. That
+    /// asymmetry is the whole of why a retirement can be licensed across
+    /// a cut and a reclaim cannot. An absence answers only inside its
+    /// window. Which readings answer at all is [`Self::read`].
     #[must_use]
     pub fn answer(
         self,
         probed_wt: WeightedTimestamp,
         deadline: Deadline,
         inclusion: Inclusion,
-        core_len: usize,
     ) -> Option<Inclusion> {
         if matches!(inclusion, Inclusion::Absent) && !self.absence_answers_at(probed_wt, deadline) {
             return None;
         }
-        self.read(inclusion, core_len)
+        self.read(inclusion)
     }
 
-    /// What `inclusion` of the probed cell says, for a core of `core_len`
-    /// shards: the inclusion itself, or `None` where it says nothing.
+    /// What `inclusion` of the probed cell says, whatever the clock: the
+    /// inclusion itself, or `None` where it says nothing.
     ///
-    /// A cell present says the counterpart took the transaction whatever
-    /// the core's arity. A claim absent says the core never took it only
-    /// where the core is one shard, whose one execution wrote the claim
-    /// by the deadline or never will; on a core of more it says only
-    /// that a sibling is pending. A committed cell absent says the core
-    /// never took it — never included it, or refused it and retracted
-    /// the cell — and is read only where the core is more than one
-    /// shard, since a core of one answers through its claim. The one
-    /// rule for both, stated once, so the prober asks only what an
-    /// absence would answer and the fold reads a carried proof by the
-    /// same rule whoever fetched it.
+    /// The one rule, stated once, so the prober asks only what a reading
+    /// would answer and the fold reads a carried proof by the same rule
+    /// whoever fetched it. A committed cell answers absent — the member
+    /// never included the transaction, or refused and retracted the
+    /// cell — and present is a member still pending, whose refusal may
+    /// yet retract it. A core consumer's claim answers present — the
+    /// consuming finalization committed, which it does only once every
+    /// core member certified — and absent is a sibling still pending. A
+    /// delivery's claim answers either way.
     #[must_use]
-    pub const fn read(self, inclusion: Inclusion, core_len: usize) -> Option<Inclusion> {
+    pub const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
-            (Inclusion::Present(_), _) | (Inclusion::Absent, Self::Delivery) => Some(inclusion),
-            (Inclusion::Absent, Self::Claim) if core_len == 1 => Some(inclusion),
-            (Inclusion::Absent, Self::Core) if core_len > 1 => Some(inclusion),
-            (Inclusion::Absent, Self::Claim | Self::Core) => None,
+            (Inclusion::Present(_), Self::Claim | Self::Delivery)
+            | (Inclusion::Absent, Self::Core | Self::Delivery) => Some(inclusion),
+            (Inclusion::Present(_), Self::Core) | (Inclusion::Absent, Self::Claim) => None,
         }
     }
 }
@@ -279,7 +314,8 @@ mod tests {
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
     use crate::{
-        Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON, WeightedTimestamp,
+        CLAIM_VISIBILITY_LAG, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE,
+        RETENTION_HORIZON, WeightedTimestamp,
     };
 
     fn ms(value: u64) -> WeightedTimestamp {
@@ -365,8 +401,7 @@ mod tests {
                 .absence_answers_at(lapse.end.minus(Duration::from_millis(1)), deadline)
         );
         assert!(!Probed::Delivery.absence_answers_at(lapse.end, deadline));
-        assert_eq!(Window::Claim.of(deadline), core.start..lapse.end);
-        assert_eq!(Window::LegEntry.of(deadline), Window::Claim.of(deadline));
+        assert_eq!(Window::LegEntry.of(deadline), core.start..lapse.end);
     }
 
     /// A probe at the validity end itself licenses nothing: a core block
@@ -420,34 +455,56 @@ mod tests {
         let expiry_ms = validity_end.as_millis() + CROSSING_GRACE_MS;
         let deadline = Deadline::from_expiry(expiry_ms);
         assert_eq!(deadline, Deadline::of(validity_end));
-        let claim = Window::Claim.of(deadline);
-        assert_eq!(claim.end, ms(expiry_ms));
-        assert_eq!(claim.end.elapsed_since(claim.start), CLAIM_WINDOW);
+        let entry = Window::LegEntry.of(deadline);
+        assert_eq!(entry.end, ms(expiry_ms));
+        assert_eq!(entry.end.elapsed_since(entry.start), CLAIM_WINDOW);
     }
 
-    /// A claim absent answers for a core of one shard and a committed
-    /// cell absent for a core of more; each says nothing about the other
-    /// arity, a delivery's claim absent answers whatever the core, and a
-    /// cell present answers everywhere.
+    /// A committed cell answers absent and never present, a core
+    /// consumer's claim answers present and never absent, and a
+    /// delivery's claim answers either way.
     #[test]
-    fn an_absence_answers_only_for_the_arity_that_writes_the_cell() {
+    fn each_cell_answers_with_the_reading_its_writer_makes_final() {
         let present = Inclusion::Present([7; 32]);
-        for core_len in [0, 1, 2, 3] {
-            for probed in [Probed::Core, Probed::Claim, Probed::Delivery] {
-                assert_eq!(probed.read(present, core_len), Some(present));
-            }
-            assert_eq!(
-                Probed::Delivery.read(Inclusion::Absent, core_len),
-                Some(Inclusion::Absent)
-            );
-            assert_eq!(
-                Probed::Claim.read(Inclusion::Absent, core_len).is_some(),
-                core_len == 1
-            );
-            assert_eq!(
-                Probed::Core.read(Inclusion::Absent, core_len).is_some(),
-                core_len > 1
-            );
-        }
+        assert_eq!(Probed::Core.read(present), None);
+        assert_eq!(
+            Probed::Core.read(Inclusion::Absent),
+            Some(Inclusion::Absent)
+        );
+        assert_eq!(Probed::Claim.read(present), Some(present));
+        assert_eq!(Probed::Claim.read(Inclusion::Absent), None);
+        assert_eq!(Probed::Delivery.read(present), Some(present));
+        assert_eq!(
+            Probed::Delivery.read(Inclusion::Absent),
+            Some(Inclusion::Absent)
+        );
+    }
+
+    /// A core consumer's claim is asked from the deadline, or one lag
+    /// past a cue heard earlier; a delivery's from its lapse or the same
+    /// cue; a committed cell only inside its absence window, since a cue
+    /// promises a presence and a present committed cell answers nothing.
+    #[test]
+    fn a_cue_opens_a_presence_question_early_and_never_a_committed_cell() {
+        let deadline = Deadline::of(ms(60_000));
+        let cued = deadline.at().minus(Duration::from_secs(30));
+        let readable = cued.plus(CLAIM_VISIBILITY_LAG);
+        assert!(!Probed::Claim.asks_at(
+            readable.minus(Duration::from_millis(1)),
+            deadline,
+            Some(cued)
+        ));
+        assert!(Probed::Claim.asks_at(readable, deadline, Some(cued)));
+        assert!(!Probed::Claim.asks_at(
+            deadline.at().minus(Duration::from_millis(1)),
+            deadline,
+            None
+        ));
+        assert!(Probed::Claim.asks_at(deadline.at(), deadline, None));
+        assert!(Probed::Delivery.asks_at(readable, deadline, Some(cued)));
+        assert!(!Probed::Delivery.asks_at(deadline.at(), deadline, None));
+        assert!(Probed::Delivery.asks_at(Window::Lapse.of(deadline).start, deadline, None));
+        assert!(!Probed::Core.asks_at(readable, deadline, Some(cued)));
+        assert!(Probed::Core.asks_at(deadline.at(), deadline, Some(cued)));
     }
 }

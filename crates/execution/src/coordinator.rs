@@ -7879,10 +7879,22 @@ mod tests {
         }
         let later = lapse.plus(Duration::from_secs(1));
         let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
-        assert_eq!(
-            state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![claim])],
+        let fetches = state_proof_fetches(&opened);
+        assert!(
+            fetches.contains(&(bundle.anchor, vec![claim])),
             "the newest header inside the lapse window is the anchor, and the claim cell the key"
+        );
+        let core_cell = committed_tx_cell_key(
+            PEER,
+            tx_hash,
+            transaction.validity_range().end_timestamp_exclusive,
+        );
+        assert!(
+            fetches
+                .iter()
+                .any(|(anchor, keys)| anchor.height == BlockHeight::new(3)
+                    && *keys == vec![core_cell]),
+            "and the core's committed cell at the newest header inside its own window"
         );
 
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
@@ -8195,55 +8207,96 @@ mod tests {
         );
     }
 
-    /// A core of two shards that turns out to have committed the
-    /// transaction is not absent: the presence answers the question,
-    /// offers nothing, and the core is not asked again — its own
-    /// certificate speaks next.
+    /// A committed cell read present is not the core's last word. A
+    /// member that included the transaction can still refuse or abort
+    /// inside the core window, and its retraction is what the leg has
+    /// to read to take the crossing back — so a present cell is a
+    /// member still pending, asked again at each newer header, and its
+    /// certificate is not fetched on it.
     #[test]
-    fn a_core_that_committed_the_transaction_is_not_probed_again() {
+    fn a_core_cell_read_present_is_asked_again_until_its_retraction_answers() {
         let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
         let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
-        let key = committed_tx_cell_key(
-            CORE,
-            tx_hash,
-            transaction.validity_range().end_timestamp_exclusive,
-        );
+        let validity_end = transaction.validity_range().end_timestamp_exclusive;
+        let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
         let mut state = leg_state(&transaction, &two_shard_core_classified());
         state.committed_ts = deadline;
-        let (bundle, opened) = proven_at(&mut state, &schedule, CORE, 4, deadline, &[key], &[key]);
+
+        // Both core shards had committed the transaction at the deadline.
+        let (included, opened) = proven_at(
+            &mut state,
+            &schedule,
+            CORE,
+            4,
+            deadline,
+            &[cell(CORE)],
+            &[cell(CORE)],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(
-                bundle.anchor,
-                vec![key, core_claim(&two_shard_core_classified())]
+                included.anchor,
+                vec![cell(CORE), core_claim(&two_shard_core_classified())]
             )],
             "the committed cell is asked about, and the consumer's claim beside it"
         );
-
-        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
-        assert!(
-            matches!(
-                reading(&state, CORE, tx_hash, key),
-                Some(Inclusion::Present(_))
-            ),
-            "a core that committed it is not absent"
+        let (sibling_included, _) = proven_at(
+            &mut state,
+            &schedule,
+            CORE_SIBLING,
+            4,
+            deadline,
+            &[cell(CORE_SIBLING)],
+            &[cell(CORE_SIBLING)],
+        );
+        fetch_answers(&mut state, &sibling_included, &[cell(CORE_SIBLING)]);
+        let folded = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            deadline.as_millis(),
+            vec![included, sibling_included],
         );
         assert!(
-            folded.iter().any(|action| matches!(
-                action,
-                Action::Fetch(FetchRequest::ExecutionCerts { source_shard, tx_hash: fetched, .. })
-                    if *source_shard == CORE && *fetched == tx_hash
-            )),
-            "and its certificate is fetched, since a refusal there licenses the reclaim"
+            reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)).is_none(),
+            "a cell present is a member still pending, not an answer"
+        );
+        assert!(
+            !folded
+                .iter()
+                .any(|action| matches!(action, Action::Fetch(FetchRequest::ExecutionCerts { .. }))),
+            "and no certificate is fetched on it"
         );
         assert!(state.offers().abandonment_records.is_empty());
+
+        // A block later the sibling aborted it and retracted its cell.
+        let later = deadline.plus(Duration::from_secs(1));
+        let (retracted, opened) = proven_at(
+            &mut state,
+            &schedule,
+            CORE_SIBLING,
+            5,
+            later,
+            &[],
+            &[cell(CORE_SIBLING)],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(retracted.anchor, vec![cell(CORE_SIBLING)])],
+            "the sibling is asked again at the newer header",
+        );
+        commit_carrying(&mut state, &schedule, 2, later.as_millis(), vec![retracted]);
+        assert_eq!(
+            reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)),
+            Some(Inclusion::Absent)
+        );
         assert!(
-            state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
-            "and is not asked again"
+            reclaim_admitted(&state, tx_hash),
+            "which is what licenses taking the crossing back"
         );
     }
 
@@ -8387,11 +8440,8 @@ mod tests {
             vec![included, never],
         );
         assert!(
-            matches!(
-                reading(&state, CORE, tx_hash, cell(CORE)),
-                Some(Inclusion::Present(_))
-            ),
-            "the shard that included it is not absent",
+            reading(&state, CORE, tx_hash, cell(CORE)).is_none(),
+            "the shard that included it is still pending",
         );
         assert_eq!(
             reading(&state, CORE_SIBLING, tx_hash, cell(CORE_SIBLING)),
@@ -8440,34 +8490,50 @@ mod tests {
         state
     }
 
-    /// A core consumer's claim is asked about beside the core's
-    /// committed cell. On a core of one shard a claim proved absent
-    /// past the deadline is the core never taking the crossing: it
-    /// reaches the fence, is offered as an `Untaken` record, and neither
-    /// question is asked again.
+    /// A core of one shard is asked about its committed cell beside its
+    /// consumer's claim, and the cell is what answers: the claim absent
+    /// says only that the consumer has not claimed yet, and the cell
+    /// absent that it never will.
     #[test]
-    fn a_single_shard_cores_claim_proved_absent_is_its_answer() {
+    fn a_single_shard_core_answers_through_its_committed_cell() {
         let schedule = two_shard_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let figures = UnsettledTx::for_transaction(&transaction);
         let deadline = figures.deadline.at();
+        let cell = committed_tx_cell_key(
+            PEER,
+            figures.tx_hash,
+            transaction.validity_range().end_timestamp_exclusive,
+        );
         let claim = core_claim(&leg_classified());
         let mut state = claimed_leg_state(&transaction, claim);
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 4, deadline, &[], &[claim]);
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            4,
+            deadline,
+            &[],
+            &[cell, claim],
+        );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![claim])],
-            "a core of one shard writes no committed cell, so only its consumer's claim is asked"
+            vec![(bundle.anchor, vec![cell, claim])],
+            "the committed cell is asked about, and the consumer's claim beside it"
         );
 
         fetch_answers(&mut state, &bundle, &[]);
         commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        assert!(
+            reading(&state, PEER, figures.tx_hash, claim).is_none(),
+            "an absent claim proves nothing on its own"
+        );
         assert_eq!(
-            reading(&state, PEER, figures.tx_hash, claim),
+            reading(&state, PEER, figures.tx_hash, cell),
             Some(Inclusion::Absent),
-            "an absent claim on a core of one shard is evidence"
+            "the committed cell absent is the evidence"
         );
         assert!(
             reclaim_admitted(&state, figures.tx_hash),
@@ -8481,21 +8547,20 @@ mod tests {
             5,
             deadline.plus(Duration::from_secs(2)),
             &[],
-            &[claim],
+            &[cell, claim],
         );
         assert!(
             state_proof_fetches(&opened).is_empty(),
-            "and the claim is not asked again: it answered"
+            "and nothing is asked again: the entry is covered"
         );
     }
 
-    /// On a core of more than one shard the same absence says only that
-    /// a sibling is pending: the core settles on its siblings' clock, so
-    /// nothing reaches the fence, nothing is offered, and the claim is
-    /// asked again at the next header — alone, since the committed cell
-    /// answered. That cell is what answers for such a core.
+    /// A claim absent says only that a sibling is pending, and a
+    /// committed cell present that a member is: nothing reaches the
+    /// fence, nothing is offered, and both are asked again at the next
+    /// header.
     #[test]
-    fn a_multi_shard_cores_claim_proved_absent_is_asked_again() {
+    fn a_claim_proved_absent_and_a_cell_proved_present_are_asked_again() {
         let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -8542,12 +8607,12 @@ mod tests {
             5,
             deadline.plus(Duration::from_secs(2)),
             &[core_key],
-            &[claim],
+            &[core_key, claim],
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(later.anchor, vec![claim])],
-            "only the claim is asked again: the committed cell answered"
+            vec![(later.anchor, vec![core_key, claim])],
+            "both are asked again: neither reading answered"
         );
     }
 
@@ -9146,9 +9211,9 @@ mod tests {
     }
 
     /// A shape frozen divided with an inbound leg on [`HOME`] delivered
-    /// on [`PEER`], whose core of one shard sits beside the delivery and
-    /// writes no committed cell — so only the leg's delivery is ever
-    /// probed.
+    /// on [`PEER`], whose core of one shard sits beside the delivery —
+    /// so the leg probes that shard's committed cell and the delivery's
+    /// claim.
     fn delivery_classified() -> Classified {
         use hyperscale_vm_types::LegRole;
 
