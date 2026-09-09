@@ -217,23 +217,30 @@ impl Probed {
         self.window().of(deadline).contains(&probed_wt)
     }
 
-    /// Whether an answer taken at `probed_wt` says anything about what
-    /// this question asks of a transaction with this `deadline`.
+    /// What `inclusion` of the probed cell, read at `probed_wt`, says
+    /// for a transaction with this `deadline` on a core of `core_len`
+    /// shards: the inclusion itself, or `None` where it says nothing.
     ///
     /// A presence is bounded by neither end of the window: these cells
     /// are written by the one execution that consumes the crossing and
     /// by nothing else, so a cell that is there was written by it,
     /// whenever the reading was taken — and a swept one reads absent
     /// rather than present. That asymmetry is the whole of why a
-    /// retirement can be licensed across a cut and a reclaim cannot.
+    /// retirement can be licensed across a cut and a reclaim cannot. An
+    /// absence answers only inside the window and only for the arity
+    /// that writes the cell, as [`Self::read`] says.
     #[must_use]
-    pub fn licenses(
+    pub fn answer(
         self,
         probed_wt: WeightedTimestamp,
         deadline: Deadline,
         inclusion: Inclusion,
-    ) -> bool {
-        matches!(inclusion, Inclusion::Present(_)) || self.absence_answers_at(probed_wt, deadline)
+        core_len: usize,
+    ) -> Option<Inclusion> {
+        if matches!(inclusion, Inclusion::Absent) && !self.absence_answers_at(probed_wt, deadline) {
+            return None;
+        }
+        self.read(inclusion, core_len)
     }
 
     /// What `inclusion` of the probed cell says, for a core of `core_len`
