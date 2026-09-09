@@ -315,10 +315,7 @@ pub fn select_abandonment_records(
             let kept: Vec<UnsettledTx> = verdict
                 .unsettled()
                 .iter()
-                .filter(|entry| {
-                    RecordsSection::name_stands(ctx, fold, verdict.evidence(), entry.tx_hash)
-                        .is_ok()
-                })
+                .filter(|entry| RecordsSection::name_stands(ctx, fold, entry.tx_hash).is_ok())
                 .cloned()
                 .collect();
             (!kept.is_empty())

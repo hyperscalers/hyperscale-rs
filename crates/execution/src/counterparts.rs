@@ -160,9 +160,9 @@ pub struct Inherited {
     /// The newest counterpart header the claim has been asked at, so
     /// the question is not re-sent at the same one every block.
     asked_at: Option<BlockHeight>,
-    /// What a committed proof said, once one has said anything:
+    /// What a committed claim read of the cell, once one has read it:
     /// present at any anchor, absent only past the lapse.
-    pub answer: Option<Word>,
+    pub answer: Option<Inclusion>,
 }
 
 impl Inherited {
@@ -224,9 +224,9 @@ pub struct Counterparts {
 
     /// What counterparts have said about the transactions legs here
     /// issued for, shared with the shard coordinator's vote fence: a
-    /// core's refusal, a proved absence, a consumer's claim. This
-    /// account is the only writer, and the only one that says what
-    /// to drop — the ledger above is what an entry there speaks for.
+    /// core's refusal, a proved absence. This account is the only
+    /// writer, and the only one that says what to drop — the ledger
+    /// above is what an entry there speaks for.
     ///
     /// One mirror, because the fence checks a record against exactly
     /// what was offered from, and two copies could answer differently.
@@ -655,12 +655,12 @@ impl Counterparts {
     /// replica had a probe out, and wherever its own probe sat — so a
     /// replica that never fetched reads the same answer as the one that
     /// did. A key found present means the counterpart took the
-    /// transaction, and its own certificate speaks for it next: a
-    /// refusal there is mirrored on arrival, and an acceptance is what
-    /// settles the record held for the consumer's claim. A core
-    /// consumer's claim absent on a core of more than one shard says
-    /// only that a sibling is pending, and is asked again at the next
-    /// header.
+    /// transaction: a claim cell present is the consumer holding the
+    /// crossing, which is written straight to the ledger and licenses
+    /// the retirement, and the counterpart's own certificate speaks for
+    /// the verdict next. A core consumer's claim absent on a core of
+    /// more than one shard says only that a sibling is pending, and is
+    /// asked again at the next header.
     /// The first proof to answer a cell is the answer; a later one adds
     /// nothing. The hand-off is a continuation emitted here rather than
     /// a map the fence reads later, so an answer is never collected
@@ -711,11 +711,7 @@ impl Counterparts {
             if !Probed::Delivery.licenses(stated.anchor.ts, record.deadline(), inclusion) {
                 continue;
             }
-            record.answer = Some(if inclusion.is_present() {
-                Word::Present
-            } else {
-                Word::Absent
-            });
+            record.answer = Some(inclusion);
         }
     }
 
@@ -786,6 +782,16 @@ impl Counterparts {
                             preferred: None,
                             class: None,
                         }));
+                        // A claim cell is written by the consuming
+                        // execution and by nothing else, so its
+                        // presence is the consumer holding the
+                        // crossing. A committed cell present says only
+                        // that the core committed the transaction,
+                        // which settles nothing — its certificate
+                        // speaks to that, and is fetched above.
+                        if matches!(probed, Probed::Claim | Probed::Delivery) {
+                            self.ledger.record_claimed(tx_hash, shard);
+                        }
                     }
                     Inclusion::Absent => {
                         self.mirror.record(
@@ -799,38 +805,18 @@ impl Counterparts {
                         );
                     }
                 }
-                // A claim cell present is the settling word: that
-                // cell is written by the consuming execution and by
-                // nothing else, so its presence is the consumer
-                // holding the crossing. A committed cell present
-                // says only that the core committed the
-                // transaction, which settles no record — its
-                // certificate speaks to that, and is fetched above.
-                if inclusion.is_present() && matches!(probed, Probed::Claim | Probed::Delivery) {
-                    self.mirror.record(
-                        tx_hash,
-                        shard,
-                        Heard {
-                            question: Question::Cell(probed),
-                            word: Word::Present,
-                            at: claim.anchor.ts,
-                        },
-                    );
-                }
             }
         }
         actions
     }
 
-    /// Write what the block's abandoning records cover into the mirror
-    /// the gate and the fence read: neither asks a settled set about a
-    /// transaction the chain has established no counterpart can settle.
+    /// Write what the block's records cover into the mirror the gate and
+    /// the fence read: neither asks a settled set about a transaction
+    /// the chain has established no counterpart can settle.
     fn cover_recorded(&self, block: &Block) {
         for record in block.abandonment_records() {
-            if record.evidence().abandons() {
-                for tx_hash in record.tx_hashes() {
-                    self.mirror.cover(tx_hash);
-                }
+            for tx_hash in record.tx_hashes() {
+                self.mirror.cover(tx_hash);
             }
         }
     }
@@ -1010,16 +996,9 @@ impl Counterparts {
         // spanning two satisfies the fence's equality check for neither,
         // and the rest waits a block. Nothing is offered beside a
         // departure, which answers for everything the shard was party
-        // to. A presence is offered until the chain has it written down
-        // and no longer: the mirror lives to the entry, and the entry to
-        // the retirement, so a record offered past its own commit could
-        // reach a block after the evidence every voter checks it against
-        // has gone.
+        // to.
         let mut heard: HeardByQuestion = BTreeMap::new();
         for (tx_hash, shard, word) in self.mirror.all() {
-            if matches!(word.word, Word::Present) && !self.ledger.claim_unrecorded(tx_hash, shard) {
-                continue;
-            }
             let Some(figures) = self.ledger.unsettled_figures(tx_hash) else {
                 continue;
             };

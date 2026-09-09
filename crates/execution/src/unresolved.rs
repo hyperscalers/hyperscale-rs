@@ -611,12 +611,9 @@ const fn decided_by(evidence: CounterpartEvidence) -> Option<TransactionDecision
             (Question::Cell(Probed::Core | Probed::Claim), Word::Absent) => {
                 Some(TransactionDecision::Aborted)
             }
-            // A presence decides nothing about the transaction: it
-            // says the consumer holds the crossing, which retires the
-            // record and leaves the verdict to the core.
             (Question::Cell(Probed::Delivery), _)
-            | (Question::Verdict, Word::Absent | Word::Present)
-            | (Question::Cell(_), Word::Refused { .. } | Word::Present) => None,
+            | (Question::Verdict, Word::Absent)
+            | (Question::Cell(_), Word::Refused { .. }) => None,
         },
     }
 }
@@ -724,20 +721,17 @@ impl UnresolvedTxs {
             .is_some_and(|core| core.contains(&shard))
     }
 
-    /// Whether a consumer's claim of `tx_hash` still wants writing down:
-    /// the entry is a leg's, no record has named `shard` as having
-    /// claimed, and no tick has taken the entry's records. Past any of
-    /// those the record adds nothing, and a proposer that kept offering
-    /// one would carry it into a block its voters can no longer check,
-    /// once their mirrors go with the entry.
-    #[must_use]
-    pub fn claim_unrecorded(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.owed.get(&tx_hash).is_some_and(|owed| {
-            owed.part.is_leg()
-                && owed.covered.is_none()
-                && owed.taken.is_none()
-                && !owed.claimed_by.contains(&shard)
-        })
+    /// Record that a committed claim read `shard`'s claim cell for
+    /// `tx_hash` present: the consumer holds the crossing a leg here
+    /// issued. Once every consumer has, the retirement is licensed.
+    ///
+    /// Fed from the committed claim itself, which every replica folds at
+    /// the same block, so the retirements two replicas compose agree
+    /// without the reading being restated as a record.
+    pub fn record_claimed(&mut self, tx_hash: TxHash, shard: ShardId) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.claimed_by.insert(shard);
+        }
     }
 
     /// Whether `shard` consumes a crossing this shard issued for the
@@ -1108,16 +1102,6 @@ impl UnresolvedTxs {
         let mut reconstructed = 0usize;
         for verdict in verdicts {
             for entry in verdict.unsettled() {
-                // The settling arm: a consumer accepted, and the entry
-                // holds its records for the retirement rather than for a
-                // reclaim. A name this ledger does not hold is left
-                // alone — nothing here is owed for it.
-                if !verdict.evidence().abandons() {
-                    if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
-                        owed.claimed_by.insert(verdict.shard());
-                    }
-                    continue;
-                }
                 if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
                     owed.covered = Some((verdict.shard(), verdict.evidence()));
                     continue;
@@ -1626,16 +1610,6 @@ mod tests {
                 decision: TransactionDecision::Reject,
                 digest: Hash::from_bytes(b"digest"),
             },
-            at,
-        }
-    }
-
-    /// An acceptance at `at`.
-    /// The settling word: a consumer's claim cell read present.
-    fn claimed(at: WeightedTimestamp) -> Heard {
-        Heard {
-            question: Question::Cell(Probed::Claim),
-            word: Word::Present,
             at,
         }
     }
@@ -2831,14 +2805,7 @@ mod tests {
             "the shard holding the claim's prefix consumes what the leg issued",
         );
 
-        ledger.record_abandonment_records(
-            LOCAL,
-            &[AbandonmentRecord::heard(
-                SUCCESSOR,
-                claimed(ms(70_000)),
-                [names(&tx)],
-            )],
-        );
+        ledger.record_claimed(tx.hash(), SUCCESSOR);
         let retirable = ledger.retirable();
         assert_eq!(
             retirable.len(),
@@ -2848,13 +2815,13 @@ mod tests {
         assert_eq!(retirable[0].tx_hash, tx.hash());
     }
 
-    /// A committed `Claimed` record is what licenses retiring a leg's
-    /// records — never a clock, never a certificate — once every
-    /// consumer is on record; the retirement's own finalization
-    /// releases the entry, and a claimed entry is neither reclaimable
-    /// nor abandonable meanwhile.
+    /// A committed claim reading the consumer's cell present is what
+    /// licenses retiring a leg's records — never a clock, never a
+    /// certificate — once every consumer has claimed; the retirement's
+    /// own finalization releases the entry, and a claimed entry is
+    /// neither reclaimable nor abandonable meanwhile.
     #[test]
-    fn a_claimed_record_licenses_the_retirement_and_its_finalization_releases_the_entry() {
+    fn a_committed_claim_licenses_the_retirement_and_its_finalization_releases_the_entry() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(8, 60_000);
         commit(&mut ledger, &tx);
@@ -2869,14 +2836,7 @@ mod tests {
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
-        ledger.record_abandonment_records(
-            LOCAL,
-            &[AbandonmentRecord::heard(
-                PARTNER,
-                claimed(ms(70_000)),
-                [names(&tx)],
-            )],
-        );
+        ledger.record_claimed(tx.hash(), PARTNER);
         let retirable = ledger.retirable();
         assert_eq!(retirable.len(), 1, "every consumer claimed");
         assert_eq!(retirable[0].tx_hash, tx.hash());

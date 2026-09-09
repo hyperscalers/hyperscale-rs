@@ -1177,16 +1177,16 @@ mod tests {
 
         // One shard under two arms is two answers about two sets of
         // transactions, in arm order.
-        let claimed = Heard {
+        let absent = Heard {
             question: Question::Cell(Probed::Claim),
-            word: Word::Present,
+            word: Word::Absent,
             at: WeightedTimestamp::from_millis(9),
         };
         let two_arms = vec![
             verdict(left, &[1]),
             AbandonmentRecord::heard(
                 left,
-                claimed,
+                absent,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
         ];
@@ -1195,7 +1195,7 @@ mod tests {
         let arms_reversed = vec![
             AbandonmentRecord::heard(
                 left,
-                claimed,
+                absent,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
             verdict(left, &[1]),

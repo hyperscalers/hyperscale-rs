@@ -13,7 +13,7 @@
 //! written down as one [`Heard`]: the [`Question`] asked, the [`Word`]
 //! that answered it, and the moment it was taken at.
 //!
-//! Every word licenses something. A core's refusal ends the transaction
+//! Every word licenses an abort. A core's refusal ends the transaction
 //! outright. A core's committed cell absent past the deadline says the
 //! core never committed it, since before the deadline the core may still
 //! legitimately commit and past the cell's own sweep the cell is gone
@@ -21,10 +21,7 @@
 //! the delivery, on the same terms against its claim cell; and a
 //! one-shard core's consumer claim absent past the deadline says the
 //! core never took it, since a block carrying that core's success past
-//! the deadline is refused. Each of those licenses an abort. A
-//! consumer's acceptance says the opposite — it took what a leg here
-//! issued — and licenses the retirement of the record cell the issuer
-//! held for its claim, the family's one settling arm.
+//! the deadline is refused.
 //!
 //! So the answer is written down while it can still be read. A record
 //! names the transactions this chain still owes an outcome for, with the
@@ -35,7 +32,12 @@
 //!
 //! What is never recorded is a settlement. That a counterpart *did*
 //! settle a transaction changes nothing this shard can act on — the
-//! transaction stays owed and unabandonable either way.
+//! transaction stays owed and unabandonable either way. A consumer's
+//! claim cell read present is the one settling answer, and it needs no
+//! record: the reading is itself committed content, folded by every
+//! replica at the block that carries it, and what it licenses — the
+//! retirement of the record cell the issuer held for the claim — is
+//! composed from the ledger that fold writes.
 //!
 //! Each name carries the figures composing the abort takes: the deadline
 //! it opens at, the reservation it returns, and the charge it settles.
@@ -308,14 +310,15 @@ const _: () = assert!(Question::ALL.len() == Probed::ALL.len() + 1);
 ///
 /// A certificate answers a [`Question::Verdict`] with a refusal, named
 /// by its attested digest so a claim to it can be held to the copy a
-/// voter holds. A proof answers a [`Question::Cell`] either way: absent,
-/// and the crossing is the issuer's to take back; present, and the
-/// consumer has it.
+/// voter holds. A proof answers a [`Question::Cell`] with an absence,
+/// and the crossing is the issuer's to take back.
 ///
-/// A success is not among them. What a certificate says of one is that
-/// the counterpart's execution went through, which is the cue to ask
-/// whether it wrote the claim that success promises — see
-/// [`Spoken`](crate::Spoken).
+/// Neither a success nor a presence is among them. What a certificate
+/// says of a success is that the counterpart's execution went through,
+/// which is the cue to ask whether it wrote the claim that success
+/// promises — see [`Spoken`](crate::Spoken). What a proof says of a
+/// present cell is that the consumer holds the crossing, and that is
+/// folded off the committed claim itself rather than restated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Word {
     /// The counterpart refused the transaction: a rejection or an abort.
@@ -328,14 +331,6 @@ pub enum Word {
     },
     /// The probed cell was absent.
     Absent,
-    /// The probed cell was present.
-    ///
-    /// A claim cell is written by the consuming execution and by
-    /// nothing else, so its presence is the consumer holding the
-    /// crossing — which is what licenses the issuer to retire the
-    /// record it left. Unlike an absence it needs no window: a swept
-    /// cell reads absent, so presence is never a stale reading.
-    Present,
 }
 
 /// One thing a counterpart's chain said about one transaction, and when.
@@ -365,21 +360,9 @@ impl Heard {
                     TransactionDecision::Reject | TransactionDecision::Aborted
                 )
             }
-            (Question::Cell(_), Word::Absent | Word::Present) => true,
-            (Question::Verdict, Word::Absent | Word::Present)
-            | (Question::Cell(_), Word::Refused { .. }) => false,
+            (Question::Cell(_), Word::Absent) => true,
+            (Question::Verdict, Word::Absent) | (Question::Cell(_), Word::Refused { .. }) => false,
         }
-    }
-
-    /// Whether the word licenses a reclaim — the counterpart can never
-    /// settle — rather than a retirement, where it did.
-    ///
-    /// Total over what [`Self::is_well_formed`] admits: presence is the
-    /// one settling word, and every other answer a record may carry
-    /// leaves the crossing the issuer's.
-    #[must_use]
-    pub const fn abandons(&self) -> bool {
-        !matches!(self.word, Word::Present)
     }
 }
 
@@ -417,16 +400,6 @@ impl CounterpartEvidence {
         }
     }
 
-    /// Whether this arm licenses a reclaim — the counterpart can never
-    /// settle — rather than a retirement, where it did.
-    #[must_use]
-    pub const fn abandons(&self) -> bool {
-        match self {
-            Self::Departed { .. } => true,
-            Self::Heard(heard) => heard.abandons(),
-        }
-    }
-
     /// Whether the evidence is in a form a record may carry.
     #[must_use]
     pub const fn is_well_formed(&self) -> bool {
@@ -438,7 +411,7 @@ impl CounterpartEvidence {
 }
 
 /// One counterpart's remainder as this chain sees it: what it can never
-/// settle, or — under the one settling arm — what it has claimed.
+/// settle.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct AbandonmentRecord {
     /// The counterpart shard that can never settle these.
@@ -792,8 +765,6 @@ mod tests {
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Core), Word::Absent)),
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Delivery), Word::Absent)),
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Absent)),
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Delivery), Word::Present)),
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Present)),
         ];
         for arm in arms {
             assert_eq!(arm.moment(), wt());
@@ -802,7 +773,6 @@ mod tests {
         }
         let malformed = [
             heard(Question::Verdict, Word::Absent),
-            heard(Question::Verdict, Word::Present),
             heard(Question::Cell(Probed::Core), refused),
             heard(
                 Question::Verdict,
@@ -816,14 +786,5 @@ mod tests {
             assert!(!heard.is_well_formed(), "{heard:?}");
             assert!(!AbandonmentRecord::heard(ShardId::ROOT, heard, [tx(1)]).is_well_formed());
         }
-        assert!(
-            !CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Present))
-                .abandons()
-        );
-        assert!(
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Absent))
-                .abandons()
-        );
-        assert!(CounterpartEvidence::Departed { terminal_wt: wt() }.abandons());
     }
 }

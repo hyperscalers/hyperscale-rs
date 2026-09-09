@@ -57,12 +57,12 @@ use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
-    FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode, ProvenAnchors,
-    ProvenCells, Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites,
-    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict,
-    tick_leader, tick_leader_at,
+    FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, MerkleInclusionProof, Mode,
+    ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie,
+    StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, Window, derive_block_transactions,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -1118,13 +1118,13 @@ impl ExecutionCoordinator {
                     .then_some(Licence::OwnLeaf)
             } else {
                 // The cell is elsewhere, and what decides it is the
-                // proof a block carried: present, the consumer holds
+                // claim a block carried: present, the consumer holds
                 // the crossing and the record is deleted; absent past
                 // the lapse, nobody took it and the value goes back.
                 match record.answer {
-                    Some(Word::Present) => Some(Licence::Accepted),
-                    Some(Word::Absent) => Some(Licence::Unclaimed),
-                    Some(Word::Refused { .. }) | None => None,
+                    Some(Inclusion::Present(_)) => Some(Licence::Accepted),
+                    Some(Inclusion::Absent) => Some(Licence::Unclaimed),
+                    None => None,
                 }
             };
             let Some(licence) = licence else {
@@ -9006,10 +9006,11 @@ mod tests {
     /// A consumer's claim proved present is what licenses the
     /// retirement: the cell is written by the consuming execution and by
     /// nothing else, so its presence is the consumer holding the
-    /// crossing. The certificate is still fetched — a core's acceptance
-    /// decides the transaction — but it is not what the record stands on.
+    /// crossing. The committed claim is the whole of the evidence — it
+    /// reaches no mirror and no record — and the certificate is still
+    /// fetched, since a core's acceptance decides the transaction.
     #[test]
-    fn a_claim_proved_present_is_the_evidence_the_record_carries() {
+    fn a_claim_proved_present_licenses_the_retirement_off_the_claim_alone() {
         let schedule = two_shard_topology();
         let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
         let tx_hash = transaction.hash();
@@ -9053,31 +9054,46 @@ mod tests {
                 .is_none(),
             "the verdict is a separate question and nothing answered it"
         );
-        let present = Heard {
-            question: Question::Cell(Probed::Claim),
-            word: Word::Present,
-            at: probed_wt,
-        };
-        assert_eq!(
+        assert!(
             state
                 .counterparts
                 .mirror
-                .heard(tx_hash, PEER, Question::Cell(Probed::Claim)),
-            Some(present),
-            "the presence is mirrored as the settling word"
+                .heard(tx_hash, PEER, Question::Cell(Probed::Claim))
+                .is_none(),
+            "a presence is not a word the mirror holds"
         );
-        assert_eq!(
-            state.offers().abandonment_records,
-            vec![AbandonmentRecord::heard(PEER, present, [figures])],
-            "and offered as the record that retires the crossing"
+        assert!(
+            state.offers().abandonment_records.is_empty(),
+            "and no record restates it"
+        );
+        let request = folded
+            .iter()
+            .find_map(|action| match action {
+                Action::ExecuteTransactions { requests, .. } => {
+                    requests.iter().find(|request| request.tx_hash == tx_hash)
+                }
+                _ => None,
+            })
+            .expect("the same commit composes the retirement into its tick");
+        assert!(matches!(
+            request.runs,
+            Runs::Settle {
+                on: Licence::Accepted,
+                ..
+            }
+        ));
+        assert!(
+            state.counterparts.ledger.retirable().is_empty(),
+            "and the ledger has handed it to the tick"
         );
     }
 
     /// A consumer's acceptance opens the probe and nothing else. It
-    /// reaches no mirror and no record: what the record carries is the
-    /// presence its probe reads, and once that record commits the next
-    /// commit composes the retirement into its tick — a dispatched
-    /// member running no node, awaiting nobody, charged nothing.
+    /// reaches no mirror and no record: what licenses the retirement is
+    /// the presence its probe reads, and once the claim carrying it
+    /// commits the next commit composes the retirement into its tick —
+    /// a dispatched member running no node, awaiting nobody, charged
+    /// nothing.
     #[test]
     fn a_consumers_acceptance_cues_the_probe_and_the_presence_retires() {
         let schedule = two_shard_topology();
@@ -9117,16 +9133,9 @@ mod tests {
             "the retirement waits on the presence its probe reads"
         );
 
-        // The probe answers present, which is what the record carries.
-        let word = Heard {
-            question: Question::Cell(Probed::Claim),
-            word: Word::Present,
-            at: probed_wt,
-        };
-        state
-            .counterparts
-            .ledger
-            .record_abandonment_records(HOME, &[AbandonmentRecord::heard(PEER, word, [figures])]);
+        // The probe answers present, which the committed claim writes
+        // to the ledger.
+        state.counterparts.ledger.record_claimed(tx_hash, PEER);
         let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
         let request = actions
             .iter()
