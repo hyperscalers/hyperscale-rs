@@ -24,10 +24,9 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization, Inclusion,
-    MAX_VALIDITY_RANGE, Probed, Question, Role, RoutePrefix, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window, Word,
+    AbandonmentRecord, Anchor, BlockHeight, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
+    Probed, Role, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
 
 /// Where a question this shard put to a counterpart about one cell
@@ -120,10 +119,8 @@ struct Owed {
     /// reclaim or a retirement — so the finalization naming the hash
     /// next is that member's. Meaningless off a leg entry.
     taken: Option<Licence>,
-    /// The counterpart a committed record says can never settle this
-    /// transaction, and what it established — a departure, a refusal,
-    /// an absence — which is what the reclaim it licenses says the
-    /// transaction's fate was.
+    /// The departed counterpart a committed record says left this
+    /// transaction unsettled.
     ///
     /// The evidence that nothing can settle it, in the one form that
     /// outlives the settled set it was read from. Where the deadline
@@ -135,7 +132,7 @@ struct Owed {
     /// abandonable from the moment the record commits, so what it waits on
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
-    covered: Option<(ShardId, CounterpartEvidence)>,
+    departed_by: Option<ShardId>,
     /// Where a consumer's certificate spoke a claiming success for this
     /// transaction, if one has.
     ///
@@ -187,9 +184,41 @@ impl Asked {
             key == claim && matches!(probe.standing, Standing::Closed(Inclusion::Present(_)))
         })
     }
+
+    /// The questions the chain read absent, each an answer that the
+    /// counterpart asked can never settle the transaction.
+    fn absences(&self) -> impl Iterator<Item = Probed> + '_ {
+        self.cells.values().filter_map(|probe| {
+            matches!(probe.standing, Standing::Closed(Inclusion::Absent)).then_some(probe.probed)
+        })
+    }
 }
 
 impl Owed {
+    /// Whether the chain has established that no counterpart can settle
+    /// the transaction: a departed shard's record names it, or a cell a
+    /// counterpart would have written was read absent inside its
+    /// window. Either licenses the abandonment or the reclaim, and puts
+    /// every question the entry asks to rest.
+    fn covered(&self) -> bool {
+        self.departed_by.is_some() || self.asked.absences().next().is_some()
+    }
+
+    /// What the evidence covering the entry established of the
+    /// transaction, where it established a verdict at all: a departure,
+    /// a core's committed cell absent or a one-shard core's claim absent
+    /// says the core never took it, which aborts the transaction; a
+    /// delivery's claim absent says only that the delivery lapsed, and
+    /// the core decided.
+    fn abandoned_verdict(&self) -> Option<TransactionDecision> {
+        (self.departed_by.is_some()
+            || self
+                .asked
+                .absences()
+                .any(|probed| matches!(probed, Probed::Core | Probed::Claim)))
+        .then_some(TransactionDecision::Aborted)
+    }
+
     /// The moment the entry stops being settleable and becomes the
     /// shard's to abandon: the transaction's deadline, or for a delivery
     /// the close of its window, past which the crossing it would claim
@@ -273,10 +302,7 @@ pub struct Pruned {
 ///
 /// - **What it keeps.** A leg and a core issuer hold the body and the
 ///   classification a reclaim is composed from. A whole shape and a
-///   delivery hold nothing, and neither does a leg rebuilt from a record
-///   on a replica whose replay never reached the transaction's own block
-///   — held as a leg is, so it waits out its horizon rather than
-///   abandoning what the record licenses a reclaim of.
+///   delivery hold nothing.
 /// - **Whether it is resolved.** A core issuer that accepted has
 ///   crossings out its deliveries still owe a claim for, so its own
 ///   verdict ends the transaction while the entry stays on for the
@@ -337,18 +363,8 @@ impl Part {
         }
     }
 
-    /// A leg entry rebuilt from a committed record naming it, with no
-    /// body to reclaim with.
-    pub(crate) const fn rebuilt() -> Self {
-        Self {
-            role: Role::Leg,
-            kept: None,
-            resolved: false,
-        }
-    }
-
     /// Whether the entry bears no verdict of its own and is held for a
-    /// reclaim: a leg's, a resolved issuer's, or a rebuilt leg's.
+    /// reclaim: a leg's, or a resolved issuer's.
     const fn is_leg(&self) -> bool {
         matches!(self.role, Role::Leg) || self.is_remainder()
     }
@@ -587,11 +603,10 @@ enum Meaning {
     /// A delivery that succeeded claimed what an accepted core issued,
     /// which is the verdict.
     Delivered,
-    /// The reclaim of what a leg issued, reporting what its record
-    /// established of the transaction — a core's refusal is the
-    /// transaction's verdict; a departure, or a core that never took
-    /// it, aborts it; a delivery that lapsed says nothing of the
-    /// transaction, which the core decided.
+    /// The reclaim of what a leg issued, reporting what the evidence
+    /// covering it established of the transaction — a departure, or a
+    /// core that never took it, aborts it; a delivery that lapsed says
+    /// nothing of the transaction, which the core decided.
     Reclaimed(Option<TransactionDecision>),
     /// This shard's verdict, or a share of it.
     Verdict(TransactionDecision),
@@ -613,26 +628,9 @@ fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -
             }
         }
         Some(owed) if accepted && owed.part.is_leg() => {
-            Meaning::Reclaimed(owed.covered.and_then(|(_, evidence)| decided_by(evidence)))
+            Meaning::Reclaimed(owed.abandoned_verdict())
         }
         _ => Meaning::Verdict(decision),
-    }
-}
-
-/// What a record's evidence established of the transaction it named,
-/// where it established a verdict at all.
-const fn decided_by(evidence: CounterpartEvidence) -> Option<TransactionDecision> {
-    match evidence {
-        CounterpartEvidence::Departed { .. } => Some(TransactionDecision::Aborted),
-        CounterpartEvidence::Heard(heard) => match (heard.question, heard.word) {
-            (Question::Verdict, Word::Refused { .. }) => Some(TransactionDecision::Reject),
-            (Question::Cell(Probed::Core | Probed::Claim), Word::Absent) => {
-                Some(TransactionDecision::Aborted)
-            }
-            (Question::Cell(Probed::Delivery), _)
-            | (Question::Verdict, Word::Absent)
-            | (Question::Cell(_), Word::Refused { .. }) => None,
-        },
     }
 }
 
@@ -707,11 +705,22 @@ impl UnresolvedTxs {
                 charged: false,
                 part: Part::of(self.local, tx, classified),
                 taken: None,
-                covered: None,
+                departed_by: None,
                 cued: None,
                 asked: Asked::default(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
+        }
+    }
+
+    /// What the chain read of `key` on `shard` for `tx_hash`, once it
+    /// has read it.
+    #[cfg(test)]
+    pub fn reading(&self, tx_hash: TxHash, shard: ShardId, key: SubstateKey) -> Option<Inclusion> {
+        let probe = self.owed.get(&tx_hash)?.asked.cells.get(&(shard, key))?;
+        match probe.standing {
+            Standing::Closed(inclusion) => Some(inclusion),
+            _ => None,
         }
     }
 
@@ -732,17 +741,6 @@ impl UnresolvedTxs {
             .get(&tx_hash)
             .and_then(|owed| owed.part.kept())
             .map(Kept::core)
-    }
-
-    /// The figures a record naming a leg entry restates, for one no
-    /// record covers yet. `None` for anything else: a record is composed
-    /// once per entry.
-    #[must_use]
-    pub fn unsettled_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
-        self.owed
-            .get(&tx_hash)
-            .filter(|owed| owed.part.kept().is_some() && owed.covered.is_none())
-            .map(|owed| owed.figures.clone())
     }
 
     /// Whether `shard` is one of the transaction's core — whose refusal
@@ -918,7 +916,7 @@ impl UnresolvedTxs {
     }
 
     /// The leg entries whose counterparts may now be asked whether they
-    /// took the transaction: past the deadline and covered by no record
+    /// took the transaction: past the deadline and covered by nothing
     /// yet.
     ///
     /// Two things open a probe, because the two words answer different
@@ -950,15 +948,15 @@ impl UnresolvedTxs {
         }
     }
 
-    /// Every leg entry no record has answered for, with the counterpart
+    /// Every leg entry nothing has answered for, with the counterpart
     /// cells its questions are asked of, whatever the clock: what a
-    /// proof the chain committed is read against, since the proof's
+    /// claim the chain committed is read against, since the claim's
     /// own anchor says whether the window was open.
     #[must_use]
     pub fn cells(&self) -> Vec<Probeable> {
         self.owed
             .iter()
-            .filter(|(_, owed)| owed.covered.is_none())
+            .filter(|(_, owed)| !owed.covered())
             .filter_map(|(tx_hash, owed)| {
                 let kept = owed.part.kept()?;
                 // What an entry asks about is what it waits on. A leg
@@ -994,11 +992,9 @@ impl UnresolvedTxs {
     /// it keeps.
     ///
     /// The precondition the two settlements below share, so what each of
-    /// them adds is its own licence and nothing else: a reclaim needs a
-    /// record covering the entry, a retirement needs every claim
-    /// answered and no such record. An entry keeping nothing — a leg
-    /// rebuilt from a record, with no body to settle from — is not
-    /// either shard's to compose.
+    /// them adds is its own licence and nothing else: a reclaim needs the
+    /// entry covered, a retirement needs every claim read present and
+    /// nothing covering it.
     fn untaken_legs(&self) -> impl Iterator<Item = (TxHash, &Owed, &Kept)> {
         self.owed.iter().filter_map(|(tx_hash, owed)| {
             let kept = owed.part.kept()?;
@@ -1006,14 +1002,16 @@ impl UnresolvedTxs {
         })
     }
 
-    /// The leg entries a committed record has licensed a reclaim of and
+    /// The leg entries committed content has licensed a reclaim of and
     /// no tick has taken yet, each with the body the reclaim derives
-    /// from.
+    /// from: a departed counterpart's record names the transaction, or a
+    /// claim read a cell a counterpart would have written absent inside
+    /// its window.
     ///
     /// Read off committed content alone, like [`Self::past_deadline`],
     /// so every replica at the same frontier composes the same reclaims.
-    /// Never a clock reading: a record is the only thing that puts an
-    /// entry here, and a record carries evidence.
+    /// Never a clock reading: a record or a claim is the only thing that
+    /// puts an entry here, and both carry evidence.
     ///
     /// Each carries whether a committed finalization of this shard's
     /// settled the price — a leg that ran settled it inside its own
@@ -1022,7 +1020,7 @@ impl UnresolvedTxs {
     #[must_use]
     pub fn reclaimable(&self) -> Vec<Settleable> {
         self.untaken_legs()
-            .filter(|(_, owed, _)| owed.covered.is_some())
+            .filter(|(_, owed, _)| owed.covered())
             .map(|(tx_hash, owed, kept)| Settleable {
                 tx_hash,
                 body: Arc::clone(&kept.body),
@@ -1055,7 +1053,7 @@ impl UnresolvedTxs {
     #[must_use]
     pub fn retirable(&self) -> Vec<Settleable> {
         self.untaken_legs()
-            .filter(|(_, owed, _)| owed.covered.is_none())
+            .filter(|(_, owed, _)| !owed.covered())
             .filter_map(|(tx_hash, owed, kept)| {
                 let claims: Vec<SubstateKey> = kept
                     .every_claim(self.local)
@@ -1118,10 +1116,8 @@ impl UnresolvedTxs {
     /// sign the tick they compose.
     ///
     /// A reconstructed entry is `certified`, because a record names
-    /// nothing else, and reaches no prefixes: the questions that read them
-    /// — who else is party, whether anyone can still settle — are the ones
-    /// a covered entry is never asked, since the record has already
-    /// answered them.
+    /// nothing else, and runs whole: it holds no body to reclaim with,
+    /// and what a record licenses on a name it never held is the abort.
     ///
     /// Returns how many it reconstructed, which is how far short this
     /// replica's replay window fell — or how long after the block it was
@@ -1134,7 +1130,7 @@ impl UnresolvedTxs {
         for verdict in verdicts {
             for entry in verdict.unsettled() {
                 if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
-                    owed.covered = Some((verdict.shard(), verdict.evidence()));
+                    owed.departed_by = Some(verdict.shard());
                     continue;
                 }
                 reconstructed = reconstructed.saturating_add(1);
@@ -1144,20 +1140,9 @@ impl UnresolvedTxs {
                         figures: entry.clone(),
                         certified: true,
                         charged: false,
-                        // A leg entry lives inside the replay window —
-                        // its horizon is the transaction's own — so a
-                        // replay registers and marks it before any record
-                        // naming it lands. A replica that still meets one
-                        // first reads the part off the arm: only a leg is
-                        // ever refused or unclaimed.
-                        part: if matches!(verdict.evidence(), CounterpartEvidence::Departed { .. })
-                        {
-                            Part::whole()
-                        } else {
-                            Part::rebuilt()
-                        },
+                        part: Part::whole(),
                         taken: None,
-                        covered: Some((verdict.shard(), verdict.evidence())),
+                        departed_by: Some(verdict.shard()),
                         cued: None,
                         asked: Asked::default(),
                     },
@@ -1186,7 +1171,7 @@ impl UnresolvedTxs {
             .filter(|(_, owed)| {
                 owed.certified
                     && !owed.part.is_remainder()
-                    && owed.covered.is_none()
+                    && !owed.covered()
                     && self.party_to_entry(owed, shard, cut)
             })
             .map(|(_, owed)| owed.figures.clone())
@@ -1217,14 +1202,12 @@ impl UnresolvedTxs {
             .is_some_and(|owed| owed.part.is_delivery())
     }
 
-    /// Whether a committed record has established that `tx_hash` can
+    /// Whether committed content has established that `tx_hash` can
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.
     #[must_use]
-    pub fn is_unsettled_by_departed(&self, tx_hash: TxHash) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.covered.is_some())
+    pub fn is_unsettleable(&self, tx_hash: TxHash) -> bool {
+        self.owed.get(&tx_hash).is_some_and(Owed::covered)
     }
 
     /// Record where a departed participant's chain ended, and when what it
@@ -1470,7 +1453,7 @@ impl UnresolvedTxs {
             .filter(|(_, owed)| !owed.part.is_leg())
             .filter(|(_, owed)| {
                 let window = owed.abandon_window();
-                now >= window.start && (owed.covered.is_some() || now < window.end)
+                now >= window.start && (owed.covered() || now < window.end)
             })
             .map(|(_, owed)| owed.figures.clone())
             .collect()
@@ -1500,7 +1483,10 @@ impl UnresolvedTxs {
     /// the same window the record was composed in, it is the one an entry
     /// reconstructed from a record has, and it is finite where a live
     /// counterpart's is not — which is what lets a replay floor reach
-    /// every record still owed a verdict.
+    /// every record still owed a verdict. One a committed claim decided —
+    /// a core member whose sibling's cell was read absent — waits on the
+    /// same block, and lives to the horizon a leg has, past which nothing
+    /// can be composed for the transaction at all.
     ///
     /// A leg entry has a clock of its own, and it is the transaction's:
     /// `deadline + 2 * MAX_VALIDITY_RANGE`, which is the validity end plus
@@ -1532,10 +1518,10 @@ impl UnresolvedTxs {
                     // past it neither the reclaim nor the retirement can
                     // be composed, whatever evidence lands. Short of it
                     // only the finalization that decides it ends it.
-                    if owed.part.is_leg() {
+                    if owed.part.is_leg() || owed.asked.absences().next().is_some() {
                         return Window::LegEntry.of(owed.figures.deadline).end > now;
                     }
-                    if let Some((shard, _)) = owed.covered {
+                    if let Some(shard) = owed.departed_by {
                         if self.departed.get(&shard).is_some_and(|departure| {
                             departure.readable_until.is_none_or(|until| now <= until)
                         }) {
@@ -1587,7 +1573,7 @@ impl UnresolvedTxs {
         let local = self.local;
         self.departed.retain(|shard, departure| {
             owed.values().any(|entry| {
-                entry.covered.is_some_and(|(covered, _)| covered == *shard)
+                entry.departed_by == Some(*shard)
                     || (departure.cut > entry.figures.first_commit()
                         && entry.figures.reach.iter().any(|route| {
                             !ShardTrie::shard_owns_route(local, *route)
@@ -1617,33 +1603,11 @@ mod tests {
         test_prefix, test_principal,
     };
     use hyperscale_types::{
-        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard,
-        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified,
-        WeightedTimestamp,
+        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
+        MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
-
-    /// `probed` proved absent at `at`.
-    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
-        Heard {
-            question: Question::Cell(probed),
-            word: Word::Absent,
-            at,
-        }
-    }
-
-    /// A rejection at `at`.
-    fn refused(at: WeightedTimestamp) -> Heard {
-        Heard {
-            question: Question::Verdict,
-            word: Word::Refused {
-                decision: TransactionDecision::Reject,
-                digest: Hash::from_bytes(b"digest"),
-            },
-            at,
-        }
-    }
 
     /// This shard owns the prefixes whose leading bit is zero, so an
     /// address is remote or local by its top byte and nothing else.
@@ -1714,6 +1678,29 @@ mod tests {
         ];
         let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
+        assert!(classified.decomposed());
+        classified
+    }
+
+    /// The depth-2 shard beside `LOCAL` in a core of two, holding the
+    /// left half of `PARTNER`'s keyspace.
+    const SIBLING: ShardId = ShardId::leaf(2, 2);
+
+    /// A shape frozen divided with `LOCAL` in a core of two shards, fed
+    /// by an inbound leg on the other half of `PARTNER`'s keyspace.
+    fn two_shard_core() -> Classified {
+        use hyperscale_types::ShardTrie;
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(3, LegRole::Inbound, &[]),
+            leg(0, LegRole::Core, &[(0, 0)]),
+            leg(2, LegRole::Core, &[(1, 0)]),
+        ];
+        let trie = ShardTrie::from_leaves([LOCAL, SIBLING, ShardId::leaf(2, 3)]);
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([LOCAL, SIBLING]));
         assert!(classified.decomposed());
         classified
     }
@@ -2052,7 +2039,7 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
         assert_eq!(
-            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            ledger.record_abandonment_records(&[AbandonmentRecord::new(
                 PARTNER,
                 cut,
                 [names(&tx)]
@@ -2085,7 +2072,7 @@ mod tests {
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
 
         assert_eq!(
-            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            ledger.record_abandonment_records(&[AbandonmentRecord::new(
                 PARTNER,
                 cut,
                 [names(&one), names(&two)],
@@ -2094,7 +2081,7 @@ mod tests {
             "neither was held, so both are rebuilt",
         );
         assert_eq!(ledger.len(), 2);
-        assert!(ledger.is_unsettled_by_departed(one.hash()));
+        assert!(ledger.is_unsettleable(one.hash()));
 
         // And each is abandonable on the record's own terms, which is the
         // whole point of it carrying them.
@@ -2118,11 +2105,7 @@ mod tests {
         let tx = tx(21, 60_000);
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            cut,
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
 
         assert!(
             ledger.prune(cut).unanswerable.is_empty(),
@@ -2159,7 +2142,7 @@ mod tests {
             "on its own clock the shard has stopped speaking for it",
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(500_000),
             [names(&tx)],
@@ -2169,7 +2152,7 @@ mod tests {
             vec![abandons(&tx)],
             "the record says nothing can settle it, so the shard may",
         );
-        assert!(ledger.is_unsettled_by_departed(tx.hash()));
+        assert!(ledger.is_unsettleable(tx.hash()));
     }
 
     /// A record still opens nothing before the transaction's own
@@ -2181,7 +2164,7 @@ mod tests {
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
         ledger.certify(tx.hash());
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(500_000),
             [names(&tx)],
@@ -2342,11 +2325,7 @@ mod tests {
         ledger.certify(tx.hash());
         let cut = ms(100_000);
         ledger.record_terminal(PARTNER, cut, None);
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            cut,
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
         assert_eq!(ledger.unstamped_departures(), vec![PARTNER]);
 
         let far = expiry(cut).plus(EPOCH_DURATION * 100);
@@ -2456,11 +2435,8 @@ mod tests {
             "at the deadline the leg is probeable and the whole entry is not"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Core, deadline),
-            [names(&leg)],
-        )]);
+        let (_, claim) = core_claim(&classified());
+        ledger.close_question(leg.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
         assert!(
             ledger.probeable(deadline).is_empty(),
             "a covered entry is asked about once"
@@ -2495,11 +2471,14 @@ mod tests {
                 cued_at: None,
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
+        let (_, claim) = delivered_claim(&delivering());
+        ledger.close_question(
+            leg.hash(),
             PARTNER,
-            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
-            [names(&leg)],
-        )]);
+            claim,
+            Probed::Delivery,
+            Inclusion::Absent,
+        );
         assert!(ledger.probeable(deadline).is_empty(), "covered once");
         assert_eq!(
             ledger.reclaimable().len(),
@@ -2511,8 +2490,8 @@ mod tests {
     /// An issuer in the core is released by its own verdict like any
     /// entry — unless it accepted with deliveries owed, when it stays on
     /// as a remainder: never abandoned, named by no departure, probed
-    /// past the deadline for its claims, reclaimed on a lapse record,
-    /// and released by the reclaim's finalization.
+    /// past the deadline for its claims, reclaimed on a claim read
+    /// absent past the lapse, and released by the reclaim's finalization.
     #[test]
     fn an_issuer_that_accepted_stays_on_as_a_remainder_for_its_deliveries() {
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2547,11 +2526,14 @@ mod tests {
                 cued_at: None,
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
+        let (_, claim) = delivered_claim(&issuing());
+        ledger.close_question(
+            tx.hash(),
             PARTNER,
-            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
-            [names(&tx)],
-        )]);
+            claim,
+            Probed::Delivery,
+            Inclusion::Absent,
+        );
         let reclaims = ledger.reclaimable();
         assert_eq!(reclaims.len(), 1);
         assert!(
@@ -2587,7 +2569,7 @@ mod tests {
             "a leg is never abandoned"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
             [names(&tx)],
@@ -2610,7 +2592,7 @@ mod tests {
         let tx = tx(7, 60_000);
         commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
             [names(&tx)],
@@ -2673,36 +2655,14 @@ mod tests {
             make_finalization(BlockHeight::new(9), leg.hash(), TransactionDecision::Accept);
         assert!(
             fw(&ledger, reclaim.clone()).is_empty(),
-            "a deciding success on a leg entry no record covers says nothing"
+            "a deciding success on a leg entry nothing covers says nothing"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            refused(ms(70_000)),
-            [names(&leg)],
-        )]);
+        let (_, claim) = core_claim(&classified());
+        ledger.close_question(leg.hash(), PARTNER, claim, Probed::Claim, Inclusion::Absent);
         assert_eq!(
-            fw(&ledger, reclaim.clone()),
-            decided(&leg, TransactionDecision::Reject),
-            "the reclaim of a refused leg reports the refusal"
-        );
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&leg)],
-        )]);
-        assert_eq!(
-            fw(&ledger, reclaim.clone()),
+            fw(&ledger, reclaim),
             decided(&leg, TransactionDecision::Aborted),
             "the reclaim of a leg its core never took reports an abort"
-        );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Delivery, ms(200_000)),
-            [names(&leg)],
-        )]);
-        assert!(
-            fw(&ledger, reclaim).is_empty(),
-            "a lapse reclaim says nothing: the core accepted, and its certificates say so"
         );
 
         let delivery = tx(3, 60_000);
@@ -2743,7 +2703,7 @@ mod tests {
         // owner and not the shard the prefix routes to now — which is
         // what makes the dating decide something.
         let trie = ShardTrie::uniform(2);
-        let record = AbandonmentRecord::departed(PARTNER, ms(70_000), [names(&tx)]);
+        let record = AbandonmentRecord::new(PARTNER, ms(70_000), [names(&tx)]);
 
         // The replica that was seated when the block committed.
         let mut seated = UnresolvedTxs::new(LOCAL);
@@ -2885,7 +2845,7 @@ mod tests {
             "and the body goes with it"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
             [names(&tx)],
@@ -2910,7 +2870,7 @@ mod tests {
             "nothing is reclaimed on a clock"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
             [names(&tx)],
@@ -2940,31 +2900,88 @@ mod tests {
         );
     }
 
-    /// A refusal names only legs, so a replica meeting one for a
-    /// transaction it does not hold rebuilds a leg entry: never
-    /// abandoned, and — with no body to derive the reclaim from — never
-    /// reclaimed here either. It waits out its horizon.
+    /// A reclaim reports what covered the leg: a departed core aborts
+    /// the transaction, and a lapsed delivery says nothing of it, since
+    /// the core accepted and its certificates say so.
     #[test]
-    fn a_refusal_record_naming_an_unheld_transaction_rebuilds_a_leg_entry() {
+    fn a_reclaim_reports_what_covered_the_leg() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
-        let tx = tx(7, 60_000);
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
+        let reclaim_of = |ledger: &UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>| {
+            ledger.resolutions_of(&[Arc::new(Verifiable::from(make_finalization(
+                BlockHeight::new(9),
+                tx.hash(),
+                TransactionDecision::Accept,
+            )))])
+        };
+
+        let departed = tx(4, 60_000);
+        commit_as(&mut ledger, &departed, &classified());
+        ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
-            refused(ms(1_000)),
-            [names(&tx)],
+            ms(1_000),
+            [names(&departed)],
         )]);
-        assert_eq!(ledger.len(), 1);
-        let past = ms(60_000)
-            .plus(MAX_FINALIZATION_DELAY)
-            .plus(Duration::from_secs(1));
-        assert!(ledger.past_deadline(past).is_empty(), "never abandoned");
-        assert!(
-            ledger.reclaimable().is_empty(),
-            "and nothing to reclaim with"
+        assert_eq!(
+            reclaim_of(&ledger, &departed),
+            vec![(
+                departed.hash(),
+                TxResolution::Decided(TransactionDecision::Aborted)
+            )],
+            "the reclaim of a leg whose core left reports an abort"
         );
+
+        let lapsed = tx(5, 60_000);
+        commit_as(&mut ledger, &lapsed, &delivering());
+        let (_, claim) = delivered_claim(&delivering());
+        ledger.close_question(
+            lapsed.hash(),
+            PARTNER,
+            claim,
+            Probed::Delivery,
+            Inclusion::Absent,
+        );
+        assert!(
+            reclaim_of(&ledger, &lapsed).is_empty(),
+            "a lapse reclaim says nothing: the core accepted, and its certificates say so"
+        );
+    }
+
+    /// A core member whose sibling's committed cell was read absent is
+    /// covered by the claim alone: abandonable at once, and held until
+    /// the horizon past which nothing can be composed — not dropped as a
+    /// strand at the next commit, since the sibling never departed.
+    #[test]
+    fn a_core_member_covered_by_a_siblings_absence_lives_to_its_horizon() {
+        use hyperscale_storage::committed_tx_cell_key;
+
+        let mut ledger = UnresolvedTxs::new(LOCAL);
+        let tx = tx(8, 60_000);
+        commit_as(&mut ledger, &tx, &two_shard_core());
+        ledger.certify(tx.hash());
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        let past = deadline.plus(MAX_VALIDITY_RANGE);
+        assert!(!ledger.is_unsettleable(tx.hash()));
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "past the abandon window the shard no longer speaks for it on its own clock"
+        );
+
+        let sibling = committed_tx_cell_key(SIBLING, tx.hash(), ms(60_000));
+        ledger.close_question(tx.hash(), SIBLING, sibling, Probed::Core, Inclusion::Absent);
+        assert!(ledger.is_unsettleable(tx.hash()));
+        assert_eq!(
+            ledger.past_deadline(past),
+            vec![abandons(&tx)],
+            "the sibling's silence says nothing can settle it, so the shard may"
+        );
+        assert!(
+            ledger.prune(past).unanswerable.is_empty(),
+            "a live sibling's silence is no strand"
+        );
+        assert_eq!(ledger.len(), 1, "and the entry stands for the abort");
         let horizon = Window::LegEntry.of(Deadline::of(ms(60_000))).end;
-        assert!(ledger.prune(horizon).unanswerable.is_empty());
-        assert_eq!(ledger.len(), 0, "gone at its horizon");
+        ledger.prune(horizon);
+        assert_eq!(ledger.len(), 0, "gone where nothing can be composed for it");
     }
 
     /// A leg entry dies where its evidence does: at its horizon the claim
@@ -2981,7 +2998,7 @@ mod tests {
             commit_as(&mut ledger, &tx, &classified());
             ledger.certify(tx.hash());
             if covered {
-                ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+                ledger.record_abandonment_records(&[AbandonmentRecord::new(
                     PARTNER,
                     ms(1_000),
                     [names(&tx)],

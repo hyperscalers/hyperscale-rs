@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
-    ExecutionOutcome, Finalization, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    ExecutionOutcome, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
     StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
@@ -118,7 +118,7 @@ pub enum Block {
         provisions: Arc<Vec<Arc<Verifiable<Provisions>>>>,
         /// What departed shards left unresolved of this chain's business.
         /// Committed via the header's `abandonment_root`.
-        #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+        #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
         /// What this block commits about counterparts' chains: cells
         /// their commit-proven state holds, proved against their
@@ -157,7 +157,7 @@ pub enum Block {
         /// Retained through sealing, unlike provisions: a verdict is
         /// composed on this evidence however long after the terminal it
         /// came from, which is the whole reason it is written down.
-        #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+        #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
         /// Proofs of counterparts' cells, retained through sealing like
         /// the records: a replay of any depth re-folds its answers off

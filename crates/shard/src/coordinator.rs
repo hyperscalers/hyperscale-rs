@@ -6692,13 +6692,12 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts,
-        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, LeafRoot,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed,
-        Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, Word, settled_set_verdict, test_utils,
+        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, LeafRoot, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledSetVerdict, SettledTxSet,
+        SettledTxsRoot, ShardAnchor, ShardId, Signer, SignerBitfield, StateClaimsRoot,
+        TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
+        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -11358,7 +11357,7 @@ mod tests {
     /// A record claiming `shard` left `tx` unsettled when it terminated at
     /// `terminal_wt`, restating the figures [`figures_of`] fixes.
     fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> AbandonmentRecord {
-        AbandonmentRecord::departed(
+        AbandonmentRecord::new(
             shard,
             WeightedTimestamp::from_millis(terminal_wt),
             [figures_of(tx)],
@@ -11623,231 +11622,6 @@ mod tests {
         assert!(
             coord.verification.is_root_verified(block_hash, kind),
             "an exact restatement verifies the root"
-        );
-    }
-
-    /// `probed` proved absent at `at`.
-    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
-        Heard {
-            question: Question::Cell(probed),
-            word: Word::Absent,
-            at,
-        }
-    }
-
-    /// A verdict at `at`, which a record may only ever carry as a
-    /// refusal.
-    fn verdict(at: WeightedTimestamp) -> Heard {
-        Heard {
-            question: Question::Verdict,
-            word: Word::Refused {
-                decision: TransactionDecision::Reject,
-                digest: Hash::from_bytes(b"digest"),
-            },
-            at,
-        }
-    }
-
-    /// A block carrying one record of what `ROOT` said, naming `tx`.
-    fn record_of(heard: Heard) -> Block {
-        block_with_records(
-            AFTER_CUT_MS,
-            vec![AbandonmentRecord::heard(
-                ShardId::ROOT,
-                heard,
-                [figures_of(b"tx")],
-            )],
-        )
-    }
-
-    /// A refusal record is checked against this validator's own mirror
-    /// of the core's certificate, and against nothing else: a matching
-    /// mirror passes it outside any terminal window; a mirror at another
-    /// anchor, of another decision or of another certificate refuses it;
-    /// and no mirror defers it.
-    #[test]
-    fn a_refusal_record_stands_or_falls_on_the_mirror() {
-        let refused_wt = WeightedTimestamp::from_millis(5_000);
-        let block = record_of(verdict(refused_wt));
-        let tx_hash = figures_of(b"tx").tx_hash;
-
-        let matching = fence_coordinator();
-        matching
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, verdict(refused_wt));
-        assert!(
-            matching.vote_fence().records(&block).is_ok(),
-            "a matching mirror passes it"
-        );
-
-        let mut aborted = verdict(refused_wt);
-        aborted.word = Word::Refused {
-            decision: TransactionDecision::Aborted,
-            digest: Hash::from_bytes(b"digest"),
-        };
-        let mut other_bytes = verdict(refused_wt);
-        other_bytes.word = Word::Refused {
-            decision: TransactionDecision::Reject,
-            digest: Hash::from_bytes(b"other"),
-        };
-        for (held, why) in [
-            (
-                verdict(WeightedTimestamp::from_millis(6_000)),
-                "another anchor",
-            ),
-            (aborted, "another decision"),
-            (other_bytes, "another certificate"),
-        ] {
-            let mismatched = fence_coordinator();
-            mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
-            assert!(
-                mismatched.vote_fence().records(&block).is_err(),
-                "a mirror of {why} refuses it"
-            );
-        }
-
-        let absent = fence_coordinator();
-        assert!(
-            absent.vote_fence().records(&block).is_err(),
-            "no mirror defers it"
-        );
-    }
-
-    /// An absence record is checked against the proof this validator
-    /// folded off the chain: the record's anchor has to sit inside the
-    /// name's absence window and be the one folded. A proof at the
-    /// deadline passes a record at the deadline, a record at an anchor
-    /// this validator has not folded defers, a record probed short of
-    /// the deadline is refused whatever the mirror holds, and so is one
-    /// probed where the cell may be swept.
-    #[test]
-    fn an_absence_record_stands_or_falls_on_the_mirror() {
-        let deadline = figures_of(b"tx").deadline.at();
-        let tx_hash = figures_of(b"tx").tx_hash;
-        let record = |at| record_of(absent(Probed::Core, at));
-
-        let matching = fence_coordinator();
-        matching
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
-        assert!(
-            matching.vote_fence().records(&record(deadline)).is_ok(),
-            "a proof at the deadline passes a record at the deadline"
-        );
-        assert!(
-            matching
-                .vote_fence()
-                .records(&record(deadline.plus(Duration::from_secs(5))))
-                .is_err(),
-            "a record at an anchor this validator has not folded defers"
-        );
-        assert!(
-            matching
-                .vote_fence()
-                .records(&record(deadline.minus(Duration::from_millis(1))))
-                .is_err(),
-            "a record probed before the deadline is refused whatever the mirror holds"
-        );
-        let sweep = deadline.plus(MAX_VALIDITY_RANGE);
-        assert!(
-            matching.vote_fence().records(&record(sweep)).is_err(),
-            "a record probed where the committed cell may be swept is refused"
-        );
-        let late = fence_coordinator();
-        late.evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
-        assert!(
-            late.vote_fence().records(&record(deadline)).is_err(),
-            "a mirror taken past the sweep proves nothing and defers"
-        );
-
-        let absent_mirror = fence_coordinator();
-        assert!(
-            absent_mirror
-                .vote_fence()
-                .records(&record(deadline))
-                .is_err(),
-            "no proof defers it"
-        );
-    }
-
-    /// An untaken record — a one-shard core's claim absent — stands on
-    /// the claim's own mirror: a folded claim absence at the record's
-    /// anchor passes it, and a committed-cell absence at the same anchor
-    /// does not, since the questions are different proofs.
-    #[test]
-    fn an_untaken_record_stands_on_the_claims_own_mirror() {
-        let deadline = figures_of(b"tx").deadline.at();
-        let tx_hash = figures_of(b"tx").tx_hash;
-        let record = record_of(absent(Probed::Claim, deadline));
-
-        let claim = fence_coordinator();
-        claim
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
-        assert!(
-            claim.vote_fence().records(&record).is_ok(),
-            "a folded claim absence at the anchor passes it"
-        );
-
-        let cell = fence_coordinator();
-        cell.evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
-        assert!(
-            cell.vote_fence().records(&record).is_err(),
-            "a committed-cell absence is another question's proof, and defers"
-        );
-    }
-
-    /// A lapse record is the same check against a later window: the
-    /// name's deadline plus one validity range. A proof at the lapse
-    /// passes a record at the lapse, a record anchored at the deadline
-    /// is refused whatever the mirror holds, and a mirror short of the
-    /// lapse defers — the proof it holds is a core's answer, not a
-    /// delivery's.
-    #[test]
-    fn a_lapse_record_is_held_to_the_deadline_plus_a_validity_range() {
-        let deadline = figures_of(b"tx").deadline.at();
-        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
-        let tx_hash = figures_of(b"tx").tx_hash;
-        let record = |at| record_of(absent(Probed::Delivery, at));
-
-        let matching = fence_coordinator();
-        matching
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
-        assert!(
-            matching.vote_fence().records(&record(lapse)).is_ok(),
-            "a proof at the lapse passes a record at the lapse"
-        );
-        assert!(
-            matching.vote_fence().records(&record(deadline)).is_err(),
-            "a lapse record anchored at the deadline is refused whatever the mirror holds"
-        );
-        assert!(
-            matching
-                .vote_fence()
-                .records(&record(lapse.plus(MAX_VALIDITY_RANGE)))
-                .is_err(),
-            "a lapse record anchored where the claim cell may be swept is refused"
-        );
-
-        let short = fence_coordinator();
-        short
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
-        assert!(
-            short.vote_fence().records(&record(lapse)).is_err(),
-            "a proof short of the lapse defers it"
-        );
-
-        let cores = fence_coordinator();
-        cores
-            .evidence()
-            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
-        assert!(
-            cores.vote_fence().records(&record(lapse)).is_err(),
-            "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
 

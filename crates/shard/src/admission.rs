@@ -24,7 +24,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, CounterpartEvidence, Finalization, FinalizationHash,
+    AbandonmentRecord, BlockHash, BlockHeight, Finalization, FinalizationHash,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
@@ -495,8 +495,8 @@ pub struct RecordsFold<'a> {
     /// The finalizations the block carries, whose names no record may
     /// repeat.
     pub finalizations: &'a FinalizationsFold,
-    /// The last admitted record's position, which the next must follow.
-    pub previous: Option<(ShardId, CounterpartEvidence)>,
+    /// The last admitted record's shard, which the next must follow.
+    pub previous: Option<ShardId>,
     /// Names the admitted records carry, against the drain's own bound.
     pub named: usize,
     /// Bytes the admitted records weigh, against the section's budget.
@@ -543,16 +543,13 @@ impl RecordsSection<'_> {
         already_resolved(ctx, tx_hash)
     }
 
-    /// Whether a departure record's evidence is one the schedule
-    /// attests at the block's anchor: the cut it names is the departed
-    /// shard's, and its boundary record is still readable. A record
-    /// anchored after the beacon closed and swept the departure claims
-    /// what nobody can check. A refusal names a live shard and is held
-    /// to no window.
+    /// Whether a record's departure is one the schedule attests at the
+    /// block's anchor: the cut it names is the departed shard's, and its
+    /// boundary record is still readable. A record anchored after the
+    /// beacon closed and swept the departure claims what nobody can
+    /// check.
     fn evidence_stands(ctx: &Admission<'_>, verdict: &AbandonmentRecord) -> Result<(), String> {
-        let CounterpartEvidence::Departed { terminal_wt } = verdict.evidence() else {
-            return Ok(());
-        };
+        let terminal_wt = verdict.terminal_wt();
         let shard = verdict.shard();
         let scheduled = ctx.schedule.terminal_cut_for_shard(shard, ctx.anchor);
         if scheduled != Some(terminal_wt) {
@@ -576,17 +573,15 @@ impl<'f> Section for RecordsSection<'f> {
     type Fold = RecordsFold<'f>;
 
     /// A well-formed record, in its place in the section's order, under
-    /// evidence the schedule attests, naming only what stands, within
+    /// a departure the schedule attests, naming only what stands, within
     /// the budget the records share.
     ///
-    /// The order is ascending by shard and then by arm, which gives
-    /// uniqueness and one encoding per claim set together — two records
-    /// for one shard under one arm would leave which answer counts to
-    /// the reader, and a reordering would be a second form of the same
-    /// block. One shard may carry several arms: what it refused and
-    /// what it never took are different transactions. Both budgets
-    /// are sums across every record, because the per-record decode cap
-    /// alone would let a block spend either once per record.
+    /// The order is ascending by shard, which gives uniqueness and one
+    /// encoding per claim set together — two records for one shard
+    /// would leave which answer counts to the reader, and a reordering
+    /// would be a second form of the same block. Both budgets are sums
+    /// across every record, because the per-record decode cap alone
+    /// would let a block spend either once per record.
     ///
     /// The byte budget is what bounds the block, since a name's cost
     /// varies with its reach and a count cannot see that. At the
@@ -607,7 +602,7 @@ impl<'f> Section for RecordsSection<'f> {
                 verdict.shard()
             ));
         }
-        let position = (verdict.shard(), verdict.evidence());
+        let position = verdict.shard();
         if fold.previous.is_some_and(|previous| previous >= position) {
             return Err(format!(
                 "abandonment record for {:?} repeats or precedes the one before it",

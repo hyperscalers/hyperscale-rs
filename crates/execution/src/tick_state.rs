@@ -290,6 +290,11 @@ struct Seat {
     /// classification at admission. Attested on the outcome only where
     /// the execution escrowed something.
     crossing_targets: BTreeSet<ShardId>,
+    /// The committed cell this shard wrote at the member's inclusion,
+    /// for a member of the core. Attested on the outcome only where the
+    /// member refuses: the settling block deletes it, and a leg probing
+    /// the core reads the refusal as the absence it is.
+    committed_cell: Option<SubstateKey>,
     /// Which shards have reported on the member via a certificate.
     covered_by: BTreeSet<ShardId>,
     /// A certificate reported abort. Terminal — an aborted transaction
@@ -317,6 +322,7 @@ impl Seat {
             attested_work: 0,
             escrowed: Vec::new(),
             crossing_targets: BTreeSet::new(),
+            committed_cell: None,
             covered_by: BTreeSet::new(),
             aborted_anywhere: false,
             settled: false,
@@ -644,6 +650,14 @@ impl TickState {
         }
     }
 
+    /// Record the committed cell this shard wrote at a core member's
+    /// inclusion, which its refusal retracts.
+    pub fn record_committed_cell(&mut self, tx_hash: TxHash, cell: SubstateKey) {
+        if let Some(seat) = self.seats.get_mut(&tx_hash) {
+            seat.committed_cell = Some(cell);
+        }
+    }
+
     /// Record the fee receipt the engine built beside a member's
     /// execution receipt: what the payer owes if the transaction aborts.
     pub fn record_fee_receipt(&mut self, receipt: StoredReceipt) {
@@ -819,6 +833,14 @@ impl TickState {
                 } else {
                     seat.crossing_targets.clone()
                 };
+                // A core member's refusal retracts the committed cell
+                // its inclusion wrote: the settling block deletes it,
+                // so a leg probing the core reads the refusal as an
+                // absence, the same one a core that never included the
+                // transaction leaves.
+                let retracts = seat
+                    .committed_cell
+                    .filter(|_| !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
                 match charge {
                     Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, seat.attested_work),
                     None => TxOutcome::attesting(*tx_hash, outcome, seat.attested_work),
@@ -830,6 +852,7 @@ impl TickState {
                 .awaiting(counterparts)
                 .escrowing(seat.escrowed.clone())
                 .crossing_to(targets)
+                .retracting(retracts)
                 .as_role(seat.membership.role())
             })
             .collect();
@@ -1310,6 +1333,57 @@ mod tests {
 
     fn shard(index: u64) -> ShardId {
         ShardId::leaf(1, index)
+    }
+
+    /// A core member's refusal retracts the committed cell its inclusion
+    /// wrote, and its success does not: the settling block deletes the
+    /// cell of a refused transaction, so a leg probing the core reads
+    /// the refusal as the absence a core that never included it leaves.
+    #[test]
+    fn a_core_members_refusal_retracts_its_committed_cell() {
+        use hyperscale_types::test_utils::test_key;
+
+        let local = shard(0);
+        let (refused, accepted) = (tx(1), tx(2));
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        for (tx_hash, cell) in [(refused, test_key(1)), (accepted, test_key(2))] {
+            tick.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local, shard(1)])),
+                10,
+                Admission::Executes,
+            );
+            tick.record_committed_cell(tx_hash, cell);
+        }
+        tick.record_execution_result(refused, ExecutionOutcome::Failed);
+        tick.record_execution_result(
+            accepted,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        let (_, _, outcomes) = tick.build_vote_data().expect("every member came back");
+        let retracts = |tx_hash: TxHash| {
+            outcomes
+                .iter()
+                .find(|outcome| outcome.tx_hash() == tx_hash)
+                .expect("the tick votes every member")
+                .retracts()
+        };
+        assert_eq!(
+            retracts(refused),
+            Some(test_key(1)),
+            "the refusal names the cell the settling block deletes"
+        );
+        assert_eq!(
+            retracts(accepted),
+            None,
+            "a success leaves its cell standing"
+        );
     }
 
     /// A tick at `shard(0)` running one single-shard member and one leg

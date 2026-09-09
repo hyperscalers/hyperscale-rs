@@ -1,43 +1,29 @@
-//! What a counterpart's chain established about the transactions this
-//! shard still owes an outcome for, and the evidence that says so.
+//! What a departed counterpart left unsettled of the transactions this
+//! shard still owes an outcome for.
 //!
 //! A cross-shard transaction needs every certificate its settlement
 //! waits on, so one whose counterpart can never certify it can never
 //! settle anywhere. That is the fact this shard needs in order to abandon
-//! it, and it is established one of two ways. The counterpart left
-//! without settling: its settled set is complete and beacon-attested, so
-//! absence from it is proof, but the set can only be fetched while the
-//! terminal it belongs to is still served. Or the counterpart was heard
-//! from — its certificate carried a verdict, or a proof against one of
-//! its commit-proven headers answered for a cell — and what it said is
-//! written down as one [`Heard`]: the [`Question`] asked, the [`Word`]
-//! that answered it, and the moment it was taken at.
-//!
-//! Every word licenses an abort. A core's refusal ends the transaction
-//! outright. A core's committed cell absent past the deadline says the
-//! core never committed it, since before the deadline the core may still
-//! legitimately commit and past the cell's own sweep the cell is gone
-//! either way; a delivery's claim absent past the lapse says the same of
-//! the delivery, on the same terms against its claim cell; and a
-//! one-shard core's consumer claim absent past the deadline says the
-//! core never took it, since a block carrying that core's success past
-//! the deadline is refused.
+//! it. For a counterpart still running, the chain reads it off the
+//! counterpart's own state: a claim carries what a commit-proven header
+//! said of a cell, every replica folds the claim at the block that
+//! carries it, and an absence inside its window licenses the reclaim
+//! from the ledger alone. For a counterpart that left, there is no state
+//! to read: its settled set is complete and beacon-attested, so absence
+//! from it is proof, but the set can only be fetched while the terminal
+//! it belongs to is still served.
 //!
 //! So the answer is written down while it can still be read. A record
-//! names the transactions this chain still owes an outcome for, with the
-//! evidence its counterpart's chain gave, and once committed it is
-//! ordinary history: every replica reads the same verdicts off its own
-//! chain at any distance, including one that was switched off when the
-//! counterpart left.
+//! names the transactions this chain still owes an outcome for that the
+//! departed shard did not settle, and once committed it is ordinary
+//! history: every replica reads the same verdicts off its own chain at
+//! any distance, including one that was switched off when the
+//! counterpart left, and one that never held the transaction rebuilds
+//! its entry from the figures the record restates.
 //!
 //! What is never recorded is a settlement. That a counterpart *did*
 //! settle a transaction changes nothing this shard can act on — the
-//! transaction stays owed and unabandonable either way. A consumer's
-//! claim cell read present is the one settling answer, and it needs no
-//! record: the reading is itself committed content, folded by every
-//! replica at the block that carries it, and what it licenses — the
-//! retirement of the record cell the issuer held for the claim — is
-//! composed from the ledger that fold writes.
+//! transaction stays owed and unabandonable either way.
 //!
 //! Each name carries the figures composing the abort takes: the deadline
 //! it opens at, the reservation it returns, and the charge it settles.
@@ -49,9 +35,9 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    ABANDONMENT_RECORD_BYTES, Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VALIDITY_RANGE, Probed, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, SubstateKey, Transaction,
-    TransactionDecision, TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
+    ABANDONMENT_RECORD_BYTES, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VALIDITY_RANGE, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, SubstateKey, Transaction, TxHash,
+    UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -278,146 +264,21 @@ impl Resolutions {
     }
 }
 
-/// What a leg's ledger asks a counterpart about one transaction.
+/// One departed counterpart's remainder as this chain sees it: what it
+/// left unsettled.
 ///
-/// Its verdict, which its certificate answers; or one of its cells,
-/// which a proof against one of its commit-proven headers answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
-pub enum Question {
-    /// What the counterpart decided.
-    Verdict,
-    /// Whether the counterpart's state holds the probed cell.
-    Cell(Probed),
-}
-
-impl Question {
-    /// Every question, in the order a block carries their records.
-    pub const ALL: [Self; 4] = [
-        Self::Verdict,
-        Self::Cell(Probed::Core),
-        Self::Cell(Probed::Delivery),
-        Self::Cell(Probed::Claim),
-    ];
-}
-
-// A cell question per [`Probed`] and the verdict beside them. Held at
-// compile time because the array is written out: a `Probed` variant
-// added without a line here would leave the order a block carries its
-// records silently short of one.
-const _: () = assert!(Question::ALL.len() == Probed::ALL.len() + 1);
-
-/// What a counterpart said in answer.
-///
-/// A certificate answers a [`Question::Verdict`] with a refusal, named
-/// by its attested digest so a claim to it can be held to the copy a
-/// voter holds. A proof answers a [`Question::Cell`] with an absence,
-/// and the crossing is the issuer's to take back.
-///
-/// Neither a success nor a presence is among them. What a certificate
-/// says of a success is that the counterpart's execution went through,
-/// which is the cue to ask whether it wrote the claim that success
-/// promises — see [`Spoken`](crate::Spoken). What a proof says of a
-/// present cell is that the consumer holds the crossing, and that is
-/// folded off the committed claim itself rather than restated here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
-pub enum Word {
-    /// The counterpart refused the transaction: a rejection or an abort.
-    Refused {
-        /// What the certificate decided — never an acceptance.
-        decision: TransactionDecision,
-        /// The certificate's attested digest: its signed identity, which
-        /// is copy-invariant where its wire hash is not.
-        digest: Hash,
-    },
-    /// The probed cell was absent.
-    Absent,
-}
-
-/// One thing a counterpart's chain said about one transaction, and when.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
-pub struct Heard {
-    /// What was asked.
-    pub question: Question,
-    /// What answered it.
-    pub word: Word,
-    /// The moment the answer was taken at: the certificate's vote
-    /// anchor, or the weighted timestamp of the block the absence was
-    /// proved against — which has to sit inside the window the question
-    /// is meaningful in, or the answer says nothing.
-    pub at: WeightedTimestamp,
-}
-
-impl Heard {
-    /// Whether the word answers the question: a certificate speaks to a
-    /// verdict, a proof to a cell, and a verdict a record may carry is
-    /// always a refusal.
-    #[must_use]
-    pub const fn is_well_formed(&self) -> bool {
-        match (self.question, self.word) {
-            (Question::Verdict, Word::Refused { decision, .. }) => {
-                matches!(
-                    decision,
-                    TransactionDecision::Reject | TransactionDecision::Aborted
-                )
-            }
-            (Question::Cell(_), Word::Absent) => true,
-            (Question::Verdict, Word::Absent) | (Question::Cell(_), Word::Refused { .. }) => false,
-        }
-    }
-}
-
-/// What a counterpart's chain shows about the transactions a record
-/// names, and when it was read there.
-///
-/// Every arm carries a moment and none carries its proof. The proof is
-/// fetched by the voter — a settled set, a certificate, or a state proof
-/// against a commit-proven header — and a voter that cannot verify
-/// defers. An absence proof is a JMT non-inclusion path; carrying one
-/// per entry would blow the record's size budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
-pub enum CounterpartEvidence {
-    /// The shard left without settling. Absence from its complete,
-    /// beacon-attested settled set is the proof.
-    Departed {
-        /// Its terminal block's weighted timestamp — what a validator
-        /// resolves its settled set against, and what dates the record
-        /// against the transactions it speaks for.
-        terminal_wt: WeightedTimestamp,
-    },
-    /// The shard was heard from: its certificate or its commit-proven
-    /// state answered a question, and every name in the record got the
-    /// same answer at the same moment.
-    Heard(Heard),
-}
-
-impl CounterpartEvidence {
-    /// The moment the evidence was taken at.
-    #[must_use]
-    pub const fn moment(&self) -> WeightedTimestamp {
-        match self {
-            Self::Departed { terminal_wt } => *terminal_wt,
-            Self::Heard(heard) => heard.at,
-        }
-    }
-
-    /// Whether the evidence is in a form a record may carry.
-    #[must_use]
-    pub const fn is_well_formed(&self) -> bool {
-        match self {
-            Self::Departed { .. } => true,
-            Self::Heard(heard) => heard.is_well_formed(),
-        }
-    }
-}
-
-/// One counterpart's remainder as this chain sees it: what it can never
-/// settle.
+/// The record carries no proof. The proof is the departed shard's
+/// settled set, which the voter fetches — it is complete and
+/// beacon-attested, so absence from it is proof rather than ignorance —
+/// and a voter that cannot read it defers.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct AbandonmentRecord {
     /// The counterpart shard that can never settle these.
     shard: ShardId,
-    /// Why not, and as of when.
-    evidence: CounterpartEvidence,
+    /// Its terminal block's weighted timestamp — what a validator
+    /// resolves its settled set against, and what dates the record
+    /// against the transactions it speaks for.
+    terminal_wt: WeightedTimestamp,
     /// Transactions this chain still owes an outcome for that `shard`
     /// can never settle.
     ///
@@ -428,11 +289,12 @@ pub struct AbandonmentRecord {
 }
 
 impl AbandonmentRecord {
-    /// Build a record over `unsettled`, in the canonical order.
+    /// A record over what `shard`, which left at `terminal_wt`, did not
+    /// settle of `unsettled`, in the canonical order.
     #[must_use]
     pub fn new(
         shard: ShardId,
-        evidence: CounterpartEvidence,
+        terminal_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         let mut unsettled: Vec<UnsettledTx> = unsettled.into_iter().collect();
@@ -440,35 +302,9 @@ impl AbandonmentRecord {
         unsettled.dedup_by_key(|entry| entry.tx_hash);
         Self {
             shard,
-            evidence,
+            terminal_wt,
             unsettled,
         }
-    }
-
-    /// A record over what a shard that left at `terminal_wt` did not
-    /// settle.
-    #[must_use]
-    pub fn departed(
-        shard: ShardId,
-        terminal_wt: WeightedTimestamp,
-        unsettled: impl IntoIterator<Item = UnsettledTx>,
-    ) -> Self {
-        Self::new(
-            shard,
-            CounterpartEvidence::Departed { terminal_wt },
-            unsettled,
-        )
-    }
-
-    /// A record over what `shard` was heard to say, of every name at
-    /// once.
-    #[must_use]
-    pub fn heard(
-        shard: ShardId,
-        heard: Heard,
-        unsettled: impl IntoIterator<Item = UnsettledTx>,
-    ) -> Self {
-        Self::new(shard, CounterpartEvidence::Heard(heard), unsettled)
     }
 
     /// The counterpart shard.
@@ -477,10 +313,10 @@ impl AbandonmentRecord {
         self.shard
     }
 
-    /// Why it can never settle these, and as of when.
+    /// Where the counterpart's chain ended.
     #[must_use]
-    pub const fn evidence(&self) -> CounterpartEvidence {
-        self.evidence
+    pub const fn terminal_wt(&self) -> WeightedTimestamp {
+        self.terminal_wt
     }
 
     /// An upper bound on what this record costs the block that carries
@@ -513,8 +349,8 @@ impl AbandonmentRecord {
         self.unsettled.iter().map(|entry| entry.tx_hash)
     }
 
-    /// Whether the record is in the one form it may take: evidence a
-    /// word answers, sorted names without repeats, and naming something.
+    /// Whether the record is in the one form it may take: sorted names
+    /// without repeats, and naming something.
     ///
     /// An empty record asserts nothing and would cost a block a leaf for
     /// it, so it is not well-formed rather than merely pointless. The
@@ -523,8 +359,7 @@ impl AbandonmentRecord {
     /// the block's own check applies.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        self.evidence.is_well_formed()
-            && !self.unsettled.is_empty()
+        !self.unsettled.is_empty()
             && self.unsettled.len() <= MAX_UNSETTLED_PER_BLOCK
             && self
                 .unsettled
@@ -697,9 +532,8 @@ mod tests {
 
     #[test]
     fn a_record_is_built_in_its_canonical_order() {
-        let jumbled =
-            AbandonmentRecord::departed(ShardId::ROOT, wt(), [tx(3), tx(1), tx(3), tx(2)]);
-        let ordered = AbandonmentRecord::departed(ShardId::ROOT, wt(), [tx(1), tx(2), tx(3)]);
+        let jumbled = AbandonmentRecord::new(ShardId::ROOT, wt(), [tx(3), tx(1), tx(3), tx(2)]);
+        let ordered = AbandonmentRecord::new(ShardId::ROOT, wt(), [tx(1), tx(2), tx(3)]);
 
         assert_eq!(jumbled, ordered, "sorted and deduplicated on the way in");
         assert!(jumbled.is_well_formed());
@@ -709,7 +543,7 @@ mod tests {
     /// a claim it does not make.
     #[test]
     fn an_empty_record_is_not_well_formed() {
-        let empty = AbandonmentRecord::departed(ShardId::ROOT, wt(), []);
+        let empty = AbandonmentRecord::new(ShardId::ROOT, wt(), []);
         assert!(!empty.is_well_formed());
     }
 
@@ -719,14 +553,14 @@ mod tests {
     fn a_record_out_of_its_canonical_order_is_refused() {
         let reversed = AbandonmentRecord {
             shard: ShardId::ROOT,
-            evidence: CounterpartEvidence::Departed { terminal_wt: wt() },
+            terminal_wt: wt(),
             unsettled: vec![tx(2), tx(1)],
         };
         assert!(!reversed.is_well_formed());
 
         let repeating = AbandonmentRecord {
             shard: ShardId::ROOT,
-            evidence: CounterpartEvidence::Departed { terminal_wt: wt() },
+            terminal_wt: wt(),
             unsettled: vec![tx(1), tx(1)],
         };
         assert!(!repeating.is_well_formed());
@@ -737,54 +571,11 @@ mod tests {
     /// takes.
     #[test]
     fn a_name_carries_what_abandoning_it_takes() {
-        let record = AbandonmentRecord::departed(ShardId::ROOT, wt(), [tx(2), tx(1)]);
+        let record = AbandonmentRecord::new(ShardId::ROOT, wt(), [tx(2), tx(1)]);
         assert_eq!(
             record.unsettled(),
             &[tx(1), tx(2)],
             "each name keeps its own deadline and reservation through the sort",
         );
-    }
-
-    /// Every well-formed arm reads its moment back, and a word that does
-    /// not answer its question is refused as a record.
-    #[test]
-    fn every_arm_reads_its_moment_and_only_an_answering_word_is_well_formed() {
-        let digest = Hash::from_bytes(b"digest");
-        let heard = |question, word| Heard {
-            question,
-            word,
-            at: wt(),
-        };
-        let refused = Word::Refused {
-            decision: TransactionDecision::Reject,
-            digest,
-        };
-        let arms = [
-            CounterpartEvidence::Departed { terminal_wt: wt() },
-            CounterpartEvidence::Heard(heard(Question::Verdict, refused)),
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Core), Word::Absent)),
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Delivery), Word::Absent)),
-            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Absent)),
-        ];
-        for arm in arms {
-            assert_eq!(arm.moment(), wt());
-            assert!(arm.is_well_formed());
-            assert!(AbandonmentRecord::new(ShardId::ROOT, arm, [tx(1)]).is_well_formed());
-        }
-        let malformed = [
-            heard(Question::Verdict, Word::Absent),
-            heard(Question::Cell(Probed::Core), refused),
-            heard(
-                Question::Verdict,
-                Word::Refused {
-                    decision: TransactionDecision::Accept,
-                    digest,
-                },
-            ),
-        ];
-        for heard in malformed {
-            assert!(!heard.is_well_formed(), "{heard:?}");
-            assert!(!AbandonmentRecord::heard(ShardId::ROOT, heard, [tx(1)]).is_well_formed());
-        }
     }
 }

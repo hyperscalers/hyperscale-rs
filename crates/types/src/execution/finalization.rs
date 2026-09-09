@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
-    TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, SubstateKey, TickId,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -791,6 +791,23 @@ impl Finalization {
             })
             .cloned()
             .collect()
+    }
+
+    /// The committed cells this shard's own outcomes retract: what the
+    /// block settling this finalization deletes beside the sweep's
+    /// removals. Only the local certificate's, since a committed cell is
+    /// written under the shard that included the transaction and a
+    /// counterpart's retractions are that counterpart's to apply.
+    pub fn retractions(&self) -> impl Iterator<Item = SubstateKey> + '_ {
+        // Read off the certificates by tick rather than through the
+        // local-certificate accessor, which is a lookup that must
+        // succeed: a malformed finalization needs no special case on the
+        // commit path.
+        self.execution_certificates
+            .iter()
+            .filter(|ec| ec.tick_id() == &self.tick_id)
+            .flat_map(|ec| ec.tx_outcomes())
+            .filter_map(TxOutcome::retracts)
     }
 
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).

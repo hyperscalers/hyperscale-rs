@@ -160,9 +160,6 @@ pub struct Metrics {
     /// Reclaims admitted into a tick — escrowed value taken back on
     /// committed evidence.
     pub reclaims_admitted: Counter,
-    /// Votes withheld because a block's verdict claim names a
-    /// certificate this validator does not hold.
-    pub verdict_claims_deferred: Counter,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -772,12 +769,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            verdict_claims_deferred: register_counter!(
-                "hyperscale_verdict_claims_deferred_total",
-                "Votes withheld on a verdict claim whose certificate this validator lacks"
-            )
-            .unwrap(),
-
             fetch_responses_refused: register_counter_vec!(
                 "hyperscale_fetch_responses_refused_total",
                 "Fetch responses refused by the requester's own check",
@@ -1097,10 +1088,6 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_admitted(&self) {
         self.metrics.reclaims_admitted.inc();
-    }
-
-    fn record_verdict_claim_deferred(&self) {
-        self.metrics.verdict_claims_deferred.inc();
     }
 
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {

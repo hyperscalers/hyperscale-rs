@@ -82,7 +82,7 @@ fn a_records_weight_bounds_its_encoding() {
     let deep = ShardId::leaf(9, 300);
     for names in [1usize, 2, 64] {
         for routes in [0, 2, 64] {
-            let record = AbandonmentRecord::departed(
+            let record = AbandonmentRecord::new(
                 deep,
                 WeightedTimestamp::from_millis(u64::MAX / 2),
                 (0..names).map(|at| name(u8::try_from(at % 256).expect("masked"), routes)),
@@ -97,7 +97,7 @@ fn a_records_weight_bounds_its_encoding() {
             );
         }
     }
-    let empty = AbandonmentRecord::departed(deep, WeightedTimestamp::ZERO, []);
+    let empty = AbandonmentRecord::new(deep, WeightedTimestamp::ZERO, []);
     assert_eq!(empty.wire_weight(), ABANDONMENT_RECORD_BYTES);
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= ABANDONMENT_RECORD_BYTES);
 }

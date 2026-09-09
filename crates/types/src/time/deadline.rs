@@ -131,8 +131,9 @@ pub enum Window {
     /// [`MAX_FINALIZATION_DELAY`] past the close or never will.
     Delivery,
     /// Where a core's committed cell being absent proves the core never
-    /// committed the transaction: from the deadline, since before it
-    /// the core may still commit, to the cell's own sweep one
+    /// took the transaction — never included it, or included it and
+    /// refused, which retracts the cell: from the deadline, since
+    /// before it the core may still commit, to the cell's own sweep one
     /// [`MAX_VALIDITY_RANGE`] on, past which a proof is a true proof of
     /// a cell that was present.
     Core,
@@ -178,7 +179,9 @@ impl Window {
 /// offered as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Probed {
-    /// A core's committed cell, past the transaction's deadline.
+    /// A core's committed cell, past the transaction's deadline: absent
+    /// where the core never included the transaction, or included it
+    /// and refused.
     Core,
     /// A delivering shard's claim cell, past the crossing's lapse.
     Delivery,
@@ -251,11 +254,12 @@ impl Probed {
     /// where the core is one shard, whose one execution wrote the claim
     /// by the deadline or never will; on a core of more it says only
     /// that a sibling is pending. A committed cell absent says the core
-    /// never committed it only where the core is more than one shard,
-    /// since a core of one writes none. The one rule for both, stated
-    /// once, so the prober asks only what an absence would answer and
-    /// the fold reads a carried proof by the same rule whoever fetched
-    /// it.
+    /// never took it — never included it, or refused it and retracted
+    /// the cell — and is read only where the core is more than one
+    /// shard, since a core of one answers through its claim. The one
+    /// rule for both, stated once, so the prober asks only what an
+    /// absence would answer and the fold reads a carried proof by the
+    /// same rule whoever fetched it.
     #[must_use]
     pub const fn read(self, inclusion: Inclusion, core_len: usize) -> Option<Inclusion> {
         match (inclusion, self) {

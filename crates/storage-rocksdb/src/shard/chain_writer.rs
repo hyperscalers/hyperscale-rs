@@ -35,11 +35,6 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter())
             .collect();
-        let settling: Vec<StoredReceipt> = finalizations
-            .iter()
-            .flat_map(|fw| fw.settling_receipts())
-            .collect();
-
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet (e.g.,
@@ -78,8 +73,13 @@ impl ShardChainWriter for RocksDbShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        let settled =
-            settled_writes_at(&settling, parent.state, parent.height, creations, removals);
+        let settled = settled_writes_at(
+            finalizations,
+            parent.state,
+            parent.height,
+            creations,
+            removals,
+        );
 
         let (computed_root, collected) = if parent.pending.is_empty() {
             put_at_version(

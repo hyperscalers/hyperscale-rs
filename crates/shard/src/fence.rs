@@ -4,8 +4,8 @@
 //! A block's content rules are deterministic over the block and the
 //! committed chain, and every replica reaches the same verdict on them.
 //! The fence is the other kind of check: a block claims that a departed
-//! shard left a transaction unsettled, that a counterpart said a word
-//! about it, that a core's header carries a root, that a predecessor
+//! shard left a transaction unsettled, that a counterpart's cell read
+//! one way, that a core's header carries a root, that a predecessor
 //! never committed a transaction — and a validator can only hold those
 //! claims to what it has itself mirrored. So the fence has three answers
 //! rather than two. A claim the evidence contradicts refuses the vote for
@@ -14,17 +14,16 @@
 //! cannot attest to passes.
 //!
 //! Everything the fence reads is a mirror shared with the execution
-//! coordinator — what counterparts said, which anchors are commit-proven,
-//! what the predecessors answered — so a block passes here exactly when
+//! coordinator — the departed shards' settled sets, which anchors are
+//! commit-proven, what cells this validator proved, what the predecessors
+//! answered — so a block passes here exactly when
 //! the composer that offered its content would have offered it against
 //! the same mirror.
 
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
-use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, Block, CounterpartEvidence, CounterpartMirror, Heard, ProvenAnchors,
-    ProvenCells, Question, SettledSetVerdict, ShardId, StateClaim, TopologySchedule, UnsettledTx,
-    WeightedTimestamp, settled_set_verdict,
+    AbandonmentRecord, Block, CounterpartMirror, ProvenAnchors, ProvenCells, SettledSetVerdict,
+    ShardId, StateClaim, TopologySchedule, WeightedTimestamp, settled_set_verdict,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -57,7 +56,7 @@ impl Withheld {
 /// The evidence a vote is fenced on, borrowed from the coordinator for
 /// one judgment.
 pub struct VoteFence<'a> {
-    /// What counterparts said, and the departed shards' settled sets.
+    /// The departed shards' settled sets, and what committed records cover.
     pub evidence: &'a CounterpartMirror,
     /// The commit-proven remote headers.
     pub proven_anchors: &'a ProvenAnchors,
@@ -75,10 +74,10 @@ pub struct VoteFence<'a> {
 
 impl VoteFence<'_> {
     /// Judge every claim `block` makes, in the order the cheapest
-    /// evidence answers: its finalizations against the settled sets, its
-    /// records against the sets and the mirror, its state claims against
-    /// the anchors and cells this validator has proven, and its pre-cut
-    /// content against the predecessors' answers.
+    /// evidence answers: its finalizations and its records against the
+    /// settled sets, its state claims against the anchors and cells this
+    /// validator has proven, and its pre-cut content against the
+    /// predecessors' answers.
     ///
     /// # Errors
     ///
@@ -142,11 +141,10 @@ impl VoteFence<'_> {
     /// Whether the block's abandonment records are ones this voter can
     /// attest to.
     ///
-    /// Each record is held to the evidence it claims, on the arm it
-    /// carries. The figures each name restates are not this fence's to
-    /// check: they are read off the committed body, which lives in the
-    /// store, and so are checked by the delegated verification the vote
-    /// also waits on.
+    /// Each record is held to the departed shard's settled set. The
+    /// figures each name restates are not this fence's to check: they
+    /// are read off the committed body, which lives in the store, and so
+    /// are checked by the delegated verification the vote also waits on.
     ///
     /// # Errors
     ///
@@ -156,22 +154,7 @@ impl VoteFence<'_> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|verdict| self.record_stands(verdict))
-    }
-
-    /// Whether one record's evidence stands for this validator, on the
-    /// arm it carries. A departure is checked against this validator's
-    /// own ledger and the departed shard's settled set; what a shard was
-    /// heard to say is checked against this validator's own mirror of
-    /// it, equality on the word and the moment.
-    fn record_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
-        match verdict.evidence() {
-            CounterpartEvidence::Departed { .. } => self.departure_stands(verdict),
-            CounterpartEvidence::Heard(heard) => verdict
-                .unsettled()
-                .iter()
-                .try_for_each(|entry| self.heard_stands(verdict.shard(), entry, heard)),
-        }
+            .try_for_each(|verdict| self.departure_stands(verdict))
     }
 
     /// Whether a departure record stands: this validator's own ledger
@@ -227,51 +210,6 @@ impl VoteFence<'_> {
             ))),
             Some(None) => Ok(()),
         }
-    }
-
-    /// Whether one name's word stands for this validator: an answer to a
-    /// cell question sits inside the window the question is meaningful
-    /// in for the name's deadline, and the word and the moment are the
-    /// ones this validator itself mirrored — off the counterpart's
-    /// certificate, or off the claim the chain committed, which every
-    /// replica folds at the same height. A voter holding no mirror
-    /// cannot say and defers; one whose mirror disagrees refuses.
-    fn heard_stands(
-        &self,
-        shard: ShardId,
-        entry: &UnsettledTx,
-        heard: Heard,
-    ) -> Result<(), Withheld> {
-        if let Question::Cell(probed) = heard.question
-            && !probed.absence_answers_at(heard.at, entry.deadline)
-        {
-            return Err(Withheld::Refused(format!(
-                "abandonment record probes {shard:?} for {} at {:?}, outside the window its \
-                 deadline {:?} licenses",
-                entry.tx_hash, heard.at, entry.deadline
-            )));
-        }
-        match self.evidence.heard(entry.tx_hash, shard, heard.question) {
-            Some(mirrored) if mirrored == heard => {}
-            Some(mirrored) => {
-                return Err(Withheld::Refused(format!(
-                    "abandonment record restates {heard:?} of {shard:?} for {}, which this \
-                     validator reads as {mirrored:?}",
-                    entry.tx_hash
-                )));
-            }
-            None => {
-                if heard.question == Question::Verdict {
-                    record_verdict_claim_deferred();
-                }
-                return Err(Withheld::deferred(format!(
-                    "abandonment record restates an answer of {shard:?} for {} this validator \
-                     has not mirrored",
-                    entry.tx_hash
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Whether the block's readings of counterparts' cells are ones this

@@ -37,9 +37,8 @@ impl LeafRoot for AbandonmentRoot {
 mod tests {
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, Deadline, Hash, Heard, LocalKey, Probed, Question,
-        RootMismatch, RoutePrefix, ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx,
-        Verified, Verify, WeightedTimestamp, Word,
+        AbortCharge, Address, AddressClass, Deadline, Hash, LocalKey, RootMismatch, RoutePrefix,
+        ShardId, SubstateKey, TxHash, UnsettledTx, Verified, Verify, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -62,7 +61,7 @@ mod tests {
     }
 
     fn record(shard: ShardId, seeds: &[u8]) -> AbandonmentRecord {
-        AbandonmentRecord::departed(
+        AbandonmentRecord::new(
             shard,
             WeightedTimestamp::from_millis(1_000),
             seeds.iter().copied().map(tx),
@@ -91,7 +90,7 @@ mod tests {
         assert_ne!(root, root_of(&record(ShardId::ROOT, &[1, 3])));
         assert_ne!(
             root,
-            root_of(&AbandonmentRecord::departed(
+            root_of(&AbandonmentRecord::new(
                 ShardId::ROOT,
                 WeightedTimestamp::from_millis(2_000),
                 [tx(1), tx(2)],
@@ -104,7 +103,7 @@ mod tests {
         // so a block restating any of them differently is a different
         // block.
         let restated = |entry: UnsettledTx| {
-            root_of(&AbandonmentRecord::departed(
+            root_of(&AbandonmentRecord::new(
                 ShardId::ROOT,
                 WeightedTimestamp::from_millis(1_000),
                 [entry, tx(2)],
@@ -144,49 +143,6 @@ mod tests {
                 ..tx(1)
             })
         );
-    }
-
-    /// The arms license different aborts, so two records agreeing on
-    /// everything but the evidence are different claims.
-    #[test]
-    fn every_arm_at_one_moment_gives_its_own_leaf() {
-        let moment = WeightedTimestamp::from_millis(1_000);
-        let heard = |question, word| {
-            AbandonmentRecord::heard(
-                ShardId::ROOT,
-                Heard {
-                    question,
-                    word,
-                    at: moment,
-                },
-                [tx(1)],
-            )
-        };
-        let digest = Hash::from_bytes(b"digest");
-        let records = [
-            AbandonmentRecord::departed(ShardId::ROOT, moment, [tx(1)]),
-            heard(
-                Question::Verdict,
-                Word::Refused {
-                    decision: TransactionDecision::Reject,
-                    digest,
-                },
-            ),
-            heard(
-                Question::Verdict,
-                Word::Refused {
-                    decision: TransactionDecision::Aborted,
-                    digest,
-                },
-            ),
-            heard(Question::Cell(Probed::Core), Word::Absent),
-            heard(Question::Cell(Probed::Delivery), Word::Absent),
-            heard(Question::Cell(Probed::Claim), Word::Absent),
-        ];
-        let mut roots: Vec<AbandonmentRoot> = records.iter().map(root_of).collect();
-        roots.sort_unstable();
-        roots.dedup();
-        assert_eq!(roots.len(), records.len());
     }
 
     /// Verification is the recomputation, so a claimed root the records do

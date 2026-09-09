@@ -271,10 +271,6 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaims_admitted", None, 1);
     }
 
-    fn record_verdict_claim_deferred(&self) {
-        self.inc("verdict_claims_deferred", None, 1);
-    }
-
     fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
         self.inc("fetch_responses_refused", Some(kind), 1);
         self.inc(

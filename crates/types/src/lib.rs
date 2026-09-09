@@ -144,10 +144,7 @@ pub use receipt::event::{
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
-pub use shard::abandonment::{
-    AbandonmentRecord, AbortCharge, CounterpartEvidence, Heard, Question, Resolutions, UnsettledTx,
-    Word,
-};
+pub use shard::abandonment::{AbandonmentRecord, AbortCharge, Resolutions, UnsettledTx};
 pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
@@ -168,13 +165,12 @@ pub use shard::header::{
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
-    ABANDONMENT_RECORD_BYTES, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_DRAIN_WORK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, UNSETTLED_TX_BYTES, drain_admits_block,
-    evidence_admits_block, sweep_admits_block,
+    ABANDONMENT_RECORD_BYTES, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
+    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
+    UNSETTLED_TX_BYTES, drain_admits_block, evidence_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
