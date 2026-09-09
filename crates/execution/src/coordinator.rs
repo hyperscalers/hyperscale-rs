@@ -476,7 +476,7 @@ impl ExecutionCoordinator {
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
-        evidence: Arc<CounterpartMirror>,
+        mirror: Arc<CounterpartMirror>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -506,7 +506,7 @@ impl ExecutionCoordinator {
                 local_shard,
                 proven_anchors,
                 proven_cells,
-                evidence,
+                mirror,
                 &recovered.inherited_records,
             ),
             finalized,
@@ -1121,7 +1121,7 @@ impl ExecutionCoordinator {
                 // the crossing and the record is deleted; absent past
                 // the lapse, nobody took it and the value goes back.
                 match record.answer {
-                    Some(Inclusion::Present(_)) => Some(Licence::Accepted),
+                    Some(Inclusion::Present(_)) => Some(Licence::Claimed),
                     Some(Inclusion::Absent) => Some(Licence::Unclaimed),
                     None => None,
                 }
@@ -1185,7 +1185,7 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Some(transaction),
                 records,
-                Licence::Accepted,
+                Licence::Claimed,
                 charged,
             );
         }
@@ -1214,7 +1214,7 @@ impl ExecutionCoordinator {
         // the claims were. Every other settlement is this shard's verdict
         // on the transaction.
         let membership = match on {
-            Licence::Accepted => Membership::housekeeping(local_shard),
+            Licence::Claimed => Membership::housekeeping(local_shard),
             Licence::Unclaimed | Licence::OwnLeaf => {
                 Membership::whole(BTreeSet::from([local_shard])).settling()
             }
@@ -3087,7 +3087,7 @@ impl ExecutionCoordinator {
                 // refuses. Which clock each runs on is already applied —
                 // an entry reaches here only past its own abandon
                 // window's opening.
-                self.counterparts.ledger.is_unsettleable(tx_hash)
+                self.counterparts.ledger.is_covered(tx_hash)
                     || self.counterparts.ledger.is_delivery(tx_hash)
                     || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
             }
@@ -3104,7 +3104,7 @@ impl ExecutionCoordinator {
     /// the one that was left it unsettled.
     fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
         !self.counterparts.ledger.reaches_beyond(tx_hash)
-            || self.counterparts.ledger.is_unsettleable(tx_hash)
+            || self.counterparts.ledger.is_covered(tx_hash)
     }
 
     /// Let go of what this shard holds against transactions no shard can
@@ -8362,7 +8362,7 @@ mod tests {
         // The committed claim is what releases the member: the entry is
         // covered, and a covered entry is the shard's to abandon.
         let _ = figures;
-        assert!(state.counterparts.ledger.is_unsettleable(tx_hash));
+        assert!(state.counterparts.ledger.is_covered(tx_hash));
         let held_by = state
             .ticks
             .tick_assignment(tx_hash)
@@ -8715,7 +8715,7 @@ mod tests {
             matches!(
                 inherited_settlement(true),
                 Some(Runs::Settle {
-                    on: Licence::Accepted,
+                    on: Licence::Claimed,
                     ..
                 })
             ),
@@ -8863,7 +8863,7 @@ mod tests {
         assert!(matches!(
             request.runs,
             Runs::Settle {
-                on: Licence::Accepted,
+                on: Licence::Claimed,
                 ..
             }
         ));
@@ -8926,7 +8926,7 @@ mod tests {
         assert!(matches!(
             request.runs,
             Runs::Settle {
-                on: Licence::Accepted,
+                on: Licence::Claimed,
                 ..
             }
         ));
@@ -9553,7 +9553,7 @@ mod tests {
             .counterparts
             .ledger
             .record_abandonment_records(&records);
-        assert!(state.counterparts.ledger.is_unsettleable(tx_hash));
+        assert!(state.counterparts.ledger.is_covered(tx_hash));
 
         // And what it does not offer twice.
         assert!(

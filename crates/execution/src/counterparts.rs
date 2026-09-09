@@ -252,10 +252,10 @@ impl Counterparts {
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
-        evidence: Arc<CounterpartMirror>,
+        mirror: Arc<CounterpartMirror>,
         records: &[(SubstateKey, Vec<u8>)],
     ) -> Self {
-        let mut counterparts = Self::new(local_shard, proven_anchors, proven_cells, evidence);
+        let mut counterparts = Self::new(local_shard, proven_anchors, proven_cells, mirror);
         counterparts.inherited = records
             .iter()
             .filter_map(|(key, value)| {
@@ -710,10 +710,10 @@ impl Counterparts {
     /// Tell the mempool a core's refusal of a transaction a leg here
     /// issued for: the verdict, as the counterpart's certificate carries
     /// it. Nothing is written down — what licenses taking the crossing
-    /// back is the claim cell a refusing core never writes, read absent
-    /// past the deadline — and the mempool reads a verdict it already
-    /// holds as nothing new.
-    pub fn fold_verdict(
+    /// back is the committed cell the refusal retracts, read absent past
+    /// the deadline — and the mempool reads a verdict it already holds
+    /// as nothing new.
+    pub fn relay_refusal(
         &self,
         shard: ShardId,
         tx_hash: TxHash,
@@ -902,7 +902,7 @@ impl Counterparts {
         let mut actions = Vec::new();
         for (tx_hash, spoken) in ec.verdicts() {
             actions.extend(match spoken {
-                Spoken::Refused(decision) => self.fold_verdict(shard, tx_hash, decision),
+                Spoken::Refused(decision) => self.relay_refusal(shard, tx_hash, decision),
                 Spoken::Claimed { at } => self.fold_claimed(shard, tx_hash, at),
             });
         }

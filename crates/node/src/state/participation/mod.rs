@@ -153,7 +153,7 @@ impl ShardParticipation {
             finalization_store,
             Arc::clone(shard_coordinator.proven_anchors()),
             Arc::clone(shard_coordinator.proven_cells()),
-            Arc::clone(shard_coordinator.evidence()),
+            Arc::clone(shard_coordinator.mirror()),
         );
         Self {
             local_shard,

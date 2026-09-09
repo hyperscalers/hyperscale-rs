@@ -474,7 +474,7 @@ pub struct ShardCoordinator {
     /// equality on the anchor — and a voter that does not hold the
     /// evidence defers. One mirror rather than a copy, so a record
     /// cannot pass here that its own composer would not have offered.
-    evidence: Arc<CounterpartMirror>,
+    mirror: Arc<CounterpartMirror>,
 
     /// Commit-proven anchors of remote shards — the root and parent-QC
     /// clock each header carries — mirrored off `RemoteHeaderCommitted`
@@ -670,7 +670,7 @@ impl ShardCoordinator {
             precut: Precut::succeeding(recovered.predecessors),
             precut_generation: 0,
             fence_seen: (0, 0, 0, 0),
-            evidence: Arc::new(CounterpartMirror::new()),
+            mirror: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
             proven_cells: Arc::new(ProvenCells::new()),
         }
@@ -960,8 +960,8 @@ impl ShardCoordinator {
     /// The counterpart mirror the vote fence reads, for the execution
     /// coordinator to write.
     #[must_use]
-    pub const fn evidence(&self) -> &Arc<CounterpartMirror> {
-        &self.evidence
+    pub const fn mirror(&self) -> &Arc<CounterpartMirror> {
+        &self.mirror
     }
 
     /// The mirror, for the execution coordinator to read the same bytes
@@ -995,7 +995,7 @@ impl ShardCoordinator {
     /// The evidence a vote is fenced on, borrowed for one judgment.
     fn vote_fence(&self) -> VoteFence<'_> {
         VoteFence {
-            evidence: &self.evidence,
+            mirror: &self.mirror,
             proven_anchors: &self.proven_anchors,
             proven_cells: &self.proven_cells,
             precut: &self.precut,
@@ -1013,7 +1013,7 @@ impl ShardCoordinator {
     /// were deferred on what it wrote.
     pub fn take_fence_evidence_advanced(&mut self) -> bool {
         let now = (
-            self.evidence.generation(),
+            self.mirror.generation(),
             self.proven_anchors.generation(),
             self.proven_cells.generation(),
             self.precut_generation,
@@ -11398,7 +11398,7 @@ mod tests {
 
         assert_eq!(
             settled_set_verdict(
-                &coord.evidence().with_settled(Clone::clone),
+                &coord.mirror().with_settled(Clone::clone),
                 &sched,
                 coord.local_shard,
                 WeightedTimestamp::from_millis(AFTER_CUT_MS),
@@ -11459,7 +11459,7 @@ mod tests {
     fn a_record_the_schedule_attests_is_voted_on() {
         let coord = fence_coordinator();
         coord
-            .evidence()
+            .mirror()
             .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(
@@ -11481,7 +11481,7 @@ mod tests {
         let block = block_with_records(AFTER_CUT_MS, records);
 
         let stranger = fence_coordinator();
-        stranger.evidence().record_settled(
+        stranger.mirror().record_settled(
             ShardId::ROOT,
             root_settled(b"other"),
             parties_of(b"other"),
@@ -11632,7 +11632,7 @@ mod tests {
     #[test]
     fn a_record_naming_what_the_departed_shard_settled_is_refused() {
         let coord = fence_coordinator();
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11720,7 +11720,7 @@ mod tests {
     fn fence_rejects_an_abandonment_a_terminated_shard_settled() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11744,7 +11744,7 @@ mod tests {
     fn fence_admits_an_abandonment_the_settled_set_does_not_name() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
@@ -11787,9 +11787,7 @@ mod tests {
     fn fence_admits_an_abandonment_a_committed_record_covers() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord
-            .evidence()
-            .cover(TxHash::from(Hash::from_bytes(b"tx")));
+        coord.mirror().cover(TxHash::from(Hash::from_bytes(b"tx")));
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
             coord
@@ -11797,7 +11795,7 @@ mod tests {
                 .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             Ok(())
         ));
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11821,7 +11819,7 @@ mod tests {
     fn the_abandonment_scan_leaves_a_settlement_alone() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11851,7 +11849,7 @@ mod tests {
     fn the_abandonment_scan_leaves_a_verdict_that_awaited_nobody_alone() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11893,7 +11891,7 @@ mod tests {
     fn fence_passes_when_tick_settled() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -11919,7 +11917,7 @@ mod tests {
     fn fence_rejects_unsettled_tick() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: BTreeSet::new(),
@@ -11947,7 +11945,7 @@ mod tests {
     fn fence_rejects_past_the_evidence_window() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12076,7 +12074,7 @@ mod tests {
         // Record ROOT's settled set including the straddler's tick, then
         // re-drive: the fence now passes, so the block proceeds to
         // verification.
-        coord.evidence().record_settled(
+        coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
