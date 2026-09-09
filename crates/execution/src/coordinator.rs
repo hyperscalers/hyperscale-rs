@@ -3951,7 +3951,7 @@ mod tests {
 
     use super::*;
     use crate::counterparts::Inherited;
-    use crate::unresolved::{Kept, Part};
+    use crate::unresolved::Part;
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -7519,16 +7519,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                leg_classified(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &leg_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         state
             .counterparts
@@ -7611,16 +7602,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                leg_classified(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &leg_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         assert!(
             state.counterparts.mirror.all().is_empty(),
@@ -7698,16 +7680,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                leg_classified(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &leg_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let certificate = |outcome: ExecutionOutcome| {
@@ -7789,16 +7762,7 @@ mod tests {
         accepting
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        accepting.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                leg_classified(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &leg_classified())]);
         let before = accepting.counterparts.mirror.generation();
         let actions = accepting.handle_attestation(
             &schedule,
@@ -7851,22 +7815,13 @@ mod tests {
     /// committed cell is ever asked about.
     fn leg_state(
         transaction: &Arc<Verifiable<Transaction>>,
-        classified: Classified,
+        classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
             .counterparts
             .ledger
-            .register_committed([(transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            transaction.hash(),
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                classified,
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
+            .register_committed([(transaction, classified)]);
         state.counterparts.ledger.certify(transaction.hash());
         state
     }
@@ -7969,22 +7924,6 @@ mod tests {
     }
 
     /// The part a leg plays, with the cells a fixture names for it.
-    fn leg_part(
-        body: Arc<Verified<Transaction>>,
-        classified: Classified,
-        deliveries: Vec<(ShardId, SubstateKey)>,
-        claims: Vec<(ShardId, SubstateKey)>,
-    ) -> Part {
-        let core = classified.core().clone();
-        Part::leg(Kept {
-            body,
-            classified,
-            core,
-            deliveries,
-            claims,
-        })
-    }
-
     /// The absences of `tx_hash` at [`PEER`] handed to the fence among
     /// mirror.
     fn absences_observed(state: &ExecutionCoordinator, tx_hash: TxHash) -> Vec<Heard> {
@@ -8045,24 +7984,12 @@ mod tests {
         let figures = UnsettledTx::for_transaction(&transaction);
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
-        let claim = SubstateKey {
-            owner: test_prefix(0x81),
-            local: LocalKey([0xC1; 16]),
-        };
+        let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                delivery_classified(),
-                vec![(PEER, claim)],
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
@@ -8114,24 +8041,12 @@ mod tests {
         let later = deadline
             .plus(MAX_VALIDITY_RANGE)
             .plus(Duration::from_secs(1));
-        let claim = SubstateKey {
-            owner: test_prefix(0x81),
-            local: LocalKey([0xC1; 16]),
-        };
+        let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                delivery_classified(),
-                vec![(PEER, claim)],
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
         assert_eq!(
@@ -8174,24 +8089,12 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let claim = SubstateKey {
-            owner: test_prefix(0x81),
-            local: LocalKey([0xC4; 16]),
-        };
+        let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                delivery_classified(),
-                vec![(PEER, claim)],
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let lapse = Window::Lapse
@@ -8235,11 +8138,9 @@ mod tests {
         let figures = UnsettledTx::for_transaction(&transaction);
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
-        // An owner under the peer's left child, as the trie cuts it.
-        let claim = SubstateKey {
-            owner: test_prefix(0x81),
-            local: LocalKey([0xC1; 16]),
-        };
+        // The delivery's target falls under the peer's left child, as
+        // the trie cuts it.
+        let claim = delivered_claim(&delivery_classified());
         assert_eq!(
             schedule.head().shard_trie().shard_for_prefix(claim.owner),
             successor,
@@ -8249,16 +8150,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .register_committed([(&transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            tx_hash,
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                delivery_classified(),
-                vec![(PEER, claim)],
-                Vec::new(),
-            ),
-        );
+            .register_committed([(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         // The local chain has crossed the peer's cut: its committee is
         // anchored in a window whose trie names the children.
@@ -8336,7 +8228,7 @@ mod tests {
             transaction.validity_range().end_timestamp_exclusive,
         );
         let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
-        let mut state = leg_state(&transaction, two_shard_core_classified());
+        let mut state = leg_state(&transaction, &two_shard_core_classified());
         let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
             (3, deadline.minus(Duration::from_millis(1)), b"short"),
             (5, deadline.plus(Duration::from_secs(1)), b"later"),
@@ -8385,8 +8277,12 @@ mod tests {
         let (bundle, opened) = proven_at(&mut state, &schedule, CORE, 5, later, &[], &[key]);
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![key])],
-            "the newest header inside the window is the anchor"
+            vec![(
+                bundle.anchor,
+                vec![key, core_claim(&two_shard_core_classified())]
+            )],
+            "the newest header inside the window is the anchor, and the consumer's claim is \
+             asked beside the committed cell"
         );
         assert!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
@@ -8461,12 +8357,16 @@ mod tests {
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
-        let mut state = leg_state(&transaction, two_shard_core_classified());
+        let mut state = leg_state(&transaction, &two_shard_core_classified());
         state.committed_ts = deadline;
         let (bundle, opened) = proven_at(&mut state, &schedule, CORE, 4, deadline, &[key], &[key]);
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![key])]
+            vec![(
+                bundle.anchor,
+                vec![key, core_claim(&two_shard_core_classified())]
+            )],
+            "the committed cell is asked about, and the consumer's claim beside it"
         );
 
         let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
@@ -8590,7 +8490,7 @@ mod tests {
         let deadline = figures.deadline.at();
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
-        let mut state = leg_state(&transaction, two_shard_core_classified());
+        let mut state = leg_state(&transaction, &two_shard_core_classified());
         state.committed_ts = deadline;
 
         // The lowest core shard committed the transaction; its sibling
@@ -8606,7 +8506,11 @@ mod tests {
         );
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(included.anchor, vec![cell(CORE)])],
+            vec![(
+                included.anchor,
+                vec![cell(CORE), core_claim(&two_shard_core_classified())]
+            )],
+            "the shard holding the consumer's target is asked about its claim too",
         );
         let (never, opened) = proven_at(
             &mut state,
@@ -8657,7 +8561,7 @@ mod tests {
         transaction: &Arc<Verifiable<Transaction>>,
         claim: SubstateKey,
     ) -> ExecutionCoordinator {
-        claimed_leg_state_under(transaction, claim, leg_classified())
+        claimed_leg_state_under(transaction, claim, &leg_classified())
     }
 
     /// [`claimed_leg_state`] with the shape frozen as `classified` says:
@@ -8665,21 +8569,21 @@ mod tests {
     fn claimed_leg_state_under(
         transaction: &Arc<Verifiable<Transaction>>,
         claim: SubstateKey,
-        classified: Classified,
+        classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
             .counterparts
             .ledger
-            .register_committed([(transaction, &Classified::whole())]);
-        state.counterparts.ledger.seed(
-            transaction.hash(),
-            leg_part(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-                classified,
-                Vec::new(),
-                vec![(PEER, claim)],
-            ),
+            .register_committed([(transaction, classified)]);
+        assert_eq!(
+            state.counterparts.ledger.cells()[0]
+                .claims
+                .iter()
+                .map(|(_, key)| *key)
+                .collect::<Vec<_>>(),
+            vec![claim],
+            "the claim the fixture asks about is the one the shape derives",
         );
         state.counterparts.ledger.certify(transaction.hash());
         state.committed_ts = UnsettledTx::for_transaction(transaction).deadline.at();
@@ -8697,18 +8601,9 @@ mod tests {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
         let deadline = figures.deadline.at();
-        let core_key = committed_tx_cell_key(
-            PEER,
-            tx_hash,
-            transaction.validity_range().end_timestamp_exclusive,
-        );
-        let claim = SubstateKey {
-            owner: core_key.owner,
-            local: LocalKey([0x7C; 16]),
-        };
+        let claim = core_claim(&leg_classified());
         let mut state = claimed_leg_state(&transaction, claim);
         let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 4, deadline, &[], &[claim]);
         assert_eq!(
@@ -8767,11 +8662,8 @@ mod tests {
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
-        let claim = SubstateKey {
-            owner: core_key.owner,
-            local: LocalKey([0x7C; 16]),
-        };
-        let mut state = claimed_leg_state_under(&transaction, claim, two_shard_core_classified());
+        let claim = core_claim(&two_shard_core_classified());
+        let mut state = claimed_leg_state_under(&transaction, claim, &two_shard_core_classified());
         let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
@@ -8927,12 +8819,9 @@ mod tests {
         );
     }
 
-    /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`
-    /// under `local`, with the transaction, its figures and the claim
-    /// key beside it.
-    fn consumer_claim_fixture(
-        local: u8,
-    ) -> (
+    /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
+    /// with the transaction, its figures and the claim key beside it.
+    fn consumer_claim_fixture() -> (
         Arc<Verifiable<Transaction>>,
         UnsettledTx,
         SubstateKey,
@@ -8942,15 +8831,7 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let figures = UnsettledTx::for_transaction(&transaction);
-        let claim = SubstateKey {
-            owner: committed_tx_cell_key(
-                PEER,
-                transaction.hash(),
-                transaction.validity_range().end_timestamp_exclusive,
-            )
-            .owner,
-            local: LocalKey([local; 16]),
-        };
+        let claim = core_claim(&leg_classified());
         let state = claimed_leg_state(&transaction, claim);
         (transaction, figures, claim, state)
     }
@@ -8966,7 +8847,7 @@ mod tests {
     #[test]
     fn a_cued_claim_waits_for_the_cell_to_be_readable() {
         let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
         let claimed_at = figures.deadline.at().minus(Duration::from_secs(5));
         state
             .counterparts
@@ -9011,7 +8892,7 @@ mod tests {
     #[test]
     fn a_claim_proved_present_licenses_the_retirement_off_the_claim_alone() {
         let schedule = two_shard_topology();
-        let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let (bundle, opened) = proven_at(
@@ -9096,7 +8977,7 @@ mod tests {
     #[test]
     fn a_consumers_acceptance_cues_the_probe_and_the_presence_retires() {
         let schedule = two_shard_topology();
-        let (transaction, figures, _, mut state) = consumer_claim_fixture(0x7D);
+        let (transaction, figures, _, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -9185,7 +9066,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let (transaction, _, _, mut state) = consumer_claim_fixture(0x7E);
+        let (transaction, _, _, mut state) = consumer_claim_fixture();
         let tx_hash = transaction.hash();
         let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             TickId::new(PEER, BlockHeight::new(5)),
@@ -9510,19 +9391,47 @@ mod tests {
         classified
     }
 
-    /// A shape frozen divided with its core on a leaf no held header
-    /// names, so only the leg's deliveries are ever probed.
+    /// A shape frozen divided with an inbound leg on [`HOME`] delivered
+    /// on [`PEER`], whose core of one shard sits beside the delivery and
+    /// writes no committed cell — so only the leg's delivery is ever
+    /// probed.
     fn delivery_classified() -> Classified {
         use hyperscale_vm_types::LegRole;
 
         use crate::fixtures::leg;
         let legs = [
             leg(0, LegRole::Inbound, &[]),
-            leg(3, LegRole::Core, &[(0, 0)]),
+            leg(2, LegRole::Core, &[]),
+            leg(2, LegRole::Outbound, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(2));
-        assert_eq!(classified.core(), &BTreeSet::from([ShardId::leaf(2, 3)]));
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([PEER]));
+        assert!(classified.decomposed());
         classified
+    }
+
+    /// The claim cell the core writes for what `classified` says
+    /// [`HOME`] issued, under the shard holding the consumer's target.
+    fn core_claim(classified: &Classified) -> SubstateKey {
+        let claims = classified.core_claims(HOME);
+        assert_eq!(
+            claims.len(),
+            1,
+            "the fixture issues one crossing to the core"
+        );
+        claims[0].1
+    }
+
+    /// The claim cell a delivery writes for what `classified` says
+    /// [`HOME`] issued.
+    fn delivered_claim(classified: &Classified) -> SubstateKey {
+        let claims = classified.delivered_claims(HOME);
+        assert_eq!(
+            claims.len(),
+            1,
+            "the fixture issues one crossing to a delivery"
+        );
+        claims[0].1
     }
 
     /// [`HOME`] beside [`CORE`] and [`CORE_SIBLING`], all live: the

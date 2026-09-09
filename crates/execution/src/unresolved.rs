@@ -357,13 +357,13 @@ impl Part {
     /// Whether a core issuer still holds crossings its deliveries owe a
     /// claim for, so its verdict resolves the transaction and leaves the
     /// entry standing for the reclaim.
-    fn issued(&self) -> bool {
+    fn issued(&self, local: ShardId) -> bool {
         matches!(self.role, Role::Core)
             && !self.resolved
             && self
                 .kept
                 .as_ref()
-                .is_some_and(|kept| !kept.deliveries.is_empty())
+                .is_some_and(|kept| !kept.deliveries(local).is_empty())
     }
 
     /// Keep the entry on for the reclaim of what its deliveries never
@@ -417,17 +417,6 @@ impl Part {
         let kept = Kept {
             body,
             classified: classified.clone(),
-            // For a core issuer this is also what its own settlement
-            // waits on, which a leg's never is.
-            core: classified.core().clone(),
-            deliveries: classified.delivered_claims(local),
-            // A core member's consumers run beside it; only a leg hands
-            // value to a core it is not in.
-            claims: if in_core {
-                Vec::new()
-            } else {
-                classified.core_claims(local)
-            },
         };
         if in_core {
             Self::core(kept)
@@ -443,26 +432,48 @@ impl Part {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
     pub body: Arc<Verified<Transaction>>,
-    /// The classification the committing block froze, which a reclaim
-    /// reads its edges and its scope from.
+    /// The classification the committing block froze, which every cell
+    /// the entry asks about and every scope a settlement runs under is
+    /// read off.
     pub classified: Classified,
+}
+
+impl Kept {
     /// Whose refusal is the transaction's, and the arity an absent
     /// committed cell is read against. An issuer in the core holds the
     /// core it is part of, itself included; the prober skips this shard,
     /// since what it has committed is not something it fetches a proof
     /// of. Empty for a shape with no core.
-    pub core: BTreeSet<ShardId>,
-    /// The claim cells deliveries elsewhere write for the crossings this
-    /// shard issued, each under the shard that was to deliver it when
+    const fn core(&self) -> &BTreeSet<ShardId> {
+        self.classified.core()
+    }
+
+    /// The claim cells deliveries elsewhere write for the crossings
+    /// `local` issued, each under the shard that was to deliver it when
     /// the transaction committed — what a lapse probe asks about once
     /// the delivery window has closed. The cell follows its prefix to a
     /// departed deliverer's successor; the prober resolves that off the
     /// trie, since the ledger holds no topology.
-    pub deliveries: Vec<(ShardId, SubstateKey)>,
-    /// The claim cells core consumers write for the crossings a leg
-    /// here issued, each under the shard holding the consumer's target
-    /// — what a probe asks the core about past the deadline.
-    pub claims: Vec<(ShardId, SubstateKey)>,
+    fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.classified.delivered_claims(local)
+    }
+
+    /// The claim cells core consumers write for the crossings a leg on
+    /// `local` issued, each under the shard holding the consumer's
+    /// target — what a probe asks the core about past the deadline.
+    /// Empty for a core shard: a leg beside the core is the core's, so
+    /// nothing a core shard produces is claimed by a core it is not in.
+    fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.classified.core_claims(local)
+    }
+
+    /// Every claim cell a consumer elsewhere writes for what `local`
+    /// issued, whichever side consumes it.
+    fn every_claim(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        let mut claims = self.claims(local);
+        claims.extend(self.deliveries(local));
+        claims
+    }
 }
 
 /// A leg entry a committed record has licensed a settlement of, with
@@ -695,8 +706,8 @@ impl UnresolvedTxs {
         }
     }
 
-    /// Give a registered entry the part a fixture wants it to play, cells
-    /// and all, where the fixture's classification would not derive them.
+    /// Give a registered entry the part a fixture wants it to play,
+    /// where the block that committed it froze another.
     #[cfg(test)]
     pub fn seed(&mut self, tx_hash: TxHash, part: Part) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
@@ -711,7 +722,7 @@ impl UnresolvedTxs {
         self.owed
             .get(&tx_hash)
             .and_then(|owed| owed.part.kept())
-            .map(|kept| &kept.core)
+            .map(Kept::core)
     }
 
     /// The figures a record naming a leg entry restates, for one no
@@ -759,9 +770,8 @@ impl UnresolvedTxs {
     pub fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         let kept = self.owed.get(&tx_hash).and_then(|owed| owed.part.kept());
         kept.is_some_and(|kept| {
-            kept.claims
+            kept.every_claim(self.local)
                 .iter()
-                .chain(&kept.deliveries)
                 .any(|(_, claim)| ShardTrie::shard_owns_prefix(shard, claim.owner))
         })
     }
@@ -850,7 +860,7 @@ impl UnresolvedTxs {
                         probed,
                         key,
                         deadline: owed.figures.deadline,
-                        core: owed.part.kept().map_or(0, |kept| kept.core.len()),
+                        core: owed.part.kept().map_or(0, |kept| kept.core().len()),
                     });
                 }
             }
@@ -946,14 +956,14 @@ impl UnresolvedTxs {
                 // Its deliveries are what it waits on once it has a
                 // verdict, as the `Remainder` its acceptance leaves.
                 let (deliveries, claims) = if owed.part.is_leg() {
-                    (kept.deliveries.clone(), kept.claims.clone())
+                    (kept.deliveries(self.local), kept.claims(self.local))
                 } else {
                     (Vec::new(), Vec::new())
                 };
                 Some(Probeable {
                     tx_hash: *tx_hash,
                     deadline: owed.figures.deadline,
-                    core: kept.core.clone(),
+                    core: kept.core().clone(),
                     deliveries,
                     claims,
                     cued_at: owed.cued,
@@ -1035,10 +1045,9 @@ impl UnresolvedTxs {
             .filter(|(_, owed, _)| owed.covered.is_none() && !owed.claimed_by.is_empty())
             .filter_map(|(tx_hash, owed, kept)| {
                 let claims: Vec<SubstateKey> = kept
-                    .claims
-                    .iter()
-                    .chain(&kept.deliveries)
-                    .map(|(_, claim)| *claim)
+                    .every_claim(self.local)
+                    .into_iter()
+                    .map(|(_, claim)| claim)
                     .collect();
                 (!claims.is_empty()
                     && claims.iter().all(|claim| {
@@ -1388,6 +1397,7 @@ impl UnresolvedTxs {
         &mut self,
         finalizations: &[Arc<Verifiable<Finalization>>],
     ) -> Vec<(Anchor, SubstateKey)> {
+        let local = self.local;
         let mut released = Vec::new();
         for finalization in finalizations {
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
@@ -1408,7 +1418,7 @@ impl UnresolvedTxs {
                 // deliveries owe a claim for: its verdict resolves the
                 // transaction, and the entry stays on as a leg entry for
                 // the reclaim alone. One that refused issued nothing.
-                let issued = decision == TransactionDecision::Accept && owed.part.issued();
+                let issued = decision == TransactionDecision::Accept && owed.part.issued(local);
                 if issued {
                     owed.part.resolve();
                     owed.charged = true;
@@ -1599,7 +1609,7 @@ mod tests {
         test_prefix, test_principal,
     };
     use hyperscale_types::{
-        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard, LocalKey,
+        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard,
         MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified,
         WeightedTimestamp,
     };
@@ -1642,7 +1652,7 @@ mod tests {
     const SUCCESSOR: ShardId = ShardId::leaf(2, 3);
 
     /// A shape frozen divided with an inbound leg on `LOCAL` feeding a
-    /// core on `PARTNER`.
+    /// core on `PARTNER`: the leg issues one crossing the core claims.
     fn classified() -> Classified {
         use hyperscale_types::ShardTrie;
         use hyperscale_vm_types::LegRole;
@@ -1654,6 +1664,68 @@ mod tests {
         ];
         let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
+        classified
+    }
+
+    /// The claim cell the core writes for what `classified` says `LOCAL`
+    /// issued, under the shard holding the consumer's target.
+    fn core_claim(classified: &Classified) -> (ShardId, SubstateKey) {
+        let claims = classified.core_claims(LOCAL);
+        assert_eq!(
+            claims.len(),
+            1,
+            "the fixture issues one crossing to the core"
+        );
+        claims[0]
+    }
+
+    /// The claim cell a delivery writes for what `classified` says
+    /// `LOCAL` issued, under the shard that delivers it.
+    fn delivered_claim(classified: &Classified) -> (ShardId, SubstateKey) {
+        let claims = classified.delivered_claims(LOCAL);
+        assert_eq!(
+            claims.len(),
+            1,
+            "the fixture issues one crossing to a delivery"
+        );
+        claims[0]
+    }
+
+    /// A shape frozen divided with an inbound leg on `LOCAL` feeding an
+    /// outbound leg on `PARTNER` directly, the core sitting on `PARTNER`
+    /// beside it: the leg issues one crossing a delivery claims.
+    fn delivering() -> Classified {
+        use hyperscale_types::ShardTrie;
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Core, &[]),
+            leg(2, LegRole::Outbound, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
+        assert!(classified.decomposed());
+        classified
+    }
+
+    /// A shape frozen divided with `LOCAL` in the core — its sign-in
+    /// bears the verdict — and its withdraw delivered on `PARTNER`: an
+    /// issuer with one delivery owed a claim.
+    fn issuing() -> Classified {
+        use hyperscale_types::ShardTrie;
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Attesting, &[]),
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Outbound, &[(1, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([LOCAL]));
+        assert!(classified.decomposed());
         classified
     }
 
@@ -1684,45 +1756,18 @@ mod tests {
         EpochWindows::new(EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
     }
 
-    /// The body a leg entry keeps for its reclaim.
-    fn body(tx: &Arc<Verifiable<Transaction>>) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone()))
-    }
-
     fn commit(ledger: &mut UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>) {
-        ledger.register_committed([(tx, &Classified::whole())]);
+        commit_as(ledger, tx, &Classified::whole());
     }
 
-    /// The part a leg plays, with the cells a fixture names for it.
-    fn leg_part(
-        body: Arc<Verified<Transaction>>,
-        classified: Classified,
-        deliveries: Vec<(ShardId, SubstateKey)>,
-        claims: Vec<(ShardId, SubstateKey)>,
-    ) -> Part {
-        let core = classified.core().clone();
-        Part::leg(Kept {
-            body,
-            classified,
-            core,
-            deliveries,
-            claims,
-        })
-    }
-
-    /// The part an issuer plays, with the deliveries a fixture names.
-    fn issuer_part(
-        body: Arc<Verified<Transaction>>,
-        classified: Classified,
-        deliveries: Vec<(ShardId, SubstateKey)>,
-    ) -> Part {
-        Part::core(Kept {
-            body,
-            classified,
-            core: BTreeSet::new(),
-            deliveries,
-            claims: Vec::new(),
-        })
+    /// Commit `tx` frozen as `classified`, which is what fixes the part
+    /// this shard plays and every cell its entry asks about.
+    fn commit_as(
+        ledger: &mut UnresolvedTxs,
+        tx: &Arc<Verifiable<Transaction>>,
+        classified: &Classified,
+    ) {
+        ledger.register_committed([(tx, classified)]);
     }
 
     /// A record's name for `tx`, stating the terms a committing block
@@ -2378,12 +2423,8 @@ mod tests {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let leg = tx(4, 60_000);
         let whole = tx(5, 60_000);
-        commit(&mut ledger, &leg);
+        commit_as(&mut ledger, &leg, &classified());
         commit(&mut ledger, &whole);
-        ledger.seed(
-            leg.hash(),
-            leg_part(body(&leg), classified(), Vec::new(), Vec::new()),
-        );
         ledger.certify(leg.hash());
         ledger.certify(whole.hash());
 
@@ -2401,7 +2442,7 @@ mod tests {
                 deadline: Deadline::of(ms(60_000)),
                 core: BTreeSet::from([PARTNER]),
                 deliveries: Vec::new(),
-                claims: Vec::new(),
+                claims: vec![core_claim(&classified())],
                 cued_at: None,
             }],
             "at the deadline the leg is probeable and the whole entry is not"
@@ -2431,15 +2472,7 @@ mod tests {
     fn a_leg_delivered_elsewhere_is_probeable_with_its_claims() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let leg = tx(6, 60_000);
-        commit(&mut ledger, &leg);
-        let claim = SubstateKey {
-            owner: test_prefix(AWAY),
-            local: LocalKey([0xC1; 16]),
-        };
-        ledger.seed(
-            leg.hash(),
-            leg_part(body(&leg), classified(), vec![(PARTNER, claim)], Vec::new()),
-        );
+        commit_as(&mut ledger, &leg, &delivering());
         ledger.certify(leg.hash());
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -2449,7 +2482,7 @@ mod tests {
                 tx_hash: leg.hash(),
                 deadline: Deadline::of(ms(60_000)),
                 core: BTreeSet::from([PARTNER]),
-                deliveries: vec![(PARTNER, claim)],
+                deliveries: vec![delivered_claim(&delivering())],
                 claims: Vec::new(),
                 cued_at: None,
             }],
@@ -2474,19 +2507,11 @@ mod tests {
     /// and released by the reclaim's finalization.
     #[test]
     fn an_issuer_that_accepted_stays_on_as_a_remainder_for_its_deliveries() {
-        let claim = SubstateKey {
-            owner: test_prefix(AWAY),
-            local: LocalKey([0xC2; 16]),
-        };
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let resolved = |decision| {
             let tx = tx(8, 60_000);
             let mut ledger = UnresolvedTxs::new(LOCAL);
-            commit(&mut ledger, &tx);
-            ledger.seed(
-                tx.hash(),
-                issuer_part(body(&tx), classified(), vec![(PARTNER, claim)]),
-            );
+            commit_as(&mut ledger, &tx, &issuing());
             ledger.certify(tx.hash());
             let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
             ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
@@ -2508,8 +2533,8 @@ mod tests {
             vec![Probeable {
                 tx_hash: tx.hash(),
                 deadline: Deadline::of(ms(60_000)),
-                core: BTreeSet::new(),
-                deliveries: vec![(PARTNER, claim)],
+                core: BTreeSet::from([LOCAL]),
+                deliveries: vec![delivered_claim(&issuing())],
                 claims: Vec::new(),
                 cued_at: None,
             }],
@@ -2539,11 +2564,7 @@ mod tests {
     fn a_leg_entry_outlives_its_own_finalization_and_is_never_abandoned() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(4, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
 
         let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
@@ -2579,11 +2600,7 @@ mod tests {
     fn a_reclaim_charges_what_no_committed_finalization_settled() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(7, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
         ledger.record_abandonment_records(&[AbandonmentRecord::departed(
             PARTNER,
@@ -2630,11 +2647,7 @@ mod tests {
         );
 
         let leg = tx(2, 60_000);
-        commit(&mut ledger, &leg);
-        ledger.seed(
-            leg.hash(),
-            leg_part(body(&leg), classified(), Vec::new(), Vec::new()),
-        );
+        commit_as(&mut ledger, &leg, &classified());
         assert_eq!(
             fw(&ledger, make_leg_finalization(h, leg.hash())),
             vec![(leg.hash(), TxResolution::LegFinalized)],
@@ -2773,15 +2786,7 @@ mod tests {
 
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(8, 60_000);
-        commit(&mut ledger, &tx);
-        let claim = SubstateKey {
-            owner: test_prefix(AWAY),
-            local: LocalKey([0x77; 16]),
-        };
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), vec![(PARTNER, claim)]),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
         assert!(
             ledger.consumer_holds(tx.hash(), SUCCESSOR),
@@ -2807,15 +2812,7 @@ mod tests {
     fn a_committed_claim_licenses_the_retirement_and_its_finalization_releases_the_entry() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(8, 60_000);
-        commit(&mut ledger, &tx);
-        let claim = SubstateKey {
-            owner: test_prefix(AWAY),
-            local: LocalKey([0x77; 16]),
-        };
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), vec![(PARTNER, claim)]),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
@@ -2855,11 +2852,7 @@ mod tests {
     fn a_failed_legs_own_finalization_releases_its_entry() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(5, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
@@ -2888,11 +2881,7 @@ mod tests {
     fn a_record_licenses_the_reclaim_and_its_finalization_releases_the_entry() {
         let mut ledger = UnresolvedTxs::new(LOCAL);
         let tx = tx(6, 60_000);
-        commit(&mut ledger, &tx);
-        ledger.seed(
-            tx.hash(),
-            leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
-        );
+        commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash());
         assert!(
             ledger.reclaimable().is_empty(),
@@ -2967,11 +2956,7 @@ mod tests {
         for covered in [false, true] {
             let mut ledger = UnresolvedTxs::new(LOCAL);
             let tx = tx(5, 60_000);
-            commit(&mut ledger, &tx);
-            ledger.seed(
-                tx.hash(),
-                leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
-            );
+            commit_as(&mut ledger, &tx, &classified());
             ledger.certify(tx.hash());
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::departed(
