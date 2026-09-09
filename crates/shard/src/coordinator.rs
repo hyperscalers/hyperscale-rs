@@ -6697,8 +6697,8 @@ mod tests {
         Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
-        Word, settled_set_verdict, test_utils,
+        VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WitnessSources, Word, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -10420,10 +10420,7 @@ mod tests {
 
         // Past the round timeout, inside the progress window.
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
-        state.set_time(
-            LocalTimestamp::ZERO
-                .plus(hyperscale_types::VIEW_CHANGE_TIMEOUT + Duration::from_millis(1)),
-        );
+        state.set_time(LocalTimestamp::ZERO.plus(VIEW_CHANGE_TIMEOUT + Duration::from_millis(1)));
         assert!(
             !state.should_advance_round(),
             "content still landing here is worth the window",
