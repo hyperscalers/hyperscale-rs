@@ -7,13 +7,11 @@ fail-fast = false
 # a test.
 slow-timeout = { period = "120s", terminate-after = 5 }
 
-# Cluster sims hold multi-node state in memory; on 4-thread runners this caps
-# them at two concurrent so they don't exhaust the 16GB of RAM. The ci feature
-# runs sims at the production 5-minute epoch (hyperscale-simulator inherits it
-# through its simulation dependency), and hosted 4-core runners execute ~2.7x
-# slower than a 16-core dev machine, so the largest reshape sims legitimately
-# may need ~2 hours.
+# The ci feature runs sims at the production 5-minute epoch
+# (hyperscale-simulator inherits it through its simulation dependency), so the
+# largest reshape sims run far longer than the rest of the suite and need their
+# own slow-timeout. A sim holds multi-node state in memory but peaks near 1 GiB
+# per process, so a 4-vCPU/16 GiB runner seats one per thread without pressure.
 [[profile.ci.overrides]]
 filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
-threads-required = 2
 slow-timeout = { period = "300s", terminate-after = 48 }
