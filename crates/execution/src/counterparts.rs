@@ -510,12 +510,12 @@ impl Counterparts {
                 // header, not of the same one every block.
                 if self
                     .ledger
-                    .probe_stands(entry.tx_hash, shard, probed, anchor.height)
+                    .probe_stands(entry.tx_hash, shard, key, anchor.height)
                 {
                     continue;
                 }
                 self.ledger
-                    .record_probe(entry.tx_hash, shard, probed, anchor, key);
+                    .record_probe(entry.tx_hash, shard, key, probed, anchor);
                 wanted.entry(anchor).or_default().push(key);
             }
         }
@@ -609,7 +609,7 @@ impl Counterparts {
                 .is_some()
             {
                 self.ledger
-                    .verify_probe(entry.tx_hash, entry.shard, entry.probed);
+                    .verify_probe(entry.tx_hash, entry.shard, entry.key);
                 answering.insert(entry.key);
                 speaks_for.insert(entry.tx_hash);
             }
@@ -750,10 +750,15 @@ impl Counterparts {
                 else {
                     continue;
                 };
-                // The question is answered, and a fetch still out
-                // for it is released with it.
+                // The question is answered with what the chain read,
+                // and a fetch still out for it is released with it. A
+                // claim cell present is the consumer holding the
+                // crossing, which is what licenses the retirement; a
+                // committed cell present says only that the core
+                // committed the transaction, and settles nothing.
                 let Some(Released(released)) =
-                    self.ledger.close_question(entry.tx_hash, shard, probed)
+                    self.ledger
+                        .close_question(entry.tx_hash, shard, key, probed, inclusion)
                 else {
                     continue;
                 };
@@ -771,16 +776,6 @@ impl Counterparts {
                             preferred: None,
                             class: None,
                         }));
-                        // A claim cell is written by the consuming
-                        // execution and by nothing else, so its
-                        // presence is the consumer holding the
-                        // crossing. A committed cell present says only
-                        // that the core committed the transaction,
-                        // which settles nothing — its certificate
-                        // speaks to that, and is fetched above.
-                        if matches!(probed, Probed::Claim | Probed::Delivery) {
-                            self.ledger.record_claimed(tx_hash, shard);
-                        }
                     }
                     Inclusion::Absent => {
                         self.mirror.record(
