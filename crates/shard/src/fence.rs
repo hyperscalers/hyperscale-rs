@@ -24,7 +24,7 @@ use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, Block, CounterpartEvidence, CounterpartMirror, Heard, ProvenAnchors,
     ProvenCells, Question, SettledSetVerdict, ShardId, StateClaim, TopologySchedule, UnsettledTx,
-    WeightedTimestamp, Word, settled_set_verdict,
+    WeightedTimestamp, settled_set_verdict,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -233,7 +233,7 @@ impl VoteFence<'_> {
     /// cell question sits inside the window the question is meaningful
     /// in for the name's deadline, and the word and the moment are the
     /// ones this validator itself mirrored — off the counterpart's
-    /// certificate, or off the proof the chain committed, which every
+    /// certificate, or off the claim the chain committed, which every
     /// replica folds at the same height. A voter holding no mirror
     /// cannot say and defers; one whose mirror disagrees refuses.
     fn heard_stands(
@@ -243,7 +243,6 @@ impl VoteFence<'_> {
         heard: Heard,
     ) -> Result<(), Withheld> {
         if let Question::Cell(probed) = heard.question
-            && heard.word != Word::Present
             && !probed.absence_answers_at(heard.at, entry.deadline)
         {
             return Err(Withheld::Refused(format!(
@@ -252,17 +251,8 @@ impl VoteFence<'_> {
                 entry.tx_hash, heard.at, entry.deadline
             )));
         }
-        // A presence is compared as a word and not as a moment. Its
-        // anchor carries no meaning — the cell is written by the one
-        // execution that consumes the crossing, so it is there or it is
-        // not, whenever the reading was taken — and two validators that
-        // probed at different headers of the same chain read the same
-        // fact. Holding them to one header would refuse a record for a
-        // race neither of them lost.
         match self.evidence.heard(entry.tx_hash, shard, heard.question) {
-            Some(mirrored)
-                if mirrored == heard
-                    || (heard.word == Word::Present && mirrored.word == Word::Present) => {}
+            Some(mirrored) if mirrored == heard => {}
             Some(mirrored) => {
                 return Err(Withheld::Refused(format!(
                     "abandonment record restates {heard:?} of {shard:?} for {}, which this \

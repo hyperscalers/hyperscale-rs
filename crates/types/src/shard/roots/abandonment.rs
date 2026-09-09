@@ -182,7 +182,6 @@ mod tests {
             heard(Question::Cell(Probed::Core), Word::Absent),
             heard(Question::Cell(Probed::Delivery), Word::Absent),
             heard(Question::Cell(Probed::Claim), Word::Absent),
-            heard(Question::Cell(Probed::Claim), Word::Present),
         ];
         let mut roots: Vec<AbandonmentRoot> = records.iter().map(root_of).collect();
         roots.sort_unstable();

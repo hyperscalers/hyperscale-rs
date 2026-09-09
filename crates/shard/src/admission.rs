@@ -517,18 +517,15 @@ impl<'a> RecordsFold<'a> {
 }
 
 impl RecordsSection<'_> {
-    /// Whether a record under `evidence` may name `tx_hash`: not one a
-    /// finalization in the same block resolves, and, for an abandoning
-    /// record, not one the chain already resolved.
+    /// Whether a record may name `tx_hash`: not one a finalization in
+    /// the same block resolves, and not one the chain already resolved.
     ///
-    /// A settling record names a transaction the chain resolved by
-    /// design — the issuer's own verdict committed before its consumer
-    /// could accept — so only an abandoning one is a request for a
-    /// second verdict, and one every replica would honour, since a
-    /// replica reconstructs the entry from the record precisely when it
-    /// cannot check the name against an account of its own. The
-    /// proposer trims a record to the names that stand and offers what
-    /// is left; the voter refuses a record naming one that does not.
+    /// A record is a request for a second verdict, and one every replica
+    /// would honour, since a replica reconstructs the entry from the
+    /// record precisely when it cannot check the name against an account
+    /// of its own. The proposer trims a record to the names that stand
+    /// and offers what is left; the voter refuses a record naming one
+    /// that does not.
     ///
     /// # Errors
     ///
@@ -536,7 +533,6 @@ impl RecordsSection<'_> {
     pub fn name_stands(
         ctx: &Admission<'_>,
         fold: &RecordsFold<'_>,
-        evidence: CounterpartEvidence,
         tx_hash: TxHash,
     ) -> Result<(), String> {
         if fold.finalizations.resolved_here.contains(&tx_hash) {
@@ -544,10 +540,7 @@ impl RecordsSection<'_> {
                 "abandonment record names {tx_hash}, which the same block resolves"
             ));
         }
-        if evidence.abandons() {
-            already_resolved(ctx, tx_hash)?;
-        }
-        Ok(())
+        already_resolved(ctx, tx_hash)
     }
 
     /// Whether a departure record's evidence is one the schedule
@@ -590,8 +583,8 @@ impl<'f> Section for RecordsSection<'f> {
     /// uniqueness and one encoding per claim set together — two records
     /// for one shard under one arm would leave which answer counts to
     /// the reader, and a reordering would be a second form of the same
-    /// block. One shard may carry several arms: what it claimed and
-    /// what it left unclaimed are different transactions. Both budgets
+    /// block. One shard may carry several arms: what it refused and
+    /// what it never took are different transactions. Both budgets
     /// are sums across every record, because the per-record decode cap
     /// alone would let a block spend either once per record.
     ///
@@ -623,7 +616,7 @@ impl<'f> Section for RecordsSection<'f> {
         }
         Self::evidence_stands(ctx, verdict)?;
         for tx_hash in verdict.tx_hashes() {
-            Self::name_stands(ctx, fold, verdict.evidence(), tx_hash)?;
+            Self::name_stands(ctx, fold, tx_hash)?;
         }
         let named = fold.named.saturating_add(verdict.unsettled().len());
         if named > MAX_UNSETTLED_PER_BLOCK {

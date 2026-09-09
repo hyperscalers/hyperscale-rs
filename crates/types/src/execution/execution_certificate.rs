@@ -37,8 +37,8 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 /// carry that word. A claiming success is a cue: it says the
 /// counterpart's execution went through, not that it wrote the claim
 /// the success promises — its own finalization can still be refused
-/// afterwards — so what a record stands on is the claim cell proved
-/// present, and the certificate only opens the question.
+/// afterwards — so what the retirement stands on is the claim cell
+/// proved present, and the certificate only opens the question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spoken {
     /// The counterpart refused it, at the vote anchor, named by the
