@@ -36,24 +36,21 @@ use hyperscale_types::{
 /// A probe is the fetch and nothing more. Its answer is read off the
 /// block that carries the claim, by every replica alike, so the
 /// standing is kept so one header is asked once — a question in flight
-/// is left alone, one whose fetch returned a reading that answered
-/// nothing is moved on to a newer header, one whose reading answered is
-/// held to offer — and, once the chain has answered, to hold what it
-/// said: the reading is what licenses the settlement of the crossing
-/// the cell was asked about, and it is never asked again.
+/// is left alone, one whose fetch returned is moved on to a newer
+/// header — and, once the chain has answered, to hold what it said: the
+/// reading is what licenses the settlement of the crossing the cell was
+/// asked about, and it is never asked again. A reading this validator
+/// fetched and holds to offer is not a standing: it is the validator's
+/// own, not the chain's, and the offers it keeps beside the ledger say
+/// so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
     /// A fetch against `anchor` is out.
     Asked(Anchor),
-    /// The fetch against `anchor` returned, and its reading answered
-    /// nothing — an absence outside its window, a claim absent, or a
-    /// committed cell present — so the question is put again at a
-    /// newer header.
+    /// The fetch against `anchor` returned, so the question is put
+    /// again at a newer header — unless the reading it brought back
+    /// answered, and is held to offer.
     Answered(Anchor),
-    /// The fetch against `anchor` returned with a reading that answers
-    /// the question for this validator, held to offer in a block it
-    /// proposes. Nothing is asked again until the chain answers.
-    Verified(Anchor),
     /// The chain answered, and this is what it read.
     Closed(Inclusion),
 }
@@ -79,7 +76,7 @@ fn outstanding_fetches(owed: &Owed) -> impl Iterator<Item = (Anchor, SubstateKey
         .iter()
         .filter_map(|(&(_, key), probe)| match probe.standing {
             Standing::Asked(anchor) => Some((anchor, key)),
-            Standing::Answered(_) | Standing::Verified(_) | Standing::Closed(_) => None,
+            Standing::Answered(_) | Standing::Closed(_) => None,
         })
 }
 
@@ -815,15 +812,15 @@ impl UnresolvedTxs {
     }
 
     /// Whether a probe of `key` on `shard` is already out, already
-    /// answered by this validator's own fetch or by the chain, or
-    /// returned a reading that answered nothing at `height` or newer.
+    /// answered by the chain, or returned at `height` or newer.
     ///
     /// A question in flight is left alone: a core's header lands every
     /// block, and moving the probe to each new one abandons the fetch
-    /// before its answer returns. One whose fetch returned a reading
-    /// that answered nothing is moved on, which is how a cell read
-    /// outside its window is asked again — at a newer header, not at
-    /// the same one every block.
+    /// before its answer returns. One whose fetch returned is moved on,
+    /// which is how a cell read outside its window is asked again — at
+    /// a newer header, not at the same one every block. Whether the
+    /// reading it brought back answered is not the ledger's to say: the
+    /// offers held beside it are.
     #[must_use]
     pub fn probe_stands(
         &self,
@@ -836,7 +833,7 @@ impl UnresolvedTxs {
             .get(&tx_hash)
             .and_then(|owed| owed.asked.cells.get(&(shard, key)))
             .is_some_and(|probe| match probe.standing {
-                Standing::Asked(_) | Standing::Verified(_) | Standing::Closed(_) => true,
+                Standing::Asked(_) | Standing::Closed(_) => true,
                 Standing::Answered(anchor) => anchor.height >= height,
             })
     }
@@ -889,22 +886,6 @@ impl UnresolvedTxs {
             }
         }
         answered
-    }
-
-    /// Record that the reading this validator's fetch took of `key` on
-    /// `shard` answers its question about `tx_hash`, so the question is
-    /// not put to a counterpart again for an answer already in hand.
-    ///
-    /// Kept apart from the mirror, which stays fed by committed content
-    /// alone so two validators at one committed height compose the
-    /// same records. What this licenses is narrower: not asking again.
-    pub fn verify_probe(&mut self, tx_hash: TxHash, shard: ShardId, key: SubstateKey) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash)
-            && let Some(probe) = owed.asked.cells.get_mut(&(shard, key))
-            && let Standing::Answered(anchor) = probe.standing
-        {
-            probe.standing = Standing::Verified(anchor);
-        }
     }
 
     /// Close the question `probed` asks of `key` on `shard` about
