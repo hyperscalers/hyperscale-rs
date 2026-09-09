@@ -194,12 +194,16 @@ pub struct Counterparts {
     /// composes nothing.
     pub(crate) proven_cells: Arc<ProvenCells>,
 
-    /// The readings this validator's own fetches took, each with the
-    /// transactions whose probes it spoke to, held to offer in a block
-    /// this validator proposes: a claim is committed content, folded by
-    /// every replica at the same height, and the fetch is only how the
-    /// proposer came by the answer. A claim leaves when a block carries
-    /// it, or when every transaction it answered for is gone.
+    /// The readings this validator's own fetches took that answered,
+    /// each with the transactions whose probes it spoke to, held to
+    /// offer in a block this validator proposes: a claim is committed
+    /// content, folded by every replica at the same height, and the
+    /// fetch is only how the proposer came by the answer. A claim leaves
+    /// when a block carries it, or when every transaction it answered
+    /// for is gone. While it is here the question it answers is not put
+    /// again: what licenses that is narrower than the mirror, which
+    /// stays fed by committed content alone so two validators at one
+    /// committed height compose the same records.
     fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
 
     /// The escrow records this shard inherited with a prefix, each still
@@ -433,15 +437,17 @@ impl Counterparts {
             else {
                 continue;
             };
-            // A question in flight, one this validator's own fetch
-            // answered and one the chain answered are left alone: a
-            // core's header lands every block, and moving a probe to
+            // A question in flight, one whose answer this validator
+            // holds to offer and one the chain answered are left alone:
+            // a core's header lands every block, and moving a probe to
             // each new one abandons the fetch before its answer
             // returns. A probe whose fetch returned a reading that
             // answered nothing is moved on, which is how a cell read
             // outside its window is asked again — at a newer header,
             // not of the same one every block.
-            if self.ledger.probe_stands(tx_hash, shard, key, anchor.height) {
+            if self.holds_answer(shard, key)
+                || self.ledger.probe_stands(tx_hash, shard, key, anchor.height)
+            {
                 continue;
             }
             self.ledger
@@ -483,6 +489,15 @@ impl Counterparts {
             .collect()
     }
 
+    /// Whether this validator holds an answering reading of `key` on
+    /// `shard` to offer, so the question is not put to a counterpart
+    /// again for an answer already in hand.
+    fn holds_answer(&self, shard: ShardId, key: SubstateKey) -> bool {
+        self.fetched
+            .keys()
+            .any(|claim| claim.anchor.shard == shard && claim.reading(key).is_some())
+    }
+
     /// Take what a fetched proof attests: hold it as proven, close the
     /// questions it answers, and keep the reading to offer in a block
     /// this validator proposes.
@@ -496,9 +511,9 @@ impl Counterparts {
     ///
     /// What the ledger did ask about is what is offered. The probes the
     /// proof spoke to are marked answered, so the question is not put to
-    /// the same header again, and the claim is kept beside the
-    /// transactions it answered for, dated to the clock the probe read
-    /// off the header.
+    /// the same header again, and a reading that answered is kept
+    /// beside the transactions it answered for, which is what keeps the
+    /// question from being put to any header until a block carries it.
     pub fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
@@ -538,8 +553,6 @@ impl Counterparts {
                 .answer(anchor.ts, question.deadline, inclusion)
                 .is_some()
             {
-                self.ledger
-                    .verify_probe(question.tx_hash, question.shard, question.key);
                 answering.insert(question.key);
                 speaks_for.insert(question.tx_hash);
             } else {
