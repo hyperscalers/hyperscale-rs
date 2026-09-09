@@ -603,8 +603,10 @@ impl Counterparts {
             let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key) else {
                 continue;
             };
-            if entry.probed.licenses(anchor.ts, entry.deadline, inclusion)
-                && entry.probed.read(inclusion, entry.core).is_some()
+            if entry
+                .probed
+                .answer(anchor.ts, entry.deadline, inclusion, entry.core)
+                .is_some()
             {
                 self.ledger
                     .verify_probe(entry.tx_hash, entry.shard, entry.probed);
@@ -694,9 +696,11 @@ impl Counterparts {
             let Some(inclusion) = stated.reading(claim) else {
                 continue;
             };
-            if !Probed::Delivery.licenses(stated.anchor.ts, record.deadline(), inclusion) {
+            let Some(inclusion) =
+                Probed::Delivery.answer(stated.anchor.ts, record.deadline(), inclusion, 0)
+            else {
                 continue;
-            }
+            };
             record.answer = Some(inclusion);
         }
     }
@@ -735,16 +739,15 @@ impl Counterparts {
                 let Some(inclusion) = claim.reading(key) else {
                     continue;
                 };
-                // Judged per word, not per anchor: an absence is
-                // read only inside its window, a presence wherever
-                // it was taken.
-                if !probed.licenses(claim.anchor.ts, entry.deadline, inclusion) {
-                    continue;
-                }
-                // Read by the one arity rule, whoever fetched the
-                // proof: a probe never sent may still be answered
-                // by a proof a block carries.
-                let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
+                // Judged per word and by the one arity rule, whoever
+                // fetched the proof: an absence is read only inside
+                // its window and only for the arity that writes the
+                // cell, a presence wherever it was taken — and a probe
+                // never sent may still be answered by a claim a block
+                // carries.
+                let Some(inclusion) =
+                    probed.answer(claim.anchor.ts, entry.deadline, inclusion, entry.core.len())
+                else {
                     continue;
                 };
                 // The question is answered, and a fetch still out
