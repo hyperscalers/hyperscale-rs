@@ -989,7 +989,8 @@ impl Counterparts {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, Hash, LocalKey, RoutePrefix, evidence_admits_block,
+        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Hash, LocalKey, RoutePrefix,
+        evidence_admits_block,
     };
 
     use super::*;
@@ -1007,6 +1008,10 @@ mod tests {
                     local: LocalKey([byte; 16]),
                 },
                 amount: 1,
+            },
+            committed: CommittedAt {
+                height: BlockHeight::new(1),
+                anchor: WeightedTimestamp::ZERO,
             },
             reach: (0..routes)
                 .map(|at| {

@@ -261,7 +261,7 @@ pub const fn evidence_admits_block(weight: usize) -> bool {
 pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
-pub const UNSETTLED_TX_BYTES: usize = 128;
+pub const UNSETTLED_TX_BYTES: usize = 144;
 
 /// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
 /// costs.

@@ -768,9 +768,27 @@ where
                 .filter(|tx| tx.try_derived(derivation.as_ref()).is_ok())
                 .map(|tx| (tx.hash(), tx))
                 .collect();
-            let verdict = Resolutions::of(entries, |tx_hash| {
-                held.get(&tx_hash)
-                    .map(|tx| UnsettledTx::for_transaction(tx))
+            // A name says where this chain committed its transaction,
+            // and the block at that height is what checks it: one this
+            // store holds either carries the transaction under the
+            // anchor the name states or refutes the name, and one it
+            // does not hold leaves the name unanswered, as a body it
+            // does not hold does.
+            let committed_at = |entry: &UnsettledTx| -> Option<bool> {
+                let height = entry.committed.height;
+                let carried = ctx.pending_chain.transactions_for_block(height)?;
+                let header = ctx.pending_chain.certified_header(height)?;
+                Some(
+                    carried.iter().any(|tx| tx.hash() == entry.tx_hash)
+                        && header.header().parent_qc().weighted_timestamp()
+                            == entry.committed.anchor,
+                )
+            };
+            let verdict = Resolutions::of(entries, |entry| {
+                let tx = held.get(&entry.tx_hash)?;
+                let restated = committed_at(entry)?
+                    && UnsettledTx::for_transaction(tx, entry.committed) == *entry;
+                Some(restated)
             })
             .and_deliveries(deliveries, |tx_hash| {
                 // A finalization resolving a name it does not decide is a

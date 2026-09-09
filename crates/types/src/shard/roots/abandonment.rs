@@ -37,8 +37,9 @@ impl LeafRoot for AbandonmentRoot {
 mod tests {
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, Deadline, Hash, LocalKey, RootMismatch, RoutePrefix,
-        ShardId, SubstateKey, TxHash, UnsettledTx, Verified, Verify, WeightedTimestamp,
+        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
+        RootMismatch, RoutePrefix, ShardId, SubstateKey, TxHash, UnsettledTx, Verified, Verify,
+        WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -52,6 +53,10 @@ mod tests {
                     local: LocalKey([seed; 16]),
                 },
                 amount: 11,
+            },
+            committed: CommittedAt {
+                height: BlockHeight::new(3),
+                anchor: WeightedTimestamp::from_millis(100),
             },
             reach: vec![RoutePrefix::of(Address::new(
                 [seed; 31],

@@ -6692,9 +6692,9 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, LeafRoot,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, RoutePrefix,
-        SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash,
+        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
+        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT,
         ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
@@ -11346,6 +11346,10 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
             declared_work: 5,
             charge: stub_abort_charge(5),
+            committed: CommittedAt {
+                height: BlockHeight::new(1),
+                anchor: WeightedTimestamp::ZERO,
+            },
             reach: vec![route(0xAA)],
         }
     }

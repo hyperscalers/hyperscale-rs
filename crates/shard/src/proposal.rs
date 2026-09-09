@@ -549,7 +549,7 @@ mod tests {
         test_transaction_running,
     };
     use hyperscale_types::{
-        Address, AddressClass, CommittedTxsRoot, Hash, MAX_SUBINTENTS,
+        Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, RoutePrefix, TimestampRange, TransactionDecision, UnsettledTx,
         ValidatorSet,
@@ -605,6 +605,10 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
             declared_work: 3,
             charge: stub_abort_charge(3),
+            committed: CommittedAt {
+                height: BlockHeight::new(1),
+                anchor: WeightedTimestamp::ZERO,
+            },
             reach: vec![RoutePrefix::of(Address::new(
                 [0x00; 31],
                 AddressClass::Principal,

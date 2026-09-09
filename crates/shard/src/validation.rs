@@ -443,8 +443,8 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash,
-        Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
+        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, Finalization,
+        Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
         NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions,
         QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield,
@@ -1111,6 +1111,10 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(900)),
             declared_work: 11,
             charge: stub_abort_charge(11),
+            committed: CommittedAt {
+                height: BlockHeight::new(1),
+                anchor: WeightedTimestamp::ZERO,
+            },
             reach: vec![route(0x00), route(0xC0)],
         }
     }

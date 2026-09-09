@@ -452,11 +452,11 @@ mod tests {
     use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
-        CertificateRoot, ChainOrigin, ConsensusReceipt, Deadline, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-        ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId,
-        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp,
-        WitnessSources,
+        BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+        LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
+        TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable,
+        WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -734,6 +734,10 @@ mod tests {
                 deadline: Deadline::of(WeightedTimestamp::from_millis(1_500)),
                 declared_work: 7,
                 charge: stub_abort_charge(7),
+                committed: CommittedAt {
+                    height: BlockHeight::new(1),
+                    anchor: WeightedTimestamp::from_millis(500),
+                },
                 reach: Vec::new(),
             }],
         )

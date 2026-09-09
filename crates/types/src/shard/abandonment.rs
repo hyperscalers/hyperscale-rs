@@ -25,20 +25,39 @@
 //! settle a transaction changes nothing this shard can act on — the
 //! transaction stays owed and unabandonable either way.
 //!
-//! Each name carries the figures composing the abort takes: the deadline
-//! it opens at, the reservation it returns, and the charge it settles.
-//! All are functions of the transaction body, so a proposer restates them
-//! and a voter holding the transaction checks the restatement — and a
-//! replica whose rebuild never reached the transaction's own block still
-//! holds enough to compose the same verdict as its peers.
+//! Each name carries the figures composing the abort takes — the deadline
+//! it opens at, the reservation it returns, and the charge it settles —
+//! and the block of this chain that committed the transaction, which is
+//! what dates the departure against it. The figures are functions of the
+//! transaction body and the commit is a fact of the chain, so a proposer
+//! restates them and a voter holding the transaction and the block
+//! checks the restatement — and a replica whose rebuild never reached
+//! the transaction's own block still holds enough to compose the same
+//! verdict as its peers.
 
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    ABANDONMENT_RECORD_BYTES, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VALIDITY_RANGE, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey,
-    Transaction, TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
+    ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
+    ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
+    UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
+
+/// Where a chain committed a transaction: the block, and the anchor it
+/// carried.
+///
+/// The anchor is what the block was admitted against — its parent
+/// QC's weighted timestamp — and so the instant its trie is read at:
+/// the trie that classified the transaction, routed its crossings, and
+/// named which shards were party to it. The height is where a replica
+/// reads that anchor off its own chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct CommittedAt {
+    /// The block that carried the transaction.
+    pub height: BlockHeight,
+    /// The anchor that block was admitted against.
+    pub anchor: WeightedTimestamp,
+}
 
 /// What an abort of one transaction burns, and out of whose vault.
 ///
@@ -71,6 +90,17 @@ pub struct UnsettledTx {
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
     pub charge: AbortCharge,
+    /// Where this chain committed the transaction.
+    ///
+    /// What dates a departure against the name: a shard that had left
+    /// the trie by this anchor was issued nothing of the transaction,
+    /// whatever its keyspace covered, while one still in it held the
+    /// route the crossing went to. A transaction whose validity opened
+    /// before a cut can commit here after it, so nothing read off the
+    /// body says which side of the cut the commit fell on — only the
+    /// chain does, and a name restates it so a replica holding no entry
+    /// dates the departure as one that held the block would.
+    pub committed: CommittedAt,
     /// The route every owner prefix the transaction touches takes,
     /// ascending — the whole reach, not one shard's share of it.
     ///
@@ -93,19 +123,20 @@ pub struct UnsettledTx {
 }
 
 impl UnsettledTx {
-    /// What abandoning `tx` states, read off the transaction itself.
+    /// What abandoning `tx`, which this chain committed at `committed`,
+    /// states.
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
     /// deadline is the transaction's own, the reservation is the
-    /// declared work, and the charge is the fee vault at the declared
-    /// price.
+    /// declared work, the charge is the fee vault at the declared price,
+    /// and the commit is the block's.
     ///
     /// # Panics
     ///
     /// As [`Transaction::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn for_transaction(tx: &Transaction) -> Self {
+    pub fn for_transaction(tx: &Transaction, committed: CommittedAt) -> Self {
         Self {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
@@ -114,6 +145,7 @@ impl UnsettledTx {
                 vault: tx.fee_vault(),
                 amount: tx.price(),
             },
+            committed,
             reach: tx.routing().all_routes(),
         }
     }
@@ -131,7 +163,8 @@ impl UnsettledTx {
 
     /// Whether `shard`, leaving at `cut`, was party to this transaction
     /// as seen from `local`: it held one of the transaction's remote
-    /// routes when the transaction committed, and left afterwards.
+    /// routes when this chain committed the transaction, and left
+    /// afterwards.
     ///
     /// `departures` is every departure the reader can see, as the shard
     /// and the cut its chain ended at. Owning the route and leaving
@@ -141,6 +174,15 @@ impl UnsettledTx {
     /// departure would abandon what the first already settled. The
     /// shard a record may name is the one that held the route then,
     /// which is the earliest departure over it after the commit.
+    ///
+    /// Dated by the block that committed the transaction here rather
+    /// than by anything the body fixes: a cut is an instant on the
+    /// chain's own clock, and the commit's anchor is the one reading
+    /// of that clock at which the trie was consulted for the
+    /// transaction. A window that opened before the cut says nothing —
+    /// the commit may still have fallen after it, routed to the
+    /// successor, which then holds a crossing the departed shard was
+    /// never issued.
     ///
     /// Read off the figures a record restates and the departures alone,
     /// so the ledger composing a record and the admission judging it
@@ -155,8 +197,8 @@ impl UnsettledTx {
         cut: WeightedTimestamp,
         departures: &[(ShardId, WeightedTimestamp)],
     ) -> bool {
-        let first_commit = self.first_commit();
-        cut > first_commit
+        let committed = self.committed.anchor;
+        cut > committed
             && self.reach.iter().any(|&route| {
                 !ShardTrie::shard_owns_route(local, route)
                     && ShardTrie::shard_owns_route(shard, route)
@@ -164,28 +206,12 @@ impl UnsettledTx {
                         .iter()
                         .filter(|(departed, departed_at)| {
                             ShardTrie::shard_owns_route(*departed, route)
-                                && *departed_at > first_commit
+                                && *departed_at > committed
                         })
                         .map(|(_, departed_at)| *departed_at)
                         .min()
                         .is_none_or(|first| first >= cut)
             })
-    }
-
-    /// The earliest instant any shard could have committed the
-    /// transaction: one validity range before its validity ends.
-    ///
-    /// What dates a departure against the entry — a shard that left
-    /// before this never held the transaction, whatever its keyspace
-    /// covers now. Read off the transaction rather than off the block
-    /// that committed it, because the block differs per shard and the
-    /// question does not: two shards commit one transaction at two
-    /// frontiers, and a replica meeting it in a record has neither.
-    /// Erring early is the safe direction — it can only widen who counts
-    /// as party, never narrow it.
-    #[must_use]
-    pub fn first_commit(&self) -> WeightedTimestamp {
-        self.deadline.validity_end().minus(MAX_VALIDITY_RANGE)
     }
 }
 
@@ -193,12 +219,13 @@ impl UnsettledTx {
 /// the figures its records restate, and the deliveries its finalizations
 /// carry.
 ///
-/// The voter's answer, read off committed bodies. A validator whose
-/// store holds a transaction answers for it — a figure exactly or
-/// wrongly, a delivery inside its window or past the lapse, a success
-/// inside its deadline or past it — and one whose store never held it,
-/// having synced past its block, cannot say,
-/// which is a third answer and not a pass.
+/// The voter's answer, read off committed bodies and blocks. A
+/// validator whose store holds a transaction and the block a name says
+/// committed it answers for it — a figure exactly or wrongly, a
+/// delivery inside its window or past the lapse, a success inside its
+/// deadline or past it — and one whose store never held them, having
+/// synced past the block, cannot say, which is a third answer and not a
+/// pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolutions {
     /// Every figure of every name is the one its transaction fixes, no
@@ -226,21 +253,22 @@ pub enum Resolutions {
 }
 
 impl Resolutions {
-    /// How `entries` stand against the figures `held` reads off each
-    /// named transaction, `None` for one it does not hold.
+    /// How `entries` stand against what this validator's store fixes
+    /// for each, `restated` saying whether a name restates it exactly,
+    /// `None` for one the store cannot answer for.
     ///
     /// A misstatement answers over an unknown name: a proposer who
     /// restates one figure wrongly is refused whatever else the record
     /// names, and only a record every name of which checks out is exact.
     pub fn of(
         entries: impl IntoIterator<Item = UnsettledTx>,
-        held: impl Fn(TxHash) -> Option<UnsettledTx>,
+        restated: impl Fn(&UnsettledTx) -> Option<bool>,
     ) -> Self {
         let mut unknown = None;
         for entry in entries {
-            match held(entry.tx_hash) {
-                Some(figures) if figures == entry => {}
-                Some(_) => return Self::Wrong(entry.tx_hash),
+            match restated(&entry) {
+                Some(true) => {}
+                Some(false) => return Self::Wrong(entry.tx_hash),
                 None => {
                     unknown.get_or_insert(entry.tx_hash);
                 }
@@ -430,6 +458,10 @@ mod tests {
                 },
                 amount: u128::from(seed) * 3,
             },
+            committed: CommittedAt {
+                height: BlockHeight::new(u64::from(seed)),
+                anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
+            },
             reach: vec![RoutePrefix::of(Address::new(
                 [seed; 31],
                 AddressClass::Component,
@@ -444,12 +476,16 @@ mod tests {
     /// One form: whatever order a caller offers, the record it builds is
     /// the record every other builder would have produced.
     /// A holder checks every figure: the same entry is exact, and one
-    /// naming another vault, another amount, another reservation or
-    /// another deadline is wrong.
+    /// naming another vault, another amount, another reservation,
+    /// another deadline or another commit is wrong.
     #[test]
     fn a_holder_checks_every_figure() {
         let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
-        let restated = |entry: UnsettledTx| Resolutions::of([entry], held);
+        let restated = |entry: UnsettledTx| {
+            Resolutions::of([entry], |entry| {
+                held(entry.tx_hash).map(|held| held == *entry)
+            })
+        };
 
         assert_eq!(restated(tx(1)), Resolutions::Exact);
         let wrong = Resolutions::Wrong(tx(1).tx_hash);
@@ -489,6 +525,82 @@ mod tests {
             }),
             wrong,
         );
+        assert_eq!(
+            restated(UnsettledTx {
+                committed: CommittedAt {
+                    anchor: tx(1).committed.anchor.plus(Duration::from_millis(1)),
+                    ..tx(1).committed
+                },
+                ..tx(1)
+            }),
+            wrong,
+        );
+        assert_eq!(
+            restated(UnsettledTx {
+                committed: CommittedAt {
+                    height: tx(1).committed.height.next(),
+                    ..tx(1).committed
+                },
+                ..tx(1)
+            }),
+            wrong,
+        );
+    }
+
+    /// A departed shard is party to a name when it held one of the
+    /// name's remote routes at the anchor this chain committed the
+    /// transaction under, and left afterwards — however the body's
+    /// window sits against the cut.
+    #[test]
+    fn a_party_is_dated_by_the_commit() {
+        let local = ShardId::leaf(1, 1);
+        let departed = ShardId::leaf(1, 0);
+        let successor = ShardId::leaf(2, 0);
+        let name = UnsettledTx {
+            reach: vec![RoutePrefix::of(Address::new(
+                [0x00; 31],
+                AddressClass::Component,
+            ))],
+            committed: CommittedAt {
+                height: BlockHeight::new(7),
+                anchor: WeightedTimestamp::from_millis(1_000),
+            },
+            ..tx(1)
+        };
+        let after = WeightedTimestamp::from_millis(1_500);
+        let before = WeightedTimestamp::from_millis(500);
+
+        assert!(
+            name.party(local, departed, after, &[(departed, after)]),
+            "a shard that left after the commit held the route when the crossing went",
+        );
+        assert!(
+            !name.party(local, departed, before, &[(departed, before)]),
+            "a shard that had left by the commit was issued nothing, whatever its keyspace",
+        );
+        assert!(
+            !name.party(local, local, after, &[(local, after)]),
+            "the route has to be somebody else's",
+        );
+        let later = WeightedTimestamp::from_millis(2_000);
+        assert!(
+            !name.party(
+                local,
+                successor,
+                later,
+                &[(departed, after), (successor, later)]
+            ),
+            "a successor leaving later never held what its predecessor's departure covered",
+        );
+        assert!(
+            name.party(
+                local,
+                departed,
+                after,
+                &[(departed, after), (successor, later)]
+            ),
+            "and the predecessor is still the one party",
+        );
     }
 
     /// A validator that does not hold a transaction cannot say either
@@ -496,7 +608,7 @@ mod tests {
     /// elsewhere in the record answers over it.
     #[test]
     fn a_non_holder_cannot_say_unless_a_figure_is_wrong() {
-        let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
+        let held = |entry: &UnsettledTx| (entry.tx_hash == tx(1).tx_hash).then(|| tx(1) == *entry);
         assert_eq!(
             Resolutions::of([tx(2)], held),
             Resolutions::Unknown(tx(2).tx_hash)

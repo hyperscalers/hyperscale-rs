@@ -25,9 +25,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE, Probed, RoutePrefix,
-    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
+    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE, Probed,
+    RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash,
+    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
 };
 
 /// What the chain read of one cell a counterpart was asked about:
@@ -620,13 +620,13 @@ impl Ledger {
     /// this shard does not own.
     ///
     /// Who was party to the transaction is a question about these and
-    /// the trie of the moment, and the trie of the moment is not
-    /// something a rebuild can recover — windows evict, and a shard that
-    /// has since split answers for a keyspace it no longer owns. The
-    /// routes are the transaction's own, and [`UnsettledTx::reach`]
-    /// states them, so this reaches the same set from the committing
-    /// block and from a record naming the transaction alike — which is
-    /// what a replica rotated in after that block has.
+    /// the trie at the commit, and that trie is not something a rebuild
+    /// can recover — windows evict, and a shard that has since split
+    /// answers for a keyspace it no longer owns. The routes are the
+    /// transaction's own and the commit is the block's, and
+    /// [`UnsettledTx`] states both, so this reaches the same set from
+    /// the committing block and from a record naming the transaction
+    /// alike — which is what a replica rotated in after that block has.
     fn remote_routes<'a>(&self, owed: &'a Owed) -> impl Iterator<Item = RoutePrefix> + 'a {
         let local = self.local;
         owed.figures
@@ -646,16 +646,20 @@ impl Ledger {
     /// transaction body and this shard's own identity, both of which
     /// outlive any window, so the two agree at any distance.
     ///
+    /// `committed` is the block itself: what dates every departure
+    /// against the entries it registers.
+    ///
     /// Idempotent per transaction: a hash cannot commit twice within its
     /// own validity window, and re-registering one must not move the
     /// deadline it was admitted under.
     pub fn register_committed<'a>(
         &mut self,
+        committed: CommittedAt,
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
             let owed = Owed {
-                figures: UnsettledTx::for_transaction(tx),
+                figures: UnsettledTx::for_transaction(tx, committed),
                 certified: false,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
@@ -1031,8 +1035,9 @@ impl Ledger {
     ///
     /// Only certified ones: a transaction no certificate of ours covers
     /// is decided by its own deadline and needs no record to speak for
-    /// it. Only ones committed before the cut, since a shard that had
-    /// already gone was never party to what came after. Only ones no
+    /// it. Only ones this chain committed before the cut, since a shard
+    /// that had already gone was issued nothing of what came after —
+    /// its successor was, and still holds it. Only ones no
     /// record covers yet, so a departure is answered once. And never a
     /// remainder: its verdict is in, and a departed deliverer's
     /// successor still delivers what it was owed — only the lapse says a
@@ -1122,15 +1127,16 @@ impl Ledger {
     /// When the shard that held `prefix` when the transaction committed
     /// left, if it has.
     ///
-    /// The earliest recorded terminal after the transaction's own commit:
-    /// earlier ones belong to shards that were already gone and so never
-    /// held it, and later ones to successors that never did either. `None`
-    /// while the prefix is still owned by the shard that owned it then.
+    /// The earliest recorded terminal after this chain committed the
+    /// transaction: earlier ones belong to shards that were already gone
+    /// and so never held it, and later ones to successors that never did
+    /// either. `None` while the prefix is still owned by the shard that
+    /// owned it then.
     fn departure_over(&self, owed: &Owed, route: RoutePrefix) -> Option<(ShardId, Departure)> {
         self.departed
             .iter()
             .filter(|(shard, _)| ShardTrie::shard_owns_route(**shard, route))
-            .filter(|(_, departure)| departure.cut > owed.figures.first_commit())
+            .filter(|(_, departure)| departure.cut > owed.figures.committed.anchor)
             .min_by_key(|(_, departure)| departure.cut)
             .map(|(shard, departure)| (*shard, *departure))
     }
@@ -1169,7 +1175,7 @@ impl Ledger {
                     .iter()
                     .filter(|(shard, departure)| {
                         ShardTrie::shard_owns_route(**shard, route)
-                            && departure.cut > owed.figures.first_commit()
+                            && departure.cut > owed.figures.committed.anchor
                     })
                     .map(|(shard, _)| *shard),
             );
@@ -1411,7 +1417,7 @@ impl Ledger {
         self.departed.retain(|shard, departure| {
             owed.values().any(|entry| {
                 entry.departed_by == Some(*shard)
-                    || (departure.cut > entry.figures.first_commit()
+                    || (departure.cut > entry.figures.committed.anchor
                         && entry.figures.reach.iter().any(|route| {
                             !ShardTrie::shard_owns_route(local, *route)
                                 && ShardTrie::shard_owns_route(*shard, *route)
@@ -1602,7 +1608,19 @@ mod tests {
     /// Commit `tx` frozen as `classified`, which is what fixes the part
     /// this shard plays and every cell its entry asks about.
     fn commit_as(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) {
-        ledger.register_committed([(tx, classified)]);
+        ledger.register_committed(committed_at(tx), [(tx, classified)]);
+    }
+
+    /// Where the fixtures commit `tx`: well inside its window, at a
+    /// height of no consequence.
+    fn committed_at(tx: &Arc<Verifiable<Transaction>>) -> CommittedAt {
+        CommittedAt {
+            height: BlockHeight::new(1),
+            anchor: tx
+                .validity_range()
+                .end_timestamp_exclusive
+                .minus(Duration::from_secs(100)),
+        }
     }
 
     /// A record's name for `tx`, stating the terms a committing block
@@ -1613,6 +1631,7 @@ mod tests {
             deadline: Deadline::of_transaction(tx),
             declared_work: tx.work(),
             charge: charge(tx),
+            committed: committed_at(tx),
             reach: tx.routing().all_routes(),
         }
     }
@@ -1624,7 +1643,7 @@ mod tests {
 
     /// The burn an abort of `tx` settles.
     fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
-        UnsettledTx::for_transaction(tx).charge
+        UnsettledTx::for_transaction(tx, committed_at(tx)).charge
     }
 
     /// A committed transaction is owed an outcome from the moment its
@@ -2109,28 +2128,25 @@ mod tests {
         assert_eq!(after.len(), 2, "and the one that holds it now");
     }
 
-    /// A shard that left before the transaction could have been committed
-    /// anywhere never held it, whatever its keyspace covers now — so its
-    /// terminal says nothing about this transaction's fate, and cannot be
-    /// the silence that strands it.
+    /// A shard that left before this chain committed the transaction
+    /// never held it, whatever its keyspace covers now — so its terminal
+    /// says nothing about this transaction's fate, and cannot be the
+    /// silence that strands it.
     ///
-    /// Dated by the transaction rather than by the block that committed
-    /// it here: two shards commit one transaction at two frontiers and a
-    /// replica meeting it in a record has neither, so the only instant
-    /// every reader agrees on is the transaction's own earliest possible
-    /// commit — one validity range before it expires.
+    /// Dated by the block that committed it here, which the entry
+    /// carries: a replica meeting the transaction in a record reads the
+    /// same block off the name.
     #[test]
     fn a_terminal_older_than_the_transaction_is_not_its_counterpart_leaving() {
         let mut ledger = Ledger::new(LOCAL);
         let tx = tx(14, 600_000);
-        ledger.register_committed([(&tx, &Classified::whole())]);
+        commit(&mut ledger, &tx);
         ledger.certify(tx.hash());
-        // Before the earliest instant the transaction could have been
-        // committed on any shard, which its validity end fixes.
+        // Before the block that committed the transaction here.
         let stale = ms(400_000);
         assert!(
-            stale < names(&tx).first_commit(),
-            "the terminal has to predate every commit of the transaction",
+            stale < names(&tx).committed.anchor,
+            "the terminal has to predate the commit of the transaction",
         );
         ledger.record_terminal(PARTNER, stale, Some(expiry(stale)));
 
@@ -2576,10 +2592,10 @@ mod tests {
         entrant.record_abandonment_records(&[record]);
 
         // A departure between the two instants the entry could be dated
-        // by: past anything that could have committed the transaction,
-        // and short of the record that names it. Which of the two the
-        // ledger reads is what decides whether the departed shard was
-        // party, so both replicas have to read the same one.
+        // by: past the block that committed the transaction, and short
+        // of the record that names it. Which of the two the ledger reads
+        // is what decides whether the departed shard was party, so both
+        // replicas have to read the same one.
         for ledger in [&mut seated, &mut entrant] {
             ledger.record_terminal(PARTNER, ms(65_000), None);
         }

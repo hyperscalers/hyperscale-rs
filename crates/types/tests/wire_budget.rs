@@ -11,7 +11,7 @@
 use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass, Anchor,
-    BlockHeight, Deadline, Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES,
+    BlockHeight, CommittedAt, Deadline, Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_UNSETTLED_PER_BLOCK, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, StateClaim, StateRoot,
     SubstateKey, TxHash, UNSETTLED_TX_BYTES, UnsettledTx, WeightedTimestamp, evidence_admits_block,
 };
@@ -34,6 +34,10 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
         charge: AbortCharge {
             vault: key(seed),
             amount: u128::MAX,
+        },
+        committed: CommittedAt {
+            height: BlockHeight::new(u64::MAX),
+            anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
         },
         reach: (0..routes)
             .map(|at| {
