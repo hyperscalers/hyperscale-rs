@@ -56,7 +56,8 @@ impl Withheld {
 /// The evidence a vote is fenced on, borrowed from the coordinator for
 /// one judgment.
 pub struct VoteFence<'a> {
-    /// The departed shards' settled sets, and what committed records cover.
+    /// The departed shards' settled sets, and what committed records
+    /// cover.
     pub mirror: &'a CounterpartMirror,
     /// The commit-proven remote headers.
     pub proven_anchors: &'a ProvenAnchors,
@@ -157,43 +158,19 @@ impl VoteFence<'_> {
             .try_for_each(|record| self.record_stands(record))
     }
 
-    /// Whether an abandonment record stands: this validator's own ledger
-    /// says the departed shard was party to every name, and the shard's
-    /// settled set names none of them. That the schedule attests the
-    /// cut it names, inside the evidence window, is admission's rule.
+    /// Whether an abandonment record stands: the departed shard's
+    /// settled set names none of the record's names. That the schedule
+    /// attests the cut it names, inside the evidence window, and that
+    /// the departed shard was party to every name, are admission's
+    /// rules.
     ///
-    /// The set says what the departed shard settled; the ledger says
-    /// what it was party to, and a record may name only that — a
-    /// stranger to the departed shard is absent from its set trivially,
-    /// and abandoning it would charge a payer for a transaction a live
-    /// counterpart can still settle. The set is complete and
-    /// beacon-attested, so absence from it is proof rather than
-    /// ignorance; a voter that has not acquired it defers, since the
-    /// record is only proposable inside the window the set can be read
-    /// in, so a voter inside it either has the set or is about to.
+    /// The set is complete and beacon-attested, so absence from it is
+    /// proof rather than ignorance; a voter that has not acquired it
+    /// defers, since the record is only proposable inside the window the
+    /// set can be read in, so a voter inside it either has the set or is
+    /// about to.
     fn record_stands(&self, record: &AbandonmentRecord) -> Result<(), Withheld> {
         let shard = record.shard();
-        let stranger = self.mirror.with_parties(shard, |parties| {
-            parties.map(|parties| {
-                record
-                    .tx_hashes()
-                    .find(|tx_hash| !parties.contains(tx_hash))
-            })
-        });
-        match stranger {
-            None => {
-                return Err(Withheld::deferred(format!(
-                    "abandonment record's parties for {shard:?} not yet mirrored"
-                )));
-            }
-            Some(Some(stranger)) => {
-                return Err(Withheld::Refused(format!(
-                    "abandonment record names {stranger}, which the departed shard {shard:?} \
-                     was not party to"
-                )));
-            }
-            Some(None) => {}
-        }
         let settled = self.mirror.with_settled(|sets| {
             sets.get(&shard).map(|settled| {
                 record

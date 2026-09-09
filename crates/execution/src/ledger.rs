@@ -1051,21 +1051,6 @@ impl Ledger {
             .collect()
     }
 
-    /// The transactions this ledger holds that `shard`, leaving at `cut`,
-    /// was party to: what an abandonment record naming this shard's
-    /// business with it may name, and nothing else. Wider than
-    /// [`Self::outstanding_with`] — an entry no certificate covers, or one
-    /// a record already answered, is still one the shard was party to —
-    /// so a voter reading it refuses only a stranger.
-    #[must_use]
-    pub fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> BTreeSet<TxHash> {
-        self.owed
-            .iter()
-            .filter(|(_, owed)| self.party_to_entry(owed, shard, cut))
-            .map(|(tx_hash, _)| *tx_hash)
-            .collect()
-    }
-
     /// Whether this shard only delivers for `tx_hash`, so no outcome of
     /// its own bears the verdict and the lapse is what bounds it.
     #[must_use]
@@ -1150,25 +1135,16 @@ impl Ledger {
             .map(|(shard, departure)| (*shard, *departure))
     }
 
-    /// Whether `shard`, leaving at `cut`, was party to `owed`: it held
-    /// one of the entry's remote prefixes when the transaction
-    /// committed, and left afterwards.
-    ///
-    /// Owning the prefix and leaving after the commit is not enough. A
-    /// successor owns its predecessor's keyspace, so two cuts over one
-    /// prefix inside one entry's life would name the entry to both,
-    /// where [`Self::departure_over`] reads only the first — and the
-    /// second departure would abandon what the first already settled.
-    /// The shard a record may name is the one that held the prefix
-    /// then, which is the earliest departure over it after the commit.
+    /// Whether `shard`, leaving at `cut`, was party to `owed`, by
+    /// [`UnsettledTx::party`] — the rule admission holds a record to —
+    /// read against the departures this ledger holds.
     fn party_to_entry(&self, owed: &Owed, shard: ShardId, cut: WeightedTimestamp) -> bool {
-        cut > owed.figures.first_commit()
-            && self.remote_routes(owed).any(|route| {
-                ShardTrie::shard_owns_route(shard, route)
-                    && self
-                        .departure_over(owed, route)
-                        .is_none_or(|(_, first)| first.cut >= cut)
-            })
+        let departures: Vec<(ShardId, WeightedTimestamp)> = self
+            .departed
+            .iter()
+            .map(|(departed, departure)| (*departed, departure.cut))
+            .collect();
+        owed.figures.party(self.local, shard, cut, &departures)
     }
 
     /// The shards that could hold a certificate of ours for `tx_hash` —
@@ -1845,17 +1821,17 @@ mod tests {
         ledger.record_terminal(SUCCESSOR, second, None);
 
         assert_eq!(
-            ledger.party_to(PARTNER, first),
-            BTreeSet::from([tx.hash()]),
+            ledger
+                .outstanding_with(PARTNER, first)
+                .iter()
+                .map(|entry| entry.tx_hash)
+                .collect::<Vec<_>>(),
+            vec![tx.hash()],
             "the shard that held the prefix then answers for the entry",
         );
         assert!(
-            ledger.party_to(SUCCESSOR, second).is_empty(),
-            "and its successor is a stranger to it",
-        );
-        assert!(
             ledger.outstanding_with(SUCCESSOR, second).is_empty(),
-            "so the second cut is offered nothing to name",
+            "and its successor is a stranger to it, so the second cut is offered nothing to name",
         );
     }
 

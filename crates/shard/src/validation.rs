@@ -485,6 +485,9 @@ mod tests {
         );
         let mut against = Against::schedule(topology_snapshot(), schedule);
         against.anchor = WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 500);
+        // A survivor under the right half, so the routes the fixtures
+        // name under either departed half are remote to it.
+        against.local_shard = survivors_right.0;
         against
     }
 
@@ -1099,13 +1102,16 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
     }
 
+    /// The figures of a name reaching one route under each departed
+    /// half, so a record against either half may name it.
     fn named(tx_hash: TxHash) -> UnsettledTx {
+        let route = |tag: u8| RoutePrefix::of(Address::new([tag; 31], AddressClass::Principal));
         UnsettledTx {
             tx_hash,
             deadline: Deadline::of(WeightedTimestamp::from_millis(900)),
             declared_work: 11,
             charge: stub_abort_charge(11),
-            reach: Vec::new(),
+            reach: vec![route(0x00), route(0xC0)],
         }
     }
 
@@ -1187,17 +1193,13 @@ mod tests {
     #[test]
     fn records_weighing_more_than_the_frame_affords_are_refused() {
         let (left, right) = ShardId::ROOT.children();
-        // A name at an ordinary route's reach, and enough of them
-        // between two records to clear the byte budget while staying
-        // well under the drain's count.
+        // A name at an ordinary route's reach, spread under both
+        // departed halves so either record may name it, and enough of
+        // them between two records to clear the byte budget while
+        // staying well under the drain's count.
         let wide = |seed: usize| UnsettledTx {
-            reach: (0..6)
-                .map(|at| {
-                    RoutePrefix::from(Address::new(
-                        [u8::try_from(at % 256).expect("masked"); 31],
-                        AddressClass::Component,
-                    ))
-                })
+            reach: (0..6u8)
+                .map(|at| RoutePrefix::from(Address::new([at * 0x30; 31], AddressClass::Component)))
                 .collect(),
             ..named(TxHash::from(Hash::from_bytes(&seed.to_le_bytes())))
         };

@@ -6691,13 +6691,14 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts,
-        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, LeafRoot, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledSetVerdict, SettledTxSet,
-        SettledTxsRoot, ShardAnchor, ShardId, Signer, SignerBitfield, StateClaimsRoot,
-        TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
-        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
+        AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
+        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, LeafRoot,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, RoutePrefix,
+        SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT,
+        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
+        settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -11345,13 +11346,15 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
             declared_work: 5,
             charge: stub_abort_charge(5),
-            reach: Vec::new(),
+            reach: vec![route(0xAA)],
         }
     }
 
-    /// The departed shard's business here, as the ledger would mirror it.
-    fn parties_of(tx: &[u8]) -> BTreeSet<TxHash> {
-        BTreeSet::from([TxHash::from(Hash::from_bytes(tx))])
+    /// The route of an address whose top byte is `tag`: owned by this
+    /// validator's shard, `leaf(1, 0)`, exactly when the top bit is
+    /// clear, and by `ROOT` always.
+    fn route(tag: u8) -> RoutePrefix {
+        RoutePrefix::of(Address::new([tag; 31], AddressClass::Principal))
     }
 
     /// A record claiming `shard` left `tx` unsettled when it terminated at
@@ -11460,7 +11463,7 @@ mod tests {
         let coord = fence_coordinator();
         coord
             .mirror()
-            .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
+            .record_settled(ShardId::ROOT, root_settled(b"other"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(
             coord
@@ -11471,30 +11474,50 @@ mod tests {
     }
 
     /// A record naming a transaction the departed shard was not party to
-    /// is refused: its absence from the settled set is trivial, and
-    /// abandoning it would charge a payer for a transaction a live
-    /// counterpart can still settle. A voter holding no mirror of the
-    /// departure at all cannot say either way, and defers.
+    /// is refused at admission: its absence from the settled set is
+    /// trivial, and abandoning it would charge a payer for a transaction
+    /// a live counterpart can still settle. Party is read off the
+    /// figures the record restates — a name reaching no route the
+    /// departed shard held, or only routes this shard holds itself, is a
+    /// stranger on every replica alike. A voter holding no settled set
+    /// for the departure still defers at the fence.
     #[test]
     fn a_record_naming_a_stranger_to_the_departed_shard_is_refused() {
-        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        let block = block_with_records(AFTER_CUT_MS, records);
-
-        let stranger = fence_coordinator();
-        stranger.mirror().record_settled(
-            ShardId::ROOT,
-            root_settled(b"other"),
-            parties_of(b"other"),
-        );
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let naming = |reach: Vec<RoutePrefix>| {
+            let mut figures = figures_of(b"tx");
+            figures.reach = reach;
+            vec![AbandonmentRecord::new(
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(ROOT_CUT_MS),
+                [figures],
+            )]
+        };
+        for reach in [Vec::new(), vec![route(0x11)]] {
+            let err = coord
+                .admit_records(&sched, &block_with_records(AFTER_CUT_MS, naming(reach)))
+                .unwrap_err();
+            assert!(err.contains("was not party to"), "{err}");
+        }
         assert!(
-            stranger.vote_fence().records(&block).is_err(),
-            "a name the departed shard was not party to is not voted"
+            coord
+                .admit_records(
+                    &sched,
+                    &block_with_records(AFTER_CUT_MS, naming(vec![route(0x11), route(0xAA)]))
+                )
+                .is_ok(),
+            "one remote route the departed shard held is party"
         );
 
         let unmirrored = fence_coordinator();
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(
-            unmirrored.vote_fence().records(&block).is_err(),
-            "and a voter that has mirrored no departure defers"
+            unmirrored
+                .vote_fence()
+                .records(&block_with_records(AFTER_CUT_MS, records))
+                .is_err(),
+            "a voter that has mirrored no settled set defers"
         );
     }
 
@@ -11638,7 +11661,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
             },
-            parties_of(b"tx"),
         );
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(
@@ -11726,7 +11748,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
@@ -11750,7 +11771,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
@@ -11801,7 +11821,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         assert!(matches!(
             coord
@@ -11825,7 +11844,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
@@ -11855,7 +11873,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![lone_verdict_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
@@ -11897,7 +11914,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
@@ -11923,7 +11939,6 @@ mod tests {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
@@ -11951,7 +11966,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
@@ -12080,7 +12094,6 @@ mod tests {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
-            parties_of(b"tx"),
         );
         let released = coord.redrive_pending_votes(&sched);
         assert!(

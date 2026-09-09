@@ -543,6 +543,38 @@ impl RecordsSection<'_> {
         already_resolved(ctx, tx_hash)
     }
 
+    /// Whether every name a record carries is one the departed shard was
+    /// party to, by [`UnsettledTx::party`]: it held one of the name's
+    /// remote routes when the transaction committed, and left afterwards.
+    ///
+    /// A stranger to the departed shard is absent from its settled set
+    /// trivially, and abandoning it would charge a payer for a
+    /// transaction a live counterpart can still settle. Judged from the
+    /// figures the record restates and the departures the schedule
+    /// attests at the block's anchor, so every replica answers alike —
+    /// including one holding no entry for the name, which rebuilds the
+    /// entry from the record precisely because it cannot check the name
+    /// against an account of its own.
+    fn parties_stand(ctx: &Admission<'_>, record: &AbandonmentRecord) -> Result<(), String> {
+        let departures: Vec<(ShardId, WeightedTimestamp)> =
+            ctx.schedule.departures_at(ctx.anchor).collect();
+        for entry in record.unsettled() {
+            if !entry.party(
+                ctx.local_shard,
+                record.shard(),
+                record.terminal_wt(),
+                &departures,
+            ) {
+                return Err(format!(
+                    "abandonment record names {}, which the departed shard {:?} was not party to",
+                    entry.tx_hash,
+                    record.shard()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a record's departure is one the schedule attests at the
     /// block's anchor: the cut it names is the departed shard's, and its
     /// boundary record is still readable. A record anchored after the
@@ -573,8 +605,9 @@ impl<'f> Section for RecordsSection<'f> {
     type Fold = RecordsFold<'f>;
 
     /// A well-formed record, in its place in the section's order, under
-    /// a departure the schedule attests, naming only what stands, within
-    /// the budget the records share.
+    /// a departure the schedule attests, naming only what the departed
+    /// shard was party to and what stands, within the budget the records
+    /// share.
     ///
     /// The order is ascending by shard, which gives uniqueness and one
     /// encoding per claim set together — two records for one shard
@@ -610,6 +643,7 @@ impl<'f> Section for RecordsSection<'f> {
             ));
         }
         Self::evidence_stands(ctx, verdict)?;
+        Self::parties_stand(ctx, verdict)?;
         for tx_hash in verdict.tx_hashes() {
             Self::name_stands(ctx, fold, tx_hash)?;
         }
