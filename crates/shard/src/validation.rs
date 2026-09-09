@@ -443,14 +443,14 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard,
+        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash,
         Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PrincipalAddr, Probed, ProposerTimestamp, ProvisionEntry, Provisions,
-        Question, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
-        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
-        Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
+        NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions,
+        QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange, Transaction,
+        TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
+        Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     fn verdict(shard: ShardId, seeds: &[u8]) -> AbandonmentRecord {
-        AbandonmentRecord::departed(
+        AbandonmentRecord::new(
             shard,
             WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
             seeds
@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn a_record_out_of_its_canonical_form_is_refused() {
         let malformed =
-            AbandonmentRecord::departed(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
+            AbandonmentRecord::new(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
         let root = AbandonmentRoot::over(std::slice::from_ref(&malformed));
         let err = held_records(&block_with_verdicts(vec![malformed], root)).unwrap_err();
         assert!(
@@ -1174,34 +1174,6 @@ mod tests {
             let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
-
-        // One shard under two arms is two answers about two sets of
-        // transactions, in arm order.
-        let absent = Heard {
-            question: Question::Cell(Probed::Claim),
-            word: Word::Absent,
-            at: WeightedTimestamp::from_millis(9),
-        };
-        let two_arms = vec![
-            verdict(left, &[1]),
-            AbandonmentRecord::heard(
-                left,
-                absent,
-                [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
-            ),
-        ];
-        let root = AbandonmentRoot::over(&two_arms);
-        assert!(held_records(&block_with_verdicts(two_arms, root)).is_ok());
-        let arms_reversed = vec![
-            AbandonmentRecord::heard(
-                left,
-                absent,
-                [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
-            ),
-            verdict(left, &[1]),
-        ];
-        let root = AbandonmentRoot::over(&arms_reversed);
-        assert!(held_records(&block_with_verdicts(arms_reversed, root)).is_err());
     }
 
     /// The budget is one across every record a block carries, and it is
@@ -1231,7 +1203,7 @@ mod tests {
         };
         let per_record = MAX_PROPOSAL_EVIDENCE_BYTES / wide(0).wire_weight() / 2 + 1;
         let span = |shard: ShardId, from: usize| {
-            AbandonmentRecord::departed(
+            AbandonmentRecord::new(
                 shard,
                 WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 (from..from + per_record).map(wide),
@@ -1487,7 +1459,7 @@ mod tests {
         dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
 
         let block = block_with_verdicts(
-            vec![AbandonmentRecord::departed(
+            vec![AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
                 WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 [named(tx_hash)],
@@ -1517,7 +1489,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(vec![AbandonmentRecord::departed(
+            abandonment_records: Arc::new(vec![AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
                 WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 [named(tx_hash)],

@@ -319,10 +319,10 @@ pub fn select_abandonment_records(
                 .cloned()
                 .collect();
             (!kept.is_empty())
-                .then(|| AbandonmentRecord::new(verdict.shard(), verdict.evidence(), kept))
+                .then(|| AbandonmentRecord::new(verdict.shard(), verdict.terminal_wt(), kept))
         })
         .collect();
-    trimmed.sort_by_key(|verdict| (verdict.shard(), verdict.evidence()));
+    trimmed.sort_by_key(AbandonmentRecord::shard);
     admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |verdict| verdict).0
 }
 
@@ -540,9 +540,9 @@ mod tests {
         test_transaction_running,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, Heard, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, NetworkDefinition, PredecessorTerminal, Question, TimestampRange,
-        TransactionDecision, UnsettledTx, ValidatorSet, Word,
+        CommittedTxsRoot, Hash, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, NetworkDefinition, PredecessorTerminal, TimestampRange,
+        TransactionDecision, UnsettledTx, ValidatorSet,
     };
 
     use super::*;
@@ -605,7 +605,7 @@ mod tests {
     /// handoff-anchored evidence window the fence itself derives.
     #[test]
     fn select_abandonment_records_stops_at_the_evidence_expiry() {
-        let record = AbandonmentRecord::departed(
+        let record = AbandonmentRecord::new(
             DEPARTED,
             WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
             [stranded()],
@@ -642,32 +642,21 @@ mod tests {
         );
     }
 
-    /// A refusal names a live shard and is held to no evidence window;
-    /// and any record loses the names a finalization in the same block
+    /// A record loses the names a finalization in the same block
     /// resolves, an emptied one being dropped rather than offered.
     #[test]
-    fn a_refusal_is_offered_past_the_window_and_stripped_of_what_the_block_resolves() {
+    fn a_record_is_stripped_of_what_the_block_resolves() {
         let handoff = Epoch::new(4);
         let stamped = departed_schedule(Some(handoff));
-        let past = stamped
-            .windows()
-            .handoff_evidence_expiry(handoff)
-            .plus(Duration::from_millis(1));
-        let refused = AbandonmentRecord::heard(
+        let inside = stamped.windows().handoff_evidence_expiry(handoff);
+        let refused = AbandonmentRecord::new(
             DEPARTED,
-            Heard {
-                question: Question::Verdict,
-                word: Word::Refused {
-                    decision: TransactionDecision::Reject,
-                    digest: Hash::from_bytes(b"digest"),
-                },
-                at: WeightedTimestamp::from_millis(2_000),
-            },
+            WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
             [stranded()],
         );
         let mut against =
             Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
-        against.anchor = past;
+        against.anchor = inside;
         let ctx = against.ctx();
         let none = FinalizationsFold::from(&ctx);
         assert_eq!(
@@ -678,7 +667,7 @@ mod tests {
             )
             .len(),
             1,
-            "a refusal names a live shard and is held to no window",
+            "inside the window the record is offered whole",
         );
 
         let resolving = Arc::new(Verifiable::from(make_finalization(

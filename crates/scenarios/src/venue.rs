@@ -475,11 +475,11 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
 ///
 /// The withdraw runs and certifies on the caller's own shard before the
 /// venue has said anything, so the caller is the participant left with
-/// a leg that already moved value. The venue declines, its certificate
-/// is mirrored into a refusal record on the caller's chain, and the
-/// record licenses the reclaim that credits the vault from the record
-/// cell the leg wrote. What the caller is out afterwards is the price
-/// and nothing else.
+/// a leg that already moved value. The venue declines and retracts the
+/// committed cell its inclusion wrote; the caller reads that cell absent
+/// past the deadline, and the reading licenses the reclaim that credits
+/// the vault from the record cell the leg wrote. What the caller is out
+/// afterwards is the price and nothing else.
 ///
 /// Read off the vault rather than by spending: a caller funded for many
 /// swaps pays for the next one out of what it kept, so a swap that

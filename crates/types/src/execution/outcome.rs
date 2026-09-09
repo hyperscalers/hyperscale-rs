@@ -200,6 +200,18 @@ pub struct TxOutcome {
     /// resolve the trie the issuer used.
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     crossing_targets: Vec<ShardId>,
+    /// The committed cell this shard wrote at the transaction's inclusion
+    /// and this outcome retracts: a core member that refused or aborted
+    /// the transaction, whose settling block deletes the cell so a leg
+    /// probing it reads the same absence a core that never included the
+    /// transaction leaves. A core's verdict is then a fact about its
+    /// state, like its inclusion and its claim.
+    ///
+    /// Attested rather than derived because the key carries the
+    /// transaction's validity end, and a validator holding the
+    /// certificate but not the transaction — one that synced past its
+    /// block — still has to delete the same cell or its root forks.
+    retracts: Option<SubstateKey>,
     /// What the attesting shard was to the transaction: the one fact
     /// that says whether this outcome bears the verdict, whether it is
     /// the transaction's own execution, and whether a counterpart could
@@ -232,8 +244,17 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
+            retracts: None,
             role: Role::Whole,
         }
+    }
+
+    /// Bind the committed cell this outcome retracts, if it refuses the
+    /// transaction a core member here was written one for.
+    #[must_use]
+    pub const fn retracting(mut self, cell: Option<SubstateKey>) -> Self {
+        self.retracts = cell;
+        self
     }
 
     /// Bind what this transaction reserved against the drain budget.
@@ -343,8 +364,16 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
+            retracts: None,
             role: Role::Whole,
         }
+    }
+
+    /// The committed cell this outcome retracts, where it refuses a
+    /// transaction a core member here was written one for.
+    #[must_use]
+    pub const fn retracts(&self) -> Option<SubstateKey> {
+        self.retracts
     }
 
     /// What this shard attests it did for the transaction.

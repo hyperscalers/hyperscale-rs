@@ -2468,7 +2468,7 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader + TestStore)) {
     let stranded = test_transaction(3);
-    let record = AbandonmentRecord::departed(
+    let record = AbandonmentRecord::new(
         ShardId::leaf(1, 1),
         WeightedTimestamp::from_millis(1_000),
         [UnsettledTx {

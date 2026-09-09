@@ -5,7 +5,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
 };
@@ -30,7 +30,7 @@ pub struct BlockManifest {
     /// mirrored verbatim rather than by hash: a verdict is composed on
     /// the records themselves however long after the terminal they came
     /// from, and there is no later source to fetch them from.
-    #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     abandonment_records: Vec<AbandonmentRecord>,
     /// The block's state claims, mirrored verbatim: they are small, and
     /// a voter checks each against a proof of its own rather than

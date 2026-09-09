@@ -726,7 +726,7 @@ mod tests {
     }
 
     fn boundary_record() -> AbandonmentRecord {
-        AbandonmentRecord::departed(
+        AbandonmentRecord::new(
             ShardId::leaf(1, 0),
             WeightedTimestamp::from_millis(2_000),
             [UnsettledTx {

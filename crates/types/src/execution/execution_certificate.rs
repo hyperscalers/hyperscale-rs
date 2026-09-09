@@ -18,9 +18,9 @@ use thiserror::Error;
 
 use crate::{
     AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionOutcome, ExecutionVote,
-    ExecutionVoteMessage, GlobalReceiptRoot, Hash, Heard, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    Question, RETENTION_HORIZON, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash,
-    TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp, Word, compute_global_receipt_root,
+    ExecutionVoteMessage, GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition,
+    RETENTION_HORIZON, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash, TxOutcome,
+    ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root,
     compute_sparse_proof, signed_bytes, tx_outcome_leaf, verify_sparse_inclusion,
 };
 
@@ -31,19 +31,18 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 /// What a certificate says of one transaction, as a counterpart hears
 /// it.
 ///
-/// Two shapes because they are two different things, and the record
-/// vocabulary holds only one of them. A refusal is evidence: the
-/// counterpart ended the transaction on its shard, and a record may
-/// carry that word. A claiming success is a cue: it says the
-/// counterpart's execution went through, not that it wrote the claim
-/// the success promises — its own finalization can still be refused
-/// afterwards — so what the retirement stands on is the claim cell
-/// proved present, and the certificate only opens the question.
+/// Neither is evidence the chain keeps. A refusal is the counterpart's
+/// verdict, which the mempool reports; what licenses taking the
+/// crossing back is the claim cell the refusing core never wrote,
+/// proved absent past the deadline. A claiming success is a cue: it
+/// says the counterpart's execution went through, not that it wrote the
+/// claim the success promises — its own finalization can still be
+/// refused afterwards — so what the retirement stands on is the claim
+/// cell proved present, and the certificate only opens the question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spoken {
-    /// The counterpart refused it, at the vote anchor, named by the
-    /// attested digest.
-    Refused(Heard),
+    /// The counterpart refused it: a rejection or an abort.
+    Refused(TransactionDecision),
     /// The counterpart's execution claimed, in a role that claims.
     Claimed {
         /// The vote anchor the certificate speaks at.
@@ -439,7 +438,6 @@ impl ExecutionCertificate {
     /// whatever the role, since a member that could not do its part ends
     /// the transaction on its shard.
     pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Spoken)> + '_ {
-        let digest = self.attested_digest();
         let at = self.vote_anchor_ts;
         self.tx_outcomes.iter().filter_map(move |outcome| {
             let spoken = match outcome.outcome() {
@@ -447,22 +445,8 @@ impl ExecutionCertificate {
                     .role()
                     .success_claims()
                     .then_some(Spoken::Claimed { at })?,
-                ExecutionOutcome::Failed => Spoken::Refused(Heard {
-                    question: Question::Verdict,
-                    word: Word::Refused {
-                        decision: TransactionDecision::Reject,
-                        digest,
-                    },
-                    at,
-                }),
-                ExecutionOutcome::Aborted => Spoken::Refused(Heard {
-                    question: Question::Verdict,
-                    word: Word::Refused {
-                        decision: TransactionDecision::Aborted,
-                        digest,
-                    },
-                    at,
-                }),
+                ExecutionOutcome::Failed => Spoken::Refused(TransactionDecision::Reject),
+                ExecutionOutcome::Aborted => Spoken::Refused(TransactionDecision::Aborted),
             };
             Some((outcome.tx_hash(), spoken))
         })
@@ -1215,10 +1199,7 @@ mod tests {
         assert!(matches!(spoken[1].1, Spoken::Claimed { .. }));
         assert!(matches!(
             spoken[2].1,
-            Spoken::Refused(Heard {
-                word: Word::Refused { .. },
-                ..
-            })
+            Spoken::Refused(TransactionDecision::Reject)
         ));
     }
 

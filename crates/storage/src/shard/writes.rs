@@ -6,14 +6,14 @@ use std::sync::Arc;
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
-    Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, LocalKey,
-    Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
-    SubstateKey, entry_leaf_key,
+    Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
+    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
+    SubstateKey, Verifiable, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::store::Anchored;
-use crate::shard::sweep::with_sweep;
+use crate::shard::sweep::{removals_of, with_sweep};
 use crate::tree::JmtSnapshot;
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -59,9 +59,9 @@ pub fn merge_writes_from_receipts(
     settle_writes(&merge_receipts(receipts), prior)
 }
 
-/// Everything a prepared commit lands: the settling receipts resolved
-/// against the parent's baseline, plus the sweep's own creations and
-/// removals.
+/// Everything a prepared commit lands: the receipts `finalizations`
+/// settle, resolved against the parent's baseline, plus the block's own
+/// creations, the sweep's removals and the refusals' retractions.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -80,21 +80,25 @@ pub fn merge_writes_from_receipts(
 /// other is as wrong as one resolved live.
 #[must_use]
 pub fn settled_writes_at(
-    settling: &[StoredReceipt],
+    finalizations: &[Arc<Verifiable<Finalization>>],
     baseline: &dyn Anchored,
     parent_height: BlockHeight,
     creations: &[(SubstateKey, Vec<u8>)],
-    removals: &[SubstateKey],
+    swept: &[SubstateKey],
 ) -> SettledWrites {
     assert_eq!(
         baseline.anchor(),
         parent_height,
         "a movement's baseline is anchored at the wrong height",
     );
+    let settling: Vec<StoredReceipt> = finalizations
+        .iter()
+        .flat_map(|fw| fw.settling_receipts())
+        .collect();
     with_sweep(
-        merge_writes_from_receipts(settling, baseline),
+        merge_writes_from_receipts(&settling, baseline),
         creations,
-        removals,
+        &removals_of(swept, finalizations),
     )
 }
 

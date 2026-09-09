@@ -1,15 +1,15 @@
-//! What counterparts have said about the transactions in flight here,
-//! and what this shard still asks them.
+//! What counterparts' chains have shown about the transactions in
+//! flight here, and what this shard still asks them.
 //!
 //! One account of the exchange: the ledger of what this shard owes an
-//! outcome for, the mirror of what counterparts were heard to say —
-//! shared with the vote fence, which checks a record against exactly
-//! what was offered from — the questions put to silent counterparts,
-//! and the proofs fetched back to offer in a block. Everything here is
-//! folded from committed content or from a certificate every replica
-//! hears the same way, so replicas at one frontier hold one account.
-//! The tick machine reads the ledger through it and decides what to do
-//! with a strand nobody can answer for.
+//! outcome for and what each counterpart's committed state was read to
+//! say of it, the mirror of the departed shards' settled sets — shared
+//! with the vote fence, which checks a record against exactly what was
+//! offered from — the questions put to silent counterparts, and the
+//! readings fetched back to offer in a block. Everything here is folded
+//! from committed content, so replicas at one frontier hold one
+//! account. The tick machine reads the ledger through it and decides
+//! what to do with a strand nobody can answer for.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -19,12 +19,11 @@ use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answ
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CLAIM_VISIBILITY_LAG,
-    CounterpartEvidence, CounterpartMirror, Deadline, ExecutionCertificate, Heard, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, Question,
-    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
-    TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Word,
+    CounterpartMirror, Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, SettledTxSet, ShardId, ShardTrie,
+    Spoken, StateClaim, SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision,
+    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -33,12 +32,6 @@ use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
 /// One counterpart cell a leg entry asks about: the shard holding it,
 /// the cell, the anchor an answer is held to, and which question it is.
 type CounterpartCell = (ShardId, SubstateKey, Probed);
-
-/// What counterparts were heard to say, by shard and question, then by
-/// the moment and word of each answer: the grouping a block's records
-/// are composed from.
-type HeardByQuestion =
-    BTreeMap<(ShardId, Question), BTreeMap<(WeightedTimestamp, Word), Vec<UnsettledTx>>>;
 
 /// Every cell `entry` asks a counterpart about, under `trie`: each other
 /// core shard's committed cell, each delivery's claim on the shard that
@@ -58,9 +51,10 @@ fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec
     // through its claim, which the deadline fences.
     //
     // Every core shard is asked, because any one of them absent is the
-    // whole answer — a core that one of its shards never included can
-    // never settle — while the shards that did include say only that a
-    // sibling is still pending. Asking the lowest alone leaves the
+    // whole answer — a core that one of its shards never included, or
+    // that one of its shards refused and retracted its cell for, can
+    // never settle — while the shards that still hold theirs say only
+    // that a sibling is pending. Asking the lowest alone leaves the
     // crossing stranded whenever that shard is the one that included.
     // Nothing is asked before the deadline, so a core that settles pays
     // for none of this.
@@ -222,11 +216,11 @@ pub struct Counterparts {
     /// that state.
     pub(crate) ledger: UnresolvedTxs,
 
-    /// What counterparts have said about the transactions legs here
-    /// issued for, shared with the shard coordinator's vote fence: a
-    /// core's refusal, a proved absence. This account is the only
-    /// writer, and the only one that says what to drop — the ledger
-    /// above is what an entry there speaks for.
+    /// The departed shards' settled sets and what committed records
+    /// cover, shared with the shard coordinator's vote fence. This
+    /// account is the only writer, and the only one that says what to
+    /// drop — the ledger above is what a covered entry there speaks
+    /// for.
     ///
     /// One mirror, because the fence checks a record against exactly
     /// what was offered from, and two copies could answer differently.
@@ -325,10 +319,10 @@ impl Counterparts {
         counterparts
     }
 
-    /// Fold what a committed block says about counterparts — the proofs
-    /// and verdict records it carries, the entries its certificates
-    /// resolve, the departures the schedule now proves — let go of what
-    /// no window can still answer, and ask what the block's clock opens.
+    /// Fold what a committed block says about counterparts — the claims
+    /// and records it carries, the entries its certificates resolve, the
+    /// departures the schedule now proves — let go of what no window can
+    /// still answer, and ask what the block's clock opens.
     ///
     /// `trie` is the block's committee's, which says who was party to
     /// each transaction, and `now` the committed clock every deadline is
@@ -347,7 +341,6 @@ impl Counterparts {
             self.fetched.remove(claim);
         }
         let mut actions = self.fold_state_claims(trie, block);
-        actions.extend(self.fold_verdict_records(block));
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -705,24 +698,6 @@ impl Counterparts {
         }
     }
 
-    /// Fold the verdicts a committed block's records restate: each is
-    /// the counterpart's own word, folded from the chain, so a replica
-    /// that never heard the certificate broadcast holds it from the
-    /// block alone.
-    fn fold_verdict_records(&self, block: &Block) -> Vec<Action> {
-        let mut actions = Vec::new();
-        for record in block.abandonment_records() {
-            if let CounterpartEvidence::Heard(heard) = record.evidence()
-                && heard.question == Question::Verdict
-            {
-                for entry in record.unsettled() {
-                    actions.extend(self.fold_verdict(record.shard(), entry.tx_hash, heard));
-                }
-            }
-        }
-        actions
-    }
-
     /// Fold one claim's answers into the questions the ledger is
     /// waiting on.
     fn fold_cells(
@@ -764,30 +739,16 @@ impl Counterparts {
                 };
                 self.released_fetches.extend(released);
                 record_reclaim_probe_answered(inclusion.is_present());
-                let tx_hash = entry.tx_hash;
-                match inclusion {
-                    // The counterpart took it, and its certificate
-                    // says how. Its broadcast may have missed this
-                    // shard, so it is fetched rather than waited for.
-                    Inclusion::Present(_) => {
-                        actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                            source_shard: shard,
-                            tx_hash,
-                            preferred: None,
-                            class: None,
-                        }));
-                    }
-                    Inclusion::Absent => {
-                        self.mirror.record(
-                            tx_hash,
-                            shard,
-                            Heard {
-                                question: Question::Cell(probed),
-                                word: Word::Absent,
-                                at: claim.anchor.ts,
-                            },
-                        );
-                    }
+                // The counterpart took it, and its certificate says
+                // how. Its broadcast may have missed this shard, so it
+                // is fetched rather than waited for.
+                if inclusion.is_present() {
+                    actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
+                        source_shard: shard,
+                        tx_hash: entry.tx_hash,
+                        preferred: None,
+                        class: None,
+                    }));
                 }
             }
         }
@@ -795,8 +756,8 @@ impl Counterparts {
     }
 
     /// Write what the block's records cover into the mirror the gate and
-    /// the fence read: neither asks a settled set about a transaction
-    /// the chain has established no counterpart can settle.
+    /// the fence read: neither asks a settled set about a transaction a
+    /// departed counterpart's record has established it never settled.
     fn cover_recorded(&self, block: &Block) {
         for record in block.abandonment_records() {
             for tx_hash in record.tx_hashes() {
@@ -805,40 +766,24 @@ impl Counterparts {
         }
     }
 
-    /// Fold what `shard` said of `tx_hash` into the mirror the vote
-    /// fence reads, and tell the mempool.
-    ///
-    /// Fed from two directions and read the same way from both: a
-    /// certificate arriving by broadcast, and a record the chain
-    /// committed, which is the counterpart's own word folded from the
-    /// chain rather than from whatever this replica happened to hear —
-    /// so a replica that came up between a core's verdict and the
-    /// record's proposal holds the same answer its peers do. First
-    /// write wins, as the chain's answer is: a second certificate or
-    /// record restates a decision already held.
-    ///
-    /// Only a word this shard has a use for is kept. A core's refusal
-    /// is the transaction's verdict, where a leg here issued for it, and
-    /// a core shard's acceptance counts toward the transaction being
-    /// accepted, which is every core shard saying so. A consumer's
-    /// acceptance keeps nothing: it opens the probe whose answer settles
-    /// the record held for its claim.
-    pub fn fold_verdict(&self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
-        if shard == self.local_shard || heard.question != Question::Verdict {
+    /// Tell the mempool a core's refusal of a transaction a leg here
+    /// issued for: the verdict, as the counterpart's certificate carries
+    /// it. Nothing is written down — what licenses taking the crossing
+    /// back is the claim cell a refusing core never writes, read absent
+    /// past the deadline — and the mempool reads a verdict it already
+    /// holds as nothing new.
+    pub fn fold_verdict(
+        &self,
+        shard: ShardId,
+        tx_hash: TxHash,
+        decision: TransactionDecision,
+    ) -> Vec<Action> {
+        if shard == self.local_shard || !self.ledger.core_holds(tx_hash, shard) {
             return Vec::new();
         }
-        let Word::Refused { decision, .. } = heard.word else {
-            return Vec::new();
-        };
-        if self.ledger.core_holds(tx_hash, shard)
-            && self.ledger.unsettled_figures(tx_hash).is_some()
-            && self.mirror.record(tx_hash, shard, heard)
-        {
-            return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
-                resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
-            })];
-        }
-        Vec::new()
+        vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
+            resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
+        })]
     }
 
     /// Fold a counterpart's claiming success: the cue to ask whether it
@@ -915,7 +860,7 @@ impl Counterparts {
     }
 
     /// The records this shard has evidence for and has not yet written
-    /// down — what each departed counterpart left of its business here.
+    /// down: what each departed counterpart left of its business here.
     ///
     /// Composed from the settled sets, which is what bounds when this can
     /// speak at all: a set is acquired once the departed shard's terminal
@@ -932,22 +877,17 @@ impl Counterparts {
     /// stops first: a name's cost varies with its reach, so the count
     /// alone would admit a section several frames wide.
     ///
-    /// The departures are filled before what was heard, so which of them
-    /// the budgets reach is the same on every proposer: a departure is
-    /// composed from the settled sets, which every replica at a
-    /// committed height holds alike, while what a validator has heard is
-    /// its own. Truncating loses nothing — a name no record carries
-    /// stays uncovered and is offered again next block.
+    /// Which of them the budgets reach is the same on every proposer: a
+    /// departure is composed from the settled sets, which every replica
+    /// at a committed height holds alike. Truncating loses nothing — a
+    /// name no record carries stays uncovered and is offered again next
+    /// block.
     ///
     /// Ascending by shard, which is the one order a block may carry them
     /// in.
     fn abandonment_records(&self) -> Vec<AbandonmentRecord> {
         let mut budget = Budget::empty();
-        // One record per shard and arm, ascending: a departure first,
-        // since it covers everything the shard was party to, then one
-        // per question for the shards still running, in the order the
-        // block carries them.
-        let mut records: BTreeMap<(ShardId, Option<Question>), AbandonmentRecord> = BTreeMap::new();
+        let mut records: BTreeMap<ShardId, AbandonmentRecord> = BTreeMap::new();
         // The sets are a hash map, so the shards are walked in sorted
         // order rather than its own: which departures the budget reaches
         // must not turn on a per-process iteration order.
@@ -955,7 +895,7 @@ impl Counterparts {
             let mut shards: Vec<ShardId> = sets.keys().copied().collect();
             shards.sort_unstable();
             for shard in shards {
-                if budget.spent() || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+                if budget.spent() || records.len() == MAX_PROVISION_TARGET_SHARDS {
                     break;
                 }
                 let settled = &sets[&shard];
@@ -965,49 +905,10 @@ impl Counterparts {
                 if unsettled.is_empty() {
                     continue;
                 }
-                let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
-                records.insert((shard, None), record);
+                let record = AbandonmentRecord::new(shard, settled.terminal_wt, unsettled);
+                records.insert(shard, record);
             }
         });
-        // What counterparts were heard to say, one record per shard and
-        // question, at the shard's earliest anchor: a record states the
-        // one moment every name in it was answered at, since one
-        // spanning two satisfies the fence's equality check for neither,
-        // and the rest waits a block. Nothing is offered beside a
-        // departure, which answers for everything the shard was party
-        // to.
-        let mut heard: HeardByQuestion = BTreeMap::new();
-        for (tx_hash, shard, word) in self.mirror.all() {
-            let Some(figures) = self.ledger.unsettled_figures(tx_hash) else {
-                continue;
-            };
-            heard
-                .entry((shard, word.question))
-                .or_default()
-                .entry((word.at, word.word))
-                .or_default()
-                .push(figures);
-        }
-        for ((shard, question), anchors) in heard {
-            if budget.spent() || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
-                break;
-            }
-            if records.contains_key(&(shard, None)) {
-                continue;
-            }
-            let Some(((at, word), mut unsettled)) = anchors.into_iter().next() else {
-                continue;
-            };
-            budget.take(&mut unsettled);
-            if unsettled.is_empty() {
-                continue;
-            }
-            let evidence = Heard { question, word, at };
-            records.insert(
-                (shard, Some(question)),
-                AbandonmentRecord::heard(shard, evidence, unsettled),
-            );
-        }
         records.into_values().collect()
     }
 
@@ -1060,7 +961,7 @@ impl Counterparts {
         let mut actions = Vec::new();
         for (tx_hash, spoken) in ec.verdicts() {
             actions.extend(match spoken {
-                Spoken::Refused(heard) => self.fold_verdict(shard, tx_hash, heard),
+                Spoken::Refused(decision) => self.fold_verdict(shard, tx_hash, decision),
                 Spoken::Claimed { at } => self.fold_claimed(shard, tx_hash, at),
             });
         }
@@ -1156,11 +1057,8 @@ mod tests {
             let mut offered = left.clone();
             Budget::empty().take(&mut offered);
             assert!(!offered.is_empty(), "each block carries something");
-            let record = AbandonmentRecord::departed(
-                ShardId::ROOT,
-                WeightedTimestamp::ZERO,
-                offered.clone(),
-            );
+            let record =
+                AbandonmentRecord::new(ShardId::ROOT, WeightedTimestamp::ZERO, offered.clone());
             assert!(
                 evidence_admits_block(record.wire_weight()),
                 "and what it carries is a section a voter admits",

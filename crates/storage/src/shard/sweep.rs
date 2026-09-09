@@ -7,14 +7,14 @@
 //! an index a split child does not inherit. The prefix is the only thing
 //! guaranteed to arrive, so the cell has to carry the answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Address, Block, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites, ShardId,
-    ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
-    WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Address, Block, Finalization, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites,
+    ShardId, ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction,
+    TxHash, Verifiable, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
@@ -406,23 +406,24 @@ pub fn merge_sweep_overlay(
 }
 
 /// Fold what the block itself writes — the committed-transaction cells
-/// it creates and the sweep's removals — into the settled set its
-/// receipts produced.
+/// it creates, and the sweep's removals with the refusals' retractions
+/// — into the settled set its receipts produced.
 ///
-/// Both are ordinary writes, a value at the key or `None` at it, so
-/// neither needs a commit path of its own: they fold with everything
-/// else and land under `state_root` like any other change. That is the
-/// fact that makes this tractable rather than novel.
+/// All are ordinary writes, a value at the key or `None` at it, so
+/// none needs a commit path of its own: they fold with everything else
+/// and land under `state_root` like any other change. That is the fact
+/// that makes this tractable rather than novel.
 ///
 /// # Panics
 ///
 /// If a creation or a removal names a cell the block's own receipts
-/// also write. The two would be one entry in the settled map, so one of
-/// them would silently not happen — and which one is decided by
-/// insertion order, which is not something a validator can check. A
-/// creation sits under the shard's own owner, which no receipt writes,
-/// and validation refuses a block sweeping what it writes before
-/// anything reaches here; this is the assertion that both hold.
+/// also write, or a removal is named twice. The two would be one entry
+/// in the settled map, so one of them would silently not happen — and
+/// which one is decided by insertion order, which is not something a
+/// validator can check. A creation sits under the shard's own owner,
+/// which no receipt writes, validation refuses a block sweeping what it
+/// writes before anything reaches here, and [`removals_of`] names each
+/// removal once; this is the assertion that all three hold.
 #[must_use]
 pub fn with_sweep(
     settled: SettledWrites,
@@ -446,6 +447,22 @@ pub fn with_sweep(
         );
     }
     SettledWrites::from_parts(cells, entries)
+}
+
+/// Everything a block removes, each once: what its sweep retires, and
+/// the committed cells its finalizations' refusals retract.
+///
+/// One set, because a refused transaction's cell can fall to the sweep
+/// in the block that retracts it, and a removal named twice would be
+/// two `None`s at one key. Ascending, so the fold walks one order.
+#[must_use]
+pub fn removals_of(
+    swept: &[SubstateKey],
+    finalizations: &[Arc<Verifiable<Finalization>>],
+) -> Vec<SubstateKey> {
+    let mut removals: BTreeSet<SubstateKey> = swept.iter().copied().collect();
+    removals.extend(finalizations.iter().flat_map(|fw| fw.retractions()));
+    removals.into_iter().collect()
 }
 
 /// The cells a followed block removed: everything sweepable strictly
@@ -474,8 +491,11 @@ pub fn sweep_through(
 }
 
 /// What a followed block writes under `prefix`, composed as the chain
-/// composed it: the receipts its ticks settled, the committed cells its
-/// committer derived, and the sweep its header names.
+/// composed it.
+///
+/// The receipts its ticks settled, the committed cells its committer
+/// derived, the sweep its header names, and the cells its refusals
+/// retract.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
@@ -503,7 +523,8 @@ pub fn followed_block_writes(
         &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
         prior,
     );
-    let removals = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
+    let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
+    let removals = removals_of(&swept, block.certificates());
     filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
 }
 
@@ -789,6 +810,35 @@ mod tests {
         );
         assert_eq!(settled.cells().get(&created), Some(&Some(value)));
         assert_eq!(settled.cells().get(&removed), Some(&None));
+    }
+
+    /// A refusal's retraction removes the cell beside the sweep, and a
+    /// cell both name is removed once.
+    #[test]
+    fn a_refusals_retraction_removes_beside_the_sweep_once() {
+        use hyperscale_types::test_utils::finalization_of;
+        use hyperscale_types::{BlockHeight, ExecutionOutcome, Hash, TxOutcome};
+
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let (swept, _, _) = cell(1, 1, 0xD1);
+        let (retracted, _, _) = cell(2, 3, 0xC2);
+        let finalizations = vec![Arc::new(Verifiable::from(finalization_of(
+            BlockHeight::new(1),
+            vec![
+                TxOutcome::new(tx(1), ExecutionOutcome::Failed).retracting(Some(retracted)),
+                TxOutcome::new(tx(2), ExecutionOutcome::Aborted).retracting(Some(swept)),
+            ],
+        )))];
+        let mut expected = vec![swept, retracted];
+        expected.sort_unstable();
+        assert_eq!(removals_of(&[swept], &finalizations), expected);
+        let settled = with_sweep(
+            SettledWrites::default(),
+            &[],
+            &removals_of(&[swept], &finalizations),
+        );
+        assert_eq!(settled.cells().get(&retracted), Some(&None));
+        assert_eq!(settled.cells().get(&swept), Some(&None));
     }
 
     /// One committed cell per transaction given, under the shard's own

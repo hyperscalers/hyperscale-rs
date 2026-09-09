@@ -11,7 +11,7 @@
 
 use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
 
-use crate::{Address, LocalKey, Question, RoutePrefix, WorkInFlight};
+use crate::{Address, LocalKey, RoutePrefix, WorkInFlight};
 
 /// The largest message any transport carries, compressed.
 ///
@@ -169,24 +169,6 @@ pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 /// length it claims.
 pub const MAX_PREFIXES_PER_TX: usize =
     MAX_TX_BYTES_LEN / (size_of::<Address>() + size_of::<LocalKey>());
-
-/// Hard cap on the abandonment records one block may carry.
-///
-/// What a composer offers is one departure per counterpart shard plus
-/// one per question it heard an answer to, and a record may name a live
-/// shard — a refusing core, a consumer that claimed — as readily as one
-/// that left. So the bound is the shard count times a departure and one
-/// per question. A shard with evidence at several anchors under one
-/// question drains one anchor per block, which costs settlement rate
-/// rather than this bound.
-///
-/// This is a decode cap and is what makes it a bound: a block claiming
-/// more never decodes. The admitted ordering is finer than the count —
-/// strictly ascending `(shard, evidence)`, and evidence carries the
-/// anchor it was taken at — so the ordering alone would admit several
-/// records per shard and question, and does not imply this figure.
-pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
-    MAX_PROVISION_TARGET_SHARDS * (1 + Question::ALL.len());
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.

@@ -25,7 +25,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    Finalization, FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
 };
@@ -98,7 +98,7 @@ pub struct ElidedCertifiedBlock {
     /// business, always inline: the records are small, rare, and are what
     /// a verdict is composed on, so a hop that dropped them would hand
     /// back a block that cannot answer for itself.
-    #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     abandonment_records: Vec<AbandonmentRecord>,
     /// The block's state claims, always inline: they are small, and the
     /// receiver folds them at commit.

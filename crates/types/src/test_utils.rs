@@ -895,7 +895,8 @@ pub fn make_finalization_leaving(
 }
 
 /// A single-certificate finalization at `block_height` over `outcomes`.
-fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
+#[must_use]
+pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
     let tick_id = TickId::new(ShardId::ROOT, block_height);
     let ec = ExecutionCertificate::new(
         tick_id,
