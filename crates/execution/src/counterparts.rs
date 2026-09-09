@@ -265,15 +265,6 @@ pub struct Counterparts {
     /// it, or when every transaction it answered for is gone.
     fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
 
-    /// The questions this validator has answered for itself, off a proof
-    /// it fetched and verified.
-    ///
-    /// Kept apart from the mirror, which stays fed by committed content
-    /// alone so two validators at one committed height compose the same
-    /// records. What this licenses is narrower: not asking a counterpart
-    /// again for an answer already in hand.
-    verified: BTreeSet<(TxHash, ShardId, Probed)>,
-
     /// The escrow records this shard inherited with a prefix, each still
     /// undisposed, by cell key.
     ///
@@ -308,7 +299,6 @@ impl Counterparts {
             proven_anchors,
             proven_cells,
             fetched: BTreeMap::new(),
-            verified: BTreeSet::new(),
             inherited: BTreeMap::new(),
             released_fetches: Vec::new(),
         }
@@ -488,12 +478,6 @@ impl Counterparts {
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.ledger.probeable(now) {
             for (shard, key, probed) in counterpart_cells(&entry, self.local_shard, trie) {
-                // The chain has answered: nothing is asked again.
-                if self.ledger.answered(entry.tx_hash, shard, probed)
-                    || self.verified.contains(&(entry.tx_hash, shard, probed))
-                {
-                    continue;
-                }
                 // The newest header an absence would answer at, of those
                 // standing at the chain's clock: the one the shard is
                 // likeliest to still serve, and the one every member of
@@ -516,12 +500,14 @@ impl Counterparts {
                 else {
                     continue;
                 };
-                // A question in flight is left alone: a core's header
-                // lands every block, and moving the probe to each new
-                // one abandons the fetch before its answer returns. A
-                // probe whose fetch has answered is moved on, which is
-                // how a claim the chain read absent is asked again —
-                // at a newer header, not of the same one every block.
+                // A question in flight, one this validator's own fetch
+                // answered and one the chain answered are left alone: a
+                // core's header lands every block, and moving a probe
+                // to each new one abandons the fetch before its answer
+                // returns. A probe whose fetch returned a reading that
+                // answered nothing is moved on, which is how a cell
+                // read outside its window is asked again — at a newer
+                // header, not of the same one every block.
                 if self
                     .ledger
                     .probe_stands(entry.tx_hash, shard, probed, anchor.height)
@@ -620,8 +606,8 @@ impl Counterparts {
             if entry.probed.licenses(anchor.ts, entry.deadline, inclusion)
                 && entry.probed.read(inclusion, entry.core).is_some()
             {
-                self.verified
-                    .insert((entry.tx_hash, entry.shard, entry.probed));
+                self.ledger
+                    .verify_probe(entry.tx_hash, entry.shard, entry.probed);
                 answering.insert(entry.key);
                 speaks_for.insert(entry.tx_hash);
             }
@@ -904,11 +890,6 @@ impl Counterparts {
     /// answered first, or one whose entry is gone — so a counterpart
     /// that never serves the height does not pin the slot.
     fn release_answered_fetches(&mut self) -> Vec<Action> {
-        // What this validator answered for itself goes with the entry it
-        // answered about: past that there is nothing left to not ask.
-        let held = &self.ledger;
-        self.verified
-            .retain(|(tx_hash, _, _)| held.contains(*tx_hash));
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an
