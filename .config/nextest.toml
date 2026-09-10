@@ -10,8 +10,11 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # The ci feature runs sims at the production 5-minute epoch
 # (hyperscale-simulator inherits it through its simulation dependency), so the
 # largest reshape sims run far longer than the rest of the suite and need their
-# own slow-timeout. A sim holds multi-node state in memory but peaks near 1 GiB
-# per process, so a 4-vCPU/16 GiB runner seats one per thread without pressure.
+# own slow-timeout. A sim is single-threaded, but a runner's four vCPUs are not
+# four independent cores: seating one sim per vCPU slows every scenario enough
+# to push the longest ones past their terminate-after, so each takes two slots
+# to hold a core of its own.
 [[profile.ci.overrides]]
 filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
+threads-required = 2
 slow-timeout = { period = "300s", terminate-after = 72 }
