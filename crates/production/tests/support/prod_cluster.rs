@@ -19,7 +19,8 @@ use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::{RanAs, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
+    vote_reshape_threshold,
 };
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, Derivation, NetworkDefinition, PrincipalAddr,
@@ -214,8 +215,7 @@ impl ProdCluster {
             .inner
             .beacon_state()?
             .derive_topology_snapshot(NetworkDefinition::simulator());
-        topology_snapshot
-            .all_shards_for_transaction(tx)
+        submission_shards(&topology_snapshot, tx)
             .into_iter()
             .find_map(|shard| self.inner.host_serving(shard))
     }

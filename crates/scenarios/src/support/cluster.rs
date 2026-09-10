@@ -6,12 +6,36 @@ use std::time::Duration;
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, Derivation, Event, ShardId, Signer, StateRoot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
+    Address, BeaconState, BlockHeight, Derivation, Event, ShardId, Signer, StateRoot,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    WeightedTimestamp, WorkInFlight,
 };
 
 use super::Budget;
 use super::query::RanAs;
+
+/// The shards a submission of `tx` may enter at, the fee payer's first.
+///
+/// The payer's shard proposes the transaction, so a host serving it
+/// carries a submission into a block on its own. A host serving only
+/// another touched shard parks the submission until the payer's shard
+/// engages it, and the only thing that prompts the payer's shard is the
+/// gossip the submitting host sends — a fault that suppresses gossip
+/// strands it there. Routing to the payer's shard is what a client does,
+/// and it is what keeps a gossip fault a fault in delivery rather than in
+/// submission.
+#[must_use]
+pub fn submission_shards(snapshot: &TopologySnapshot, tx: &Transaction) -> Vec<ShardId> {
+    let payer = snapshot.shard_for_prefix(tx.body().fee_payer);
+    let mut shards = vec![payer];
+    shards.extend(
+        snapshot
+            .all_shards_for_transaction(tx)
+            .into_iter()
+            .filter(|&shard| shard != payer),
+    );
+    shards
+}
 
 /// A running cluster of assembled nodes, observed and driven by a scenario.
 ///

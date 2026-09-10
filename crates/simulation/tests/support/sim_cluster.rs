@@ -22,7 +22,8 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
+    vote_reshape_threshold,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
@@ -436,25 +437,20 @@ impl SimCluster {
         );
     }
 
-    /// A host serving any shard `tx` touches, for submission routing. Single
-    /// shard tests resolve to the one serving host; cross-shard source
-    /// selection is refined when cross-shard scenarios land.
+    /// The host a submission of `tx` enters at: the first serving the
+    /// payer's shard, else the first serving any shard it touches.
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
         let topology_snapshot = self.runner.host_topology(0)?;
         // Built by the harness rather than by a node, so nothing has
         // derived it yet and routing is a derived fact.
         tx.try_derived(self.runner.host_derivation(0)?.as_ref())
             .ok()?;
-        let shards: BTreeSet<ShardId> = topology_snapshot
-            .all_shards_for_transaction(tx)
+        submission_shards(&topology_snapshot, tx)
             .into_iter()
-            .collect();
-        (0..self.runner.num_hosts()).find(|&host| {
-            self.runner
-                .hosted_shards_of(host)
-                .iter()
-                .any(|shard| shards.contains(shard))
-        })
+            .find_map(|shard| {
+                (0..self.runner.num_hosts())
+                    .find(|&host| self.runner.hosted_shards_of(host).contains(&shard))
+            })
     }
 }
 

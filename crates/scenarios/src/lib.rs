@@ -95,7 +95,7 @@ pub use straddler::{
 };
 pub use support::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, conservation, epochs, grow_to,
-    query, tx, vote_reshape_threshold, wait,
+    query, submission_shards, tx, vote_reshape_threshold, wait,
 };
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{
