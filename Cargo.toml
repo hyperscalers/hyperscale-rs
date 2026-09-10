@@ -140,6 +140,7 @@ hyperscale-vm-fixtures = { path = "vm/crates/fixtures" }
 hyperscale-vm-gate = { path = "vm/crates/gate" }
 hyperscale-vm-kernel = { path = "vm/crates/kernel" }
 hyperscale-vm-manifest-builder = { path = "vm/crates/manifest-builder" }
+hyperscale-vm-meter = { path = "vm/crates/meter" }
 hyperscale-vm-ref = { path = "vm/crates/ref" }
 hyperscale-vm-runtime = { path = "vm/crates/runtime", default-features = false }
 hyperscale-vm-sdk = { path = "vm/crates/sdk" }

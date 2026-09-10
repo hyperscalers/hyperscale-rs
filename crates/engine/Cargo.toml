@@ -28,14 +28,15 @@ hyperscale-hbor.workspace = true
 # fallback. The differential guarantee — byte-identical receipts and
 # fuel across both runtimes — is what makes the split sound.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+hyperscale-vm-meter.workspace = true
 hyperscale-vm-runtime = { workspace = true, features = ["engine"] }
 crossbeam.workspace = true
 wasmtime.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 hyperscale-vm-ref.workspace = true
-# The profile validator alone: an artifact has to be judgeable where the
-# blessed engine is not built in.
+# Admission alone: an artifact has to be judged and instrumented where
+# the blessed engine is not built in.
 hyperscale-vm-runtime.workspace = true
 
 # The reference interpreter only ships on wasm32, so nothing in a native

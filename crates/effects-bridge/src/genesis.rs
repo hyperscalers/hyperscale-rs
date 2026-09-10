@@ -293,7 +293,7 @@ pub const XRD_RECORD: ResourceRecord = ResourceRecord::Fungible { display_digits
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::test_principal;
-    use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account};
+    use hyperscale_vm_stdlib::{ACCOUNT_MODULE, account};
 
     use super::*;
     use crate::account_address;
@@ -304,11 +304,11 @@ mod tests {
 
         // The code is the committed blob and the section is what was
         // added, so the address covers both.
-        assert!(artifact.starts_with(ACCOUNT_COMPONENT));
-        assert!(artifact.len() > ACCOUNT_COMPONENT.len());
+        assert!(artifact.starts_with(ACCOUNT_MODULE));
+        assert!(artifact.len() > ACCOUNT_MODULE.len());
         assert_ne!(
             package_hash(&ProtocolHasher, artifact),
-            package_hash(&ProtocolHasher, ACCOUNT_COMPONENT)
+            package_hash(&ProtocolHasher, ACCOUNT_MODULE)
         );
 
         // What genesis publishes is admitted out of the artifact by the

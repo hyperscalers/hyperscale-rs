@@ -38,7 +38,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
-use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, instantiate, staking};
+use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
     Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, encode_amount,
 };
@@ -2149,7 +2149,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // be the same bytes, so vary the metadata to vary the address.
     let mut metadata = published_metadata();
     naming(&mut metadata, "republished");
-    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
     let cache = executor.packages();
@@ -2190,7 +2190,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
 /// fixture drops the claim rather than the tests asserting a publish the
 /// gate does not allow.
 fn published_account_artifact() -> Vec<u8> {
-    attach_metadata(STAKING_COMPONENT, &published_metadata()).expect("attaches")
+    attach_metadata(STAKING_MODULE, &published_metadata()).expect("attaches")
 }
 
 /// The metadata a publisher's artifact carries.
@@ -2241,7 +2241,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 
     let mut metadata = published_metadata();
     naming(&mut metadata, "compiled");
-    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     assert!(
         !executor.package_code_settled(package),
@@ -2273,7 +2273,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
 
     let mut metadata = published_metadata();
     naming(&mut metadata, "reseeded");
-    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
     // What a restarting host replays from its stores' package indices:
@@ -2295,7 +2295,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     // whatever the store holds, so one unreadable entry must not be the
     // end of the reseed.
     naming(&mut metadata, "after the refusal");
-    let next = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let next = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     executor.install_artifact(&next);
     await_code_settled(&executor, package_hash(&ProtocolHasher, &next));
 }
@@ -2311,7 +2311,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
 
     let mut metadata = published_metadata();
     naming(&mut metadata, "smuggled");
-    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publisher = fee_payer(11);
 
@@ -2670,7 +2670,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
             signature.totality = Totality::Infallible;
         }
     }
-    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7, artifact,

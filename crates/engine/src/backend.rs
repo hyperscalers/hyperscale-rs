@@ -140,23 +140,23 @@ mod native {
     use hyperscale_vm_kernel::{
         GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
+    use hyperscale_vm_meter::instantiation_cost;
     use hyperscale_vm_runtime::{
-        InstantiationCharges, add_kernel_to_linker, blessed_engine, classify,
-        exhausted as fuel_exhausted, instantiate_charged, instantiation_charges, invoke_export,
-        validate_component,
+        HostRefusal, Invoking, add_kernel_imports, admit, blessed_engine, instantiate_metered,
+        invoke_export,
     };
     use hyperscale_vm_types::AbortReason;
-    use wasmtime::component::{Component, InstancePre, Linker};
-    use wasmtime::{Engine, Store};
+    use wasmtime::{Engine, InstancePre, Linker, Module, Store};
 
     use super::{FUEL, PackageSlots};
     use crate::genesis::GenesisPackages;
 
-    /// One package's runnable form: the pre-linked compilation and the
-    /// instantiation charge sequence derived from the same bytes.
+    /// One package's runnable form: the instrumented module the meter
+    /// made of the artifact, pre-linked, and what instantiating it
+    /// prepays off the counter, derived from the same bytes.
     pub struct CompiledPackage {
-        pre: InstancePre<KernelSession>,
-        charges: InstantiationCharges,
+        pre: InstancePre<Invoking<KernelSession>>,
+        cost: u64,
     }
 
     /// The compiled guests, pre-linked for cheap instantiation.
@@ -180,22 +180,22 @@ mod native {
         /// Compile `packages` on the blessed engine and start the
         /// compile worker for everything published after them.
         ///
-        /// The artifact compiled is the one the package address covers,
+        /// The artifact admitted is the one the package address covers,
         /// metadata section included: what the chain stores is what the
-        /// engine runs. The set is the network's genesis set, because a
-        /// package the chain is born holding is one no node ever fetches
-        /// — every node compiles it at boot instead.
+        /// meter instruments and the engine runs. The set is the
+        /// network's genesis set, because a package the chain is born
+        /// holding is one no node ever fetches — every node compiles it
+        /// at boot instead.
         ///
         /// # Panics
         ///
-        /// Panics if a genesis artifact fails profile validation or
-        /// compilation — a build defect, not a runtime condition.
+        /// Panics if a genesis artifact fails admission or compilation —
+        /// a build defect, not a runtime condition.
         pub fn new(packages: &GenesisPackages) -> Self {
             let engine = blessed_engine().expect("blessed engine configuration is pinned");
             let linker = kernel_linker(&engine);
             let slots = Arc::new(PackageSlots::new());
             for artifact in packages.artifacts() {
-                validate_component(artifact).expect("a genesis artifact clears the profile");
                 let pre = build(&engine, &linker, artifact).expect("a genesis artifact compiles");
                 let package = package_hash(&ProtocolHasher, artifact);
                 assert!(slots.claim(package), "genesis packages are distinct");
@@ -254,11 +254,11 @@ mod native {
         }
     }
 
-    /// A linker carrying the kernel world — the one import surface a
-    /// deployable component may name.
-    fn kernel_linker(engine: &Engine) -> Linker<KernelSession> {
-        let mut linker = Linker::<KernelSession>::new(engine);
-        add_kernel_to_linker(&mut linker).expect("kernel world wiring");
+    /// A linker carrying the kernel imports — the one import surface a
+    /// deployable module may name.
+    fn kernel_linker(engine: &Engine) -> Linker<Invoking<KernelSession>> {
+        let mut linker = Linker::<Invoking<KernelSession>>::new(engine);
+        add_kernel_imports(&mut linker).expect("kernel import wiring");
         linker
     }
 
@@ -280,28 +280,31 @@ mod native {
         }
     }
 
-    /// Build one artifact, or `None` if the blessed engine refuses it.
+    /// Build one artifact, or `None` if admission or the blessed engine
+    /// refuses it.
     ///
-    /// Compilation is one pinned wasmtime over one blessed config, so
-    /// every way it can end is a function of the bytes and every replica
-    /// reaches the same one — an unwind included, which is why the
-    /// worker catches rather than dies on it. What is not deterministic
-    /// is the profile validator having admitted bytes wasmtime will not
-    /// take, so a refusal here is logged as the disagreement it is.
+    /// Admission and compilation are one pass and one pinned wasmtime
+    /// over one blessed config, so every way this can end is a function
+    /// of the bytes and every replica reaches the same one — an unwind
+    /// included, which is why the worker catches rather than dies on it.
+    /// What is not deterministic is admission having passed bytes
+    /// wasmtime will not take, so a refusal here is logged as the
+    /// disagreement it is.
     fn build(
         engine: &Engine,
-        linker: &Linker<KernelSession>,
+        linker: &Linker<Invoking<KernelSession>>,
         artifact: &[u8],
     ) -> Option<CompiledPackage> {
         let attempt = catch_unwind(AssertUnwindSafe(|| {
-            let component =
-                Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
+            let admitted = admit(artifact).map_err(|error| format!("admission: {error:#}"))?;
+            let module =
+                Module::new(engine, &admitted).map_err(|error| format!("compile: {error:#}"))?;
             let pre = linker
-                .instantiate_pre(&component)
+                .instantiate_pre(&module)
                 .map_err(|error| format!("link: {error:#}"))?;
-            let charges = instantiation_charges(artifact)
-                .map_err(|error| format!("charge derivation: {error:#}"))?;
-            Ok(CompiledPackage { pre, charges })
+            let cost = instantiation_cost(artifact)
+                .map_err(|error| format!("instantiation cost: {error:#}"))?;
+            Ok(CompiledPackage { pre, cost })
         }));
         let reason = match attempt {
             Ok(Ok(pre)) => return Some(pre),
@@ -321,40 +324,41 @@ mod native {
             // What the transaction has left, under the per-invocation
             // ceiling: a manifest's nodes draw from one signed budget.
             let budget = call.fuel_budget.min(FUEL);
-            let mut store = Store::new(&self.engine, session);
+            let mut store = Store::new(&self.engine, Invoking::new(session));
             let Some(package) = self.slots.resolve(call.package) else {
                 // This node's own cache, not the transaction: nothing
                 // about the batch is decided by a miss here.
                 return InvokeResult {
-                    session: store.into_data(),
+                    session: store.into_data().into_host(),
                     fuel: 0,
                     result: Invoked::Unavailable(AbortReason::CodeUnavailable),
-                    exhausted: false,
                 };
             };
-            let instance = match instantiate_charged(&mut store, budget, &package.charges, |s| {
+            let instance = match instantiate_metered(&mut store, budget, package.cost, |s| {
                 package.pre.instantiate(s)
             }) {
                 Ok(instance) => instance,
-                // Exhausting the signed budget during instantiation is the
-                // sender's own deterministic trap; any other instantiation
-                // failure is this machine's.
-                Err(error) if fuel_exhausted(&error) => {
-                    let fuel = budget - store.get_fuel().expect("fuel metering is enabled");
+                // A budget under the prepaid instantiation is the sender's
+                // own deterministic refusal, spending the whole of it; any
+                // other instantiation failure is this machine's.
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<HostRefusal>(),
+                        Some(HostRefusal(AbortReason::OutOfGas))
+                    ) =>
+                {
                     return InvokeResult {
-                        session: store.into_data(),
-                        fuel,
-                        result: Invoked::Aborted(classify(&error)),
-                        exhausted: true,
+                        session: store.into_data().into_host(),
+                        fuel: budget,
+                        result: Invoked::Aborted(AbortReason::OutOfGas),
                     };
                 }
                 Err(error) => {
-                    tracing::debug!(?error, "component did not instantiate");
+                    tracing::debug!(?error, "module did not instantiate");
                     return InvokeResult {
-                        session: store.into_data(),
+                        session: store.into_data().into_host(),
                         fuel: 0,
                         result: Invoked::Unavailable(AbortReason::InstantiationFailed),
-                        exhausted: false,
                     };
                 }
             };
@@ -363,10 +367,9 @@ mod native {
                 tracing::debug!(export = call.export, ?reason, "guest aborted");
             }
             InvokeResult {
-                session: store.into_data(),
+                session: store.into_data().into_host(),
                 fuel: end.fuel,
                 result: end.result,
-                exhausted: end.exhausted,
             }
         }
     }
@@ -384,10 +387,8 @@ mod reference {
     use hyperscale_vm_kernel::{
         GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
-    use hyperscale_vm_ref::{
-        CVal, InstantiateError, RefComponent, RefComponentInstance, Trap as RefTrap,
-    };
-    use hyperscale_vm_runtime::validate_component;
+    use hyperscale_vm_ref::{InstantiateError, RefModule, RefModuleInstance};
+    use hyperscale_vm_runtime::admit;
     use hyperscale_vm_types::AbortReason;
 
     use super::{FUEL, PackageSlots};
@@ -395,38 +396,40 @@ mod reference {
 
     /// The decoded guests under the reference interpreter.
     pub struct EngineBackend {
-        slots: Arc<PackageSlots<RefComponent>>,
+        slots: Arc<PackageSlots<RefModule>>,
     }
 
     impl EngineBackend {
-        /// Decode the genesis packages.
+        /// Admit and decode the genesis packages.
         ///
-        /// The artifact clears the same profile it clears under the
-        /// blessed engine: the verdict is a property of the bytes, and
-        /// a build that interprets components rather than compiling them
-        /// has no less need of it.
+        /// The artifact goes through the same admission it goes through
+        /// under the blessed engine: the verdict and the instrumented
+        /// module are properties of the bytes, and a build that
+        /// interprets modules rather than compiling them has no less
+        /// need of either.
         ///
         /// # Panics
         ///
-        /// Panics if a genesis artifact fails profile validation or
-        /// decoding — a build defect, not a runtime condition.
+        /// Panics if a genesis artifact fails admission or decoding — a
+        /// build defect, not a runtime condition.
         pub fn new(packages: &GenesisPackages) -> Self {
             let slots = Arc::new(PackageSlots::new());
             for artifact in packages.artifacts() {
-                validate_component(artifact).expect("a genesis artifact clears the profile");
-                let component = RefComponent::decode(artifact).expect("a genesis artifact decodes");
+                let admitted = admit(artifact).expect("a genesis artifact is admitted");
+                let module = RefModule::decode(&admitted).expect("a genesis artifact decodes");
                 let package = package_hash(&ProtocolHasher, artifact);
                 assert!(slots.claim(package), "genesis packages are distinct");
-                slots.fulfil(package, Some(component));
+                slots.fulfil(package, Some(module));
             }
             Self { slots }
         }
 
         /// Absorb a committed package's artifact.
         ///
-        /// Decoding is one parser pass, so this target does it in place
-        /// — no worker, and the pending set never holds an entry long
-        /// enough for an invocation to wait on it.
+        /// Admission and decoding are a few parser passes, so this
+        /// target does them in place — no worker, and the pending set
+        /// never holds an entry long enough for an invocation to wait on
+        /// it.
         pub fn absorb_artifact(&self, artifact: &[u8]) {
             absorb_into(&self.slots, artifact);
         }
@@ -452,15 +455,18 @@ mod reference {
         }
     }
 
-    fn absorb_into(slots: &PackageSlots<RefComponent>, artifact: &[u8]) {
+    fn absorb_into(slots: &PackageSlots<RefModule>, artifact: &[u8]) {
         let package = package_hash(&ProtocolHasher, artifact);
         if !slots.claim(package) {
             return;
         }
-        match RefComponent::decode(artifact) {
-            Ok(component) => slots.fulfil(package, Some(component)),
+        let decoded = admit(artifact)
+            .map_err(|error| error.to_string())
+            .and_then(|admitted| RefModule::decode(&admitted).map_err(|error| error.to_string()));
+        match decoded {
+            Ok(module) => slots.fulfil(package, Some(module)),
             Err(error) => {
-                tracing::error!(?package, %error, "published artifact failed to decode");
+                tracing::error!(?package, %error, "published artifact was not admitted");
                 slots.fulfil(package, None);
             }
         }
@@ -468,44 +474,39 @@ mod reference {
 
     impl Backend for EngineBackend {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
-            let args: Vec<CVal> = call.args.iter().map(CVal::from).collect();
-            let Some(component) = self.slots.resolve(call.package) else {
+            let Some(module) = self.slots.resolve(call.package) else {
                 // This node's own cache, not the transaction: nothing
                 // about the batch is decided by a miss here.
                 return InvokeResult {
                     session,
                     fuel: 0,
                     result: Invoked::Unavailable(AbortReason::CodeUnavailable),
-                    exhausted: false,
                 };
             };
-            // The same budget the blessed engine meters against, applied
-            // before segment work: exhausting it during instantiation is
-            // the sender's own deterministic trap; any other instantiation
-            // failure is this machine's.
+            // The same budget the blessed engine sets its counter to,
+            // judged against the prepaid instantiation first: a budget
+            // under it is the sender's own deterministic refusal; any other
+            // instantiation failure is this machine's.
             let budget = call.fuel_budget.min(FUEL);
-            let mut instance = match RefComponentInstance::instantiate(&component, session, budget)
-            {
+            let mut instance = match RefModuleInstance::instantiate(&module, session, budget) {
                 Ok(instance) => instance,
-                Err((host, InstantiateError::Trap(RefTrap::OutOfFuel))) => {
+                Err((host, InstantiateError::OutOfGas)) => {
                     return InvokeResult {
                         session: host,
                         fuel: budget,
                         result: Invoked::Aborted(AbortReason::OutOfGas),
-                        exhausted: true,
                     };
                 }
                 Err((host, error)) => {
-                    tracing::debug!(?error, "component did not instantiate");
+                    tracing::debug!(?error, "module did not instantiate");
                     return InvokeResult {
                         session: host,
                         fuel: 0,
                         result: Invoked::Unavailable(AbortReason::InstantiationFailed),
-                        exhausted: false,
                     };
                 }
             };
-            let end = instance.invoke_kernel(call.export, &args);
+            let end = instance.invoke(call.export, call.args);
             if let Invoked::Aborted(reason) = &end.result {
                 tracing::debug!(export = call.export, ?reason, "guest aborted");
             }
@@ -513,7 +514,6 @@ mod reference {
                 session: instance.into_host(),
                 fuel: end.fuel,
                 result: end.result,
-                exhausted: end.exhausted,
             }
         }
     }

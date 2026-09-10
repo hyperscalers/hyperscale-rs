@@ -36,7 +36,7 @@ use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
 use hyperscale_vm_sdk::client::VaultField;
-use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, instantiate, staking};
+use hyperscale_vm_stdlib::{STAKING_MODULE, account, account_artifact, instantiate, staking};
 use hyperscale_vm_types::Address;
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -1706,7 +1706,7 @@ pub fn storm_artifact(nonce: u16) -> Vec<u8> {
             signature.totality = Totality::Infallible;
         }
     }
-    attach_metadata(STAKING_COMPONENT, &metadata).expect("storm metadata attaches")
+    attach_metadata(STAKING_MODULE, &metadata).expect("storm metadata attaches")
 }
 
 /// Build a signed publish of `artifact`, paid for by `payer` from their

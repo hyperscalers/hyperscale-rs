@@ -356,9 +356,9 @@ mod tests {
         // in this crate, which now runs the artifact. The reference
         // interpreter ships only on wasm32, so its acceptance has no
         // native witness unless one is written.
-        use hyperscale_vm_ref::RefComponent;
+        use hyperscale_vm_ref::RefModule;
 
-        RefComponent::decode(account_artifact())
+        RefModule::decode(account_artifact())
             .expect("the reference interpreter decodes the stdlib artifact");
     }
 }
