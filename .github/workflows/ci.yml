@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,7 +110,7 @@ jobs:
         run: >
           cargo nextest run --archive-file nextest-archive.tar.zst
           --workspace-remap . --profile ci
-          --partition hash:${{ matrix.shard }}/6
+          --partition hash:${{ matrix.shard }}/10
 
   build:
     name: Build Docker Image

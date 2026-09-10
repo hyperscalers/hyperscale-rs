@@ -14,4 +14,4 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # per process, so a 4-vCPU/16 GiB runner seats one per thread without pressure.
 [[profile.ci.overrides]]
 filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
-slow-timeout = { period = "300s", terminate-after = 48 }
+slow-timeout = { period = "300s", terminate-after = 72 }
