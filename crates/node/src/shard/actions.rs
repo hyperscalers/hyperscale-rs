@@ -913,6 +913,25 @@ where
         schedule: Arc<TopologySchedule>,
     ) {
         let committee_size = schedule.head().committee_for_shard(self.shard).len();
+        // The beacon attests a boundary off its child's header, and the
+        // commit path pins the boundary when that child commits. A shard
+        // that halts with the child certified but never committed leaves
+        // its attested anchor unpinned on every member, and nothing can
+        // seat against it — not a rotation's entrant, not the recovery's
+        // fresh committee. The committed tip is the anchor's exact state
+        // for as long as it stays the tip, so pin it the moment the
+        // attestation lands. A pin that already exists costs a stat.
+        if let Some(anchor) = schedule.head().boundary(self.shard)
+            && anchor.height == self.io.storage.committed_height()
+            && let Err(error) = self.io.storage.pin_boundary(anchor.height)
+        {
+            warn!(
+                shard = ?self.shard,
+                height = anchor.height.inner(),
+                error,
+                "attested boundary pin failed; this node won't serve this boundary"
+            );
+        }
         self.process.apply_topology(epoch, schedule);
 
         tracing::info!(

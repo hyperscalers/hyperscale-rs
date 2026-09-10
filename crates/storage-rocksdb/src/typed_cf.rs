@@ -13,7 +13,8 @@ use hyperscale_hbor::{
 };
 use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::{
-    BlockHeight, ChainOrigin, Hash, LEAF_KEY_BYTES, QuorumCertificate, StateRoot, WeightedTimestamp,
+    BlockHeight, CertifiedBlockHeader, ChainOrigin, Hash, LEAF_KEY_BYTES, QuorumCertificate,
+    StateRoot, WeightedTimestamp,
 };
 use rocksdb::{ColumnFamily, DB, DBRawIteratorWithThreadMode, Snapshot, WriteBatch};
 
@@ -486,6 +487,16 @@ impl MetadataEntry for ChainOriginEntry {
     const KEY: &'static [u8] = b"chain:origin";
     type Value = ChainOrigin;
     type Codec = ChainOriginCodec;
+}
+
+/// The certified header of the boundary a snap-sync imported, held
+/// without its block so the store serves the next joiner's witness
+/// history as one that committed the block would.
+pub struct BoundaryHeaderEntry;
+impl MetadataEntry for BoundaryHeaderEntry {
+    const KEY: &'static [u8] = b"import:boundary_header";
+    type Value = CertifiedBlockHeader;
+    type Codec = HborCodec<CertifiedBlockHeader>;
 }
 
 /// The staged snap-sync import's progress record, written atomically

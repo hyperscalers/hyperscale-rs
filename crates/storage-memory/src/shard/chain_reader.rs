@@ -33,15 +33,18 @@ impl ShardChainReader for SimShardStorage {
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
-        read_or_recover(&self.consensus)
+        let consensus = read_or_recover(&self.consensus);
+        consensus
             .blocks
             .get(&height)
             .map(|certified| {
-                Verified::<CertifiedBlockHeader>::from_persisted(CertifiedBlockHeader::new(
+                CertifiedBlockHeader::new(
                     certified.block().header().clone(),
                     certified.qc().clone(),
-                ))
+                )
             })
+            .or_else(|| consensus.boundary_headers.get(&height).cloned())
+            .map(Verified::<CertifiedBlockHeader>::from_persisted)
     }
 
     fn committed_height(&self) -> BlockHeight {

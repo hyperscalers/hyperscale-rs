@@ -11,8 +11,8 @@
 
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardId, ShardWitnessPayload,
-    StateRoot, SubstateKey, SubstateLeaf,
+    BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlockHeader, ChainOrigin, ShardId,
+    ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
 };
 
 use crate::Substates;
@@ -42,6 +42,12 @@ pub struct WitnessSeed {
     pub base: BeaconWitnessLeafCount,
     /// The window's payloads in leaf-index order.
     pub payloads: Vec<ShardWitnessPayload>,
+    /// The anchor's certified header — the boundary block's header and
+    /// the QC that certifies it, verified against the attested anchor.
+    /// A store that committed through the boundary holds it with the
+    /// block; an import holds it alone, and serves the next joiner's
+    /// witness history from it. `None` for an import with no history.
+    pub boundary: Option<CertifiedBlockHeader>,
 }
 
 /// One sub-range's fetch cursor within a staged import.
@@ -327,9 +333,11 @@ pub trait BoundaryStore {
     /// Install the staged boundary state at `height` into this (empty)
     /// store: raw substates, the JMT rebuilt from the staged leaf keys,
     /// and the anchor window's witness payloads — the state-level image
-    /// of a store that committed through the boundary. The staging area
-    /// is cleared on success. Chain metadata is not touched; tail block-sync
-    /// from `height + 1` layers on top.
+    /// of a store that committed through the boundary, pinned at
+    /// `height` as that store's would be and holding the boundary's
+    /// certified header, so the next joiner can sync from this one. The
+    /// staging area is cleared on success. No other chain metadata is
+    /// touched; tail block-sync from `height + 1` layers on top.
     ///
     /// Returns the resulting state root, which the caller must compare
     /// against the beacon-attested anchor before trusting the store.

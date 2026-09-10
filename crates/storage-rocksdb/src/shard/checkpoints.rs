@@ -39,7 +39,7 @@ use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
-use super::metadata::{read_jmt_metadata, write_jmt_metadata};
+use super::metadata::{read_jmt_metadata, write_boundary_header, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
     ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, iter_from, meta_delete,
@@ -602,7 +602,27 @@ impl BoundaryStore for RocksDbShardStorage {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
-        self.finalize_staged(height, &witnesses, IMPORT_BATCH_BYTES, None)
+        let root = self.finalize_staged(height, &witnesses, IMPORT_BATCH_BYTES, None)?;
+        // The store now holds exactly the boundary's state, as one that
+        // committed through it would: that one holds the boundary's
+        // certified header with the block and pinned the state, so this
+        // one keeps the header alone and pins too. A failed pin degrades
+        // serving, never the import.
+        if let Some(boundary) = &witnesses.boundary {
+            let mut batch = WriteBatch::default();
+            write_boundary_header(&mut batch, boundary);
+            self.db
+                .write(batch)
+                .map_err(|e| format!("boundary header write failed: {e}"))?;
+        }
+        if let Err(error) = self.checkpoints.create(height) {
+            warn!(
+                %height,
+                %error,
+                "boundary pin after import failed; this node won't serve this boundary"
+            );
+        }
+        Ok(root)
     }
 
     fn follow_block_writes(
@@ -695,12 +715,12 @@ mod tests {
     use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
-        commit_one, completed_import_progress, import_boundary_state,
+        commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
         test_import_gate_reads_the_trie,
     };
-    use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
+    use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
     use hyperscale_types::AddressClass;
     use tempfile::TempDir;
 
@@ -932,6 +952,44 @@ mod tests {
         assert_eq!(root, expected);
         assert_eq!(staged.read_jmt_metadata(), (7, expected));
         assert_eq!(staged.read_import_progress(), None);
+    }
+
+    /// An import keeps the anchor's certified header without its
+    /// block, so the store answers the next joiner's witness history as
+    /// one that committed the boundary would, and pins the anchor as
+    /// that one did.
+    #[test]
+    fn import_keeps_the_boundary_header_without_its_block() {
+        let replica_dir = TempDir::new().unwrap();
+        let replica = open_storage(replica_dir.path());
+        let anchor = pin_snap_sync_replica(&replica, 3, &[]);
+        let boundary = replica
+            .get_certified_header(anchor.height)
+            .expect("the replica committed the boundary");
+
+        let fresh_dir = TempDir::new().unwrap();
+        let fresh = open_storage(fresh_dir.path());
+        let progress = completed_import_progress(anchor.height, 12);
+        fresh
+            .stage_import_chunk(&progress, &[staged_leaf(0x11)])
+            .unwrap();
+        fresh
+            .finalize_boundary_import(
+                anchor.height,
+                WitnessSeed {
+                    boundary: Some((*boundary).clone()),
+                    ..WitnessSeed::default()
+                },
+            )
+            .unwrap();
+
+        assert!(fresh.get_block(anchor.height).is_none());
+        assert_eq!(
+            fresh.get_certified_header(anchor.height).as_deref(),
+            Some(&*boundary),
+        );
+        assert!(fresh.get_certified_header(BlockHeight::new(1)).is_none());
+        assert!(fresh.open_boundary(anchor.height).is_some());
     }
 
     /// A wipe discards the staged chunks and the progress record.

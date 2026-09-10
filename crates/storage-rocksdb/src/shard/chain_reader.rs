@@ -13,6 +13,7 @@ use hyperscale_types::{
 
 use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, ProvisionsCf, TxCertIndexCf};
 use super::core::RocksDbShardStorage;
+use super::metadata::read_boundary_header;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
 
 impl ShardChainReader for RocksDbShardStorage {
@@ -35,11 +36,16 @@ impl ShardChainReader for RocksDbShardStorage {
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
-        let metadata = self.get_block_metadata(height)?;
-        let (header, _, qc, _) = metadata.into_parts();
-        Some(Verified::<CertifiedBlockHeader>::from_persisted(
-            CertifiedBlockHeader::new(header, qc),
-        ))
+        self.get_block_metadata(height)
+            .map(|metadata| {
+                let (header, _, qc, _) = metadata.into_parts();
+                CertifiedBlockHeader::new(header, qc)
+            })
+            .or_else(|| {
+                read_boundary_header(&*self.db)
+                    .filter(|boundary| boundary.header().height() == height)
+            })
+            .map(Verified::<CertifiedBlockHeader>::from_persisted)
     }
 
     fn committed_height(&self) -> BlockHeight {

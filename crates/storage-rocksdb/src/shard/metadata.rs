@@ -4,12 +4,14 @@
 //! the key bytes, value type, and codec are declared once in `typed_cf.rs`.
 //! These thin wrappers provide domain-specific names and handle default values.
 
-use hyperscale_types::{BlockHeight, ChainOrigin, Hash, QuorumCertificate, StateRoot};
+use hyperscale_types::{
+    BlockHeight, CertifiedBlockHeader, ChainOrigin, Hash, QuorumCertificate, StateRoot,
+};
 use rocksdb::WriteBatch;
 
 use crate::typed_cf::{
-    self, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry,
-    JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
+    self, BoundaryHeaderEntry, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry,
+    CommittedQcEntry, JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
 };
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────
@@ -72,6 +74,18 @@ pub fn write_retention_floor(batch: &mut WriteBatch, version: u64) {
 /// horizon's worth of time gives anyway.
 pub fn read_retention_floor(store: &impl ReadableStore) -> u64 {
     typed_cf::meta_read::<RetentionFloorEntry>(store).unwrap_or(0)
+}
+
+// ─── Imported boundary header ────────────────────────────────────────────────
+
+pub fn write_boundary_header(batch: &mut WriteBatch, header: &CertifiedBlockHeader) {
+    typed_cf::meta_write::<BoundaryHeaderEntry>(batch, header);
+}
+
+/// The certified header of the boundary this store imported, if it was
+/// snap-synced and the import carried one.
+pub fn read_boundary_header(store: &impl ReadableStore) -> Option<CertifiedBlockHeader> {
+    typed_cf::meta_read::<BoundaryHeaderEntry>(store)
 }
 
 // ─── Chain origin ────────────────────────────────────────────────────────────

@@ -359,6 +359,12 @@ pub struct ShardCoordinator {
     /// reaches it; see [`Self::recovery_behind_retained_tip`].
     retained_tip_offered: Option<BlockHeight>,
 
+    /// When this member first stood seated under a pending halt recovery
+    /// with nothing offered — the start of the window it gives the
+    /// retained cohort to carry a tip above the anchor before it takes
+    /// the anchor itself; see [`Self::try_adopt_anchor_qc`].
+    halt_harvest_started: Option<LocalTimestamp>,
+
     /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
     /// voted to extend. We refuse to vote for a block whose `parent_qc` round
     /// is below this — the entire fork-safety mechanism, kept local (no
@@ -640,6 +646,7 @@ impl ShardCoordinator {
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
             retained_tip_offered: None,
+            halt_harvest_started: None,
             // Recover the registers from the durable record (which holds
             // every position this validator signed — persisted before each
             // signature left the process), floored at the high QC's round
@@ -2630,6 +2637,49 @@ impl ShardCoordinator {
         actions
     }
 
+    /// Adopt the snap-synced anchor QC on the periodic entry, when the
+    /// recovery this member was seated for leaves the anchor as the tip.
+    ///
+    /// A forked shard refuses every retained suffix, so the anchor is its
+    /// one legitimate parent and the QC is adopted at once. A halt
+    /// recovery seeds from the retained committee's signals instead: the
+    /// harvest carries the unique certified tip, and adopting the anchor
+    /// QC ahead of it would let the fresh committee certify a sibling of
+    /// real committed history above the anchor and break commit linkage
+    /// when the suffix then syncs in. So under a halt the anchor is taken
+    /// only once the cohort has had [`MAX_PROGRESS_WAIT`] — several of
+    /// the timeout retransmissions that carry an offer — to name a tip
+    /// above it and named none. A cohort that answers with nothing above
+    /// the anchor is one of importers, or one whose suffix left with the
+    /// members that held it; either way the anchor is the frontier, and
+    /// the QC the bootstrap bound to it is the parent the first block
+    /// past it extends. An offer that lands later still holds proposals
+    /// and syncs the suffix in. Outside a recovery the QC stays buffered:
+    /// a halt recovery upgraded to fork provenance by a later fold becomes
+    /// adoptable then.
+    fn try_adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let Some(recovery) = topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+        else {
+            return Vec::new();
+        };
+        match recovery.cause {
+            RecoveryCause::Fork => self.adopt_anchor_qc(topology_schedule),
+            RecoveryCause::Halt => {
+                if self.retained_tip_offered.is_some() {
+                    return Vec::new();
+                }
+                let started = *self.halt_harvest_started.get_or_insert(self.now);
+                if self.now.saturating_sub(started) < MAX_PROGRESS_WAIT {
+                    return Vec::new();
+                }
+                self.adopt_anchor_qc(topology_schedule)
+            }
+        }
+    }
+
     /// Verify and adopt the snap-synced anchor QC once the schedule
     /// resolves its committee. The bootstrap bound the QC to the
     /// beacon-attested anchor structurally (it certifies the anchor's
@@ -2640,7 +2690,7 @@ impl ShardCoordinator {
     /// discards the QC (a Byzantine serving peer's forgery — a higher
     /// adopted QC or the halt harvest routes around it); any QC adopted
     /// first makes it moot.
-    fn try_adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+    fn adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if self.latest_qc.is_some() {
             self.anchor_qc = None;
             return Vec::new();
@@ -2652,23 +2702,6 @@ impl ShardCoordinator {
             // A genesis anchor needs no adoption: `proposal_parent`'s
             // chain-origin fallback reconstructs the genesis QC exactly.
             self.anchor_qc = None;
-            return Vec::new();
-        }
-        // Fork-cause recoveries only. A halt recovery (and any ordinary
-        // anchored join) seeds from the retained committee's signals — the
-        // harvest carries the unique certified tip, and adopting the anchor
-        // QC first would let the fresh committee certify a sibling of real
-        // committed history above the anchor and break commit linkage when
-        // the suffix then syncs in. A forked shard refuses that suffix
-        // wholesale, so the anchor is its one legitimate parent. The QC
-        // stays buffered: a halt recovery upgraded to fork provenance by a
-        // later fold becomes adoptable then.
-        if topology_schedule
-            .head()
-            .pending_recoveries()
-            .get(&self.local_shard)
-            .is_none_or(|recovery| recovery.cause != RecoveryCause::Fork)
-        {
             return Vec::new();
         }
         let Some(verified) = self.verify_qc_sync(topology_schedule, &qc) else {

@@ -240,7 +240,13 @@ impl BoundaryStore for SimShardStorage {
                 .beacon_witnesses
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
+        if let Some(boundary) = witnesses.boundary {
+            consensus.boundary_headers.insert(height, boundary);
+        }
         drop(consensus);
+        // The store now holds exactly the boundary's state, as one that
+        // committed through it would, and that one pinned it.
+        self.pin_boundary(height)?;
         Ok(root)
     }
 

@@ -36,8 +36,8 @@ use hyperscale_types::network::response::{
     GetStateRangeResponse, GetWitnessHistoryResponse, MAX_LEAVES_PER_STATE_RANGE,
 };
 use hyperscale_types::{
-    BlockHeader, BlockHeight, Hash, MAX_WITNESSES_PER_FETCH, QuorumCertificate, ShardAnchor,
-    ShardId, ShardWitnessPayload, StateRoot, shard_prefix_path,
+    BlockHeader, BlockHeight, CertifiedBlockHeader, Hash, MAX_WITNESSES_PER_FETCH,
+    QuorumCertificate, ShardAnchor, ShardId, ShardWitnessPayload, StateRoot, shard_prefix_path,
 };
 
 use self::snap_sync::SnapSync;
@@ -326,6 +326,10 @@ impl ShardBootstrap {
             .map_or_else(WitnessSeed::default, |window| WitnessSeed {
                 base: window.header.beacon_witness_base(),
                 payloads: std::mem::take(&mut window.payloads),
+                boundary: Some(CertifiedBlockHeader::new(
+                    (*window.header).clone(),
+                    (*window.qc).clone(),
+                )),
             });
         Some((self.anchor.height, seed))
     }
@@ -526,6 +530,46 @@ mod tests {
 
     fn witness_leaves() -> Vec<ShardWitnessPayload> {
         (1u64..=5).map(stake_deposit).collect()
+    }
+
+    /// A store that snap-synced serves the next joiner as one that
+    /// committed through the boundary would: the import pinned the
+    /// anchor and kept its certified header, so the witness history
+    /// and the state ranges both answer from it — a shard whose every
+    /// remaining member imported can still seat a member.
+    #[test]
+    fn a_snap_synced_store_serves_the_next_joiner() {
+        let leaves = witness_leaves();
+        let (serving, anchor) = replica(&leaves);
+        let first = Arc::new(SimShardStorage::default());
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
+        drive(
+            &mut bootstrap,
+            &serving,
+            &PendingChain::new(Arc::clone(&serving)),
+            &first,
+        );
+        assert!(
+            first.open_boundary(anchor.height).is_some(),
+            "the import pins the anchor it holds",
+        );
+
+        let second = Arc::new(SimShardStorage::default());
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor);
+        drive(
+            &mut bootstrap,
+            &first,
+            &PendingChain::new(Arc::clone(&first)),
+            &second,
+        );
+        let recovered = bootstrap.into_recovered_state();
+        assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
+        assert_eq!(second.state_root(), anchor.state_root);
+        assert_eq!(
+            PendingChain::new(Arc::clone(&second))
+                .get_beacon_witness_payload_range(0, leaves.len() as u64),
+            leaves,
+        );
     }
 
     /// The full sequencing: state fan-out, import + root check against

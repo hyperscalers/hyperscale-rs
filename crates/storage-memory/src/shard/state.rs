@@ -8,11 +8,11 @@ use std::sync::Arc;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
-    WeightedTimestamp,
+    Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    ConsensusReceipt, EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization,
+    FinalizationHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
+    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction,
+    TxHash, ValidatorId, WeightedTimestamp,
 };
 
 use super::tree_store::SimTreeStore;
@@ -196,6 +196,10 @@ pub fn apply_state_writes(
 pub struct ConsensusState {
     /// Committed blocks indexed by height.
     pub blocks: BTreeMap<BlockHeight, CertifiedBlock>,
+    /// Certified headers held without their blocks: the anchor a
+    /// snap-sync imported, kept so this store serves the next joiner's
+    /// witness history as one that committed the block would.
+    pub boundary_headers: BTreeMap<BlockHeight, CertifiedBlockHeader>,
     /// Committed height.
     pub committed_height: BlockHeight,
     /// Committed block hash.
@@ -263,6 +267,7 @@ impl ConsensusState {
     pub(crate) fn new() -> Self {
         Self {
             blocks: BTreeMap::new(),
+            boundary_headers: BTreeMap::new(),
             committed_height: BlockHeight::new(0),
             committed_hash: None,
             committed_qc: None,
