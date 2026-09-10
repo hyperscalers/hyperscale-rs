@@ -30,8 +30,8 @@ use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, Sub
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
-    shard_prefix_path,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    WorkInFlight, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -119,6 +119,10 @@ pub struct ClusterSpec {
 /// the live shard-store registry and transaction hooks, and the handles
 /// to shut it down and join its runner task.
 struct Host {
+    /// The validators this host runs, for routing a submission to a
+    /// host the beacon seats on the shard rather than one still carrying
+    /// a retired loop.
+    validator_ids: Vec<ValidatorId>,
     adapter: Arc<Libp2pAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
@@ -198,6 +202,7 @@ impl Harness {
             let shutdown = bh.runner.shutdown_handle().expect("shutdown handle");
             let join = spawn(bh.runner.run());
             running.push(Host {
+                validator_ids: bh.validator_ids,
                 adapter: bh.adapter,
                 rpc_status: bh.rpc_status,
                 beacon_storage: bh.beacon_storage,
@@ -316,6 +321,16 @@ impl Harness {
         self.hosts
             .iter()
             .position(|h| h.adapter.local_shards().contains(&shard))
+    }
+
+    /// The first host serving `shard` that runs one of `committee`, if
+    /// any — a host the beacon seats there, not one whose supervisor has
+    /// yet to retire a replaced loop.
+    pub fn host_serving_in(&self, shard: ShardId, committee: &[ValidatorId]) -> Option<usize> {
+        self.hosts.iter().position(|h| {
+            h.adapter.local_shards().contains(&shard)
+                && h.validator_ids.iter().any(|v| committee.contains(v))
+        })
     }
 
     /// Every host index serving `shard` — its committee members, before a
@@ -496,6 +511,7 @@ impl Harness {
 
 /// A built-but-not-yet-spawned host.
 struct BuiltHost {
+    validator_ids: Vec<ValidatorId>,
     runner: ProductionRunner,
     adapter: Arc<Libp2pAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
@@ -542,6 +558,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
     let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();
+    let validator_ids: Vec<ValidatorId> = args.validators.iter().map(|v| v.validator_id).collect();
     let mut builder = ProductionRunner::builder(
         args.validators,
         args.genesis.clone(),
@@ -563,6 +580,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
     let tx_status = runner.tx_status_cache();
 
     BuiltHost {
+        validator_ids,
         runner,
         adapter,
         rpc_status,

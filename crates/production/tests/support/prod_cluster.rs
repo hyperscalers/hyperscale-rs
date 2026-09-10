@@ -217,7 +217,11 @@ impl ProdCluster {
             .derive_topology_snapshot(NetworkDefinition::simulator());
         submission_shards(&topology_snapshot, tx)
             .into_iter()
-            .find_map(|shard| self.inner.host_serving(shard))
+            .find_map(|shard| {
+                self.inner
+                    .host_serving_in(shard, topology_snapshot.committee_for_shard(shard))
+                    .or_else(|| self.inner.host_serving(shard))
+            })
     }
 }
 

@@ -437,8 +437,15 @@ impl SimCluster {
         );
     }
 
-    /// The host a submission of `tx` enters at: the first serving the
-    /// payer's shard, else the first serving any shard it touches.
+    /// The host a submission of `tx` enters at: a member of the payer
+    /// shard's live committee, else of any touched shard's.
+    ///
+    /// The live committee rather than any host carrying the shard: a
+    /// member a recovery or a rotation replaced keeps its loop until the
+    /// placement scan retires it, and a submission queued at one runs
+    /// after the teardown on a host that serves nothing — dropped, not
+    /// delayed. A client routes to the committee the beacon names, and
+    /// so does this.
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
         let topology_snapshot = self.runner.host_topology(0)?;
         // Built by the harness rather than by a node, so nothing has
@@ -447,10 +454,7 @@ impl SimCluster {
             .ok()?;
         submission_shards(&topology_snapshot, tx)
             .into_iter()
-            .find_map(|shard| {
-                (0..self.runner.num_hosts())
-                    .find(|&host| self.runner.hosted_shards_of(host).contains(&shard))
-            })
+            .find_map(|shard| self.live_committee_hosts(shard).first().copied())
     }
 }
 

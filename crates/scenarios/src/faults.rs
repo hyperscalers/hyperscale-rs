@@ -352,7 +352,8 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
             })
         }),
         "a post-recovery transfer per direction must settle on both chains \
-         and credit its recipient once",
+         and credit its recipient once; {}",
+        revival_report(c, halted, survivor, &revived),
     );
 
     assert_conserved_less_the_strand(c, &world, &charges, stranded);
@@ -489,6 +490,38 @@ fn submit_probe<C: Cluster>(
             .of(Deadline::of(window.end_timestamp_exclusive))
             .end,
     }
+}
+
+/// Where each post-recovery probe stands, for the stall report: its
+/// direction, what each chain recorded for it, the status the cluster
+/// reports, and its recipient's balance, beside both shards' heights.
+fn revival_report<C: Cluster>(
+    c: &C,
+    halted: ShardId,
+    survivor: ShardId,
+    revived: &[Probe],
+) -> String {
+    let mut report = format!(
+        "at {}s, halted {halted:?} at {:?}, survivor {survivor:?} at {:?}, epoch {:?}",
+        c.now().as_secs(),
+        c.committed_height(halted),
+        c.committed_height(survivor),
+        beacon_epoch(c),
+    );
+    for probe in revived {
+        let _ = write!(
+            report,
+            "; probe {:?} {:?} -> {:?}: halted {:?}, survivor {:?}, status {:?}, recipient holds {}",
+            probe.hash,
+            probe.payer_shard,
+            probe.recipient_shard,
+            c.chain_fate(halted, probe.hash),
+            c.chain_fate(survivor, probe.hash),
+            c.tx_status(probe.hash),
+            vault_balance(c, probe.recipient_shard, probe.recipient),
+        );
+    }
+    report
 }
 
 /// Whether `probe`'s recipient holds exactly its genesis dust plus one
