@@ -387,8 +387,8 @@ impl SimCluster {
             .and_then(|storage| storage.get_block(height))
     }
 
-    /// Restart `host`'s replica of `shard`: tear the vnode down and seat
-    /// it again on the storage it kept.
+    /// Restart `host`'s replica of `shard`: tear the shard loop down and
+    /// seat every member it carried again on the storage it kept.
     ///
     /// What a process restart leaves behind. The committed chain
     /// survives on disk; everything consensus and execution held in
@@ -429,14 +429,7 @@ impl SimCluster {
     }
 
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
-        let host = host_index(host);
-        let validator = self
-            .runner
-            .vnode_state_in(host, shard)
-            .expect("restart of a shard this host does not serve")
-            .validator_id();
-        let storage = self.runner.leave_shard(host, shard);
-        let kind = self.runner.join_shard(host, validator, shard, storage);
+        let kind = self.runner.restart_shard(host_index(host), shard);
         assert!(
             matches!(kind, JoinKind::Retained { .. }),
             "a restart resumes the store it kept, not a fresh sync; got {kind:?}",

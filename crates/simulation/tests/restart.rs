@@ -27,7 +27,7 @@ use hyperscale_scenarios::{
     Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD, epochs,
     grind_onto, split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
-use hyperscale_types::{HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
+use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::SimCluster;
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
@@ -78,10 +78,27 @@ fn owed_an_outcome(c: &SimCluster, shard: ShardId, tx: TxHash) -> bool {
     committed.is_some() && outcome.is_none()
 }
 
+/// The seeds every restart here runs under: one seed is one leader
+/// schedule, and a restart lands differently against each.
+const SEEDS: [u64; 8] = [42, 7, 11, 1337, 2026, 99, 5, 8];
+
+/// Every host's committed height on `shard`, `None` where the host does
+/// not carry it — the stall report a wedge is read from.
+fn heights(c: &SimCluster, shard: ShardId) -> Vec<(usize, Option<u64>)> {
+    (0..c.runner().num_hosts() as usize)
+        .map(|host| {
+            (
+                host,
+                c.host_committed_height(host, shard).map(BlockHeight::inner),
+            )
+        })
+        .collect()
+}
+
 /// The chain advances again after `restarted` of four members bounce
 /// together, with traffic either side of the bounce.
-fn restart_and_advance(restarted: usize) {
-    let mut cluster = SimCluster::with_accounts(&one_shard(), 42, &genesis_accounts(8, 1));
+fn restart_and_advance(restarted: usize, seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
     let shard = ShardId::ROOT;
     let (payer, from) = sender(0);
 
@@ -115,9 +132,9 @@ fn restart_and_advance(restarted: usize) {
         cluster.run_until(epochs(24), |c| c
             .committed_height(shard)
             .is_some_and(|h| h.inner() >= target)),
-        "the chain must advance past {target:?} after {restarted} of four restart; \
-         it reached {:?}",
-        cluster.committed_height(shard),
+        "seed {seed}: the chain must advance past {target:?} after {restarted} of four \
+         restart; hosts sit at {:?}",
+        heights(&cluster, shard),
     );
 }
 
@@ -132,8 +149,10 @@ fn restart_and_advance(restarted: usize) {
 /// asserting one restart and calling the path covered.
 #[test]
 fn a_committee_advances_after_part_of_it_restarts() {
-    for restarted in 1..=3 {
-        restart_and_advance(restarted);
+    for seed in SEEDS {
+        for restarted in 1..=3 {
+            restart_and_advance(restarted, seed);
+        }
     }
 }
 
@@ -251,7 +270,9 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
 /// extend its own certificate.
 #[test]
 fn a_committee_advances_after_all_of_it_restarts() {
-    restart_and_advance(4);
+    for seed in SEEDS {
+        restart_and_advance(4, seed);
+    }
 }
 
 /// A restarted member agrees with its peers about what it executed.
@@ -354,9 +375,28 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
 /// than the vote.
 #[test]
 fn a_restarted_payer_still_reclaims_its_refused_leg() {
+    payer_reclaims_after_restart(42, false);
+}
+
+/// A restart brings back every member the host carried.
+///
+/// The committee is drawn from validators the hosts co-host, so a seed
+/// can place two of the payer shard's four members on one host. A
+/// restart that reseated one of them would leave the committee a member
+/// short of its quorum with nothing failed: the shard commits the block
+/// its survivors had already voted, then never another. The seed is
+/// chosen for that placement and the test insists on it, so a change to
+/// the draw shows up as a failed premise rather than a pass that covers
+/// nothing.
+#[test]
+fn a_restarted_host_reseats_every_member_it_carries() {
+    payer_reclaims_after_restart(5, true);
+}
+
+fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
     let mut cluster = SimCluster::with_grown_packages(
         &venue_config(),
-        42,
+        seed,
         &venue_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     );
@@ -395,7 +435,17 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
          the evidence rather than before it",
     );
 
-    for host in cluster.committee_hosts(SWAPPER_SHARD) {
+    let hosts = cluster.committee_hosts(SWAPPER_SHARD);
+    if co_hosted {
+        assert!(
+            hosts.len() < venue_config().shard_size as usize,
+            "the seed must place two of the payer shard's members on one host; \
+             its {} members sit on hosts {hosts:?}",
+            venue_config().shard_size,
+        );
+    }
+    let before = cluster.committed_height(SWAPPER_SHARD).expect("running");
+    for host in hosts {
         cluster.restart_host(host, SWAPPER_SHARD);
     }
 
@@ -405,8 +455,10 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
         cluster.run_until(epochs(24), |c| vault_balance(c, SWAPPER_SHARD, caller)
             == funded - price),
         "a restarted payer must still reclaim what its leg issued: holds {}, \
-         expected {}",
+         expected {}; the payer shard committed {before:?} before the restart and \
+         its hosts sit at {:?}",
         vault_balance(&cluster, SWAPPER_SHARD, caller),
         funded - price,
+        heights(&cluster, SWAPPER_SHARD),
     );
 }

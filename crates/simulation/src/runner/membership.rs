@@ -306,6 +306,27 @@ impl SimulationRunner {
         }
     }
 
+    /// Bounce `host`'s replica of `shard`: tear the shard loop down and seat
+    /// every validator it carried again on the storage it kept, as a
+    /// process restart does. Seating one member back would leave a host
+    /// that co-hosts two of the shard's members a member short, and the
+    /// committee without a quorum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard` isn't hosted on `host`.
+    pub fn restart_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
+        let carried: Vec<ValidatorId> = (0..self.hosts[host as usize].vnodes_len(shard))
+            .map(|index| {
+                self.hosts[host as usize]
+                    .vnode_state(shard, index)
+                    .validator_id()
+            })
+            .collect();
+        let storage = self.leave_shard(host, shard);
+        self.seat_joined_group(host, shard, &carried, storage)
+    }
+
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.
