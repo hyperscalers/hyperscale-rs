@@ -448,7 +448,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
     // say.
-    instantiate(&mut root, from, pool).expect("a derivable pool answers its seal");
+    instantiate(&mut root, from, pool, ()).expect("a derivable pool answers its seal");
     env.register_instance(meta);
     env.seal(root)
         .expect("the root declares nothing to discharge")
