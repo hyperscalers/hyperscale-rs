@@ -15,7 +15,7 @@ use hyperscale_production::{ShardCommand, VnodeConfig};
 use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::{BeaconChainConfig, ReshapeThresholds, ShardId, ValidatorId};
 use serial_test::serial;
-use support::{CONNECTION_TIMEOUT, build_runner};
+use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_factory};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
@@ -160,17 +160,26 @@ async fn pooled_validator_boots_as_follower_only_host() {
 /// store handle leaves every rejoin spinning on the `RocksDB` lock
 /// ("Join rejected: storage open failed … lock hold by current process").
 ///
-/// Runs the cycle on a pooled surplus validator the committed view never
-/// seats: a seated validator's manual leave is undone by the supervisor's
-/// reconcile backstop on its own schedule, which races the assertions.
+/// The reopen is the test's own, against the directory the supervisor
+/// opened, rather than a second `Join`. The supervisor reconciles hosted
+/// shards against the committed view on a one-second tick, and a
+/// validator the view never seats has its manual join retired at the
+/// next one — the shard is seated for a window a poll can miss. A
+/// validator the view does seat is no better: its manual leave is undone
+/// by the join backstop on the same tick, racing the assertion that it
+/// left. `RocksDB` holds an exclusive lock per directory, so the open
+/// answers the question directly: it succeeds once the departed thread
+/// has dropped its handle and never while one is leaked. The teardown
+/// releases the store off the supervisor loop, so the open is retried
+/// within the timeout rather than asserted at the first try.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn shard_rejoin_reopens_the_store_after_leave() {
+async fn leaving_a_shard_releases_its_store() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::with_surplus(45, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
+    let (mut runner, dir, _) = build_runner(&fixtures, &[1], vec![], None);
 
     let adapter = Arc::clone(runner.network());
     let reconfigure = runner.reconfigure_handle();
@@ -178,17 +187,15 @@ async fn shard_rejoin_reopens_the_store_after_leave() {
     let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
 
-    let join_root = || ShardCommand::Join {
-        shard: ShardId::ROOT,
-        vnodes: vec![VnodeConfig {
-            validator_id: surplus,
-            local_shard: ShardId::ROOT,
-            signer: fixtures.signer(1),
-        }],
-    };
-
     reconfigure
-        .send(join_root())
+        .send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(1),
+            }],
+        })
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -197,7 +204,15 @@ async fn shard_rejoin_reopens_the_store_after_leave() {
         }
     })
     .await
-    .expect("first join seats the shard");
+    .expect("the join seats the shard");
+
+    // The lock is what the reopen below measures: while the shard is
+    // hosted, its thread holds it and a second opener is refused.
+    let open = temp_storage_factory(&dir);
+    assert!(
+        open(ShardId::ROOT).is_err(),
+        "a hosted shard holds its store's lock",
+    );
 
     reconfigure
         .send(ShardCommand::Leave {
@@ -211,23 +226,23 @@ async fn shard_rejoin_reopens_the_store_after_leave() {
         }
     })
     .await
-    .expect("left shard is removed from the adapter");
+    .expect("the left shard is removed from the adapter");
 
-    reconfigure
-        .send(join_root())
-        .await
-        .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while !adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
+    let reopened = timeout(CONNECTION_TIMEOUT, async {
+        loop {
+            match open(ShardId::ROOT) {
+                Ok(storage) => break storage,
+                Err(_) => sleep(Duration::from_millis(50)).await,
+            }
         }
     })
     .await
-    .expect("the rejoin reopens the shard store and seats the shard");
+    .expect("leaving the shard releases its store for a reopen");
+    drop(reopened);
 
     drop(shutdown);
     let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the rejoin");
+    assert!(result.is_ok(), "runner exits after the leave");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
 }
 
