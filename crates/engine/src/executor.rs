@@ -22,8 +22,8 @@ use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
-    BridgeStatics, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry, ProtocolHasher,
-    admit_package, declared_vector, decode_tree, envelope_bytes, envelope_identity,
+    BridgeStatics, DeclaredVector, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
+    ProtocolHasher, admit_package, declared_vector, decode_tree, envelope_bytes, envelope_identity,
     witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
@@ -80,6 +80,10 @@ pub struct PreparedTx {
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.
     pub gas_limits: Vec<u64>,
+    /// What the calls' packages declare they may emit between them,
+    /// which the kernel meters the transaction's events against and the
+    /// declaration priced as retention.
+    pub event_bytes: usize,
     /// What the transaction declares it may consume, whole. A settlement
     /// is the batch's own and declares nothing.
     pub work: DeclaredWork,
@@ -613,6 +617,8 @@ impl Executor {
             declaration,
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
+            // A settlement invokes no node, so nothing of it emits.
+            event_bytes: 0,
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
@@ -663,7 +669,11 @@ impl Executor {
         // derivation — which admits under the rule as the chain applies
         // it, and caches what it derived onto the transaction.
         let legs = legs_of(&admitted.admitted);
-        let (shares, everywhere) = declared_vector(
+        let DeclaredVector {
+            shares,
+            everywhere,
+            event_bytes,
+        } = declared_vector(
             packages,
             vm,
             &routing,
@@ -702,6 +712,7 @@ impl Executor {
             declaration,
             nullifiers: admitted.subintents,
             gas_limits: vm.gas_limits.clone(),
+            event_bytes,
             work,
             judges: OwnerSet::whole(),
         })
@@ -1502,6 +1513,7 @@ impl Executor {
                     .with_job(entry.job.clone())
                     .with_nullifiers(entry.nullifiers.clone())
                     .with_gas_limits(entry.gas_limits.clone())
+                    .with_event_bytes(entry.event_bytes)
                     .with_applies(locality.clone())
                     .with_judges(entry.judges.clone())
                     .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
