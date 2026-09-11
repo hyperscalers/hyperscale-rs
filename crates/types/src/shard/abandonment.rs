@@ -84,8 +84,9 @@ pub struct UnsettledTx {
     /// so a voter checks a proof's block against this figure rather
     /// than against a clock.
     pub deadline: Deadline,
-    /// What the transaction was charged, which the abandonment attests
-    /// as its own outcome does.
+    /// What the committing shard attests for the transaction — the
+    /// price of its own share — which the abandonment carries as the
+    /// outcome would have.
     pub charged: u128,
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
@@ -128,22 +129,29 @@ impl UnsettledTx {
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
-    /// deadline is the transaction's own, the charge is the fee vault at
-    /// the declared price under `table`, and the commit is the block's.
+    /// deadline is the transaction's own, what `shard` attests is the
+    /// price of its share under `trie` — the placement its committing
+    /// block froze — the charge is the fee vault at the whole declared
+    /// price under `table`, and the commit is the block's.
     ///
     /// # Panics
     ///
     /// As [`Transaction::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn for_transaction(tx: &Transaction, committed: CommittedAt, table: &PriceTable) -> Self {
-        let charged = tx.price(table);
+    pub fn for_transaction(
+        tx: &Transaction,
+        committed: CommittedAt,
+        trie: &ShardTrie,
+        shard: ShardId,
+        table: &PriceTable,
+    ) -> Self {
         Self {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            charged,
+            charged: tx.local_price(trie, shard, table),
             charge: AbortCharge {
                 vault: tx.fee_vault(),
-                amount: charged,
+                amount: tx.price(table),
             },
             committed,
             reach: tx.routing().all_routes(),
