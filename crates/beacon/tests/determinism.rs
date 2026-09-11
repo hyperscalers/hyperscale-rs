@@ -81,7 +81,7 @@ fn initial_state() -> BeaconState {
             id: pool_id,
             // Generous so `min_stake` stays clamped at the floor and no
             // admission gates trip across 50 epochs.
-            total_stake: Stake::from_attos(50 * MIN_STAKE_FLOOR.attos()),
+            total_stake: Stake::from_quanta(50 * MIN_STAKE_FLOOR.quanta()),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),
             released_cumulative: Stake::ZERO,

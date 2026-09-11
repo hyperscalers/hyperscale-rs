@@ -16,7 +16,8 @@ use hyperscale_engine::genesis::{
     staking_artifact,
 };
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, XRD, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
+    genesis_writes,
 };
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
@@ -173,13 +174,14 @@ const fn terms(max_fee: u128) -> Terms {
     }
 }
 
-/// `delegator.withdraw(*XRD) -> pool.stake -> delegator.deposit(units)`.
+/// `delegator.withdraw(*PROTOCOL_RESOURCE) -> pool.stake -> delegator.deposit(units)`.
 fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let chain = client().records();
     let mut b = client().builder(&chain, from);
-    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let funds =
+        account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
@@ -200,7 +202,8 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, HEADER);
-    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let funds =
+        account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
@@ -250,7 +253,7 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
 
 /// The whole channel in one assertion: a delegation to a seated pool is a
 /// beacon fact by the time it leaves the engine, with the pool named by
-/// the instance that emitted it and the amount carried across as attos.
+/// the instance that emitted it and the amount carried across as quanta.
 /// A record the cache answers for is the record the cell that sealed it
 /// holds, whether genesis wrote the cell or a transaction did.
 ///
@@ -549,7 +552,8 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
     let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator(), HEADER);
-    let funds = account::withdraw(&mut root, delegator(), *XRD, 500).expect("an account withdraws");
+    let funds = account::withdraw(&mut root, delegator(), *PROTOCOL_RESOURCE, 500)
+        .expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
         .stake(&mut root, funds)
         .expect_err("a pool nobody sealed resolves nothing");
@@ -571,7 +575,7 @@ fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
         witnesses(&executed[0]),
         vec![BeaconWitnessEvent::StakeDeposit {
             pool_id: StakePoolId::new(POOL_ID),
-            amount: Stake::from_attos(500),
+            amount: Stake::from_quanta(500),
         }],
     );
 }

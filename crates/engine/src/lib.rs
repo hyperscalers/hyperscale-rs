@@ -42,7 +42,7 @@ pub use executor::{
     Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash, publish_work,
 };
 pub use genesis::{
-    GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,
+    GenesisConfig, PROTOCOL_RESOURCE, World, genesis_package_facts, genesis_world, genesis_writes,
 };
 pub use hyperscale_effects_bridge::{LocalCells, account_address};
 pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};

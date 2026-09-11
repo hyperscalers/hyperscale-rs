@@ -9,7 +9,7 @@
 //! pool is, and what these scenarios pin is what each side is left
 //! holding after the venue accepts, refuses, or is never reached.
 //!
-//! The pair is XRD against a pool's stake unit. Value enters the world
+//! The pair is protocol resource against a pool's stake unit. Value enters the world
 //! through a mint and nowhere else, so the second side is minted the way
 //! anything else is: an account stakes, and what it is handed back is a
 //! resource the venue can price.
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::stake_unit;
 use hyperscale_types::{
     ComponentAddr, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr, ProtocolHasher, ResourceAddr,
@@ -39,8 +39,8 @@ use crate::support::wait::await_tx_terminal;
 use crate::support::{Budget, Cluster, epochs};
 
 /// What the liquidity provider is funded with: enough to stake the
-/// floor, stock the pool's XRD side, and pay for both.
-pub const PROVIDER_FUNDING: u128 = 8 * MIN_STAKE_FLOOR.attos();
+/// floor, stock the pool's protocol resource side, and pay for both.
+pub const PROVIDER_FUNDING: u128 = 8 * MIN_STAKE_FLOOR.quanta();
 
 /// What each swapping account is funded with.
 pub const SWAPPER_FUNDING: u128 = 200_000_000;
@@ -158,7 +158,7 @@ pub fn reserve_cell(venue: &InstanceMeta, resource: ResourceAddr) -> SubstateKey
 pub struct StockedVenue {
     /// The venue's metadata, which every call is typed against.
     pub meta: InstanceMeta,
-    /// The stake unit the venue prices XRD against.
+    /// The stake unit the venue prices protocol resource against.
     pub unit: ResourceAddr,
 }
 
@@ -172,7 +172,7 @@ pub fn stand_up_venue<C: Cluster>(c: &mut C, shard: ShardId, taken: &mut Vec<u8>
     let (provider_key, provider_account) = grind_onto(shard, taken);
     let pool = pool_at(GENESIS_POOL_ID);
     let unit = stake_unit(pool);
-    let meta = venue_on(shard, (*XRD, unit));
+    let meta = venue_on(shard, (*PROTOCOL_RESOURCE, unit));
     stock_venue(c, &provider_key, provider_account, pool, &meta, unit);
     StockedVenue { meta, unit }
 }
@@ -188,14 +188,14 @@ pub fn stock_venue<C: Cluster>(
 ) {
     // The second side of the pair, minted the only way value is: the
     // provider stakes, and the units it is handed are what the venue
-    // prices XRD against.
+    // prices protocol resource against.
     accepted(
         c,
         build_stake_tx(
             key,
             account,
             pool,
-            MIN_STAKE_FLOOR.attos(),
+            MIN_STAKE_FLOOR.quanta(),
             validity_around(c.now()),
         ),
         "the provider must hold the side it is about to stock",
@@ -217,7 +217,7 @@ pub fn stock_venue<C: Cluster>(
     // spends instead.
     assert!(
         c.run_until(epochs(8), |c| held(c, account.address(), unit)
-            >= MIN_STAKE_FLOOR.attos()),
+            >= MIN_STAKE_FLOOR.quanta()),
         "the provider's stake must mint the units its venue is stocked with",
     );
     accepted(
@@ -226,8 +226,8 @@ pub fn stock_venue<C: Cluster>(
             key,
             account,
             meta,
-            (*XRD, unit),
-            (MIN_STAKE_FLOOR.attos(), MIN_STAKE_FLOOR.attos()),
+            (*PROTOCOL_RESOURCE, unit),
+            (MIN_STAKE_FLOOR.quanta(), MIN_STAKE_FLOOR.quanta()),
             validity_around(c.now()),
         ),
         "the venue must hold both sides before it can quote",
@@ -269,11 +269,11 @@ fn venue_worlds<C: Cluster>(
     callers: impl IntoIterator<Item = PrincipalAddr>,
 ) -> (World, World) {
     let holders: Vec<_> = callers.into_iter().map(PrincipalAddr::address).collect();
-    let xrd = World::open(
+    let protocol_resource = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         holders.iter().copied(),
-        [reserve_cell(&venue.meta, *XRD)],
+        [reserve_cell(&venue.meta, *PROTOCOL_RESOURCE)],
     );
     let units = World::open(
         c,
@@ -281,20 +281,20 @@ fn venue_worlds<C: Cluster>(
         holders,
         [reserve_cell(&venue.meta, venue.unit)],
     );
-    (xrd, units)
+    (protocol_resource, units)
 }
 
 /// Assert both sides of the venue's pair conserved across `charges`: the
-/// XRD the callers and the venue hold between them fell by exactly the
+/// protocol resource the callers and the venue hold between them fell by exactly the
 /// prices burned, and the units moved between them and nowhere else.
 fn assert_pair_conserved<C: Cluster>(
     c: &mut C,
-    (xrd, units): &(World, World),
+    (protocol_resource, units): &(World, World),
     charges: &Charges,
     budget: Budget,
     context: &str,
 ) {
-    xrd.assert_settles_within(c, charges, budget, context);
+    protocol_resource.assert_settles_within(c, charges, budget, context);
     units.assert_settles_within(c, &Charges::default(), budget, context);
 }
 
@@ -309,7 +309,7 @@ fn assert_pair_conserved<C: Cluster>(
 /// this pins is a second charge of exactly the same size, which every
 /// bound loose enough to survive a re-pricing would admit.
 ///
-/// The venue's reserve of XRD rises by the input: what the caller paid
+/// The venue's reserve of protocol resource rises by the input: what the caller paid
 /// is what the core claimed, and nothing was minted or stranded on the
 /// way.
 ///
@@ -329,14 +329,14 @@ pub fn a_swap_charges_its_caller_its_input_and_one_price<C: Cluster>(c: &mut C, 
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         0,
         validity_around(c.now()),
     );
     let price = declared_price(c, &swap);
     let funded = vault_balance(c, SWAPPER_SHARD, caller);
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -409,7 +409,7 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         0,
         validity_around(c.now()),
@@ -427,7 +427,7 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
          whether it is written is the fold's answer"
     );
     let funded = vault_balance(c, VENUE_SHARD, caller);
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -507,14 +507,14 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         SWAP_INPUT * 100,
         validity_around(c.now()),
     );
     let price = declared_price(c, &refused);
     let funded = vault_balance(c, SWAPPER_SHARD, caller);
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -569,7 +569,7 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         0,
         validity_around(c.now()),
@@ -623,7 +623,7 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         funded * 2,
         0,
         validity_around(c.now()),
@@ -638,7 +638,7 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
     .first()
     .copied()
     .expect("a swap crosses to its venue");
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -751,7 +751,7 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
             key,
             *account,
             &venue.meta,
-            *XRD,
+            *PROTOCOL_RESOURCE,
             SWAP_INPUT,
             0,
             validity_around(c.now()),

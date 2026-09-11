@@ -437,7 +437,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     };
     let metadata = Some(ExecutionMetadata::new(
         FeeSummary {
-            total_execution_cost: Some(u128::from(seed) * Stake::ATTOS_PER_WHOLE),
+            total_execution_cost: Some(u128::from(seed) * Stake::QUANTA_PER_WHOLE),
             total_royalty_cost: None,
             total_storage_cost: None,
             total_tipping_cost: None,

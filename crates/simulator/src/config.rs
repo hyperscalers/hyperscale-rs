@@ -18,7 +18,7 @@ pub struct SimulatorConfig {
     /// Number of accounts to create per shard.
     pub accounts_per_shard: usize,
 
-    /// Initial XRD balance for each account.
+    /// Initial protocol resource balance for each account.
     pub initial_balance: u128,
 
     /// Workload configuration.

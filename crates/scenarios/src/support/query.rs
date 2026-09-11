@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_engine::{XRD, publish_work};
+use hyperscale_engine::{PROTOCOL_RESOURCE, publish_work};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
@@ -315,7 +315,7 @@ pub fn assert_reclaimed_leg<C: Cluster + ?Sized>(c: &C, shard: ShardId, tx: TxHa
 /// Panics if the cell holds anything but an amount.
 #[must_use]
 pub fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: impl Into<Address>) -> u128 {
-    let vault = vault_key(owner, *XRD);
+    let vault = vault_key(owner, *PROTOCOL_RESOURCE);
     c.substate(shard, vault.owner, vault.local.0)
         .map_or(0, |bytes| {
             let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");

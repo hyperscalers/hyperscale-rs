@@ -22,8 +22,8 @@ use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
-    BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, XRD, admit_package,
-    declared_footprint, decode_tree, envelope_identity, witness_from_event,
+    BridgeStatics, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry, ProtocolHasher,
+    admit_package, declared_footprint, decode_tree, envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -759,7 +759,7 @@ pub fn abort_reason(outcome: &Outcome) -> String {
 
 /// The node-local metadata of one execution: what it was charged, and
 /// why it aborted if it did.
-/// The receipt's own summary of what was charged, in attos — the unit
+/// The receipt's own summary of what was charged, in quanta — the unit
 /// the price and the ceiling are already in.
 fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
     ExecutionMetadata::new(
@@ -796,9 +796,9 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128)
     //
     // This composition lands in the receipt `writes_root` commits over,
     // so it stays exact gross — and it can: the standing debit is
-    // bounded by the XRD that exists, the burn by the ceiling the payer
+    // bounded by the protocol resource that exists, the burn by the ceiling the payer
     // signed, and the two together sit far inside `u128`.
-    let burned = Movement::debit(*XRD, burn);
+    let burned = Movement::debit(*PROTOCOL_RESOURCE, burn);
     writes
         .movements
         .entry(payer.vault)
@@ -894,7 +894,7 @@ pub fn build_fee_receipt(
 ) -> ConsensusReceipt {
     let writes = StateWrites {
         cells: BTreeMap::new(),
-        movements: BTreeMap::from([(vault, Movement::debit(*XRD, amount))]),
+        movements: BTreeMap::from([(vault, Movement::debit(*PROTOCOL_RESOURCE, amount))]),
         entries: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(
@@ -1494,7 +1494,7 @@ impl Executor {
                     .with_judges(entry.judges.clone())
                     .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
                         vault: payer.vault,
-                        resource: *XRD,
+                        resource: *PROTOCOL_RESOURCE,
                         amount: payer.price.min(payer.max_fee),
                     }))
             })

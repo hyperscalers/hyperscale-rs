@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
     TransactionStatus, TxHash,
@@ -36,9 +36,14 @@ use super::{Budget, Cluster};
 const SETTLED_TAIL: Duration = Duration::from_secs(5);
 
 /// The world a [`build_probe_transfer_tx`](super::tx::build_probe_transfer_tx)
-/// train reaches: the first genesis-funded sender and recipient, in XRD.
+/// train reaches: the first genesis-funded sender and recipient, in protocol resource.
 pub fn probe_world<C: Cluster + ?Sized>(c: &C) -> World {
-    World::open(c, *XRD, [sender(0).1.address(), recipient(0).address()], [])
+    World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [sender(0).1.address(), recipient(0).address()],
+        [],
+    )
 }
 
 /// Everything a scenario's transactions can reach that holds one

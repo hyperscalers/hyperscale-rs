@@ -120,9 +120,9 @@ pub use primitives::hash_kinds::{
     RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
-    Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
-    Round, ShardId, SpcView, Stake, StakePoolId, StakePoolSeat, ValidatorId, VoteCount,
-    WorkInFlight,
+    Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
+    PROTOCOL_DISPLAY_DIGITS, RatifyRound, Round, ShardId, SpcView, Stake, StakePoolId,
+    StakePoolSeat, ValidatorId, VoteCount, WorkInFlight,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof, compute_sparse_proof,

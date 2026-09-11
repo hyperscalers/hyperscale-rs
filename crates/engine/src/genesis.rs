@@ -10,13 +10,14 @@
 use std::sync::Arc;
 
 pub use hyperscale_effects_bridge::genesis::{
-    GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, STAKE_UNIT_RECORD, World, XRD_RECORD,
-    account_artifact, genesis_publisher, genesis_world, genesis_world_with_pools, pool_address,
-    pool_meta, pool_owner_badge, stake_unit, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, PROTOCOL_RESOURCE_RECORD,
+    STAKE_UNIT_RECORD, World, account_artifact, genesis_publisher, genesis_world,
+    genesis_world_with_pools, pool_address, pool_meta, pool_owner_badge, stake_unit,
+    staking_artifact,
 };
 use hyperscale_effects_bridge::vm_statics::config_key;
+pub use hyperscale_effects_bridge::{PROTOCOL_RESOURCE, draw_key, vault_key};
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
-pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
 use hyperscale_hbor::{Hash32, to_vec};
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
@@ -57,7 +58,7 @@ pub struct GenesisConfig {
 ///
 /// The protocol's stdlib flash composed with this network's allocations:
 /// a seated pool's validator records, its owner-badge custody, and one
-/// [`XRD`] vault cell per funded account, identity-keyed under the
+/// [`PROTOCOL_RESOURCE`] vault cell per funded account, identity-keyed under the
 /// owner's prefix.
 ///
 /// # Panics
@@ -153,11 +154,15 @@ pub fn genesis_writes(
         );
     }
     // The fee resource's record, under its issuer: the one cell that says
-    // what XRD is, written where every resource's record lives.
+    // what protocol resource is, written where every resource's record lives.
     writes.cells.insert(
-        resource_record_key(&ProtocolHasher, genesis_publisher(&ProtocolHasher), *XRD),
+        resource_record_key(
+            &ProtocolHasher,
+            genesis_publisher(&ProtocolHasher),
+            *PROTOCOL_RESOURCE,
+        ),
         Some(
-            XRD_RECORD
+            PROTOCOL_RESOURCE_RECORD
                 .to_cell()
                 .expect("a record encodes within its wire depth"),
         ),
@@ -172,7 +177,7 @@ pub fn genesis_writes(
     SettledWrites::from_parts(writes.cells, writes.entries)
 }
 
-/// The XRD each funded account is born holding, as the mint that made it.
+/// The protocol resource each funded account is born holding, as the mint that made it.
 ///
 /// Value enters the world through a mint and nowhere else, genesis
 /// included. Written straight into the cells it would be a stock no
@@ -197,10 +202,10 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
         .iter()
         .map(|(address, _)| DeclaredAccess {
             effect: Effect {
-                target: EffectTarget::Point(vault_key(*address, *XRD)),
+                target: EffectTarget::Point(vault_key(*address, *PROTOCOL_RESOURCE)),
                 mode: Mode::Delta { moves: Moves::Both },
             },
-            holds: Some(*XRD),
+            holds: Some(*PROTOCOL_RESOURCE),
             // Genesis credits the accounts it is naming, so every one of
             // these is under the prefix it belongs to and none reaches a
             // stranger's.
@@ -232,7 +237,7 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     // grants no `Mint` entry, and what a body may do here is the
     // occasion's rather than any caller's.
     session.grant_issuance(vec![IssuanceGrant {
-        resource: *XRD,
+        resource: *PROTOCOL_RESOURCE,
         kind: ResourceKind::Fungible,
         direction: Issued::Minted,
     }]);
@@ -304,8 +309,14 @@ mod tests {
         assert_eq!(
             cells,
             std::collections::BTreeMap::from([
-                (vault_key(alice, *XRD), Some(encode_amount(500).to_vec())),
-                (vault_key(bob, *XRD), Some(encode_amount(700).to_vec())),
+                (
+                    vault_key(alice, *PROTOCOL_RESOURCE),
+                    Some(encode_amount(500).to_vec())
+                ),
+                (
+                    vault_key(bob, *PROTOCOL_RESOURCE),
+                    Some(encode_amount(700).to_vec())
+                ),
             ]),
             "the mint credits each funded vault and nothing besides"
         );
@@ -328,9 +339,13 @@ mod tests {
             writes.cells().get(&resource_record_key(
                 &ProtocolHasher,
                 genesis_publisher(&ProtocolHasher),
-                *XRD
+                *PROTOCOL_RESOURCE
             )),
-            Some(&Some(XRD_RECORD.to_cell().expect("a record encodes")))
+            Some(&Some(
+                PROTOCOL_RESOURCE_RECORD
+                    .to_cell()
+                    .expect("a record encodes")
+            ))
         );
         assert!(
             writes
@@ -340,7 +355,7 @@ mod tests {
         );
 
         for (owner, balance) in [(alice, 500u128), (bob, 700)] {
-            let key = vault_key(owner, *XRD);
+            let key = vault_key(owner, *PROTOCOL_RESOURCE);
             assert_eq!(key.owner, owner);
             assert_eq!(
                 writes.cells().get(&key),

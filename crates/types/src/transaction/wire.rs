@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-use hyperscale_vm_types::{LegShape, price_attos};
+use hyperscale_vm_types::{LegShape, price};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
@@ -178,7 +178,7 @@ impl Transaction {
         self.derived().footprint
     }
 
-    /// What this transaction is charged, in attos: its declared work at
+    /// What this transaction is charged, in quanta: its declared work at
     /// the protocol's rate. One figure whatever the outcome and wherever
     /// it runs — a participant measuring only its own legs bills the
     /// same as one that ran the whole — and never more than the signed
@@ -189,7 +189,7 @@ impl Transaction {
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
     pub fn price(&self) -> u128 {
-        price_attos(self.work())
+        price(self.work())
     }
 
     /// [`Self::price`] for an envelope that may not have been derived
@@ -200,7 +200,7 @@ impl Transaction {
     ///
     /// [`DerivationError`], where the envelope derives to nothing.
     pub fn price_under(&self, derivation: &dyn Derivation) -> Result<u128, DerivationError> {
-        Ok(price_attos(self.try_derived(derivation)?.work))
+        Ok(price(self.try_derived(derivation)?.work))
     }
 
     /// Each manifest node's placement-free shape, in node order.
@@ -642,7 +642,7 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // A publish is priced by its artifact and capped at the ceiling;
         // only a call declares a price the ceiling has to cover.
         if vm.artifact().is_none() {
-            let price = price_attos(derived.work);
+            let price = price(derived.work);
             if price > vm.max_fee {
                 return Err(TransactionVerifyError::CeilingBelowPrice {
                     max_fee: vm.max_fee,

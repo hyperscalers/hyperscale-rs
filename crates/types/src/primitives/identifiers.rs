@@ -378,6 +378,11 @@ impl Display for Epoch {
     }
 }
 
+/// How many base-10 subunit digits a client renders one whole of the
+/// protocol resource as. A rendering fact the genesis record carries;
+/// stated once here so the stake arithmetic reads the same figure.
+pub const PROTOCOL_DISPLAY_DIGITS: u8 = 18;
+
 /// Aggregate stake committed to a beacon-chain validator pool.
 ///
 /// Beacon-side accounting only — delegator-level deposits and withdrawals
@@ -385,7 +390,7 @@ impl Display for Epoch {
 /// per-pool aggregate `Stake` deltas via `ShardWitnessPayload::StakeDeposit`
 /// / `StakeWithdraw`.
 ///
-/// Denominated in **attos** (10⁻¹⁸ whole tokens), matching the amount
+/// Denominated in quanta of the protocol resource, matching the amount
 /// cells the engine settles. `u128` gives ~3.4 × 10²⁰ whole tokens of
 /// headroom — vastly more than any realistic supply, so arithmetic
 /// doesn't need to be defensive against overflow at protocol-reasonable
@@ -395,9 +400,9 @@ impl Display for Epoch {
 pub struct Stake(u128);
 
 impl Stake {
-    /// Whole tokens per atto — the unit shift factor `10^18`. Matches
-    /// Radix `Decimal`'s 18-decimal scale.
-    pub const ATTOS_PER_WHOLE: u128 = 1_000_000_000_000_000_000;
+    /// Quanta per whole token: ten to the protocol resource's display
+    /// digits, so the genesis record and this figure cannot disagree.
+    pub const QUANTA_PER_WHOLE: u128 = 10u128.pow(PROTOCOL_DISPLAY_DIGITS as u32);
 
     /// Zero stake.
     pub const ZERO: Self = Self(0);
@@ -408,36 +413,35 @@ impl Stake {
     /// `.min(...)` clamp picks the admit-threshold or floor instead.
     pub const MAX: Self = Self(u128::MAX);
 
-    /// Construct from a raw atto count. The canonical primary
-    /// constructor — sites that hold a Radix-derived atto value pass it
+    /// Construct from a raw quantum count. The canonical primary
+    /// constructor — sites that already hold a quantum count pass it
     /// straight through, no rounding policy needed.
     #[must_use]
-    pub const fn from_attos(attos: u128) -> Self {
-        Self(attos)
+    pub const fn from_quanta(quanta: u128) -> Self {
+        Self(quanta)
     }
 
     /// Construct from a whole-token count.
     ///
-    /// `n * ATTOS_PER_WHOLE` always fits in `u128` for any `u64` input
+    /// `n * QUANTA_PER_WHOLE` always fits in `u128` for any `u64` input
     /// (`u64::MAX * 10^18` is ~1.8 × 10³⁷, well below `u128::MAX` of
     /// ~3.4 × 10³⁸), so the multiplication is overflow-safe by
     /// construction.
     #[must_use]
     pub const fn from_whole_tokens(n: u64) -> Self {
-        Self((n as u128) * Self::ATTOS_PER_WHOLE)
+        Self((n as u128) * Self::QUANTA_PER_WHOLE)
     }
 
-    /// Inner atto count. Use at boundaries (display, threshold
-    /// arithmetic, Radix-side conversion via
-    /// `Decimal::from_attos`) only.
+    /// Inner quantum count. Use at boundaries (display, threshold
+    /// arithmetic) only.
     #[must_use]
-    pub const fn attos(self) -> u128 {
+    pub const fn quanta(self) -> u128 {
         self.0
     }
 
     /// Saturating sum. Beacon stake-accumulation sites (deposits,
     /// reward distribution) should use this rather than reaching for the
-    /// inner attos, so the saturating semantics live with the type.
+    /// inner quanta, so the saturating semantics live with the type.
     #[must_use]
     pub const fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))

@@ -27,7 +27,7 @@ use hyperscale_vm_effects::{
     AdmittedTree, ChainRecords, Claim, CrossingSite, EnvelopeTree, IntentHeader, ManifestHash,
     PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree,
     child_key, effect_units, footprint, legs_of, package_hash,
-    package_key as canonical_package_key, principal_address, route_tree, xrd,
+    package_key as canonical_package_key, principal_address, protocol_resource, route_tree,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
@@ -131,7 +131,8 @@ pub fn crossing_cells_footprint(legs: &[LegShape]) -> u64 {
 /// A resource like any other, minted by an address no signer reaches —
 /// so supply moves only where the protocol writes state directly, and
 /// the address sits where a hash puts it, on no shard by preference.
-pub static XRD: LazyLock<ResourceAddr> = LazyLock::new(|| xrd(&ProtocolHasher));
+pub static PROTOCOL_RESOURCE: LazyLock<ResourceAddr> =
+    LazyLock::new(|| protocol_resource(&ProtocolHasher));
 
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
@@ -379,7 +380,7 @@ fn classify_declared_access(
         }
         access.declared_modes.push((key, effect.mode));
     }
-    let fee_vault = DeclaredKey::Cell(vault_key(fee_payer, *XRD));
+    let fee_vault = DeclaredKey::Cell(vault_key(fee_payer, *PROTOCOL_RESOURCE));
     let fee_mode = (fee_vault, Mode::Delta { moves: Moves::Out });
     access.write_keys.insert(fee_vault);
     if !access.declared_modes.contains(&fee_mode) {
@@ -551,7 +552,7 @@ impl BridgeStatics {
         let publisher = vm.fee_payer;
         let package = package_hash(&ProtocolHasher, artifact);
         let cell = package_key(publisher, package);
-        let vault = vault_key(publisher, *XRD);
+        let vault = vault_key(publisher, *PROTOCOL_RESOURCE);
         let mut write_keys = vec![DeclaredKey::Cell(cell), DeclaredKey::Cell(vault)];
         write_keys.sort_unstable();
         write_keys.dedup();
@@ -728,7 +729,7 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.subintent.0.0)
                 .collect(),
-            fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
+            fee_vault_local: vault_key(vm.fee_payer, *PROTOCOL_RESOURCE).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
             packages,
         })
@@ -1688,7 +1689,11 @@ mod tests {
         // whatever it holds: the key is checked before the value is
         // read, which is what keeps this cheap over every committed cell.
         let cache = InstanceCache::new(InstanceRegistry::new());
-        assert!(!cache.absorb_cell(address, vault_key(address, *XRD).local.0, &record));
+        assert!(!cache.absorb_cell(
+            address,
+            vault_key(address, *PROTOCOL_RESOURCE).local.0,
+            &record
+        ));
     }
 
     /// The address a served record derives, read off the bytes alone.

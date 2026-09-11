@@ -137,13 +137,13 @@ pub fn witness_from_event(
                 .ok()
                 .map(|staked: pool::Staked| BeaconWitnessEvent::StakeDeposit {
                     pool_id,
-                    amount: Stake::from_attos(staked.amount.subunits()),
+                    amount: Stake::from_quanta(staked.amount.subunits()),
                 })
         }
         UNSTAKED => from_slice(payload).ok().map(|unstaked: pool::Unstaked| {
             BeaconWitnessEvent::StakeWithdraw {
                 pool_id,
-                amount: Stake::from_attos(unstaked.amount.subunits()),
+                amount: Stake::from_quanta(unstaked.amount.subunits()),
             }
         }),
         VALIDATOR_REGISTERED => {
@@ -260,14 +260,14 @@ mod tests {
             witness_from_event(&event(pool, STAKED, 500), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeDeposit {
                 pool_id: StakePoolId::new(POOL_ID),
-                amount: Stake::from_attos(500),
+                amount: Stake::from_quanta(500),
             }),
         );
         assert_eq!(
             witness_from_event(&event(pool, UNSTAKED, 40), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeWithdraw {
                 pool_id: StakePoolId::new(POOL_ID),
-                amount: Stake::from_attos(40),
+                amount: Stake::from_quanta(40),
             }),
         );
     }

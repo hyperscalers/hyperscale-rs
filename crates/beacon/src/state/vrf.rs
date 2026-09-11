@@ -398,7 +398,7 @@ mod tests {
         // to support them.
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)
@@ -451,7 +451,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)
@@ -607,7 +607,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)

@@ -2742,7 +2742,7 @@ mod tests {
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: members.clone(),
             initial_shard_committee: members,
@@ -3850,7 +3850,7 @@ mod tests {
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: members.clone(),
             initial_shard_committee: members,

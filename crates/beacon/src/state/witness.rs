@@ -1235,7 +1235,7 @@ mod tests {
         state.current_epoch = Epoch::new(2);
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
         let new_id = ValidatorId::new(5);
         let new_pubkey = pubkey(5);
@@ -1267,7 +1267,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
         let existing_id = ValidatorId::new(0);
         let prior = state.validators.get(&existing_id).unwrap().clone();
@@ -1318,7 +1318,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
         let new_id = ValidatorId::new(5);
         let effects = apply_witness_chunk(
@@ -1345,7 +1345,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
         let new_id = ValidatorId::new(5);
         let effects = apply_witness_chunk(
@@ -1370,7 +1370,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
         let new_id = ValidatorId::new(5);
         let effects = apply_witness_chunk(
@@ -1442,7 +1442,7 @@ mod tests {
             stranger,
             StakePool {
                 id: stranger,
-                total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,
@@ -1473,7 +1473,7 @@ mod tests {
             stranger,
             StakePool {
                 id: stranger,
-                total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,
@@ -1627,7 +1627,7 @@ mod tests {
         state.committee = (0u64..3).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)
@@ -1752,7 +1752,7 @@ mod tests {
             .chain(std::iter::once(jailed_id))
             .map(ValidatorId::new)
             .collect();
-        pool.total_stake = Stake::from_attos(u128::from(ready + 1) * MIN_STAKE_FLOOR.attos());
+        pool.total_stake = Stake::from_quanta(u128::from(ready + 1) * MIN_STAKE_FLOOR.quanta());
         state
     }
 
@@ -2053,7 +2053,7 @@ mod tests {
         let target = ValidatorId::new(10);
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)
@@ -2133,7 +2133,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)
@@ -2389,7 +2389,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
-            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
             .pools
             .get_mut(&pool_id)

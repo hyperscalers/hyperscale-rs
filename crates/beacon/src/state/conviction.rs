@@ -112,7 +112,7 @@ mod tests {
                 pool_id,
                 StakePool {
                     id: pool_id,
-                    total_stake: Stake::from_attos(stake_multiple * MIN_STAKE_FLOOR.attos()),
+                    total_stake: Stake::from_quanta(stake_multiple * MIN_STAKE_FLOOR.quanta()),
                     validators: ids.into_iter().map(ValidatorId::new).collect(),
                     pending_withdrawals: Vec::new(),
                     released_cumulative: Stake::ZERO,

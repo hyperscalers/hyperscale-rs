@@ -22,8 +22,8 @@ pub use records::{LocalCells, NodeRecords};
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
-    BridgeStatics, XRD, account_address, declared_footprint, decode_tree, draw_key, encode_tree,
-    envelope_identity, validator_key, vault_key,
+    BridgeStatics, PROTOCOL_RESOURCE, account_address, declared_footprint, decode_tree, draw_key,
+    encode_tree, envelope_identity, validator_key, vault_key,
 };
 
 #[cfg(test)]
@@ -50,7 +50,7 @@ mod tests {
                 "resource/minted = e7ade2f9f5f36c4a571c1f0f003b6a5e3a788d18362634e11b9d82df673bd404",
                 "resource/minted-nf = ac913fc5425c3f6b4712e91099ef2754b4d739998d3bdee9eff308794405b904",
                 "native/genesis-publisher = a8d17f712889af8c3657c416f393543e4c7c2871c0e361decaedefda4fc9c705",
-                "resource/xrd = f0762f0fd514e13031e6b12df742a5901b263aec476126ca1bc0b130bc0d3d04",
+                "resource/protocol = f0762f0fd514e13031e6b12df742a5901b263aec476126ca1bc0b130bc0d3d04",
             ]
         );
     }

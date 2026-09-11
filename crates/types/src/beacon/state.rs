@@ -1113,8 +1113,8 @@ impl StakePool {
         if min_stake == Stake::ZERO {
             return usize::MAX;
         }
-        let e = self.effective_stake().attos();
-        (e / min_stake.attos()) as usize
+        let e = self.effective_stake().quanta();
+        (e / min_stake.quanta()) as usize
     }
 }
 
@@ -1885,7 +1885,7 @@ impl BeaconState {
     pub fn min_stake(&self) -> Stake {
         let ne = self.t_no_eject();
         let ad = self.admit_threshold();
-        Stake::from_attos(ne.attos().min(ad.attos()).max(MIN_STAKE_FLOOR.attos()))
+        Stake::from_quanta(ne.quanta().min(ad.quanta()).max(MIN_STAKE_FLOOR.quanta()))
     }
 
     /// Highest `min_stake` could be without forcing any active validator
@@ -1903,11 +1903,11 @@ impl BeaconState {
                 if active == 0 {
                     None
                 } else {
-                    Some(pool.effective_stake().attos() / active as u128)
+                    Some(pool.effective_stake().quanta() / active as u128)
                 }
             })
             .min()
-            .map_or(Stake::MAX, Stake::from_attos)
+            .map_or(Stake::MAX, Stake::from_quanta)
     }
 
     /// Marginal price at which exactly the target epoch count is offered
@@ -1940,7 +1940,7 @@ impl BeaconState {
             if pool.conviction.is_some() {
                 continue;
             }
-            let e = pool.effective_stake().attos();
+            let e = pool.effective_stake().quanta();
             if e == 0 {
                 continue;
             }
@@ -1953,7 +1953,7 @@ impl BeaconState {
             let floor_cap = if MIN_STAKE_FLOOR == Stake::ZERO {
                 target
             } else {
-                (e / MIN_STAKE_FLOOR.attos()) as usize
+                (e / MIN_STAKE_FLOOR.quanta()) as usize
             };
             let k_max = floor_cap.min(target);
             for k in 1..=k_max {
@@ -1966,7 +1966,7 @@ impl BeaconState {
         }
 
         offerings.sort_unstable_by(|a, b| b.cmp(a));
-        Stake::from_attos(offerings[target - 1])
+        Stake::from_quanta(offerings[target - 1])
     }
 }
 
@@ -2066,7 +2066,7 @@ mod tests {
             pool_id,
             StakePool {
                 id: pool_id,
-                total_stake: Stake::from_attos(u128::from(n_active) * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(u128::from(n_active) * MIN_STAKE_FLOOR.quanta()),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,

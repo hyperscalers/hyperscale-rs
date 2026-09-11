@@ -197,14 +197,14 @@ pub(super) fn distribute_epoch_rewards(
     if total == 0 {
         return BTreeMap::new();
     }
-    let emission = EMISSIONS_PER_EPOCH.attos();
+    let emission = EMISSIONS_PER_EPOCH.quanta();
     let mut credited = BTreeMap::new();
     for (pool_id, n) in pool_weight {
-        let share_attos = emission * n / total;
-        if share_attos == 0 {
+        let share_quanta = emission * n / total;
+        if share_quanta == 0 {
             continue;
         }
-        let share = Stake::from_attos(share_attos);
+        let share = Stake::from_quanta(share_quanta);
         let pool = state
             .pools
             .get_mut(&pool_id)
@@ -269,12 +269,12 @@ mod tests {
 
     /// Build a pool with `n_active` validators (`OnShard`) plus
     /// `insufficient` `InsufficientStake` validators in the same pool.
-    /// Pool stake is `total_stake_attos` attos; caller picks it to
+    /// Pool stake is `total_stake_quanta` quanta; caller picks it to
     /// engineer specific `max_active_count` outcomes.
     fn state_with_insufficient(
         n_active: u64,
         insufficient: &[u64],
-        total_stake_attos: u128,
+        total_stake_quanta: u128,
     ) -> BeaconState {
         let mut state = empty_state();
         let pool_id = StakePoolId::new(0);
@@ -309,7 +309,7 @@ mod tests {
             pool_id,
             StakePool {
                 id: pool_id,
-                total_stake: Stake::from_attos(total_stake_attos),
+                total_stake: Stake::from_quanta(total_stake_quanta),
                 validators: pool_validators,
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,
@@ -330,7 +330,7 @@ mod tests {
     fn auto_reactivate_promotes_insufficient_when_capacity_available() {
         // 3 actives, 1 insufficient, stake covers 4. After
         // reactivation cur=4 ≤ max=4.
-        let mut state = state_with_insufficient(3, &[5], 4 * MIN_STAKE_FLOOR.attos());
+        let mut state = state_with_insufficient(3, &[5], 4 * MIN_STAKE_FLOOR.quanta());
 
         let effects = apply_next_epoch(&mut state, &[]);
 
@@ -347,7 +347,7 @@ mod tests {
     fn auto_reactivate_skips_pool_at_capacity() {
         // 4 actives, 1 insufficient, stake covers 4 only. cur=4, max=4
         // → no reactivation.
-        let mut state = state_with_insufficient(4, &[5], 4 * MIN_STAKE_FLOOR.attos());
+        let mut state = state_with_insufficient(4, &[5], 4 * MIN_STAKE_FLOOR.quanta());
 
         let effects = apply_next_epoch(&mut state, &[]);
 
@@ -362,7 +362,7 @@ mod tests {
     /// reactivation.
     #[test]
     fn auto_reactivate_noop_when_no_candidates() {
-        let mut state = state_with_insufficient(3, &[], 10 * MIN_STAKE_FLOOR.attos());
+        let mut state = state_with_insufficient(3, &[], 10 * MIN_STAKE_FLOOR.quanta());
 
         let effects = apply_next_epoch(&mut state, &[]);
 
@@ -378,7 +378,7 @@ mod tests {
         // Each iteration adds one validator: iteration 1 adds 9
         // (cur=2), iteration 2 adds 7 (cur=3), iteration 3 sees
         // cur=3=max, no further picks.
-        let mut state = state_with_insufficient(1, &[5, 7, 9], 3 * MIN_STAKE_FLOOR.attos());
+        let mut state = state_with_insufficient(1, &[5, 7, 9], 3 * MIN_STAKE_FLOOR.quanta());
 
         let effects = apply_next_epoch(&mut state, &[]);
 
@@ -406,15 +406,15 @@ mod tests {
     /// flood and pins that it yields the same flips a clean state does.
     #[test]
     fn auto_reactivate_outcome_unaffected_by_dust_pools() {
-        let base_attos = 3 * MIN_STAKE_FLOOR.attos();
-        let mut baseline = state_with_insufficient(1, &[5, 7, 9], base_attos);
-        let mut flooded = state_with_insufficient(1, &[5, 7, 9], base_attos);
+        let base_quanta = 3 * MIN_STAKE_FLOOR.quanta();
+        let mut baseline = state_with_insufficient(1, &[5, 7, 9], base_quanta);
+        let mut flooded = state_with_insufficient(1, &[5, 7, 9], base_quanta);
         for i in 100u32..160 {
             flooded.pools.insert(
                 StakePoolId::new(i),
                 StakePool {
                     id: StakePoolId::new(i),
-                    total_stake: Stake::from_attos(1),
+                    total_stake: Stake::from_quanta(1),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
                     released_cumulative: Stake::ZERO,
@@ -457,7 +457,7 @@ mod tests {
         // — deactivates validator 3, leaves cur=3 max=3.
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             MIN_STAKE_FLOOR,
             initiated,
             current,
@@ -632,15 +632,15 @@ mod tests {
         // Pool A's share = EMISSIONS_PER_EPOCH * 1 / 4 (integer
         // div). Pool B's share = EMISSIONS_PER_EPOCH * 3 / 4.
         let total = 4u128;
-        let expected_a = Stake::from_attos(EMISSIONS_PER_EPOCH.attos() / total);
-        let expected_b = Stake::from_attos(EMISSIONS_PER_EPOCH.attos() * 3 / total);
+        let expected_a = Stake::from_quanta(EMISSIONS_PER_EPOCH.quanta() / total);
+        let expected_b = Stake::from_quanta(EMISSIONS_PER_EPOCH.quanta() * 3 / total);
         assert_eq!(credited[&pool_a], expected_a);
         assert_eq!(credited[&pool_b], expected_b);
         // Sum is at most EMISSIONS_PER_EPOCH (remainder burns at most
-        // total_pools - 1 = 1 atto).
-        let sum = credited[&pool_a].attos() + credited[&pool_b].attos();
-        assert!(sum <= EMISSIONS_PER_EPOCH.attos());
-        assert!(EMISSIONS_PER_EPOCH.attos() - sum < total);
+        // total_pools - 1 = 1 quantum).
+        let sum = credited[&pool_a].quanta() + credited[&pool_b].quanta();
+        assert!(sum <= EMISSIONS_PER_EPOCH.quanta());
+        assert!(EMISSIONS_PER_EPOCH.quanta() - sum < total);
     }
 
     /// Zero-share pools (in this case: pool with only `Pooled`
@@ -725,7 +725,7 @@ mod tests {
             second_pool,
             StakePool {
                 id: second_pool,
-                total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
                 validators: std::iter::once(second).collect(),
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,
@@ -759,12 +759,12 @@ mod tests {
             weighted[&StakePoolId::new(0)] > weighted[&second_pool],
             "work should move emission: {weighted:?}"
         );
-        let total: u128 = weighted.values().map(|s| s.attos()).sum();
-        assert!(total <= EMISSIONS_PER_EPOCH.attos());
+        let total: u128 = weighted.values().map(|s| s.quanta()).sum();
+        assert!(total <= EMISSIONS_PER_EPOCH.quanta());
 
         // The quiet shard still earns: the floor is what keeps a secured but
         // idle shard fundable.
-        assert!(weighted[&second_pool] > Stake::from_attos(0));
+        assert!(weighted[&second_pool] > Stake::from_quanta(0));
 
         // Stored bytes weigh on the same footing. Giving the quiet shard the
         // network's whole byte level pulls its share back up.
@@ -834,7 +834,7 @@ mod tests {
                 second_pool,
                 StakePool {
                     id: second_pool,
-                    total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                    total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
                     validators: std::iter::once(second).collect(),
                     pending_withdrawals: Vec::new(),
                     released_cumulative: Stake::ZERO,

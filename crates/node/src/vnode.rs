@@ -66,7 +66,7 @@ pub struct SeatVnodeGroup<'a> {
     /// Host beacon storage; the group's coordinators resume from its
     /// committed tip.
     pub beacon_storage: &'a dyn BeaconStorage,
-    /// Radix network identity bound into beacon signatures.
+    /// The network identity bound into beacon signatures.
     pub beacon_network: NetworkDefinition,
     /// Genesis config hash bound into beacon signatures alongside the
     /// network.
@@ -194,7 +194,7 @@ pub struct SeatFollower<'a> {
     /// Host beacon storage; the follower's coordinator resumes from its
     /// committed tip and stays warm by committing every block it folds.
     pub beacon_storage: &'a dyn BeaconStorage,
-    /// Radix network identity bound into beacon signatures.
+    /// The network identity bound into beacon signatures.
     pub beacon_network: NetworkDefinition,
     /// Genesis config hash bound into beacon signatures alongside the
     /// network.

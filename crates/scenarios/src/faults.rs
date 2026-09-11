@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, MAX_VALIDITY_RANGE,
     PrincipalAddr, ShardId, StateRoot, SubstateKey, TransactionDecision, TransactionStatus, TxHash,
@@ -230,7 +230,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     // after the recovery. The ballast holds the band and never spends.
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         setup
             .straddlers
             .iter()
@@ -1508,7 +1508,7 @@ fn fault_family_world<C: Cluster>(c: &C) -> World {
         holders.push(payer.address());
         holders.push(recipient.address());
     }
-    World::open(c, *XRD, holders, [])
+    World::open(c, *PROTOCOL_RESOURCE, holders, [])
 }
 
 /// Submit the family's crossing: the left child's funded account pays the

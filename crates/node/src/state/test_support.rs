@@ -105,7 +105,7 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
         .collect();
     let initial_pools = vec![GenesisPool {
         id: pool_id,
-        total_stake: Stake::from_attos(n as u128 * MIN_STAKE_FLOOR.attos()),
+        total_stake: Stake::from_quanta(n as u128 * MIN_STAKE_FLOOR.quanta()),
     }];
     let chain_config = BeaconChainConfig::default();
     let beacon_count = n.min(chain_config.beacon_committee_size as usize);

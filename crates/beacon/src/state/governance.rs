@@ -46,7 +46,7 @@ pub(super) fn tally_param_votes(state: &mut BeaconState) {
         let weight = state
             .pools
             .get(pool_id)
-            .map_or(0, |pool| pool.total_stake.attos());
+            .map_or(0, |pool| pool.total_stake.quanta());
         let bucket = buckets.entry(proposal.params).or_insert(0);
         *bucket = bucket.saturating_add(weight);
     }
@@ -65,7 +65,7 @@ pub(super) fn tally_param_votes(state: &mut BeaconState) {
         .values()
         .filter(|pool| pool.conviction.is_none())
         .fold(0u128, |acc, pool| {
-            acc.saturating_add(pool.total_stake.attos())
+            acc.saturating_add(pool.total_stake.quanta())
         });
     let winner = buckets
         .into_iter()
@@ -105,7 +105,7 @@ mod tests {
         }
     }
 
-    /// A state at `current_epoch` with one pool per `(id, stake_attos)`.
+    /// A state at `current_epoch` with one pool per `(id, stake_quanta)`.
     fn state_with_pools(current_epoch: u64, pools: &[(u32, u128)]) -> BeaconState {
         let mut state = empty_state();
         state.current_epoch = Epoch::new(current_epoch);
@@ -114,7 +114,7 @@ mod tests {
                 StakePoolId::new(id),
                 StakePool {
                     id: StakePoolId::new(id),
-                    total_stake: Stake::from_attos(stake),
+                    total_stake: Stake::from_quanta(stake),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
                     released_cumulative: Stake::ZERO,

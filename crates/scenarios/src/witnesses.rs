@@ -13,7 +13,7 @@
 //!
 //! [`BeaconState`]: hyperscale_types::BeaconState
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, ShardId, Stake,
     StakePoolId, Transaction, TransactionDecision, TransactionStatus, UNBONDING_WINDOW_EPOCHS,
@@ -49,7 +49,7 @@ fn dummy_pubkey(c: &impl Cluster, seed: u8) -> ConsensusPublicKey {
     c.signer_from_seed(&[seed; 32]).public_key()
 }
 
-/// Everything a pool scenario's XRD can reach: the accounts that pay —
+/// Everything a pool scenario's protocol resource can reach: the accounts that pay —
 /// the delegator, the pool's operator and the badge buyer — and each
 /// pool's own vault, where a delegation lands.
 ///
@@ -58,7 +58,7 @@ fn dummy_pubkey(c: &impl Cluster, seed: u8) -> ConsensusPublicKey {
 fn pool_world<C: Cluster>(c: &C, pools: impl IntoIterator<Item = ComponentAddr>) -> World {
     World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [
             delegator().1.address(),
             pool_operator().1.address(),
@@ -86,7 +86,7 @@ fn delegate<C: Cluster>(
         charges,
         build_stake_tx(&key, delegator, pool, amount, validity_around(c.now())),
     );
-    let expected = before.saturating_add(Stake::from_attos(amount));
+    let expected = before.saturating_add(Stake::from_quanta(amount));
     assert!(
         c.run_until(epochs(8), |c| pool_total_stake(c, id) == Some(expected)),
         "the delegation never folded; pool stake = {:?}",
@@ -179,11 +179,11 @@ pub fn delegation_folds_into_beacon_state(c: &mut impl Cluster) {
     );
 
     // The pool's stake is the delegation, in the units the beacon counts:
-    // a amount cell is attos, which is what `Stake` is denominated in,
+    // a amount cell is quanta, which is what `Stake` is denominated in,
     // so nothing rescales on the way through.
     assert!(
         c.run_until(epochs(10), |c| pool_total_stake(c, pool)
-            == Some(Stake::from_attos(DELEGATION))),
+            == Some(Stake::from_quanta(DELEGATION))),
         "the beacon never folded the delegation; pool stake = {:?}",
         pool_total_stake(c, pool),
     );
@@ -212,7 +212,7 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
         &mut charges,
         pool_at(STAKE_POOL_ID),
         STAKE_POOL_ID,
-        MIN_STAKE_FLOOR.attos() * 10,
+        MIN_STAKE_FLOOR.quanta() * 10,
     );
     register(c, &mut charges, pool_at(STAKE_POOL_ID), 9, newcomer);
     assert!(
@@ -243,7 +243,7 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
         &mut charges,
         pool_at(STAKE_POOL_ID),
         STAKE_POOL_ID,
-        MIN_STAKE_FLOOR.attos() / 2,
+        MIN_STAKE_FLOOR.quanta() / 2,
     );
 
     // The registration itself commits — it is a well-formed action by the
@@ -270,7 +270,7 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
         &mut charges,
         pool_at(STAKE_POOL_ID),
         STAKE_POOL_ID,
-        MIN_STAKE_FLOOR.attos() * 2,
+        MIN_STAKE_FLOOR.quanta() * 2,
     );
     register(c, &mut charges, pool_at(STAKE_POOL_ID), 12, funded);
     assert!(
@@ -302,9 +302,9 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
     warm_up(c);
 
     let pool = STAKE_POOL_ID;
-    let delegated = MIN_STAKE_FLOOR.attos() * 5;
-    let returned = MIN_STAKE_FLOOR.attos() * 2;
-    let remaining = Stake::from_attos(delegated - returned);
+    let delegated = MIN_STAKE_FLOOR.quanta() * 5;
+    let returned = MIN_STAKE_FLOOR.quanta() * 2;
+    let remaining = Stake::from_quanta(delegated - returned);
     let (key, delegator) = delegator();
     let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
     let mut charges = Charges::default();
@@ -322,7 +322,7 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
     );
     assert!(
         c.run_until(epochs(8), |c| pool_total_stake(c, pool)
-            == Some(Stake::from_attos(delegated))),
+            == Some(Stake::from_quanta(delegated))),
         "the delegation never folded; pool stake = {:?}",
         pool_total_stake(c, pool),
     );
@@ -348,10 +348,10 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
     // drops immediately.
     assert_eq!(
         pool_total_stake(c, pool),
-        Some(Stake::from_attos(delegated)),
+        Some(Stake::from_quanta(delegated)),
         "total stake must hold until the withdrawal unbonds",
     );
-    // The unbond destroys units and moves no XRD yet: the pool still
+    // The unbond destroys units and moves no protocol resource yet: the pool still
     // holds the whole delegation.
     world.assert_settles_within(c, &charges, epochs(4), "a delegation and its unbond");
 }
@@ -373,7 +373,7 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
     warm_up(c);
 
     let member = ValidatorId::new(3000);
-    let funded = MIN_STAKE_FLOOR.attos() * 10;
+    let funded = MIN_STAKE_FLOOR.quanta() * 10;
     let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
     let mut charges = Charges::default();
     delegate(
@@ -394,7 +394,7 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
     // place until it matures; the release then drops the pool below one
     // `min_stake` and the over-capacity sweep deactivates its member.
     let (key, delegator) = delegator();
-    let returned = funded - MIN_STAKE_FLOOR.attos() / 2;
+    let returned = funded - MIN_STAKE_FLOOR.quanta() / 2;
     submit_committed(
         c,
         &mut charges,
@@ -502,7 +502,7 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
         ),
         "the seller's key must stop operating after the sale; status = {status:?}",
     );
-    // Custody moved and XRD did not: three prices, and nothing else.
+    // Custody moved and protocol resource did not: three prices, and nothing else.
     world.assert_settles_within(c, &charges, epochs(4), "a badge sale and two votes");
 }
 
@@ -542,7 +542,7 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
         &mut charges,
         pool_at(STAKE_POOL_ID),
         STAKE_POOL_ID,
-        MIN_STAKE_FLOOR.attos() * 10,
+        MIN_STAKE_FLOOR.quanta() * 10,
     );
     register(c, &mut charges, pool_at(STAKE_POOL_ID), 9, newcomer);
     assert!(
@@ -596,7 +596,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
 
     let id = ValidatorId::new(1000);
     let first = dummy_pubkey(c, 9);
-    let capacity = MIN_STAKE_FLOOR.attos() * 10;
+    let capacity = MIN_STAKE_FLOOR.quanta() * 10;
     let world = pool_world(c, [pool_at(STAKE_POOL_ID), pool_at(SECOND_POOL_ID)]);
     let mut charges = Charges::default();
     delegate(
@@ -661,7 +661,7 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
         &mut charges,
         pool_at(STAKE_POOL_ID),
         STAKE_POOL_ID,
-        MIN_STAKE_FLOOR.attos() * 3,
+        MIN_STAKE_FLOOR.quanta() * 3,
     );
 
     // Four registrations against capacity three: every one is a valid
