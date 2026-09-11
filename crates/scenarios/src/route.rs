@@ -20,6 +20,7 @@ use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
 use crate::support::tx::{build_route_tx, validity_around};
+use crate::support::wait::await_blocks;
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell, stand_up_venue,
@@ -275,16 +276,21 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     );
 }
 
+/// Blocks each venue commits between the reclaim landing and the reserves
+/// being read again — a second reclaim of the same transaction would ride
+/// one of the next few.
+const RECLAIM_TAIL_BLOCKS: u64 = 16;
+
 /// Assert both venues hold exactly what they held before a refused
 /// route, and hold it once.
 ///
 /// Driven until the reclaim lands rather than read once: the verdict
 /// comes from the hop that declined and the reclaim is a block of the
 /// first venue's own, so it follows the trader's refund. Then read
-/// again after the chain has had room for several more blocks — the
-/// equality is reached on the way past if the shard keeps reclaiming the
-/// same transaction, so sampling it once says nothing about how many
-/// times the claim came back.
+/// again after each venue has committed [`RECLAIM_TAIL_BLOCKS`] more —
+/// the equality is reached on the way past if the shard keeps
+/// reclaiming the same transaction, so sampling it once says nothing
+/// about how many times the claim came back.
 fn assert_venues_gave_back<C: Cluster>(
     c: &mut C,
     (first_cell, second_cell): (SubstateKey, SubstateKey),
@@ -303,7 +309,12 @@ fn assert_venues_gave_back<C: Cluster>(
          on an input of {ROUTE_INPUT}",
     );
 
-    c.run_until(epochs(5), |_| false);
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            await_blocks(c, venue, RECLAIM_TAIL_BLOCKS, epochs(1)),
+            "venue {venue} must keep committing after the reclaim",
+        );
+    }
     assert_eq!(
         (held_at(c, first_cell), held_at(c, second_cell)),
         (first_before, second_before),

@@ -42,7 +42,7 @@ use crate::support::tx::{
     remote_delegator, securify_cast, sender, shared_recipient_cast, storm_artifact,
     storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
-use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
+use crate::support::wait::{await_beacon_epoch, await_folds, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
 
 /// Per-payment amount of the contention scenarios.
@@ -790,9 +790,12 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
         "byte levels never reached the beacon"
     );
     let before = (recorded_bytes(c, left), recorded_bytes(c, right));
-    // Burn the budget with nothing to wait for: the condition never holds,
-    // so this runs the cluster on for the whole span and returns false.
-    c.run_until(epochs(8), |_| false);
+    // A record moves only at a fold, so two more folds are the drift the
+    // claim rules out.
+    assert!(
+        await_folds(c, 2, epochs(8)),
+        "the beacon must keep folding with nothing executing"
+    );
     let after = (recorded_bytes(c, left), recorded_bytes(c, right));
     assert_eq!(
         before, after,
@@ -1532,8 +1535,10 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     // reclaim that refuses it at the deadline is the receipt that carries
     // the charge. A terminal status is reported the moment this shard
     // decides, a block or more before that receipt commits, so the vault
-    // is given that long to settle.
-    c.run_until(epochs(4), |_| false);
+    // is driven to the charge rather than read at the verdict.
+    let _ = c.run_until(epochs(4), |c| {
+        vault_balance(c, payer_shard, payer) == before - price
+    });
     let after = vault_balance(c, payer_shard, payer);
     assert_eq!(
         after,

@@ -30,7 +30,7 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, epoch_duration_ms, held, held_at, merge_keeper_count,
+    anchored_genesis_height, clock, epoch_duration_ms, held, held_at, merge_keeper_count,
     scheduled_terminal_epoch, split_admitted,
 };
 use crate::support::tx::{
@@ -41,7 +41,7 @@ use crate::support::tx::{
 };
 use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
-    await_tx_terminal,
+    await_tx_terminal, measure_blocks_per_epoch,
 };
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -574,12 +574,15 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
     let mut charges = Charges::default();
 
     // From the drain the venue includes for a while, then coasts on empty
-    // blocks to its terminal — so a stream spaced across the coast lands
-    // on both sides of it.
+    // blocks until its children take over — so a stream spaced across the
+    // coast lands on both sides of its terminal. A swap sent once the
+    // children serve is handed on by routing alone, so the stream stops
+    // spacing itself out there and the rest go at once.
     assert!(
         c.run_until(budget, |c| !split_admitted(c, venue_shard)),
         "the venue's reshape gate must drain before the stream goes",
     );
+    let (left, right) = venue_shard.children();
     let mut stream: Vec<(TxHash, PrincipalAddr)> = Vec::new();
     for (key, caller) in &set.swappers {
         let swap = build_swap_tx(
@@ -592,11 +595,10 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
             validity_around(c.now()),
         );
         stream.push((charges.submit(c, swap), *caller));
-        c.run_until(epochs(1), |_| false);
+        let _ = c.run_until(epochs(1), |c| c.serves_shard(left) && c.serves_shard(right));
     }
     await_cut(c, venue_shard);
 
-    let (left, right) = venue_shard.children();
     let mut took = 0;
     let mut handed_on = 0;
     for (hash, caller) in &stream {
@@ -674,12 +676,6 @@ const LATEST_SUBMISSION_AFTER_THE_CUT: Duration = Duration::from_secs(70);
 /// the set is wanted on the first beacon fold that attests the terminal
 /// and a record is offered at the next proposal.
 const SETTLED_SET_SLACK: Duration = Duration::from_secs(60);
-
-/// The cluster's clock as the weighted timestamp a block anchored now
-/// carries.
-fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
-    WeightedTimestamp::ZERO.plus(c.now())
-}
 
 /// Stand the venue up on the departing shard with its callers on the
 /// survivor, and read the cut its reshape is scheduled for.
@@ -1374,7 +1370,6 @@ fn drive_train<C: Cluster>(
         c.committed_height(terminating)
             .map_or(0, BlockHeight::inner)
     };
-    let before = height(c);
     send_leg(
         c,
         legs.next().expect("a funded leg"),
@@ -1383,8 +1378,7 @@ fn drive_train<C: Cluster>(
         &mut admitted_once,
         &pending,
     );
-    c.run_until(epochs(1), |_| false);
-    let spacing = (height(c).saturating_sub(before) / TRAIN_PER_EPOCH).max(1);
+    let spacing = (measure_blocks_per_epoch(c, terminating) / TRAIN_PER_EPOCH).max(1);
 
     arm(c);
 

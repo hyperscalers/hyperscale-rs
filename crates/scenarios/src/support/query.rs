@@ -15,7 +15,7 @@ use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
     MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
     StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, ValidatorId, ValidatorStatus, sweep_admits_block,
+    TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
 };
 
 use super::Cluster;
@@ -339,6 +339,13 @@ pub const fn status_rank(status: &TransactionStatus) -> u8 {
 #[must_use]
 pub fn beacon_epoch<C: Cluster>(c: &C) -> Option<Epoch> {
     c.beacon_state().map(|state| state.current_epoch)
+}
+
+/// The cluster's clock as the weighted timestamp a block anchored now
+/// carries.
+#[must_use]
+pub fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
+    WeightedTimestamp::ZERO.plus(c.now())
 }
 
 /// Whether the beacon has admitted a split for `parent` — a pending `Split`

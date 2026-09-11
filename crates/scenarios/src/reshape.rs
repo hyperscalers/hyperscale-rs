@@ -10,12 +10,13 @@ use hyperscale_types::{
 
 use crate::support::conservation::{Charges, probe_world};
 use crate::support::query::{
-    committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
+    clock, committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
 };
 use crate::support::tx::{build_probe_transfer_tx, validity_around};
 use crate::support::wait::{
-    assert_height_frozen, await_beacon_epoch, await_height, await_merge_keeper_count,
+    assert_height_frozen, await_beacon_epoch, await_blocks, await_height, await_merge_keeper_count,
     await_root_matches_anchor, await_serves, await_serves_ahead_of_anchor, await_split_admitted,
+    measure_blocks_per_epoch,
 };
 use crate::support::{Cluster, epochs, grow_to, vote_reshape_threshold};
 
@@ -190,10 +191,20 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     let replay = pick_replay(c, root, &probes);
     let replayed = replay.hash();
 
-    c.submit(replay);
-    c.run_until(epochs(4), |_| false);
-
+    c.submit(replay.clone());
+    // A transaction commits only inside its validity window, so the
+    // refusal is decided once the window has closed and each child has
+    // committed a few blocks anchored past it.
+    let closed = replay.validity_range().end_timestamp_exclusive;
+    assert!(
+        c.run_until(epochs(4), |c| clock(c) >= closed),
+        "the replay's validity window must close within budget",
+    );
     for child in [left, right] {
+        assert!(
+            await_blocks(c, child, REPLAY_TAIL_BLOCKS, epochs(1)),
+            "child {child} must keep committing past the replay's window",
+        );
         assert!(
             c.chain_fate(child, replayed).0.is_none(),
             "child {child} committed {replayed}, which its parent had already committed",
@@ -205,18 +216,19 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(8), "a probe train and its replay");
 }
 
+/// Blocks each child commits past the replay's window before its refusal
+/// is read — room for a block anchored inside the window to land after
+/// the harness clock has left it.
+const REPLAY_TAIL_BLOCKS: u64 = 8;
+
 /// How many blocks `shard` should commit between consecutive probes.
 ///
 /// Block cadence is activity-driven and scales with neither the epoch nor
 /// the harness, so the train's spacing is measured rather than assumed.
-/// One probe supplies the activity; callers absorb the measurement epoch
-/// into the wait for the reshape admission that follows it.
+/// One probe supplies the activity the sample prices in.
 fn measure_probe_spacing(c: &mut impl Cluster, charges: &mut Charges, shard: ShardId) -> u64 {
     charges.submit(c, build_probe_transfer_tx(validity_around(c.now())));
-    let before = committed_height(c, shard);
-    c.run_until(epochs(1), |_| false);
-    let blocks_per_epoch = committed_height(c, shard).saturating_sub(before);
-    (blocks_per_epoch / PROBES_PER_EPOCH).max(1)
+    (measure_blocks_per_epoch(c, shard) / PROBES_PER_EPOCH).max(1)
 }
 
 /// Submit a train of probes across a terminating shard's remaining life
@@ -278,7 +290,7 @@ fn pick_replay(
     terminating: ShardId,
     probes: &[Arc<Transaction>],
 ) -> Arc<Transaction> {
-    let anchor = WeightedTimestamp::ZERO.plus(c.now());
+    let anchor = clock(c);
     probes
         .iter()
         .rev()
@@ -325,7 +337,7 @@ fn build_precut_probe(c: &impl Cluster, successor: ShardId) -> Arc<Transaction> 
 
     let opens = WeightedTimestamp::from_millis(cut.as_millis().saturating_sub(PRECUT_LEAD_MS));
     let range = TimestampRange::new(opens, opens.plus(PRECUT_PROBE_LIFE));
-    let anchor = WeightedTimestamp::ZERO.plus(c.now());
+    let anchor = clock(c);
     assert!(
         range.contains(anchor),
         "a probe opening before the cut ({cut:?}) must still be signed for now ({anchor:?}) — \

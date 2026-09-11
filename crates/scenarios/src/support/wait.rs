@@ -5,13 +5,22 @@
 //! whether the condition held within budget; a scenario asserts on that.
 
 use std::cell::Cell;
+use std::time::Duration;
 
-use hyperscale_types::{ShardId, TransactionStatus, TxHash};
+use hyperscale_types::{BlockHeight, Epoch, ShardId, TransactionStatus, TxHash};
 
 use super::query::{
-    anchor_root, anchored_genesis_height, beacon_epoch, merge_keeper_count, split_admitted,
+    anchor_root, anchored_genesis_height, beacon_epoch, epoch_duration_ms, merge_keeper_count,
+    split_admitted,
 };
-use super::{Budget, Cluster};
+use super::{Budget, Cluster, epochs};
+
+/// How long [`measure_blocks_per_epoch`] samples a shard's cadence for.
+///
+/// Block cadence is activity-driven and steady within an epoch, so a few
+/// dozen blocks read the rate; the harness advances a second at a time,
+/// so the sample is spelled in seconds rather than blocks.
+const CADENCE_SAMPLE: Duration = Duration::from_secs(10);
 
 /// Wait until the committed beacon epoch reaches `target`.
 pub fn await_beacon_epoch<C: Cluster>(c: &mut C, target: u64, budget: Budget) -> bool {
@@ -26,6 +35,56 @@ pub fn await_height<C: Cluster>(c: &mut C, shard: ShardId, target: u64, budget: 
         c.committed_height(shard)
             .is_some_and(|h| h.inner() >= target)
     })
+}
+
+/// Wait until `shard` commits `blocks` more blocks past its height now.
+///
+/// The hold behind a claim about what a chain does *not* do next. A
+/// delivery, a reclaim or a credit rides a block, so "nothing more comes
+/// back" is read over blocks: a shard commits many times a second
+/// whatever the epoch length, and an epoch of that is thousands of
+/// blocks for a question a handful decides.
+pub fn await_blocks<C: Cluster>(c: &mut C, shard: ShardId, blocks: u64, budget: Budget) -> bool {
+    let target = c
+        .committed_height(shard)
+        .map_or(0, BlockHeight::inner)
+        .saturating_add(blocks);
+    await_height(c, shard, target, budget)
+}
+
+/// Wait until the beacon commits `folds` more epochs past the one committed
+/// now.
+///
+/// The hold behind a claim about a beacon record: a record moves only at a
+/// fold, so "the record did not move" is read across folds.
+pub fn await_folds<C: Cluster>(c: &mut C, folds: u64, budget: Budget) -> bool {
+    let target = beacon_epoch(c)
+        .map_or(0, Epoch::inner)
+        .saturating_add(folds);
+    await_beacon_epoch(c, target, budget)
+}
+
+/// How many blocks `shard` commits per epoch at its current cadence,
+/// sampled over [`CADENCE_SAMPLE`] and scaled to the epoch.
+///
+/// Block cadence is activity-driven and scales with neither the epoch nor
+/// the harness, so a train spaced in blocks measures the rate rather
+/// than assuming it. Whatever activity the caller wants priced in has to
+/// be in flight before the sample starts.
+///
+/// # Panics
+///
+/// Panics if no beacon epoch is committed, since the epoch length is what
+/// the sample is scaled to.
+pub fn measure_blocks_per_epoch<C: Cluster>(c: &mut C, shard: ShardId) -> u64 {
+    let epoch_ms = epoch_duration_ms(c).expect("a committed beacon epoch");
+    let height = |c: &C| c.committed_height(shard).map_or(0, BlockHeight::inner);
+    let before = height(c);
+    let until = c.now() + CADENCE_SAMPLE;
+    let _ = c.run_until(epochs(1), |c| c.now() >= until);
+    let sampled = height(c).saturating_sub(before);
+    let sample_ms = u64::try_from(CADENCE_SAMPLE.as_millis()).expect("a short sample");
+    sampled.saturating_mul(epoch_ms) / sample_ms
 }
 
 /// Wait until any host serves `shard`.
