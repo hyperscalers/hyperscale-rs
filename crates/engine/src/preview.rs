@@ -25,14 +25,14 @@ use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
+    Baseline, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
 };
 use hyperscale_vm_types::{Outcome, PriceTable, SubstateKey};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
-    PayerFee, TargetAuthority, TickBaseline, abort_reason, materialize_declared, protocol_hash,
-    publish_work,
+    PayerFee, TargetAuthority, TickBaseline, abort_reason, batch_entry, materialize_declared,
+    protocol_hash, publish_work,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, PROTOCOL_RESOURCE};
@@ -300,17 +300,20 @@ impl Executor {
         let base = Arc::new(base);
 
         let vm_tx = tx.hash();
-        let batch = [BatchTx::new(
+        // The same entry a tick would run, so the report meters against
+        // the bounds the chain would: total locality is the one thing a
+        // preview differs in, and it differs deliberately.
+        let batch = [batch_entry(
             vm_tx,
-            prepared.declaration,
+            &prepared,
             EnvInputs {
                 clock_ms: inputs.clock.as_millis(),
                 epoch: inputs.env.windows.epoch_for(inputs.clock).inner(),
                 seeds: inputs.env.seeds.clone(),
             },
-        )
-        .with_job(prepared.job)
-        .with_nullifiers(prepared.nullifiers)];
+            OwnerSet::whole(),
+            None,
+        )];
         let walk = ManifestWalk {
             backend: &self.backend,
         };
