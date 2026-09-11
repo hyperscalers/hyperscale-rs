@@ -2212,18 +2212,22 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     let unregistered =
         build_instance_instantiate_tx(key, &artifact, UNREGISTERED_SALT, validity_around(c.now()));
     let unregistered_hash = charges.submit(c, unregistered);
+    // Judged at every step rather than sampled at the end: the call and
+    // the registration can land in one window, and a check that reads
+    // the status once cannot tell which came first.
     c.run_until(epochs(8), |c| {
-        c.tx_status(unregistered_hash).is_some_and(|s| s.is_final())
-            || c.beacon_state()
-                .is_some_and(|state| state.packages.contains_key(&registered))
+        let listed = c
+            .beacon_state()
+            .is_some_and(|state| state.packages.contains_key(&registered));
+        if !listed {
+            let held = c.tx_status(unregistered_hash);
+            assert!(
+                !held.as_ref().is_some_and(TransactionStatus::is_final),
+                "a call was decided before the beacon registered its package: {held:?}"
+            );
+        }
+        listed
     });
-    let before_registry = c.tx_status(unregistered_hash);
-    assert!(
-        !before_registry
-            .as_ref()
-            .is_some_and(TransactionStatus::is_final),
-        "a call was decided before the beacon registered its package: {before_registry:?}"
-    );
     assert!(
         c.beacon_state()
             .is_some_and(|state| state.packages.contains_key(&registered)),
@@ -2236,20 +2240,23 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // could be handed to a node whose fetch had not landed.
     let early = build_instance_instantiate_tx(key, &artifact, EARLY_SALT, validity_around(c.now()));
     let early_hash = charges.submit(c, early);
+    // Judged at every step, on the terms the registration check is.
     c.run_until(epochs(8), |c| {
-        c.tx_status(early_hash).is_some_and(|s| s.is_final())
-            || c.beacon_state().is_some_and(|state| {
-                state
-                    .packages
-                    .get(&registered)
-                    .is_some_and(|fact| fact.usable_in(state.current_epoch))
-            })
+        let matured = c.beacon_state().is_some_and(|state| {
+            state
+                .packages
+                .get(&registered)
+                .is_some_and(|fact| fact.usable_in(state.current_epoch))
+        });
+        if !matured {
+            let held = c.tx_status(early_hash);
+            assert!(
+                !held.as_ref().is_some_and(TransactionStatus::is_final),
+                "a call was decided while its package was still maturing: {held:?}"
+            );
+        }
+        matured
     });
-    let held = c.tx_status(early_hash);
-    assert!(
-        !held.as_ref().is_some_and(TransactionStatus::is_final),
-        "a call was decided while its package was still maturing: {held:?}"
-    );
 
     // Past the window. The same call settles now, and settling it means
     // the code reached the nodes that never committed the publish —

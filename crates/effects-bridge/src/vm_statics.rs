@@ -133,7 +133,7 @@ pub fn declared_vector(
     routing: &RoutedTransaction,
     legs: &[LegShape],
     envelope_bytes: u64,
-) -> (Vec<OwnerShare>, DeclaredWork) {
+) -> DeclaredVector {
     let mut by_owner: BTreeMap<Address, DeclaredWork> = BTreeMap::new();
     let mut add = |owner: Address, term: DeclaredWork| {
         let share = by_owner.entry(owner).or_default();
@@ -214,21 +214,41 @@ pub fn declared_vector(
         .into_iter()
         .map(|(owner, work)| OwnerShare { owner, work })
         .collect();
-    // A package with an event table may fill the transaction's event
-    // allowance, and the receipt that carries it is retained like the
-    // envelope.
+    // What the calls may emit between them: each package declares what
+    // one call into it may, so a manifest calling one twice may emit
+    // twice. Held to what a receipt can carry at all, which is what the
+    // kernel meters the emits against and what retention prices.
     let metadata = packages.load();
-    let events = if routing.calls.iter().any(|call| {
-        metadata
-            .get(call.package)
-            .is_some_and(|package| !package.events.is_empty())
-    }) {
-        MAX_EVENT_BYTES_PER_TX as u64
-    } else {
-        0
-    };
-    let everywhere = everywhere(&shares, envelope_bytes, vm.signatures(), events);
-    (shares, everywhere)
+    let event_bytes = routing
+        .calls
+        .iter()
+        .fold(0usize, |total, call| {
+            let declared = metadata
+                .get(call.package)
+                .map_or(0, |package| package.event_bytes as usize);
+            total.saturating_add(declared)
+        })
+        .min(MAX_EVENT_BYTES_PER_TX);
+    let everywhere = everywhere(&shares, envelope_bytes, vm.signatures(), event_bytes as u64);
+    DeclaredVector {
+        shares,
+        everywhere,
+        event_bytes,
+    }
+}
+
+/// What a transaction declares, as the derivation reads it off the tree:
+/// the vector by owner, what every shard bears, and the bound the kernel
+/// meters the transaction's events against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredVector {
+    /// What each owner prefix bears.
+    pub shares: Vec<OwnerShare>,
+    /// What every shard committing the transaction bears whatever it
+    /// holds.
+    pub everywhere: DeclaredWork,
+    /// The most bytes the receipt's events may carry between them.
+    pub event_bytes: usize,
 }
 
 /// What every shard that commits a transaction bears whatever it holds:
@@ -864,8 +884,9 @@ impl Derivation for BridgeStatics {
         vm.admit_terms(routing.calls.len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let legs = legs_of(&admitted.admitted);
-        let (shares, everywhere) =
-            declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?);
+        let DeclaredVector {
+            shares, everywhere, ..
+        } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?);
         let work = whole_work(&shares, everywhere);
         Ok(Derived {
             effective_window,
@@ -1430,9 +1451,15 @@ mod tests {
                 >= envelope_bytes + derived.work.write_bytes + vm.signatures().retention,
             "retention carries the envelope, every write and the auth material"
         );
-        // The account package has an event table, so the event
-        // allowance is retained whole.
-        assert!(derived.work.retention >= MAX_EVENT_BYTES_PER_TX as u64);
+        // Each call into an eventful package carries that package's own
+        // bound, so a transfer's three calls into the account carry
+        // three of them.
+        let per_call = u64::from(account::metadata().event_bytes);
+        assert!(per_call > 0, "the account bounds what a call may emit");
+        assert!(
+            derived.work.retention >= envelope_bytes + derived.work.write_bytes + 3 * per_call,
+            "retention carries the envelope, the writes and each call's event bound"
+        );
         // The fixture statics know the account package's metadata and
         // not its artifact, so nothing is read for it; a statics that
         // does adds the artifact once however many nodes run it.
