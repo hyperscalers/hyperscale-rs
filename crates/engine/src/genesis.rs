@@ -215,7 +215,7 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
         .collect();
     let mut set = EffectSet::new();
     for declared in &ordered {
-        set.insert(declared.effect)
+        set.insert_at_cap(declared.effect)
             .expect("a commutative credit conflicts with nothing");
     }
     let declaration = Declaration {
