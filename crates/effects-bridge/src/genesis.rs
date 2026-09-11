@@ -113,7 +113,7 @@ impl World {
     #[must_use]
     pub fn fork(&self) -> Self {
         Self {
-            cache: PackageCache::new((*self.cache.load()).clone()),
+            cache: self.cache.forked(),
             instances: self.instances.forked(),
             account_package: self.account_package,
             staking_package: self.staking_package,
@@ -158,18 +158,17 @@ pub fn genesis_world() -> World {
 /// package — a build defect, not a runtime condition.
 #[must_use]
 pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPackages) -> World {
-    let mut seed = MetadataCache::new();
+    let cache = PackageCache::new(MetadataCache::new());
     for artifact in packages.artifacts() {
-        seed.publish(
+        cache.publish(
             package_hash(&ProtocolHasher, artifact),
             admit_protocol_package(artifact).expect("a genesis artifact publishes as a package"),
-        )
-        .expect("a gate-admitted record clears the cache door");
+            artifact.len() as u64,
+        );
     }
     let account_package = package_hash(&ProtocolHasher, account_artifact());
     let staking_package = package_hash(&ProtocolHasher, staking_artifact());
 
-    let cache = PackageCache::new(seed);
     let mut instances = InstanceRegistry::new();
     // Funded accounts need nothing registered: a principal address
     // commits its own auth material, and the blueprint serving every

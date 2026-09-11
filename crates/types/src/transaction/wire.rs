@@ -15,14 +15,14 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-use hyperscale_vm_types::{LegShape, price};
+use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
-    Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
-    NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey, TimestampRange,
-    TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
+    Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey,
+    MAX_ENVELOPE_BYTES, NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey,
+    TimestampRange, TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
 };
 
 /// What a transaction is verified against: the network its envelope has
@@ -50,7 +50,7 @@ pub struct TransactionContext<'a> {
 #[derive(Hbor)]
 pub struct Transaction {
     /// HBOR-encoded [`TransactionEnvelope`] bytes — the canonical wire form.
-    #[hbor(max = MAX_TX_BYTES_LEN)]
+    #[hbor(max = MAX_ENVELOPE_BYTES)]
     serialized_bytes: Vec<u8>,
 
     /// Decoded envelope, populated by `body()` on first access from
@@ -153,43 +153,54 @@ impl Transaction {
         keys
     }
 
-    /// What including this transaction costs a block, in work units:
-    /// the fixed admit-and-track charge, the declared footprint, and the
-    /// signed gas limit.
-    ///
-    /// The packing bound sums this over the drain. Derived locally, so
-    /// it is not something a sender can understate.
+    /// What this transaction declares it may consume, whole. Derived
+    /// locally, so it is not something a sender can understate.
     ///
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::routing`].
     #[must_use]
-    pub fn work(&self) -> u64 {
-        self.derived().work
+    pub fn work(&self) -> &DeclaredWork {
+        &self.derived().work
     }
 
-    /// What the declaration claims it will touch, in footprint units.
+    /// What this transaction declares against `shard` under `trie`'s
+    /// placement: the shares of the owners the shard holds, and what
+    /// every committing shard bears. What a block on that shard reserves
+    /// against its caps.
+    ///
+    /// Placement alone decides, never the classification: a node on a
+    /// multi-shard core is counted where its target sits, so the shares
+    /// of every shard sum to the whole in compute and footprint.
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn footprint(&self) -> u64 {
-        self.derived().footprint
+    pub fn local_work(&self, trie: &ShardTrie, shard: ShardId) -> DeclaredWork {
+        let derived = self.derived();
+        derived
+            .shares
+            .iter()
+            .filter(|share| trie.shard_for_prefix(share.owner) == shard)
+            .fold(derived.everywhere, |total, share| {
+                total.saturating_add(share.work)
+            })
     }
 
-    /// What this transaction is charged, in quanta: its declared work at
-    /// the protocol's rate. One figure whatever the outcome and wherever
-    /// it runs — a participant measuring only its own legs bills the
-    /// same as one that ran the whole — and never more than the signed
-    /// ceiling, which admission holds it to.
+    /// What this transaction is charged, in quanta, under `table`: its
+    /// declared work at the table's rows, raised by its signed priority.
+    /// One figure whatever the outcome and wherever it runs — a
+    /// participant measuring only its own legs bills the same as one
+    /// that ran the whole — and never more than the signed ceiling,
+    /// which admission holds it to.
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn price(&self) -> u128 {
-        price(self.work())
+    pub fn price(&self, table: &PriceTable) -> u128 {
+        table.price(self.work(), self.body().priority_bp)
     }
 
     /// [`Self::price`] for an envelope that may not have been derived
@@ -199,8 +210,13 @@ impl Transaction {
     /// # Errors
     ///
     /// [`DerivationError`], where the envelope derives to nothing.
-    pub fn price_under(&self, derivation: &dyn Derivation) -> Result<u128, DerivationError> {
-        Ok(price(self.try_derived(derivation)?.work))
+    pub fn price_under(
+        &self,
+        derivation: &dyn Derivation,
+        table: &PriceTable,
+    ) -> Result<u128, DerivationError> {
+        let work = self.try_derived(derivation)?.work;
+        Ok(table.price(&work, self.body().priority_bp))
     }
 
     /// Each manifest node's placement-free shape, in node order.
@@ -642,7 +658,7 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // A publish is priced by its artifact and capped at the ceiling;
         // only a call declares a price the ceiling has to cover.
         if vm.artifact().is_none() {
-            let price = price(derived.work);
+            let price = PriceTable::GENESIS.price(&derived.work, vm.priority_bp);
             if price > vm.max_fee {
                 return Err(TransactionVerifyError::CeilingBelowPrice {
                     max_fee: vm.max_fee,
@@ -704,7 +720,7 @@ mod tests {
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
         Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey, SubintentSig, TransactionBody, declared_work,
+        Secp256k1PrivateKey, SubintentSig, TransactionBody,
     };
 
     struct StubStatics;
@@ -753,8 +769,9 @@ mod tests {
                     ],
                 },
                 subintent_hashes,
-                work: declared_work(0, 0, 0),
-                footprint: 0,
+                work: DeclaredWork::ZERO,
+                shares: Vec::new(),
+                everywhere: DeclaredWork::ZERO,
                 legs: Vec::new(),
                 nullifiers: Vec::new(),
                 packages: Vec::new(),
@@ -1095,16 +1112,16 @@ mod tests {
     #[test]
     fn decode_rejects_oversized_tx_bytes() {
         // Hand-roll a payload whose `serialized_bytes` length prefix
-        // exceeds MAX_TX_BYTES_LEN. The bound check must fire before
+        // exceeds MAX_ENVELOPE_BYTES. The bound check must fire before
         // allocating the full Vec.
         let mut buf = Vec::new();
-        varint::write(&mut buf, MAX_TX_BYTES_LEN + 1).unwrap();
-        buf.extend(std::iter::repeat_n(0u8, MAX_TX_BYTES_LEN + 1));
+        varint::write(&mut buf, MAX_ENVELOPE_BYTES + 1).unwrap();
+        buf.extend(std::iter::repeat_n(0u8, MAX_ENVELOPE_BYTES + 1));
         let err = hbor_from_slice::<Transaction>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::BoundExceeded { max, actual }
-                if max == MAX_TX_BYTES_LEN && actual == MAX_TX_BYTES_LEN + 1
+                if max == MAX_ENVELOPE_BYTES && actual == MAX_ENVELOPE_BYTES + 1
         ));
     }
 

@@ -5,4 +5,4 @@
 //! single transaction can claim — independent of how many transactions
 //! a block carries (which is governed by [`crate::shard::limits`]).
 
-pub use hyperscale_vm_types::MAX_TX_BYTES_LEN;
+pub use hyperscale_vm_types::{MAX_ARTIFACT_BYTES, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES};

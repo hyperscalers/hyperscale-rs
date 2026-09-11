@@ -251,7 +251,7 @@ mod tests {
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]),
-                work_in_flight: header.work_in_flight(),
+                txs_in_flight: header.txs_in_flight(),
                 ..Default::default()
             });
         }

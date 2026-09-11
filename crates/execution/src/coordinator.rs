@@ -58,11 +58,11 @@ use hyperscale_types::{
     CommittedAt, ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MerkleInclusionProof, Mode, ProvenAnchors, ProvenCells, Provisions, SettledSetVerdict,
-    SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    MerkleInclusionProof, Mode, PriceTable, ProvenAnchors, ProvenCells, Provisions,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt, SubstateKey,
+    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Window, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -951,7 +951,7 @@ impl ExecutionCoordinator {
         for entry in self.abandonable(tick_id) {
             let UnsettledTx {
                 tx_hash,
-                declared_work,
+                charged,
                 charge,
                 ..
             } = entry;
@@ -967,7 +967,7 @@ impl ExecutionCoordinator {
             state.admit(
                 tx_hash,
                 Membership::whole(participating).settling(),
-                declared_work,
+                Some(charged),
                 Admission::Aborted,
             );
             // An abandonment reaches no engine, so the charge its verdict
@@ -1224,7 +1224,7 @@ impl ExecutionCoordinator {
                 Membership::whole(BTreeSet::from([local_shard])).settling()
             }
         };
-        state.admit(tx_hash, membership, 0, Admission::Executes);
+        state.admit(tx_hash, membership, None, Admission::Executes);
         self.ticks.assign_tx(tx_hash, tick_id);
         requests.push(CrossShardExecutionRequest {
             tx_hash,
@@ -1270,8 +1270,8 @@ impl ExecutionCoordinator {
             member.request.tx_hash,
             member.membership,
             match &shape {
-                Some((_, body)) if !second_member => body.work(),
-                _ => 0,
+                Some((_, body)) if !second_member => Some(body.price(&PriceTable::GENESIS)),
+                _ => None,
             },
             member.admission,
         );
@@ -4049,7 +4049,7 @@ mod tests {
             state.admit(
                 tx.hash(),
                 Membership::whole(participating),
-                tx.work(),
+                Some(tx.price(&PriceTable::GENESIS)),
                 Admission::Executes,
             );
         }
@@ -6871,7 +6871,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let reserved = tx.work();
+        let reserved = tx.price(&PriceTable::GENESIS);
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         state.on_block_committed(
@@ -6907,9 +6907,9 @@ mod tests {
         assert_eq!(outcomes[0].tx_hash(), tx_hash);
         assert!(outcomes[0].is_aborted(), "abandonment is an abort");
         assert_eq!(
-            outcomes[0].declared_work(),
+            outcomes[0].charged(),
             reserved,
-            "releasing exactly what the committing block reserved",
+            "attesting exactly what the committing block priced",
         );
     }
 
@@ -6931,7 +6931,7 @@ mod tests {
             state.counterpart_trie(&schedule),
             tx.hash(),
             tx.fee_vault(),
-            tx.price(),
+            tx.price(&PriceTable::GENESIS),
         );
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -7562,7 +7562,11 @@ mod tests {
             .record_abandonment_records(&[AbandonmentRecord::new(
                 PEER,
                 WeightedTimestamp::from_millis(1_000),
-                [UnsettledTx::for_transaction(&transaction, test_committed())],
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    &PriceTable::GENESIS,
+                )],
             )]);
 
         let block = make_live_block_on_shard(
@@ -7866,7 +7870,8 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let claim = delivered_claim(&delivery_classified());
@@ -7932,9 +7937,10 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction, test_committed())
-            .deadline
-            .at();
+        let deadline =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS)
+                .deadline
+                .at();
         let later = deadline
             .plus(MAX_VALIDITY_RANGE)
             .plus(Duration::from_secs(1));
@@ -8032,7 +8038,8 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         // The delivery's target falls under the deliverer's left child,
@@ -8114,7 +8121,8 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let key = committed_tx_cell_key(
             CORE,
@@ -8236,9 +8244,10 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction, test_committed())
-            .deadline
-            .at();
+        let deadline =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS)
+                .deadline
+                .at();
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
         let mut state = leg_state(&transaction, &two_shard_core_classified());
@@ -8333,7 +8342,8 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let cell = |shard| {
             committed_tx_cell_key(
@@ -8409,7 +8419,8 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
@@ -8507,9 +8518,10 @@ mod tests {
             "the claim the fixture asks about is the one the shape derives",
         );
         state.counterparts.ledger.certify(transaction.hash());
-        state.committed_ts = UnsettledTx::for_transaction(transaction, test_committed())
-            .deadline
-            .at();
+        state.committed_ts =
+            UnsettledTx::for_transaction(transaction, test_committed(), &PriceTable::GENESIS)
+                .deadline
+                .at();
         state
     }
 
@@ -8523,7 +8535,8 @@ mod tests {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let deadline = figures.deadline.at();
         let cell = committed_tx_cell_key(
             PEER,
@@ -8589,9 +8602,10 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction, test_committed())
-            .deadline
-            .at();
+        let deadline =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS)
+                .deadline
+                .at();
         let core_key = committed_tx_cell_key(
             CORE,
             tx_hash,
@@ -8766,7 +8780,8 @@ mod tests {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let figures = UnsettledTx::for_transaction(&transaction, test_committed());
+        let figures =
+            UnsettledTx::for_transaction(&transaction, test_committed(), &PriceTable::GENESIS);
         let claim = core_claim(&leg_classified());
         let state = claimed_leg_state(&transaction, claim);
         (transaction, figures, claim, state)
@@ -9401,7 +9416,7 @@ mod tests {
                 vec![UnsettledTx {
                     tx_hash,
                     deadline: Deadline::of(WeightedTimestamp::from_millis(30_000)),
-                    declared_work: 1,
+                    charged: 1,
                     charge: AbortCharge {
                         vault: SubstateKey {
                             owner: Address::new([9; 31], AddressClass::Component),

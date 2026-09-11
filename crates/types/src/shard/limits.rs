@@ -9,9 +9,12 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
-use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
+use hyperscale_vm_types::{
+    DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT,
+    MAX_SUBINTENTS, VERIFY_WEIGHT,
+};
 
-use crate::{Address, LocalKey, RoutePrefix, WorkInFlight};
+use crate::{Address, LocalKey, RoutePrefix, TxsInFlight};
 
 /// The largest message any transport carries, compressed.
 ///
@@ -25,6 +28,21 @@ use crate::{Address, LocalKey, RoutePrefix, WorkInFlight};
 /// to fit inside it are stated here, and a bound nothing can be checked
 /// against is not a bound.
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The bytes one transaction fetch response, or one outbound gossip
+/// batch, carries between its transactions.
+///
+/// A response answers by hash, so the requester cannot know what it
+/// asked for weighs; the responder stops filling at this budget and the
+/// rest is asked for again. Sized so a batch ending on a maximal
+/// envelope still encodes under the frame that carries it, which would
+/// otherwise drop the whole message.
+pub const MAX_FETCH_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_FETCH_RESPONSE_BYTES + MAX_ENVELOPE_BYTES < MAX_WIRE_MESSAGE_BYTES,
+    "a response filled to its budget plus the envelope that overran it fits the frame"
+);
 
 /// Hard cap on the number of live transactions any single block can carry.
 ///
@@ -98,10 +116,10 @@ pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the cells one block's sweep may remove.
 ///
-/// A count and not a work term: removals earn no fee because they are
+/// A count and not a priced term: removals earn no fee because they are
 /// not optional, and nothing is in flight for them — they resolve inside
 /// the block that states them, so they never enter
-/// [`MAX_DRAIN_WORK`]. That is the same trade the frontier's mandatory
+/// [`MAX_UNSETTLED_TXS`]. That is the same trade the frontier's mandatory
 /// advance makes, and it is why a proposer cannot decline to sweep in
 /// order to keep block space for what does pay.
 ///
@@ -143,8 +161,8 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 ///
 /// A record answers for the transactions this chain still owes an outcome
 /// for that a counterpart can never settle, and how many that can be is
-/// what [`MAX_DRAIN_WORK`] already bounds — a transaction is only owed
-/// while its reservation stands. So the ceiling is the drain's own count
+/// what [`MAX_UNSETTLED_TXS`] already bounds — a transaction is only owed
+/// while its place in the drain stands. So the ceiling is the drain's own
 /// bound rather than a figure of its own, and a counterpart with more
 /// outstanding than one block will carry is answered over several, each
 /// record standing alone.
@@ -155,20 +173,20 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 /// counterpart can hold the whole of it — but that cap alone would let a
 /// block carry the budget once per record, which is why the sum is
 /// checked as well.
-pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
+pub const MAX_UNSETTLED_PER_BLOCK: usize = 3 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the owner prefixes one transaction's routing names.
 ///
 /// A wire bound on the reach a record restates, and the only structural
 /// one there is: a prefix enters a transaction's routing through a
 /// declared key, and a declared key costs its owner and its local half
-/// inside the envelope, so the envelope's own cap divides. Every real
+/// inside the call body, so the body's own cap divides. Every real
 /// transaction sits orders below it — a transfer names two, a route
 /// half a dozen — and what the bound is for is that a decoder allocates
 /// against an envelope a sender actually paid for rather than against a
 /// length it claims.
 pub const MAX_PREFIXES_PER_TX: usize =
-    MAX_TX_BYTES_LEN / (size_of::<Address>() + size_of::<LocalKey>());
+    MAX_CALL_BYTES / (size_of::<Address>() + size_of::<LocalKey>());
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.
@@ -261,7 +279,7 @@ pub const fn evidence_admits_block(weight: usize) -> bool {
 pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
-pub const UNSETTLED_TX_BYTES: usize = 144;
+pub const UNSETTLED_TX_BYTES: usize = 160;
 
 /// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
 /// costs.
@@ -301,27 +319,16 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
 /// would lose the round and lose it again on every block of that shape.
 const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
-/// How far the drain's transaction *count* may run past the depth its
-/// work budget is sized for, when every transaction is as cheap as one
-/// can be.
+/// How many transactions a shard's chain may hold committed and
+/// unsettled at once: a full pipeline of blocks — commit, execute,
+/// certify — each at the wire cap.
 ///
-/// One scalar has to bound two things: how much work the drain owes, and
-/// how many transactions owe it. Those stay within a factor of each other
-/// only while the engine's fixed per-transaction charge is comparable to
-/// [`MAX_GAS_LIMIT`] — otherwise a flood of zero-gas transactions fits
-/// the same budget as a handful of heavy ones and the count runs free.
-/// Two is chosen rather than derived; what the assert below does is hold
-/// the gas ceiling to it.
-const DRAIN_COUNT_SLACK: u64 = 2;
-
-/// How much unsettled work this shard's chain may owe at once.
-///
-/// The packing bound: a proposer adds transactions only while the
-/// drain's summed work stays under this, so a shard that is not settling
-/// admits less until it does. Replaces the transaction *count* as the
-/// packing rule — counting priced a publish and a transfer the same, and
-/// bounded the drain by how many transactions it held rather than by
-/// what they would cost to execute and settle.
+/// The packing bound: a proposer adds transactions only while the count
+/// the parent header carries stays under this, so a shard that is not
+/// settling admits less until it does. A count and not a weight, because
+/// every block is already capped per dimension on its own content, so
+/// what a full pipeline can owe in any dimension is at most three block
+/// caps by construction — and no arithmetic a price change could move.
 ///
 /// A block carrying transactions is valid only if the total it leaves is
 /// under this, so a chain of valid blocks never owes more than the
@@ -332,67 +339,120 @@ const DRAIN_COUNT_SLACK: u64 = 2;
 ///
 /// The total advances on commit and retreats when a certificate resolves
 /// the transaction, whichever verdict it carries. One still unresolved at
-/// its own deadline is certified aborted at the reservation its block
-/// took — unless a certificate of the shard's own already covers it, in
-/// which case a counterpart could have settled against that certificate,
-/// and only that counterpart's departure makes the abort admissible. A
-/// straddler waiting on a counterpart that never leaves holds its
-/// reservation for as long as it waits.
-///
-/// Sized like the count it replaces: a full pipeline of blocks
-/// (commit → execute → certify) at a representative gas limit, so a
-/// shard settling normally never feels it. Every number here is a
-/// placeholder, and they calibrate together against measured throughput
-/// rather than one at a time.
-pub const MAX_DRAIN_WORK: u64 = 3 * MAX_TXS_PER_BLOCK as u64 * (TX_UNITS + MAX_GAS_LIMIT);
-
-/// The count bound the engine's fixed charge exists to provide, asserted
-/// rather than assumed: the cheapest a transaction can be is that charge
-/// alone, so this is how many the drain could ever hold at once.
-///
-/// It is [`MAX_GAS_LIMIT`] that has to give if this fails. The charge is
-/// the engine's, set against its own schedule, and the ceiling is the
-/// one quantity here free to be chosen — so raising the ceiling past the
-/// charge is what unbounds the count, and this is where that is caught.
-const _: () = assert!(
-    MAX_DRAIN_WORK / TX_UNITS <= DRAIN_COUNT_SLACK * 3 * MAX_TXS_PER_BLOCK as u64,
-    "the work budget must bound the drain's transaction count, not only its weight",
-);
+/// its own deadline is certified aborted at the price its block took —
+/// unless a certificate of the shard's own already covers it, in which
+/// case a counterpart could have settled against that certificate, and
+/// only that counterpart's departure makes the abort admissible. A
+/// straddler waiting on a counterpart that never leaves holds its place
+/// for as long as it waits.
+pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 
 /// Whether a block carrying `tx_count` transactions, and leaving the
-/// drain owing `work_in_flight`, is one a validator may vote for.
+/// drain holding `in_flight`, is one a validator may vote for.
 ///
-/// `work_in_flight` is what the block leaves owing, not what it
-/// inherited, so the bound is on the level a block produces: one that
-/// would carry the drain past the budget is refused, and a chain whose
-/// blocks all pass this never exceeds it.
+/// `in_flight` is what the block leaves owing, not what it inherited, so
+/// the bound is on the level a block produces: one that would carry the
+/// drain past the budget is refused, and a chain whose blocks all pass
+/// this never exceeds it.
 ///
 /// A block that adds nothing is exempt from the level entirely. Those are
 /// the blocks that carry the certificates the drain retreats on, so
 /// refusing them would be refusing the only way back under.
 #[must_use]
-pub const fn drain_admits_block(work_in_flight: WorkInFlight, tx_count: usize) -> bool {
-    tx_count == 0 || work_in_flight.inner() <= MAX_DRAIN_WORK
+pub const fn drain_admits_block(in_flight: TxsInFlight, tx_count: usize) -> bool {
+    tx_count == 0 || in_flight.inner() <= MAX_UNSETTLED_TXS
 }
 
-/// The largest compute a transaction may sign for, summed over its
-/// per-node ceilings.
+/// The fuel one block's transactions may declare between them: an
+/// execution window of 125 ms on four cores at 2 G fuel/s.
+pub const MAX_BLOCK_COMPUTE: u64 = 1_000_000_000;
+
+/// The bytes one block's transactions may declare read off the store
+/// between them: the window's share of a warm solid-state store under range reads,
+/// taken at a third of nominal.
+pub const MAX_BLOCK_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The bytes one block's transactions may declare written between them:
+/// the window's share of leaf and tree writes, at the same discount.
+pub const MAX_BLOCK_WRITE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The footprint one block's transactions may declare between them.
 ///
-/// The figure is the sender's to choose, and it enters the drain
-/// budget at face value — so without a bound one envelope could reserve
-/// the whole of it and stall the shard for the price of a single
-/// signature. The engine's per-invocation fuel backstop is a different
-/// thing: it stops a runaway guest, not a runaway declaration.
+/// Footprint prices exclusion, which no physical rate bounds, so this
+/// is sized against the corpus rather than derived: a transfer declares
+/// a few dozen units and a book sweep some hundreds, and a full block of
+/// either fits.
+pub const MAX_BLOCK_FOOTPRINT: u64 = 256 * MAX_TXS_PER_BLOCK as u64;
+
+/// The bytes one block's transactions may ask every validator to retain
+/// between them: a validator's unique link share after gossip fanout,
+/// over the blocks a second holds.
+pub const MAX_BLOCK_RETENTION_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Every block cap as one vector, judged the way the sweep cap is: on
+/// the block's own content, over each transaction's local share, so a
+/// validator reaches the verdict with no history behind it.
+pub const BLOCK_CAPS: DeclaredWork = DeclaredWork {
+    compute: MAX_BLOCK_COMPUTE,
+    read_bytes: MAX_BLOCK_READ_BYTES,
+    write_bytes: MAX_BLOCK_WRITE_BYTES,
+    footprint: MAX_BLOCK_FOOTPRINT,
+    retention: MAX_BLOCK_RETENTION_BYTES,
+};
+
+/// Whether a block whose transactions declare `work` between them, over
+/// their shares on the judging shard, is one a validator may vote for.
 ///
-/// Bounded above by the engine's fixed per-transaction charge and
-/// [`DRAIN_COUNT_SLACK`], which the assert above enforces: a ceiling far
-/// past that charge lets a handful of heavy envelopes fill the budget a
-/// flood of trivial ones also fills, and the drain stops bounding the
-/// count.
+/// The one reading of the caps, so the proposer that fills a block and
+/// the admission that checks it stop at the same place.
+#[must_use]
+pub const fn budget_admits_block(work: &DeclaredWork) -> bool {
+    work.fits(&BLOCK_CAPS)
+}
+
+/// The bytes one transaction may declare read off the store: a
+/// sixteenth of the block, so one envelope cannot own it.
+pub const MAX_TX_READ_BYTES: u64 = MAX_BLOCK_READ_BYTES / 16;
+
+/// The bytes one transaction may declare written: an eighth of the
+/// block, on [`MAX_TX_READ_BYTES`]'s terms.
+pub const MAX_TX_WRITE_BYTES: u64 = MAX_BLOCK_WRITE_BYTES / 8;
+
+/// The footprint one transaction may declare: a sixteenth of the block,
+/// on [`MAX_TX_READ_BYTES`]'s terms.
+pub const MAX_TX_FOOTPRINT: u64 = MAX_BLOCK_FOOTPRINT / 16;
+
+/// The most one transaction may declare in any dimension.
 ///
-/// Placeholder like the rest of the work model, and set against what
-/// the heaviest legitimate transaction actually needs.
-pub const MAX_GAS_LIMIT: u64 = 1_000_000;
+/// Compute is held at derivation to [`MAX_GAS_LIMIT`] over the nodes,
+/// with the verification of every signature the envelope may bind on
+/// top; retention is bounded by the envelope's own caps, the write
+/// ceiling and the event term. Both are stated here so the one check
+/// covers the vector.
+pub const TX_CAPS: DeclaredWork = DeclaredWork {
+    compute: MAX_GAS_LIMIT + MAX_TX_SIGNATURE_COMPUTE,
+    read_bytes: MAX_TX_READ_BYTES,
+    write_bytes: MAX_TX_WRITE_BYTES,
+    footprint: MAX_TX_FOOTPRINT,
+    retention: MAX_ENVELOPE_BYTES as u64 + MAX_TX_WRITE_BYTES + MAX_EVENT_BYTES_PER_TX as u64,
+};
+
+/// The most verifying one envelope's signatures can cost: the composer
+/// and every subintent at the slowest registered scheme.
+const MAX_TX_SIGNATURE_COMPUTE: u64 = (MAX_SUBINTENTS as u64 + 1) * 3 * VERIFY_WEIGHT;
+
+/// Whether a transaction declaring `work` is one a block may carry at
+/// all, whatever else it carries.
+#[must_use]
+pub const fn caps_admit_transaction(work: &DeclaredWork) -> bool {
+    work.fits(&TX_CAPS)
+}
+
+/// A full block of transactions each at its own ceiling would not fit
+/// the block in every dimension — that is what the per-block caps are
+/// for — but one transaction at its ceiling always fits an empty block,
+/// or the ceiling would be a figure nothing could ever carry.
+const _: () = assert!(TX_CAPS.fits(&BLOCK_CAPS));
 
 /// Hard cap on `header.round() - header.parent_qc().round()` — how many
 /// skipped consensus rounds a single block may span.
@@ -421,9 +481,11 @@ pub const MAX_ROUND_GAP: u64 = 100_000;
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_vm_types::DeclaredWork;
+
     use super::{
-        MAX_DRAIN_WORK, MAX_SWEEPABLE_CREATED_PER_BLOCK, WorkInFlight, drain_admits_block,
-        sweep_admits_block,
+        BLOCK_CAPS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_TXS, TX_CAPS, TxsInFlight,
+        budget_admits_block, caps_admit_transaction, drain_admits_block, sweep_admits_block,
     };
 
     /// The bound bites on the level a block leaves: one carrying
@@ -431,9 +493,48 @@ mod tests {
     /// budget, and admitted right up to it.
     #[test]
     fn a_block_is_refused_for_the_total_it_leaves() {
-        let over = WorkInFlight::new(MAX_DRAIN_WORK + 1);
+        let over = TxsInFlight::new(MAX_UNSETTLED_TXS + 1);
         assert!(!drain_admits_block(over, 1));
-        assert!(drain_admits_block(WorkInFlight::new(MAX_DRAIN_WORK), 1));
+        assert!(drain_admits_block(TxsInFlight::new(MAX_UNSETTLED_TXS), 1));
+    }
+
+    /// Each cap bites in its own dimension: a block at every cap is
+    /// admitted, one byte over any one of them is refused, and a
+    /// transaction at its own ceilings fits an empty block.
+    #[test]
+    fn every_dimension_is_capped_on_its_own() {
+        assert!(budget_admits_block(&BLOCK_CAPS));
+        assert!(budget_admits_block(&DeclaredWork::ZERO));
+        let over = [
+            DeclaredWork {
+                compute: BLOCK_CAPS.compute + 1,
+                ..DeclaredWork::ZERO
+            },
+            DeclaredWork {
+                read_bytes: BLOCK_CAPS.read_bytes + 1,
+                ..DeclaredWork::ZERO
+            },
+            DeclaredWork {
+                write_bytes: BLOCK_CAPS.write_bytes + 1,
+                ..DeclaredWork::ZERO
+            },
+            DeclaredWork {
+                footprint: BLOCK_CAPS.footprint + 1,
+                ..DeclaredWork::ZERO
+            },
+            DeclaredWork {
+                retention: BLOCK_CAPS.retention + 1,
+                ..DeclaredWork::ZERO
+            },
+        ];
+        for work in over {
+            assert!(!budget_admits_block(&work), "{work:?}");
+        }
+        assert!(caps_admit_transaction(&TX_CAPS));
+        assert!(!caps_admit_transaction(&DeclaredWork {
+            read_bytes: TX_CAPS.read_bytes + 1,
+            ..DeclaredWork::ZERO
+        }));
     }
 
     /// And it never bites on a block that adds nothing. Those carry the
@@ -441,7 +542,7 @@ mod tests {
     /// chain that touched the ceiling unable to come back under it.
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {
-        assert!(drain_admits_block(WorkInFlight::new(u64::MAX), 0));
+        assert!(drain_admits_block(TxsInFlight::new(u64::MAX), 0));
     }
 
     /// The creation cap bites at the cell. That it is outrun by the

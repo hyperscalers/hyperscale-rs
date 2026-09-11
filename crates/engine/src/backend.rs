@@ -17,17 +17,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use arc_swap::ArcSwap;
 use hyperscale_vm_effects::PackageHash;
 
-/// The ceiling on what one invocation may consume, whatever its
-/// transaction declared.
-///
-/// Consensus content: exhaustion is a deterministic trap, so the two
-/// engines have to meter against one number. It lives outside both
-/// backend modules because they are target-gated and never compile
-/// together — a per-module constant could drift between targets with
-/// nothing to catch it, and the divergence would only surface as two
-/// nodes disagreeing on whether a runaway guest trapped.
-const FUEL: u64 = 10_000_000;
-
 /// The build verdict for guest code by content address, growable while
 /// invocations run.
 ///
@@ -148,7 +137,7 @@ mod native {
     use hyperscale_vm_types::AbortReason;
     use wasmtime::{Engine, InstancePre, Linker, Module, Store};
 
-    use super::{FUEL, PackageSlots};
+    use super::PackageSlots;
     use crate::genesis::GenesisPackages;
 
     /// One package's runnable form: the instrumented module the meter
@@ -323,7 +312,7 @@ mod native {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
             // What the transaction has left, under the per-invocation
             // ceiling: a manifest's nodes draw from one signed budget.
-            let budget = call.fuel_budget.min(FUEL);
+            let budget = call.fuel_budget;
             let mut store = Store::new(&self.engine, Invoking::new(session));
             let Some(package) = self.slots.resolve(call.package) else {
                 // This node's own cache, not the transaction: nothing
@@ -391,7 +380,7 @@ mod reference {
     use hyperscale_vm_runtime::admit;
     use hyperscale_vm_types::AbortReason;
 
-    use super::{FUEL, PackageSlots};
+    use super::PackageSlots;
     use crate::genesis::GenesisPackages;
 
     /// The decoded guests under the reference interpreter.
@@ -487,7 +476,7 @@ mod reference {
             // judged against the prepaid instantiation first: a budget
             // under it is the sender's own deterministic refusal; any other
             // instantiation failure is this machine's.
-            let budget = call.fuel_budget.min(FUEL);
+            let budget = call.fuel_budget;
             let mut instance = match RefModuleInstance::instantiate(&module, session, budget) {
                 Ok(instance) => instance,
                 Err((host, InstantiateError::OutOfGas)) => {

@@ -25,14 +25,14 @@ use hyperscale_types::{
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Deadline,
     DeferOn, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot, NetworkDefinition,
-    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
+    PreparedCommit, PriceTable, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
     ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, Window, WitnessSources, WorkInFlight, absorb_committed_cells,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, Window, WitnessSources, absorb_committed_cells,
     commit_witness_window, derive_leaves, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
     signed_bytes, vrf_output_from_proof, work_over_certificates,
@@ -216,7 +216,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     abandonment_records: Vec<AbandonmentRecord>,
     state_claims: Vec<StateClaim>,
-    parent_in_flight: WorkInFlight,
+    parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
     parent_load: Option<ShardLoad>,
@@ -346,18 +346,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     )
     .into_inner();
 
-    // The drain is deterministic from the block's own content: what its
-    // transactions reserve, less what its certificates return. Both terms
-    // read off this block, so a validator reaches the same total without
-    // any history behind it.
-    let work_in_flight = parent_in_flight
-        .saturating_add(
-            transactions
-                .iter()
-                .fold(0u64, |total, tx| total.saturating_add(tx.work())),
-        )
+    // The drain is deterministic from the block's own content: the
+    // places its transactions take, less those its certificates give
+    // back. Both terms read off this block, so a validator reaches the
+    // same total without any history behind it.
+    let txs_in_flight = parent_in_flight
+        .saturating_add(transactions.len() as u64)
         .saturating_sub(certificates.iter().fold(0u64, |total, fw| {
-            total.saturating_add(fw.as_unverified().declared_work())
+            total.saturating_add(fw.as_unverified().released())
         }));
 
     // Settlement order, folded the same way and read off the same list.
@@ -403,7 +399,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provision_tx_roots,
         abandonment_root,
         state_claims_root,
-        work_in_flight,
+        txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,
         beacon_witness_root,
@@ -787,7 +783,8 @@ where
             let verdict = Resolutions::of(entries, |entry| {
                 let tx = held.get(&entry.tx_hash)?;
                 let restated = committed_at(entry)?
-                    && UnsettledTx::for_transaction(tx, entry.committed) == *entry;
+                    && UnsettledTx::for_transaction(tx, entry.committed, &PriceTable::GENESIS)
+                        == *entry;
                 Some(restated)
             })
             .and_deliveries(deliveries, |tx_hash| {

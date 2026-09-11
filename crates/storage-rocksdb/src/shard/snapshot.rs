@@ -6,15 +6,13 @@
 //! value is the value at V. If no such entry exists, `StateCf[K]` was
 //! stable since V and is the answer.
 
-use std::collections::BTreeMap;
-
 use hyperscale_storage::{Anchored, Substates};
 use hyperscale_types::{BlockHeight, SubstateKey};
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::{DB, ReadOptions, Snapshot};
 
 use super::column_families::{CfHandles, EntriesCf, EntriesHistoryCf, StateCf, StateHistoryCf};
-use super::entry_key::{VersionedEntryKeyCodec, entry_range_bounds, scan_entries};
+use super::entry_key::{EntryKeyCodec, VersionedEntryKeyCodec, entry_range_bounds, scan_entries};
 use crate::typed_cf::{DbCodec, HborCodec, TypedCf, get};
 
 /// Length of the version suffix on each state-history key (`u64` big-endian).
@@ -112,55 +110,75 @@ impl Substates for RocksDbSnapshot<'_> {
         let entries_cf = EntriesCf::handle(&cf);
         let at_tip = self.version >= self.current_version;
 
-        // The interval's current rows, ascending by order key. At the
-        // tip they are the answer, so the walk stops at the limit;
-        // historically they are the base the history overlay corrects.
-        let rows = scan_entries(
-            self.db.raw_iterator_cf_opt(entries_cf, self.read_opts()),
-            owner,
-            collection,
-            lo,
-            hi,
-            at_tip.then_some(limit),
-        );
+        // At the tip the interval's current rows are the answer, so the
+        // walk stops at the limit.
         if at_tip {
-            return rows;
+            return scan_entries(
+                self.db.raw_iterator_cf_opt(entries_cf, self.read_opts()),
+                owner,
+                collection,
+                lo,
+                hi,
+                Some(limit),
+            );
         }
-        let mut current: BTreeMap<u128, Vec<u8>> = rows.into_iter().collect();
-        let (start, end) = entry_range_bounds(owner, collection, lo, hi);
 
-        // Historical overlay: for each order with history rows after V,
+        // Historically the current rows are the base the history
+        // overlay corrects: for each order with history rows after V,
         // the value at V is the prior of the smallest such row — the
-        // per-key rule `cell` applies, per order over the interval.
+        // per-key rule `cell` applies, per order over the interval. The
+        // two iterators walk in lockstep by order, so the walk stops at
+        // `limit` visible entries and touches no row past the last one
+        // returned, whatever the interval holds beyond it.
+        let (start, end) = entry_range_bounds(owner, collection, lo, hi);
         let history_cf = EntriesHistoryCf::handle(&cf);
-        let mut overridden: BTreeMap<u128, Option<Vec<u8>>> = BTreeMap::new();
         let value_codec: HborCodec<Option<Vec<u8>>> = HborCodec::default();
-        let mut iter = self.db.raw_iterator_cf_opt(history_cf, self.read_opts());
-        iter.seek(&start);
-        while iter.valid() {
-            let Some(raw_key) = iter.key() else { break };
-            if raw_key >= end.as_slice() {
-                break;
-            }
-            let (key, version) = VersionedEntryKeyCodec.decode(raw_key);
-            if version > self.version && !overridden.contains_key(&key.order) {
-                overridden.insert(
-                    key.order,
-                    value_codec.decode(iter.value().unwrap_or_default()),
-                );
-            }
-            iter.next();
-        }
-        for (order, prior) in overridden {
-            match prior {
-                Some(value) => {
-                    current.insert(order, value);
+        let mut current = self.db.raw_iterator_cf_opt(entries_cf, self.read_opts());
+        let mut history = self.db.raw_iterator_cf_opt(history_cf, self.read_opts());
+        current.seek(&start);
+        history.seek(&start);
+        let mut visible = Vec::with_capacity(limit);
+        while visible.len() < limit {
+            let head = bounded(current.key(), &end).map(|raw| EntryKeyCodec.decode(raw).order);
+            let rewritten =
+                bounded(history.key(), &end).map(|raw| VersionedEntryKeyCodec.decode(raw).0.order);
+            let order = match (head, rewritten) {
+                (Some(head), Some(rewritten)) => head.min(rewritten),
+                (Some(head), None) => head,
+                (None, Some(rewritten)) => rewritten,
+                (None, None) => break,
+            };
+            // Every history row of this order: rows at or before V are
+            // writes the current row already reflects; the first past V
+            // holds the value at V.
+            let mut prior: Option<Option<Vec<u8>>> = None;
+            while let Some(raw) = bounded(history.key(), &end) {
+                let (key, version) = VersionedEntryKeyCodec.decode(raw);
+                if key.order != order {
+                    break;
                 }
-                None => {
-                    current.remove(&order);
+                if version > self.version && prior.is_none() {
+                    prior = Some(value_codec.decode(history.value().unwrap_or_default()));
                 }
+                history.next();
+            }
+            let now = if head == Some(order) {
+                let value = current.value().unwrap_or_default().to_vec();
+                current.next();
+                Some(value)
+            } else {
+                None
+            };
+            if let Some(value) = prior.unwrap_or(now) {
+                visible.push((order, value));
             }
         }
-        current.into_iter().take(limit).collect()
+        visible
     }
+}
+
+/// `raw` where it is a key inside the interval ending at `end`, or
+/// nothing where the iterator has run out or past it.
+fn bounded<'a>(raw: Option<&'a [u8]>, end: &[u8]) -> Option<&'a [u8]> {
+    raw.filter(|raw| *raw < end)
 }

@@ -42,10 +42,10 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, ForkFence, LocalTimestamp,
-    MAX_DRAIN_WORK, MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified,
-    WeightedTimestamp, Window,
+    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
+    LocalTimestamp, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId, ShardTrie,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution,
+    Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -320,16 +320,15 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // The signed compute enters the drain budget at face value, so a
-        // figure nobody could legitimately need is refused here rather
-        // than allowed to reserve the shard's whole allowance for one
-        // signature.
-        let compute = tx.body().gas_limit_total();
-        if compute > MAX_GAS_LIMIT {
+        // The declared vector enters the block's caps at face value, so
+        // a transaction past its own ceiling in any dimension is refused
+        // here rather than allowed to own a block's whole allowance for
+        // one signature.
+        if !caps_admit_transaction(tx.work()) {
             tracing::debug!(
                 tx_hash = ?hash,
-                compute,
-                "Rejecting transaction declaring more gas than the protocol admits"
+                work = ?tx.work(),
+                "Rejecting transaction declaring more than the protocol admits of one"
             );
             return None;
         }
@@ -987,7 +986,8 @@ impl MempoolCoordinator {
     }
 
     /// The transactions this shard offers for the next block, in hash
-    /// order, under what the drain has room for.
+    /// order, as many as the drain has places for and the block's caps
+    /// admit over their shares on this shard.
     ///
     /// Availability decides who is eligible — admitted, past its dwell,
     /// not parked on engagement evidence — and nothing here decides who
@@ -995,50 +995,52 @@ impl MempoolCoordinator {
     /// offered; execution composes them into one batch and sequences
     /// them there.
     ///
-    /// `in_flight` is what the chain says this shard still owes, read
+    /// `in_flight` is what the chain says this shard still holds, read
     /// off the parent header rather than from local state, so every
     /// replica prices the same headroom. `max_count` is the wire cap on
-    /// a block's transaction list, not a packing bound.
+    /// a block's transaction list. `trie` places each transaction's
+    /// shares, so the caps are judged the way admission judges them.
     ///
     /// # Performance
     ///
     /// `O(pool_size)` in the worst case: the pool is walked in key order
-    /// and filtered, stopping at `max_count` offers.
+    /// and filtered, stopping at the count.
     #[must_use]
     pub fn ready_transactions(
         &self,
         max_count: usize,
         in_flight: u64,
+        trie: &ShardTrie,
         now: LocalTimestamp,
     ) -> Vec<Arc<Verified<Transaction>>> {
-        // `max_count` is the wire cap on a block's transaction list, not
-        // a packing bound: what decides how far selection goes is the
-        // drain the chain says this shard still owes, in work units.
-        // Selection adds to it only while the total stays under budget —
-        // a shard that is not settling admits less until it does.
-        let Some(mut budget) = MAX_DRAIN_WORK.checked_sub(in_flight) else {
+        // The drain is a count: a shard that is not settling admits
+        // fewer until it does, and none at the budget.
+        let Some(places) = MAX_UNSETTLED_TXS.checked_sub(in_flight) else {
             return Vec::new();
         };
+        let room = max_count.min(usize::try_from(places).unwrap_or(usize::MAX));
 
         let min_dwell = self.config.min_dwell_time;
+        let mut filled = DeclaredWork::ZERO;
         let mut selected = Vec::new();
         for (_, entry) in self.pool.iter().filter(|(hash, entry)| {
             matches!(entry.status, TransactionStatus::Pending)
                 && !self.parked_engagement.contains_key(*hash)
                 && now.saturating_sub(entry.admitted_at) >= min_dwell
         }) {
-            if selected.len() >= max_count {
+            if selected.len() >= room {
                 break;
             }
-            // Hash order decides who is offered; the budget decides how
-            // far down the list that goes. A transaction too heavy for
-            // what is left is passed over rather than ending selection —
-            // otherwise one outsized envelope would stall every lighter
-            // one behind it until the drain cleared.
-            let Some(remaining) = budget.checked_sub(entry.tx.work()) else {
+            // Hash order decides who is offered; the caps decide how far
+            // down the list that goes. A transaction too heavy for what
+            // is left in any dimension is passed over rather than ending
+            // selection — otherwise one outsized envelope would stall
+            // every lighter one behind it until the block cleared.
+            let next = filled.saturating_add(entry.tx.local_work(trie, self.local_shard));
+            if !budget_admits_block(&next) {
                 continue;
-            };
-            budget = remaining;
+            }
+            filled = next;
             selected.push(Arc::clone(&entry.tx));
         }
         selected
@@ -1238,10 +1240,10 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, install_stub_protocol_statics, make_finalization, make_live_block,
-        stub_transaction, test_prefix, test_principal, test_transaction,
-        test_transaction_with_prefixes, test_validity_range,
+        stub_transaction, stub_transaction_declaring, test_prefix, test_principal,
+        test_transaction, test_transaction_with_prefixes, test_validity_range,
     };
-    use hyperscale_types::{Address, PrincipalAddr, Verified, WitnessSources};
+    use hyperscale_types::{Address, MAX_BLOCK_COMPUTE, PrincipalAddr, Verified, WitnessSources};
 
     /// Test-only convenience: wrap any `Transaction` in a
     /// `Verified` witness via the test-only gate.
@@ -1249,8 +1251,7 @@ mod tests {
         Verified::new_unchecked_for_test(tx)
     }
     use hyperscale_types::{
-        Block, Finalization, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TX_UNITS,
-        ValidatorId,
+        Block, Finalization, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, ValidatorId,
     };
 
     use super::*;
@@ -1924,7 +1925,7 @@ mod tests {
         assert!(!mempool.is_tombstoned(&tx_hash));
         assert!(
             mempool
-                .ready_transactions(10, 0, LocalTimestamp::ZERO)
+                .ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO)
                 .is_empty(),
             "and is never offered again"
         );
@@ -2192,7 +2193,7 @@ mod tests {
         );
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, read_at);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), read_at);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
@@ -2209,7 +2210,7 @@ mod tests {
         );
 
         // The drain the chain reports is already at the cap.
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"
@@ -2242,7 +2243,7 @@ mod tests {
         );
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO);
         assert_eq!(ready.len(), 2);
     }
 
@@ -2263,7 +2264,7 @@ mod tests {
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
 
-        let ready = mempool.ready_transactions(10, 0, now);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), now);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
     }
 
@@ -2278,7 +2279,12 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_100));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(10_100),
+        );
         assert_eq!(
             ready.len(),
             0,
@@ -2286,7 +2292,12 @@ mod tests {
         );
 
         // At t=10.15s — eligible (150ms >= 150ms)
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_150));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(10_150),
+        );
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
 
@@ -2305,11 +2316,16 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // Still at t=10s — dwell time not met
-        let ready = mempool.ready_transactions(10, 0, submitted_at);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), submitted_at);
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_300));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(10_300),
+        );
         assert_eq!(
             ready.len(),
             0,
@@ -2317,7 +2333,12 @@ mod tests {
         );
 
         // Advance to t=10.5s — exactly at dwell time
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_500));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(10_500),
+        );
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
 
@@ -2347,11 +2368,21 @@ mod tests {
         );
 
         // At t=1.4s — tx1 has 400ms dwell (eligible), tx2 has 100ms (not eligible).
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_400));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(1_400),
+        );
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
         // At t=1.5s — both eligible
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_500));
+        let ready = mempool.ready_transactions(
+            10,
+            0,
+            &ShardTrie::single(),
+            LocalTimestamp::from_millis(1_500),
+        );
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }
 
@@ -2680,12 +2711,15 @@ mod tests {
 
     /// A shard that is not settling admits less until it does.
     ///
-    /// The drain the chain reports is what selection has left to spend,
+    /// The drain the chain reports is what selection has left to fill,
     /// so a backlog does not merely slow proposals down — it shrinks
-    /// them, and stops them entirely at the budget.
+    /// them, and stops them entirely at the budget. The count bounds a
+    /// flood of minimal transactions the same way: each takes one place
+    /// whatever it declared.
     #[test]
     fn a_backlogged_shard_admits_less_until_it_drains() {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
+        let trie = topology.shard_trie();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
         let owners: Vec<PrincipalAddr> = (0..8u8).map(|i| test_principal(0x40 + i)).collect();
@@ -2696,134 +2730,76 @@ mod tests {
         let now = LocalTimestamp::from_millis(1_000);
 
         // An idle chain offers everything the block can hold.
-        let idle = mempool.ready_transactions(10, 0, now);
+        let idle = mempool.ready_transactions(10, 0, trie, now);
         assert_eq!(idle.len(), 8, "an undrained budget selects freely");
 
-        // Halfway to the budget, only what fits is offered.
-        let each = idle[0].work();
-        let room_for_three = MAX_DRAIN_WORK - each * 3;
-        let squeezed = mempool.ready_transactions(10, room_for_three, now);
+        // Three places from the budget, only three are offered.
+        let squeezed = mempool.ready_transactions(10, MAX_UNSETTLED_TXS - 3, trie, now);
         assert_eq!(
             squeezed.len(),
             3,
-            "selection spends exactly the room the drain left"
+            "selection fills exactly the places the drain left"
         );
 
         // At the budget it offers nothing, whatever is pooled.
         assert!(
             mempool
-                .ready_transactions(10, MAX_DRAIN_WORK, now)
+                .ready_transactions(10, MAX_UNSETTLED_TXS, trie, now)
                 .is_empty(),
             "a shard at its budget admits nothing until the drain clears"
         );
     }
 
-    /// Minimal transactions are not free. The fixed admit-and-track
-    /// charge inside each one's work is what keeps the budget a bound on
-    /// how *many* the drain holds, not just how heavy they are — without
-    /// it a flood declaring nothing and signing a zero gas limit would
-    /// price at almost zero and slip past.
+    /// The caps bind on the block's own content: a transaction whose
+    /// share would carry the block past a cap is passed over while the
+    /// count still has room, and the ones behind it that fit are still
+    /// offered.
     #[test]
-    fn a_flood_of_minimal_transactions_is_bounded_by_the_same_budget() {
+    fn a_transaction_over_a_cap_is_passed_over_while_the_count_has_room() {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
+        let trie = topology.shard_trie();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
-
-        let owners: Vec<PrincipalAddr> = (0..6u8).map(|i| test_principal(0x60 + i)).collect();
+        // Each declares a thirty-second of the block's compute, so the
+        // caps admit thirty-two of forty where the count would admit
+        // them all.
+        let heavy = MAX_BLOCK_COMPUTE / 32;
+        let owners: Vec<PrincipalAddr> = (0..40u8).map(|i| test_principal(0x80 + i)).collect();
         for owner in &owners {
-            let tx = stub_vm(*owner, &[owner.address()]);
+            install_stub_protocol_statics();
+            let tx = Arc::new(verified(stub_transaction_declaring(
+                *owner,
+                &[],
+                &[],
+                &[owner.address()],
+                1_000,
+                vec![heavy],
+                test_validity_range(),
+            )));
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
-
-        let each = mempool.ready_transactions(10, 0, now)[0].work();
+        let offered = mempool.ready_transactions(100, 0, trie, now);
+        let filled = offered.iter().fold(DeclaredWork::ZERO, |total, tx| {
+            total.saturating_add(tx.local_work(trie, ShardId::ROOT))
+        });
         assert!(
-            each >= TX_UNITS,
-            "every transaction costs the fixed charge whatever it declared: {each}"
+            budget_admits_block(&filled),
+            "what is offered fits the caps"
         );
-        let room_for_two = MAX_DRAIN_WORK - each * 2;
+        assert!(
+            offered.len() < owners.len() && offered.len() >= 30,
+            "the compute cap, not the count, decided: {} offered",
+            offered.len()
+        );
+        // With room for one more place than the caps admit, the count
+        // is not what stopped selection.
+        let places = u64::try_from(offered.len()).expect("fits") + 1;
         assert_eq!(
-            mempool.ready_transactions(10, room_for_two, now).len(),
-            2,
-            "the fixed charge is what makes the budget count them"
+            mempool
+                .ready_transactions(100, MAX_UNSETTLED_TXS - places, trie, now)
+                .len(),
+            offered.len()
         );
-    }
-
-    /// A transaction this shard only delivers for — frozen divided
-    /// with this shard outside the core and every leg here a delivery
-    /// — is held to the delivery window's close; one this shard issues
-    /// for, or runs whole, is held to its validity end whoever pays.
-    #[test]
-    fn a_delivery_is_held_to_the_windows_close_and_nothing_else_is() {
-        use hyperscale_types::TimestampRange;
-        use hyperscale_types::test_utils::{StubVmStatics, leg_shape};
-        use hyperscale_vm_types::LegRole;
-
-        let topology = TestCommittee::new(4, 42).topology_snapshot(2);
-        let local = ShardId::leaf(1, 0);
-        let mut mempool = MempoolCoordinator::new(local);
-        let end = WeightedTimestamp::from_millis(60_000);
-        let range = TimestampRange::new(WeightedTimestamp::ZERO, end);
-        // A clear top bit routes to leaf(1, 0); a set one to leaf(1, 1).
-        let local_owner = test_principal(0x02);
-        let remote_owner = test_principal(0x82);
-        install_stub_protocol_statics();
-        // The legs are derived facts and not body, so each shape gets a
-        // fee ceiling of its own to keep the three hashes apart.
-        let stub = |payer: PrincipalAddr, max_fee: u128, legs: Vec<_>| {
-            Arc::new(verified(
-                stub_transaction(
-                    payer,
-                    &[local_owner.address(), remote_owner.address()],
-                    max_fee,
-                    range,
-                )
-                .with_legs(&StubVmStatics, legs),
-            ))
-        };
-        // A swap whose output lands here: the withdraw and the venue
-        // away, the deposit here consuming what the venue issued.
-        let delivery = stub(
-            remote_owner,
-            1_000,
-            vec![
-                leg_shape(remote_owner.address(), LegRole::Inbound, &[]),
-                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
-                leg_shape(local_owner.address(), LegRole::Outbound, &[(1, 0)]),
-            ],
-        );
-        // The same swap the other way round: this shard issues for it.
-        let issuer = stub(
-            local_owner,
-            2_000,
-            vec![
-                leg_shape(local_owner.address(), LegRole::Inbound, &[]),
-                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
-                leg_shape(remote_owner.address(), LegRole::Outbound, &[(1, 0)]),
-            ],
-        );
-        // A shape with no legs, paid for elsewhere: whole, and no delivery.
-        let whole = stub(remote_owner, 3_000, Vec::new());
-
-        set_current_ts(&mut mempool, end);
-        for tx in [&delivery, &issuer, &whole] {
-            mempool.on_transaction_gossip(&topology, Arc::clone(tx), false, LocalTimestamp::ZERO);
-        }
-        assert!(
-            mempool.status(&delivery.hash()).is_some(),
-            "a delivery is admitted past its validity end"
-        );
-        assert!(
-            mempool.status(&issuer.hash()).is_none(),
-            "an issuer's window is the transaction's"
-        );
-        assert!(
-            mempool.status(&whole.hash()).is_none(),
-            "and so is a whole shape's, wherever its payer sits"
-        );
-
-        set_current_ts(&mut mempool, Window::Delivery.of(Deadline::of(end)).end);
-        assert_eq!(mempool.cleanup_expired_pending(), 1, "the close sweeps it");
-        assert!(mempool.status(&delivery.hash()).is_none());
     }
 
     #[test]
@@ -2844,7 +2820,12 @@ mod tests {
         assert_eq!(mempool.parked_count(), 1);
         assert!(
             mempool
-                .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
+                .ready_transactions(
+                    10,
+                    0,
+                    &ShardTrie::single(),
+                    LocalTimestamp::from_millis(1_000)
+                )
                 .is_empty()
         );
 
@@ -2859,7 +2840,12 @@ mod tests {
             LocalTimestamp::ZERO,
         );
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
+            .ready_transactions(
+                10,
+                0,
+                &ShardTrie::single(),
+                LocalTimestamp::from_millis(1_000),
+            )
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2875,7 +2861,12 @@ mod tests {
         mempool.on_engagement_evidence(payer_shard, [parked_hash]);
         assert_eq!(mempool.parked_count(), 0);
         let mut ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
+            .ready_transactions(
+                10,
+                0,
+                &ShardTrie::single(),
+                LocalTimestamp::from_millis(1_000),
+            )
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2902,7 +2893,12 @@ mod tests {
 
         assert_eq!(mempool.parked_count(), 0);
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
+            .ready_transactions(
+                10,
+                0,
+                &ShardTrie::single(),
+                LocalTimestamp::from_millis(1_000),
+            )
             .iter()
             .map(|tx| tx.hash())
             .collect();

@@ -15,7 +15,7 @@ use crate::{
     MAX_PROVISION_TARGET_SHARDS, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot,
     ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
     SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot,
-    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
+    TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -30,7 +30,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommittedTip {
     /// Work the tip leaves in flight, which the next block advances.
-    pub work_in_flight: WorkInFlight,
+    pub txs_in_flight: TxsInFlight,
     /// Highest tick whose determined half has settled at or below the tip.
     pub settled_tick_frontier: BlockHeight,
     /// How far the tip's sweep reached, which the next block advances.
@@ -46,7 +46,7 @@ impl CommittedTip {
     /// known rather than guessed, which is why a fresh start resolves here
     /// instead of refusing to check its first block.
     pub const GENESIS: Self = Self {
-        work_in_flight: WorkInFlight::ZERO,
+        txs_in_flight: TxsInFlight::ZERO,
         settled_tick_frontier: BlockHeight::GENESIS,
         sweep_frontier: SweepFrontier::ZERO,
         reveal_chain: RevealChain::ZERO,
@@ -85,10 +85,10 @@ pub struct BlockHeader {
     /// read.
     abandonment_root: AbandonmentRoot,
     state_claims_root: StateClaimsRoot,
-    work_in_flight: WorkInFlight,
+    txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
-    /// block carries. Folded like `work_in_flight` and read off the block
+    /// block carries. Folded like `txs_in_flight` and read off the block
     /// the same way — the certificates name their tick and their half, so
     /// a validator checks the claim with no history behind it.
     ///
@@ -190,7 +190,7 @@ pub struct BlockHeaderParts {
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     pub abandonment_root: AbandonmentRoot,
     pub state_claims_root: StateClaimsRoot,
-    pub work_in_flight: WorkInFlight,
+    pub txs_in_flight: TxsInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
     pub beacon_witness_root: BeaconWitnessRoot,
@@ -222,7 +222,7 @@ impl Default for BlockHeaderParts {
             provision_tx_roots: BTreeMap::new(),
             abandonment_root: AbandonmentRoot::ZERO,
             state_claims_root: StateClaimsRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
+            txs_in_flight: TxsInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
@@ -262,7 +262,7 @@ impl BlockHeader {
             provision_tx_roots,
             abandonment_root,
             state_claims_root,
-            work_in_flight,
+            txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
             beacon_witness_root,
@@ -290,7 +290,7 @@ impl BlockHeader {
             provision_tx_roots,
             abandonment_root,
             state_claims_root,
-            work_in_flight,
+            txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
             beacon_witness_root,
@@ -593,8 +593,8 @@ impl BlockHeader {
     /// the parent's in-flight count forward unchanged (no txs admitted, none
     /// finalized).
     #[must_use]
-    pub const fn work_in_flight(&self) -> WorkInFlight {
-        self.work_in_flight
+    pub const fn txs_in_flight(&self) -> TxsInFlight {
+        self.txs_in_flight
     }
 
     /// The highest tick whose determined half has settled at or below
@@ -717,7 +717,7 @@ impl BlockHeader {
     #[must_use]
     pub const fn committed_tip(&self) -> CommittedTip {
         CommittedTip {
-            work_in_flight: self.work_in_flight,
+            txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,
             reveal_chain: self.reveal_chain,
@@ -750,7 +750,7 @@ impl BlockHeader {
             provision_tx_roots: self.provision_tx_roots,
             abandonment_root: self.abandonment_root,
             state_claims_root: self.state_claims_root,
-            work_in_flight: self.work_in_flight,
+            txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,
             beacon_witness_root: self.beacon_witness_root,

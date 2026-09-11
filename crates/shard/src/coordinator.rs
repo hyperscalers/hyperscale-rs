@@ -20,7 +20,7 @@ use hyperscale_types::{
     FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateKey, VerificationKind, WeightedTimestamp, WorkInFlight,
+    StoredReceipt, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
     derive_reshape_trigger, ready_signal_window,
 };
 
@@ -3297,7 +3297,7 @@ impl ShardCoordinator {
                 let chain = self.chain_view();
                 let genesis_parent = block.header().parent_qc().is_genesis();
                 let parent_in_flight = if genesis_parent {
-                    Some(WorkInFlight::ZERO)
+                    Some(TxsInFlight::ZERO)
                 } else {
                     chain.parent_in_flight_checked(block.header().parent_block_hash())
                 };
@@ -6553,7 +6553,7 @@ impl ShardCoordinator {
     #[must_use]
     pub fn committed_in_flight(&self) -> u64 {
         self.committed_tip
-            .map_or(0, |tip| tip.work_in_flight.inner())
+            .map_or(0, |tip| tip.txs_in_flight.inner())
     }
 
     /// The drain this shard still owes at the proposal parent: committed
@@ -6564,7 +6564,7 @@ impl ShardCoordinator {
     /// same block — where a locally-tracked count drifts with each node's
     /// own pipeline position.
     #[must_use]
-    pub fn proposal_parent_in_flight(&self) -> WorkInFlight {
+    pub fn proposal_parent_in_flight(&self) -> TxsInFlight {
         self.chain_view()
             .parent_in_flight(self.proposal_parent_block_hash())
     }
@@ -7834,7 +7834,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -8263,7 +8263,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -8332,7 +8332,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -8418,7 +8418,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -8514,7 +8514,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -8563,7 +8563,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -9154,7 +9154,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -9511,7 +9511,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -9554,7 +9554,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -9649,7 +9649,7 @@ mod tests {
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
-                work_in_flight: __h.work_in_flight(),
+                txs_in_flight: __h.txs_in_flight(),
                 ..Default::default()
             })
         };
@@ -10532,7 +10532,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10602,7 +10602,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10651,7 +10651,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10858,7 +10858,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10893,7 +10893,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10908,6 +10908,68 @@ mod tests {
         let result = state.admit_transactions(&topology, &block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in QC chain ancestor"));
+    }
+
+    /// The caps are judged on the block's own content: a transaction
+    /// past its own ceiling is refused whatever else the block carries,
+    /// and a block whose transactions' shares on this shard sum past a
+    /// per-block cap is refused at the one that carries it past.
+    #[test]
+    fn a_block_is_refused_at_the_caps_on_its_own_content() {
+        use hyperscale_types::test_utils::{
+            install_stub_protocol_statics, stub_transaction_declaring, test_principal,
+            test_validity_range,
+        };
+        use hyperscale_types::{DeclaredWork, MAX_BLOCK_COMPUTE, SchemeId, TX_CAPS};
+
+        install_stub_protocol_statics();
+        let (state, topology) = make_test_state();
+        let declaring = |seed: u8, compute: u64| {
+            let payer = test_principal(seed);
+            Arc::new(stub_transaction_declaring(
+                payer,
+                &[],
+                &[],
+                &[payer.address()],
+                1_000,
+                vec![compute],
+                test_validity_range(),
+            ))
+        };
+        let block_of = |txs: Vec<Arc<Transaction>>| {
+            make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                100_000,
+                ValidatorId::new(0),
+                txs,
+                Vec::new(),
+            )
+        };
+
+        // One transaction over its own compute ceiling.
+        let refused = state
+            .admit_transactions(
+                &topology,
+                &block_of(vec![declaring(1, TX_CAPS.compute + 1)]),
+            )
+            .expect_err("a transaction past its ceiling is refused");
+        assert!(refused.contains("of one transaction"), "{refused}");
+
+        // Thirty-two at a thirty-second of the block's compute fill it
+        // exactly, the ceiling and the signature's verification
+        // together; a thirty-third carries it past.
+        let share = MAX_BLOCK_COMPUTE / 32 - DeclaredWork::signature(SchemeId::ED25519).compute;
+        let full: Vec<Arc<Transaction>> = (1..=32u8).map(|seed| declaring(seed, share)).collect();
+        state
+            .admit_transactions(&topology, &block_of(full.clone()))
+            .expect("a block at the cap is admitted");
+        let mut over = full;
+        over.push(declaring(33, share));
+        let refused = state
+            .admit_transactions(&topology, &block_of(over))
+            .expect_err("a block past the cap is refused");
+        assert!(refused.contains("per-block cap"), "{refused}");
     }
 
     #[test]
@@ -10936,7 +10998,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -10969,7 +11031,7 @@ mod tests {
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
-                    work_in_flight: __h.work_in_flight(),
+                    txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
                 })
             },
@@ -11377,7 +11439,7 @@ mod tests {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(tx)),
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
-            declared_work: 5,
+            charged: 5,
             charge: stub_abort_charge(5),
             committed: CommittedAt {
                 height: BlockHeight::new(1),

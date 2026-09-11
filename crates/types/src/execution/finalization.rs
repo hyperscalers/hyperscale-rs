@@ -361,23 +361,31 @@ impl Finalization {
             })
     }
 
-    /// Work this tick releases back to the drain budget.
+    /// The places in the drain this tick gives back.
     ///
-    /// The reservations its transactions took when their block committed
-    /// them, returned now that they are settled. Read off the same
-    /// outcomes as [`Self::attested_work`] and for the same reason: it
-    /// has to cover every verdict, because an aborted transaction leaves
-    /// the drain exactly as a completed one does.
-    ///
-    /// Saturating, so a forged tick cannot wrap a block's running total.
+    /// One per member whose committing block took one, returned now
+    /// that they are settled. Read off the same outcomes as
+    /// [`Self::attested_work`] and for the same reason: it has to cover
+    /// every verdict, because an aborted transaction leaves the drain
+    /// exactly as a completed one does.
     #[must_use]
-    pub fn declared_work(&self) -> u64 {
+    pub fn released(&self) -> u64 {
         self.local_ec()
             .tx_outcomes()
             .iter()
-            .fold(0u64, |sum, outcome| {
-                sum.saturating_add(outcome.declared_work())
-            })
+            .filter(|outcome| outcome.reserved())
+            .count() as u64
+    }
+
+    /// What this tick's transactions were charged between them, in
+    /// quanta. Saturating, so a forged tick cannot wrap a block's
+    /// running total.
+    #[must_use]
+    pub fn charged(&self) -> u128 {
+        self.local_ec()
+            .tx_outcomes()
+            .iter()
+            .fold(0u128, |sum, outcome| sum.saturating_add(outcome.charged()))
     }
 
     /// Iterator over the tick's tx hashes in canonical block order.

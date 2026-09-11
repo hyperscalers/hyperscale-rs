@@ -933,7 +933,7 @@ pub fn submit_straddler<C: Cluster>(
     from: PrincipalAddr,
     to: PrincipalAddr,
 ) -> TxHash {
-    submit_straddler_reserving(c, charges, key, from, to).0
+    submit_straddler_deriving(c, charges, key, from, to).0
 }
 
 /// [`submit_straddler`], also reporting the record cells its crossings
@@ -950,32 +950,28 @@ pub fn submit_straddler_recording<C: Cluster>(
     from: PrincipalAddr,
     to: PrincipalAddr,
 ) -> (TxHash, Vec<SubstateKey>) {
-    let (hash, _, records) = submit_straddler_reserving(c, charges, key, from, to);
+    let (hash, records) = submit_straddler_deriving(c, charges, key, from, to);
     (hash, records)
 }
 
 /// [`submit_straddler`], also reporting what the transaction reserves
 /// against its shards' drains.
 ///
-/// The figure a committed abandonment returns exactly, so a scenario
-/// measuring the release can name the straddler's own contribution rather
-/// than inferring it from a level other traffic also moves.
-fn submit_straddler_reserving<C: Cluster>(
+fn submit_straddler_deriving<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
     key: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
-) -> (TxHash, u64, Vec<SubstateKey>) {
+) -> (TxHash, Vec<SubstateKey>) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
     let records = crossing_records(
         &tx.try_derived(c.derivation().as_ref())
             .expect("a scenario transfer derives")
             .legs,
     );
-    let work = tx.work();
     let hash = charges.submit(c, tx);
-    (hash, work, records)
+    (hash, records)
 }
 
 /// Assert the settled-transaction fence held for `probes`: every straddler the

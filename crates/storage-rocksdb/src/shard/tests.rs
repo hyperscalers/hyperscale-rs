@@ -184,7 +184,7 @@ fn entries_commit_serve_ranges_and_gc_history() {
         vec![(5, vec![5]), (10, vec![99]), (30, vec![30])],
     );
     assert_eq!(
-        storage.snapshot_at(BlockHeight::new(4)).entries_in_range(
+        storage.snapshot_at(BlockHeight::new(6)).entries_in_range(
             key.owner,
             key.collection,
             0,

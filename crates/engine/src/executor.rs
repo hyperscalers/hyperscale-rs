@@ -23,16 +23,17 @@ use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, LocalCells, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry, ProtocolHasher,
-    admit_package, declared_footprint, decode_tree, envelope_identity, witness_from_event,
+    admit_package, declared_vector, decode_tree, envelope_bytes, envelope_identity,
+    witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root, declared_work,
-    install_protocol_statics,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    install_protocol_statics, whole_work,
 };
 pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
@@ -45,8 +46,8 @@ use hyperscale_vm_kernel::{
     ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, Effect, EffectSet, EffectTarget, EntryKey, Mode, Moves,
-    Outcome, ResourceAddr, SubstateKey, UnmetCondition,
+    Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget, EntryKey,
+    Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -79,11 +80,9 @@ pub struct PreparedTx {
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.
     pub gas_limits: Vec<u64>,
-    /// What the transaction costs a block on the engine's own schedule:
-    /// the fixed charge for carrying it, its declared footprint, and the
-    /// ceiling it signed. A settlement is the batch's own and costs the
-    /// block nothing.
-    pub work: u64,
+    /// What the transaction declares it may consume, whole. A settlement
+    /// is the batch's own and declares nothing.
+    pub work: DeclaredWork,
     /// The owners this shard judges — with the job's plan, the one part
     /// of an entry that differs per participant.
     pub judges: OwnerSet,
@@ -385,9 +384,11 @@ impl Executor {
     pub fn install_artifact(&self, artifact: &[u8]) {
         match admit_package(artifact) {
             Ok(metadata) => {
-                self.world
-                    .cache
-                    .publish(package_hash(&ProtocolHasher, artifact), metadata);
+                self.world.cache.publish(
+                    package_hash(&ProtocolHasher, artifact),
+                    metadata,
+                    artifact.len() as u64,
+                );
                 self.backend.absorb_artifact(artifact);
             }
             Err(error) => {
@@ -466,8 +467,9 @@ impl Executor {
     pub(crate) fn prepare(
         tx: &Transaction,
         chain: &dyn ChainRecords,
+        packages: &PackageCache,
     ) -> Result<PreparedTx, String> {
-        Self::prepare_with_authority(tx, chain, TargetAuthority::Required)
+        Self::prepare_with_authority(tx, chain, packages, TargetAuthority::Required)
     }
 
     /// [`Self::prepare`] for a member running the transaction's shape:
@@ -476,10 +478,11 @@ impl Executor {
     fn prepare_shape(
         tx: &Transaction,
         records: &BatchRecords,
+        packages: &PackageCache,
         member: &Member,
         arrivals: &[EscrowedValue],
     ) -> Result<PreparedTx, String> {
-        let mut entry = Self::prepare(tx, records)?;
+        let mut entry = Self::prepare(tx, records, packages)?;
         let plan = member
             .classified()
             .plan(arrivals, member.local(), member.side())
@@ -610,7 +613,7 @@ impl Executor {
             declaration,
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
-            work: 0,
+            work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
     }
@@ -624,6 +627,7 @@ impl Executor {
     pub(crate) fn prepare_with_authority(
         tx: &Transaction,
         chain: &dyn ChainRecords,
+        packages: &PackageCache,
         authority: TargetAuthority,
     ) -> Result<PreparedTx, String> {
         let vm = tx.body();
@@ -654,16 +658,19 @@ impl Executor {
         )
         .map_err(|error| format!("admission: {error}"))?;
         let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
-        // The same price derivation puts on the envelope, so a preview
+        // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies
         // it, and caches what it derived onto the transaction.
         let legs = legs_of(&admitted.admitted);
-        let work = declared_work(
-            declared_footprint(&routing, &legs),
-            vm.gas_limit_total(),
-            vm.signature_work(),
+        let (shares, everywhere) = declared_vector(
+            packages,
+            vm,
+            &routing,
+            &legs,
+            envelope_bytes(vm).map_err(|error| error.to_string())?,
         );
+        let work = whole_work(&shares, everywhere);
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks. Unioning `per_shard`
@@ -1361,7 +1368,9 @@ impl Executor {
                 Runs::Shape(shape) => input
                     .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())
-                    .and_then(|tx| Self::prepare_shape(tx, &records, shape, input.arrivals)),
+                    .and_then(|tx| {
+                        Self::prepare_shape(tx, &records, &self.world.cache, shape, input.arrivals)
+                    }),
             };
             match planned {
                 Ok(entry) => {
@@ -1470,7 +1479,7 @@ impl Executor {
                     PayerFee {
                         vault,
                         max_fee: vm.max_fee,
-                        price: tx.price(),
+                        price: tx.price(&PriceTable::GENESIS),
                         abortable: shapes
                             .get(&tx.hash())
                             .is_some_and(|input| input.runs.abortable()),

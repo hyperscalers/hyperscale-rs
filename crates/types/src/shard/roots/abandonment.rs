@@ -46,7 +46,7 @@ mod tests {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
             deadline: Deadline::of(WeightedTimestamp::from_millis(500)),
-            declared_work: 7,
+            charged: 7,
             charge: AbortCharge {
                 vault: SubstateKey {
                     owner: Address::new([seed; 31], AddressClass::Component),
@@ -117,7 +117,7 @@ mod tests {
         assert_ne!(
             root,
             restated(UnsettledTx {
-                declared_work: 8,
+                charged: 8,
                 ..tx(1)
             })
         );

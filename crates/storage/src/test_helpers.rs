@@ -23,14 +23,14 @@ use hyperscale_types::{
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
     GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2,
-    PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
-    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert,
-    RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
+    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
+    RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
+    ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
     StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-    ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
-    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -1109,7 +1109,9 @@ pub fn test_entries_commit_serve_and_history<S: VersionedStore + TestStore>(stor
         vec![(5, vec![5]), (10, vec![99]), (30, vec![30])],
     );
 
-    // The historical scan at version 1 answers the old interval.
+    // The historical scan at version 1 answers the old interval, and
+    // stops at the limit: the cap is on visible entries, so the removed
+    // one and the one added later are neither counted nor returned.
     assert_eq!(
         storage.snapshot_at(BlockHeight::new(1)).entries_in_range(
             key.owner,
@@ -1119,6 +1121,55 @@ pub fn test_entries_commit_serve_and_history<S: VersionedStore + TestStore>(stor
             10
         ),
         vec![(5, vec![5]), (10, vec![10]), (20, vec![20])],
+    );
+    assert_eq!(
+        storage.snapshot_at(BlockHeight::new(1)).entries_in_range(
+            key.owner,
+            key.collection,
+            6,
+            u128::MAX,
+            1
+        ),
+        vec![(10, vec![10])],
+    );
+    assert_eq!(
+        storage.snapshot_at(BlockHeight::new(2)).entries_in_range(
+            key.owner,
+            key.collection,
+            6,
+            u128::MAX,
+            1
+        ),
+        vec![(10, vec![99])],
+        "the cap counts what is visible at the version, not what the interval holds"
+    );
+
+    // A wide interval of another owner rewritten whole: the historical
+    // scan returns the limit's worth of the old values and no more, off
+    // the tip as at it.
+    let wide_key = entry_key(8, 100);
+    let wide: Vec<(u128, Option<Vec<u8>>)> = (100..140u128)
+        .map(|order| (order, Some(vec![u8::try_from(order).expect("small")])))
+        .collect();
+    commit(&make_settled_entries(8, &wide));
+    let rewritten: Vec<(u128, Option<Vec<u8>>)> = (100..140u128)
+        .map(|order| (order, (order % 3 != 0).then(|| vec![0xAA])))
+        .collect();
+    commit(&make_settled_entries(8, &rewritten));
+    assert_eq!(
+        storage.snapshot_at(BlockHeight::new(3)).entries_in_range(
+            wide_key.owner,
+            wide_key.collection,
+            100,
+            139,
+            3
+        ),
+        vec![(100, vec![100]), (101, vec![101]), (102, vec![102])],
+    );
+    assert_eq!(
+        storage.entries_in_range(wide_key.owner, wide_key.collection, 100, 139, 3),
+        vec![(100, vec![0xAA]), (101, vec![0xAA]), (103, vec![0xAA])],
+        "at the tip the removed orders are skipped under the same cap"
     );
     // And another collection's interval stays empty.
     assert!(
@@ -2172,7 +2223,7 @@ pub fn test_recovery_carries_the_tip_drain_total(
     storage: &impl TestStore,
     recovered: impl Fn() -> RecoveredState,
 ) {
-    let in_flight = WorkInFlight::new(7);
+    let in_flight = TxsInFlight::new(7);
     let mut block = make_test_block(BlockHeight::new(1));
     let Block::Live { header, .. } = &mut block else {
         panic!("the fixture builds a live block");
@@ -2182,7 +2233,7 @@ pub fn test_recovery_carries_the_tip_drain_total(
         parent_block_hash: header.parent_block_hash(),
         parent_qc: header.parent_qc().clone().into(),
         timestamp: header.timestamp(),
-        work_in_flight: in_flight,
+        txs_in_flight: in_flight,
         ..Default::default()
     });
     commit_settled_at(
@@ -2194,7 +2245,7 @@ pub fn test_recovery_carries_the_tip_drain_total(
     );
 
     assert_eq!(
-        recovered().committed_tip.map(|tip| tip.work_in_flight),
+        recovered().committed_tip.map(|tip| tip.txs_in_flight),
         Some(in_flight),
         "the tip's drain total is on its stored header, so recovery reads it",
     );
@@ -2474,10 +2525,10 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
         [UnsettledTx {
             tx_hash: stranded.hash(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(500)),
-            declared_work: stranded.work(),
+            charged: stranded.price(&PriceTable::GENESIS),
             charge: AbortCharge {
                 vault: stranded.fee_vault(),
-                amount: stranded.price(),
+                amount: stranded.price(&PriceTable::GENESIS),
             },
             committed: CommittedAt {
                 height: BlockHeight::new(1),

@@ -30,8 +30,8 @@ use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, Sub
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
-    WorkInFlight, shard_prefix_path,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    WeightedTimestamp, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -381,11 +381,11 @@ impl Harness {
     /// The work `shard`'s committed tip leaves owing against the drain,
     /// read off the tip header the live store holds. `None` if no host
     /// serves `shard` or the tip carries no header.
-    pub fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight> {
+    pub fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
         let store = self.store_for(shard)?;
         store
             .get_certified_header(store.committed_height())
-            .map(|header| header.header().work_in_flight())
+            .map(|header| header.header().txs_in_flight())
     }
 
     /// [`chain_membership`] over the live store — what `shard`'s own

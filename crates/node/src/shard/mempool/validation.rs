@@ -26,8 +26,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{
-    Address, NetworkId, ShardId, TopologySnapshot, Transaction, TransactionContext,
-    TransactionVerifyError, TxHash, Verified, Verify,
+    Address, MAX_FETCH_RESPONSE_BYTES, NetworkId, ShardId, TopologySnapshot, Transaction,
+    TransactionContext, TransactionVerifyError, TxHash, Verified, Verify,
 };
 
 use super::{DeferredOrigin, DeferredTransaction, TransactionBinding};
@@ -37,11 +37,9 @@ use crate::host::NodeHost;
 use crate::process::SubmitFanout;
 use crate::shard::{HostEvent, ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
-/// Byte budget one outbound gossip batch accumulates before it flushes.
-/// Sized so a full batch — even one ending on a maximum-size envelope —
-/// encodes below the transport's frame cap, which would otherwise refuse
-/// the message and un-gossip the whole batch.
-const TX_GOSSIP_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Byte budget one outbound gossip batch accumulates before it flushes:
+/// the fetch response's, since both answer with envelopes into one frame.
+const TX_GOSSIP_BYTE_BUDGET: usize = MAX_FETCH_RESPONSE_BYTES;
 
 /// One envelope's verdict: the envelope itself, its verified form where
 /// it has one, and the records a derivation gap wanted.

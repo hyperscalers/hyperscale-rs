@@ -14,7 +14,7 @@ pub use hyperscale_vm_types::{
     AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
     TransactionBody, TransactionEnvelope,
 };
-use hyperscale_vm_types::{LegShape, SubstateKey};
+use hyperscale_vm_types::{DeclaredWork, LegShape, SubstateKey};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -283,24 +283,26 @@ pub struct Derived {
     /// rather than the envelope's raw fields, which are the composer's
     /// claim alone.
     pub effective_window: TimestampRange,
-    /// What including this transaction costs a block, in work units.
-    ///
-    /// A fixed admit-and-track charge, the declared footprint, and the
-    /// signed gas limit. The fixed term is what makes a budget over this
-    /// quantity bound the *number* of transactions in the drain as well
-    /// as their weight: a minimal declaration prices at almost nothing
-    /// and a gas limit may be zero, while every committed transaction
-    /// costs a tick entry, a tick-chain entry, a receipt and mempool
-    /// tracking whatever it declared.
+    /// What this transaction declares it may consume, whole: the sum of
+    /// every owner's share and what every participating shard bears.
     ///
     /// Derived locally from the manifest and published metadata like
     /// every other routing quantity — nothing about it travels on the
-    /// wire, so a sender cannot understate it.
-    pub work: u64,
-    /// What the declaration claims it will touch, priced on the effects
-    /// crate's schedule — the one term of `work` a burn reads whole.
-    /// Carried beside the sum because the sum is not invertible.
-    pub footprint: u64,
+    /// wire, so a sender cannot understate it. What the fee prices, on
+    /// every outcome.
+    pub work: DeclaredWork,
+    /// The declaration's terms by the owner prefix they fall under: the
+    /// effects declared on the owner's cells, the ceilings of the nodes
+    /// targeting it, the artifacts those nodes instantiate, and the
+    /// kernel cells written under it. Sorted and unique by owner.
+    ///
+    /// What a shard's own share is read off: the shares of the owners
+    /// it holds under a placement, plus [`Self::everywhere`].
+    pub shares: Vec<OwnerShare>,
+    /// What every shard that commits the transaction bears whatever it
+    /// holds: the committed cell it writes, and the whole retention,
+    /// since every validator keeps the envelope and its receipt.
+    pub everywhere: DeclaredWork,
     /// Each manifest node's placement-free shape, in node order. Empty
     /// for a publish, which has no manifest to divide.
     pub legs: Vec<LegShape>,
@@ -320,6 +322,25 @@ pub struct Derived {
     /// counts for a shard against
     /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
     pub nullifiers: Vec<SubstateKey>,
+}
+
+/// One owner prefix's share of a transaction's declared work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerShare {
+    /// The owner prefix the share falls under.
+    pub owner: Address,
+    /// What the transaction declares against this owner's cells and the
+    /// nodes that target it.
+    pub work: DeclaredWork,
+}
+
+/// The vector a transaction declares whole: every share plus what each
+/// committing shard bears once.
+#[must_use]
+pub fn whole_work(shares: &[OwnerShare], everywhere: DeclaredWork) -> DeclaredWork {
+    shares
+        .iter()
+        .fold(everywhere, |total, share| total.saturating_add(share.work))
 }
 
 /// Why a derivation did not answer.

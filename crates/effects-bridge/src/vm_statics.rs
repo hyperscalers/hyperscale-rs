@@ -13,27 +13,29 @@
 //! nullifier creation writes ride the routed sets, so admission
 //! conflicts on them like any other exclusive key.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt, Hash,
-    MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, ProtocolStatics, Routing,
-    TimestampRange, TransactionEnvelope, WeightedTimestamp, declared_work,
+    MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, OwnerShare, ProtocolStatics, Routing,
+    TimestampRange, TransactionEnvelope, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AdmittedTree, ChainRecords, Claim, CrossingSite, EnvelopeTree, IntentHeader, ManifestHash,
-    PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree,
-    child_key, effect_units, footprint, legs_of, package_hash,
-    package_key as canonical_package_key, principal_address, protocol_resource, route_tree,
+    AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
+    IntentHeader, MARKER_CELL_BYTES, ManifestHash, PackageHash, PrefixShardResolver,
+    Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key, effect_units, legs_of,
+    package_hash, package_key as canonical_package_key, principal_address, protocol_resource,
+    route_tree,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, Effect, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr, ResourceAddr,
-    SchemeId, SubstateKey,
+    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
+    LegShape, LocalKey, MAX_EVENT_BYTES_PER_TX, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId,
+    SubstateKey, read_bytes, write_bytes,
 };
 
 use crate::ProtocolHasher;
@@ -88,41 +90,192 @@ pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
     records.into_iter().map(|(_, record)| record).collect()
 }
 
-/// What a manifest transaction declares it will touch, priced on the
-/// engine's own schedule.
-///
-/// The declaration spans every shard it routes to, because the
-/// reservation is taken once against the whole of it — and every value
-/// edge's record and claim beside it, which the engine declares at
-/// prepare wherever the edge turns out to cross: placement is a fact of
-/// the anchor, and the price is fixed when the envelope is composed.
-/// With the fixed charge for carrying the transaction and the ceiling
-/// it signed for its own execution, this is its work.
-#[must_use]
-pub fn declared_footprint(routing: &RoutedTransaction, legs: &[LegShape]) -> u64 {
-    routing
-        .per_shard
-        .values()
-        .fold(0u64, |total, set| total.saturating_add(footprint(set)))
-        .saturating_add(crossing_cells_footprint(legs))
+/// The footprint of one point write on the effects schedule: what a
+/// kernel cell the declaration does not name — a record, a claim, the
+/// committed cell — costs in exclusion and depth.
+const fn point_write_units() -> u64 {
+    effect_units(Effect {
+        target: EffectTarget::Point(SubstateKey {
+            owner: Address::new([0; 31], AddressClass::Component),
+            local: LocalKey([0; 16]),
+        }),
+        mode: Mode::Write { moves: Moves::Both },
+    })
 }
 
-/// The footprint of the cells a transaction's value edges write.
+/// The owner prefix a declared target's cells fall under.
+const fn target_owner(target: &EffectTarget) -> Address {
+    match target {
+        EffectTarget::Point(key) => key.owner,
+        EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => *owner,
+    }
+}
+
+/// What a call transaction declares, by the owner prefix each term
+/// falls under, and what every committing shard bears beside the shares.
 ///
-/// The record under the producer and the claim under the consumer, each
-/// a point write on the effects schedule, for every edge whether or not
-/// it crosses at any placement.
+/// The declaration spans every shard it routes to, because the price is
+/// taken once against the whole of it — and every value edge's record
+/// and claim beside it, which the engine declares at prepare wherever
+/// the edge turns out to cross: placement is a fact of the anchor, and
+/// the price is fixed when the envelope is composed. A node's ceiling
+/// sits under its target, each distinct package's artifact under the
+/// first node that runs it, and the verification of every signature
+/// under the payer, whose shard engages the reservation. The whole is
+/// the shares plus what every shard bears.
+///
+/// `envelope_bytes` is the envelope's own encoded length, the one term
+/// of retention no derivation of the tree can see.
 #[must_use]
-pub fn crossing_cells_footprint(legs: &[LegShape]) -> u64 {
-    crossing_records(legs)
+pub fn declared_vector(
+    packages: &PackageCache,
+    vm: &TransactionEnvelope,
+    routing: &RoutedTransaction,
+    legs: &[LegShape],
+    envelope_bytes: u64,
+) -> (Vec<OwnerShare>, DeclaredWork) {
+    let mut by_owner: BTreeMap<Address, DeclaredWork> = BTreeMap::new();
+    let mut add = |owner: Address, term: DeclaredWork| {
+        let share = by_owner.entry(owner).or_default();
+        *share = share.saturating_add(term);
+    };
+
+    // The declaration's effects, each under its target's owner. Reads
+    // are per target, since one leaf read once serves every mode
+    // declared on it; writes and footprint are per effect.
+    let set = &routing.declaration().set;
+    let mut read_targets = BTreeSet::new();
+    for effect in set.iter() {
+        let width = set.width_of(&effect.target);
+        let read = if read_targets.insert(effect.target) {
+            read_bytes(&effect.target, width)
+        } else {
+            0
+        };
+        add(
+            target_owner(&effect.target),
+            DeclaredWork {
+                read_bytes: read,
+                write_bytes: write_bytes(&effect.target, effect.mode, width),
+                footprint: effect_units(effect),
+                ..DeclaredWork::ZERO
+            },
+        );
+    }
+
+    // Every value edge's record under its producer and claim under its
+    // consumer, at the kernel's own widths, whether or not the edge
+    // crosses at any placement.
+    let point_write = point_write_units();
+    for consumer in legs {
+        for edge in &consumer.edges {
+            let Some(producer) = legs.get(edge.source as usize) else {
+                continue;
+            };
+            add(
+                producer.target,
+                DeclaredWork {
+                    write_bytes: u64::from(CROSSING_CELL_BYTES),
+                    footprint: point_write,
+                    ..DeclaredWork::ZERO
+                },
+            );
+            add(
+                consumer.target,
+                DeclaredWork {
+                    write_bytes: u64::from(MARKER_CELL_BYTES),
+                    footprint: point_write,
+                    ..DeclaredWork::ZERO
+                },
+            );
+        }
+    }
+
+    // Each node's ceiling under its target, and each distinct package's
+    // artifact once, under the first node that runs it.
+    let mut seen = BTreeSet::new();
+    for (index, (leg, call)) in legs.iter().zip(&routing.calls).enumerate() {
+        let artifact = if seen.insert(call.package) {
+            packages.artifact_bytes(call.package).unwrap_or(0)
+        } else {
+            0
+        };
+        add(
+            leg.target,
+            DeclaredWork {
+                compute: vm.gas_limits.get(index).copied().unwrap_or(0),
+                read_bytes: artifact,
+                ..DeclaredWork::ZERO
+            },
+        );
+    }
+
+    // Verification at the payer's shard, where the reservation engages.
+    let signatures = vm.signatures();
+    add(
+        vm.fee_payer.address(),
+        DeclaredWork {
+            compute: signatures.compute,
+            ..DeclaredWork::ZERO
+        },
+    );
+
+    let shares: Vec<OwnerShare> = by_owner
         .into_iter()
-        .fold(0u64, |total, record| {
-            let cell = effect_units(Effect {
-                target: EffectTarget::Point(record),
-                mode: Mode::Write { moves: Moves::Both },
-            });
-            total.saturating_add(cell.saturating_mul(2))
-        })
+        .map(|(owner, work)| OwnerShare { owner, work })
+        .collect();
+    // A package with an event table may fill the transaction's event
+    // allowance, and the receipt that carries it is retained like the
+    // envelope.
+    let metadata = packages.load();
+    let events = if routing.calls.iter().any(|call| {
+        metadata
+            .get(call.package)
+            .is_some_and(|package| !package.events.is_empty())
+    }) {
+        MAX_EVENT_BYTES_PER_TX as u64
+    } else {
+        0
+    };
+    let everywhere = everywhere(&shares, envelope_bytes, signatures.retention, events);
+    (shares, everywhere)
+}
+
+/// What every shard that commits a transaction bears whatever it holds:
+/// the committed cell it writes, and the retention every validator
+/// keeps — the envelope, every write, the auth material, and the events
+/// its packages may emit.
+fn everywhere(
+    shares: &[OwnerShare],
+    envelope_bytes: u64,
+    auth_bytes: u64,
+    event_bytes: u64,
+) -> DeclaredWork {
+    let committed_cell = u64::from(MARKER_CELL_BYTES);
+    let written = shares.iter().fold(committed_cell, |total, share| {
+        total.saturating_add(share.work.write_bytes)
+    });
+    DeclaredWork {
+        write_bytes: committed_cell,
+        retention: envelope_bytes
+            .saturating_add(written)
+            .saturating_add(auth_bytes)
+            .saturating_add(event_bytes),
+        ..DeclaredWork::ZERO
+    }
+}
+
+/// The envelope's own encoded length: the one term of retention the
+/// tree does not carry.
+///
+/// # Errors
+///
+/// A locally built envelope past the wire caps, which a decoded one
+/// never is.
+pub fn envelope_bytes(vm: &TransactionEnvelope) -> Result<u64, DerivationError> {
+    hbor_to_vec(vm)
+        .map(|bytes| bytes.len() as u64)
+        .map_err(|error| DerivationError::Refused(format!("envelope encodes: {error}")))
 }
 
 /// The protocol fee and transfer resource: the genesis publisher's
@@ -561,19 +714,31 @@ impl BridgeStatics {
         write_keys.dedup();
 
         // A publish never reaches the kernel, so it declares no effects
-        // for `footprint` to price. Its footprint stands in as the two
-        // exclusive cells it claims plus the artifact it writes whole
-        // into state — the largest transaction the protocol admits, and
-        // one the declared side would otherwise price as the smallest.
-        let footprint = (write_keys.len() as u64).saturating_add(artifact.len() as u64);
-        let work = declared_work(footprint, vm.gas_limit_total(), vm.signature_work());
+        // to price. Its vector stands in as the two exclusive point
+        // writes it claims — the package cell, written whole with the
+        // artifact, and the vault the fee burns from — under the
+        // publisher, with its one ceiling and its signature.
+        let signatures = vm.signatures();
+        let written = (artifact.len() as u64).saturating_add(AMOUNT_CELL_BYTES as u64);
+        let shares = vec![OwnerShare {
+            owner: publisher.address(),
+            work: DeclaredWork {
+                compute: vm.gas_limit_total().saturating_add(signatures.compute),
+                write_bytes: written,
+                footprint: point_write_units().saturating_mul(write_keys.len() as u64),
+                ..DeclaredWork::ZERO
+            },
+        }];
+        let everywhere = everywhere(&shares, envelope_bytes(vm)?, signatures.retention, 0);
+        let work = whole_work(&shares, everywhere);
 
         Ok(Derived {
             // A publish carries no tree, so nothing narrows the window
             // its composer signed and nothing binds a subintent.
             effective_window: vm.validity_window(),
             work,
-            footprint,
+            shares,
+            everywhere,
             // No manifest, so nothing to divide, nothing crossing, and no
             // subintent bound; the publisher pays and signs.
             legs: Vec::new(),
@@ -709,16 +874,14 @@ impl Derivation for BridgeStatics {
         vm.admit_terms(routing.calls.len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let legs = legs_of(&admitted.admitted);
-        let declared_footprint = declared_footprint(&routing, &legs);
-        let work = declared_work(
-            declared_footprint,
-            vm.gas_limit_total(),
-            vm.signature_work(),
-        );
+        let (shares, everywhere) =
+            declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?);
+        let work = whole_work(&shares, everywhere);
         Ok(Derived {
             effective_window,
             work,
-            footprint: declared_footprint,
+            shares,
+            everywhere,
             legs,
             nullifiers: admitted
                 .subintents
@@ -792,7 +955,8 @@ impl ProtocolStatics for BridgeStatics {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TX_UNITS, TransactionBody,
+        CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, ShardId, ShardTrie,
+        Transaction, TransactionBody,
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
@@ -803,7 +967,7 @@ mod tests {
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
-    use hyperscale_vm_types::{AddressClass, CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr};
+    use hyperscale_vm_types::{CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr};
 
     use super::*;
     use crate::records::record_address;
@@ -1034,25 +1198,96 @@ mod tests {
             "nothing bound, nothing spent"
         );
 
-        // The footprint is the term of the price the declaration fixes,
-        // carried whole beside the sum it feeds — and it prices the
-        // crossing's record and claim beside what the routing declares.
-        let cells = crossing_cells_footprint(&derived.legs);
-        assert_eq!(
-            cells,
-            2 * effect_units(Effect {
-                target: EffectTarget::Point(records[0]),
-                mode: Mode::Write { moves: Moves::Both },
-            }),
-            "one record and one claim, each a point write"
+        // The crossing's record and claim are priced beside what the
+        // routing declares: the record under the producer at the
+        // crossing cell's width, the claim under the consumer at the
+        // marker's, each a point write on the footprint schedule.
+        let point_write = effect_units(Effect {
+            target: EffectTarget::Point(records[0]),
+            mode: Mode::Write { moves: Moves::Both },
+        });
+        let share = |owner: Address| {
+            derived
+                .shares
+                .iter()
+                .find(|share| share.owner == owner)
+                .map(|share| share.work)
+                .expect("the owner has a share")
+        };
+        let producer = share(composer_addr().address());
+        let consumer = share(bob_addr().address());
+        assert!(
+            producer.write_bytes >= u64::from(CROSSING_CELL_BYTES)
+                && producer.footprint > point_write,
+            "the record sits under the producer beside its own declaration"
         );
         assert!(
-            derived.footprint > cells,
-            "the routing's own declaration is priced beside them"
+            consumer.write_bytes >= u64::from(MARKER_CELL_BYTES)
+                && consumer.footprint >= point_write,
+            "the claim sits under the consumer"
         );
         assert_eq!(
             derived.work,
-            declared_work(derived.footprint, vm.gas_limit_total(), vm.signature_work())
+            whole_work(&derived.shares, derived.everywhere),
+            "the whole is the shares plus what every shard bears"
+        );
+        assert_eq!(
+            derived.work.compute,
+            vm.gas_limit_total() + vm.signatures().compute,
+            "compute is the ceilings and the verification"
+        );
+        assert_eq!(
+            derived.work.retention, derived.everywhere.retention,
+            "retention is borne whole by every shard"
+        );
+    }
+
+    /// A shard's share under a placement is the shares of the owners
+    /// it holds plus what every shard bears: over every shard of a trie
+    /// the shares sum to the whole in compute and footprint, and each
+    /// carries the whole retention.
+    #[test]
+    fn local_shares_sum_to_the_whole_across_a_trie() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let tx = Transaction::new(envelope(&tree, &[]));
+        let whole = tx.try_derived(&statics()).expect("derives").work;
+
+        let split = ShardTrie::from_leaves([ShardId::leaf(1, 0), ShardId::leaf(1, 1)]);
+        let (payer, bob) = (
+            split.shard_for_prefix(composer_addr().address()),
+            split.shard_for_prefix(bob_addr().address()),
+        );
+        assert_ne!(
+            payer, bob,
+            "the ends must sit apart for the shares to split"
+        );
+        let mine = tx.local_work(&split, payer);
+        let theirs = tx.local_work(&split, bob);
+        assert_eq!(mine.compute + theirs.compute, whole.compute);
+        assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
+        assert_eq!(mine.retention, whole.retention);
+        assert_eq!(theirs.retention, whole.retention);
+        assert!(
+            mine.compute > theirs.compute,
+            "the payer's shard runs the sign-in and the withdraw and verifies the signature"
+        );
+        assert!(theirs.compute > 0, "the recipient's shard runs the deposit");
+        // Both shards write the committed cell, so writes sum past the
+        // whole by exactly one marker.
+        assert_eq!(
+            mine.write_bytes + theirs.write_bytes,
+            whole.write_bytes + u64::from(MARKER_CELL_BYTES)
+        );
+
+        let one = ShardTrie::from_leaves([ShardId::ROOT]);
+        assert_eq!(
+            tx.local_work(&one, ShardId::ROOT),
+            whole,
+            "one shard holding everything bears the whole"
         );
     }
 
@@ -1176,16 +1411,12 @@ mod tests {
         );
     }
 
-    /// Work is what a block pays to carry a transaction: a fixed charge
-    /// nobody escapes, plus what it declared, plus what it signed for.
-    ///
-    /// The fixed term is the part that matters. Without it a minimal
-    /// zero-gas transaction would price at almost nothing, and a budget
-    /// over work would bound weight while the transaction count — which
-    /// is what tick entries, tick-chain entries and receipts scale with
-    /// — ran free.
+    /// The vector carries what the envelope signed for and what every
+    /// validator keeps of it: the ceilings and the verification as
+    /// compute, the envelope's own bytes and its writes as retention, and
+    /// the artifacts its nodes instantiate as reads.
     #[test]
-    fn work_prices_the_fixed_cost_of_carrying_a_transaction() {
+    fn work_carries_the_ceilings_the_envelope_and_the_artifacts() {
         let tree = single_intent_tree(vec![
             sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
@@ -1193,17 +1424,35 @@ mod tests {
         ]);
         let vm = envelope(&tree, &[]);
         let derived = statics().derive(&vm).expect("derives");
+        let envelope_bytes = envelope_bytes(&vm).expect("encodes");
 
-        // The envelope's own ceilings are in there, summed over its
-        // nodes, and so is a charge no declaration can shrink.
-        assert!(
-            derived.work > TX_UNITS + vm.gas_limit_total(),
-            "work must carry the fixed charge and the signed ceilings: {}",
-            derived.work
+        assert_eq!(
+            derived.work.compute,
+            vm.gas_limit_total() + vm.signatures().compute
         );
+        assert!(
+            derived.work.retention
+                >= envelope_bytes + derived.work.write_bytes + vm.signatures().retention,
+            "retention carries the envelope, every write and the auth material"
+        );
+        // The account package has an event table, so the event
+        // allowance is retained whole.
+        assert!(derived.work.retention >= MAX_EVENT_BYTES_PER_TX as u64);
+        // The fixture statics know the account package's metadata and
+        // not its artifact, so nothing is read for it; a statics that
+        // does adds the artifact once however many nodes run it.
+        let with_artifact = statics();
+        with_artifact.cache.publish(
+            PackageHash(ProtocolHasher.hash(b"package", &[b"account"])),
+            account::metadata(),
+            12_345,
+        );
+        let priced = with_artifact.derive(&vm).expect("derives");
+        assert_eq!(priced.work.read_bytes, derived.work.read_bytes + 12_345);
 
-        // A second recipient declares more, so it costs more — nothing
-        // else about the two envelopes differs.
+        // A second recipient declares more, so it costs more in every
+        // dimension the declaration reaches — nothing else about the two
+        // envelopes differs.
         let wider = single_intent_tree(vec![
             sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
@@ -1213,8 +1462,11 @@ mod tests {
         ]);
         let wider = statics().derive(&envelope(&wider, &[])).expect("derives");
         assert!(
-            wider.work > derived.work,
-            "a wider declaration must not be cheaper: {} vs {}",
+            wider.work.footprint > derived.work.footprint
+                && wider.work.write_bytes > derived.work.write_bytes
+                && wider.work.read_bytes > derived.work.read_bytes
+                && wider.work.retention > derived.work.retention,
+            "a wider declaration must not be cheaper: {:?} vs {:?}",
             wider.work,
             derived.work
         );
@@ -1245,8 +1497,8 @@ mod tests {
         let wider = statics().derive(&wider.sign(&secp)).expect("derives");
 
         assert!(
-            wider.work > ed.work,
-            "a wider signature scheme must not verify for free: {} vs {}",
+            wider.work.compute > ed.work.compute && wider.work.retention > ed.work.retention,
+            "a wider signature scheme must not verify for free: {:?} vs {:?}",
             wider.work,
             ed.work
         );

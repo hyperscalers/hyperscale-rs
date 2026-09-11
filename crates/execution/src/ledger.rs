@@ -25,9 +25,10 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE, Probed,
-    RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash,
-    TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Window,
+    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
+    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Window,
 };
 
 /// What the chain read of one cell a counterpart was asked about:
@@ -659,7 +660,7 @@ impl Ledger {
     ) {
         for (tx, classified) in members {
             let owed = Owed {
-                figures: UnsettledTx::for_transaction(tx, committed),
+                figures: UnsettledTx::for_transaction(tx, committed, &PriceTable::GENESIS),
                 certified: false,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
@@ -1640,7 +1641,7 @@ mod tests {
         UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            declared_work: tx.work(),
+            charged: tx.price(&PriceTable::GENESIS),
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
@@ -1654,7 +1655,7 @@ mod tests {
 
     /// The burn an abort of `tx` settles.
     fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
-        UnsettledTx::for_transaction(tx, committed_at(tx)).charge
+        UnsettledTx::for_transaction(tx, committed_at(tx), &PriceTable::GENESIS).charge
     }
 
     /// A committed transaction is owed an outcome from the moment its

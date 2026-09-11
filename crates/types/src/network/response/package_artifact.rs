@@ -3,7 +3,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::network::request::MAX_PACKAGE_ARTIFACTS_PER_REQUEST;
-use crate::{MAX_TX_BYTES_LEN, MessageClass, NetworkMessage};
+use crate::{MAX_ARTIFACT_BYTES, MessageClass, NetworkMessage};
 
 /// Response to a package artifact fetch request.
 ///
@@ -30,7 +30,7 @@ fn artifacts_fit(response: &GetPackageArtifactsResponse) -> Result<(), &'static 
     if response
         .artifacts
         .iter()
-        .all(|artifact| artifact.len() <= MAX_TX_BYTES_LEN)
+        .all(|artifact| artifact.len() <= MAX_ARTIFACT_BYTES)
     {
         Ok(())
     } else {

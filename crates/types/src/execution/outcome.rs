@@ -148,23 +148,25 @@ pub struct TxOutcome {
     /// one, so an attempt that failed or aborted still reports the
     /// declaration work it really did.
     attested_work: u64,
-    /// What carrying this transaction cost a block, in work units — the
-    /// quantity admission reserved against the drain budget.
+    /// What this transaction was charged, in quanta: its declared vector
+    /// at the table in force at its block's anchor, raised by its signed
+    /// priority.
     ///
-    /// The mirror image of [`TxOutcome::attested_work`]. That is this
-    /// shard's own share of what the transaction *cost*, which
-    /// participants are meant to differ on; this is what it *reserved*,
-    /// derived from the whole declaration and therefore identical on
-    /// every participant.
+    /// Attested rather than re-derived because a validator holding the
+    /// certificate but not the transaction — a node that snap-synced
+    /// past it — still has to reach the same figure, and because the
+    /// beacon weighs a shard's emission by what its certificates settled.
+    /// Zero for a member whose shard charged the transaction already.
+    charged: u128,
+    /// Whether the block that committed this member took a place in the
+    /// drain for it, which its settlement gives back.
     ///
-    /// Attested rather than re-derived because release has to work
-    /// without the transaction. A block settling a tick releases the
-    /// reservation its committing block took, and a validator holding
-    /// the certificate but not the transactions — a node that snap-synced
-    /// past them — still has to reach the same total. Reserving one
-    /// number and releasing another leaves the running total drifting
-    /// upward and never returning to zero.
-    declared_work: u64,
+    /// False for the second member a mixed shard runs of one
+    /// transaction: its issuing member took the place, settled the price
+    /// and committed the signers' nullifiers, so this one releases
+    /// nothing. Attested for the reason `charged` is: the settling block
+    /// counts what it releases with no history behind it.
+    reserved: bool,
     /// The other shards party to the transaction — the ones whose
     /// certificates its settlement waits on. Ascending and distinct;
     /// empty for a transaction reaching no further than this shard.
@@ -174,7 +176,7 @@ pub struct TxOutcome {
     /// left out: the certificate carrying this outcome is its report.
     ///
     /// Attested rather than re-derived for the reason
-    /// [`TxOutcome::declared_work`] is — a validator holding the
+    /// [`TxOutcome::charged`] is — a validator holding the
     /// certificate but not the transaction still has to reach the same
     /// answer — and it is what lets a set of certificates state how
     /// complete it needs to be. Without it the rule discarding a refused
@@ -237,7 +239,8 @@ impl TxOutcome {
     pub const fn attesting(tx_hash: TxHash, outcome: ExecutionOutcome, work: u64) -> Self {
         Self {
             attested_work: work,
-            declared_work: 0,
+            charged: 0,
+            reserved: false,
             tx_hash,
             outcome,
             fee_receipt: None,
@@ -257,10 +260,12 @@ impl TxOutcome {
         self
     }
 
-    /// Bind what this transaction reserved against the drain budget.
+    /// Bind what this transaction was charged, and that its committing
+    /// block took a place in the drain for it.
     #[must_use]
-    pub const fn reserving(mut self, declared_work: u64) -> Self {
-        self.declared_work = declared_work;
+    pub const fn reserving(mut self, charged: u128) -> Self {
+        self.charged = charged;
+        self.reserved = true;
         self
     }
 
@@ -357,7 +362,8 @@ impl TxOutcome {
     ) -> Self {
         Self {
             attested_work: work,
-            declared_work: 0,
+            charged: 0,
+            reserved: false,
             tx_hash,
             outcome,
             fee_receipt: Some(fee_receipt),
@@ -382,10 +388,17 @@ impl TxOutcome {
         self.attested_work
     }
 
-    /// What carrying this transaction reserved against the drain budget.
+    /// What this transaction was charged, in quanta.
     #[must_use]
-    pub const fn declared_work(&self) -> u64 {
-        self.declared_work
+    pub const fn charged(&self) -> u128 {
+        self.charged
+    }
+
+    /// Whether this member's committing block took a place in the drain
+    /// for it, which its settlement gives back.
+    #[must_use]
+    pub const fn reserved(&self) -> bool {
+        self.reserved
     }
 
     /// The fee receipt this outcome settles, if any.

@@ -368,11 +368,11 @@ impl ShardParticipation {
         // work therefore lowers this shard's admission ceiling for good,
         // and the failure that has to stay impossible is the chain
         // stopping rather than the ceiling dropping.
-        if !drain_admits_block(header.work_in_flight(), total_tx_count) {
+        if !drain_admits_block(header.txs_in_flight(), total_tx_count) {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
-                work_in_flight = header.work_in_flight().inner(),
+                txs_in_flight = header.txs_in_flight().inner(),
                 tx_count = total_tx_count,
                 "Rejecting block that adds to a drain already over the work budget"
             );
@@ -505,7 +505,7 @@ mod tests {
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]),
-                work_in_flight: header.work_in_flight(),
+                txs_in_flight: header.txs_in_flight(),
                 ..Default::default()
             });
         }

@@ -66,7 +66,7 @@ mod reservation_tests {
     use super::{compute_global_receipt_root, tx_outcome_leaf};
     use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash, TxOutcome};
 
-    fn outcome(reserved: u64) -> TxOutcome {
+    fn outcome(reserved: u128) -> TxOutcome {
         TxOutcome::attesting(
             TxHash::from(Hash::from_bytes(b"tx")),
             ExecutionOutcome::Succeeded {

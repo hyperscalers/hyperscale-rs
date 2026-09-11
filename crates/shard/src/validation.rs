@@ -545,7 +545,7 @@ mod tests {
             local_receipt_root: base.local_receipt_root(),
             provision_root: base.provision_root(),
             provision_tx_roots: base.provision_tx_roots().clone(),
-            work_in_flight: base.work_in_flight(),
+            txs_in_flight: base.txs_in_flight(),
             ..Default::default()
         })
     }
@@ -962,34 +962,53 @@ mod tests {
     ///
     /// An envelope binds at most `MAX_SUBINTENTS`, so the cap is reached
     /// by a block of fully composed transactions rather than by one
-    /// transaction — which is the shape it is sized for.
+    /// transaction — which is the shape it is sized for. Every nullifier
+    /// is a signature to verify, so enough of them to fill the cap would
+    /// pass the compute cap first; the fold starts near the cap and a
+    /// few fill it, so what is judged is the count at the one that
+    /// carries it past.
     #[test]
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
+        use crate::admission::ProvisionsFold;
+
         // Each fully composed transaction creates its subintents'
         // nullifiers, all on this one shard, and its committed cell
         // beside them.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
-            .map(|i| {
-                Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
-                    u32::try_from(i).expect("fewer than u32 transactions"),
-                    MAX_SUBINTENTS,
-                    test_utils::test_validity_range(),
-                )))
-            })
-            .collect();
-        let at_cap = block_with_transactions(BlockHeight::new(3), txs.clone());
-        assert!(admit(&plain(), &at_cap).is_ok());
-
-        txs.push(Arc::new(Verifiable::from(
-            test_utils::stub_transaction_binding(
-                u32::MAX,
+        let cells = MAX_SUBINTENTS + 1;
+        let full = 3;
+        let composed = |seed: u32| {
+            Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
+                seed,
                 MAX_SUBINTENTS,
                 test_utils::test_validity_range(),
-            ),
-        )));
-        let over = block_with_transactions(BlockHeight::new(3), txs);
-        let err = admit(&plain(), &over).expect_err("past the cap is refused");
+            )))
+        };
+        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
+            .map(|i| composed(u32::try_from(i).expect("fewer than u32 transactions")))
+            .collect();
+        let against = plain();
+        let provisions = ProvisionsFold::default();
+        let near_cap = || {
+            let mut fold = TransactionsFold::beside(&provisions);
+            fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells;
+            fold
+        };
+        let mut at_cap = near_cap();
+        admit_all::<TransactionsSection<'_>>(
+            &against.ctx(),
+            &mut at_cap,
+            txs.iter().map(unwrapped),
+        )
+        .expect("a block at the cap is admitted");
+        assert_eq!(at_cap.sweepable, MAX_SWEEPABLE_CREATED_PER_BLOCK);
+
+        txs.push(composed(u32::MAX));
+        let err = admit_all::<TransactionsSection<'_>>(
+            &against.ctx(),
+            &mut near_cap(),
+            txs.iter().map(unwrapped),
+        )
+        .expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
 
         // A block that binds nothing creates only its transactions'
@@ -1109,7 +1128,7 @@ mod tests {
         UnsettledTx {
             tx_hash,
             deadline: Deadline::of(WeightedTimestamp::from_millis(900)),
-            declared_work: 11,
+            charged: 11,
             charge: stub_abort_charge(11),
             committed: CommittedAt {
                 height: BlockHeight::new(1),

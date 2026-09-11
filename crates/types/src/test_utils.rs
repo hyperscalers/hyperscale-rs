@@ -6,7 +6,7 @@ use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_hbor::Hash32;
 use hyperscale_vm_types::{
-    Address, AddressClass, LegRole, LegShape, LocalKey, Mode, Moves, PrincipalAddr,
+    Address, AddressClass, DeclaredWork, LegRole, LegShape, LocalKey, Mode, Moves, PrincipalAddr,
     SWEEP_BUCKET_BYTES, SchemeId, SubintentHash, SubstateKey, SweepBucket, ValueEdge,
 };
 
@@ -21,7 +21,7 @@ use crate::{
     SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubintentSig, TickHalf, TickId,
     TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
     TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
     install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
@@ -1010,6 +1010,13 @@ impl Derivation for StubVmStatics {
             .iter()
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
+        let work = DeclaredWork {
+            compute: vm.gas_limit_total(),
+            footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
+            retention: vm.message.len() as u64,
+            ..DeclaredWork::ZERO
+        }
+        .saturating_add(vm.signatures());
         Ok(Derived {
             // A stub derives no tree, so the envelope's own window is
             // the whole of it.
@@ -1047,15 +1054,14 @@ impl Derivation for StubVmStatics {
             auth_cell_local: [0xAE; 16],
             packages,
             // The stub prices a declared key like the real derivation
-            // prices an effect — one unit each — and hands the total to
-            // the same schedule, so a stubbed transaction and a derived
-            // one are priced by the same function.
-            work: declared_work(
-                (read_prefixes.len() + write_prefixes.len()) as u64,
-                vm.gas_limit_total(),
-                vm.signature_work(),
-            ),
-            footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
+            // prices an effect — one unit each — and hands the vector to
+            // the same table, so a stubbed transaction and a derived one
+            // are priced by the same function.
+            work,
+            // A stub derives no owners to divide the vector by, so every
+            // shard bears the whole of it.
+            shares: Vec::new(),
+            everywhere: work,
             // A stub derives no manifest, so it has no legs to divide;
             // its payer is the one party its routing declares.
             legs: Vec::new(),
@@ -1285,6 +1291,36 @@ pub fn stub_transaction_running(
     max_fee: u128,
     validity: TimestampRange,
 ) -> Transaction {
+    stub_transaction_declaring(
+        fee_payer,
+        packages,
+        read_prefixes,
+        write_prefixes,
+        max_fee,
+        vec![1_000_000],
+        validity,
+    )
+}
+
+/// [`stub_transaction_running`] signing `gas_limits` for its compute.
+///
+/// What a test that fills a block's compute cap declares: the stub
+/// derivation reads the ceilings as the vector's compute and holds
+/// nothing else against them.
+///
+/// # Panics
+///
+/// As [`stub_transaction_running`].
+#[must_use]
+pub fn stub_transaction_declaring(
+    fee_payer: PrincipalAddr,
+    packages: &[Hash],
+    read_prefixes: &[Address],
+    write_prefixes: &[Address],
+    max_fee: u128,
+    gas_limits: Vec<u64>,
+    validity: TimestampRange,
+) -> Transaction {
     install_stub_protocol_statics();
     let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
     let mut tree = vec![u8::try_from(read_prefixes.len()).expect("stub read set fits a byte")];
@@ -1300,7 +1336,7 @@ pub fn stub_transaction_running(
         subintent_sigs: Vec::new(),
         fee_payer,
         max_fee,
-        gas_limits: vec![1_000_000],
+        gas_limits,
         priority_bp: 0,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),

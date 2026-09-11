@@ -27,7 +27,7 @@ use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
 };
-use hyperscale_vm_types::{Outcome, SubstateKey, price};
+use hyperscale_vm_types::{Outcome, PriceTable, SubstateKey};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
@@ -264,17 +264,18 @@ impl Executor {
         // producing a receipt root, and a client asking what an envelope
         // would do wants the answer for a component whose seal landed on
         // some other shard.
-        let prepared = match Self::prepare_with_authority(tx, &self.records(), authority) {
-            Ok(derived) => derived,
-            Err(reason) => return PreviewReport::refused(reason),
-        };
+        let prepared =
+            match Self::prepare_with_authority(tx, &self.records(), &self.world.cache, authority) {
+                Ok(derived) => derived,
+                Err(reason) => return PreviewReport::refused(reason),
+            };
         let payer = PayerFee {
             vault,
             max_fee: vm.max_fee,
             // The declaration's price, read off what prepared rather
             // than derived again: a preview under an assumed authority
             // admits what derivation would refuse.
-            price: price(prepared.work),
+            price: PriceTable::GENESIS.price(&prepared.work, vm.priority_bp),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.

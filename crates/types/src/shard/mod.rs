@@ -256,7 +256,7 @@ mod tests {
                 local_receipt_root: header.local_receipt_root(),
                 provision_root: header.provision_root(),
                 provision_tx_roots: header.provision_tx_roots().clone(),
-                work_in_flight: header.work_in_flight(),
+                txs_in_flight: header.txs_in_flight(),
                 beacon_witness_root: header.beacon_witness_root(),
                 beacon_witness_leaf_count: header.beacon_witness_leaf_count(),
                 beacon_witness_base: header.beacon_witness_base(),

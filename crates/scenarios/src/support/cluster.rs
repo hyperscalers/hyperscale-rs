@@ -7,8 +7,8 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, Derivation, Event, ShardId, Signer, StateRoot,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    WeightedTimestamp, WorkInFlight,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    WeightedTimestamp,
 };
 
 use super::Budget;
@@ -168,7 +168,7 @@ pub trait Cluster {
     /// An observation seam, like [`Self::chain_origin_anchor`]: a scenario
     /// asserting that stranded work returns to the drain has to read the
     /// level itself, and no transaction status reports it.
-    fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight>;
+    fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight>;
 
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;

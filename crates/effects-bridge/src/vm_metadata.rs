@@ -1,11 +1,11 @@
 //! The package-metadata section codec, as the chain reaches it.
 //!
 //! Both the codec and the byte budget are [`hyperscale_vm_gate`]'s: the
-//! cap is a share of [`MAX_TX_BYTES_LEN`], which is the vocabulary's own
-//! constant, so the number and the encoding it bounds sit together. What
-//! this module adds is the chain's error type.
+//! cap is a share of [`MAX_ARTIFACT_BYTES`], which is the vocabulary's
+//! own constant, so the number and the encoding it bounds sit together.
+//! What this module adds is the chain's error type.
 //!
-//! [`MAX_TX_BYTES_LEN`]: hyperscale_types::MAX_TX_BYTES_LEN
+//! [`MAX_ARTIFACT_BYTES`]: hyperscale_types::MAX_ARTIFACT_BYTES
 
 use hyperscale_types::DerivationError;
 use hyperscale_vm_effects::PackageMetadata;

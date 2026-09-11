@@ -1001,7 +1001,7 @@ mod tests {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&seed.to_le_bytes())),
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
-            declared_work: 5,
+            charged: 5,
             charge: AbortCharge {
                 vault: SubstateKey {
                     owner: Address::new([byte; 31], AddressClass::Component),

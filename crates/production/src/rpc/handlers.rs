@@ -35,7 +35,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_metrics_prometheus::encode_metrics;
 use hyperscale_types::{
-    Hash, Transaction, TransactionDecision, TransactionStatus, TxHash, WorkInFlight,
+    Hash, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
 };
 
 use super::state::RpcState;
@@ -313,7 +313,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
     // reject if any of them flags a congested remote shard.
     for v in snapshot.vnodes.values() {
         let threshold = v.remote_congestion_threshold;
-        if threshold <= WorkInFlight::ZERO {
+        if threshold <= TxsInFlight::ZERO {
             continue;
         }
         if let Some((&congested_shard, &count)) = v

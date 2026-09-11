@@ -18,8 +18,8 @@ use hyperscale_types::{
     ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
     ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, ShardTrie, SplitChildRoots, StateRoot,
     SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash,
-    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
-    WeightedTimestamp, WorkInFlight,
+    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1702,7 +1702,7 @@ impl VerificationPipeline {
     /// voting, running verifications only, or aborting.
     pub(crate) fn classify_vote_terms(
         &mut self,
-        parent_in_flight: Option<WorkInFlight>,
+        parent_in_flight: Option<TxsInFlight>,
         parent_settled_frontier: Option<BlockHeight>,
         block_hash: BlockHash,
         block: &Block,
@@ -1767,7 +1767,7 @@ impl VerificationPipeline {
 
     /// Verify the proposed drain total is deterministically correct.
     ///
-    /// `work_in_flight` = parent's + what this block's transactions
+    /// `txs_in_flight` = parent's + what this block's transactions
     /// reserve - what its certificates return.
     ///
     /// Both terms are read off the block itself, so every validator
@@ -1777,18 +1777,13 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        parent_in_flight: WorkInFlight,
+        parent_in_flight: TxsInFlight,
     ) -> bool {
-        let proposed = block.header().work_in_flight();
+        let proposed = block.header().txs_in_flight();
         let expected = parent_in_flight
-            .saturating_add(
-                block
-                    .transactions()
-                    .iter()
-                    .fold(0u64, |total, tx| total.saturating_add(tx.work())),
-            )
+            .saturating_add(block.transactions().len() as u64)
             .saturating_sub(block.certificates().iter().fold(0u64, |total, fw| {
-                total.saturating_add(fw.as_unverified().declared_work())
+                total.saturating_add(fw.as_unverified().released())
             }));
 
         if proposed == expected {
@@ -2263,7 +2258,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
             provision_tx_roots: std::collections::BTreeMap::new(),
-            work_in_flight: WorkInFlight::new(u64::from(in_flight)),
+            txs_in_flight: TxsInFlight::new(u64::from(in_flight)),
             load: ShardLoad::ZERO.advance(0, substate_bytes),
             ..Default::default()
         })
@@ -2440,7 +2435,7 @@ mod tests {
         let block_hash = block.hash();
 
         let out = vp.classify_vote_terms(
-            Some(WorkInFlight::ZERO),
+            Some(TxsInFlight::ZERO),
             Some(BlockHeight::GENESIS),
             block_hash,
             &block,
@@ -2468,7 +2463,7 @@ mod tests {
         let block_hash = block.hash();
 
         let out = vp.classify_vote_terms(
-            Some(WorkInFlight::ZERO),
+            Some(TxsInFlight::ZERO),
             Some(BlockHeight::GENESIS),
             block_hash,
             &block,
@@ -2486,7 +2481,7 @@ mod tests {
         let block_hash = block.hash();
 
         let out = vp.classify_vote_terms(
-            Some(WorkInFlight::ZERO),
+            Some(TxsInFlight::ZERO),
             Some(BlockHeight::GENESIS),
             block_hash,
             &block,
@@ -2495,30 +2490,26 @@ mod tests {
         assert!(matches!(out, InFlightCheck::Abort));
     }
 
-    /// The drain is what its transactions reserved, not how many there
-    /// are. A block carrying one transaction has to claim that
-    /// transaction's work — a count would have claimed one.
+    /// The drain is the count of what the block carries: a block
+    /// carrying one transaction claims one place, and a block claiming
+    /// any other figure is refused.
     #[test]
     fn the_drain_states_what_the_block_reserved() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
-        let reserved = tx.work();
-        assert!(
-            reserved > 1,
-            "a transaction reserves more than a count would give it: {reserved}"
-        );
+        let reserved = 1u32;
 
         let honest = block_claiming(
             BlockHeight::new(1),
             BlockHash::ZERO,
-            u32::try_from(reserved).expect("fits"),
+            reserved,
             vec![Arc::clone(&tx)],
             None,
         );
         let hash = honest.hash();
         assert!(matches!(
             vp.classify_vote_terms(
-                Some(WorkInFlight::ZERO),
+                Some(TxsInFlight::ZERO),
                 Some(BlockHeight::GENESIS),
                 hash,
                 &honest,
@@ -2527,13 +2518,14 @@ mod tests {
             InFlightCheck::Proceed
         ));
 
-        // Understating it would let a shard carry work the budget never
-        // saw, so the claim has to be exact rather than a ceiling.
-        let understated = block_with(BlockHeight::new(1), BlockHash::ZERO, 1, vec![tx]);
+        // Overstating or understating it would let a shard hold places
+        // the drain never saw taken or given back, so the claim has to
+        // be exact rather than a bound.
+        let understated = block_with(BlockHeight::new(1), BlockHash::ZERO, 2, vec![tx]);
         let hash = understated.hash();
         assert!(matches!(
             vp.classify_vote_terms(
-                Some(WorkInFlight::ZERO),
+                Some(TxsInFlight::ZERO),
                 Some(BlockHeight::GENESIS),
                 hash,
                 &understated,

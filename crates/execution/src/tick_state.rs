@@ -251,10 +251,13 @@ struct Seat {
     /// Whose certificate its settlement waits on, and who its own is
     /// owed to.
     membership: Membership,
-    /// The reservation its committing block took against the drain.
-    /// Carried apart from the transaction because an abandoned member
-    /// has no body here and still has to release exactly what was taken.
-    reserved_work: u64,
+    /// What the member was charged, where its committing block took a
+    /// place in the drain for it — `None` for the second member a mixed
+    /// shard runs, whose issuing member took the place and settled the
+    /// price. Carried apart from the transaction because an abandoned
+    /// member has no body here and still has to attest exactly what was
+    /// priced.
+    charged: Option<u128>,
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
     awaiting_result: bool,
@@ -309,10 +312,10 @@ struct Seat {
 
 impl Seat {
     /// A seat on the terms `admission` names.
-    const fn new(membership: Membership, reserved_work: u64, admission: Admission) -> Self {
+    const fn new(membership: Membership, charged: Option<u128>, admission: Admission) -> Self {
         Self {
             membership,
-            reserved_work,
+            charged,
             awaiting_result: admission.dispatched(),
             aborted: admission.aborts(),
             abandons: matches!(admission, Admission::Aborted),
@@ -429,7 +432,7 @@ impl TickState {
         &mut self,
         tx_hash: TxHash,
         membership: Membership,
-        reserved_work: u64,
+        charged: Option<u128>,
         admission: Admission,
     ) {
         if self.seats.contains_key(&tx_hash) {
@@ -437,7 +440,7 @@ impl TickState {
         }
         self.order.push(tx_hash);
         self.seats
-            .insert(tx_hash, Seat::new(membership, reserved_work, admission));
+            .insert(tx_hash, Seat::new(membership, charged, admission));
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -841,14 +844,18 @@ impl TickState {
                 let retracts = seat
                     .committed_cell
                     .filter(|_| !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
-                match charge {
+                let attested = match charge {
                     Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, seat.attested_work),
                     None => TxOutcome::attesting(*tx_hash, outcome, seat.attested_work),
+                };
+                // What the transaction was charged when its block
+                // committed it, and that the block took a place in the
+                // drain for it, carried so the settling block releases
+                // exactly that.
+                match seat.charged {
+                    Some(charged) => attested.reserving(charged),
+                    None => attested,
                 }
-                // What the transaction reserved when its block committed
-                // it, carried so the settling block can release exactly
-                // that.
-                .reserving(seat.reserved_work)
                 .awaiting(counterparts)
                 .escrowing(seat.escrowed.clone())
                 .crossing_to(targets)
@@ -1354,7 +1361,7 @@ mod tests {
             tick.admit(
                 tx_hash,
                 Membership::whole(BTreeSet::from([local, shard(1)])),
-                10,
+                Some(10),
                 Admission::Executes,
             );
             tick.record_committed_cell(tx_hash, cell);
@@ -1399,13 +1406,13 @@ mod tests {
         tick.admit(
             determined,
             Membership::whole(BTreeSet::from([local])),
-            10,
+            Some(10),
             Admission::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
-            20,
+            Some(20),
             Admission::Executes,
         );
         for tx_hash in [determined, leg] {
@@ -1447,7 +1454,7 @@ mod tests {
         tick.admit(
             member,
             Membership::whole(BTreeSet::from([local, peer])),
-            10,
+            Some(10),
             Admission::Executes,
         );
         let from_peer = |counterparts: Vec<ShardId>| {
@@ -1502,13 +1509,13 @@ mod tests {
         tick.admit(
             determined,
             Membership::whole(BTreeSet::from([local])),
-            10,
+            Some(10),
             Admission::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
-            20,
+            Some(20),
             Admission::Executes,
         );
         for tx_hash in [determined, leg] {
@@ -1583,8 +1590,8 @@ mod tests {
             "the half names its own members and no others",
         );
         assert_eq!(
-            half.declared_work(),
-            10,
+            (half.released(), half.charged()),
+            (1, 10),
             "and releases only what those members reserved",
         );
         assert!(!tick.has_spoken(), "the leg is still owed a verdict");
@@ -1625,7 +1632,7 @@ mod tests {
         assert!(tick.legs_ready());
         let half = tick.take_legs_finalization().expect("covered");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
-        assert_eq!(half.declared_work(), 20);
+        assert_eq!((half.released(), half.charged()), (1, 20));
         assert!(tick.has_spoken());
     }
 
@@ -1642,7 +1649,7 @@ mod tests {
         tick.admit(
             tx(1),
             Membership::whole(BTreeSet::from([local])),
-            10,
+            Some(10),
             Admission::Executes,
         );
         tick.record_execution_result(
@@ -1779,12 +1786,12 @@ mod tests {
         ));
         assert!(membership.role().delivers());
         assert_eq!(membership.role(), Role::Delivery);
-        tick.admit(delivery, membership, 10, Admission::Executes);
+        tick.admit(delivery, membership, Some(10), Admission::Executes);
         let issuer = tx(2);
         tick.admit(
             issuer,
             Membership::of(&Member::of(swap, leaf(0), Side::Issuing, participating)),
-            10,
+            Some(10),
             Admission::Executes,
         );
         tick.record_execution_result(delivery, ExecutionOutcome::Failed);
@@ -1832,7 +1839,7 @@ mod tests {
                 Side::Issuing,
                 BTreeSet::from([local, venue]),
             )),
-            10,
+            Some(10),
             Admission::Executes,
         );
 
