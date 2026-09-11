@@ -1,7 +1,7 @@
 //! Core `SimShardStorage` struct and basic implementations.
 //!
 //! In-memory storage for deterministic simulation testing (DST).
-//! Substates live in two `BTreeMaps`: `current_state: (key → value)`
+//! Substates live in two persistent maps: `current_state: (key → value)`
 //! for current-tip reads, and `state_history: ((key, write_version) →
 //! Option<prior>)` for historical reads. A read at
 //! version V below the current tip uses a single forward seek on
@@ -28,9 +28,10 @@ use super::state::{ConsensusState, SharedState, apply_writes};
 
 /// In-memory storage for simulation and testing.
 ///
-/// Substates live in a `current_state` `BTreeMap` (authoritative for
-/// current-tip reads) with a companion `state_history` `BTreeMap`
-/// capturing per-write prior values for historical reads. This mirrors
+/// Substates live in a `current_state` map (authoritative for
+/// current-tip reads) with a companion `state_history` map capturing
+/// per-write prior values for historical reads; both are persistent, so
+/// a snapshot shares their structure instead of copying it. This mirrors
 /// `RocksDbShardStorage`'s two-CF layout.
 ///
 /// Implements `Substates` directly, plus the `SubstateStore` /

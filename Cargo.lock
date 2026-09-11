@@ -2629,6 +2629,7 @@ dependencies = [
  "hyperscale-types",
  "hyperscale-vm-effects",
  "hyperscale-vm-types",
+ "im",
  "indexmap",
 ]
 

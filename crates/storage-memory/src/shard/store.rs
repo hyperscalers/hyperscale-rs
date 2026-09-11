@@ -135,7 +135,7 @@ impl SweepIndex for SimShardStorage {
             |bucket| state.sweep_index.from_bucket(bucket),
             |lo, hi, each| {
                 for (&key, value) in state.current_state.range(lo..=hi) {
-                    if !each(key, value) {
+                    if !each(key, &value[..]) {
                         break;
                     }
                 }

@@ -103,7 +103,7 @@ impl BoundaryStore for SimShardStorage {
             .range(prefix_low_key(&prefix)..)
             .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
             .filter(|(key, value)| is_record_cell(**key, value))
-            .map(|(key, value)| (*key, value.clone()))
+            .map(|(key, value)| (*key, value.to_vec()))
             .collect()
     }
 
@@ -211,13 +211,13 @@ impl BoundaryStore for SimShardStorage {
                 sweep,
             } = LeafRows::of(leaf.key, &leaf.value);
             if let Some((entry_key, value)) = entry {
-                state.current_entries.insert(entry_key, value);
+                state.current_entries.insert(entry_key, Arc::from(value));
             }
             if let Some(package) = package {
                 state.package_artifacts.insert(package, leaf.value.clone());
             }
             sweep_rows.delta(leaf.key.owner, None, sweep);
-            state.current_state.insert(leaf.key, leaf.value);
+            state.current_state.insert(leaf.key, Arc::from(leaf.value));
         }
         state.sweep_index.fold(&sweep_rows);
 

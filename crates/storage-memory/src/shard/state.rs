@@ -14,6 +14,7 @@ use hyperscale_types::{
     SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction,
     TxHash, ValidatorId, WeightedTimestamp,
 };
+use im::OrdMap;
 
 use super::tree_store::SimTreeStore;
 
@@ -21,11 +22,29 @@ use super::tree_store::SimTreeStore;
 // Shared substate + JMT state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Current value per substate key.
+pub type Cells = OrdMap<SubstateKey, Arc<[u8]>>;
+
+/// Prior value per `(key, write_version)`; `None` when the key was absent
+/// before that write.
+pub type CellHistory = OrdMap<(SubstateKey, u64), Option<Arc<[u8]>>>;
+
+/// Current value per ordered-collection entry.
+pub type Entries = OrdMap<EntryKey, Arc<[u8]>>;
+
+/// Prior value per `(entry key, write_version)`, mirroring [`CellHistory`].
+pub type EntryHistory = OrdMap<(EntryKey, u64), Option<Arc<[u8]>>>;
+
 /// Substate data and JMT state protected by a single `RwLock`.
 ///
 /// Using `RwLock` (instead of Mutex) allows concurrent read access: speculative
 /// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
+///
+/// The substate maps are persistent: a snapshot clones them by sharing
+/// their structure, so taking one costs the same whatever the state holds,
+/// and a write after it copies only the path it touches. Values are shared
+/// slices for the same reason — a copied path carries pointers, not bytes.
 #[derive(Clone)]
 pub struct SharedState {
     pub tree_store: SimTreeStore,
@@ -33,18 +52,18 @@ pub struct SharedState {
     pub current_root_hash: StateRoot,
     /// Current value per substate key. Absent key = no value. This is
     /// the authoritative source of truth for reads at the current tip.
-    pub current_state: BTreeMap<SubstateKey, Vec<u8>>,
+    pub current_state: Cells,
     /// Per-write prior-value entries keyed by `(key, write_version)`.
     /// `None` means the key was absent immediately before the write at
     /// that version. Consumed by historical reads and the retention GC.
-    pub state_history: BTreeMap<(SubstateKey, u64), Option<Vec<u8>>>,
+    pub state_history: CellHistory,
     /// Current value per ordered-collection entry — the order-native
     /// mirror of the entry leaves in `current_state`. Derived state: at
     /// every height it equals the tree's entry leaves.
-    pub current_entries: BTreeMap<EntryKey, Vec<u8>>,
+    pub current_entries: Entries,
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
-    pub entries_history: BTreeMap<(EntryKey, u64), Option<Vec<u8>>>,
+    pub entries_history: EntryHistory,
     /// Each version's weighted timestamp, from the floor on; what
     /// [`retire_dated`] reads.
     pub version_time: BTreeMap<u64, u64>,
@@ -99,10 +118,10 @@ impl SharedState {
             tree_store: SimTreeStore::new(),
             current_block_height: BlockHeight::GENESIS,
             current_root_hash: StateRoot::ZERO,
-            current_state: BTreeMap::new(),
-            state_history: BTreeMap::new(),
-            current_entries: BTreeMap::new(),
-            entries_history: BTreeMap::new(),
+            current_state: OrdMap::new(),
+            state_history: OrdMap::new(),
+            current_entries: OrdMap::new(),
+            entries_history: OrdMap::new(),
             version_time: BTreeMap::new(),
             retention_floor: 0,
             substate_bytes: BTreeMap::new(),
@@ -372,7 +391,9 @@ pub fn apply_writes(
         }
         match change {
             Some(value) => {
-                state.current_state.insert(*key, value.clone());
+                state
+                    .current_state
+                    .insert(*key, Arc::from(value.as_slice()));
             }
             None => {
                 state.current_state.remove(key);
@@ -387,7 +408,9 @@ pub fn apply_writes(
         }
         match change {
             Some(value) => {
-                state.current_entries.insert(*key, value.clone());
+                state
+                    .current_entries
+                    .insert(*key, Arc::from(value.as_slice()));
             }
             None => {
                 state.current_entries.remove(key);

@@ -11,6 +11,7 @@ hyperscale-types.workspace = true
 hyperscale-jmt.workspace = true
 hyperscale-vm-effects.workspace = true
 hyperscale-vm-types.workspace = true
+im.workspace = true
 
 [dev-dependencies]
 hyperscale-hbor.workspace = true
