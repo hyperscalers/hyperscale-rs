@@ -980,59 +980,56 @@ impl Display for VoteCount {
     }
 }
 
-/// In-flight transaction count on a shard at block-proposal time.
+/// The transactions a shard's chain has committed and not yet settled,
+/// at block-proposal time.
 ///
-/// Work committed to this shard's chain and not yet settled.
-///
-/// The drain, in the same units admission prices a transaction in: a
-/// fixed admit-and-track charge, the declared footprint, and the signed
-/// gas limit. Carried in `BlockHeader` and gossiped cross-shard so remote
-/// nodes can shed RPC submissions targeting a congested shard.
+/// The drain is a count. Every block is capped per dimension on its own
+/// content and the pipeline is three blocks deep, so the unsettled
+/// weight is bounded by construction and the number in flight is the
+/// only thing left to bound. Carried in `BlockHeader` and gossiped
+/// cross-shard so remote nodes can shed RPC submissions targeting a
+/// congested shard.
 ///
 /// Verified deterministically as `parent + added - released`, both terms
 /// read off the block's own content — the transactions it carries and the
-/// reservations its certificates return. A validator needs no history to
+/// places its certificates give back. A validator needs no history to
 /// check it, which is what lets a node that snap-synced past those
 /// transactions still reach the same total.
-///
-/// Weight rather than count, because counting prices a publish and a
-/// transfer the same. The fixed charge inside each transaction's work is
-/// what keeps this a bound on their number as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Hbor)]
 #[hbor(transparent)]
-pub struct WorkInFlight(u64);
+pub struct TxsInFlight(u64);
 
-impl WorkInFlight {
+impl TxsInFlight {
     /// Nothing in flight (genesis).
     pub const ZERO: Self = Self(0);
 
-    /// Construct a drain total from raw work units.
+    /// Construct a count from a raw figure.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Inner work units. Use sparingly — at boundaries (display,
-    /// structured log fields, budget comparisons) only.
+    /// The count. Use sparingly — at boundaries (display, structured
+    /// log fields, budget comparisons) only.
     #[must_use]
     pub const fn inner(self) -> u64 {
         self.0
     }
 
-    /// Add what this block's transactions reserved.
+    /// Add the places this block's transactions took.
     #[must_use]
     pub const fn saturating_add(self, added: u64) -> Self {
         Self(self.0.saturating_add(added))
     }
 
-    /// Subtract what this block's certificates released.
+    /// Subtract the places this block's certificates gave back.
     #[must_use]
     pub const fn saturating_sub(self, released: u64) -> Self {
         Self(self.0.saturating_sub(released))
     }
 }
 
-impl Display for WorkInFlight {
+impl Display for TxsInFlight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

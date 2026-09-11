@@ -13,9 +13,9 @@ use hyperscale_engine::{PROTOCOL_RESOURCE, publish_work};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
-    StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
+    MAX_TXS_PER_BLOCK, PendingReshape, PriceTable, ResourceAddr, ShardId, ShardTrie, Stake,
+    StakePool, StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
 };
 
 use super::Cluster;
@@ -43,7 +43,7 @@ pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
     if let Some(artifact) = body.artifact() {
         return u128::from(publish_work(artifact)).min(body.max_fee);
     }
-    tx.price_under(c.derivation().as_ref())
+    tx.price_under(c.derivation().as_ref(), &PriceTable::GENESIS)
         .expect("a scenario fixture derives")
 }
 

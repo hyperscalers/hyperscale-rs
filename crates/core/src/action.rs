@@ -22,8 +22,8 @@ use hyperscale_types::{
     SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
     SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
     TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
-    Verified, VoteCount, VotePosition, WeightedTimestamp, WorkInFlight,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
@@ -1017,7 +1017,7 @@ pub enum Action {
         /// voters verify the reservations against.
         fee_read_height: BlockHeight,
         /// Parent block's in-flight count (for deterministic computation).
-        parent_in_flight: WorkInFlight,
+        parent_in_flight: TxsInFlight,
         /// Parent block's settlement frontier — the highest tick whose
         /// determined half has settled at or below it. The block advances
         /// it by the determined halves it carries, and may carry none

@@ -24,11 +24,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, BlockHeight, Finalization, FinalizationHash,
+    AbandonmentRecord, BlockHash, BlockHeight, DeclaredWork, Finalization, FinalizationHash,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
-    evidence_admits_block, sweep_admits_block,
+    budget_admits_block, caps_admit_transaction, evidence_admits_block, sweep_admits_block,
 };
 
 use crate::chain_view::ChainView;
@@ -230,6 +230,10 @@ pub struct TransactionsFold<'a> {
     /// The sweepable cells the admitted transactions create on this
     /// shard, against the per-block creation cap.
     pub sweepable: usize,
+    /// What the admitted transactions declare against this shard between
+    /// them — each one's share under the block's placement — against the
+    /// per-block caps.
+    pub budget: DeclaredWork,
     /// The provisions admitted beside them, which engage a cross-shard
     /// transaction's payer.
     pub provisions: &'a ProvisionsFold,
@@ -241,6 +245,7 @@ impl<'a> TransactionsFold<'a> {
     pub const fn beside(provisions: &'a ProvisionsFold) -> Self {
         Self {
             sweepable: 0,
+            budget: DeclaredWork::ZERO,
             provisions,
         }
     }
@@ -252,7 +257,9 @@ impl<'p> Section for TransactionsSection<'p> {
 
     /// A transaction the chain does not already carry, naming packages
     /// this window can run, engaged by its payer bundle where its payer
-    /// is elsewhere, and fitting the block's sweepable-cell cap.
+    /// is elsewhere, under its own ceilings in every dimension, and
+    /// fitting the block's sweepable-cell cap and its per-dimension caps
+    /// over the share this shard bears.
     ///
     /// The package rule is stated as the permission rather than the
     /// refusal: every package a transaction names must be registered
@@ -310,7 +317,25 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} carries the block past the per-block cap on sweepable cells"
             ));
         }
+        // The declared vector, held to the transaction's own ceilings
+        // whole and to the block's caps over this shard's share: what
+        // the block reserves is what its transactions may consume here,
+        // judged from the block alone.
+        if !caps_admit_transaction(tx.work()) {
+            return Err(format!(
+                "transaction {tx_hash} declares more than the protocol admits of one transaction"
+            ));
+        }
+        let budget = fold
+            .budget
+            .saturating_add(tx.local_work(trie, ctx.local_shard));
+        if !budget_admits_block(&budget) {
+            return Err(format!(
+                "transaction {tx_hash} carries the block past a per-block cap on this shard"
+            ));
+        }
         fold.sweepable = sweepable;
+        fold.budget = budget;
         Ok(())
     }
 }

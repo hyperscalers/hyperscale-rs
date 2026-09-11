@@ -1030,7 +1030,7 @@ mod tests {
             local_receipt_root: header.local_receipt_root(),
             provision_root: header.provision_root(),
             provision_tx_roots: roots,
-            work_in_flight: header.work_in_flight(),
+            txs_in_flight: header.txs_in_flight(),
             ..Default::default()
         });
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

@@ -46,9 +46,9 @@ use hyperscale_types::{
     ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot,
     StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
     TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
-    TxHash, TxRootVerifyError, ValidatorId, Verifiable, VerificationKind, Verified, Verify,
-    VoteCount, VrfProof, WeightedTimestamp, WorkInFlight, local_settled_tx_hashes,
-    shard_reveal_sign, signed_bytes,
+    TxHash, TxRootVerifyError, TxsInFlight, ValidatorId, Verifiable, VerificationKind, Verified,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
+    signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -97,7 +97,7 @@ struct StaleReparent {
     parent_qc: QuorumCertificate,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    parent_in_flight: WorkInFlight,
+    parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
     parent_load: ShardLoad,
@@ -1980,7 +1980,7 @@ impl ShardCoordinatorSim {
             parent_qc: grandparent.parent_qc().clone(),
             parent_state_root: ancestor.state_root(),
             parent_block_height: ancestor.height(),
-            parent_in_flight: ancestor.work_in_flight(),
+            parent_in_flight: ancestor.txs_in_flight(),
             parent_settled_frontier: ancestor.settled_tick_frontier(),
             parent_sweep_frontier: ancestor.sweep_frontier(),
             parent_load: ancestor.load(),

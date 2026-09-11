@@ -603,7 +603,7 @@ mod tests {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
             deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
-            declared_work: 3,
+            charged: 3,
             charge: stub_abort_charge(3),
             committed: CommittedAt {
                 height: BlockHeight::new(1),
@@ -1116,7 +1116,14 @@ mod tests {
         // composed transaction creates its subintents' nullifiers, all
         // on this one shard, and its committed cell beside them — which
         // every transaction writes, so the smallest one still costs one.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
+        // Every nullifier is a signature to verify, so enough fully
+        // composed transactions to fill the cap would pass the compute
+        // cap first; the fold starts near the cap and three fill it.
+        let cells = MAX_SUBINTENTS + 1;
+        let full = 3;
+        let provisions = ProvisionsFold::default();
+        let mut fold = TransactionsFold::beside(&provisions);
+        fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells - (cells / 2);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
                 binding(
@@ -1143,7 +1150,7 @@ mod tests {
                 precut: &refuses_precut(),
                 late_deliveries: &HashSet::new(),
             },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
+            &mut fold,
             &txs,
         );
 

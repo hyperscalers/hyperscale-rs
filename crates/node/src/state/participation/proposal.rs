@@ -35,20 +35,24 @@ impl ShardParticipation {
     ) -> ProposalInputs {
         // The wire cap, not the packing bound — a block cannot encode
         // more than this however light its transactions are. What decides
-        // how many are actually offered is the work budget inside
-        // `ready_transactions`. The overhead compensates for QC-chain
-        // duplicates shard consensus filters during proposal building.
+        // how many are actually offered is the drain's count and the
+        // block's caps inside `ready_transactions`. The overhead
+        // compensates for QC-chain duplicates shard consensus filters
+        // during proposal building.
         // The transactions the ancestor chain above the committed tip
         // already carries. Proposal building drops them as duplicates, so
         // the budget has to be raised by what will be dropped or the
         // block comes out short.
         let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
         // The budget reads the chain, not a local claim set: the parent
-        // header carries what this shard still owes in work.
+        // header carries how many this shard still holds unsettled.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
-        let ready_txs =
-            self.mempool_coordinator
-                .ready_transactions(max_txs, in_flight.inner(), self.now);
+        let ready_txs = self.mempool_coordinator.ready_transactions(
+            max_txs,
+            in_flight.inner(),
+            sched.head().shard_trie(),
+            self.now,
+        );
         let finalizations = self.execution_coordinator.get_finalizations();
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read, and the proofs

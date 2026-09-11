@@ -30,7 +30,7 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
     UnsettledTx {
         tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
         deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2)),
-        declared_work: u64::MAX,
+        charged: u128::MAX,
         charge: AbortCharge {
             vault: key(seed),
             amount: u128::MAX,

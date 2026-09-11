@@ -20,8 +20,8 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ConsensusPublicKey, Epoch,
     ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup,
-    ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId, Verified,
-    WeightedTimestamp, WorkInFlight,
+    ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId,
+    Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -913,13 +913,13 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, WorkInFlight> {
+    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, TxsInFlight> {
         self.tips
             .iter()
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
                 self.verified
                     .get(&(shard, tip_height))
-                    .map(|h| (shard, h.header().work_in_flight()))
+                    .map(|h| (shard, h.header().txs_in_flight()))
             })
             .collect()
     }

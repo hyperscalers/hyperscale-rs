@@ -547,22 +547,52 @@ impl InstanceCache {
 /// nothing waits on, where a lock would put every derivation behind the
 /// commit path.
 #[derive(Clone, Debug)]
-pub struct PackageCache(Arc<ArcSwap<MetadataCache>>);
+pub struct PackageCache {
+    metadata: Arc<ArcSwap<MetadataCache>>,
+    /// Each published artifact's length beside its metadata: what
+    /// derivation prices a node's instantiation at, since running a
+    /// node reads the package's artifact whole.
+    artifact_bytes: Arc<ArcSwap<BTreeMap<PackageHash, u64>>>,
+}
 
 impl PackageCache {
-    /// A cache seeded with the packages a cold start already knows.
+    /// A cache seeded with the packages a cold start already knows,
+    /// their artifact lengths unknown until [`Self::publish`] states
+    /// them.
     #[must_use]
     pub fn new(seed: MetadataCache) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(seed)))
+        Self {
+            metadata: Arc::new(ArcSwap::from_pointee(seed)),
+            artifact_bytes: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+        }
+    }
+
+    /// A cache holding what this one holds now, growing apart from it
+    /// afterwards.
+    #[must_use]
+    pub fn forked(&self) -> Self {
+        Self {
+            metadata: Arc::new(ArcSwap::from_pointee((*self.load()).clone())),
+            artifact_bytes: Arc::new(ArcSwap::from_pointee(
+                (**self.artifact_bytes.load()).clone(),
+            )),
+        }
     }
 
     /// The current published set.
     #[must_use]
     pub fn load(&self) -> Arc<MetadataCache> {
-        self.0.load_full()
+        self.metadata.load_full()
     }
 
-    /// Publish `metadata` under `package` unless it is already there.
+    /// The length of `package`'s artifact, where this node has seen it.
+    #[must_use]
+    pub fn artifact_bytes(&self, package: PackageHash) -> Option<u64> {
+        self.artifact_bytes.load().get(&package).copied()
+    }
+
+    /// Publish `metadata` under `package` unless it is already there,
+    /// and record the artifact's length.
     ///
     /// First-write-wins by content address, which is what makes
     /// republishing idempotent: equal hash means equal artifact, so the
@@ -573,14 +603,19 @@ impl PackageCache {
     /// Panics if the metadata fails the cache's publish check. Every
     /// caller feeds this from a committed artifact that already cleared
     /// admission, so a refusal here is a node defect, never an input.
-    pub fn publish(&self, package: PackageHash, metadata: PackageMetadata) {
+    pub fn publish(&self, package: PackageHash, metadata: PackageMetadata, bytes: u64) {
+        if !self.artifact_bytes.load().contains_key(&package) {
+            let mut lengths = (**self.artifact_bytes.load()).clone();
+            lengths.insert(package, bytes);
+            self.artifact_bytes.store(Arc::new(lengths));
+        }
         if self.load().get(package).is_some() {
             return;
         }
         let mut next = (*self.load()).clone();
         next.publish(package, metadata)
             .expect("everything published here cleared the artifact gate");
-        self.0.store(Arc::new(next));
+        self.metadata.store(Arc::new(next));
     }
 
     /// Publish the package a committed cell holds, if it holds one, and
@@ -600,7 +635,7 @@ impl PackageCache {
         let Ok(metadata) = admit_package(value) else {
             return false;
         };
-        self.publish(package, metadata);
+        self.publish(package, metadata, value.len() as u64);
         true
     }
 }

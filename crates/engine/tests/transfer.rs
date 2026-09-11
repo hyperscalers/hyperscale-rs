@@ -27,10 +27,10 @@ use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline,
     DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
-    EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr,
-    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
-    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
-    Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
+    EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable,
+    PrincipalAddr, ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot,
+    StateWrites, SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
+    TxHash, Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
@@ -328,7 +328,7 @@ fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// What `tx` is charged, derived under the executor's own derivation:
 /// the figure a test pins a balance against.
 fn price_of(executor: &Executor, tx: &Transaction) -> u128 {
-    tx.price_under(executor.derivation().as_ref())
+    tx.price_under(executor.derivation().as_ref(), &PriceTable::GENESIS)
         .expect("a test transaction derives")
 }
 
@@ -1716,7 +1716,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 1_000),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let price = tx.price();
+    let price = tx.price(&PriceTable::GENESIS);
     assert!(price > 0, "a priced fixture, or the charge proves nothing");
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);

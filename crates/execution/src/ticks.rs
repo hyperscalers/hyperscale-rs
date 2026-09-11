@@ -447,7 +447,7 @@ mod tests {
         state.admit(
             test_transaction(tx_seed).hash(),
             Membership::whole(BTreeSet::from([shard()])),
-            1,
+            Some(1),
             Admission::Executes,
         );
         state

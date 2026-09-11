@@ -25,7 +25,7 @@ use hyperscale_scenarios::{
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, Derivation, NetworkDefinition, PrincipalAddr,
     ReshapeThresholds, ShardId, StateRoot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, ValidatorId, WeightedTimestamp, WorkInFlight,
+    TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -295,8 +295,8 @@ impl Cluster for ProdCluster {
         self.inner.chain_origin_anchor(shard)
     }
 
-    fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight> {
-        self.inner.committed_work_in_flight(shard)
+    fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
+        self.inner.committed_txs_in_flight(shard)
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {

@@ -496,7 +496,7 @@ mod tests {
             local_receipt_root: local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
             provision_root: h.provision_root(),
             provision_tx_roots: h.provision_tx_roots().clone(),
-            work_in_flight: h.work_in_flight(),
+            txs_in_flight: h.txs_in_flight(),
             ..Default::default()
         })
     }
@@ -732,7 +732,7 @@ mod tests {
             [UnsettledTx {
                 tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
                 deadline: Deadline::of(WeightedTimestamp::from_millis(1_500)),
-                declared_work: 7,
+                charged: 7,
                 charge: stub_abort_charge(7),
                 committed: CommittedAt {
                     height: BlockHeight::new(1),

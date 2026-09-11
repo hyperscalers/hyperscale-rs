@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use hyperscale_node::TxStatusCache;
-use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, WorkInFlight};
+use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, TxsInFlight};
 use serde::{Deserialize, Serialize};
 
 use crate::status::SyncStatus;
@@ -116,10 +116,10 @@ pub struct VnodeMempoolSnapshot {
     /// Per-remote-shard unsettled work, from the latest verified block
     /// headers. Used for cross-shard backpressure: reject transactions
     /// targeting congested shards.
-    pub remote_shard_in_flight: HashMap<ShardId, WorkInFlight>,
+    pub remote_shard_in_flight: HashMap<ShardId, TxsInFlight>,
     /// Threshold for rejecting transactions due to remote shard congestion
     /// (80% of [`hyperscale_types::MAX_DRAIN_WORK`]).
-    pub remote_congestion_threshold: WorkInFlight,
+    pub remote_congestion_threshold: TxsInFlight,
 }
 
 impl Default for VnodeMempoolSnapshot {
@@ -132,7 +132,7 @@ impl Default for VnodeMempoolSnapshot {
             accepting_rpc_transactions: true,
             at_pending_limit: false,
             remote_shard_in_flight: HashMap::new(),
-            remote_congestion_threshold: WorkInFlight::ZERO,
+            remote_congestion_threshold: TxsInFlight::ZERO,
         }
     }
 }

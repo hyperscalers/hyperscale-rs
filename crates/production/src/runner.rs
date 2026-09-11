@@ -54,9 +54,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
-    NetworkDefinition, ShardBoundary, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId,
-    ValidatorStatus, Verifier, WorkInFlight,
+    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS,
+    NetworkDefinition, ShardBoundary, ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight,
+    ValidatorId, ValidatorStatus, Verifier,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -1555,7 +1555,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     // differ, so the backpressure check iterates every entry rather
     // than picking a per-shard representative.
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
-        let remote_congestion_threshold = WorkInFlight::new(MAX_DRAIN_WORK * 4 / 5);
+        let remote_congestion_threshold = TxsInFlight::new(MAX_UNSETTLED_TXS * 4 / 5);
         mempool_snapshot.rcu(|current| {
             let mut updated = (**current).clone();
             for vnode in &shard_loop.vnodes {
@@ -1570,7 +1570,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                         in_flight_count: in_flight,
                         total_count: mempool.len(),
                         updated_at: Some(Instant::now()),
-                        accepting_rpc_transactions: in_flight < MAX_DRAIN_WORK,
+                        accepting_rpc_transactions: in_flight < MAX_UNSETTLED_TXS,
                         at_pending_limit: mempool.at_pending_limit(),
                         remote_shard_in_flight: state
                             .remote_headers_coordinator()

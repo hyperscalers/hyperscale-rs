@@ -18,8 +18,8 @@ use std::time::Duration;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
-    TimestampRange, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
-    WorkInFlight,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
+    Window,
 };
 
 use crate::reshape::split_lifecycle;
@@ -991,10 +991,10 @@ fn submit_departing_route<C: Cluster>(
     c: &mut C,
     route: &DepartingRoute,
     charges: &mut Charges,
-) -> (TxHash, WorkInFlight, u128, WeightedTimestamp) {
+) -> (TxHash, TxsInFlight, u128, WeightedTimestamp) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let baseline = c
-        .committed_work_in_flight(survivor)
+        .committed_txs_in_flight(survivor)
         .expect("the survivor must serve a committed tip before the route");
     let validity = validity_around(c.now());
     let tx = build_route_tx(
@@ -1013,7 +1013,7 @@ fn submit_departing_route<C: Cluster>(
         "both shards must commit the route while both are live",
     );
     let engaged = c
-        .committed_work_in_flight(survivor)
+        .committed_txs_in_flight(survivor)
         .expect("the survivor must serve a committed tip once it holds the route");
     assert!(
         engaged > baseline,
@@ -1088,11 +1088,11 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // settled set reaches the survivor.
     await_departed(c);
     assert!(
-        c.run_until(epochs(12), |c| c.committed_work_in_flight(survivor)
+        c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
         "the survivor's hold must return to its baseline once the departed venue's settled \
          set has answered; holds {:?} against {baseline:?}",
-        c.committed_work_in_flight(survivor),
+        c.committed_txs_in_flight(survivor),
     );
     // The abandonment record licenses the trader's reclaim, which reads the
     // record cell the trader's leg wrote — and reads it whenever the
@@ -1215,11 +1215,11 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
          apply what it settled",
     );
     assert!(
-        c.run_until(epochs(12), |c| c.committed_work_in_flight(survivor)
+        c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
         "the survivor's hold must return to its baseline once it has settled; holds {:?} \
          against {baseline:?}",
-        c.committed_work_in_flight(survivor),
+        c.committed_txs_in_flight(survivor),
     );
     // The output is a delivery to the trader, admissible to the delivery
     // window's close. On a clock the window outlasts, the trader banks

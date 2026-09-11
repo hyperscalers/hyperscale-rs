@@ -39,8 +39,8 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
-    UNSETTLED_TX_BYTES, WeightedTimestamp,
+    PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
+    TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// Where a chain committed a transaction: the block, and the anchor it
@@ -84,9 +84,9 @@ pub struct UnsettledTx {
     /// so a voter checks a proof's block against this figure rather
     /// than against a clock.
     pub deadline: Deadline,
-    /// The reservation its committing block took against the drain, which
-    /// the abandonment returns exactly.
-    pub declared_work: u64,
+    /// What the transaction was charged, which the abandonment attests
+    /// as its own outcome does.
+    pub charged: u128,
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
     pub charge: AbortCharge,
@@ -128,22 +128,22 @@ impl UnsettledTx {
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
-    /// deadline is the transaction's own, the reservation is the
-    /// declared work, the charge is the fee vault at the declared price,
-    /// and the commit is the block's.
+    /// deadline is the transaction's own, the charge is the fee vault at
+    /// the declared price under `table`, and the commit is the block's.
     ///
     /// # Panics
     ///
     /// As [`Transaction::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn for_transaction(tx: &Transaction, committed: CommittedAt) -> Self {
+    pub fn for_transaction(tx: &Transaction, committed: CommittedAt, table: &PriceTable) -> Self {
+        let charged = tx.price(table);
         Self {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            declared_work: tx.work(),
+            charged,
             charge: AbortCharge {
                 vault: tx.fee_vault(),
-                amount: tx.price(),
+                amount: charged,
             },
             committed,
             reach: tx.routing().all_routes(),
@@ -450,7 +450,7 @@ mod tests {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
             deadline: Deadline::of(WeightedTimestamp::from_millis(u64::from(seed) * 100)),
-            declared_work: u64::from(seed) * 7,
+            charged: u128::from(seed) * 7,
             charge: AbortCharge {
                 vault: SubstateKey {
                     owner: Address::new([seed; 31], AddressClass::Component),
@@ -511,7 +511,7 @@ mod tests {
         );
         assert_eq!(
             restated(UnsettledTx {
-                declared_work: tx(1).declared_work + 1,
+                charged: tx(1).charged + 1,
                 ..tx(1)
             }),
             wrong,
@@ -622,7 +622,7 @@ mod tests {
                 [
                     tx(2),
                     UnsettledTx {
-                        declared_work: tx(1).declared_work + 1,
+                        charged: tx(1).charged + 1,
                         ..tx(1)
                     }
                 ],

@@ -19,11 +19,11 @@ use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
-    Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
-    DerivationError, Derived, EnvelopeExt, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey,
-    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, ShardId, StateWrites, SubstateKey,
-    Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp,
-    declared_work,
+    Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange,
+    DeclaredWork, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionMetadata,
+    GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr, Routing, SchemeId, ShardId,
+    StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_types::Moves;
 
@@ -77,6 +77,12 @@ impl Derivation for ReservingStatics {
             (ranged, Mode::Delta { moves: Moves::Both }),
         ];
         declared_modes.sort_unstable();
+        let work = DeclaredWork {
+            compute: vm.gas_limit_total(),
+            footprint: 4,
+            ..DeclaredWork::ZERO
+        }
+        .saturating_add(vm.signatures());
         Ok(Derived {
             owners: Vec::new(),
             // This stub derives no tree; the envelope's window stands.
@@ -94,8 +100,9 @@ impl Derivation for ReservingStatics {
             subintent_hashes: Vec::new(),
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
-            work: declared_work(4, vm.gas_limit_total(), vm.signature_work()),
-            footprint: 4,
+            work,
+            shares: Vec::new(),
+            everywhere: work,
             legs: Vec::new(),
             nullifiers: Vec::new(),
             packages: Vec::new(),

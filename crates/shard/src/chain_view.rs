@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip,
-    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, Verified,
-    WorkInFlight,
+    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, TxsInFlight,
+    Verified,
 };
 use tracing::warn;
 
@@ -139,11 +139,11 @@ impl<'a> ChainView<'a> {
     /// joiner extending its boundary anchor resolves through the tip (the
     /// anchor header never enters `pending`); a `None` skips the vote,
     /// since the claimed in-flight count can't be checked.
-    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<WorkInFlight> {
+    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<TxsInFlight> {
         if let Some(header) = self.get_header(parent_block_hash) {
-            return Some(header.work_in_flight());
+            return Some(header.txs_in_flight());
         }
-        self.tip_if(parent_block_hash).map(|tip| tip.work_in_flight)
+        self.tip_if(parent_block_hash).map(|tip| tip.txs_in_flight)
     }
 
     /// Settlement frontier on the parent header — the highest tick whose
@@ -217,9 +217,9 @@ impl<'a> ChainView<'a> {
 
     /// Drain total on the parent header. Returns zero if the parent is
     /// unresolvable (see [`Self::parent_in_flight_checked`]).
-    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> WorkInFlight {
+    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> TxsInFlight {
         self.parent_in_flight_checked(parent_block_hash)
-            .unwrap_or(WorkInFlight::ZERO)
+            .unwrap_or(TxsInFlight::ZERO)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -259,7 +259,7 @@ mod tests {
             timestamp: ProposerTimestamp::from_millis(1000),
             state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
             provision_tx_roots: std::collections::BTreeMap::new(),
-            work_in_flight: WorkInFlight::new(u64::from(height)),
+            txs_in_flight: TxsInFlight::new(u64::from(height)),
             ..Default::default()
         })
     }
@@ -552,7 +552,7 @@ mod tests {
     fn parent_in_flight_returns_header_value_or_zero() {
         let block = make_block(7, BlockHash::ZERO);
         let hash = block.hash();
-        let expected_in_flight = block.header().work_in_flight();
+        let expected_in_flight = block.header().txs_in_flight();
         let unknown = bh(b"unknown");
 
         let mut pending = PendingBlocks::new();
@@ -566,7 +566,7 @@ mod tests {
             None,
             |view| {
                 assert_eq!(view.parent_in_flight(hash), expected_in_flight);
-                assert_eq!(view.parent_in_flight(unknown), WorkInFlight::ZERO);
+                assert_eq!(view.parent_in_flight(unknown), TxsInFlight::ZERO);
             },
         );
     }

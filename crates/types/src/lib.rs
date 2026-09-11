@@ -101,11 +101,11 @@ pub use hyperscale_crypto::{
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, CallTarget, CollectionId,
-    ComponentAddr, Compose, EntryKey, EntryLeaf, InvalidAddress, LEAF_KEY_BYTES, LocalKey,
-    MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr, NotCallable, OverDebit, PackageAddr,
-    Presence, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId,
-    SettledCells, SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket, TX_UNITS,
-    amount_cell, compatible, declared_work, encode_amount, entry_leaf_key, read_amount,
+    ComponentAddr, Compose, DeclaredWork, EntryKey, EntryLeaf, InvalidAddress, LEAF_KEY_BYTES,
+    LocalKey, MAX_CELL_VALUE_LEN, MAX_GAS_LIMIT, Mode, ModeKind, Movement, NativeAddr, NotCallable,
+    OverDebit, PackageAddr, Presence, PriceTable, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES,
+    SWEEP_BUCKET_SHIFT, SchemeId, SettledCells, SettledEntries, SettledWrites, StateWrites,
+    SubstateKey, SweepBucket, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -122,7 +122,7 @@ pub use primitives::hash_kinds::{
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
     PROTOCOL_DISPLAY_DIGITS, RatifyRound, Round, ShardId, SpcView, Stake, StakePoolId,
-    StakePoolSeat, ValidatorId, VoteCount, WorkInFlight,
+    StakePoolSeat, TxsInFlight, ValidatorId, VoteCount,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof, compute_sparse_proof,
@@ -167,12 +167,15 @@ pub use shard::header::{
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
-    ABANDONMENT_RECORD_BYTES, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
-    MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
-    UNSETTLED_TX_BYTES, drain_admits_block, evidence_admits_block, sweep_admits_block,
+    ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, MAX_BLOCK_COMPUTE, MAX_BLOCK_FOOTPRINT,
+    MAX_BLOCK_READ_BYTES, MAX_BLOCK_RETENTION_BYTES, MAX_BLOCK_WRITE_BYTES,
+    MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_PREFIXES_PER_TX,
+    MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES,
+    ROUTE_PREFIX_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction,
+    drain_admits_block, evidence_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
@@ -236,15 +239,16 @@ pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 pub use topology::trie::{RoutePrefix, ShardTrie};
 pub use topology::validator::{ValidatorInfo, ValidatorSet};
 pub use transaction::declared_key::{DeclaredKey, DeclaredRange};
-pub use transaction::limits::MAX_TX_BYTES_LEN;
+pub use transaction::limits::{MAX_ARTIFACT_BYTES, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES};
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
     TxResolution,
 };
 pub use transaction::vm::{
-    Derivation, DerivationError, Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS,
+    Derivation, DerivationError, Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS, OwnerShare,
     ProtocolStatics, ProtocolVerifier, Routing, SchemeVerifier, SubintentSig, TransactionBody,
     TransactionEnvelope, install_protocol_statics, protocol_statics, protocol_statics_installed,
+    whole_work,
 };
 pub use transaction::wire::{Transaction, TransactionContext, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};
