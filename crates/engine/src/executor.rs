@@ -23,7 +23,7 @@ use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, XRD, admit_package,
-    decode_tree, envelope_identity, witness_from_event,
+    declared_footprint, decode_tree, envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -31,12 +31,14 @@ use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root, declared_work,
     install_protocol_statics,
 };
+pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
     ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, NodeCall, PackageHash,
-    PrefixShardResolver, SubintentRecord, admit_tree, package_hash, route_tree,
+    PrefixShardResolver, SubintentRecord, admit_tree_with_authority, legs_of, package_hash,
+    route_tree,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
@@ -53,17 +55,6 @@ use crate::legs::{Licence, Member, Runs};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
-
-/// Whether a derivation holds a gated node to its target's authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetAuthority {
-    /// The rule as the chain applies it.
-    Required,
-    /// Every gated node is treated as authorised. A preview grant only,
-    /// for answering what an envelope would do before the accounts it
-    /// touches have signed for it.
-    Assumed,
-}
 
 /// One derived transaction, as the batch consumes it.
 ///
@@ -88,6 +79,11 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
+    /// What the transaction costs a block on the engine's own schedule:
+    /// the fixed charge for carrying it, its declared footprint, and the
+    /// ceiling it signed. A settlement is the batch's own and costs the
+    /// block nothing.
+    pub work: u64,
     /// The owners this shard judges — with the job's plan, the one part
     /// of an entry that differs per participant.
     pub judges: OwnerSet,
@@ -614,6 +610,7 @@ impl Executor {
             declaration,
             nullifiers: Vec::new(),
             gas_limit: 0,
+            work: 0,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
     }
@@ -644,9 +641,29 @@ impl Executor {
         // The records the caller answers with. Admission composes the
         // envelope's own over these itself, and holds each to standing
         // for the seal of the component it derives.
-        let admitted = admit_tree(&tree, signer, envelope_identity(vm), chain, &ProtocolHasher)
-            .map_err(|error| format!("admission: {error}"))?;
+        // Under an assumed authority admission admits the signature
+        // wherever the envelope presents it; the judgment it would fail
+        // is dropped below.
+        let admitted = admit_tree_with_authority(
+            &tree,
+            signer,
+            envelope_identity(vm),
+            chain,
+            &ProtocolHasher,
+            authority,
+        )
+        .map_err(|error| format!("admission: {error}"))?;
         let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
+        // The same price derivation puts on the envelope, so a preview
+        // reports what a block would charge without running the
+        // derivation — which admits under the rule as the chain applies
+        // it, and caches what it derived onto the transaction.
+        let legs = legs_of(&admitted.admitted);
+        let work = declared_work(
+            declared_footprint(&routing, &legs),
+            vm.gas_limit,
+            vm.signature_work(),
+        );
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks. Unioning `per_shard`
@@ -657,9 +674,8 @@ impl Executor {
             TargetAuthority::Required => routing.calls,
             // A preview shown before its counterparties have signed:
             // every guarded call is answered as if whoever it names
-            // had presented themselves. The lie is told here and
-            // nowhere else, so nothing on the commit path can reach
-            // it.
+            // had presented themselves. The lie is told at admission's
+            // door and here, and nowhere on the commit path.
             TargetAuthority::Assumed => routing
                 .calls
                 .into_iter()
@@ -679,6 +695,7 @@ impl Executor {
             declaration,
             nullifiers: admitted.subintents,
             gas_limit: vm.gas_limit,
+            work,
             judges: OwnerSet::whole(),
         })
     }

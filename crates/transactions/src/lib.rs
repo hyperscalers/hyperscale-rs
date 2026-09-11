@@ -66,6 +66,19 @@ pub struct Terms {
 /// through the publish check, and the answer is the same every time.
 static GENESIS: LazyLock<World> = LazyLock::new(genesis_world);
 
+/// The account address `signer`'s key derives — the identity its
+/// signature signs in as.
+///
+/// # Panics
+///
+/// If the key is not material its own scheme admits, which is a defect
+/// in the signer rather than in anything it was asked to sign.
+#[must_use]
+pub fn principal_of<S: AccountSigner>(signer: &S) -> PrincipalAddr {
+    principal_for(signer.scheme(), &signer.public_key_bytes())
+        .expect("a signer's key is material its own scheme admits")
+}
+
 /// What a client needs to build a transaction: the world its targets
 /// resolve in, and the network its envelopes are signed for.
 #[derive(Debug, Clone)]
@@ -122,7 +135,13 @@ impl Client {
     }
 
     /// The withdraw-then-deposit graph moving `amount` of the native
-    /// resource from `from` to `to`.
+    /// resource from `from` to `to`, composed by `signer`.
+    ///
+    /// When `signer` is `from`, the withdrawal takes the intent's
+    /// signature. For anyone else the withdrawal presents `from`'s own
+    /// sign-in, whose stored rule the signer answers with a sign-in at
+    /// their own account composed ahead of it — how a key an account's
+    /// rule names acts for that account.
     ///
     /// # Errors
     ///
@@ -131,13 +150,19 @@ impl Client {
     /// stdlib rather than anything about the transfer.
     pub fn transfer_graph(
         &self,
+        signer: PrincipalAddr,
         from: PrincipalAddr,
         to: PrincipalAddr,
         amount: u128,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
-        let mut b = self.builder(&chain, from);
-        let funds = account::withdraw(&mut b, from, *XRD, amount)?;
+        let mut b = self.builder(&chain, signer);
+        let funds = if signer == from {
+            account::withdraw(&mut b, from, *XRD, amount)?
+        } else {
+            let proof = account::authorize(&mut b, from)?;
+            b.presenting(proof, |b| account::withdraw(b, from, *XRD, amount))?
+        };
         account::deposit(&mut b, to, funds)?;
         b.build()
     }
@@ -236,12 +261,10 @@ impl Client {
         payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
-        let signer = principal_for(payer.scheme(), &payer.public_key_bytes())
-            .expect("a signer's key is material its own scheme admits");
         let envelope = signing::wrap(
             tree,
             sigs,
-            signer,
+            principal_of(payer),
             self.network,
             signing::Terms {
                 max_fee: terms.max_fee,
@@ -255,10 +278,8 @@ impl Client {
             .expect("a composed envelope stays within the wire caps")
     }
 
-    /// A signed native-resource transfer from `from` to `to`.
-    ///
-    /// `payer` must control `from`: only the withdrawing account's
-    /// authority is gated, so one signature composes the whole transfer.
+    /// A signed native-resource transfer from `from` to `to`, composed
+    /// by `payer`'s own account.
     ///
     /// # Errors
     ///
@@ -271,7 +292,7 @@ impl Client {
         amount: u128,
         terms: Terms,
     ) -> Result<Transaction, TypedError> {
-        let graph = self.transfer_graph(from, to, amount)?;
+        let graph = self.transfer_graph(principal_of(payer), from, to, amount)?;
         Ok(Transaction::new(self.sign(graph, payer, terms)))
     }
 }
@@ -299,7 +320,7 @@ mod tests {
         let from = test_principal(0x11);
         let to = test_principal(0x22);
         assert_eq!(
-            client.transfer_graph(from, to, 100).unwrap(),
+            client.transfer_graph(from, from, to, 100).unwrap(),
             ManifestGraph {
                 nodes: vec![
                     GraphNode {
@@ -338,7 +359,12 @@ mod tests {
     fn a_built_transfer_admits() {
         let client = Client::genesis(NETWORK);
         let graph = client
-            .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
+            .transfer_graph(
+                test_principal(0x11),
+                test_principal(0x11),
+                test_principal(0x22),
+                100,
+            )
             .unwrap();
         admit(
             &graph,

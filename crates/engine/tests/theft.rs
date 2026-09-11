@@ -104,7 +104,7 @@ const fn terms(max_fee: u128) -> Terms {
 fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
     let graph = client()
-        .transfer_graph(from, to, amount)
+        .transfer_graph(from, from, to, amount)
         .expect("an account answers a transfer");
     Transaction::new(client().sign(graph, &key, terms(2_000)))
 }
@@ -151,28 +151,25 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 
 /// The defect, closed: an address is public, and knowing one buys nothing.
 ///
-/// The envelope is well-formed — the thief's own badge is presented, and
-/// admission asks only that a guarded call present something — so the
-/// verdict is the victim's account's to give, and it aborts. The thief
-/// pays the ceiling they signed for having asked.
+/// The envelope is well-formed as a shape and the thief's signature is
+/// valid — but the one place a signature is judged is the signer's own
+/// account, and the sign-in this manifest leads with is the victim's.
+/// The gate refuses that from signed content alone, so the theft never
+/// reaches a block: the victim's balance is never asked, and the thief
+/// pays nothing for having asked.
 #[test]
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     let executor = Executor::new(ExecutionMode::Serial);
     let theft = signed_transfer(VICTIM, thief(), 5_000);
 
     assert!(theft.body().signature_is_valid());
-    assert!(
-        theft.try_derived(executor.derivation().as_ref()).is_ok(),
-        "the shape is well-formed"
-    );
+    let refused = theft
+        .try_derived(executor.derivation().as_ref())
+        .expect_err("a sign-in at someone else's account is refused at the gate");
+    assert!(refused.to_string().contains("signature"), "{refused}");
 
-    let executed = execute(&executor, theft);
-    let ConsensusReceipt::Failed = &executed[0].consensus else {
-        panic!("the theft must not settle: {:?}", executed[0].consensus);
-    };
-
-    // The victim's balance is untouched, which is the property the whole
-    // mechanism exists for.
+    // The same shape signed by its own account settles: the gate refuses
+    // the signer, not the manifest.
     let executed = execute(&executor, signed_transfer(thief(), VICTIM, 5_000));
     assert!(matches!(
         &executed[0].consensus,

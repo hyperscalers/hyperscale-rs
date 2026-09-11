@@ -17,7 +17,7 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_hbor::TypeShape;
-use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
+use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms, principal_of};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
@@ -1361,7 +1361,7 @@ pub fn build_transfer_tx<S: AccountSigner>(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = client()
-        .transfer_graph(from, to, amount)
+        .transfer_graph(principal_of(payer), from, to, amount)
         .expect("the stdlib account answers a transfer");
     Transaction::new(envelope(graph, payer, validity))
 }
@@ -1371,7 +1371,10 @@ pub fn build_transfer_tx<S: AccountSigner>(
 ///
 /// The payer field names `payer`, and whether the signer's identity may
 /// spend it is the payer shard's binding verdict — refused where the
-/// payer's rule does not admit it, engaged where it does.
+/// payer's rule does not admit it, engaged where it does. The graph is
+/// composed by the signer's own account, so a `from` the signer's key
+/// does not derive is answered by its stored rule with the signer's
+/// sign-in.
 ///
 /// # Panics
 ///
@@ -1388,7 +1391,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
 ) -> Transaction {
     let client = client();
     let graph = client
-        .transfer_graph(from, to, amount)
+        .transfer_graph(principal_of(signer), from, to, amount)
         .expect("the stdlib account answers a transfer");
     let envelope = signing::wrap(
         &EnvelopeTree {

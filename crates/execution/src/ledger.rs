@@ -1513,21 +1513,32 @@ mod tests {
         claims[0]
     }
 
+    /// The two depth-2 shards a delivery fixture places off `LOCAL`,
+    /// each holding half of `PARTNER`'s keyspace: the core of one shard
+    /// bearing the verdict, and the shard the leg's crossing is
+    /// delivered on.
+    const BEARER: ShardId = ShardId::leaf(2, 3);
+    const DELIVERER: ShardId = ShardId::leaf(2, 2);
+
+    /// The trie [`delivering`] is frozen under.
+    fn delivery_trie() -> ShardTrie {
+        ShardTrie::from_leaves([LOCAL, DELIVERER, BEARER])
+    }
+
     /// A shape frozen divided with an inbound leg on `LOCAL` feeding an
-    /// outbound leg on `PARTNER` directly, the core sitting on `PARTNER`
-    /// beside it: the leg issues one crossing a delivery claims.
+    /// outbound leg on `DELIVERER` directly, the core of one shard on
+    /// `BEARER`: the leg issues one crossing a delivery claims.
     fn delivering() -> Classified {
-        use hyperscale_types::ShardTrie;
         use hyperscale_vm_types::LegRole;
 
         use crate::fixtures::leg;
         let legs = [
             leg(0, LegRole::Inbound, &[]),
-            leg(2, LegRole::Core, &[]),
+            leg(3, LegRole::Core, &[]),
             leg(2, LegRole::Outbound, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
-        assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
+        let classified = Classified::freeze(&legs, &[], &delivery_trie());
+        assert_eq!(classified.core(), &BTreeSet::from([BEARER]));
         assert!(classified.decomposed());
         classified
     }
@@ -2322,31 +2333,31 @@ mod tests {
         ledger.certify(leg.hash());
 
         let (delivered_by, claim) = delivered_claim(&delivering());
-        let question = |key, probed| Question {
+        let question = |shard, key, probed| Question {
             tx_hash: leg.hash(),
-            shard: PARTNER,
+            shard,
             key,
             probed,
             deadline: Deadline::of(ms(60_000)),
             cued: None,
         };
-        assert_eq!(delivered_by, PARTNER);
+        assert_eq!(delivered_by, DELIVERER);
         assert_eq!(
-            ledger.questions(&ShardTrie::uniform(1)),
+            ledger.questions(&delivery_trie()),
             vec![
-                question(core_cell(PARTNER, &leg), Probed::Core),
-                question(claim, Probed::Delivery),
+                question(BEARER, core_cell(BEARER, &leg), Probed::Core),
+                question(DELIVERER, claim, Probed::Delivery),
             ],
         );
         ledger.record_reading(
             leg.hash(),
-            PARTNER,
+            DELIVERER,
             claim,
             Probed::Delivery,
             Inclusion::Absent,
         );
         assert!(
-            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
+            ledger.questions(&delivery_trie()).is_empty(),
             "covered once"
         );
         assert_eq!(
@@ -2810,7 +2821,7 @@ mod tests {
         let (_, claim) = delivered_claim(&delivering());
         ledger.record_reading(
             lapsed.hash(),
-            PARTNER,
+            DELIVERER,
             claim,
             Probed::Delivery,
             Inclusion::Absent,

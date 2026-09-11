@@ -602,7 +602,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = client()
-        .transfer_graph(from, from, 100)
+        .transfer_graph(from, from, from, 100)
         .expect("an account answers a transfer");
     let tx = Transaction::new(client().sign(graph, &key, terms(1_000)));
     let executed = execute(&executor, tx);

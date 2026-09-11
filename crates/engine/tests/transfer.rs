@@ -296,7 +296,7 @@ fn signed_transfer_with_fee(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let graph = client()
-        .transfer_graph(from, to, amount)
+        .transfer_graph(from, from, to, amount)
         .expect("an account answers a transfer");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
@@ -2558,22 +2558,17 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    // Signed by 7, withdrawing from Alice: the shape the gate refuses.
+    // Signed by 7, signing in at Alice: the shape the gate refuses from
+    // signed content alone, so it never enters a block and nobody pays.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
     let held = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
-    assert!(
-        matches!(held.outcome, PreviewOutcome::Aborted { .. }),
-        "outcome = {:?}",
-        held.outcome
-    );
-    // Only the payer's own fee is reported: nothing of Alice's moves
-    // without her.
-    assert!(
-        held.changes
-            .iter()
-            .all(|change| change.key.owner != alice().address())
-    );
+    let PreviewOutcome::Refused { reason } = &held.outcome else {
+        panic!("outcome = {:?}", held.outcome);
+    };
+    assert!(reason.contains("signature"), "reason = {reason}");
+    assert_eq!(held.fee, 0);
+    assert!(held.changes.is_empty());
 
     let granted = preview_on(
         &accounts,

@@ -7861,7 +7861,7 @@ mod tests {
     /// floor, and licenses the reclaim.
     #[test]
     fn a_silent_delivery_is_probed_past_the_lapse_and_its_lapse_offered() {
-        let schedule = two_shard_topology();
+        let schedule = delivery_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -7877,40 +7877,42 @@ mod tests {
             .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
-        let held: [(u64, WeightedTimestamp, &[u8]); 2] =
-            [(3, deadline, b"deadline"), (4, lapse, b"at")];
-        for (height, ts, tag) in held {
+        let held: [(ShardId, u64, WeightedTimestamp, &[u8]); 3] = [
+            (BEARER, 3, deadline, b"bearer"),
+            (DELIVERER, 3, deadline, b"deadline"),
+            (DELIVERER, 4, lapse, b"at"),
+        ];
+        for (shard, height, ts, tag) in held {
             state.proven_anchors().record(Anchor {
-                shard: PEER,
+                shard,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
             });
-            state.on_committed_remote_header(&schedule, PEER);
+            state.on_committed_remote_header(&schedule, shard);
         }
         let later = lapse.plus(Duration::from_secs(1));
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
+        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
         let fetches = state_proof_fetches(&opened);
         assert!(
             fetches.contains(&(bundle.anchor, vec![claim])),
             "the newest header inside the lapse window is the anchor, and the claim cell the key"
         );
         let core_cell = committed_tx_cell_key(
-            PEER,
+            BEARER,
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
         assert!(
-            fetches
-                .iter()
-                .any(|(anchor, keys)| anchor.height == BlockHeight::new(3)
-                    && *keys == vec![core_cell]),
-            "and the core's committed cell at the newest header inside its own window"
+            fetches.iter().any(|(anchor, keys)| anchor.shard == BEARER
+                && anchor.height == BlockHeight::new(3)
+                && *keys == vec![core_cell]),
+            "and the bearer's committed cell at the newest header inside its own window"
         );
 
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
-            reading(&state, PEER, tx_hash, claim),
+            reading(&state, DELIVERER, tx_hash, claim),
             Some(Inclusion::Absent),
             "the lapse is read off the committed claim"
         );
@@ -7925,7 +7927,7 @@ mod tests {
     /// read off the header, until a block carries it, and not after.
     #[test]
     fn a_fetched_proof_is_offered_until_a_block_carries_it() {
-        let schedule = two_shard_topology();
+        let schedule = delivery_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -7943,7 +7945,7 @@ mod tests {
             .ledger
             .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
+        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
@@ -7979,7 +7981,7 @@ mod tests {
     /// bytes each of them already holds.
     #[test]
     fn a_proof_this_validator_fetched_stops_it_asking_again() {
-        let schedule = two_shard_topology();
+        let schedule = delivery_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -7995,7 +7997,7 @@ mod tests {
         let lapse = Window::Lapse
             .of(Deadline::of_transaction(&transaction))
             .start;
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, lapse, &[], &[claim]);
+        let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, lapse, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
@@ -8003,7 +8005,7 @@ mod tests {
         );
         fetch_answers(&mut state, &bundle, &[]);
 
-        let (_, opened) = proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
+        let (_, opened) = proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
         assert!(
             state_proof_fetches(&opened).is_empty(),
             "and not again at a newer header, the answer being in hand",
@@ -8024,8 +8026,8 @@ mod tests {
     /// every validator proves whichever shard a record names.
     #[test]
     fn a_delivery_whose_deliverer_departed_is_probed_on_its_successor() {
-        let schedule = peer_terminating_schedule(60_000);
-        let (successor, _) = PEER.children();
+        let schedule = deliverer_terminating_schedule(60_000);
+        let (successor, _) = DELIVERER.children();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -8033,13 +8035,13 @@ mod tests {
         let figures = UnsettledTx::for_transaction(&transaction, test_committed());
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
-        // The delivery's target falls under the peer's left child, as
-        // the trie cuts it.
+        // The delivery's target falls under the deliverer's left child,
+        // as the trie cuts it.
         let claim = delivered_claim(&delivery_classified());
         assert_eq!(
             schedule.head().shard_trie().shard_for_prefix(claim.owner),
             successor,
-            "the fixture's claim sits under the departed peer's left child"
+            "the fixture's claim sits under the departed deliverer's left child"
         );
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state
@@ -8047,8 +8049,8 @@ mod tests {
             .ledger
             .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
-        // The local chain has crossed the peer's cut: its committee is
-        // anchored in a window whose trie names the children.
+        // The local chain has crossed the deliverer's cut: its committee
+        // is anchored in a window whose trie names the children.
         state.committed_committee_anchor_wt = lapse;
 
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
@@ -8068,12 +8070,13 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the successor's newest header inside the lapse window is the anchor, and the \
-             claim cell the key; the departed peer, with no header, is not asked"
+             claim cell the key; the departed deliverer, with no header, is not asked"
         );
 
-        // A header of the departed peer past the lapse is asked as well.
+        // A header of the departed deliverer past the lapse is asked as
+        // well.
         let (peer_bundle, peer_opened) =
-            proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
+            proven_at(&mut state, &schedule, DELIVERER, 6, lapse, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&peer_opened),
             vec![(peer_bundle.anchor, vec![claim])],
@@ -9197,6 +9200,12 @@ mod tests {
     const CORE: ShardId = ShardId::leaf(2, 2);
     const CORE_SIBLING: ShardId = ShardId::leaf(2, 3);
 
+    /// The two leaves a delivery fixture places off [`HOME`], [`PEER`]'s
+    /// children again: the core of one shard bearing the verdict, and
+    /// the shard the leg's crossing is delivered on.
+    const BEARER: ShardId = ShardId::leaf(2, 2);
+    const DELIVERER: ShardId = ShardId::leaf(2, 3);
+
     /// A shape frozen divided with an inbound leg on `HOME` feeding a
     /// core on `PEER`.
     fn leg_classified() -> Classified {
@@ -9232,10 +9241,10 @@ mod tests {
         classified
     }
 
-    /// A shape frozen divided with an inbound leg on [`HOME`] delivered
-    /// on [`PEER`], whose core of one shard sits beside the delivery —
-    /// so the leg probes that shard's committed cell and the delivery's
-    /// claim.
+    /// A shape frozen divided under [`delivery_topology`] with an
+    /// inbound leg on [`HOME`] delivered on [`DELIVERER`], the core of
+    /// one shard on [`BEARER`] — so the leg probes the bearer's
+    /// committed cell and the deliverer's claim.
     fn delivery_classified() -> Classified {
         use hyperscale_vm_types::LegRole;
 
@@ -9243,10 +9252,11 @@ mod tests {
         let legs = [
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Core, &[]),
-            leg(2, LegRole::Outbound, &[(0, 0)]),
+            leg(3, LegRole::Outbound, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
-        assert_eq!(classified.core(), &BTreeSet::from([PEER]));
+        let trie = ShardTrie::from_leaves([HOME, BEARER, DELIVERER]);
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([BEARER]));
         assert!(classified.decomposed());
         classified
     }
@@ -9279,6 +9289,31 @@ mod tests {
     /// topology a leg on `HOME` probes a two-shard core under.
     fn two_shard_core_topology() -> TopologySchedule {
         TopologySchedule::single(leaves_snap(&[HOME, CORE, CORE_SIBLING], &[]))
+    }
+
+    /// [`HOME`] beside [`BEARER`] and [`DELIVERER`], all live: the
+    /// topology a leg on `HOME` probes a delivery under.
+    fn delivery_topology() -> TopologySchedule {
+        TopologySchedule::single(leaves_snap(&[HOME, BEARER, DELIVERER], &[]))
+    }
+
+    /// A schedule in which [`DELIVERER`] splits at the end of epoch 0
+    /// while [`HOME`] and [`BEARER`] run on, so the deliverer is
+    /// past-terminal anywhere in epoch 1 and its keyspace passes to its
+    /// two children.
+    fn deliverer_terminating_schedule(epoch_duration_ms: u64) -> TopologySchedule {
+        let (left, right) = DELIVERER.children();
+        let mut sched = TopologySchedule::new(
+            epoch_duration_ms,
+            Epoch::new(0),
+            leaves_snap(&[HOME, BEARER, DELIVERER], &[(DELIVERER, 0)]),
+        );
+        let post = leaves_snap_departed(&[HOME, BEARER, left, right], &[], &[(DELIVERER, None)]);
+        for epoch in 1..=12u64 {
+            sched.insert(Epoch::new(epoch), Arc::clone(&post));
+        }
+        sched.set_head(post);
+        sched
     }
 
     /// [`HOME`] and [`PEER`] both live, both crewed — the topology a

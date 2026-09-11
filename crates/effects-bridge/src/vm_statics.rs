@@ -88,6 +88,25 @@ pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
     records.into_iter().map(|(_, record)| record).collect()
 }
 
+/// What a manifest transaction declares it will touch, priced on the
+/// engine's own schedule.
+///
+/// The declaration spans every shard it routes to, because the
+/// reservation is taken once against the whole of it — and every value
+/// edge's record and claim beside it, which the engine declares at
+/// prepare wherever the edge turns out to cross: placement is a fact of
+/// the anchor, and the price is fixed when the envelope is composed.
+/// With the fixed charge for carrying the transaction and the ceiling
+/// it signed for its own execution, this is its work.
+#[must_use]
+pub fn declared_footprint(routing: &RoutedTransaction, legs: &[LegShape]) -> u64 {
+    routing
+        .per_shard
+        .values()
+        .fold(0u64, |total, set| total.saturating_add(footprint(set)))
+        .saturating_add(crossing_cells_footprint(legs))
+}
+
 /// The footprint of the cells a transaction's value edges write.
 ///
 /// The record under the producer and the claim under the consumer, each
@@ -681,20 +700,7 @@ impl Derivation for BridgeStatics {
             .into_iter()
             .collect();
         let legs = legs_of(&admitted.admitted);
-        // What this transaction costs a block, on the engine's own
-        // schedule: the fixed charge for carrying it, what it declared it
-        // would touch, and the ceiling it signed for its own execution.
-        // The declaration spans every shard it routes to, because the
-        // reservation is taken once against the whole of it — and every
-        // value edge's record and claim beside it, which the engine
-        // declares at prepare wherever the edge turns out to cross:
-        // placement is a fact of the anchor, and the price is fixed when
-        // the envelope is composed.
-        let declared_footprint = routing
-            .per_shard
-            .values()
-            .fold(0u64, |total, set| total.saturating_add(footprint(set)))
-            .saturating_add(crossing_cells_footprint(&legs));
+        let declared_footprint = declared_footprint(&routing, &legs);
         let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
         Ok(Derived {
             effective_window,
@@ -1413,7 +1419,7 @@ mod tests {
             ))
             .expect_err("refuses");
         assert!(
-            refused.to_string().contains("signature proof"),
+            refused.to_string().contains("signature"),
             "{}",
             refused.to_string()
         );

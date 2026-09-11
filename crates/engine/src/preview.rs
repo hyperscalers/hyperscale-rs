@@ -268,17 +268,13 @@ impl Executor {
             Ok(derived) => derived,
             Err(reason) => return PreviewReport::refused(reason),
         };
-        // The price is the declaration's; an envelope that prepared
-        // derives, so a refusal here is answered as one rather than
-        // reached.
-        let price = match tx.try_derived(self.derivation().as_ref()) {
-            Ok(derived) => price_attos(derived.work),
-            Err(error) => return PreviewReport::refused(error.to_string()),
-        };
         let payer = PayerFee {
             vault,
             max_fee: vm.max_fee,
-            price,
+            // The declaration's price, read off what prepared rather
+            // than derived again: a preview under an assumed authority
+            // admits what derivation would refuse.
+            price: price_attos(prepared.work),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.
