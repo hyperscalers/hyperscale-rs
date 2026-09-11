@@ -719,6 +719,32 @@ impl Executor {
     }
 }
 
+/// The batch entry `prepared` runs as: every bound the kernel meters
+/// against and every set it judges against, carried from the
+/// preparation.
+///
+/// One mapping for every caller, because a term left behind here is a
+/// bound the kernel does not apply — and a preview that left one behind
+/// would report a verdict the chain would not reach. `applies` is the
+/// caller's, being the one thing the preparation does not fix: a tick
+/// scopes it to the shard's own keys and a preview covers everything.
+pub fn batch_entry(
+    tx: TxHash,
+    prepared: &PreparedTx,
+    env: EnvInputs,
+    applies: OwnerSet,
+    fee: Option<FeeBurn>,
+) -> BatchTx {
+    BatchTx::new(tx, prepared.declaration.clone(), env)
+        .with_job(prepared.job.clone())
+        .with_nullifiers(prepared.nullifiers.clone())
+        .with_gas_limits(prepared.gas_limits.clone())
+        .with_event_bytes(prepared.event_bytes)
+        .with_applies(applies)
+        .with_judges(prepared.judges.clone())
+        .with_fee(fee)
+}
+
 /// Fuel and the abort reason (if any) as node-local metadata.
 /// How an abort reads in a diagnostic: its class, rendered.
 ///
@@ -1509,18 +1535,17 @@ impl Executor {
                     .get(vm_tx)
                     .cloned()
                     .expect("every prepared transaction has an environment");
-                BatchTx::new(*vm_tx, entry.declaration.clone(), env)
-                    .with_job(entry.job.clone())
-                    .with_nullifiers(entry.nullifiers.clone())
-                    .with_gas_limits(entry.gas_limits.clone())
-                    .with_event_bytes(entry.event_bytes)
-                    .with_applies(locality.clone())
-                    .with_judges(entry.judges.clone())
-                    .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
+                batch_entry(
+                    *vm_tx,
+                    entry,
+                    env,
+                    locality.clone(),
+                    fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
                         vault: payer.vault,
                         resource: *PROTOCOL_RESOURCE,
                         amount: payer.price.min(payer.max_fee),
-                    }))
+                    }),
+                )
             })
             .collect();
         let walk = ManifestWalk {
@@ -1707,6 +1732,45 @@ mod tests {
     use hyperscale_vm_types::AbortReason;
 
     use super::*;
+
+    /// Every bound the preparation fixed reaches the entry the kernel
+    /// runs. A bound left behind here is one the kernel never applies,
+    /// and a preview that left one behind would report a verdict the
+    /// chain would not reach — which is why both callers map through
+    /// one function and why this names the terms it must carry.
+    #[test]
+    fn the_batch_entry_carries_every_bound_the_preparation_fixed() {
+        let prepared = PreparedTx {
+            job: Job::Manifest {
+                calls: Vec::new(),
+                legs: LegPlan::whole(0),
+            },
+            declaration: Declaration::default(),
+            nullifiers: Vec::new(),
+            gas_limits: vec![7, 9],
+            event_bytes: 4_321,
+            work: DeclaredWork::ZERO,
+            judges: OwnerSet::whole(),
+        };
+        let entry = batch_entry(
+            TxHash::from(Hash::from_bytes(b"entry")),
+            &prepared,
+            EnvInputs::unsealed(1_000),
+            OwnerSet::whole(),
+            Some(FeeBurn {
+                vault: SubstateKey {
+                    owner: Address::new([3; 31], AddressClass::Component),
+                    local: LocalKey([4; 16]),
+                },
+                resource: *PROTOCOL_RESOURCE,
+                amount: 11,
+            }),
+        );
+        assert_eq!(entry.gas_limits, prepared.gas_limits);
+        assert_eq!(entry.event_bytes, prepared.event_bytes);
+        assert_eq!(entry.fee.as_ref().map(|burn| burn.amount), Some(11));
+        assert!(matches!(entry.job, Job::Manifest { .. }));
+    }
 
     /// One price, whatever refused it. A completed run carries the burn
     /// in its own writes and settles it apart only where a tick can
