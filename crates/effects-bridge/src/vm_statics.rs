@@ -544,6 +544,9 @@ impl BridgeStatics {
                 "a publish carries no subintents".into(),
             ));
         }
+        // A publish lowers to one node and signs one ceiling for it.
+        vm.admit_terms(1)
+            .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         // The artifact has to describe itself before it is addressed:
         // what the address covers is code and signatures together, so an
         // artifact that declares nothing is not a package.
@@ -563,7 +566,7 @@ impl BridgeStatics {
         // into state — the largest transaction the protocol admits, and
         // one the declared side would otherwise price as the smallest.
         let footprint = (write_keys.len() as u64).saturating_add(artifact.len() as u64);
-        let work = declared_work(footprint, vm.gas_limit, vm.signature_work());
+        let work = declared_work(footprint, vm.gas_limit_total(), vm.signature_work());
 
         Ok(Derived {
             // A publish carries no tree, so nothing narrows the window
@@ -700,9 +703,18 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        // One signed ceiling per lowered node, summing under the bound,
+        // and a priority under its own: the composer's terms are held to
+        // the manifest the tree lowered to.
+        vm.admit_terms(routing.calls.len())
+            .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let legs = legs_of(&admitted.admitted);
         let declared_footprint = declared_footprint(&routing, &legs);
-        let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
+        let work = declared_work(
+            declared_footprint,
+            vm.gas_limit_total(),
+            vm.signature_work(),
+        );
         Ok(Derived {
             effective_window,
             work,
@@ -791,7 +803,7 @@ mod tests {
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
-    use hyperscale_vm_types::{AddressClass, CollectionId, LegRole, ResourceAddr};
+    use hyperscale_vm_types::{AddressClass, CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr};
 
     use super::*;
     use crate::records::record_address;
@@ -977,7 +989,8 @@ mod tests {
             subintent_sigs,
             fee_payer: composer_addr(),
             max_fee: 1_000,
-            gas_limit: 1_000_000,
+            gas_limits: vec![250_000; tree.node_count()],
+            priority_bp: 0,
             validity_start_ms: 0,
             validity_end_ms: 1_000_000,
             message: Vec::new(),
@@ -1039,8 +1052,86 @@ mod tests {
         );
         assert_eq!(
             derived.work,
-            declared_work(derived.footprint, vm.gas_limit, vm.signature_work())
+            declared_work(derived.footprint, vm.gas_limit_total(), vm.signature_work())
         );
+    }
+
+    /// The ceilings index the lowered manifest one to one: a count off
+    /// the node count is refused, whether short or long.
+    #[test]
+    fn a_ceiling_count_off_the_manifest_is_refused() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let mut vm = envelope(&tree, &[]);
+        assert_eq!(vm.gas_limits.len(), 3);
+        statics().derive(&vm).expect("one ceiling per node derives");
+
+        vm.gas_limits.pop();
+        let short = statics()
+            .derive(&vm)
+            .expect_err("two ceilings for three nodes");
+        assert!(short.to_string().contains("3 manifest nodes"), "{short}");
+
+        vm.gas_limits = vec![250_000; 4];
+        assert!(
+            statics().derive(&vm).is_err(),
+            "four ceilings for three nodes"
+        );
+    }
+
+    /// The bound is on the sum over the nodes, not on any one of them.
+    #[test]
+    fn ceilings_summing_past_the_bound_are_refused() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let mut vm = envelope(&tree, &[]);
+        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2, 1];
+        let heavy = statics()
+            .derive(&vm)
+            .expect_err("the sum is past the bound");
+        assert!(heavy.to_string().contains("sum"), "{heavy}");
+
+        vm.gas_limits = vec![MAX_GAS_LIMIT / 2, MAX_GAS_LIMIT / 2, 0];
+        statics().derive(&vm).expect("at the bound derives");
+    }
+
+    /// A publish carries one ceiling, the node it lowers to.
+    #[test]
+    fn a_publish_carries_one_ceiling() {
+        let key = key(7);
+        let mut vm = TransactionEnvelope {
+            body: TransactionBody::Publish(vec![0xAB; 64]),
+            subintent_sigs: Vec::new(),
+            fee_payer: composer_addr(),
+            max_fee: 1_000,
+            gas_limits: vec![1, 2],
+            priority_bp: 0,
+            validity_start_ms: 0,
+            validity_end_ms: 1_000_000,
+            message: Vec::new(),
+            network: NETWORK,
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
+        }
+        .sign(&key);
+        let two = statics()
+            .derive(&vm)
+            .expect_err("two ceilings for one node");
+        assert!(two.to_string().contains("1 manifest node"), "{two}");
+        // One ceiling passes the terms; what refuses the envelope then
+        // is the artifact, which is not a package.
+        vm.gas_limits = vec![1];
+        let refused = statics()
+            .derive(&vm)
+            .expect_err("the artifact is not a package");
+        assert!(!refused.to_string().contains("ceilings"), "{refused}");
     }
 
     /// An escrow cell is keyed by what its node's own signer signed. Two
@@ -1100,13 +1191,14 @@ mod tests {
             withdraw(composer_addr(), RES_X, 100),
             deposit_edge(bob_addr(), 1, RES_X),
         ]);
-        let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
+        let vm = envelope(&tree, &[]);
+        let derived = statics().derive(&vm).expect("derives");
 
-        // The envelope's own ceiling is in there, and so is a charge no
-        // declaration can shrink.
+        // The envelope's own ceilings are in there, summed over its
+        // nodes, and so is a charge no declaration can shrink.
         assert!(
-            derived.work > TX_UNITS + 1_000_000,
-            "work must carry the fixed charge and the signed limit: {}",
+            derived.work > TX_UNITS + vm.gas_limit_total(),
+            "work must carry the fixed charge and the signed ceilings: {}",
             derived.work
         );
 

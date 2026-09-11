@@ -375,9 +375,10 @@ pub const fn drain_admits_block(work_in_flight: WorkInFlight, tx_count: usize) -
     tx_count == 0 || work_in_flight.inner() <= MAX_DRAIN_WORK
 }
 
-/// The largest execution ceiling a transaction may sign for.
+/// The largest compute a transaction may sign for, summed over its
+/// per-node ceilings.
 ///
-/// A sender's `gas_limit` is theirs to choose, and it enters the drain
+/// The figure is the sender's to choose, and it enters the drain
 /// budget at face value — so without a bound one envelope could reserve
 /// the whole of it and stall the shard for the price of a single
 /// signature. The engine's per-invocation fuel backstop is a different

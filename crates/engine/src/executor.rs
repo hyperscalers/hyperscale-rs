@@ -76,9 +76,9 @@ pub struct PreparedTx {
     /// One record per bound subintent: the nullifier the batch entry
     /// enforces, and what the cell recording its spend says.
     pub nullifiers: Vec<SubintentRecord>,
-    /// The envelope's signed execution ceiling, in fuel — one budget for
-    /// the whole transaction, however many nodes its manifest walks.
-    pub gas_limit: u64,
+    /// The envelope's signed compute ceilings, in fuel: one per manifest
+    /// node, in node order, each metering its own node and nothing else.
+    pub gas_limits: Vec<u64>,
     /// What the transaction costs a block on the engine's own schedule:
     /// the fixed charge for carrying it, its declared footprint, and the
     /// ceiling it signed. A settlement is the batch's own and costs the
@@ -609,7 +609,7 @@ impl Executor {
             job: Job::Records(disposals),
             declaration,
             nullifiers: Vec::new(),
-            gas_limit: 0,
+            gas_limits: Vec::new(),
             work: 0,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
@@ -661,7 +661,7 @@ impl Executor {
         let legs = legs_of(&admitted.admitted);
         let work = declared_work(
             declared_footprint(&routing, &legs),
-            vm.gas_limit,
+            vm.gas_limit_total(),
             vm.signature_work(),
         );
         // Both views of the declaration, straight from the fold: the
@@ -694,7 +694,7 @@ impl Executor {
             },
             declaration,
             nullifiers: admitted.subintents,
-            gas_limit: vm.gas_limit,
+            gas_limits: vm.gas_limits.clone(),
             work,
             judges: OwnerSet::whole(),
         })
@@ -1492,7 +1492,7 @@ impl Executor {
                 BatchTx::new(*vm_tx, entry.declaration.clone(), env)
                     .with_job(entry.job.clone())
                     .with_nullifiers(entry.nullifiers.clone())
-                    .with_gas_limit(entry.gas_limit)
+                    .with_gas_limits(entry.gas_limits.clone())
                     .with_applies(locality.clone())
                     .with_judges(entry.judges.clone())
                     .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {

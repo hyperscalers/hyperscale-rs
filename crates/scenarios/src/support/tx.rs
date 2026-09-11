@@ -17,7 +17,7 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::TypeShape;
-use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms, principal_of};
+use hyperscale_transactions::{Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
@@ -1393,6 +1393,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
     let graph = client
         .transfer_graph(principal_of(signer), from, to, amount)
         .expect("the stdlib account answers a transfer");
+    let gas_limits = default_gas_limits(graph.nodes.len());
     let envelope = signing::wrap(
         &EnvelopeTree {
             root: IntentDecl {
@@ -1410,7 +1411,8 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
         client.network(),
         signing::Terms {
             max_fee: MAX_FEE,
-            gas_limit: DEFAULT_GAS_LIMIT,
+            gas_limits,
+            priority_bp: 0,
             validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
             validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
             message: Vec::new(),
@@ -1726,7 +1728,8 @@ pub fn build_publish_tx(
             subintent_sigs: Vec::new(),
             fee_payer: account_address(&payer.public_key().0),
             max_fee: PUBLISH_MAX_FEE,
-            gas_limit: 1_000_000,
+            gas_limits: vec![1_000_000],
+            priority_bp: 0,
             validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
             validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
             message: Vec::new(),

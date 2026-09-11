@@ -32,19 +32,30 @@ use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
 
-/// The execution gas limit every built envelope signs. Placeholder
-/// pricing — well above what a transfer draws, so the ceiling is never
-/// what a load generator hits first.
+/// The compute every built envelope signs for whole, split evenly over
+/// its nodes by [`default_gas_limits`].
+///
+/// Placeholder pricing — well above what a transfer draws at any node,
+/// so the ceiling is never what a load generator hits first.
 pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
+
+/// The per-node ceilings every built envelope signs for a manifest of
+/// `nodes` lowered nodes: [`DEFAULT_GAS_LIMIT`] split evenly, so the sum
+/// a block reserves is the default whatever the manifest's shape.
+#[must_use]
+pub fn default_gas_limits(nodes: usize) -> Vec<u64> {
+    let share = DEFAULT_GAS_LIMIT / u64::try_from(nodes.max(1)).unwrap_or(u64::MAX);
+    vec![share; nodes]
+}
 
 /// What a signer commits to beyond the manifest, in this workspace's
 /// vocabulary.
 ///
-/// The VM's own terms carry a validity window as plain milliseconds and a
-/// gas ceiling the caller chooses; this names the window with the clock
-/// type the rest of the workspace speaks and supplies the ceiling from
-/// [`DEFAULT_GAS_LIMIT`], which is what makes it deployment binding rather
-/// than a second spelling of the same struct.
+/// The VM's own terms carry a validity window as plain milliseconds and
+/// the compute ceilings the caller chooses; this names the window with
+/// the clock type the rest of the workspace speaks and supplies the
+/// ceilings from [`default_gas_limits`], which is what makes it
+/// deployment binding rather than a second spelling of the same struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terms {
     /// The most the signer will pay to have this transaction carried.
@@ -270,7 +281,8 @@ impl Client {
             self.network,
             signing::Terms {
                 max_fee: terms.max_fee,
-                gas_limit: DEFAULT_GAS_LIMIT,
+                gas_limits: default_gas_limits(tree.node_count()),
+                priority_bp: 0,
                 validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
                 validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
                 message: terms.message,

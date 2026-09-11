@@ -1052,7 +1052,7 @@ impl Derivation for StubVmStatics {
             // one are priced by the same function.
             work: declared_work(
                 (read_prefixes.len() + write_prefixes.len()) as u64,
-                vm.gas_limit,
+                vm.gas_limit_total(),
                 vm.signature_work(),
             ),
             footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
@@ -1207,7 +1207,8 @@ pub fn stub_transaction_binding(seed: u32, bound: usize, validity: TimestampRang
             .collect(),
         fee_payer: PrincipalAddr::new(payer),
         max_fee: 1_000,
-        gas_limit: 1_000_000,
+        gas_limits: vec![1_000_000],
+        priority_bp: 0,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
         message: Vec::new(),
@@ -1299,7 +1300,8 @@ pub fn stub_transaction_running(
         subintent_sigs: Vec::new(),
         fee_payer,
         max_fee,
-        gas_limit: 1_000_000,
+        gas_limits: vec![1_000_000],
+        priority_bp: 0,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
         message,
