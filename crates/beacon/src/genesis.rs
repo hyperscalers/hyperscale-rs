@@ -259,7 +259,7 @@ pub fn build_genesis(
     let beacon_committee: Vec<ValidatorId> = seated.into_iter().take(committee_len).collect();
 
     // One genesis pool holds every validator at the stake floor.
-    let total_stake = Stake::from_attos(validators.len() as u128 * MIN_STAKE_FLOOR.attos());
+    let total_stake = Stake::from_quanta(validators.len() as u128 * MIN_STAKE_FLOOR.quanta());
     let config = BeaconGenesisConfig {
         chain_config,
         initial_validators: validators,
@@ -345,13 +345,13 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeSet<ValidatorId> {
     }
     for pool in &config.initial_pools {
         let n = per_pool_count.get(&pool.id).copied().unwrap_or(0);
-        let Some(required_attos) = u128::from(n).checked_mul(MIN_STAKE_FLOOR.attos()) else {
+        let Some(required_quanta) = u128::from(n).checked_mul(MIN_STAKE_FLOOR.quanta()) else {
             panic!(
                 "genesis pool {} declares {n} validators, overflowing the stake floor",
                 pool.id
             );
         };
-        let required = Stake::from_attos(required_attos);
+        let required = Stake::from_quanta(required_quanta);
         assert!(
             pool.total_stake >= required,
             "genesis pool {} declares {n} validators but holds only {} stake; \
@@ -477,7 +477,9 @@ mod tests {
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(u128::from(n_validators) * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(
+                    u128::from(n_validators) * MIN_STAKE_FLOOR.quanta(),
+                ),
             }],
             initial_beacon_committee: beacon_members,
             initial_shard_committee: shard_members,
@@ -613,7 +615,7 @@ mod tests {
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: vec![
                 ValidatorId::new(3),
@@ -659,7 +661,7 @@ mod tests {
             ],
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(2 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(2 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: vec![],
             initial_shard_committee: vec![],
@@ -707,7 +709,7 @@ mod tests {
             // 4 validators × MIN_STAKE_FLOOR each, but pool holds half.
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(2 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(2 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: vec![],
             initial_shard_committee: vec![],
@@ -730,7 +732,7 @@ mod tests {
             }],
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: vec![],
             initial_shard_committee: vec![ValidatorId::new(0), ValidatorId::new(0)],
@@ -773,7 +775,7 @@ mod tests {
                 .collect(),
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(5 * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: (0u64..5).map(ValidatorId::new).collect(),
             initial_shard_committee: vec![],
@@ -803,7 +805,7 @@ mod tests {
             }],
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos(MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: vec![],
             initial_shard_committee: vec![],

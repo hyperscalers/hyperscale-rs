@@ -225,7 +225,7 @@ impl CoordinatorSim {
                 .collect(),
             initial_pools: vec![GenesisPool {
                 id: pool_id,
-                total_stake: Stake::from_attos((pool_n as u128) * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta((pool_n as u128) * MIN_STAKE_FLOOR.quanta()),
             }],
             initial_beacon_committee: members
                 .iter()

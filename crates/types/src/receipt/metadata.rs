@@ -15,7 +15,7 @@ pub const MAX_DIAGNOSTIC_STRING_LEN: usize = 4 * 1024;
 
 /// Fee metrics from transaction execution.
 ///
-/// Costs are denominated in attos (10⁻¹⁸ whole tokens), the same scale
+/// Costs are denominated in quanta (10⁻¹⁸ whole tokens), the same scale
 /// [`Stake`](crate::Stake) uses. Each is `Some` for receipts the engine
 /// actually produced and `None` for synthetic-failure records
 /// ([`ExecutionMetadata::empty`]) where the executor never reached the
@@ -143,7 +143,7 @@ mod tests {
     fn fee_summary_roundtrip_some() {
         let fs = FeeSummary {
             total_execution_cost: Some(123),
-            total_royalty_cost: Some(Stake::ATTOS_PER_WHOLE),
+            total_royalty_cost: Some(Stake::QUANTA_PER_WHOLE),
             total_storage_cost: Some(0),
             total_tipping_cost: Some(0),
         };

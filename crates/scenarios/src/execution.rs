@@ -17,8 +17,8 @@ use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, round_key};
 use hyperscale_engine::genesis::{draw_key, vault_key};
 use hyperscale_engine::{
-    DOMAIN_SEALED_DRAW, PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD,
-    account_address, protocol_hash,
+    DOMAIN_SEALED_DRAW, PROTOCOL_RESOURCE, PreviewGrants, PreviewOutcome, PreviewReport,
+    ResourceChange, account_address, protocol_hash,
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
@@ -81,7 +81,7 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
     ];
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [first.address(), second.address(), requester.address()],
         [],
     );
@@ -166,7 +166,7 @@ pub fn single_transfer(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
     let before = c.committed_state_root(ShardId::ROOT);
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let transfer = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
     let hash = charges.submit(c, transfer);
@@ -213,7 +213,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
 
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
     let over_hash = charges.submit(c, over);
@@ -261,7 +261,7 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
 
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [alice.address(), bob.address(), carol.address()],
         [],
     );
@@ -327,7 +327,7 @@ pub fn zipf_payments(
     let mut rng = Lcg(0x5eed_c0de ^ u64::from(senders) << 8 ^ u64::from(recipients));
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         (0..senders)
             .map(|index| sender(index).1.address())
             .chain((0..recipients).map(|rank| recipient(rank).address())),
@@ -370,7 +370,7 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
     let before = vault_balance(c, ShardId::ROOT, hot);
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         (0..senders)
             .map(|index| sender(index).1.address())
             .chain([hot.address()]),
@@ -428,7 +428,7 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
 /// shard's chain never commits it.
 pub fn cross_shard_transfer(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
     let hash = charges.submit(c, tx);
@@ -500,7 +500,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
     );
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [from.address(), first_to.address(), second_to.address()],
         [],
     );
@@ -594,7 +594,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     let before = vault_balance(c, recipient_shard, to);
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [remote_from.address(), local_from.address(), to.address()],
         [],
     );
@@ -677,7 +677,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
 /// on the other.
 pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
     let hash = charges.submit(c, tx);
@@ -747,7 +747,7 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
     let right = ShardId::leaf(1, 1);
 
     let (payer, from, to) = cross_shard_cast();
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
     let hash = charges.submit(c, tx);
@@ -829,7 +829,7 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
         "the beacon never folded a crossing for the shard"
     );
     let before = recorded_gas(c, shard).expect("a folded crossing");
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
@@ -1093,7 +1093,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
 /// shard's chain ever includes it.
 pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 5, validity_around(c.now()));
     let hash = charges.submit(c, tx);
@@ -1146,7 +1146,7 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_payer_cast();
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [from.address(), to.address(), victim.address()],
         [],
     );
@@ -1201,7 +1201,7 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_remote_payer_cast();
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         [from.address(), to.address(), victim.address()],
         [],
     );
@@ -1278,7 +1278,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
         "the identity this account migrates to must be post-quantum"
     );
 
-    let world = World::open(c, *XRD, [owner.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [owner.address(), to.address()], []);
     let mut charges = Charges::default();
 
     // Baseline: the founding key pays for its own account and settles
@@ -1401,7 +1401,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
         "genesis must seed a post-quantum address like any other"
     );
 
-    let world = World::open(c, *XRD, [payer.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [payer.address(), to.address()], []);
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer_key, payer, to, 100, validity_around(c.now()));
     let hash = charges.submit(c, tx);
@@ -1471,7 +1471,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     let before = vault_balance(c, payer_shard, payer);
     // The delegator and the pool: the stake never leaves the one, and
     // the other never sees it.
-    let world = World::open(c, *XRD, [payer.address(), pool.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [payer.address(), pool.address()], []);
     let mut charges = Charges::default();
 
     // Both channels the bundle travels. The fetch rule names the
@@ -1576,7 +1576,7 @@ pub fn a_delivery_cut_off_past_its_window_is_reclaimed<C: FaultableCluster>(c: &
     let recipient_shard = ShardId::leaf(1, 1);
     let before = vault_balance(c, payer_shard, from);
     let recipient_before = vault_balance(c, recipient_shard, to);
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
@@ -1671,7 +1671,7 @@ pub fn a_healed_network_does_not_revive_a_closed_delivery<C: FaultableCluster>(c
     let recipient_shard = ShardId::leaf(1, 1);
     let before = vault_balance(c, payer_shard, from);
     let recipient_before = vault_balance(c, recipient_shard, to);
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
     let broadcast_dropped = c.drop_type("provisions.broadcast");
@@ -1791,7 +1791,7 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let to = recipient(0);
 
     let before = vault_balance(c, shard, from);
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
     let price = declared_price(c, &over);
@@ -1853,7 +1853,7 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
     let (payer, from) = sender(0);
     let to = recipient(0);
     let recipient_before = vault_balance(c, shard, to);
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
     let amount_for = |index: u8| -> u128 { 1 + u128::from(index) };
@@ -1949,7 +1949,12 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         expiry_ms,
     );
 
-    let world = World::open(c, *XRD, [composer.address(), requester.address()], []);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [composer.address(), requester.address()],
+        [],
+    );
     let mut charges = Charges::default();
     let tx = build_composed_tx(
         &composer_key,
@@ -2001,7 +2006,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 /// The reported change to `owner`'s native vault.
 fn preview_change(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
     let owner = owner.into();
-    let vault = vault_key(owner, *XRD);
+    let vault = vault_key(owner, *PROTOCOL_RESOURCE);
     *report
         .changes
         .iter()
@@ -2113,7 +2118,7 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
     );
 
     // The same envelope for real: the report was the truth about it.
-    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
     charges.submit(c, candidate);
     let status = await_tx_terminal(c, hash, epochs(8));
@@ -2180,7 +2185,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     let registered = Hash::from(package.0);
     let cell = package_key(*publisher, package);
 
-    let world = World::open(c, *XRD, [publisher.address()], []);
+    let world = World::open(c, *PROTOCOL_RESOURCE, [publisher.address()], []);
     let mut charges = Charges::default();
     let publish = build_publish_tx(key, artifact.clone(), validity_around(c.now()));
     let publish_hash = charges.submit(c, publish);
@@ -2300,7 +2305,7 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
     let validity = validity_around(c.now());
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         publishers.iter().map(|(_, publisher)| publisher.address()),
         [],
     );

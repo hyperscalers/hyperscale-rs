@@ -82,7 +82,7 @@ fn fixture() -> Fixture {
         initial_validators,
         initial_pools: vec![GenesisPool {
             id: pool_id,
-            total_stake: Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+            total_stake: Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
         }],
         initial_beacon_committee: (0..4).map(|i| committee.validator_id(i)).collect(),
         initial_shard_committee: (0..4).map(|i| committee.validator_id(i)).collect(),

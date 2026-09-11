@@ -1,6 +1,6 @@
 //! Transaction scenarios.
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{TransactionDecision, TransactionStatus};
 
 use crate::reshape::split_lifecycle;
@@ -42,7 +42,12 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
     let (key_a, acc_a) = &pair[0];
     let (key_b, acc_b) = &pair[1];
 
-    let world = World::open(c, *XRD, [acc_a.address(), acc_b.address()], []);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [acc_a.address(), acc_b.address()],
+        [],
+    );
     let mut charges = Charges::default();
     let tx_a = build_transfer_tx(key_a, *acc_a, *acc_b, PROBE_PAYMENT, validity);
     let tx_b = build_transfer_tx(key_b, *acc_b, *acc_a, PROBE_PAYMENT, validity);

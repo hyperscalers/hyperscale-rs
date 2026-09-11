@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     Address, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
     TransactionStatus, TxHash, WeightedTimestamp, Window,
@@ -175,7 +175,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
-    let (xrd, units) = route_worlds(c, &first, &second, &traders);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &traders);
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
@@ -183,7 +183,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         key,
         *trader,
         (&first.meta, &second.meta),
-        *XRD,
+        *PROTOCOL_RESOURCE,
         ROUTE_INPUT,
         0,
         validity,
@@ -193,11 +193,11 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     // The trader's withdraw is a leg, its own to reach: it pays the input
     // and the price whatever the core does after.
     assert!(
-        c.run_until(epochs(8), |c| held(c, trader.address(), *XRD)
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
             < SWAPPER_FUNDING - ROUTE_INPUT),
         "the trader's leg must pay before the core is asked anything",
     );
-    let paid = held(c, trader.address(), *XRD);
+    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
     // Past the anchor a probe of the core is licensed at, and held there
     // until the probe has read the core's cell: the reading is `Present`
@@ -236,7 +236,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         );
     }
     assert_eq!(
-        held(c, trader.address(), *XRD),
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
         paid,
         "a leg whose core committed the transaction must stay paid at its deadline: \
          the probe finds the core's block, and the reclaim is refused",
@@ -251,7 +251,8 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     // and the trader banks the route's output.
     c.clear_drops();
     assert!(
-        c.run_until(epochs(8), |c| held(c, trader.address(), *XRD) > paid),
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            > paid),
         "the core must settle once its certificates flow, and the route bank its output",
     );
     let status = c.tx_status(hash);
@@ -262,7 +263,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         ),
         "a route cut off across its deadline must still settle whole; status = {status:?}",
     );
-    xrd.assert_settles_within(
+    protocol_resource.assert_settles_within(
         c,
         &charges,
         epochs(8),
@@ -338,13 +339,13 @@ fn route_worlds<C: Cluster>(
         .iter()
         .map(|(_, account)| account.address())
         .collect();
-    let xrd = World::open(
+    let protocol_resource = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         holders.iter().copied(),
         [
-            reserve_cell(&first.meta, *XRD),
-            reserve_cell(&second.meta, *XRD),
+            reserve_cell(&first.meta, *PROTOCOL_RESOURCE),
+            reserve_cell(&second.meta, *PROTOCOL_RESOURCE),
         ],
     );
     let units = World::open(
@@ -356,7 +357,7 @@ fn route_worlds<C: Cluster>(
             reserve_cell(&second.meta, second.unit),
         ],
     );
-    (xrd, units)
+    (protocol_resource, units)
 }
 
 /// Drive every trader's route through both venues and hold the run to
@@ -368,7 +369,7 @@ fn drive_routes<C: Cluster>(
     traders: &[(Ed25519PrivateKey, PrincipalAddr)],
     budget: Budget,
 ) -> RouteReport {
-    let (xrd, units) = route_worlds(c, first, second, traders);
+    let (protocol_resource, units) = route_worlds(c, first, second, traders);
 
     let start = c.now();
     let mut charges = Charges::default();
@@ -378,7 +379,7 @@ fn drive_routes<C: Cluster>(
             key,
             *account,
             (&first.meta, &second.meta),
-            *XRD,
+            *PROTOCOL_RESOURCE,
             ROUTE_INPUT,
             0,
             validity_around(c.now()),
@@ -404,12 +405,12 @@ fn drive_routes<C: Cluster>(
         );
     }
 
-    // Nothing here mints: the XRD the traders paid in is what the venues
+    // Nothing here mints: the protocol resource the traders paid in is what the venues
     // now hold less the prices burned, and the units the first venue
     // paid out are what the second took back. Driven rather than read,
     // since the deposit that banks each trader's output lands a hop
     // after the second venue's verdict.
-    xrd.assert_settles_within(c, &charges, budget, "routes through two venues");
+    protocol_resource.assert_settles_within(c, &charges, budget, "routes through two venues");
     units.assert_settles_within(c, &Charges::default(), budget, "routes through two venues");
 
     RouteReport {
@@ -461,7 +462,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         trader_key,
         trader,
         (&first.meta, &second.meta),
-        *XRD,
+        *PROTOCOL_RESOURCE,
         ROUTE_INPUT,
         REFUSED_FLOOR,
         validity_around(c.now()),
@@ -469,8 +470,8 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
     let price = declared_price(c, &refused);
     let funded = vault_balance(c, TRADER_SHARD, trader);
     let (first_cell, second_cell) = (
-        reserve_cell(&first.meta, *XRD),
-        reserve_cell(&second.meta, *XRD),
+        reserve_cell(&first.meta, *PROTOCOL_RESOURCE),
+        reserve_cell(&second.meta, *PROTOCOL_RESOURCE),
     );
     let (first_before, second_before) = (held_at(c, first_cell), held_at(c, second_cell));
     assert!(
@@ -478,7 +479,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         "both venues have to be holding something, or the reserve check \
          holds trivially at zero: {first_before} and {second_before}",
     );
-    let (xrd, units) = route_worlds(c, &first, &second, &cast[..1]);
+    let (protocol_resource, units) = route_worlds(c, &first, &second, &cast[..1]);
     let mut charges = Charges::default();
     let refused_hash = charges.submit(c, refused);
 
@@ -543,7 +544,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         trader_key,
         trader,
         (&first.meta, &second.meta),
-        *XRD,
+        *PROTOCOL_RESOURCE,
         ROUTE_INPUT,
         0,
         validity_around(c.now()),
@@ -566,7 +567,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
     // Across the refusal and the route after it, the pair is conserved:
     // the trader and the venues hold between them what they started
     // with, less the two prices.
-    xrd.assert_settles_within(
+    protocol_resource.assert_settles_within(
         c,
         &charges,
         budget,

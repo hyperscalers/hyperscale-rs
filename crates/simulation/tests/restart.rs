@@ -15,7 +15,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
@@ -410,7 +410,7 @@ fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
         &caller_key,
         caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         SWAP_INPUT * 100,
         validity_around(cluster.now()),

@@ -77,7 +77,7 @@ impl DemoSession {
         serde_wasm_bindgen::to_value(&events).map_err(Into::into)
     }
 
-    /// Submit an XRD transfer between two funded accounts, returning its
+    /// Submit a protocol resource transfer between two funded accounts, returning its
     /// short label — the same one the resulting events carry.
     pub fn submit_transfer(&mut self) -> String {
         crate::event::TxLabel::from(self.inner.submit_transfer()).0

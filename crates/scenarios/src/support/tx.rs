@@ -15,7 +15,7 @@ use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{
     OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
 };
-use hyperscale_engine::{XRD, account_address};
+use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms, principal_of};
 use hyperscale_types::{
@@ -721,7 +721,7 @@ pub fn build_fan_out_tx(
     let graph = graph(account_address(&payer.public_key().0), |b| {
         for (index, to) in recipients.iter().enumerate() {
             let leg = amount + index as u128;
-            let funds = account::withdraw(b, from, *XRD, leg)?;
+            let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, leg)?;
             account::deposit(b, *to, funds)?;
         }
         Ok(())
@@ -1755,7 +1755,7 @@ pub fn published_instance(artifact: &[u8], salt: u8, founder: PrincipalAddr) -> 
     InstanceMeta {
         package: package_hash(&ProtocolHasher, artifact),
         config: vec![
-            Value::Address((*XRD).address()),
+            Value::Address((*PROTOCOL_RESOURCE).address()),
             Value::Address(founder.address()),
         ],
         salt: Hash32([salt; 32]),
@@ -2044,7 +2044,7 @@ pub fn delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
 /// stake-scale funds rather than the token amounts the transfer
 /// scenarios use. Sized above every delegation any scenario makes plus
 /// their fees.
-pub const DELEGATOR_FUNDING: u128 = 40 * MIN_STAKE_FLOOR.attos();
+pub const DELEGATOR_FUNDING: u128 = 40 * MIN_STAKE_FLOOR.quanta();
 
 /// Genesis accounts for the staking scenarios.
 ///
@@ -2079,7 +2079,7 @@ pub fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
         &ProtocolHasher,
         pool.address(),
         SlotId(staking::Pool::SLOT),
-        &[Value::Address(XRD.address()).canonical_bytes()],
+        &[Value::Address(PROTOCOL_RESOURCE.address()).canonical_bytes()],
     )
 }
 
@@ -2227,7 +2227,7 @@ pub fn build_stake_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(account_address(&delegator.public_key().0), |b| {
-        let funds = account::withdraw(b, from, *XRD, amount)?;
+        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
         let units = staking::Staking::at(pool).stake(b, funds)?;
         account::deposit(b, from, units)
     });
@@ -2235,7 +2235,7 @@ pub fn build_stake_tx(
 }
 
 /// The one-time payment request `signer` puts their name to: whoever
-/// hands them at least `amount` XRD, they will bank it.
+/// hands them at least `amount` protocol resource, they will bank it.
 ///
 /// A declaration and nothing else — no envelope, no fee terms, no
 /// composer. Its hash is a function of this content alone, which is what
@@ -2244,7 +2244,7 @@ pub fn build_stake_tx(
 #[must_use]
 pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
     declaration(signer, |b| {
-        let incoming = b.declare(*XRD, [Constraint::MinAmount(amount)]);
+        let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
     })
 }
@@ -2262,7 +2262,7 @@ pub fn payment_request_for(
     window: TimestampRange,
 ) -> IntentDecl {
     declaration_under(signer, scenario_header(window), |b| {
-        let incoming = b.declare(*XRD, [Constraint::MinAmount(amount)]);
+        let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
     })
 }
@@ -2301,8 +2301,8 @@ pub fn build_composed_tx(
         account_address(&composer.public_key().0),
         scenario_header(validity),
     );
-    let funds =
-        account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
+    let funds = account::withdraw(&mut root, from, *PROTOCOL_RESOURCE, amount)
+        .expect("an account answers a withdrawal");
     let paid = root.export(funds);
     let wants = env
         .adopt(account_address(&signer_key.public_key().0), request.clone())

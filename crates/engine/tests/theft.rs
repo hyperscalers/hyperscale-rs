@@ -14,7 +14,8 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::account_address;
 use hyperscale_engine::genesis::{GenesisPackages, vault_key};
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, XRD, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
+    genesis_writes,
 };
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
@@ -99,7 +100,7 @@ const fn terms(max_fee: u128) -> Terms {
     }
 }
 
-/// `from.withdraw(*XRD, amount) -> to.deposit(..)`, signed and paid for by
+/// `from.withdraw(*PROTOCOL_RESOURCE, amount) -> to.deposit(..)`, signed and paid for by
 /// the thief whatever `from` says.
 fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
@@ -134,7 +135,7 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
         .resolve(&mut |key| {
             accounts
                 .iter()
-                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .find(|(owner, _)| vault_key(*owner, *PROTOCOL_RESOURCE) == key)
                 .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
         })
         .expect("the debit fits")
@@ -144,7 +145,7 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
 fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u8>> {
     writes
         .cells()
-        .get(&vault_key(owner, *XRD))
+        .get(&vault_key(owner, *PROTOCOL_RESOURCE))
         .cloned()
         .flatten()
 }

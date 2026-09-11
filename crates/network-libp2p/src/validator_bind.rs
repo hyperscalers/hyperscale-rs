@@ -292,7 +292,7 @@ impl std::fmt::Display for BindError {
 /// field is `Clone`-cheap (`Arc` or `Copy`).
 #[derive(Clone)]
 struct BindContext {
-    /// Radix network identity, bound into every signed bind message.
+    /// The network identity, bound into every signed bind message.
     network: NetworkDefinition,
     /// Per-vnode signing identities. One `(validator_id, signature)` pair
     /// is produced per entry on every bind exchange. Must be non-empty.

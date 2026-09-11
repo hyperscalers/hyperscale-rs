@@ -163,7 +163,7 @@ mod tests {
         let current = Epoch::new(initiated.inner() + UNBONDING_WINDOW_EPOCHS - 2);
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             Stake::from_whole_tokens(100),
             initiated,
             current,
@@ -194,7 +194,7 @@ mod tests {
         // small release, capacity comfortably covers the actives.
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(100 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(100 * MIN_STAKE_FLOOR.quanta()),
             MIN_STAKE_FLOOR, // small release
             initiated,
             current,
@@ -207,7 +207,7 @@ mod tests {
         // 99 × FLOOR after release, plus the epoch emission credit.
         assert_eq!(
             pool.total_stake,
-            Stake::from_attos(100 * MIN_STAKE_FLOOR.attos() - MIN_STAKE_FLOOR.attos())
+            Stake::from_quanta(100 * MIN_STAKE_FLOOR.quanta() - MIN_STAKE_FLOOR.quanta())
                 .saturating_add(EMISSIONS_PER_EPOCH),
         );
         assert!(pool.pending_withdrawals.is_empty());
@@ -225,7 +225,7 @@ mod tests {
         let current = Epoch::new(initiated_b.inner() + UNBONDING_WINDOW_EPOCHS - 1);
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(100 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(100 * MIN_STAKE_FLOOR.quanta()),
             MIN_STAKE_FLOOR, // first one already in the fixture
             initiated_a,
             current,
@@ -233,7 +233,7 @@ mod tests {
         // Add a second matured + a third unmatured.
         let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
         pool.pending_withdrawals.push(PendingWithdrawal {
-            amount: Stake::from_attos(2 * MIN_STAKE_FLOOR.attos()),
+            amount: Stake::from_quanta(2 * MIN_STAKE_FLOOR.quanta()),
             initiated_at_epoch: initiated_b,
         });
         // still-pending withdrawal initiated late enough that
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(
             pool.total_stake,
             pre_total
-                .saturating_sub(Stake::from_attos(3 * MIN_STAKE_FLOOR.attos()))
+                .saturating_sub(Stake::from_quanta(3 * MIN_STAKE_FLOOR.quanta()))
                 .saturating_add(EMISSIONS_PER_EPOCH),
         );
         // One pending entry remains.
@@ -277,7 +277,7 @@ mod tests {
         // leaves capacity for 3.
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
             MIN_STAKE_FLOOR,
             initiated,
             current,
@@ -310,8 +310,8 @@ mod tests {
         // 3 * MIN_STAKE_FLOOR — only 1 active can be supported.
         let mut state = state_with_pending_withdrawal(
             4,
-            Stake::from_attos(4 * MIN_STAKE_FLOOR.attos()),
-            Stake::from_attos(3 * MIN_STAKE_FLOOR.attos()),
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
+            Stake::from_quanta(3 * MIN_STAKE_FLOOR.quanta()),
             initiated,
             current,
         );

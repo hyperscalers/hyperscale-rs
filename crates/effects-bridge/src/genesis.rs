@@ -7,7 +7,7 @@
 //! engine: a load generator, a wallet and a scenario all need to resolve a
 //! target, and none of them executes anything.
 
-use hyperscale_types::{ComponentAddr, ResourceAddr, StakePoolSeat};
+use hyperscale_types::{ComponentAddr, PROTOCOL_DISPLAY_DIGITS, ResourceAddr, StakePoolSeat};
 use hyperscale_vm_effects::{
     Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
     ResourceRecord, Value, package_hash, resource_address,
@@ -18,7 +18,7 @@ use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 use hyperscale_vm_types::Address;
 
 use crate::records::{InstanceCache, NodeRecords, PackageCache};
-use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
+use crate::{PROTOCOL_RESOURCE, PoolRegistry, ProtocolHasher, admit_protocol_package};
 
 /// The packages a network is born running.
 ///
@@ -208,7 +208,7 @@ pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> Instance
     InstanceMeta {
         package: staking_package,
         config: vec![
-            Value::Address(XRD.address()),
+            Value::Address(PROTOCOL_RESOURCE.address()),
             Value::Address(seat.operator.address()),
         ],
         salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
@@ -286,9 +286,12 @@ pub const STAKE_UNIT_RECORD: ResourceRecord = ResourceRecord::Fungible { display
 /// The owner badge's resource record: one non-fungible kind.
 pub const OWNER_BADGE_RECORD: ResourceRecord = ResourceRecord::NonFungible;
 
-/// The fee resource's record: fungible, displayed at eighteen subunit
-/// digits. Display quantization only — nothing on-chain consults it.
-pub const XRD_RECORD: ResourceRecord = ResourceRecord::Fungible { display_digits: 18 };
+/// The protocol resource's record: fungible, displayed at the digits
+/// the stake arithmetic reads. Display quantization only — nothing
+/// on-chain consults it.
+pub const PROTOCOL_RESOURCE_RECORD: ResourceRecord = ResourceRecord::Fungible {
+    display_digits: PROTOCOL_DISPLAY_DIGITS,
+};
 
 #[cfg(test)]
 mod tests {

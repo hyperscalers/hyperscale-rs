@@ -1363,7 +1363,7 @@ mod tests {
             StakePoolId::new(0),
             StakePool {
                 id: StakePoolId::new(0),
-                total_stake: Stake::from_attos(count * MIN_STAKE_FLOOR.attos()),
+                total_stake: Stake::from_quanta(count * MIN_STAKE_FLOOR.quanta()),
                 validators,
                 pending_withdrawals: Vec::new(),
                 released_cumulative: Stake::ZERO,

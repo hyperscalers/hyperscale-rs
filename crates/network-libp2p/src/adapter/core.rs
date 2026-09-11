@@ -107,7 +107,7 @@ pub struct Libp2pAdapter {
 pub struct Libp2pAdapterArgs {
     /// Transport, gossipsub, and discovery configuration.
     pub config: Libp2pConfig,
-    /// Radix network identity, bound into every signed bind message.
+    /// The network identity, bound into every signed bind message.
     pub network: NetworkDefinition,
     /// Ed25519 keypair for libp2p transport encryption.
     pub keypair: Keypair,

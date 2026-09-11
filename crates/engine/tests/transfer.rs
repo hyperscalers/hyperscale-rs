@@ -15,8 +15,8 @@ use hyperscale_engine::genesis::{
 use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
-    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput, XRD,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PreviewGrants, PreviewInputs,
+    PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput,
     genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
@@ -261,7 +261,8 @@ fn signed_transfer_under_bound(
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let chain = client().records();
     let mut b = client().builder(&chain, from);
-    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let funds =
+        account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
@@ -281,8 +282,8 @@ fn signed_transfer_from_unknown(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let mut b = GraphBuilder::new();
-    let [funds] = b.call_signed(from, "withdraw", (*XRD, amount));
-    let [] = b.call(to, "deposit", (funds.resource_is(*XRD),));
+    let [funds] = b.call_signed(from, "withdraw", (*PROTOCOL_RESOURCE, amount));
+    let [] = b.call(to, "deposit", (funds.resource_is(*PROTOCOL_RESOURCE),));
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
@@ -683,14 +684,14 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
         writes.movements,
         accounts
             .iter()
-            .map(|(o, a)| (vault_key(*o, *XRD), a))
+            .map(|(o, a)| (vault_key(*o, *PROTOCOL_RESOURCE), a))
             .collect::<Vec<_>>()
     );
     writes
         .resolve(&mut |key| {
             accounts
                 .iter()
-                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .find(|(owner, _)| vault_key(*owner, *PROTOCOL_RESOURCE) == key)
                 .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
         })
         .expect("the debit fits")
@@ -699,7 +700,7 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
 fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u8>> {
     writes
         .cells()
-        .get(&vault_key(owner, *XRD))
+        .get(&vault_key(owner, *PROTOCOL_RESOURCE))
         .cloned()
         .flatten()
 }
@@ -707,7 +708,7 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 /// Whether the batch removed the vault cell outright — a drain, never a
 /// zero write.
 fn vault_removed(writes: &SettledWrites, owner: impl Into<Address>) -> bool {
-    writes.cells().get(&vault_key(owner, *XRD)) == Some(&None)
+    writes.cells().get(&vault_key(owner, *PROTOCOL_RESOURCE)) == Some(&None)
 }
 
 #[test]
@@ -786,11 +787,11 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
         }
     }
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(1_000 - 25 - price_of(&executor, &fine)).to_vec())
     );
     assert_eq!(
-        store.cell(vault_key(bob(), *XRD)),
+        store.cell(vault_key(bob(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(75 - price).to_vec()),
         "the credit lands and the failure's price stays charged"
     );
@@ -844,7 +845,7 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
     db.apply(charge);
     db.apply(writes);
     assert_eq!(
-        db.cell(vault_key(bob(), *XRD)),
+        db.cell(vault_key(bob(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(50 + amount - price).to_vec()),
         "a later sibling's credit must compose with the charged price, not revert it"
     );
@@ -1026,7 +1027,9 @@ fn a_receipt_carries_only_its_own_payers_burn() {
             "a receipt carries its own payer's burn"
         );
         assert!(
-            !writes.cells.contains_key(&vault_key(sibling, *XRD)),
+            !writes
+                .cells
+                .contains_key(&vault_key(sibling, *PROTOCOL_RESOURCE)),
             "a receipt never carries a sibling payer's vault"
         );
     }
@@ -1065,7 +1068,7 @@ fn shared_payer_burns_accumulate_across_a_batch() {
         store.apply(writes);
     }
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(1_000 - 10 - 11 - 12).to_vec()),
         "every burn in the batch reaches the committed balance"
     );
@@ -1265,7 +1268,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     let arrived = EscrowedValue {
         node: edge.producer,
         output: edge.output,
-        resource: *XRD,
+        resource: *PROTOCOL_RESOURCE,
         amount: 100,
         record: edge.record.key(),
     };
@@ -1342,7 +1345,7 @@ fn a_transfer_executes_divided_on_both_shards() {
         vec![EscrowedValue {
             node: edge.producer,
             output: edge.output,
-            resource: *XRD,
+            resource: *PROTOCOL_RESOURCE,
             amount: 100,
             record: edge.record.key(),
         }],
@@ -1435,7 +1438,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     };
     store.apply(writes);
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "the escrow debited the vault"
     );
@@ -1459,7 +1462,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     );
     store.apply(writes);
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(1_000).to_vec()),
         "and the reclaim restores it exactly"
     );
@@ -1545,7 +1548,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         "the record is gone"
     );
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
     );
@@ -1674,7 +1677,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     );
     unclaimed.apply(writes);
     assert_eq!(
-        Substates::cell(&unclaimed, vault_key(alice(), *XRD)),
+        Substates::cell(&unclaimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(1_000).to_vec()),
         "an unclaimed crossing returns to the cell it left"
     );
@@ -1693,7 +1696,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
         "a claimed crossing's record is deleted"
     );
     assert_eq!(
-        Substates::cell(&claimed, vault_key(alice(), *XRD)),
+        Substates::cell(&claimed, vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(900).to_vec()),
         "and the value stays where the claim took it"
     );
@@ -1755,7 +1758,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
         .expect("the refusal settles the price apart");
     store.apply(charge);
     assert_eq!(
-        store.cell(vault_key(alice(), *XRD)),
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
         Some(encode_amount(1_000 - price).to_vec()),
         "exactly the declared price leaves the vault"
     );
@@ -1860,7 +1863,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let mut holds = ProvisionalHolds::new();
     holds
-        .entry(vault_key(alice(), *XRD))
+        .entry(vault_key(alice(), *PROTOCOL_RESOURCE))
         .or_default()
         .insert(Hash::from_bytes(b"an unresolved leg").into(), 950);
     let ctx = TickBatchContext {
@@ -1900,7 +1903,8 @@ fn a_two_recipient_fan_out_executes() {
     let chain = client().records();
     let mut b = client().builder(&chain, alice());
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
-        let funds = account::withdraw(&mut b, alice(), *XRD, amount).expect("an account withdraws");
+        let funds = account::withdraw(&mut b, alice(), *PROTOCOL_RESOURCE, amount)
+            .expect("an account withdraws");
         account::deposit(&mut b, to, funds).expect("an account deposits");
     }
     let graph = b.build().expect("every output is consumed");
@@ -2317,7 +2321,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
 
     // The right bytes at the wrong key: a vault slot, not the content
     // address. Refused.
-    let vault = vault_key(publisher, *XRD);
+    let vault = vault_key(publisher, *PROTOCOL_RESOURCE);
     cache.absorb_cell(publisher, vault.local.0, &artifact);
     assert!(
         cache.load().get(package).is_none(),
@@ -2353,7 +2357,7 @@ fn preview_on(
 /// The reported change to `owner`'s native vault.
 fn change_for(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
     let owner = owner.into();
-    let key = vault_key(owner, *XRD);
+    let key = vault_key(owner, *PROTOCOL_RESOURCE);
     *report
         .changes
         .iter()
@@ -2511,7 +2515,7 @@ fn a_preview_prices_an_abort_at_the_declared_price() {
     assert_eq!(
         report.changes,
         vec![ResourceChange {
-            key: vault_key(payer, *XRD),
+            key: vault_key(payer, *PROTOCOL_RESOURCE),
             before: 1_000,
             after: 1_000 - report.fee,
             credit: 0,
@@ -2682,7 +2686,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let meta = InstanceMeta {
         package,
         config: vec![
-            Value::Address((*XRD).address()),
+            Value::Address((*PROTOCOL_RESOURCE).address()),
             Value::Address(payer.address()),
         ],
         salt: Hash32([7; 32]),

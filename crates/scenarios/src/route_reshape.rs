@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
     TimestampRange, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
@@ -171,7 +171,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, venue_shard, &mut taken);
     let swappers = swappers_on(&[caller_shard], &mut taken);
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -182,7 +182,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
         .iter()
         .map(|(_, account)| account.address())
         .collect();
-    let xrd = World::open(c, *XRD, holders.iter().copied(), [reserve]);
+    let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, holders.iter().copied(), [reserve]);
     let units = World::open(
         c,
         venue.unit,
@@ -201,7 +201,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
             key,
             *caller,
             &venue.meta,
-            *XRD,
+            *PROTOCOL_RESOURCE,
             SWAP_INPUT,
             0,
             validity_around(c.now()),
@@ -248,7 +248,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
 
     swap_against_the_child(c, &venue, &later[0], &mut charges, claimed, budget);
 
-    xrd.assert_settles_within(c, &charges, budget, "swaps across the venue's split");
+    protocol_resource.assert_settles_within(c, &charges, budget, "swaps across the venue's split");
     units.assert_settles_within(
         c,
         &Charges::default(),
@@ -274,7 +274,7 @@ struct DepartingCallers {
     swappers: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
     reserve: SubstateKey,
     stocked: u128,
-    xrd: World,
+    protocol_resource: World,
     units: World,
 }
 
@@ -361,7 +361,7 @@ fn stock_callers_against<C: Cluster>(
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, venue_shard, &mut taken);
     let swappers = swappers_on(&[caller_shard], &mut taken);
-    let reserve = reserve_cell(&venue.meta, *XRD);
+    let reserve = reserve_cell(&venue.meta, *PROTOCOL_RESOURCE);
     let stocked = held_at(c, reserve);
     assert!(
         stocked > 0,
@@ -371,7 +371,7 @@ fn stock_callers_against<C: Cluster>(
         .iter()
         .map(|(_, account)| account.address())
         .collect();
-    let xrd = World::open(c, *XRD, holders.iter().copied(), [reserve]);
+    let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, holders.iter().copied(), [reserve]);
     let units = World::open(
         c,
         venue.unit,
@@ -383,7 +383,7 @@ fn stock_callers_against<C: Cluster>(
         swappers,
         reserve,
         stocked,
-        xrd,
+        protocol_resource,
         units,
     }
 }
@@ -416,7 +416,7 @@ fn swaps_across_the_callers_cut<C: Cluster>(
         swappers,
         reserve,
         stocked,
-        xrd,
+        protocol_resource,
         units,
     } = set;
     let mut charges = Charges::default();
@@ -428,7 +428,7 @@ fn swaps_across_the_callers_cut<C: Cluster>(
             key,
             *caller,
             &venue.meta,
-            *XRD,
+            *PROTOCOL_RESOURCE,
             SWAP_INPUT,
             0,
             validity_around(c.now()),
@@ -491,7 +491,7 @@ fn swaps_across_the_callers_cut<C: Cluster>(
 
     swap_against_the_child(c, &venue, &later[0], &mut charges, claimed, budget);
 
-    xrd.assert_settles_within(c, &charges, budget, "swaps across the callers' cut");
+    protocol_resource.assert_settles_within(c, &charges, budget, "swaps across the callers' cut");
     units.assert_settles_within(
         c,
         &Charges::default(),
@@ -589,7 +589,7 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
             key,
             *caller,
             &set.venue.meta,
-            *XRD,
+            *PROTOCOL_RESOURCE,
             SWAP_INPUT,
             0,
             validity_around(c.now()),
@@ -649,8 +649,12 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
          {claimed}",
         held_at(c, set.reserve),
     );
-    set.xrd
-        .assert_settles_within(c, &charges, budget, "swaps across the venue's terminal");
+    set.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        budget,
+        "swaps across the venue's terminal",
+    );
     set.units.assert_settles_within(
         c,
         &Charges::default(),
@@ -755,7 +759,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
         key,
         *caller,
         &set.venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         0,
         TimestampRange::new(
@@ -776,7 +780,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
         clock(c),
     );
 
-    let paid_before = held(c, caller.address(), *XRD);
+    let paid_before = held(c, caller.address(), *PROTOCOL_RESOURCE);
     let hash = charges.submit(c, swap);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(caller_shard, hash).0.is_some()),
@@ -834,14 +838,14 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
     // The input is the child's, and stays so once the caller's shard can
     // read the claim: the leg retires, and nothing licenses it to take
     // the crossing back.
-    set.xrd.assert_settles_within(
+    set.protocol_resource.assert_settles_within(
         c,
         &charges,
         budget,
         "a swap committed after the venue's cut",
     );
     assert_eq!(
-        held(c, caller.address(), *XRD),
+        held(c, caller.address(), *PROTOCOL_RESOURCE),
         paid_before - SWAP_INPUT - charges.burned(c),
         "the caller's input must not come back: the child claimed it",
     );
@@ -901,7 +905,7 @@ struct DepartingRoute {
     trader: PrincipalAddr,
     reserves: [SubstateKey; 2],
     stocked: [u128; 2],
-    xrd: World,
+    protocol_resource: World,
     units: World,
 }
 
@@ -927,15 +931,15 @@ fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
     let staying = stand_up_venue(c, SECOND_VENUE_SHARD, &mut taken);
     let (key, trader) = grind_onto(TRADER_SHARD, &mut taken);
     let reserves = [
-        reserve_cell(&leaving.meta, *XRD),
-        reserve_cell(&staying.meta, *XRD),
+        reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE),
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
     ];
     let stocked = reserves.map(|reserve| held_at(c, reserve));
     assert!(
         stocked.iter().all(|&held| held > 0),
         "both venues have to be holding something to price against"
     );
-    let xrd = World::open(c, *XRD, [trader.address()], reserves);
+    let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
     let units = World::open(
         c,
         leaving.unit,
@@ -967,7 +971,7 @@ fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
         trader,
         reserves,
         stocked,
-        xrd,
+        protocol_resource,
         units,
     }
 }
@@ -997,7 +1001,7 @@ fn submit_departing_route<C: Cluster>(
         &route.key,
         route.trader,
         (&route.leaving.meta, &route.staying.meta),
-        *XRD,
+        *PROTOCOL_RESOURCE,
         ROUTE_INPUT,
         0,
         validity,
@@ -1017,14 +1021,17 @@ fn submit_departing_route<C: Cluster>(
          proves nothing; baseline = {baseline:?}, engaged = {engaged:?}",
     );
     assert!(
-        c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD)
-            < SWAPPER_FUNDING - ROUTE_INPUT),
+        c.run_until(epochs(8), |c| held(
+            c,
+            route.trader.address(),
+            *PROTOCOL_RESOURCE
+        ) < SWAPPER_FUNDING - ROUTE_INPUT),
         "the trader's leg must pay before the core is asked anything",
     );
     (
         hash,
         baseline,
-        held(c, route.trader.address(), *XRD),
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         validity.end_timestamp_exclusive,
     )
 }
@@ -1094,11 +1101,14 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // no window bounds it either: the input comes back however long the
     // departure took, on either epoch clock.
     assert!(
-        c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
-            == paid + ROUTE_INPUT),
+        c.run_until(epochs(12), |c| held(
+            c,
+            route.trader.address(),
+            *PROTOCOL_RESOURCE
+        ) == paid + ROUTE_INPUT),
         "the trader must get the route's input back on the abandonment record; holds {} \
          against {}",
-        held(c, route.trader.address(), *XRD),
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         paid + ROUTE_INPUT,
     );
     assert!(
@@ -1126,12 +1136,16 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // And conserved outright: nothing of the route is stranded, because
     // nothing it issued was swept out from under its reclaim.
     assert!(
-        c.run_until(epochs(8), |c| route.xrd.settles(c, charges.burned(c))),
+        c.run_until(epochs(8), |c| route
+            .protocol_resource
+            .settles(c, charges.burned(c))),
         "a route through a departing venue: the world must settle against the burn alone",
     );
-    route
-        .xrd
-        .assert_settled(c, charges.burned(c), "a route through a departing venue");
+    route.protocol_resource.assert_settled(
+        c,
+        charges.burned(c),
+        "a route through a departing venue",
+    );
     charges.assert_each_fits_a_full_block(c);
     route.units.assert_settles_within(
         c,
@@ -1215,24 +1229,29 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     // answers for, so the absence is proved against a live cell and the
     // issuer takes the output back. Past the window the trader is out
     // its input; the world is not, on either clock.
-    let banked = c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid);
+    let banked = c.run_until(epochs(8), |c| {
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE) > paid
+    });
     if !banked {
         let clock = WeightedTimestamp::ZERO.plus(c.now());
         assert!(
             clock >= Window::Delivery.of(Deadline::of(validity_end)).end,
             "the route must bank its output for the trader while its delivery window is open; \
              holds {} against {paid}",
-            held(c, route.trader.address(), *XRD),
+            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         );
         assert_eq!(
-            held(c, route.trader.address(), *XRD),
+            held(c, route.trader.address(), *PROTOCOL_RESOURCE),
             paid,
             "past its delivery window the output never reaches the trader",
         );
     }
-    route
-        .xrd
-        .assert_settles_within(c, &charges, epochs(8), "a route settled across a departure");
+    route.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a route settled across a departure",
+    );
     route.units.assert_settles_within(
         c,
         &Charges::default(),
@@ -1335,7 +1354,7 @@ fn train_world<C: Cluster>(
 ) -> World {
     World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         legs.iter()
             .flat_map(|(_, from, to)| [from.address(), to.address()]),
         [],
@@ -1490,10 +1509,11 @@ fn assert_train_fates<C: Cluster>(
             ),
         };
         assert!(
-            c.run_until(epochs(8), |c| held(c, to.address(), *XRD) == credited),
+            c.run_until(epochs(8), |c| held(c, to.address(), *PROTOCOL_RESOURCE)
+                == credited),
             "a recipient of a transfer sent {phase:?} and {taken} by the leaving shard must \
              hold {credited}; holds {}",
-            held(c, to.address(), *XRD),
+            held(c, to.address(), *PROTOCOL_RESOURCE),
         );
     }
     assert!(
@@ -1577,7 +1597,7 @@ fn swap_against_the_child<C: Cluster>(
         key,
         *caller,
         &venue.meta,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         SWAP_INPUT,
         0,
         validity_around(c.now()),
@@ -1596,7 +1616,7 @@ fn swap_against_the_child<C: Cluster>(
         "the post-cut swap's output never reached its caller",
     );
     assert_eq!(
-        held_at(c, reserve_cell(&venue.meta, *XRD)),
+        held_at(c, reserve_cell(&venue.meta, *PROTOCOL_RESOURCE)),
         claimed + SWAP_INPUT,
         "the venue's child claims the post-cut input",
     );

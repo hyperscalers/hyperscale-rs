@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{PrincipalAddr, ShardId, TransactionDecision, TransactionStatus, TxHash};
 
 use crate::reshape::split_lifecycle;
@@ -183,7 +183,7 @@ pub fn cross_shard_fraction(
         .collect();
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         senders
             .iter()
             .map(|(_, account)| account.address())
@@ -237,7 +237,7 @@ pub fn participant_count_sweep(
     let (payer, from) = (&accounts[0].0, accounts[0].1);
     let world = World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         accounts.iter().map(|(_, account)| account.address()),
         [],
     );

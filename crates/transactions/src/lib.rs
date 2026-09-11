@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 
 use hyperscale_effects_bridge::genesis::{World, genesis_world};
 use hyperscale_effects_bridge::vm_statics::principal_for;
-use hyperscale_effects_bridge::{NodeRecords, XRD};
+use hyperscale_effects_bridge::{NodeRecords, PROTOCOL_RESOURCE};
 use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
@@ -158,10 +158,12 @@ impl Client {
         let chain = self.records();
         let mut b = self.builder(&chain, signer);
         let funds = if signer == from {
-            account::withdraw(&mut b, from, *XRD, amount)?
+            account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount)?
         } else {
             let proof = account::authorize(&mut b, from)?;
-            b.presenting(proof, |b| account::withdraw(b, from, *XRD, amount))?
+            b.presenting(proof, |b| {
+                account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)
+            })?
         };
         account::deposit(&mut b, to, funds)?;
         b.build()
@@ -333,7 +335,7 @@ mod tests {
                         target: from.into(),
                         method: "withdraw".into(),
                         args: vec![
-                            GraphArg::Literal(Value::Address(XRD.address())),
+                            GraphArg::Literal(Value::Address(PROTOCOL_RESOURCE.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
                         evidence: [EvidenceRef::Node(0)].into(),
@@ -346,7 +348,7 @@ mod tests {
                                 producer: 1,
                                 output: 0,
                             },
-                            constraints: vec![Constraint::ResourceIs(*XRD)],
+                            constraints: vec![Constraint::ResourceIs(*PROTOCOL_RESOURCE)],
                         }],
                         evidence: BTreeSet::new(),
                     },

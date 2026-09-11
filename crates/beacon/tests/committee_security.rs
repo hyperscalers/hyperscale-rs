@@ -224,8 +224,8 @@ fn mc_state(cell: &Cell) -> BeaconState {
             id: pool_id,
             // Generous so `min_stake` stays clamped at the floor and no
             // admission gate trips over long runs.
-            total_stake: Stake::from_attos(
-                u128::from(cell.population) * 5 * MIN_STAKE_FLOOR.attos(),
+            total_stake: Stake::from_quanta(
+                u128::from(cell.population) * 5 * MIN_STAKE_FLOOR.quanta(),
             ),
             validators: pool_validators,
             pending_withdrawals: Vec::new(),

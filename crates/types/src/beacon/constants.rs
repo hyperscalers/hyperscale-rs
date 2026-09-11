@@ -311,12 +311,12 @@ pub const EPOCHS_PER_YEAR: u64 = (60 / 5) * 24 * 365;
 /// Per-epoch tokens credited to active stake pools, split pro-rata
 /// across pools by their count of `OnShard { ready: true }` validators.
 ///
-/// Computed as `TOKENS_PER_YEAR_TARGET / EPOCHS_PER_YEAR` in attos, so
-/// the annual sum equals the target modulo per-epoch attos rounding
+/// Computed as `TOKENS_PER_YEAR_TARGET / EPOCHS_PER_YEAR` in quanta, so
+/// the annual sum equals the target modulo per-epoch quanta rounding
 /// (remainder of ≈ 10⁻¹⁴ tokens/year, well below any display
 /// precision). Epochs with zero ready validators mint nothing.
-pub const EMISSIONS_PER_EPOCH: Stake = Stake::from_attos(
-    (TOKENS_PER_YEAR_TARGET as u128) * Stake::ATTOS_PER_WHOLE / (EPOCHS_PER_YEAR as u128),
+pub const EMISSIONS_PER_EPOCH: Stake = Stake::from_quanta(
+    (TOKENS_PER_YEAR_TARGET as u128) * Stake::QUANTA_PER_WHOLE / (EPOCHS_PER_YEAR as u128),
 );
 
 /// Weight every ready validator earns for participating, independent of

@@ -85,7 +85,6 @@ anyhow = "1.0.104"
 hex.workspace = true
 rand.workspace = true
 
-# Radix types for genesis configuration parsing
 tracing-appender = "0.2.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

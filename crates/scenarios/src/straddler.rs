@@ -10,7 +10,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
-use hyperscale_engine::XRD;
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
     TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
@@ -284,7 +284,7 @@ fn straddler_world<C: Cluster>(
 ) -> World {
     World::open(
         c,
-        *XRD,
+        *PROTOCOL_RESOURCE,
         straddlers
             .iter()
             .flat_map(|(_, from, to)| [from.address(), to.address()]),
@@ -464,10 +464,15 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
     let (payer_key, payer, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(c, *XRD, [payer.address(), recipient.address()], []);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [payer.address(), recipient.address()],
+        [],
+    );
     let mut charges = Charges::default();
     let before = vault_balance(c, survivor, *payer);
-    let recipient_before = held(c, recipient.address(), *XRD);
+    let recipient_before = held(c, recipient.address(), *PROTOCOL_RESOURCE);
 
     let CutLeg {
         hash,
@@ -550,7 +555,7 @@ pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c:
         vault_balance(c, survivor, *payer),
     );
     assert_eq!(
-        held(c, recipient.address(), *XRD),
+        held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
         "the recipient was never credited",
     );
@@ -595,10 +600,15 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
     let (payer_key, payer, recipient) = &setup.straddlers[0];
 
     split_lifecycle(c);
-    let world = World::open(c, *XRD, [payer.address(), recipient.address()], []);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [payer.address(), recipient.address()],
+        [],
+    );
     let mut charges = Charges::default();
     let before = vault_balance(c, splitter, *payer);
-    let recipient_before = held(c, recipient.address(), *XRD);
+    let recipient_before = held(c, recipient.address(), *PROTOCOL_RESOURCE);
 
     let CutLeg {
         hash,
@@ -681,7 +691,7 @@ pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableC
         inheritor(c),
     );
     assert_eq!(
-        held(c, recipient.address(), *XRD),
+        held(c, recipient.address(), *PROTOCOL_RESOURCE),
         recipient_before,
         "the recipient was never credited",
     );

@@ -476,7 +476,7 @@ impl Session {
             .expect("the stdlib account answers a transfer")
     }
 
-    /// Submit an XRD transfer between two funded accounts, returning its hash.
+    /// Submit a protocol resource transfer between two funded accounts, returning its hash.
     ///
     /// The payer rotates with the nonce, so a caller driving a steady rate
     /// spreads load across accounts instead of serializing on one. The payee

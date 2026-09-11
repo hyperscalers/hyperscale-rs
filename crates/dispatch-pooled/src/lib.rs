@@ -6,7 +6,7 @@
 //!   (block votes, QC verification, state root, proposal building). Never
 //!   blocked by execution batches.
 //! - **Throughput** — single shared work-stealing pool for general crypto
-//!   verification, transaction signature validation, and Radix Engine
+//!   verification, transaction signature validation, and VM engine
 //!   execution. In-handler `par_iter` fans batches across this pool's
 //!   workers.
 //!
@@ -57,7 +57,7 @@ pub enum ThreadPoolError {
 
 /// Default stack size for consensus-pool workers (verifies, JMT roots).
 const DEFAULT_CONSENSUS_STACK_SIZE: usize = 2 * 1024 * 1024;
-/// Default stack size for throughput-pool workers (Radix Engine needs more).
+/// Default stack size for throughput-pool workers (the VM engine needs more).
 const DEFAULT_THROUGHPUT_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Configuration for the two production rayon thread pools.
@@ -74,7 +74,7 @@ pub struct ThreadPoolConfig {
     pub consensus_threads: usize,
 
     /// Threads in the throughput pool. General crypto verification,
-    /// transaction signature validation, and Radix Engine execution share
+    /// transaction signature validation, and VM engine execution share
     /// this pool; rayon's work-stealing interleaves them automatically and
     /// in-handler `par_iter` calls fan batches across the same workers.
     pub throughput_threads: usize,
@@ -92,7 +92,7 @@ pub struct ThreadPoolConfig {
     /// Stack size for consensus pool threads (bytes).
     pub consensus_stack_size: usize,
 
-    /// Stack size for throughput pool threads (bytes). Radix Engine
+    /// Stack size for throughput pool threads (bytes). The VM engine
     /// execution lives here, so this is sized larger than the consensus
     /// pool's stack.
     pub throughput_stack_size: usize,

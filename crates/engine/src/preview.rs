@@ -27,7 +27,7 @@ use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
 };
-use hyperscale_vm_types::{Outcome, SubstateKey, price_attos};
+use hyperscale_vm_types::{Outcome, SubstateKey, price};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
@@ -35,7 +35,7 @@ use crate::executor::{
     publish_work,
 };
 use crate::genesis::vault_key;
-use crate::{Executor, XRD};
+use crate::{Executor, PROTOCOL_RESOURCE};
 
 /// What a preview run is permitted that a committed execution is not.
 ///
@@ -243,7 +243,7 @@ impl Executor {
         // Derived rather than read off `fee_vault`, which panics on an
         // envelope derivation refuses — the exact envelope a preview
         // exists to give an answer about.
-        let vault = vault_key(vm.fee_payer, *XRD);
+        let vault = vault_key(vm.fee_payer, *PROTOCOL_RESOURCE);
         if let Some(artifact) = vm.artifact() {
             let payer = PayerFee {
                 vault,
@@ -274,7 +274,7 @@ impl Executor {
             // The declaration's price, read off what prepared rather
             // than derived again: a preview under an assumed authority
             // admits what derivation would refuse.
-            price: price_attos(prepared.work),
+            price: price(prepared.work),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.
