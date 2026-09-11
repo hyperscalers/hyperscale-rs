@@ -44,6 +44,7 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
+use crate::memo_verifier::MemoVerifier;
 
 pub mod membership;
 pub mod reshape;
@@ -78,7 +79,7 @@ impl Default for CryptoScheme {
 fn scheme_verifier(scheme: CryptoScheme) -> Arc<dyn Verifier> {
     match scheme {
         CryptoScheme::Mock => Arc::new(MockVerifier),
-        CryptoScheme::Bls => Arc::new(BlsVerifier),
+        CryptoScheme::Bls => Arc::new(MemoVerifier::new(BlsVerifier)),
     }
 }
 

@@ -5,6 +5,7 @@
 //! every run.
 
 mod event_queue;
+mod memo_verifier;
 mod runner;
 
 // The delivery log's types appear in `SimulationRunner`'s signature, so a
