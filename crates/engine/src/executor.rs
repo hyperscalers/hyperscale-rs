@@ -1066,9 +1066,12 @@ fn declare(
     effect: Effect,
     holds: Option<ResourceAddr>,
 ) -> Result<(), String> {
+    // A cell the host reaches by key — a payer's vault, a signer's
+    // stored rule — names no slot a declaration could bound, so it is
+    // bounded at the cap.
     declaration
         .set
-        .insert(effect)
+        .insert_at_cap(effect)
         .map_err(|conflict| conflict.to_string())?;
     declaration.ordered.push(DeclaredAccess {
         effect,
