@@ -143,7 +143,10 @@ impl ShardSourceTracker {
     /// Insert a verified source-shard header. Called by the coordinator
     /// from `on_verified_source_header` for every active shard (on- or
     /// off-committee) — remote shards via the remote-header path, the
-    /// local shard from its own commit stream.
+    /// local shard from its own commit stream. The shard's window keeps
+    /// only its most recent [`MAX_RETAINED_HEADERS_PER_SHARD`] heights;
+    /// a boundary block needed past the window is retained on its
+    /// [`ObservedCrossing`].
     pub fn on_verified_source_header(
         &mut self,
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
@@ -151,10 +154,11 @@ impl ShardSourceTracker {
         let header = certified_header.header();
         let shard = header.shard_id();
         let height = header.height();
-        self.shard_headers
-            .entry(shard)
-            .or_default()
-            .insert(height, certified_header);
+        let headers = self.shard_headers.entry(shard).or_default();
+        headers.insert(height, certified_header);
+        while headers.len() > MAX_RETAINED_HEADERS_PER_SHARD {
+            headers.pop_first();
+        }
     }
 
     /// `header`'s parent, when the shard's header window or retained
@@ -192,13 +196,14 @@ impl ShardSourceTracker {
     /// the shard's chain durably reached from one it merely certified.
     #[must_use]
     pub fn commit_established(&self, shard: ShardId, boundary: &BlockHeader) -> bool {
+        let boundary_hash = boundary.hash();
         if self
             .boundary_crossings
             .get(&shard)
             .is_some_and(|per_shard| {
                 per_shard
                     .values()
-                    .any(|crossing| crossing.boundary_header.block_hash() == boundary.hash())
+                    .any(|crossing| crossing.boundary_header.block_hash() == boundary_hash)
             })
         {
             return true;
@@ -226,7 +231,7 @@ impl ShardSourceTracker {
                 link_height = h.prev();
             }
             let proof = CommitProof::new((***x).clone(), (***y).clone(), None, ancestry);
-            proof.verify_structure().is_ok() && proof.proven_block_hash() == boundary.hash()
+            proof.verify_structure().is_ok() && proof.proven_block_hash() == boundary_hash
         })
     }
 
@@ -349,21 +354,6 @@ impl ShardSourceTracker {
             false
         });
         abandoned
-    }
-
-    /// Bound `shard_headers` to a sliding window of the most recent
-    /// [`MAX_RETAINED_HEADERS_PER_SHARD`] heights per shard. Boundary
-    /// block headers needed past the window are retained on their
-    /// [`ObservedCrossing`]. Called from `adopt_block`.
-    pub fn prune_stale_headers(&mut self) {
-        for headers in self.shard_headers.values_mut() {
-            while headers.len() > MAX_RETAINED_HEADERS_PER_SHARD {
-                let Some(oldest) = headers.keys().next().copied() else {
-                    break;
-                };
-                headers.remove(&oldest);
-            }
-        }
     }
 
     /// Record any epoch-boundary crossing visible in `shard`'s header
@@ -878,7 +868,6 @@ mod tests {
                 0,
             ));
         }
-        t.prune_stale_headers();
         assert!(t.header(shard(0), BlockHeight::new(2)).is_none());
 
         let held = t
@@ -896,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_stale_headers_bounds_the_window() {
+    fn insertion_bounds_the_window() {
         let mut t = ShardSourceTracker::new();
         for height in 1..=(MAX_RETAINED_HEADERS_PER_SHARD as u64 + 3) {
             t.on_verified_source_header(linked_header(
@@ -908,7 +897,6 @@ mod tests {
                 0,
             ));
         }
-        t.prune_stale_headers();
         // Oldest heights dropped; the window holds the most recent set.
         assert!(t.header(shard(0), BlockHeight::new(1)).is_none());
         assert!(

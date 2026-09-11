@@ -96,6 +96,14 @@ impl CertifiedBlockHeader {
 }
 
 impl Verified<CertifiedBlockHeader> {
+    /// The block hash, read from the QC: construction asserts
+    /// `qc.block_hash == header.hash()`, so this is the header's hash
+    /// without re-encoding the header.
+    #[must_use]
+    pub fn block_hash(&self) -> BlockHash {
+        self.qc().block_hash()
+    }
+
     /// Construct from a raw header paired with a verified QC, trusting the
     /// QC's signers to have validated the header at their committee. The
     /// light-client construction gate: receivers of cross-shard committed

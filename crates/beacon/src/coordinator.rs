@@ -2073,8 +2073,7 @@ impl BeaconCoordinator {
 
         // Evict chunks the boundary fold has now consumed — those starting
         // below each shard's advanced applied watermark
-        // (`boundaries[shard].witness_leaf_count`) — and bound the
-        // verified-header maps to their sliding window.
+        // (`boundaries[shard].witness_leaf_count`).
         let consumed: Vec<(ShardId, u64)> = self
             .state
             .boundaries
@@ -2092,8 +2091,6 @@ impl BeaconCoordinator {
         if was_on_committee && !self.is_on_committee() {
             abandoned_witness_ids.extend(self.shard_source.evicted_from_committee());
         }
-        self.shard_source.prune_stale_headers();
-
         let next_epoch = self.state.current_epoch.next();
         self.proposal_pool.reset(next_epoch);
         self.evaluated_proposers.clear();
