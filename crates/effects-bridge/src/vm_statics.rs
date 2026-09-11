@@ -119,10 +119,10 @@ const fn target_owner(target: &EffectTarget) -> Address {
 /// and claim beside it, which the engine declares at prepare wherever
 /// the edge turns out to cross: placement is a fact of the anchor, and
 /// the price is fixed when the envelope is composed. A node's ceiling
-/// sits under its target, each distinct package's artifact under the
-/// first node that runs it, and the verification of every signature
-/// under the payer, whose shard engages the reservation. The whole is
-/// the shares plus what every shard bears.
+/// sits under its target and each distinct package's artifact under the
+/// first node that runs it; the verification of every signature is
+/// borne by every shard, since each verifies before it commits. The
+/// whole is the shares plus what every shard bears.
 ///
 /// `envelope_bytes` is the envelope's own encoded length, the one term
 /// of retention no derivation of the tree can see.
@@ -210,16 +210,6 @@ pub fn declared_vector(
         );
     }
 
-    // Verification at the payer's shard, where the reservation engages.
-    let signatures = vm.signatures();
-    add(
-        vm.fee_payer.address(),
-        DeclaredWork {
-            compute: signatures.compute,
-            ..DeclaredWork::ZERO
-        },
-    );
-
     let shares: Vec<OwnerShare> = by_owner
         .into_iter()
         .map(|(owner, work)| OwnerShare { owner, work })
@@ -237,18 +227,18 @@ pub fn declared_vector(
     } else {
         0
     };
-    let everywhere = everywhere(&shares, envelope_bytes, signatures.retention, events);
+    let everywhere = everywhere(&shares, envelope_bytes, vm.signatures(), events);
     (shares, everywhere)
 }
 
 /// What every shard that commits a transaction bears whatever it holds:
-/// the committed cell it writes, and the retention every validator
-/// keeps — the envelope, every write, the auth material, and the events
-/// its packages may emit.
+/// the verification of every signature, the committed cell it writes,
+/// and the retention every validator keeps — the envelope, every write,
+/// the auth material, and the events its packages may emit.
 fn everywhere(
     shares: &[OwnerShare],
     envelope_bytes: u64,
-    auth_bytes: u64,
+    signatures: DeclaredWork,
     event_bytes: u64,
 ) -> DeclaredWork {
     let committed_cell = u64::from(MARKER_CELL_BYTES);
@@ -256,10 +246,11 @@ fn everywhere(
         total.saturating_add(share.work.write_bytes)
     });
     DeclaredWork {
+        compute: signatures.compute,
         write_bytes: committed_cell,
         retention: envelope_bytes
             .saturating_add(written)
-            .saturating_add(auth_bytes)
+            .saturating_add(signatures.retention)
             .saturating_add(event_bytes),
         ..DeclaredWork::ZERO
     }
@@ -718,18 +709,17 @@ impl BridgeStatics {
         // writes it claims — the package cell, written whole with the
         // artifact, and the vault the fee burns from — under the
         // publisher, with its one ceiling and its signature.
-        let signatures = vm.signatures();
         let written = (artifact.len() as u64).saturating_add(AMOUNT_CELL_BYTES as u64);
         let shares = vec![OwnerShare {
             owner: publisher.address(),
             work: DeclaredWork {
-                compute: vm.gas_limit_total().saturating_add(signatures.compute),
+                compute: vm.gas_limit_total(),
                 write_bytes: written,
                 footprint: point_write_units().saturating_mul(write_keys.len() as u64),
                 ..DeclaredWork::ZERO
             },
         }];
-        let everywhere = everywhere(&shares, envelope_bytes(vm)?, signatures.retention, 0);
+        let everywhere = everywhere(&shares, envelope_bytes(vm)?, vm.signatures(), 0);
         let work = whole_work(&shares, everywhere);
 
         Ok(Derived {
@@ -1267,17 +1257,22 @@ mod tests {
         );
         let mine = tx.local_work(&split, payer);
         let theirs = tx.local_work(&split, bob);
-        assert_eq!(mine.compute + theirs.compute, whole.compute);
+        // Both shards verify the signature and write the committed cell,
+        // so compute and writes sum past the whole by exactly one
+        // verification and one marker; footprint sums exactly.
+        let verification = tx.body().signatures().compute;
+        assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
         assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
         assert_eq!(mine.retention, whole.retention);
         assert_eq!(theirs.retention, whole.retention);
         assert!(
             mine.compute > theirs.compute,
-            "the payer's shard runs the sign-in and the withdraw and verifies the signature"
+            "the payer's shard runs the sign-in and the withdraw"
         );
-        assert!(theirs.compute > 0, "the recipient's shard runs the deposit");
-        // Both shards write the committed cell, so writes sum past the
-        // whole by exactly one marker.
+        assert!(
+            theirs.compute > verification,
+            "the recipient's shard runs the deposit beside its verification"
+        );
         assert_eq!(
             mine.write_bytes + theirs.write_bytes,
             whole.write_bytes + u64::from(MARKER_CELL_BYTES)

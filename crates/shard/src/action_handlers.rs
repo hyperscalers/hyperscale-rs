@@ -783,8 +783,13 @@ where
             let verdict = Resolutions::of(entries, |entry| {
                 let tx = held.get(&entry.tx_hash)?;
                 let restated = committed_at(entry)?
-                    && UnsettledTx::for_transaction(tx, entry.committed, &PriceTable::GENESIS)
-                        == *entry;
+                    && UnsettledTx::for_transaction(
+                        tx,
+                        entry.committed,
+                        &trie,
+                        ctx.shard,
+                        &PriceTable::GENESIS,
+                    ) == *entry;
                 Some(restated)
             })
             .and_deliveries(deliveries, |tx_hash| {

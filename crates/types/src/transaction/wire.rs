@@ -171,7 +171,9 @@ impl Transaction {
     ///
     /// Placement alone decides, never the classification: a node on a
     /// multi-shard core is counted where its target sits, so the shares
-    /// of every shard sum to the whole in compute and footprint.
+    /// of every shard sum to the whole in footprint, and in compute
+    /// past it by one verification of the signatures per shard beyond
+    /// the first, since every shard verifies before it commits.
     ///
     /// # Panics
     ///
@@ -186,6 +188,19 @@ impl Transaction {
             .fold(derived.everywhere, |total, share| {
                 total.saturating_add(share.work)
             })
+    }
+
+    /// What `shard` attests for this transaction under `table`: the
+    /// price of its share under `trie`'s placement, raised by the signed
+    /// priority. What its outcome carries and the beacon weighs its
+    /// emission by; the payer burns [`Self::price`], the whole.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn local_price(&self, trie: &ShardTrie, shard: ShardId, table: &PriceTable) -> u128 {
+        table.price(&self.local_work(trie, shard), self.body().priority_bp)
     }
 
     /// What this transaction is charged, in quanta, under `table`: its

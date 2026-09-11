@@ -648,7 +648,8 @@ impl Ledger {
     /// outlive any window, so the two agree at any distance.
     ///
     /// `committed` is the block itself: what dates every departure
-    /// against the entries it registers.
+    /// against the entries it registers; `trie` is the placement it
+    /// froze the classification under, which prices this shard's share.
     ///
     /// Idempotent per transaction: a hash cannot commit twice within its
     /// own validity window, and re-registering one must not move the
@@ -656,11 +657,18 @@ impl Ledger {
     pub fn register_committed<'a>(
         &mut self,
         committed: CommittedAt,
+        trie: &ShardTrie,
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
             let owed = Owed {
-                figures: UnsettledTx::for_transaction(tx, committed, &PriceTable::GENESIS),
+                figures: UnsettledTx::for_transaction(
+                    tx,
+                    committed,
+                    trie,
+                    self.local,
+                    &PriceTable::GENESIS,
+                ),
                 certified: false,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
@@ -1620,7 +1628,7 @@ mod tests {
     /// Commit `tx` frozen as `classified`, which is what fixes the part
     /// this shard plays and every cell its entry asks about.
     fn commit_as(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) {
-        ledger.register_committed(committed_at(tx), [(tx, classified)]);
+        ledger.register_committed(committed_at(tx), &ShardTrie::uniform(1), [(tx, classified)]);
     }
 
     /// Where the fixtures commit `tx`: well inside its window, at a
@@ -1641,7 +1649,7 @@ mod tests {
         UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            charged: tx.price(&PriceTable::GENESIS),
+            charged: tx.local_price(&ShardTrie::uniform(1), LOCAL, &PriceTable::GENESIS),
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
@@ -1655,7 +1663,14 @@ mod tests {
 
     /// The burn an abort of `tx` settles.
     fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
-        UnsettledTx::for_transaction(tx, committed_at(tx), &PriceTable::GENESIS).charge
+        UnsettledTx::for_transaction(
+            tx,
+            committed_at(tx),
+            &ShardTrie::uniform(1),
+            LOCAL,
+            &PriceTable::GENESIS,
+        )
+        .charge
     }
 
     /// A committed transaction is owed an outcome from the moment its
