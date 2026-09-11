@@ -37,7 +37,9 @@ jobs:
 
   build-tests:
     name: Build Test Archive
-    runs-on: ubuntu-latest
+    # The archive is a native binary, so it is built on the same arm64
+    # runners the test matrix runs it on.
+    runs-on: ubuntu-24.04-arm
     if: >
       github.event_name == 'pull_request' ||
       startsWith(github.ref, 'refs/tags/') ||
@@ -88,7 +90,10 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    # Free for public repositories, and the four vCPUs are four Neoverse N2
+    # cores rather than two hyperthreaded ones, so four single-threaded sims
+    # run side by side without slowing each other.
+    runs-on: ubuntu-24.04-arm
     needs: build-tests
     env:
       RUSTUP_TOOLCHAIN: stable
