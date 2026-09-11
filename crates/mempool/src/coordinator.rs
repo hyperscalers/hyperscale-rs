@@ -320,14 +320,15 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // The signed ceiling enters the drain budget at face value, so a
-        // limit nobody could legitimately need is refused here rather
+        // The signed compute enters the drain budget at face value, so a
+        // figure nobody could legitimately need is refused here rather
         // than allowed to reserve the shard's whole allowance for one
         // signature.
-        if tx.body().gas_limit > MAX_GAS_LIMIT {
+        let compute = tx.body().gas_limit_total();
+        if compute > MAX_GAS_LIMIT {
             tracing::debug!(
                 tx_hash = ?hash,
-                gas_limit = tx.body().gas_limit,
+                compute,
                 "Rejecting transaction declaring more gas than the protocol admits"
             );
             return None;
