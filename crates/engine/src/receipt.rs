@@ -55,11 +55,6 @@ enum CachedOutputBody {
         /// question — and the same answer — as which shard keeps the
         /// event it was read from.
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
-        /// Fuel the engine consumed. Shard-invariant here and filtered to
-        /// nothing by projection: every participant that ran this batch
-        /// consumed the same amount, and locality scoping shows up as a
-        /// different batch rather than a different number.
-        gas_consumed: u64,
         /// What the execution escrowed out, per departing edge.
         escrowed: Vec<EscrowedValue>,
     },
@@ -75,7 +70,6 @@ impl CachedOutput {
         raw_writes: StateWrites,
         receipt_hash: GlobalReceiptHash,
         metadata: ExecutionMetadata,
-        gas_consumed: u64,
         events: Vec<Event>,
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
         escrowed: Vec<EscrowedValue>,
@@ -87,7 +81,6 @@ impl CachedOutput {
                 events,
                 receipt_hash,
                 witnesses,
-                gas_consumed,
                 escrowed,
             },
         }
@@ -127,7 +120,6 @@ pub fn project_to_shard(
             events,
             receipt_hash,
             witnesses,
-            gas_consumed,
             escrowed,
         } => {
             let owned = owned_by(local_shard, shard_trie);
@@ -159,7 +151,6 @@ pub fn project_to_shard(
                 events,
             };
             let mut executed = ExecutedTx::new(tx_hash, consensus, cached.metadata.clone());
-            executed.attested_work = *gas_consumed;
             executed.escrowed.clone_from(escrowed);
             executed
         }

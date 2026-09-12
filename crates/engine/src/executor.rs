@@ -957,16 +957,10 @@ pub fn build_fee_receipt(
         writes_root(&writes),
     )
     .receipt_hash();
-    // No gas: this receipt settles a price, it does not report execution.
-    // The transaction whose abort it settles consumed real work, but that
-    // work is unattested — a failed outcome carries no gas either — so an
-    // abort contributes nothing to its shard's emission weight. Pricing
-    // aborted work is the floor's job, not the weight's.
     let cached = CachedOutput::succeeded(
         writes,
         receipt_hash,
         vm_metadata(amount, None),
-        0,
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -992,9 +986,6 @@ fn assemble_published_tx(
     locality: &OwnerSet,
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
-    // What this shard did for it, as the local receipt reports it: the
-    // artifact is the whole of it, since nothing else runs.
-    let work = artifact.len() as u64;
     // The declaration's price at the block's table, like any other
     // transaction: a publish's artifact is bytes written and retained,
     // and its two point writes are writes.
@@ -1041,7 +1032,6 @@ fn assemble_published_tx(
                 writes,
                 receipt_hash,
                 vm_metadata(charged, None),
-                work,
                 Vec::new(),
                 witnesses,
                 Vec::new(),
@@ -1066,7 +1056,6 @@ fn assemble_published_tx(
 
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
     executed.fee_receipt = fee_receipt;
-    executed.attested_work = work;
     executed
 }
 
@@ -1135,7 +1124,6 @@ fn declare(
 #[derive(Clone, Copy)]
 struct KernelOutput<'a> {
     receipt: &'a Receipt,
-    work: u64,
     /// What the member did: whose plan names the record cell of each
     /// edge the receipt says it issued.
     job: &'a Job,
@@ -1164,11 +1152,7 @@ fn assemble_executed_tx(
     fee: Option<PayerFee>,
 ) -> ExecutedTx {
     let BatchInputs { base, locality, .. } = inputs;
-    let KernelOutput {
-        receipt,
-        work: attested_work,
-        job,
-    } = kernel;
+    let KernelOutput { receipt, job } = kernel;
     let tx_hash = vm_tx;
     let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
     let fee_receipt = fee
@@ -1270,7 +1254,6 @@ fn assemble_executed_tx(
             writes,
             receipt_hash,
             vm_metadata(charged, None),
-            receipt.fuel,
             events,
             witnesses,
             escrowed,
@@ -1280,7 +1263,6 @@ fn assemble_executed_tx(
     };
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
     executed.fee_receipt = fee_receipt;
-    executed.attested_work = attested_work;
     executed
 }
 
@@ -1584,7 +1566,6 @@ impl Executor {
             // quantity that must agree.
             let kernel = KernelOutput {
                 receipt,
-                work: outcome.work.get(vm_tx).map_or(0, |w| w.units),
                 job: prepared.get(vm_tx).map_or(&WHOLE_JOB, |entry| &entry.job),
             };
             let executed = assemble_executed_tx(

@@ -736,7 +736,7 @@ mod tests {
     /// participation floor applies, which is the
     /// pro-rata-by-ready-validator split.
     #[test]
-    fn emission_weights_follow_attested_work_and_fall_back_to_participation() {
+    fn emission_weights_follow_the_fees_and_fall_back_to_participation() {
         use hyperscale_types::{
             BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, ShardBoundary, StateRoot,
             WeightedTimestamp,

@@ -147,7 +147,6 @@ pub struct TxOutcome {
     /// verdict, where a receipt covers only the outcomes that produced
     /// one, so an attempt that failed or aborted still reports the
     /// declaration work it really did.
-    attested_work: u64,
     /// What this shard attests it charged, in quanta: the price of its
     /// own share of the declared vector, at the table in force at its
     /// block's anchor, raised by the signed priority.
@@ -237,14 +236,7 @@ impl TxOutcome {
     /// Create a new `TxOutcome` settling no fee receipt.
     #[must_use]
     pub const fn new(tx_hash: TxHash, outcome: ExecutionOutcome) -> Self {
-        Self::attesting(tx_hash, outcome, 0)
-    }
-
-    /// A `TxOutcome` attesting `work`, settling no fee receipt.
-    #[must_use]
-    pub const fn attesting(tx_hash: TxHash, outcome: ExecutionOutcome, work: u64) -> Self {
         Self {
-            attested_work: work,
             charged: 0,
             reserved: false,
             tx_hash,
@@ -364,10 +356,8 @@ impl TxOutcome {
         tx_hash: TxHash,
         outcome: ExecutionOutcome,
         fee_receipt: GlobalReceiptHash,
-        work: u64,
     ) -> Self {
         Self {
-            attested_work: work,
             charged: 0,
             reserved: false,
             tx_hash,
@@ -386,12 +376,6 @@ impl TxOutcome {
     #[must_use]
     pub const fn retracts(&self) -> Option<SubstateKey> {
         self.retracts
-    }
-
-    /// What this shard attests it did for the transaction.
-    #[must_use]
-    pub const fn attested_work(&self) -> u64 {
-        self.attested_work
     }
 
     /// What this transaction was charged, in quanta.

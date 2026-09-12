@@ -31,12 +31,6 @@ pub struct ExecutedTx {
     /// receipts. Present only where this shard is the fee payer of an
     /// outcome that charges one.
     pub fee_receipt: Option<ConsensusReceipt>,
-    /// What this shard attests it did for the transaction, under the
-    /// engine's schedule. Rides the finalization's outcome rather than
-    /// the receipt: a receipt is the effect record every participant
-    /// derives identically, while this is the shard's own share, and it
-    /// covers the verdicts that produce no receipt at all.
-    pub attested_work: u64,
     /// What this execution escrowed out, one entry per departing edge.
     /// Empty for a member that ran the whole shape, which hands nothing
     /// to anyone.
@@ -58,7 +52,6 @@ impl ExecutedTx {
             consensus,
             metadata,
             fee_receipt: None,
-            attested_work: 0,
             escrowed: Vec::new(),
         }
     }
@@ -71,7 +64,6 @@ impl ExecutedTx {
             consensus: ConsensusReceipt::Failed,
             metadata: ExecutionMetadata::empty(),
             fee_receipt: None,
-            attested_work: 0,
             escrowed: Vec::new(),
         }
     }
@@ -92,7 +84,7 @@ impl ExecutedTx {
             },
             ConsensusReceipt::Failed => ExecutionOutcome::Failed,
         };
-        TxOutcome::attesting(self.tx_hash, outcome, self.attested_work)
+        TxOutcome::new(self.tx_hash, outcome)
             .escrowing(self.escrowed.iter().map(|issued| issued.record))
     }
 }

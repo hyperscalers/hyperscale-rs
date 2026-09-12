@@ -343,31 +343,12 @@ impl Finalization {
         self.receipts.iter().map(|r| Arc::clone(&r.consensus))
     }
 
-    /// Work this shard attests across the tick's transactions.
-    ///
-    /// Read off the local EC's outcomes rather than the receipts, so it
-    /// covers the verdicts that produced no receipt — a failure or an
-    /// abort still declared, routed, and locked.
-    ///
-    /// Saturating, so a forged tick cannot wrap a block's running total
-    /// into a smaller number than its parent's.
-    #[must_use]
-    pub fn attested_work(&self) -> u64 {
-        self.local_ec()
-            .tx_outcomes()
-            .iter()
-            .fold(0u64, |sum, outcome| {
-                sum.saturating_add(outcome.attested_work())
-            })
-    }
-
     /// The places in the drain this tick gives back.
     ///
     /// One per member whose committing block took one, returned now
-    /// that they are settled. Read off the same outcomes as
-    /// [`Self::attested_work`] and for the same reason: it has to cover
-    /// every verdict, because an aborted transaction leaves the drain
-    /// exactly as a completed one does.
+    /// that they are settled. Read off the local EC's outcomes so it
+    /// covers every verdict, because an aborted transaction leaves the
+    /// drain exactly as a completed one does.
     #[must_use]
     pub fn released(&self) -> u64 {
         self.local_ec()

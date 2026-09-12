@@ -466,7 +466,6 @@ impl ExecutionSim {
             outcomes,
             results,
             fee_receipts,
-            attested_work,
         } = split_execution_outputs(executed);
         self.receipts
             .entry(tick_id)
@@ -481,7 +480,6 @@ impl ExecutionSim {
             results,
             tx_outcomes: outcomes,
             fee_receipts,
-            attested_work,
         };
 
         self.outputs.push((tick, output.clone()));
@@ -817,7 +815,6 @@ pub fn settle_refused_by_counterpart(
                     receipt_hash: receipt.consensus.receipt_hash(),
                 },
                 charge.consensus.receipt_hash(),
-                0,
             )
         })
         .collect();

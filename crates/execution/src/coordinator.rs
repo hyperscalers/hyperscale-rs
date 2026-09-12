@@ -1619,7 +1619,6 @@ impl ExecutionCoordinator {
             results,
             tx_outcomes,
             fee_receipts,
-            attested_work,
         } = outcome;
         if let Some(state) = self.ticks.get_tick_mut(&tick_id) {
             for result in results {
@@ -1627,9 +1626,6 @@ impl ExecutionCoordinator {
             }
             for fee in fee_receipts {
                 state.record_fee_receipt(fee);
-            }
-            for (tx_hash, work) in attested_work {
-                state.record_attested_work(tx_hash, work);
             }
             for wr in tx_outcomes {
                 state.record_escrowed(wr.tx_hash(), wr.escrowed().to_vec());
@@ -4329,7 +4325,6 @@ mod tests {
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
                 fee_receipts: vec![],
-                attested_work: vec![],
             },
         );
 
@@ -4392,7 +4387,6 @@ mod tests {
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
                 fee_receipts: vec![],
-                attested_work: vec![],
             },
         );
 
@@ -7484,7 +7478,6 @@ mod tests {
                     },
                 )],
                 fee_receipts: Vec::new(),
-                attested_work: Vec::new(),
             },
         );
         state.emit_vote_actions(&schedule);

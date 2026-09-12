@@ -40,10 +40,8 @@ pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     let mut outcomes = Vec::with_capacity(executed.len());
     let mut results = Vec::with_capacity(executed.len());
     let mut fee_receipts = Vec::new();
-    let mut work = Vec::with_capacity(executed.len());
     for mut tx in executed {
         outcomes.push(tx.outcome());
-        work.push((tx.tx_hash, tx.attested_work));
         if let Some(fee) = tx.fee_receipt.take() {
             fee_receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
         }
@@ -53,7 +51,6 @@ pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
         outcomes,
         results,
         fee_receipts,
-        attested_work: work,
     }
 }
 
@@ -67,8 +64,6 @@ pub struct ExecutionOutputs {
     pub results: Vec<StoredReceipt>,
     /// Charges held in reserve against a tick abort.
     pub fee_receipts: Vec<StoredReceipt>,
-    /// What this shard attests it did per transaction.
-    pub attested_work: Vec<(TxHash, u64)>,
 }
 
 /// Fold one tick's executed records into the tick output.
@@ -311,7 +306,6 @@ where
                 outcomes: tx_outcomes,
                 results,
                 fee_receipts,
-                attested_work,
             } = split_execution_outputs(executed);
 
             // Append before notifying: the coordinator dispatches the next
@@ -324,7 +318,6 @@ where
                     results,
                     tx_outcomes,
                     fee_receipts,
-                    attested_work,
                 },
             });
         }

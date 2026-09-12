@@ -1010,23 +1010,22 @@ mod tests {
         assert_eq!(cert.signers().count_ones(), 1);
     }
 
-    /// An EC whose outcomes' `work` was mutated after the root was
-    /// fixed fails the decode-side receipt-root recompute — the leaf
-    /// covers work, so an aggregator cannot ship a signature-valid EC
-    /// with forged work.
+    /// An EC whose outcomes' charge was mutated after the root was fixed
+    /// fails the decode-side receipt-root recompute — the leaf covers
+    /// what each member was charged, so an aggregator cannot ship a
+    /// signature-valid EC claiming its shard took more than it did.
     #[test]
-    fn decode_rejects_tampered_work() {
-        let outcomes = vec![TxOutcome::attesting(
-            TxHash::from(Hash::from_bytes(b"worked-tx")),
-            ExecutionOutcome::Aborted,
-            7,
-        )];
+    fn decode_rejects_a_tampered_charge() {
+        let charged = |amount| {
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"worked-tx")),
+                ExecutionOutcome::Aborted,
+            )
+            .reserving(amount)
+        };
+        let outcomes = vec![charged(100)];
         let root = compute_global_receipt_root(&outcomes);
-
-        let forged: Vec<TxOutcome> = outcomes
-            .iter()
-            .map(|o| TxOutcome::attesting(o.tx_hash(), o.outcome().clone(), 999))
-            .collect();
+        let forged = vec![charged(101)];
         let cert = ExecutionCertificate::new(
             tick_id(),
             WeightedTimestamp::from_millis(11),
