@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn emission_weights_follow_attested_work_and_fall_back_to_participation() {
         use hyperscale_types::{
-            BeaconWitnessLeafCount, BlockHash, BlockHeight, ShardBoundary, StateRoot,
+            BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, ShardBoundary, StateRoot,
             WeightedTimestamp,
         };
 
@@ -775,6 +775,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: 1_000_000,
             last_live_epoch: Epoch::GENESIS,
@@ -801,7 +802,7 @@ mod tests {
     #[test]
     fn a_lingering_terminal_record_does_not_dilute_the_storage_term() {
         use hyperscale_types::{
-            BeaconWitnessLeafCount, BlockHash, BlockHeight, ShardBoundary, StateRoot,
+            BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, ShardBoundary, StateRoot,
             WeightedTimestamp,
         };
 
@@ -812,6 +813,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: bytes,
             last_live_epoch: Epoch::GENESIS,

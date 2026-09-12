@@ -2183,7 +2183,9 @@ mod tests {
         TestCommittee, make_finalization, make_finalization_awaiting, make_leg_finalization,
         make_settling_finalization, test_transaction,
     };
-    use hyperscale_types::{AggregateSignature, TransactionDecision, Verifiable, WitnessSources};
+    use hyperscale_types::{
+        AggregateSignature, DeclaredWork, TransactionDecision, Verifiable, WitnessSources,
+    };
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, i64>> = std::sync::OnceLock::new();
@@ -2265,7 +2267,7 @@ mod tests {
             timestamp: ProposerTimestamp::from_millis(0),
             provision_tx_roots: std::collections::BTreeMap::new(),
             txs_in_flight: TxsInFlight::new(u64::from(in_flight)),
-            load: ShardLoad::ZERO.advance(0, substate_bytes),
+            load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, substate_bytes),
             ..Default::default()
         })
     }

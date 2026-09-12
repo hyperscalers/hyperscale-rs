@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, Epoch, KeeperSeat,
-    PendingReshape, Randomness, ScheduledSplit, ShardBoundary, ShardCommittee, ShardId, StateRoot,
-    ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
+    BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, DeclaredWork, Epoch,
+    KeeperSeat, PendingReshape, Randomness, ScheduledSplit, ShardBoundary, ShardCommittee, ShardId,
+    StateRoot, ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
 };
 use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
@@ -295,6 +295,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
         witness_leaf_count: BeaconWitnessLeafCount::ZERO,
         witness_base: BeaconWitnessLeafCount::ZERO,
         attested_work: 0,
+        used: DeclaredWork::ZERO,
         substate_bytes: 0,
         last_live_epoch: epoch,
         consecutive_misses: 0,
@@ -968,6 +969,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(5),
                 consecutive_misses: 0,
@@ -1340,6 +1342,7 @@ mod tests {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(5),
                     consecutive_misses: 0,
@@ -1916,6 +1919,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: 0,
             last_live_epoch: Epoch::GENESIS,

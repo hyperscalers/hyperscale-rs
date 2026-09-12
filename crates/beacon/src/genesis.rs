@@ -18,12 +18,12 @@ use std::sync::Arc;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount,
-    BlockHash, BlockHeight, CertifiedBeaconBlock, Epoch, GenesisConfigHash, GenesisPool,
-    GenesisValidator, GenesisValidators, Hash, MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN,
-    MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkParams, PackageFact, Randomness,
-    ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StakePoolSeat,
-    StateRoot, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, Verified,
-    WeightedTimestamp, genesis_config_hash,
+    BlockHash, BlockHeight, CertifiedBeaconBlock, DeclaredWork, Epoch, GenesisConfigHash,
+    GenesisPool, GenesisValidator, GenesisValidators, Hash, MAX_BEACON_COMMITTEE,
+    MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkParams, PackageFact,
+    Randomness, ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
+    StakePoolSeat, StateRoot, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus,
+    Verified, WeightedTimestamp, genesis_config_hash,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
@@ -156,6 +156,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,

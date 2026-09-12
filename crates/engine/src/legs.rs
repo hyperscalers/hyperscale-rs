@@ -426,6 +426,28 @@ impl Classified {
     }
 }
 
+/// What `transactions` reserve on `shard` under `trie` between them:
+/// each one's local share, folded.
+///
+/// The one fold, so the proposer stamping a header, the voter checking
+/// it, and the admission that judges the block against its caps all
+/// reach the same figure — a second spelling of the sum would be a
+/// header whose claim nothing else agrees with.
+#[must_use]
+pub fn local_work_over<'a>(
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+    trie: &ShardTrie,
+    shard: ShardId,
+) -> DeclaredWork {
+    transactions
+        .into_iter()
+        .fold(DeclaredWork::ZERO, |total, tx| {
+            total.saturating_add(
+                Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, shard),
+            )
+        })
+}
+
 /// The side `node` runs on at `local`: a sink whose producers run
 /// elsewhere is a delivery, waiting on their arrival; everything else —
 /// a source, the core, a sink fed beside itself — issues.

@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::PriceTable;
+use hyperscale_vm_types::{DeclaredWork, PriceTable};
 
 use crate::beacon::constants::{HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
@@ -331,6 +331,15 @@ pub struct ShardBoundary {
     /// zero, including a split child or merged parent that inherits state
     /// but not its predecessor's consumption.
     pub attested_work: u64,
+    /// What the shard's blocks have reserved against their per-block
+    /// caps over its whole history, as of the boundary header.
+    ///
+    /// A high-water mark on [`attested_work`](Self::attested_work)'s
+    /// terms, and per dimension because the price controller moves each
+    /// row by its own dimension's use. Differenced against the previous
+    /// crossing's, it is one epoch's declared consumption — the
+    /// numerator of the utilization the fold steps the table on.
+    pub used: DeclaredWork,
     /// Committed substate byte total behind the boundary header's parent
     /// state — a level, not a running total, so a crossing whose header
     /// resolved no total (the halt-recovery case) leaves the recorded value
@@ -2134,6 +2143,7 @@ mod tests {
         let child = ShardId::leaf(1, 0);
         let genesis_shard = ShardId::leaf(1, 1);
         let pending = |creation: Epoch| ShardBoundary {
+            used: DeclaredWork::ZERO,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,
@@ -2203,6 +2213,7 @@ mod tests {
         state.current_epoch = Epoch::new(40);
         let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
         let boundary = |misses: u32| ShardBoundary {
+            used: DeclaredWork::ZERO,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
             height: BlockHeight::new(5),
@@ -2511,6 +2522,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,

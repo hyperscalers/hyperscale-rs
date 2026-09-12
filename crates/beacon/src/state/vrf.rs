@@ -495,8 +495,8 @@ mod tests {
     #[test]
     fn absence_on_a_missing_crossings_shard_does_not_jail() {
         use hyperscale_types::{
-            BeaconWitnessLeafCount, BlockHash, BlockHeight, HALT_THRESHOLD_EPOCHS, ShardBoundary,
-            StateRoot, WeightedTimestamp,
+            BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, HALT_THRESHOLD_EPOCHS,
+            ShardBoundary, StateRoot, WeightedTimestamp,
         };
 
         let mut state = single_pool_state(4);
@@ -512,6 +512,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits") + 1,
@@ -550,7 +551,7 @@ mod tests {
     #[test]
     fn absence_with_one_missed_crossing_still_jails() {
         use hyperscale_types::{
-            BeaconWitnessLeafCount, BlockHash, BlockHeight, ShardBoundary, StateRoot,
+            BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, ShardBoundary, StateRoot,
             WeightedTimestamp,
         };
 
@@ -566,6 +567,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 1,

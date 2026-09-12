@@ -2176,8 +2176,8 @@ mod tests {
     #[test]
     fn missed_proposal_threshold_defers_jail_while_shard_misses_crossings() {
         use hyperscale_types::{
-            BeaconWitnessLeafCount, BlockHash, BlockHeight, HALT_THRESHOLD_EPOCHS, ShardBoundary,
-            StateRoot, WeightedTimestamp,
+            BeaconWitnessLeafCount, BlockHash, BlockHeight, DeclaredWork, HALT_THRESHOLD_EPOCHS,
+            ShardBoundary, StateRoot, WeightedTimestamp,
         };
 
         let mut state = single_pool_state(4);
@@ -2193,6 +2193,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits") + 1,

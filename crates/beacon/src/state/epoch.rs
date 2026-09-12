@@ -6,11 +6,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader,
-    CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
-    ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
-    RecoveryCause, RevealChain, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects,
-    TerminalRef, TopologySnapshot, TransitionCause, ValidatorId, ValidatorStatus, Verifier, Verify,
+    BLOCK_CAPS, BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash,
+    BlockHeader, BlockHeight, CertifiedBeaconBlock, CompletedRecovery, DeclaredWork, Epoch,
+    EpochWindows, FiveWay, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
+    QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary,
+    ShardEpochContribution, ShardId, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause,
+    Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
 };
 
 use crate::rules::{
@@ -88,6 +89,78 @@ pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
             shard_contributions: block.block().shard_contributions(),
         }
     }
+}
+
+/// What the network declared this epoch against what it could have,
+/// per dimension.
+///
+/// Over the shards whose boundary advanced, and only those: a shard
+/// that produced nothing this epoch has no reading to contribute, and
+/// counting it as idle would walk every price down through an outage
+/// nobody chose. The sum of numerators over the sum of denominators is
+/// a block-weighted mean — a shard that committed twice as many blocks
+/// had twice the capacity to fill, and filled or not, that is what it
+/// says about the network.
+///
+/// A mean cannot see one hot shard among many idle ones, and that is
+/// deliberate: the price is uniform because placement is the protocol's
+/// choice, so a hotspot is answered by capacity through reshape rather
+/// than by billing the addresses that landed on it.
+fn network_utilization(
+    state: &BeaconState,
+    before: &BTreeMap<ShardId, (DeclaredWork, BlockHeight)>,
+) -> FiveWay {
+    let mut reading = FiveWay::default();
+    for (shard, record) in &state.boundaries {
+        let (used_before, height_before) = before
+            .get(shard)
+            .copied()
+            .unwrap_or((DeclaredWork::ZERO, BlockHeight::GENESIS));
+        let blocks = u128::from(record.height.inner().saturating_sub(height_before.inner()));
+        if blocks == 0 {
+            continue;
+        }
+        let used = record.used;
+        let row = |into: &mut Utilization, used: u64, before: u64, cap: u64| {
+            into.used = into
+                .used
+                .saturating_add(u128::from(used.saturating_sub(before)));
+            into.capacity = into
+                .capacity
+                .saturating_add(u128::from(cap).saturating_mul(blocks));
+        };
+        row(
+            &mut reading.compute,
+            used.compute,
+            used_before.compute,
+            BLOCK_CAPS.compute,
+        );
+        row(
+            &mut reading.read_bytes,
+            used.read_bytes,
+            used_before.read_bytes,
+            BLOCK_CAPS.read_bytes,
+        );
+        row(
+            &mut reading.write_bytes,
+            used.write_bytes,
+            used_before.write_bytes,
+            BLOCK_CAPS.write_bytes,
+        );
+        row(
+            &mut reading.footprint,
+            used.footprint,
+            used_before.footprint,
+            BLOCK_CAPS.footprint,
+        );
+        row(
+            &mut reading.retention,
+            used.retention,
+            used_before.retention,
+            BLOCK_CAPS.retention,
+        );
+    }
+    reading
 }
 
 /// Apply one epoch to `state`.
@@ -200,6 +273,15 @@ pub fn apply_epoch(
         .iter()
         .map(|(shard, record)| (*shard, record.attested_work))
         .collect();
+    // The declared half, snapshotted the same way and for the same
+    // reason: what the epoch's blocks reserved is the movement of each
+    // record's vector across this fold, and what they could have
+    // reserved is the caps times the blocks between the two marks.
+    let load_marks_before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+        .boundaries
+        .iter()
+        .map(|(shard, record)| (*shard, (record.used, record.height)))
+        .collect();
     let (mut witness, reveals) = if let ApplyEpochInput::Normal {
         committed,
         shard_contributions,
@@ -239,6 +321,14 @@ pub fn apply_epoch(
         }
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
+    // The price level for the window after next, stepped by what this
+    // epoch's blocks declared and held inside the bounds the vote above
+    // just settled — so a vote that narrows an interval brings the level
+    // in at the same promotion that installs the interval.
+    state.next_prices = state.prices.stepped(
+        &network_utilization(state, &load_marks_before),
+        &state.next_params.price_bounds,
+    );
 
     let vrf = filter_and_roll_randomness(verifier, state, network, epoch, committed, &reveals);
     // Equivocation evidence rides committed proposals; shard-witness lifts
@@ -920,6 +1010,7 @@ fn record_boundaries(
                 witness_leaf_count: BeaconWitnessLeafCount::new(chunk_end),
                 witness_base: header.beacon_witness_base(),
                 attested_work: header.load().cumulative_work,
+                used: header.load().used,
                 // A level: an unresolved claim carries the previous value
                 // forward instead of reading as "the shard emptied".
                 substate_bytes: header.load().substate_bytes.unwrap_or(prior_substate_bytes),
@@ -1172,6 +1263,7 @@ fn seed_split_children(
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
@@ -1283,6 +1375,7 @@ fn compose_merge_parent(
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
             attested_work: 0,
+            used: DeclaredWork::ZERO,
             substate_bytes: 0,
             last_live_epoch: epoch,
             consecutive_misses: 0,
@@ -1307,12 +1400,13 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CommittedTxsRoot, Epoch, Hash,
-        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceTable, QuorumCertificate, Round,
-        SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad,
-        ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool,
-        StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TransitionCause,
-        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
+        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CommittedTxsRoot, DeclaredWork,
+        Epoch, FiveWay, Hash, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
+        QuorumCertificate, Round, SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof,
+        ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots,
+        Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
+        compute_range_proof,
     };
 
     use super::*;
@@ -1552,7 +1646,7 @@ mod tests {
             1,
             5,
             900,
-            ShardLoad::ZERO.advance(400, Some(8_192)),
+            ShardLoad::ZERO.advance(400, DeclaredWork::ZERO, Some(8_192)),
         );
         let first = state.boundaries[&shard];
         assert_eq!(first.attested_work, 400);
@@ -1565,7 +1659,7 @@ mod tests {
             2,
             9,
             1_900,
-            ShardLoad::ZERO.advance(1_000, Some(9_000)),
+            ShardLoad::ZERO.advance(1_000, DeclaredWork::ZERO, Some(9_000)),
         );
         let second = state.boundaries[&shard];
         assert_eq!(second.attested_work, 1_000);
@@ -1580,7 +1674,7 @@ mod tests {
             3,
             13,
             2_900,
-            ShardLoad::ZERO.advance(1_250, None),
+            ShardLoad::ZERO.advance(1_250, DeclaredWork::ZERO, None),
         );
         let third = state.boundaries[&shard];
         assert_eq!(third.attested_work, 1_250);
@@ -1809,6 +1903,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -1867,6 +1962,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -2262,6 +2358,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -2359,6 +2456,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -2435,6 +2533,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -3032,6 +3131,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -3053,6 +3153,7 @@ mod tests {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3566,6 +3667,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -3589,6 +3691,7 @@ mod tests {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3759,6 +3862,7 @@ mod tests {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3780,6 +3884,7 @@ mod tests {
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -4176,6 +4281,7 @@ mod tests {
                 witness_leaf_count: witness,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 attested_work: 0,
+                used: DeclaredWork::ZERO,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -4404,6 +4510,7 @@ mod tests {
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     attested_work: 0,
+                    used: DeclaredWork::ZERO,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,
@@ -4476,6 +4583,195 @@ mod tests {
         );
         assert_eq!(state.prices, moved, "the promotion installs it");
         assert_eq!(state.derive_topology_snapshot(net()).prices(), moved);
+    }
+
+    /// The controller reads each dimension on its own and only from the
+    /// shards that produced: a saturated epoch in one dimension raises
+    /// that row and no other, an idle one lowers it, and a shard whose
+    /// boundary never advanced contributes neither a numerator nor a
+    /// denominator.
+    #[test]
+    fn the_controller_steps_each_row_by_its_own_dimension() {
+        let live = ShardId::leaf(1, 0);
+        let absent = ShardId::leaf(1, 1);
+        let blocks = 4u64;
+
+        // Two shards, one of which produces. The absent one is seeded at
+        // the same marks it ends on, so it moves nothing either way.
+        let mut state = single_pool_state(4);
+        for shard in [live, absent] {
+            state
+                .boundaries
+                .insert(shard, load_boundary(DeclaredWork::ZERO, 0));
+        }
+        let full = DeclaredWork {
+            compute: BLOCK_CAPS.compute * blocks,
+            ..DeclaredWork::ZERO
+        };
+        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+            .boundaries
+            .iter()
+            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .collect();
+        state.boundaries.insert(live, load_boundary(full, blocks));
+
+        let reading = network_utilization(&state, &before);
+        assert_eq!(
+            (reading.compute.used, reading.compute.capacity),
+            (
+                u128::from(BLOCK_CAPS.compute) * u128::from(blocks),
+                u128::from(BLOCK_CAPS.compute) * u128::from(blocks)
+            ),
+            "the producing shard's blocks are the whole of the capacity"
+        );
+        assert_eq!(
+            reading.read_bytes.used, 0,
+            "a dimension nothing declared reads as idle, not as absent"
+        );
+
+        let stepped = PriceTable::GENESIS.stepped(&reading, &widened());
+        assert!(
+            stepped.compute > PriceTable::GENESIS.compute,
+            "a saturated dimension raises its own row"
+        );
+        assert!(
+            stepped.read_bytes < PriceTable::GENESIS.read_bytes,
+            "an idle dimension lowers its own row"
+        );
+        assert_eq!(
+            stepped.footprint,
+            PriceTable::GENESIS
+                .stepped(
+                    &FiveWay {
+                        footprint: reading.footprint,
+                        ..FiveWay::default()
+                    },
+                    &widened()
+                )
+                .footprint,
+            "no row reads another dimension"
+        );
+    }
+
+    /// A network where nothing advanced has no reading at all, so every
+    /// row holds rather than walking down through an outage.
+    #[test]
+    fn an_epoch_nothing_produced_in_moves_no_row() {
+        let mut state = single_pool_state(4);
+        state
+            .boundaries
+            .insert(ShardId::leaf(1, 0), load_boundary(DeclaredWork::ZERO, 7));
+        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+            .boundaries
+            .iter()
+            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .collect();
+
+        let reading = network_utilization(&state, &before);
+        assert_eq!(reading.compute.capacity, 0);
+        assert_eq!(
+            PriceTable::GENESIS.stepped(&reading, &widened()),
+            PriceTable::GENESIS
+        );
+    }
+
+    /// The fold writes the level the window after next will price at,
+    /// held inside whatever interval the vote in the same fold settled.
+    ///
+    /// What a crossing contributes to the reading is
+    /// [`network_utilization`]'s, pinned beside it; what this pins is
+    /// the rail around it — that the fold steps at all, that it reads
+    /// the bounds the level will live under rather than the ones it is
+    /// leaving, and that a level a vote just put out of range comes back
+    /// at the fold rather than at the vote.
+    #[test]
+    fn the_fold_holds_the_level_inside_the_bounds_it_just_settled() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.params.price_bounds = widened();
+        state.next_params.price_bounds = widened();
+        // A level the controller walked up while the interval was open,
+        // seeded on both rails: the fold promotes the lookahead first,
+        // so a level set only on the head is one the promotion wipes.
+        let raised = PriceTable {
+            compute: PriceTable::GENESIS.compute * 4,
+            ..PriceTable::GENESIS
+        };
+        state.prices = raised;
+        state.next_prices = raised;
+
+        let fold = |state: &mut BeaconState, epoch: u64| {
+            apply_epoch(
+                &BlsVerifier,
+                state,
+                &net(),
+                Epoch::new(epoch),
+                ApplyEpochInput::Normal {
+                    committed: &[],
+                    shard_contributions: &BTreeMap::new(),
+                },
+            );
+        };
+
+        // No shard produced, so there is no reading and the level holds
+        // where it is rather than reading as idle.
+        fold(&mut state, 1);
+        assert_eq!(state.next_prices, raised);
+
+        // A vote pinning the interval brings it back in at the next
+        // fold, not at the vote: this window keeps pricing at what it
+        // opened with.
+        state.next_params.price_bounds = PriceBounds::GENESIS;
+        let before = state.prices;
+        fold(&mut state, 2);
+        assert_eq!(
+            state.next_prices,
+            PriceTable::GENESIS,
+            "a level outside the new bounds is clamped at the next fold"
+        );
+        assert_eq!(
+            state.prices, before,
+            "and the window in force is untouched by the vote"
+        );
+    }
+
+    /// An interval a vote opened, so the controller has room to move.
+    /// The chain is born pinned, which is what keeps an uncalibrated
+    /// weight from wandering before anyone has measured it.
+    fn widened() -> PriceBounds {
+        let scaled = |by: u64, div: u64| PriceTable {
+            compute: PriceTable::GENESIS.compute * by / div,
+            read_bytes: PriceTable::GENESIS.read_bytes * by / div,
+            write_bytes: PriceTable::GENESIS.write_bytes * by / div,
+            footprint: PriceTable::GENESIS.footprint * by / div,
+            retention: PriceTable::GENESIS.retention * by / div,
+        };
+        PriceBounds {
+            floor: scaled(1, 8),
+            ceiling: scaled(8, 1),
+        }
+    }
+
+    /// A boundary record at `height` whose chain has reserved `used`.
+    fn load_boundary(used: DeclaredWork, height: u64) -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::new(height),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            attested_work: 0,
+            used,
+            substate_bytes: 0,
+            last_live_epoch: Epoch::GENESIS,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            handoff_complete: None,
+            terminal_delivered: false,
+            terminal_roots: None,
+            reshape_admitted_epoch: None,
+        }
     }
 
     /// A terminal header carrying `pair`, with the composed root as its own
