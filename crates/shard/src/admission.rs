@@ -23,6 +23,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, DeclaredWork, Finalization, FinalizationHash,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
@@ -326,9 +327,9 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} declares more than the protocol admits of one transaction"
             ));
         }
-        let budget = fold
-            .budget
-            .saturating_add(tx.local_work(trie, ctx.local_shard));
+        let budget = fold.budget.saturating_add(
+            Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, ctx.local_shard),
+        );
         if !budget_admits_block(&budget) {
             return Err(format!(
                 "transaction {tx_hash} carries the block past a per-block cap on this shard"

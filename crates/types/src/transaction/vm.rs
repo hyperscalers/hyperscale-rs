@@ -299,6 +299,16 @@ pub struct Derived {
     /// What a shard's own share is read off: the shares of the owners
     /// it holds under a placement, plus [`Self::everywhere`].
     pub shares: Vec<OwnerShare>,
+    /// What each manifest node bears, in node order: the ceiling its
+    /// composer signed for it, and the artifact instantiating it reads.
+    ///
+    /// Per node rather than under the node's owner, because a shard runs
+    /// more nodes than it holds: a multi-shard core replicates every
+    /// core node onto every core shard, so what those nodes may consume
+    /// is owed by each of them and reserved by each of them. Empty for a
+    /// publish, which invokes nothing and carries its ceiling in its
+    /// publisher's share.
+    pub node_terms: Vec<DeclaredWork>,
     /// What every shard that commits the transaction bears whatever it
     /// holds: the committed cell it writes, and the whole retention,
     /// since every validator keeps the envelope and its receipt.
@@ -334,13 +344,25 @@ pub struct OwnerShare {
     pub work: DeclaredWork,
 }
 
-/// The vector a transaction declares whole: every share plus what each
-/// committing shard bears once.
+/// The vector a transaction declares whole: every owner's share, every
+/// node's own terms, and what each committing shard bears, each counted
+/// once.
+///
+/// A replicated core node is in here once however many shards run it:
+/// the composer does not choose the core, so the price must not depend
+/// on it.
 #[must_use]
-pub fn whole_work(shares: &[OwnerShare], everywhere: DeclaredWork) -> DeclaredWork {
+pub fn whole_work(
+    shares: &[OwnerShare],
+    node_terms: &[DeclaredWork],
+    everywhere: DeclaredWork,
+) -> DeclaredWork {
+    let with_nodes = node_terms
+        .iter()
+        .fold(everywhere, |total, term| total.saturating_add(*term));
     shares
         .iter()
-        .fold(everywhere, |total, share| total.saturating_add(share.work))
+        .fold(with_nodes, |total, share| total.saturating_add(share.work))
 }
 
 /// Why a derivation did not answer.

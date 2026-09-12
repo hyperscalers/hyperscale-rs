@@ -21,8 +21,8 @@ use thiserror::Error;
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
     Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey,
-    MAX_ENVELOPE_BYTES, NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey,
-    TimestampRange, TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
+    MAX_ENVELOPE_BYTES, NetworkId, OwnerShare, PrincipalAddr, Routing, ShardId, ShardTrie,
+    SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
 };
 
 /// What a transaction is verified against: the network its envelope has
@@ -164,43 +164,38 @@ impl Transaction {
         &self.derived().work
     }
 
-    /// What this transaction declares against `shard` under `trie`'s
-    /// placement: the shares of the owners the shard holds, and what
-    /// every committing shard bears. What a block on that shard reserves
-    /// against its caps.
-    ///
-    /// Placement alone decides, never the classification: a node on a
-    /// multi-shard core is counted where its target sits, so the shares
-    /// of every shard sum to the whole in footprint, and in compute
-    /// past it by one verification of the signatures per shard beyond
-    /// the first, since every shard verifies before it commits.
+    /// What each owner prefix bears of the declaration: the effects on
+    /// its cells and the kernel cells written under it. Sorted and
+    /// unique by owner.
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn local_work(&self, trie: &ShardTrie, shard: ShardId) -> DeclaredWork {
-        let derived = self.derived();
-        derived
-            .shares
-            .iter()
-            .filter(|share| trie.shard_for_prefix(share.owner) == shard)
-            .fold(derived.everywhere, |total, share| {
-                total.saturating_add(share.work)
-            })
+    pub fn shares(&self) -> &[OwnerShare] {
+        &self.derived().shares
     }
 
-    /// What `shard` attests for this transaction under `table`: the
-    /// price of its share under `trie`'s placement, raised by the signed
-    /// priority. What its outcome carries and the beacon weighs its
-    /// emission by; the payer burns [`Self::price`], the whole.
+    /// What each manifest node bears, in node order: its signed ceiling
+    /// and the artifact instantiating it reads.
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn local_price(&self, trie: &ShardTrie, shard: ShardId, table: &PriceTable) -> u128 {
-        table.price(&self.local_work(trie, shard), self.body().priority_bp)
+    pub fn node_terms(&self) -> &[DeclaredWork] {
+        &self.derived().node_terms
+    }
+
+    /// What every shard committing this transaction bears whatever it
+    /// holds: the verification, the committed cell, and the retention.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn everywhere(&self) -> DeclaredWork {
+        self.derived().everywhere
     }
 
     /// What this transaction is charged, in quanta, under `table`: its
@@ -786,6 +781,7 @@ mod tests {
                 subintent_hashes,
                 work: DeclaredWork::ZERO,
                 shares: Vec::new(),
+                node_terms: Vec::new(),
                 everywhere: DeclaredWork::ZERO,
                 legs: Vec::new(),
                 nullifiers: Vec::new(),
