@@ -193,6 +193,7 @@ impl SimCluster {
             shard_size: config.shard_size,
             reshape_thresholds: ReshapeThresholds {
                 split_bytes: config.split_bytes,
+                split_fullness: u32::MAX,
             },
             ..BeaconChainConfig::default()
         };

@@ -36,7 +36,10 @@ fn split_trigger_asserts_once_per_window_and_verifies() {
         .as_ref()
         .clone()
         .with_params(NetworkParams {
-            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 0,
+                split_fullness: u32::MAX,
+            },
             ..NetworkParams::default()
         });
     sim.topology_schedule = TopologySchedule::single(Arc::new(snapshot));

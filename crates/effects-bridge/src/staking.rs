@@ -214,6 +214,7 @@ const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
         params: NetworkParams {
             reshape_thresholds: ReshapeThresholds {
                 split_bytes: vote.split_bytes,
+                split_fullness: basis_points(vote.split_fullness),
             },
             impound_epochs: vote.impound_epochs,
             price_bounds: PriceBounds::band(
@@ -452,6 +453,9 @@ mod tests {
 
     /// The governed parameters, in the order the package declares them.
     const SPLIT_BYTES: u64 = 9_000;
+    /// The fullness predicate off, which is what a vote about bytes
+    /// says about load.
+    const SPLIT_FULLNESS: u64 = u32::MAX as u64;
     const IMPOUND_EPOCHS: u64 = 30;
     const FLOOR_BP: u64 = 5_000;
     const CEILING_BP: u64 = 20_000;
@@ -460,6 +464,7 @@ mod tests {
     fn cast_payload() -> Vec<u8> {
         [
             SPLIT_BYTES,
+            SPLIT_FULLNESS,
             IMPOUND_EPOCHS,
             FLOOR_BP,
             CEILING_BP,
@@ -485,7 +490,8 @@ mod tests {
                 proposal: Some(ParamProposal {
                     params: NetworkParams {
                         reshape_thresholds: ReshapeThresholds {
-                            split_bytes: SPLIT_BYTES
+                            split_bytes: SPLIT_BYTES,
+                            split_fullness: u32::MAX,
                         },
                         impound_epochs: IMPOUND_EPOCHS,
                         price_bounds: PriceBounds::band(
@@ -509,10 +515,17 @@ mod tests {
     fn the_band_a_pool_votes_is_what_opens_the_controller() {
         let (pools, instances, pool, _impostor) = world();
         let bounds = |floor: u64, ceiling: u64| {
-            let payload = [SPLIT_BYTES, IMPOUND_EPOCHS, floor, ceiling, ACTIVATE_AT]
-                .iter()
-                .flat_map(|field| field.to_le_bytes())
-                .collect();
+            let payload = [
+                SPLIT_BYTES,
+                SPLIT_FULLNESS,
+                IMPOUND_EPOCHS,
+                floor,
+                ceiling,
+                ACTIVATE_AT,
+            ]
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect();
             match witness_from_event(
                 &raw(pool, PARAM_VOTE_CAST, payload),
                 &pools,
@@ -585,7 +598,7 @@ mod tests {
     #[test]
     fn a_vote_the_fold_will_reject_still_reads_as_a_vote() {
         let (pools, instances, pool, _impostor) = world();
-        let payload = [0u64; 5]
+        let payload = [0u64; 6]
             .iter()
             .flat_map(|field| field.to_le_bytes())
             .collect();

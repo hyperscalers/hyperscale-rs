@@ -197,6 +197,15 @@ pub struct TopologySnapshot {
     /// instead of at the block's anchor would price a straddling
     /// transaction differently on its two shards, which is a fork.
     prices: PriceTable,
+    /// The fullest dimension of each shard's spending mean, in basis
+    /// points of its block caps, projected from `BeaconState.fullness`
+    /// and frozen on the same terms as the table.
+    ///
+    /// What the reshape predicate reads beside the byte total: a shard
+    /// running near its caps is too big whatever it holds. One figure
+    /// per shard, since a threshold is read against the fullest
+    /// dimension and nothing asks which one it was.
+    fullness: BTreeMap<ShardId, u32>,
     /// The seeds of the epochs still inside the retained window, each
     /// beside the roll that produced it — projected from `BeaconState`,
     /// which is where they are folded.
@@ -262,6 +271,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
+            fullness: BTreeMap::new(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -312,6 +322,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
+            fullness: BTreeMap::new(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -371,6 +382,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
+            fullness: BTreeMap::new(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -466,6 +478,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
+            fullness: BTreeMap::new(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -479,6 +492,15 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn with_prices(mut self, prices: PriceTable) -> Self {
         self.prices = prices;
+        self
+    }
+
+    /// Override how full each shard has been running. Defaults to
+    /// empty, which reads as idle — what a fixture that never folds an
+    /// epoch resolves.
+    #[must_use]
+    pub fn with_fullness(mut self, fullness: BTreeMap<ShardId, u32>) -> Self {
+        self.fullness = fullness;
         self
     }
 
@@ -637,6 +659,18 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn prices(&self) -> PriceTable {
         self.prices
+    }
+
+    /// How full `shard` has been running, in basis points of its block
+    /// caps, as the mean this window froze.
+    ///
+    /// Zero for a shard the window carries no reading for — one created
+    /// this epoch, or one whose boundary has not advanced since the
+    /// fullness mean was introduced. Idle is the right answer for both:
+    /// a shard with nothing behind it has not earned a split.
+    #[must_use]
+    pub fn fullness_of(&self, shard: ShardId) -> u32 {
+        self.fullness.get(&shard).copied().unwrap_or(0)
     }
 
     /// Whether a block governed by this window may name `package`.

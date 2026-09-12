@@ -10,8 +10,8 @@ use hyperscale_types::{
     BlockHeader, BlockHeight, CertifiedBeaconBlock, CompletedRecovery, DeclaredWork, Epoch,
     EpochWindows, FiveWay, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
     QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary,
-    ShardEpochContribution, ShardId, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause,
-    Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
+    ShardEpochContribution, ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot,
+    TransitionCause, Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
 };
 
 use crate::rules::{
@@ -106,11 +106,36 @@ pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
 /// deliberate: the price is uniform because placement is the protocol's
 /// choice, so a hotspot is answered by capacity through reshape rather
 /// than by billing the addresses that landed on it.
-fn network_utilization(
+fn network_reading(readings: &BTreeMap<ShardId, FiveWay>) -> FiveWay {
+    readings
+        .values()
+        .fold(FiveWay::default(), |mut network, shard| {
+            let row = |into: &mut Utilization, from: Utilization| {
+                into.used = into.used.saturating_add(from.used);
+                into.capacity = into.capacity.saturating_add(from.capacity);
+            };
+            row(&mut network.compute, shard.compute);
+            row(&mut network.read_bytes, shard.read_bytes);
+            row(&mut network.write_bytes, shard.write_bytes);
+            row(&mut network.footprint, shard.footprint);
+            row(&mut network.retention, shard.retention);
+            network
+        })
+}
+
+/// What each shard declared this epoch against what it could have, per
+/// dimension — the reading both the price controller and the fullness
+/// mean are taken from, derived once.
+///
+/// Only the shards whose boundary advanced: a shard that produced
+/// nothing this epoch has no reading, and one taken as idle would walk
+/// the network's price down through an outage and a hot shard's own
+/// fullness down through a stall.
+fn shard_utilization(
     state: &BeaconState,
     before: &BTreeMap<ShardId, (DeclaredWork, BlockHeight)>,
-) -> FiveWay {
-    let mut reading = FiveWay::default();
+) -> BTreeMap<ShardId, FiveWay> {
+    let mut readings = BTreeMap::new();
     for (shard, record) in &state.boundaries {
         let (used_before, height_before) = before
             .get(shard)
@@ -121,46 +146,48 @@ fn network_utilization(
             continue;
         }
         let used = record.used;
-        let row = |into: &mut Utilization, used: u64, before: u64, cap: u64| {
-            into.used = into
-                .used
-                .saturating_add(u128::from(used.saturating_sub(before)));
-            into.capacity = into
-                .capacity
-                .saturating_add(u128::from(cap).saturating_mul(blocks));
+        let row = |used: u64, before: u64, cap: u64| Utilization {
+            used: u128::from(used.saturating_sub(before)),
+            capacity: u128::from(cap).saturating_mul(blocks),
         };
-        row(
-            &mut reading.compute,
-            used.compute,
-            used_before.compute,
-            BLOCK_CAPS.compute,
-        );
-        row(
-            &mut reading.read_bytes,
-            used.read_bytes,
-            used_before.read_bytes,
-            BLOCK_CAPS.read_bytes,
-        );
-        row(
-            &mut reading.write_bytes,
-            used.write_bytes,
-            used_before.write_bytes,
-            BLOCK_CAPS.write_bytes,
-        );
-        row(
-            &mut reading.footprint,
-            used.footprint,
-            used_before.footprint,
-            BLOCK_CAPS.footprint,
-        );
-        row(
-            &mut reading.retention,
-            used.retention,
-            used_before.retention,
-            BLOCK_CAPS.retention,
+        readings.insert(
+            *shard,
+            FiveWay {
+                compute: row(used.compute, used_before.compute, BLOCK_CAPS.compute),
+                read_bytes: row(
+                    used.read_bytes,
+                    used_before.read_bytes,
+                    BLOCK_CAPS.read_bytes,
+                ),
+                write_bytes: row(
+                    used.write_bytes,
+                    used_before.write_bytes,
+                    BLOCK_CAPS.write_bytes,
+                ),
+                footprint: row(used.footprint, used_before.footprint, BLOCK_CAPS.footprint),
+                retention: row(used.retention, used_before.retention, BLOCK_CAPS.retention),
+            },
         );
     }
-    reading
+    readings
+}
+
+/// Advance each live shard's fullness mean by this epoch's reading, and
+/// forget the shards the fold retired.
+///
+/// A shard with no reading keeps the mean it had, for the reason its
+/// price row holds: there was nothing to read. One the fold created
+/// starts idle — a split child inherits state but not its parent's
+/// spending, so it earns its own split rather than being born eligible
+/// for one.
+fn advance_fullness(state: &mut BeaconState, readings: &BTreeMap<ShardId, FiveWay>) {
+    state
+        .fullness
+        .retain(|shard, _| state.boundaries.contains_key(shard));
+    for (shard, reading) in readings {
+        let mean = state.fullness.entry(*shard).or_insert(ShardFullness::IDLE);
+        *mean = mean.folding(reading);
+    }
 }
 
 /// Apply one epoch to `state`.
@@ -325,10 +352,15 @@ pub fn apply_epoch(
     // epoch's blocks declared and held inside the bounds the vote above
     // just settled — so a vote that narrows an interval brings the level
     // in at the same promotion that installs the interval.
-    state.next_prices = state.prices.stepped(
-        &network_utilization(state, &load_marks_before),
-        &state.next_params.price_bounds,
-    );
+    let readings = shard_utilization(state, &load_marks_before);
+    state.next_prices = state
+        .prices
+        .stepped(&network_reading(&readings), &state.next_params.price_bounds);
+    // And each shard's own mean beside the network's, which is what its
+    // reshape predicate reads: the mean above cannot see one hot shard
+    // among idle ones, by construction, so a hotspot is answered with
+    // capacity rather than with a price every sender pays.
+    advance_fullness(state, &readings);
 
     let vrf = filter_and_roll_randomness(verifier, state, network, epoch, committed, &reveals);
     // Equivocation evidence rides committed proposals; shard-witness lifts
@@ -1399,14 +1431,15 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CommittedTxsRoot, DeclaredWork,
-        Epoch, FiveWay, Hash, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
-        QuorumCertificate, Round, SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof,
+        AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
+        BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
+        CommittedTxsRoot, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
+        ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof,
         ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots,
         Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots,
         TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
-        compute_range_proof,
+        compute_range_proof, derive_reshape_trigger,
     };
 
     use super::*;
@@ -4615,7 +4648,7 @@ mod tests {
             .collect();
         state.boundaries.insert(live, load_boundary(full, blocks));
 
-        let reading = network_utilization(&state, &before);
+        let reading = network_reading(&shard_utilization(&state, &before));
         assert_eq!(
             (reading.compute.used, reading.compute.capacity),
             (
@@ -4650,6 +4683,83 @@ mod tests {
                 )
                 .footprint,
             "no row reads another dimension"
+        );
+    }
+
+    /// One shard saturated among idle ones is invisible to the price and
+    /// visible to itself.
+    ///
+    /// The network's reading is the mean, so the table sits near target
+    /// and no sender elsewhere pays for the hotspot; the hot shard's own
+    /// mean climbs to its threshold over `FULLNESS_EPOCHS` and asserts a
+    /// split, which is the capacity the mean deliberately cannot ask
+    /// for.
+    #[test]
+    fn a_hot_shard_among_idle_ones_moves_its_own_mean_and_not_the_table() {
+        let hot = ShardId::leaf(1, 0);
+        let idle = ShardId::leaf(1, 1);
+        let blocks = 4u64;
+        let mut state = single_pool_state(4);
+        for shard in [hot, idle] {
+            state
+                .boundaries
+                .insert(shard, load_boundary(DeclaredWork::ZERO, 0));
+        }
+        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+            .boundaries
+            .iter()
+            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .collect();
+        // The hot shard spends its whole compute budget; the idle one
+        // produces the same blocks and declares nothing.
+        let full = DeclaredWork {
+            compute: BLOCK_CAPS.compute * blocks,
+            ..DeclaredWork::ZERO
+        };
+        state.boundaries.insert(hot, load_boundary(full, blocks));
+        state
+            .boundaries
+            .insert(idle, load_boundary(DeclaredWork::ZERO, blocks));
+
+        let readings = shard_utilization(&state, &before);
+        let network = network_reading(&readings);
+        assert_eq!(
+            network.compute.used * 2,
+            network.compute.capacity,
+            "one saturated shard among one idle one reads as half full"
+        );
+        assert_eq!(
+            PriceTable::GENESIS.stepped(&network, &widened()).compute,
+            PriceTable::GENESIS.compute,
+            "and a half-full network leaves the table where it is"
+        );
+
+        // The same epoch, repeated: the mean is a time constant, so one
+        // busy epoch is a fraction of the way and a run of them is most
+        // of it.
+        for _ in 0..FULLNESS_EPOCHS {
+            advance_fullness(&mut state, &readings);
+        }
+        assert_eq!(state.fullness[&idle].peak(), 0, "an idle shard stays idle");
+        let climbed = state.fullness[&hot].peak();
+        assert!(
+            climbed > 6_000 && climbed < BASIS_POINTS,
+            "the hot shard climbs toward its caps without reaching them: {climbed}"
+        );
+        assert!(
+            derive_reshape_trigger(
+                hot,
+                0,
+                climbed,
+                &ReshapeThresholds {
+                    split_bytes: u64::MAX,
+                    split_fullness: 6_000,
+                },
+                &[],
+                Epoch::GENESIS,
+            )
+            .is_some(),
+            "and asserts a split on load alone"
         );
     }
 
@@ -4693,7 +4803,7 @@ mod tests {
             .boundaries
             .insert(child, load_boundary(halfway, blocks));
 
-        let reading = network_utilization(&state, &before);
+        let reading = network_reading(&shard_utilization(&state, &before));
         assert_eq!(
             (reading.compute.used, reading.compute.capacity),
             (
@@ -4724,7 +4834,7 @@ mod tests {
             .map(|(shard, record)| (*shard, (record.used, record.height)))
             .collect();
 
-        let reading = network_utilization(&state, &before);
+        let reading = network_reading(&shard_utilization(&state, &before));
         assert_eq!(reading.compute.capacity, 0);
         assert_eq!(
             PriceTable::GENESIS.stepped(&reading, &widened()),
@@ -4736,7 +4846,7 @@ mod tests {
     /// held inside whatever interval the vote in the same fold settled.
     ///
     /// What a crossing contributes to the reading is
-    /// [`network_utilization`]'s, pinned beside it; what this pins is
+    /// [`network_reading`]'s, pinned beside it; what this pins is
     /// the rail around it — that the fold steps at all, that it reads
     /// the bounds the level will live under rather than the ones it is
     /// leaving, and that a level a vote just put out of range comes back

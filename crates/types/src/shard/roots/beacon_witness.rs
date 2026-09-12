@@ -217,6 +217,7 @@ fn verify_reshape_trigger(
         derive_reshape_trigger(
             ctx.shard,
             bytes,
+            ctx.topology_snapshot.fullness_of(ctx.shard),
             &ctx.thresholds,
             window,
             ctx.committee_anchor_epoch,
@@ -261,11 +262,18 @@ fn verify_reshape_trigger(
 pub fn derive_reshape_trigger(
     shard: ShardId,
     substate_bytes: u64,
+    fullness: u32,
     thresholds: &ReshapeThresholds,
     window_leaves: &[Hash],
     epoch: Epoch,
 ) -> Option<ReshapeTrigger> {
-    let kind = if substate_bytes >= thresholds.split_bytes {
+    // Two ways to be too big, and either asserts the same split: what
+    // the shard holds, and what its blocks have been spending. A shard
+    // over its byte threshold is one committee serving too much state; a
+    // shard over its fullness is one committee serving too much traffic,
+    // which the network's own price cannot see.
+    let kind = if substate_bytes >= thresholds.split_bytes || fullness >= thresholds.split_fullness
+    {
         ReshapeTrigger::Split { epoch }
     } else if substate_bytes < thresholds.merge_bytes() {
         ReshapeTrigger::Merge { epoch }
@@ -720,38 +728,95 @@ mod tests {
         }
     }
 
+    /// A shard running near its caps splits on that alone, whatever it
+    /// holds — and a shard under the fraction is judged on its bytes as
+    /// before, so the fullness arm adds a way to be too big rather than
+    /// changing what the byte arm says.
+    #[test]
+    fn a_full_shard_splits_on_its_load_whatever_it_holds() {
+        let thresholds = ReshapeThresholds {
+            split_bytes: 100,
+            split_fullness: 7_500,
+        };
+        let child = ShardId::leaf(1, 0);
+        let split = Some(ReshapeTrigger::Split {
+            epoch: Epoch::GENESIS,
+        });
+
+        // Holding almost nothing — which on the byte arm alone asserts a
+        // merge — but running at three quarters of its caps.
+        assert_eq!(
+            derive_reshape_trigger(child, 0, 7_500, &thresholds, &[], Epoch::GENESIS),
+            split,
+        );
+        assert_eq!(
+            derive_reshape_trigger(child, 50, 7_500, &thresholds, &[], Epoch::GENESIS),
+            split,
+        );
+        // A hair under is the byte arm's verdict, unchanged.
+        assert_eq!(
+            derive_reshape_trigger(child, 50, 7_499, &thresholds, &[], Epoch::GENESIS),
+            None
+        );
+        assert_eq!(
+            derive_reshape_trigger(child, 0, 7_499, &thresholds, &[], Epoch::GENESIS),
+            Some(ReshapeTrigger::Merge {
+                epoch: Epoch::GENESIS
+            }),
+        );
+        // And a shard whose pools voted the predicate off never trips it,
+        // however full it runs.
+        assert_eq!(
+            derive_reshape_trigger(
+                child,
+                50,
+                u32::from(u16::MAX),
+                &ReshapeThresholds {
+                    split_fullness: u32::MAX,
+                    ..thresholds
+                },
+                &[],
+                Epoch::GENESIS
+            ),
+            None
+        );
+    }
+
     /// The load predicate: split at the threshold, merge below an
     /// eighth of it (never on the root shard), nothing in between, and
     /// at most one assertion per witness window.
     #[test]
     fn reshape_predicate_fires_on_load_and_dedups_per_window() {
-        let thresholds = ReshapeThresholds { split_bytes: 100 };
+        let thresholds = ReshapeThresholds {
+            split_bytes: 100,
+            split_fullness: u32::MAX,
+        };
         let child = ShardId::leaf(1, 0);
 
         assert_eq!(
-            derive_reshape_trigger(child, 100, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, 100, 0, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS
             }),
         );
         // merge_bytes() == 12; the bound is strict.
         assert_eq!(
-            derive_reshape_trigger(child, 11, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, 11, 0, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Merge {
                 epoch: Epoch::GENESIS
             }),
         );
         assert_eq!(
-            derive_reshape_trigger(child, 12, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, 12, 0, &thresholds, &[], Epoch::GENESIS),
             None
         );
         assert_eq!(
-            derive_reshape_trigger(child, 50, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, 50, 0, &thresholds, &[], Epoch::GENESIS),
             None
         );
         // The root shard has no parent to merge under.
         assert_eq!(
-            derive_reshape_trigger(ShardId::ROOT, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(ShardId::ROOT, 0, 0, &thresholds, &[], Epoch::GENESIS),
             None,
         );
         // Disabled thresholds never fire.
@@ -759,6 +824,7 @@ mod tests {
             derive_reshape_trigger(
                 child,
                 u64::MAX - 1,
+                0,
                 &ReshapeThresholds::DISABLED,
                 &[],
                 Epoch::GENESIS
@@ -775,13 +841,14 @@ mod tests {
         .unwrap()
         .leaf_hash();
         assert_eq!(
-            derive_reshape_trigger(child, 100, &thresholds, &[split_leaf], Epoch::GENESIS),
+            derive_reshape_trigger(child, 100, 0, &thresholds, &[split_leaf], Epoch::GENESIS),
             None,
         );
         assert_eq!(
             derive_reshape_trigger(
                 child,
                 100,
+                0,
                 &thresholds,
                 &[Hash::from_bytes(b"other")],
                 Epoch::GENESIS,
@@ -825,7 +892,10 @@ mod tests {
         let topology_snapshot = snapshot_with_base(shard, 0);
         let ws = empty_sources(shard);
         let mut ctx = context_with(&topology_snapshot, &ws, shard, 0, Vec::new(), 0);
-        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.thresholds = ReshapeThresholds {
+            split_bytes: 10,
+            split_fullness: u32::MAX,
+        };
         ctx.substate_bytes = Some(10);
         ctx.claimed_substate_bytes = Some(10);
 
@@ -856,7 +926,10 @@ mod tests {
             signed_reveal(shard),
         );
         let mut ctx = context_with(&topology_snapshot, &ws, shard, 0, Vec::new(), 0);
-        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.thresholds = ReshapeThresholds {
+            split_bytes: 10,
+            split_fullness: u32::MAX,
+        };
         ctx.substate_bytes = None;
 
         assert_eq!(
@@ -893,7 +966,10 @@ mod tests {
         );
         let mut ctx = context_with(&topology_snapshot, &ws, shard, 2, Vec::new(), 3);
         ctx.parent_leaves_start = BeaconWitnessLeafCount::new(2);
-        ctx.thresholds = ReshapeThresholds { split_bytes: 10 };
+        ctx.thresholds = ReshapeThresholds {
+            split_bytes: 10,
+            split_fullness: u32::MAX,
+        };
         ctx.substate_bytes = Some(11);
         ctx.claimed_substate_bytes = Some(11);
 

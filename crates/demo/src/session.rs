@@ -401,7 +401,10 @@ impl Session {
                 // Arm the split trigger unconditionally: the demo grows on
                 // demand rather than waiting for a shard to outgrow a byte
                 // threshold in real time.
-                reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+                reshape_thresholds: ReshapeThresholds {
+                    split_bytes: 0,
+                    split_fullness: u32::MAX,
+                },
                 ..BeaconChainConfig::default()
             }),
             // Constant-cost signing, in the browser and in the tests alike: a

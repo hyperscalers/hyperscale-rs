@@ -260,6 +260,7 @@ async fn beacon_chain_config_reaches_genesis() {
         epoch_duration_ms: 400,
         reshape_thresholds: ReshapeThresholds {
             split_bytes: 50_000,
+            split_fullness: u32::MAX,
         },
         ..BeaconChainConfig::default()
     };

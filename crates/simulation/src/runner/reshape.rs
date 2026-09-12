@@ -522,7 +522,7 @@ impl SimulationRunner {
     ///
     /// The caller must have run genesis first
     /// (`initialize_genesis` / `initialize_genesis_with_balances`) and armed
-    /// the split trigger (`ReshapeThresholds { split_bytes: 0 }`) with one
+    /// the split trigger (`ReshapeThresholds { split_bytes: 0, .. }`) with one
     /// cohort of pooled extras per split — `(target_shards - 1) * shard_size`
     /// in total. A thin wrapper over [`Self::reshape_step`]: each slice steps
     /// every host's orchestrator and advances the clock, until the leaves
