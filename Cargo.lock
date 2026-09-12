@@ -2220,6 +2220,7 @@ dependencies = [
  "hyperscale-vm-kernel",
  "hyperscale-vm-manifest-builder",
  "hyperscale-vm-meter",
+ "hyperscale-vm-preview",
  "hyperscale-vm-ref",
  "hyperscale-vm-runtime",
  "hyperscale-vm-stdlib",
@@ -2752,6 +2753,15 @@ dependencies = [
  "thiserror 2.0.19",
  "wasm-encoder 0.254.0",
  "wasmparser 0.254.0",
+]
+
+[[package]]
+name = "hyperscale-vm-preview"
+version = "0.1.0"
+dependencies = [
+ "hyperscale-vm-effects",
+ "hyperscale-vm-kernel",
+ "hyperscale-vm-types",
 ]
 
 [[package]]

@@ -37,9 +37,9 @@ use hyperscale_types::{
 };
 pub use hyperscale_vm_effects::TargetAuthority;
 use hyperscale_vm_effects::{
-    ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, NodeCall, PackageHash,
-    PrefixShardResolver, SubintentRecord, admit_tree_with_authority, legs_of, package_hash,
-    route_tree,
+    Admitted, ChainRecords, CrossingCell, CrossingSite, Declaration, DeclaredAccess, NodeCall,
+    PackageHash, PrefixShardResolver, SubintentRecord, admit_tree_with_authority, legs_of,
+    package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
@@ -636,6 +636,22 @@ impl Executor {
         packages: &PackageCache,
         authority: TargetAuthority,
     ) -> Result<PreparedTx, String> {
+        Self::prepare_admitting(tx, chain, packages, authority).map(|(prepared, _)| prepared)
+    }
+
+    /// [`Self::prepare_with_authority`], keeping the admitted form it
+    /// lowered from.
+    ///
+    /// The commit path drops it — what a block runs is the entry — and a
+    /// preview keeps it, because a refusal is explained against the
+    /// declaration that named the condition and nothing else can say
+    /// which node asked for what.
+    pub(crate) fn prepare_admitting(
+        tx: &Transaction,
+        chain: &dyn ChainRecords,
+        packages: &PackageCache,
+        authority: TargetAuthority,
+    ) -> Result<(PreparedTx, Admitted), String> {
         let vm = tx.body();
         let tree = decode_tree(
             vm.call_tree()
@@ -704,20 +720,23 @@ impl Executor {
                 })
                 .collect(),
         };
-        Ok(PreparedTx {
-            // Whole until the batch pipeline plans the member for its
-            // shard; a preview never divides.
-            job: Job::Manifest {
-                calls,
-                legs: LegPlan::whole(0),
+        Ok((
+            PreparedTx {
+                // Whole until the batch pipeline plans the member for its
+                // shard; a preview never divides.
+                job: Job::Manifest {
+                    calls,
+                    legs: LegPlan::whole(0),
+                },
+                declaration,
+                nullifiers: admitted.subintents,
+                gas_limits: vm.gas_limits.clone(),
+                event_bytes,
+                work,
+                judges: OwnerSet::whole(),
             },
-            declaration,
-            nullifiers: admitted.subintents,
-            gas_limits: vm.gas_limits.clone(),
-            event_bytes,
-            work,
-            judges: OwnerSet::whole(),
-        })
+            admitted.admitted,
+        ))
     }
 }
 

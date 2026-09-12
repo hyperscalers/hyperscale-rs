@@ -14,6 +14,7 @@ hyperscale-vm-effects.workspace = true
 hyperscale-vm-types.workspace = true
 thiserror.workspace = true
 hyperscale-vm-kernel.workspace = true
+hyperscale-vm-preview.workspace = true
 hyperscale-vm-stdlib.workspace = true
 
 arc-swap.workspace = true
