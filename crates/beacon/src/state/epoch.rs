@@ -4653,6 +4653,63 @@ mod tests {
         );
     }
 
+    /// A reshaping epoch is read over the boundaries the fold left
+    /// standing.
+    ///
+    /// A child starts its own count at zero, so its blocks and what they
+    /// reserved are the whole of what it contributes; the parent it
+    /// replaced leaves `boundaries` and contributes nothing, its last
+    /// epoch of load going with it. Both understate such an epoch, which
+    /// is the safe direction: a row moves on what shards that still
+    /// exist declared, never on a count nobody will produce again.
+    #[test]
+    fn a_reshape_epoch_reads_the_boundaries_that_stand() {
+        let parent = ShardId::leaf(1, 0);
+        let child = ShardId::leaf(2, 0);
+        let blocks = 4u64;
+        let mut state = single_pool_state(4);
+
+        // Before the fold: the parent mid-chain, having reserved a full
+        // epoch's compute.
+        let spent = DeclaredWork {
+            compute: BLOCK_CAPS.compute * blocks,
+            ..DeclaredWork::ZERO
+        };
+        state.boundaries.insert(parent, load_boundary(spent, 9));
+        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+            .boundaries
+            .iter()
+            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .collect();
+
+        // After it: the parent is gone and the child holds a count of
+        // its own, half its capacity spent.
+        let halfway = DeclaredWork {
+            compute: BLOCK_CAPS.compute * blocks / 2,
+            ..DeclaredWork::ZERO
+        };
+        state.boundaries.remove(&parent);
+        state
+            .boundaries
+            .insert(child, load_boundary(halfway, blocks));
+
+        let reading = network_utilization(&state, &before);
+        assert_eq!(
+            (reading.compute.used, reading.compute.capacity),
+            (
+                u128::from(halfway.compute),
+                u128::from(BLOCK_CAPS.compute) * u128::from(blocks)
+            ),
+            "the child's own blocks are the whole reading, and the parent it \
+             replaced is no part of it"
+        );
+        assert_eq!(
+            PriceTable::GENESIS.stepped(&reading, &widened()).compute,
+            PriceTable::GENESIS.compute,
+            "and a half-full epoch holds the row where it is"
+        );
+    }
+
     /// A network where nothing advanced has no reading at all, so every
     /// row holds rather than walking down through an outage.
     #[test]
