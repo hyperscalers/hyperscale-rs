@@ -24,8 +24,10 @@ use std::sync::Arc;
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::{Event, Transaction, WeightedTimestamp};
-use hyperscale_vm_kernel::{
-    Baseline, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
+use hyperscale_vm_effects::ShardId;
+use hyperscale_vm_kernel::{EnvInputs, OwnerSet, decode_amount};
+use hyperscale_vm_preview::{
+    CellSource, Local, Report as PreviewRun, Slack, preview as preview_run,
 };
 use hyperscale_vm_types::{Outcome, PriceTable, SubstateKey};
 
@@ -149,6 +151,11 @@ pub struct PreviewReport {
     /// Fuel the run consumed — what the fee is the capped form of, so a
     /// wallet can see whether its ceiling bound the charge.
     pub fuel: u64,
+    /// The ceiling each node's run asks for, in node order: what it
+    /// spent with a margin over it. What a composer signs into
+    /// `gas_limits`, which is the reason a preview exists before the
+    /// envelope does.
+    pub ceilings: Vec<u64>,
     /// What the run emitted.
     pub events: Vec<Event>,
 }
@@ -163,6 +170,7 @@ impl PreviewReport {
             changes: Vec::new(),
             fee: 0,
             fuel: 0,
+            ceilings: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -184,26 +192,24 @@ fn amount_at(base: &TickBaseline, key: SubstateKey) -> u128 {
 /// question about commitment, not about resources.
 fn resource_changes(
     base: &TickBaseline,
-    receipt: Option<&Receipt>,
+    moved: Option<&PreviewRun>,
     fee: u128,
     payer: SubstateKey,
     grants: PreviewGrants,
 ) -> Vec<ResourceChange> {
     let mut changes: BTreeMap<SubstateKey, ResourceChange> = BTreeMap::new();
-    if let Some(receipt) = receipt {
-        let whole = OwnerSet::whole();
-        let moved = receipt.delta.owned(&whole);
-        for (key, movement) in moved.movements() {
+    if let Some(moved) = moved {
+        for (key, movement) in &moved.movements {
             let change = changes
-                .entry(key)
-                .or_insert_with(|| ResourceChange::at(key, amount_at(base, key)));
+                .entry(*key)
+                .or_insert_with(|| ResourceChange::at(*key, amount_at(base, *key)));
             change.credit = change.credit.saturating_add(movement.credit);
             change.debit = change.debit.saturating_add(movement.debit);
         }
-        for (key, settled) in moved.settles() {
+        for (key, settled) in &moved.settles {
             let change = changes
-                .entry(key)
-                .or_insert_with(|| ResourceChange::at(key, amount_at(base, key)));
+                .entry(*key)
+                .or_insert_with(|| ResourceChange::at(*key, amount_at(base, *key)));
             change.settled = change.settled.saturating_add(settled.debit);
         }
     }
@@ -277,8 +283,8 @@ impl Executor {
         // producing a receipt root, and a client asking what an envelope
         // would do wants the answer for a component whose seal landed on
         // some other shard.
-        let prepared =
-            match Self::prepare_with_authority(tx, &self.records(), &self.world.cache, authority) {
+        let (prepared, admitted) =
+            match Self::prepare_admitting(tx, &self.records(), &self.world.cache, authority) {
                 Ok(derived) => derived,
                 Err(reason) => return PreviewReport::refused(reason),
             };
@@ -327,36 +333,36 @@ impl Executor {
             OwnerSet::whole(),
             None,
         )];
-        let walk = ManifestWalk {
-            backend: &self.backend,
-        };
-        // Total locality: the report covers every cell the envelope
-        // touches, and the kernel judges each against whatever the
-        // snapshot served for it.
-        let outcome = match execute_batch(
-            Arc::clone(&base) as Arc<dyn Baseline>,
-            &batch,
-            &walk,
+        // The run itself is the preview library's: it holds the source
+        // seam, the optimism a report rests on, and the ceiling policy,
+        // so a wallet asking a node and a wallet asking a fixture get
+        // the same answer in the same shape. What stays here is what
+        // needs the chain: the price, the payer's vault and the amounts
+        // behind the cells the run moved.
+        // One shard nominally: a preview reads a whole snapshot, so what
+        // the anchor says is when it was read rather than who held it.
+        let source: Arc<dyn CellSource> = Arc::new(Local::at(
+            Arc::clone(&base),
+            ShardId(0),
+            inputs.clock.as_millis(),
+        ));
+        let report = preview_run(
+            &batch[0],
+            Some(&admitted),
+            source,
+            &self.backend,
             protocol_hash,
-            self.mode,
-        ) {
-            Ok(outcome) => outcome,
-            // The screen is a property of one derivation's own output, so
-            // this is unreachable for anything `prepare` accepted — and a
-            // preview answers rather than panics either way.
-            Err(error) => return PreviewReport::refused(error.to_string()),
-        };
-        let Some(receipt) = outcome.receipts.get(&vm_tx) else {
-            return PreviewReport::refused("the batch produced no receipt");
-        };
+            Slack::GENEROUS,
+        );
         // One price whatever the outcome, held to the ceiling like the burn.
         let fee = payer.price.min(payer.max_fee);
         PreviewReport {
-            outcome: preview_outcome(&receipt.outcome),
-            changes: resource_changes(&base, Some(receipt), fee, payer.vault, inputs.grants),
+            outcome: preview_outcome(&report.outcome),
+            changes: resource_changes(&base, Some(&report), fee, payer.vault, inputs.grants),
             fee,
-            fuel: receipt.fuel,
-            events: receipt.events.clone(),
+            fuel: report.spent.iter().fold(0u64, |t, n| t.saturating_add(*n)),
+            ceilings: report.ceilings,
+            events: report.events,
         }
     }
 }
@@ -385,10 +391,12 @@ fn preview_publish(
         outcome: PreviewOutcome::Completed,
         changes: resource_changes(&base, None, fee, payer.vault, grants),
         fee,
-        // A publish invokes nothing, so nothing burns fuel; what it
-        // costs is the fee above, which prices its artifact as bytes
-        // retained and written rather than as anything executed.
+        // A publish invokes nothing, so nothing burns fuel and there is
+        // no node to bound; what it costs is the fee above, which
+        // prices its artifact as bytes retained and written rather than
+        // as anything executed.
         fuel: 0,
+        ceilings: Vec::new(),
         events: Vec::new(),
     }
 }

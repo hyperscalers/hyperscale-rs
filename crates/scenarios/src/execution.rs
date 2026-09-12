@@ -2004,6 +2004,22 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 }
 
 /// The reported change to `owner`'s native vault.
+/// What a wallet came for: a ceiling per node it can sign, with room
+/// over what the run actually spent. A composer signing these signs a
+/// transaction the chain meters against the same figures.
+fn ceilings_cover_the_run(report: &PreviewReport) {
+    assert!(
+        !report.ceilings.is_empty(),
+        "a preview names a ceiling for every node the manifest lowers to"
+    );
+    assert!(
+        report.ceilings.iter().sum::<u64>() > report.fuel,
+        "the ceilings leave room over the measurement: {:?} against {}",
+        report.ceilings,
+        report.fuel
+    );
+}
+
 fn preview_change(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
     let owner = owner.into();
     let vault = vault_key(owner, *PROTOCOL_RESOURCE);
@@ -2062,6 +2078,8 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
         "a covered transfer previews as completed"
     );
     assert!(report.fee > 0, "a transfer costs its payer something");
+
+    ceilings_cover_the_run(&report);
 
     let sender = preview_change(&report, from);
     assert_eq!(
