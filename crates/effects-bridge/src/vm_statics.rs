@@ -216,28 +216,47 @@ pub fn declared_vector(
         .into_iter()
         .map(|(owner, work)| OwnerShare { owner, work })
         .collect();
-    // What the calls may emit between them: each package declares what
-    // one call into it may, so a manifest calling one twice may emit
-    // twice. Held to what a receipt can carry at all, which is what the
-    // kernel meters the emits against and what retention prices.
+    // What each call may emit, off the method it names: a method that
+    // emits states its bound and one that does not states nothing, so a
+    // manifest pays for the emissions of the methods it calls and for no
+    // others. The kernel meters each node against its own figure and
+    // retention prices their sum.
     let metadata = packages.load();
-    let event_bytes = routing
+    let event_bytes: Vec<u32> = routing
         .calls
         .iter()
-        .fold(0usize, |total, call| {
-            let declared = metadata
+        .map(|call| {
+            metadata
                 .get(call.package)
-                .map_or(0, |package| package.event_bytes as usize);
-            total.saturating_add(declared)
+                .and_then(|package| package.methods.get(&call.export))
+                .map_or(0, |method| method.event_bytes)
         })
-        .min(MAX_EVENT_BYTES_PER_TX);
-    let everywhere = everywhere(&shares, envelope_bytes, vm.signatures(), event_bytes as u64);
+        .collect();
+    let everywhere = everywhere(
+        &shares,
+        envelope_bytes,
+        vm.signatures(),
+        event_bytes_total(&event_bytes),
+    );
     DeclaredVector {
         shares,
         node_terms,
         everywhere,
         event_bytes,
     }
+}
+
+/// What a transaction's calls may emit between them, in bytes.
+///
+/// Saturating at the receipt's own cap, which the transaction's
+/// admission holds the sum under, so the figure a block prices and the
+/// figure a receipt can carry are one.
+#[must_use]
+pub fn event_bytes_total(per_call: &[u32]) -> u64 {
+    per_call
+        .iter()
+        .fold(0u64, |total, bytes| total.saturating_add(u64::from(*bytes)))
+        .min(MAX_EVENT_BYTES_PER_TX as u64)
 }
 
 /// Whether the envelope's subintent signatures answer the tree it binds:
@@ -281,8 +300,8 @@ pub struct DeclaredVector {
     /// What every shard committing the transaction bears whatever it
     /// holds.
     pub everywhere: DeclaredWork,
-    /// The most bytes the receipt's events may carry between them.
-    pub event_bytes: usize,
+    /// The most bytes each call may emit, in node order.
+    pub event_bytes: Vec<u32>,
 }
 
 /// What every shard that commits a transaction bears whatever it holds:
@@ -1420,14 +1439,25 @@ mod tests {
                 >= envelope_bytes + derived.work.write_bytes + vm.signatures().retention,
             "retention carries the envelope, every write and the auth material"
         );
-        // Each call into an eventful package carries that package's own
-        // bound, so a transfer's three calls into the account carry
-        // three of them.
-        let per_call = u64::from(account::metadata().event_bytes);
-        assert!(per_call > 0, "the account bounds what a call may emit");
+        // Each call carries the bound its own method declares, so a
+        // transfer's sign-in carries nothing and its withdraw and
+        // deposit carry theirs.
+        let metadata = account::metadata();
+        let bound = |method: &str| {
+            u64::from(
+                metadata
+                    .methods
+                    .get(method)
+                    .expect("the account publishes it")
+                    .event_bytes,
+            )
+        };
+        let (signing_in, moving) = (bound("authorize"), bound("withdraw") + bound("deposit"));
+        assert_eq!(signing_in, 0, "signing in emits nothing and pays nothing");
+        assert!(moving > 0, "the movements bound what they may emit");
         assert!(
-            derived.work.retention >= envelope_bytes + derived.work.write_bytes + 3 * per_call,
-            "retention carries the envelope, the writes and each call's event bound"
+            derived.work.retention >= envelope_bytes + derived.work.write_bytes + moving,
+            "retention carries the envelope, the writes and each call's own event bound"
         );
         // The fixture statics know the account package's metadata and
         // not its artifact, so nothing is read for it; a statics that

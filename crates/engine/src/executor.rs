@@ -80,10 +80,10 @@ pub struct PreparedTx {
     /// The envelope's signed compute ceilings, in fuel: one per manifest
     /// node, in node order, each metering its own node and nothing else.
     pub gas_limits: Vec<u64>,
-    /// What the calls' packages declare they may emit between them,
-    /// which the kernel meters the transaction's events against and the
+    /// What each call's method declares it may emit, in node order,
+    /// which the kernel meters that node's events against and the
     /// declaration priced as retention.
-    pub event_bytes: usize,
+    pub event_bytes: Vec<u32>,
     /// What the transaction declares it may consume, whole. A settlement
     /// is the batch's own and declares nothing.
     pub work: DeclaredWork,
@@ -618,7 +618,7 @@ impl Executor {
             nullifiers: Vec::new(),
             gas_limits: Vec::new(),
             // A settlement invokes no node, so nothing of it emits.
-            event_bytes: 0,
+            event_bytes: Vec::new(),
             work: DeclaredWork::ZERO,
             judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
@@ -740,7 +740,7 @@ pub fn batch_entry(
         .with_job(prepared.job.clone())
         .with_nullifiers(prepared.nullifiers.clone())
         .with_gas_limits(prepared.gas_limits.clone())
-        .with_event_bytes(prepared.event_bytes)
+        .with_event_bytes(prepared.event_bytes.clone())
         .with_applies(applies)
         .with_judges(prepared.judges.clone())
         .with_fee(fee)
@@ -1749,7 +1749,7 @@ mod tests {
             declaration: Declaration::default(),
             nullifiers: Vec::new(),
             gas_limits: vec![7, 9],
-            event_bytes: 4_321,
+            event_bytes: vec![4_321],
             work: DeclaredWork::ZERO,
             judges: OwnerSet::whole(),
         };
