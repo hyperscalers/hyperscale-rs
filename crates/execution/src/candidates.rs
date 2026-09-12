@@ -18,7 +18,8 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
-    Deadline, EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, Window,
+    Deadline, EscrowedValue, PriceTable, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
+    Window,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -292,6 +293,9 @@ impl TickCandidates {
                         Vec::new()
                     },
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
+                    // Resolved against that clock once the schedule is
+                    // in hand, where the member is seated.
+                    prices: PriceTable::GENESIS,
                     runs: Runs::Shape(candidate.member.clone()),
                     arrivals,
                 },

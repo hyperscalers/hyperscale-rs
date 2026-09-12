@@ -53,6 +53,16 @@ pub struct CrossShardExecutionRequest {
     /// bundle carried, so every participant executes the transaction
     /// under one clock.
     pub clock: WeightedTimestamp,
+    /// The price table the transaction's committing block anchored to.
+    ///
+    /// Carried for the reason [`Self::clock`] is, and it is the same
+    /// reason: the fee lands in a receipt every participant derives, so
+    /// a table read off the executing node's head would price one
+    /// transaction differently on two shards — and differently again on
+    /// one shard replaying the tick after a fold moved the level. The
+    /// committing block's window is the one anchor every participant
+    /// shares.
+    pub prices: PriceTable,
     /// What this member runs: the transaction as classified when its
     /// block committed — carried, never re-derived — or a settlement of
     /// what a leg here issued. What it says of the member is what the

@@ -1022,6 +1022,7 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
+        prices: PriceTable,
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
@@ -1050,6 +1051,7 @@ impl ExecutionCoordinator {
             self.seat_settling(
                 tick_id,
                 tick_ts,
+                prices,
                 state,
                 requests,
                 tx_hash,
@@ -1096,6 +1098,7 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
+        prices: PriceTable,
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
@@ -1150,7 +1153,7 @@ impl ExecutionCoordinator {
             // crossing ended at the cut, and the price it owed was
             // settled there.
             self.seat_settling(
-                tick_id, tick_ts, state, requests, tx_hash, None, records, licence, true,
+                tick_id, tick_ts, prices, state, requests, tx_hash, None, records, licence, true,
             );
         }
     }
@@ -1163,6 +1166,7 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
+        prices: PriceTable,
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
@@ -1186,6 +1190,7 @@ impl ExecutionCoordinator {
             self.seat_settling(
                 tick_id,
                 tick_ts,
+                prices,
                 state,
                 requests,
                 tx_hash,
@@ -1207,6 +1212,7 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
+        prices: PriceTable,
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
         tx_hash: TxHash,
@@ -1232,6 +1238,9 @@ impl ExecutionCoordinator {
             transaction,
             provisions: Vec::new(),
             clock: tick_ts,
+            // The tick's own anchor is this settlement's: nothing
+            // committed it but the block being composed.
+            prices,
             runs: Runs::Settle {
                 member: Member::whole(local_shard),
                 records,
@@ -1249,7 +1258,7 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         member: Admitted,
-        prices: &PriceTable,
+        topology_schedule: &TopologySchedule,
         state: &mut TickState,
         ticked: &mut TickedBatch,
         requests: &mut Vec<CrossShardExecutionRequest>,
@@ -1267,13 +1276,22 @@ impl ExecutionCoordinator {
         // reservation its block took and settled the price, so this
         // one reserves nothing and issues nothing.
         let second_member = shape.as_ref().is_some_and(|(shape, _)| shape.is_second());
+        // The table the member's own anchor names — the payer bundle's
+        // for a remote-payer leg, this chain's committing block for
+        // everything else, which is the clock the request already
+        // carries. Read here rather than once for the tick, because a
+        // tick's members come from different blocks and the fee rides a
+        // receipt every participant of the transaction derives.
+        let prices = self
+            .classification_committee(topology_schedule, member.request.clock)
+            .prices();
         let reach = member.membership_reach();
         state.admit(
             member.request.tx_hash,
             member.membership,
             match &shape {
                 Some((shape, body)) if !second_member => {
-                    Some(shape.classified().local_price(body, local_shard, prices))
+                    Some(shape.classified().local_price(body, local_shard, &prices))
                 }
                 _ => None,
             },
@@ -1343,7 +1361,9 @@ impl ExecutionCoordinator {
                 .provisional_claims
                 .extend(body.routing().declared_modes.clone());
         }
-        requests.push(member.request);
+        let mut request = member.request;
+        request.prices = prices;
+        requests.push(request);
     }
 
     fn compose_tick(
@@ -1362,13 +1382,6 @@ impl ExecutionCoordinator {
             .candidates
             .compose(&self.provisioning, held, self.committed_ts);
 
-        // The block's own window, not the head's: what a member is
-        // charged is fixed by the anchor its committing block carried,
-        // so a fold that moves the table between commit and tick never
-        // moves the figure.
-        let prices = self
-            .classification_committee(topology_schedule, block.ts)
-            .prices();
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut ticked = TickedBatch {
@@ -1379,7 +1392,7 @@ impl ExecutionCoordinator {
             self.admit_member(
                 tick_id,
                 member,
-                &prices,
+                topology_schedule,
                 &mut state,
                 &mut ticked,
                 &mut requests,
@@ -1387,12 +1400,19 @@ impl ExecutionCoordinator {
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
-        self.admit_reclaims(tick_id, block.ts, &mut state, &mut requests);
-        self.admit_retirements(tick_id, block.ts, &mut state, &mut requests);
+        // The tick's own anchor prices what the tick itself composes:
+        // a settlement is committed by the block being built, not by an
+        // earlier one, so there is one table for all of them.
+        let tick_prices = self
+            .classification_committee(topology_schedule, block.ts)
+            .prices();
+        self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
+        self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_inherited(
             topology_schedule,
             tick_id,
             block.ts,
+            tick_prices,
             &mut state,
             &mut requests,
         );
