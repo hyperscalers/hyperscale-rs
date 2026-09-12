@@ -148,9 +148,15 @@ pub struct TxOutcome {
     /// one, so an attempt that failed or aborted still reports the
     /// declaration work it really did.
     attested_work: u64,
-    /// What this transaction was charged, in quanta: its declared vector
-    /// at the table in force at its block's anchor, raised by its signed
-    /// priority.
+    /// What this shard attests it charged, in quanta: the price of its
+    /// own share of the declared vector, at the table in force at its
+    /// block's anchor, raised by the signed priority.
+    ///
+    /// The share, not the whole: the payer burns the whole price once,
+    /// on its own shard, while this is what the beacon weighs this
+    /// shard's emission by — so it has to say what this shard did, and
+    /// the shares of a cross-shard transaction sum past the whole by
+    /// what every participant repeats.
     ///
     /// Attested rather than re-derived because a validator holding the
     /// certificate but not the transaction — a node that snap-synced
