@@ -143,7 +143,6 @@ fn run_tick(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
-        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -152,8 +151,12 @@ fn run_tick(
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    let executed =
-        executor.execute_batch(&ctx, &storage.snapshot(), std::slice::from_ref(&verified));
+    let executed = executor.execute_batch(
+        &ctx,
+        PriceTable::GENESIS,
+        &storage.snapshot(),
+        std::slice::from_ref(&verified),
+    );
 
     let before = storage.state_root();
     // Execution and fee receipts both, as the tick stores them: a failed

@@ -283,7 +283,6 @@ where
             let tick_ctx = TickBatchContext {
                 local_shard: ctx.shard,
                 shard_trie,
-                prices: ctx.topology_snapshot.prices(),
                 tick_ts,
                 env,
                 holds: &holds,
@@ -295,6 +294,7 @@ where
                     transaction: r.transaction.as_ref(),
                     provisions: &r.provisions,
                     clock: r.clock,
+                    prices: r.prices,
                     runs: r.runs.clone(),
                     arrivals: &r.arrivals,
                 })

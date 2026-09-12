@@ -94,14 +94,6 @@ pub struct TickBatchContext<'a> {
     pub local_shard: ShardId,
     /// The active shard partition.
     pub shard_trie: &'a ShardTrie,
-    /// What each dimension costs under the window the tick-starting
-    /// block anchored to.
-    ///
-    /// Off the anchor like the trie beside it, and for the same reason:
-    /// a fee read at the head would price a transaction straddling an
-    /// epoch boundary differently on its two shards, and the receipt
-    /// carrying it is one both derive.
-    pub prices: PriceTable,
     /// The tick-starting block's parent-QC weighted timestamp. For a
     /// single-shard batch this is the transaction clock of every member;
     /// cross-shard batches carry per-transaction clocks on their inputs.
@@ -141,6 +133,10 @@ pub struct TickTxInput<'a> {
     /// committing block's parent-QC weighted timestamp for a cross-shard
     /// leg.
     pub clock: WeightedTimestamp,
+    /// The price table the member's committing block anchored to,
+    /// identical on every participant for the reason the clock is: the
+    /// fee it settles rides a receipt they all derive.
+    pub prices: PriceTable,
     /// What this member runs: the transaction as its block froze it —
     /// carried, never re-derived, since a reshape landing between
     /// composition and execution would otherwise leave one shard running

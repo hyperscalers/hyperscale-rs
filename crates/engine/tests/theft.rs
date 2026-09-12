@@ -115,7 +115,6 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
-        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -124,7 +123,12 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    executor.execute_batch(&ctx, &store, std::slice::from_ref(&verified))
+    executor.execute_batch(
+        &ctx,
+        PriceTable::GENESIS,
+        &store,
+        std::slice::from_ref(&verified),
+    )
 }
 
 /// A receipt's writes as they settle onto `accounts`.

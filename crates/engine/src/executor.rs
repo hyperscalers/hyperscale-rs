@@ -30,7 +30,7 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
     Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics, whole_work,
@@ -1285,6 +1285,10 @@ fn assemble_executed_tx(
 struct BatchMember {
     tx_hash: TxHash,
     body: Option<Arc<Verified<Transaction>>>,
+    /// The table this member's committing block anchored to: what its
+    /// fee is weighed at, carried per member because that is the grain
+    /// the anchor has.
+    prices: PriceTable,
 }
 
 /// Whether the settlement of `record` under `on` takes the crossing
@@ -1332,6 +1336,7 @@ impl Executor {
             .map(|i| BatchMember {
                 tx_hash: i.tx_hash,
                 body: i.transaction.map(Arc::clone),
+                prices: i.prices,
             })
             .collect();
         let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
@@ -1512,7 +1517,7 @@ impl Executor {
                     PayerFee {
                         vault,
                         max_fee: vm.max_fee,
-                        price: tx.price(&ctx.prices),
+                        price: tx.price(&member.prices),
                         abortable: shapes
                             .get(&tx.hash())
                             .is_some_and(|input| input.runs.abortable()),
@@ -1681,15 +1686,21 @@ impl Executor {
     /// deterministic-parallel executor at once, which returns one
     /// [`ExecutedTx`] per input transaction, in input order.
     #[must_use]
+    /// `prices` is stated rather than read off the context, because a
+    /// table is a fact about the block that committed a member and a
+    /// context spans a tick: one reachable from here would be one a
+    /// caller could take off its own head, which prices a transaction
+    /// differently on two shards.
     pub fn execute_batch(
         &self,
         ctx: &TickBatchContext<'_>,
+        prices: PriceTable,
         snapshot: &(dyn Substates + Sync),
         transactions: &[Arc<Verified<Transaction>>],
     ) -> Vec<ExecutedTx> {
         // Every member runs whole on its own shard and reads the
         // context's own clock: one block committed them all, so one
-        // epoch seals them all.
+        // epoch seals them all — and one table prices them all.
         let inputs: Vec<TickTxInput<'_>> = transactions
             .iter()
             .map(|tx| TickTxInput {
@@ -1697,6 +1708,7 @@ impl Executor {
                 transaction: Some(tx),
                 provisions: &[],
                 clock: ctx.tick_ts,
+                prices,
                 runs: Runs::Shape(Member::whole(ctx.local_shard)),
                 arrivals: &[],
             })

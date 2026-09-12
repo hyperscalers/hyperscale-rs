@@ -21,9 +21,9 @@ use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange,
     DeclaredWork, Derivation, DerivationError, Derived, EnvelopeExt, ExecutionMetadata,
-    GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr, Routing, SchemeId, ShardId,
-    StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified,
-    WeightedTimestamp,
+    GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PriceTable, PrincipalAddr, Routing,
+    SchemeId, ShardId, StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope,
+    TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::Moves;
 
@@ -141,6 +141,7 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
 fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
     let (local, counterpart) = ShardId::ROOT.children();
     CrossShardExecutionRequest {
+        prices: PriceTable::GENESIS,
         tx_hash: tx.hash(),
         transaction: Some(Arc::clone(tx)),
         provisions: Vec::new(),

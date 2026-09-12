@@ -461,14 +461,13 @@ fn execute_seeded(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
-        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env,
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, store, transactions)
+    executor.execute_batch(&ctx, PriceTable::GENESIS, store, transactions)
 }
 
 /// The settled round a draw wrote, if any.
@@ -654,7 +653,6 @@ fn execute_batch_on(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
-        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         // A round sealed under this grid records genesis, so the window
@@ -664,7 +662,7 @@ fn execute_batch_on(
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, snapshot_store, transactions)
+    executor.execute_batch(&ctx, PriceTable::GENESIS, snapshot_store, transactions)
 }
 
 /// A receipt's writes as they settle onto `accounts`.
@@ -1173,7 +1171,6 @@ fn execute_on_shard(
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let trie = ShardTrie::uniform(1);
     let ctx = TickBatchContext {
-        prices: PriceTable::GENESIS,
         local_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1181,7 +1178,7 @@ fn execute_on_shard(
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, &snapshot_store, transactions)
+    executor.execute_batch(&ctx, PriceTable::GENESIS, &snapshot_store, transactions)
 }
 
 fn events_of(executed: &ExecutedTx) -> Vec<(Address, u32)> {
@@ -1364,7 +1361,6 @@ fn a_transfer_executes_divided_on_both_shards() {
     let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
         let ctx = TickBatchContext {
-            prices: PriceTable::GENESIS,
             local_shard,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1372,6 +1368,7 @@ fn a_transfer_executes_divided_on_both_shards() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1460,13 +1457,13 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
-            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1547,13 +1544,13 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
-            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1649,13 +1646,13 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let issued = |store: &MapDb| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
-            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1678,13 +1675,13 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let settle = |store: &MapDb, at: u64| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
-            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(at),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
             transaction: None,
             provisions: &[],
@@ -1781,13 +1778,13 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
     let run = |store: &MapDb, charged: bool| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
-            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1851,7 +1848,6 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
     let run = |local_shard: ShardId| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
         let ctx = TickBatchContext {
-            prices: PriceTable::GENESIS,
             local_shard,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1859,6 +1855,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
+            prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
             transaction: Some(&tx),
             provisions: &[],
@@ -1928,14 +1925,18 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         .insert(Hash::from_bytes(b"an unresolved leg").into(), 950);
     let ctx = TickBatchContext {
         local_shard: near_shard,
-        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &holds,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
-    let executed = executor.execute_batch(&ctx, &snapshot_store, std::slice::from_ref(&tx));
+    let executed = executor.execute_batch(
+        &ctx,
+        PriceTable::GENESIS,
+        &snapshot_store,
+        std::slice::from_ref(&tx),
+    );
     assert!(
         matches!(executed[0].consensus, ConsensusReceipt::Failed),
         "a reservation the hold leaves uncovered must fail its leg: {:?}",
@@ -1943,11 +1944,10 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
     );
 
     let unheld = TickBatchContext {
-        prices: PriceTable::GENESIS,
         holds: &ProvisionalHolds::new(),
         ..ctx
     };
-    let executed = executor.execute_batch(&unheld, &snapshot_store, &[tx]);
+    let executed = executor.execute_batch(&unheld, PriceTable::GENESIS, &snapshot_store, &[tx]);
     assert!(
         matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
         "with nothing held the same transfer completes: {:?}",
@@ -2562,6 +2562,79 @@ fn free_credit_reports_the_fee_without_charging_it() {
         change_for(&charged, bob()),
         "a grant to the payer moves nobody else"
     );
+}
+
+/// A member's fee is weighed at the table its own committing block
+/// anchored to, never at the table the executing node happens to hold.
+///
+/// The burn lands in a receipt every participant of the transaction
+/// derives, so a table read off the head would price one transaction
+/// two ways — across two shards folding an epoch at different moments,
+/// and across one shard replaying a tick after a fold moved the level.
+#[test]
+fn a_members_fee_follows_the_table_it_carries() {
+    let executor = executor(ExecutionMode::Serial);
+    let payer = alice();
+    let funded = [(payer, 1_000_000u128)];
+
+    // Two tables an epoch apart; the member carries one of them.
+    let moved = PriceTable {
+        compute: PriceTable::GENESIS.compute * 3,
+        ..PriceTable::GENESIS
+    };
+    let burn = |prices: PriceTable| {
+        let tx = Arc::new(Verified::<Transaction>::from_persisted(
+            signed_transfer_with_fee(ALICE_SEED, payer, bob(), 100, TRANSFER_FEE),
+        ));
+        derived_through(&executor, std::slice::from_ref(&tx));
+        let trie = ShardTrie::single();
+        let ctx = TickBatchContext {
+            local_shard: ShardId::ROOT,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: sealed_env(0x5E),
+            holds: &ProvisionalHolds::new(),
+        };
+        let executed = executor.execute_batch(
+            &ctx,
+            prices,
+            &MapDb::genesis(&funded),
+            std::slice::from_ref(&tx),
+        );
+        let ConsensusReceipt::Succeeded {
+            writes: database_updates,
+            ..
+        } = &executed[0].consensus
+        else {
+            panic!("a funded transfer succeeds: {:?}", executed[0].consensus);
+        };
+        let held = vault_cell(&settled(database_updates, &funded), payer)
+            .expect("the payer's vault was written");
+        // The vault carries the transfer beside the fee, so the fee is
+        // what moves between two runs that differ only in the table.
+        (tx.price(&prices), held)
+    };
+
+    let (genesis_price, genesis_held) = burn(PriceTable::GENESIS);
+    let (moved_price, moved_held) = burn(moved);
+    assert!(
+        moved_price > genesis_price,
+        "the two tables price the transfer differently, or the pin \
+         would hold whatever the member carried"
+    );
+    assert_eq!(
+        genesis_held,
+        encode_amount(decode_held(&moved_held) + (moved_price - genesis_price)).to_vec(),
+        "the burn moves by exactly what the carried table moved"
+    );
+}
+
+/// An amount cell's figure, for an assertion that has to do arithmetic
+/// on a balance rather than compare it.
+fn decode_held(cell: &[u8]) -> u128 {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&cell[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 /// An uncovered withdrawal previews as the abort it would be, priced at
