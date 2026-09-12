@@ -293,20 +293,19 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let trie = ctx.snapshot.shard_trie();
-        if !ctx.snapshot.is_single_shard_transaction(tx) {
-            let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
-            if payer_shard != ctx.local_shard
-                && !fold
-                    .provisions
-                    .provisioned
-                    .contains(&(payer_shard, tx_hash))
-                && !ctx.dedup.contains_provision_tx(payer_shard, tx_hash)
-            {
-                return Err(format!(
-                    "cross-shard VM transaction {tx_hash} lacks its payer bundle from \
-                     {payer_shard:?}"
-                ));
-            }
+        let payer_shard = trie.shard_for_prefix(tx.body().fee_payer);
+        if !ctx.snapshot.is_single_shard_transaction(tx)
+            && payer_shard != ctx.local_shard
+            && !fold
+                .provisions
+                .provisioned
+                .contains(&(payer_shard, tx_hash))
+            && !ctx.dedup.contains_provision_tx(payer_shard, tx_hash)
+        {
+            return Err(format!(
+                "cross-shard VM transaction {tx_hash} lacks its payer bundle from \
+                 {payer_shard:?}"
+            ));
         }
         // The committed cell is one per transaction, so the term is a
         // constant rather than a reading of where the shape sits.
@@ -323,12 +322,21 @@ impl<'p> Section for TransactionsSection<'p> {
         // because the price is the window's and a signature check holds
         // no window: a transaction admissible before a fold that raised
         // the table is one its own ceiling no longer covers.
-        let price = tx.price(&ctx.snapshot.prices());
-        if price > tx.body().max_fee {
-            return Err(format!(
-                "transaction {tx_hash} signs a ceiling of {} and prices at {price}",
-                tx.body().max_fee
-            ));
+        //
+        // By the shard holding the payer's vault and by no other. Fees
+        // never move cross-shard, so that shard is where the ceiling is
+        // spent and where the table that prices it is resolved — and two
+        // shards whose blocks sit either side of a fold name two tables,
+        // so a guard every participant applied would admit a straddling
+        // transaction on one shard and refuse it on another.
+        if payer_shard == ctx.local_shard {
+            let price = tx.price(&ctx.snapshot.prices());
+            if price > tx.body().max_fee {
+                return Err(format!(
+                    "transaction {tx_hash} signs a ceiling of {} and prices at {price}",
+                    tx.body().max_fee
+                ));
+            }
         }
         // The declared vector, held to the transaction's own ceilings
         // whole and to the block's caps over this shard's share: what

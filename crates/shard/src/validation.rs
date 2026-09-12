@@ -469,11 +469,11 @@ mod tests {
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, Finalization,
         Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions,
-        QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange, Transaction,
-        TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
+        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
+        Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -2063,6 +2063,58 @@ mod tests {
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// The signed ceiling is the payer shard's verdict and no other
+    /// shard's.
+    ///
+    /// Two shards whose blocks sit either side of a fold name two
+    /// tables, so a guard every participant applied would admit a
+    /// straddling transaction on one and refuse it on the other — one
+    /// shard committing what its counterpart will never carry. The shard
+    /// that burns against the ceiling is the one that judges it.
+    #[test]
+    fn the_ceiling_is_judged_where_the_fee_is_burned() {
+        // A level no fixture ceiling covers.
+        let topo = TestCommittee::new(4, 42)
+            .topology_snapshot(2)
+            .with_prices(PriceTable {
+                compute: PriceTable::GENESIS.compute * 1_000_000,
+                ..PriceTable::GENESIS
+            });
+        let local = ShardId::leaf(1, 0);
+        let payer_shard = ShardId::leaf(1, 1);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
+        let tx_hash = tx.hash();
+
+        // On the payer's own shard, which needs no bundle to engage:
+        // refused, since this is the chain that would burn against the
+        // ceiling.
+        let err = admit(
+            &engaged(&topo, payer_shard),
+            &block_with_tx(&tx, Vec::new()),
+        )
+        .expect_err("the payer's shard prices it past the signed ceiling");
+        assert!(err.contains("signs a ceiling"), "{err}");
+
+        // On the counterpart, at the same table and with the payer
+        // bundle in hand: carried. What the ceiling covers is not this
+        // chain's question, and asking it here is what would fork the
+        // two verdicts across a fold.
+        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
+            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                payer_shard,
+                local,
+                BlockHeight::new(1),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                vec![ProvisionEntry::new(tx_hash, vec![])],
+            ))
+            .into(),
+        );
+        assert!(admit(&engaged(&topo, local), &block_with_tx(&tx, vec![bundle])).is_ok());
     }
 
     #[test]
