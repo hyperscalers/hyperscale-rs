@@ -20,8 +20,9 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, MAX_SUBINTENT_VALIDITY_RANGE,
-    NetworkId, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites,
-    ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    NetworkId, PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr,
+    SettledWrites, ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
@@ -142,6 +143,7 @@ fn run_tick(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),

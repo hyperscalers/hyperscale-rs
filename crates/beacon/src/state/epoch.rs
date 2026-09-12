@@ -146,6 +146,11 @@ pub fn apply_epoch(
     // `activate_at - 1`, so this epoch's blocks resolve the value every
     // member already froze into this window's topology snapshot.
     state.params = state.next_params;
+    // The price level travels with the bounds that hold it: the fold
+    // that computed it wrote `next_prices` an epoch ago, so this
+    // window's blocks resolve the table every member already froze into
+    // their topology snapshot.
+    state.prices = state.next_prices;
     // Freeze everything the window's schedule entry fixes, in one step
     // and before this fold mutates any of it. A window's entry is
     // written twice — the lookahead at the end of the preceding fold, the
@@ -1303,11 +1308,11 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CommittedTxsRoot, Epoch, Hash,
-        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, QuorumCertificate, Round, SettledTxsRoot,
-        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
-        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
-        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TransitionCause, ValidatorId, VrfProof,
-        WeightedTimestamp, compute_merkle_root, compute_range_proof,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceTable, QuorumCertificate, Round,
+        SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad,
+        ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool,
+        StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TransitionCause,
+        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
     };
 
     use super::*;
@@ -4284,10 +4289,11 @@ mod tests {
             })
             .collect();
         format!(
-            "shards={per_shard:?} observers={:?} keepers={:?} params={:?}",
+            "shards={per_shard:?} observers={:?} keepers={:?} params={:?} prices={:?}",
             snapshot.reshape_observer_cohorts(),
             snapshot.reshape_keeper_cohorts(),
             snapshot.params(),
+            snapshot.prices(),
         )
     }
 
@@ -4426,6 +4432,50 @@ mod tests {
             assert_eq!(seeded.height, origin.genesis_height);
             assert_eq!(seeded.state_root, derived.header().state_root());
         }
+    }
+
+    /// The price level is frozen a window ahead and promoted beside the
+    /// params, so a block anchored inside a window resolves the table
+    /// that window opened with however many folds have run since.
+    ///
+    /// The head and the lookahead are what a straddling transaction's
+    /// two shards each resolve; the pin is that the lookahead a fold
+    /// publishes is exactly what the next promotion installs.
+    #[test]
+    fn the_price_level_promotes_a_window_behind_the_fold() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+
+        // A level the fold has computed but not yet promoted: the head
+        // still carries the old one, the lookahead the new.
+        let moved = PriceTable {
+            compute: PriceTable::GENESIS.compute * 2,
+            ..PriceTable::GENESIS
+        };
+        state.next_prices = moved;
+        assert_eq!(
+            state.derive_topology_snapshot(net()).prices(),
+            PriceTable::GENESIS,
+            "this window prices at the table it opened with"
+        );
+        assert_eq!(
+            state.derive_next_topology_snapshot(net()).prices(),
+            moved,
+            "the next window carries what this fold computed"
+        );
+
+        apply_epoch(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
+        );
+        assert_eq!(state.prices, moved, "the promotion installs it");
+        assert_eq!(state.derive_topology_snapshot(net()).prices(), moved);
     }
 
     /// A terminal header carrying `pair`, with the composed root as its own

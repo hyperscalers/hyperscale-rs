@@ -21,8 +21,8 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
-    TimestampRange, Transaction, Verified, WeightedTimestamp,
+    PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites,
+    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
@@ -115,6 +115,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),

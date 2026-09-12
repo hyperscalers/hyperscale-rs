@@ -23,9 +23,9 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
-    MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie,
-    Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
-    WeightedTimestamp, absorb_committed_cells,
+    MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
+    ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
+    Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     ChainRecords, Composed, IntentHeader, holdings_collection, instance_data_key, package_hash,
@@ -228,6 +228,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -280,6 +281,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -354,6 +356,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -472,6 +475,7 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),

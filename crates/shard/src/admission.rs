@@ -318,6 +318,18 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} carries the block past the per-block cap on sweepable cells"
             ));
         }
+        // The signed ceiling covers the price at the table this block's
+        // anchor names. Judged here rather than at the signature,
+        // because the price is the window's and a signature check holds
+        // no window: a transaction admissible before a fold that raised
+        // the table is one its own ceiling no longer covers.
+        let price = tx.price(&ctx.snapshot.prices());
+        if price > tx.body().max_fee {
+            return Err(format!(
+                "transaction {tx_hash} signs a ceiling of {} and prices at {price}",
+                tx.body().max_fee
+            ));
+        }
         // The declared vector, held to the transaction's own ceilings
         // whole and to the block's caps over this shard's share: what
         // the block reserves is what its transactions may consume here,

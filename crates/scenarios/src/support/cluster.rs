@@ -6,7 +6,7 @@ use std::time::Duration;
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, Derivation, Event, ShardId, Signer, StateRoot,
+    Address, BeaconState, BlockHeight, Derivation, Event, PriceTable, ShardId, Signer, StateRoot,
     TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
     WeightedTimestamp,
 };
@@ -63,6 +63,17 @@ pub trait Cluster {
     /// nobody: routing, work and the rest are a node's answer, and the
     /// harness has to borrow one to ask.
     fn derivation(&self) -> Arc<dyn Derivation>;
+
+    /// The price table the cluster's head window carries.
+    ///
+    /// A scenario quoting a fee asks the chain rather than a constant:
+    /// the level moves with the fold, so a fixture pinned to the genesis
+    /// table would start failing the first time a scenario ran long
+    /// enough for the controller to move.
+    fn prices(&self) -> PriceTable {
+        self.beacon_state()
+            .map_or(PriceTable::GENESIS, |state| state.prices)
+    }
 
     /// Advance the cluster until `cond` holds or `budget` epochs elapse;
     /// return whether `cond` held.

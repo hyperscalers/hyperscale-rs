@@ -654,9 +654,15 @@ impl Ledger {
     /// Idempotent per transaction: a hash cannot commit twice within its
     /// own validity window, and re-registering one must not move the
     /// deadline it was admitted under.
+    ///
+    /// `prices` is the committing block's own table, so what a record
+    /// restates is what the block that committed the transaction
+    /// charged — a later fold moving the table never moves a figure
+    /// already owed.
     pub fn register_committed<'a>(
         &mut self,
         committed: CommittedAt,
+        prices: &PriceTable,
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
@@ -664,8 +670,8 @@ impl Ledger {
                 figures: UnsettledTx::for_transaction(
                     tx,
                     committed,
-                    classified.local_price(tx, self.local, &PriceTable::GENESIS),
-                    &PriceTable::GENESIS,
+                    classified.local_price(tx, self.local, prices),
+                    prices,
                 ),
                 certified: false,
                 part: Part::of(self.local, tx, classified),
@@ -1626,7 +1632,7 @@ mod tests {
     /// Commit `tx` frozen as `classified`, which is what fixes the part
     /// this shard plays and every cell its entry asks about.
     fn commit_as(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) {
-        ledger.register_committed(committed_at(tx), [(tx, classified)]);
+        ledger.register_committed(committed_at(tx), &PriceTable::GENESIS, [(tx, classified)]);
     }
 
     /// Where the fixtures commit `tx`: well inside its window, at a

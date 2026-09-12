@@ -575,6 +575,7 @@ impl Cluster for SimCluster {
             &snapshot,
             tx,
             &PreviewInputs {
+                prices: topology.prices(),
                 clock: tip.qc().weighted_timestamp(),
                 env: TickEnvironment::governing(&topology, windows),
                 grants,

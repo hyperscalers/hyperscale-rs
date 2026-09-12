@@ -45,7 +45,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{ChainRecords, PackageHash};
 use hyperscale_vm_stdlib::staking as pool;
-use hyperscale_vm_types::{Address, ComponentAddr};
+use hyperscale_vm_types::{Address, ComponentAddr, PriceBounds};
 
 /// The stake pool's event table, by the index its guest emits.
 ///
@@ -198,6 +198,13 @@ pub fn witness_from_event(
 /// Whether the values are *admissible* is the fold's to judge, and it
 /// does: bounds and a live activation epoch are checked where the vote is
 /// recorded.
+///
+/// A vote names the whole parameter set, because the tally buckets by it
+/// and two pools agree only if they agree on every row. So a governed
+/// row the pool's vocabulary does not carry is one a winning vote writes
+/// its seed value into — which is sound only while nothing else moves
+/// that row, and the literal below is what makes the compiler ask again
+/// the next time a row is added.
 const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
     ParamProposal {
         params: NetworkParams {
@@ -205,6 +212,10 @@ const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
                 split_bytes: vote.split_bytes,
             },
             impound_epochs: vote.impound_epochs,
+            // The pool's vote does not carry the price bounds, so it
+            // backs the seed interval. Nothing else moves them, so no
+            // vote overwrites a figure anyone chose.
+            price_bounds: PriceBounds::GENESIS,
         },
         activate_at: Epoch::new(vote.activate_at),
     }
@@ -448,6 +459,7 @@ mod tests {
                             split_bytes: SPLIT_BYTES
                         },
                         impound_epochs: IMPOUND_EPOCHS,
+                        price_bounds: PriceBounds::GENESIS,
                     },
                     activate_at: Epoch::new(ACTIVATE_AT),
                 }),

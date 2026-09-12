@@ -8,14 +8,14 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_engine::{PROTOCOL_RESOURCE, publish_work};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PendingReshape, PriceTable, ResourceAddr, ShardId, ShardTrie, Stake,
-    StakePool, StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
+    MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
+    StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, ValidatorId, ValidatorStatus, WeightedTimestamp, sweep_admits_block,
 };
 
 use super::Cluster;
@@ -39,11 +39,10 @@ pub(crate) const MAX_SEARCHED_DEPTH: u32 = 3;
 /// Panics if the transaction does not derive, which for a scenario
 /// fixture means it was built wrong.
 pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
-    let body = tx.try_body().expect("a scenario fixture decodes");
-    if let Some(artifact) = body.artifact() {
-        return u128::from(publish_work(artifact)).min(body.max_fee);
-    }
-    tx.price_under(c.derivation().as_ref(), &PriceTable::GENESIS)
+    // One price for every shape, a publish included: its artifact is
+    // bytes written and retained, which the declared vector already
+    // carries, so nothing about it needs a rule of its own.
+    tx.price_under(c.derivation().as_ref(), &c.prices())
         .expect("a scenario fixture derives")
 }
 
