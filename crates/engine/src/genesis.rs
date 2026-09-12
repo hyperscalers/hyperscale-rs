@@ -252,7 +252,7 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
             .expect("into the vault it was minted for");
     }
     let (receipt, _) = session
-        .finish(Vec::new(), 0)
+        .finish(Vec::new(), Vec::new())
         .expect("genesis declares every cell it credits");
     assert!(
         matches!(receipt.outcome, Outcome::Completed { .. }),
