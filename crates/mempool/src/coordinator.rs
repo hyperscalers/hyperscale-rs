@@ -44,9 +44,9 @@ use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, DeclaredWork, ForkFence,
-    LocalTimestamp, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, ShardId, ShardTrie,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution,
-    Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
+    LocalTimestamp, MAX_UNSETTLED_TXS, MessageClass, PriceTable, RETENTION_HORIZON, ShardId,
+    ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -175,6 +175,14 @@ pub struct MempoolCoordinator {
     /// in [`Self::tx_store`].
     tombstones: TombstoneStore,
 
+    /// The table the pool was last judged against.
+    ///
+    /// The level moves only at an epoch fold, so what says a sweep is
+    /// owed is this against the head's own — one comparison a commit
+    /// where nothing moved, and a sweep that catches a move however it
+    /// arrived rather than one timed off an epoch count.
+    priced_at: PriceTable,
+
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
@@ -275,6 +283,7 @@ impl MempoolCoordinator {
             local_shard,
             fork_fence: ForkFence::new(),
             now: LocalTimestamp::ZERO,
+            priced_at: PriceTable::GENESIS,
         }
     }
 
@@ -332,6 +341,23 @@ impl MempoolCoordinator {
                 tx_hash = ?hash,
                 work = ?tx.work(),
                 "Rejecting transaction declaring more than the protocol admits of one"
+            );
+            return None;
+        }
+
+        // And the fee ceiling its sender signed, against the table in
+        // force at this node's head. A filter and not the verdict: what
+        // decides admissibility is the table the block's own window
+        // names, judged where the block is built. What this keeps out is
+        // a transaction no block at the current level could carry, and
+        // what keeps it out is the same figure the boundary sweep reads.
+        let price = tx.price(&topology_snapshot.prices());
+        if price > tx.body().max_fee {
+            tracing::debug!(
+                tx_hash = ?hash,
+                price,
+                max_fee = tx.body().max_fee,
+                "Rejecting transaction whose ceiling the table has outgrown"
             );
             return None;
         }
@@ -633,6 +659,7 @@ impl MempoolCoordinator {
 
         self.current_height = height;
         self.current_ts = block.header().parent_qc().weighted_timestamp();
+        self.cleanup_underpriced_pending(topology_snapshot.prices());
 
         // A gossip-timed fork fence holds until the attested recovery for
         // its shard completes — clearing on the fold would reopen admission
@@ -1200,6 +1227,50 @@ impl MempoolCoordinator {
     /// entries when expiry outpaces selection (e.g. a transient stall in
     /// cross-shard EC delivery delays inclusion past the window).
     ///
+    /// Drop every pending transaction the table now in force prices past
+    /// the ceiling its sender signed, and record the table swept against.
+    ///
+    /// Swept when the level moves rather than on a clock: it moves only
+    /// at an epoch fold, so comparing the head's table against the one
+    /// the pool was last judged at catches every move and costs a
+    /// comparison when there is none.
+    ///
+    /// Pending entries only — a committed transaction was admitted at
+    /// the table its own block named and is the chain's to settle. No
+    /// tombstone: a ceiling the table outgrew is a verdict about the
+    /// level and not about the transaction, so the same bytes are
+    /// admissible again if the level comes back down, and admission
+    /// judges them against the head each time.
+    ///
+    /// Returns the number of entries dropped.
+    fn cleanup_underpriced_pending(&mut self, prices: PriceTable) -> usize {
+        if prices == self.priced_at {
+            return 0;
+        }
+        self.priced_at = prices;
+        let dropped: Vec<TxHash> = self
+            .pool
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.status, TransactionStatus::Pending)
+                    && entry.tx.price(&prices) > entry.tx.body().max_fee
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &dropped {
+            self.pool.remove(hash);
+        }
+        if !dropped.is_empty() {
+            tracing::debug!(
+                count = dropped.len(),
+                "Dropping pooled transactions the moved table prices past their ceilings"
+            );
+            self.tx_store.evict(dropped.iter().copied());
+            self.prune_engagement_state();
+        }
+        dropped.len()
+    }
+
     /// Returns the number of entries dropped.
     pub fn cleanup_expired_pending(&mut self) -> usize {
         let now = self.current_ts;
@@ -2331,6 +2402,66 @@ mod tests {
             ready.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
             hashes[..2],
             "the lowest hashes, as they were offered before priority existed"
+        );
+    }
+
+    /// A pooled transaction whose ceiling the table has outgrown is gone
+    /// at the commit that first carries the moved table, and one still
+    /// covered by it stays.
+    ///
+    /// The sweep keys on the table itself rather than on an epoch count,
+    /// so what it answers is the move however it arrived.
+    #[test]
+    fn a_moved_table_drops_the_ceilings_it_outgrew() {
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let topology_snapshot = make_test_topology();
+        let now = LocalTimestamp::from_millis(10_000);
+        let covered = test_transaction(1);
+        let covered_hash = covered.hash();
+        mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(covered)), now);
+        assert!(mempool.has_transaction(&covered_hash));
+
+        // A commit under the table the pool was admitted at leaves it
+        // alone.
+        let certified = certified_block_with_provisions(BlockHeight::new(5), ShardId::ROOT, &[]);
+        mempool.on_block_committed(&topology_snapshot, &certified);
+        assert!(
+            mempool.has_transaction(&covered_hash),
+            "a table that did not move drops nothing"
+        );
+
+        // A level every fixture ceiling is under.
+        let raised = topology_snapshot.clone().with_prices(PriceTable {
+            compute: PriceTable::GENESIS.compute * 1_000_000,
+            ..PriceTable::GENESIS
+        });
+        let certified = certified_block_with_provisions(BlockHeight::new(6), ShardId::ROOT, &[]);
+        mempool.on_block_committed(&raised, &certified);
+        assert!(
+            !mempool.has_transaction(&covered_hash),
+            "and one the moved table prices past its ceiling is gone"
+        );
+        assert!(
+            mempool
+                .ready_transactions(10, 0, &ShardTrie::single(), now)
+                .is_empty()
+        );
+
+        // And nothing re-admits it while the level stands: no tombstone
+        // holds it out, the head's own table does.
+        mempool.on_submit_transaction(&raised, Arc::new(verified(test_transaction(1))), now);
+        assert!(
+            !mempool.has_transaction(&covered_hash),
+            "admission judges the ceiling against the head each time"
+        );
+        mempool.on_submit_transaction(
+            &topology_snapshot,
+            Arc::new(verified(test_transaction(1))),
+            now,
+        );
+        assert!(
+            mempool.has_transaction(&covered_hash),
+            "and takes it back when the level comes down"
         );
     }
 
