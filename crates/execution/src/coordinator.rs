@@ -750,7 +750,6 @@ impl ExecutionCoordinator {
                 height: block.height,
                 anchor: block.ts,
             },
-            classification.shard_trie(),
             members
                 .iter()
                 .map(|committed| (&committed.tx, committed.member.classified())),
@@ -1249,7 +1248,6 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         member: Admitted,
-        trie: &ShardTrie,
         state: &mut TickState,
         ticked: &mut TickedBatch,
         requests: &mut Vec<CrossShardExecutionRequest>,
@@ -1272,9 +1270,11 @@ impl ExecutionCoordinator {
             member.request.tx_hash,
             member.membership,
             match &shape {
-                Some((_, body)) if !second_member => {
-                    Some(body.local_price(trie, local_shard, &PriceTable::GENESIS))
-                }
+                Some((shape, body)) if !second_member => Some(shape.classified().local_price(
+                    body,
+                    local_shard,
+                    &PriceTable::GENESIS,
+                )),
                 _ => None,
             },
             member.admission,
@@ -1368,16 +1368,8 @@ impl ExecutionCoordinator {
             provisional_claims: Vec::new(),
             legs: BTreeSet::new(),
         };
-        let trie = self.counterpart_trie(topology_schedule);
         for member in admitted {
-            self.admit_member(
-                tick_id,
-                member,
-                trie,
-                &mut state,
-                &mut ticked,
-                &mut requests,
-            );
+            self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
@@ -6686,11 +6678,10 @@ mod tests {
         let tx_hash = transaction.hash();
         let tick = cross_shard_finalization(local, ShardId::ROOT, 1, tx_hash);
         let tick_id = *tick.tick_id();
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &Classified::whole())]);
         state.ticks.assign_tx(tx_hash, tick_id);
 
         let dropped = state.emit_or_gate_finalized(&sched, tick);
@@ -7506,11 +7497,10 @@ mod tests {
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &Classified::whole())]);
 
         let block = make_live_block_on_shard(
             HOME,
@@ -7558,11 +7548,10 @@ mod tests {
         let tx_hash = transaction.hash();
         let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &leg_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &leg_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         state
             .counterparts
@@ -7580,8 +7569,7 @@ mod tests {
                 [UnsettledTx::for_transaction(
                     &transaction,
                     test_committed(),
-                    &ShardTrie::single(),
-                    ShardId::ROOT,
+                    transaction.price(&PriceTable::GENESIS),
                     &PriceTable::GENESIS,
                 )],
             )]);
@@ -7644,11 +7632,10 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &leg_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &leg_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let certificate = |outcome: ExecutionOutcome| {
@@ -7698,11 +7685,10 @@ mod tests {
             )))
         };
         let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        accepting.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &leg_classified())],
-        );
+        accepting
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &leg_classified())]);
         let actions = accepting.handle_attestation(
             &schedule,
             &certificate(ExecutionOutcome::Succeeded {
@@ -7752,11 +7738,10 @@ mod tests {
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(transaction, classified)],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(transaction, classified)]);
         state.counterparts.ledger.certify(transaction.hash());
         state
     }
@@ -7893,19 +7878,17 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &delivery_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let held: [(ShardId, u64, WeightedTimestamp, &[u8]); 3] = [
@@ -7966,8 +7949,7 @@ mod tests {
         let deadline = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -7977,11 +7959,10 @@ mod tests {
             .plus(Duration::from_secs(1));
         let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &delivery_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         let (bundle, opened) = proven_at(&mut state, &schedule, DELIVERER, 5, later, &[], &[claim]);
         assert_eq!(
@@ -8026,11 +8007,10 @@ mod tests {
         let tx_hash = transaction.hash();
         let claim = delivered_claim(&delivery_classified());
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &delivery_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
 
         let lapse = Window::Lapse
@@ -8074,8 +8054,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -8089,11 +8068,10 @@ mod tests {
             "the fixture's claim sits under the departed deliverer's left child"
         );
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &delivery_classified())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &delivery_classified())]);
         state.counterparts.ledger.certify(tx_hash);
         // The local chain has crossed the deliverer's cut: its committee
         // is anchored in a window whose trie names the children.
@@ -8163,8 +8141,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -8291,8 +8268,7 @@ mod tests {
         let deadline = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -8394,8 +8370,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -8410,7 +8385,6 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), CORE);
         state.counterparts.ledger.register_committed(
             test_committed(),
-            &ShardTrie::single(),
             [(&transaction, &two_shard_core_classified())],
         );
         state.counterparts.ledger.certify(tx_hash);
@@ -8477,8 +8451,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -8561,11 +8534,10 @@ mod tests {
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(transaction, classified)],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(transaction, classified)]);
         assert_eq!(
             state
                 .counterparts
@@ -8582,8 +8554,7 @@ mod tests {
         state.committed_ts = UnsettledTx::for_transaction(
             transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -8604,8 +8575,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let deadline = figures.deadline.at();
@@ -8676,8 +8646,7 @@ mod tests {
         let deadline = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         )
         .deadline
@@ -8859,8 +8828,7 @@ mod tests {
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
-            &ShardTrie::single(),
-            ShardId::ROOT,
+            transaction.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         );
         let claim = core_claim(&leg_classified());
@@ -9544,11 +9512,10 @@ mod tests {
         )));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &Classified::whole())]);
         state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         state
@@ -9637,11 +9604,10 @@ mod tests {
         )));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&transaction, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&transaction, &Classified::whole())]);
         state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(200_000);
         state
@@ -9962,11 +9928,10 @@ mod tests {
         ));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(&sibling, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(&sibling, &Classified::whole())]);
         state.counterparts.ledger.certify(sibling_hash);
 
         // The commit that composes the abandonment, on the shard that
@@ -10094,11 +10059,10 @@ mod tests {
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &ShardTrie::single(),
-            [(transaction, &Classified::whole())],
-        );
+        state
+            .counterparts
+            .ledger
+            .register_committed(test_committed(), [(transaction, &Classified::whole())]);
         state
             .counterparts
             .stamp_departures(topology_schedule, state.committed_ts);

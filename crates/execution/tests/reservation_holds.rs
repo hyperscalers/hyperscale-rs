@@ -102,6 +102,7 @@ impl Derivation for ReservingStatics {
             auth_cell_local: [0xAE; 16],
             work,
             shares: Vec::new(),
+            node_terms: Vec::new(),
             everywhere: work,
             legs: Vec::new(),
             nullifiers: Vec::new(),

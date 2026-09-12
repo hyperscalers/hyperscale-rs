@@ -1036,7 +1036,8 @@ impl MempoolCoordinator {
             // is left in any dimension is passed over rather than ending
             // selection — otherwise one outsized envelope would stall
             // every lighter one behind it until the block cleared.
-            let next = filled.saturating_add(entry.tx.local_work(trie, self.local_shard));
+            let classified = Classified::freeze(entry.tx.legs(), entry.tx.owners(), trie);
+            let next = filled.saturating_add(classified.local_work(&entry.tx, self.local_shard));
             if !budget_admits_block(&next) {
                 continue;
             }
@@ -2780,7 +2781,9 @@ mod tests {
         let now = LocalTimestamp::from_millis(1_000);
         let offered = mempool.ready_transactions(100, 0, trie, now);
         let filled = offered.iter().fold(DeclaredWork::ZERO, |total, tx| {
-            total.saturating_add(tx.local_work(trie, ShardId::ROOT))
+            total.saturating_add(
+                Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, ShardId::ROOT),
+            )
         });
         assert!(
             budget_admits_block(&filled),

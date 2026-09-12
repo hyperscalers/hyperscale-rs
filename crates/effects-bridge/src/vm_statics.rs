@@ -191,24 +191,26 @@ pub fn declared_vector(
         }
     }
 
-    // Each node's ceiling under its target, and each distinct package's
-    // artifact once, under the first node that runs it.
+    // Each node's ceiling, and each distinct package's artifact once,
+    // under the first node that runs it. Per node rather than under the
+    // node's owner: a core shard runs every core node whatever it holds,
+    // so what a node may consume is owed wherever it runs and an owner
+    // prefix cannot say where that is.
     let mut seen = BTreeSet::new();
-    for (index, (leg, call)) in legs.iter().zip(&routing.calls).enumerate() {
-        let artifact = if seen.insert(call.package) {
-            packages.artifact_bytes(call.package).unwrap_or(0)
-        } else {
-            0
-        };
-        add(
-            leg.target,
-            DeclaredWork {
-                compute: vm.gas_limits.get(index).copied().unwrap_or(0),
-                read_bytes: artifact,
-                ..DeclaredWork::ZERO
+    let node_terms: Vec<DeclaredWork> = routing
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| DeclaredWork {
+            compute: vm.gas_limits.get(index).copied().unwrap_or(0),
+            read_bytes: if seen.insert(call.package) {
+                packages.artifact_bytes(call.package).unwrap_or(0)
+            } else {
+                0
             },
-        );
-    }
+            ..DeclaredWork::ZERO
+        })
+        .collect();
 
     let shares: Vec<OwnerShare> = by_owner
         .into_iter()
@@ -232,18 +234,50 @@ pub fn declared_vector(
     let everywhere = everywhere(&shares, envelope_bytes, vm.signatures(), event_bytes as u64);
     DeclaredVector {
         shares,
+        node_terms,
         everywhere,
         event_bytes,
     }
 }
 
+/// Whether the envelope's subintent signatures answer the tree it binds:
+/// one per subintent, each key deriving the address that subintent
+/// names.
+///
+/// The addresses only. The signatures themselves verify at the
+/// transaction gate, over the declaration hashes admission returns —
+/// what is checked here is that the material a gate would verify belongs
+/// to the signer the tree declared.
+fn check_subintent_signers(
+    vm: &TransactionEnvelope,
+    tree: &EnvelopeTree,
+) -> Result<(), DerivationError> {
+    if vm.subintent_sigs.len() != tree.subintents.len() {
+        return Err(DerivationError::Refused(format!(
+            "envelope binds {} subintents but carries {} signatures",
+            tree.subintents.len(),
+            vm.subintent_sigs.len()
+        )));
+    }
+    for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate() {
+        if principal_for(sig.scheme, &sig.public_key) != Some(subintent.signer) {
+            return Err(DerivationError::Refused(format!(
+                "subintent {index} signer address does not match its public key"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// What a transaction declares, as the derivation reads it off the tree:
-/// the vector by owner, what every shard bears, and the bound the kernel
-/// meters the transaction's events against.
+/// the vector by owner and by node, what every shard bears, and the
+/// bound the kernel meters the transaction's events against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredVector {
     /// What each owner prefix bears.
     pub shares: Vec<OwnerShare>,
+    /// What each manifest node bears, in node order.
+    pub node_terms: Vec<DeclaredWork>,
     /// What every shard committing the transaction bears whatever it
     /// holds.
     pub everywhere: DeclaredWork,
@@ -740,7 +774,7 @@ impl BridgeStatics {
             },
         }];
         let everywhere = everywhere(&shares, envelope_bytes(vm)?, vm.signatures(), 0);
-        let work = whole_work(&shares, everywhere);
+        let work = whole_work(&shares, &[], everywhere);
 
         Ok(Derived {
             // A publish carries no tree, so nothing narrows the window
@@ -748,6 +782,9 @@ impl BridgeStatics {
             effective_window: vm.validity_window(),
             work,
             shares,
+            // No node to divide the ceiling by: a publish invokes
+            // nothing, and what it costs is its publisher's alone.
+            node_terms: Vec::new(),
             everywhere,
             // No manifest, so nothing to divide, nothing crossing, and no
             // subintent bound; the publisher pays and signs.
@@ -810,24 +847,7 @@ impl Derivation for BridgeStatics {
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
         let effective_window = effective_window(vm, &tree)?;
-        if vm.subintent_sigs.len() != tree.subintents.len() {
-            return Err(DerivationError::Refused(format!(
-                "envelope binds {} subintents but carries {} signatures",
-                tree.subintents.len(),
-                vm.subintent_sigs.len()
-            )));
-        }
-        // Bind every declared signer address to its public key; the
-        // signatures themselves verify at the transaction gate, over the
-        // declaration hashes returned here.
-        for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate()
-        {
-            if principal_for(sig.scheme, &sig.public_key) != Some(subintent.signer) {
-                return Err(DerivationError::Refused(format!(
-                    "subintent {index} signer address does not match its public key"
-                )));
-            }
-        }
+        check_subintent_signers(vm, &tree)?;
         // What the chain answers a target with: genesis, grown by every
         // seal that has committed since. Admission layers the tree's own
         // records behind these itself, holding each to standing for the
@@ -885,13 +905,17 @@ impl Derivation for BridgeStatics {
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let legs = legs_of(&admitted.admitted);
         let DeclaredVector {
-            shares, everywhere, ..
+            shares,
+            node_terms,
+            everywhere,
+            ..
         } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?);
-        let work = whole_work(&shares, everywhere);
+        let work = whole_work(&shares, &node_terms, everywhere);
         Ok(Derived {
             effective_window,
             work,
             shares,
+            node_terms,
             everywhere,
             legs,
             nullifiers: admitted
@@ -966,8 +990,7 @@ impl ProtocolStatics for BridgeStatics {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, ShardId, ShardTrie,
-        Transaction, TransactionBody,
+        CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TransactionBody,
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
@@ -1239,8 +1262,8 @@ mod tests {
         );
         assert_eq!(
             derived.work,
-            whole_work(&derived.shares, derived.everywhere),
-            "the whole is the shares plus what every shard bears"
+            whole_work(&derived.shares, &derived.node_terms, derived.everywhere),
+            "the whole is the shares and the nodes plus what every shard bears"
         );
         assert_eq!(
             derived.work.compute,
@@ -1250,60 +1273,6 @@ mod tests {
         assert_eq!(
             derived.work.retention, derived.everywhere.retention,
             "retention is borne whole by every shard"
-        );
-    }
-
-    /// A shard's share under a placement is the shares of the owners
-    /// it holds plus what every shard bears: over every shard of a trie
-    /// the shares sum to the whole in compute and footprint, and each
-    /// carries the whole retention.
-    #[test]
-    fn local_shares_sum_to_the_whole_across_a_trie() {
-        let tree = single_intent_tree(vec![
-            sign_in(composer_addr()),
-            withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 1, RES_X),
-        ]);
-        let tx = Transaction::new(envelope(&tree, &[]));
-        let whole = tx.try_derived(&statics()).expect("derives").work;
-
-        let split = ShardTrie::from_leaves([ShardId::leaf(1, 0), ShardId::leaf(1, 1)]);
-        let (payer, bob) = (
-            split.shard_for_prefix(composer_addr().address()),
-            split.shard_for_prefix(bob_addr().address()),
-        );
-        assert_ne!(
-            payer, bob,
-            "the ends must sit apart for the shares to split"
-        );
-        let mine = tx.local_work(&split, payer);
-        let theirs = tx.local_work(&split, bob);
-        // Both shards verify the signature and write the committed cell,
-        // so compute and writes sum past the whole by exactly one
-        // verification and one marker; footprint sums exactly.
-        let verification = tx.body().signatures().compute;
-        assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
-        assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
-        assert_eq!(mine.retention, whole.retention);
-        assert_eq!(theirs.retention, whole.retention);
-        assert!(
-            mine.compute > theirs.compute,
-            "the payer's shard runs the sign-in and the withdraw"
-        );
-        assert!(
-            theirs.compute > verification,
-            "the recipient's shard runs the deposit beside its verification"
-        );
-        assert_eq!(
-            mine.write_bytes + theirs.write_bytes,
-            whole.write_bytes + u64::from(MARKER_CELL_BYTES)
-        );
-
-        let one = ShardTrie::from_leaves([ShardId::ROOT]);
-        assert_eq!(
-            tx.local_work(&one, ShardId::ROOT),
-            whole,
-            "one shard holding everything bears the whole"
         );
     }
 

@@ -786,8 +786,11 @@ where
                     && UnsettledTx::for_transaction(
                         tx,
                         entry.committed,
-                        &trie,
-                        ctx.shard,
+                        Classified::freeze(tx.legs(), tx.owners(), &trie).local_price(
+                            tx,
+                            ctx.shard,
+                            &PriceTable::GENESIS,
+                        ),
                         &PriceTable::GENESIS,
                     ) == *entry;
                 Some(restated)

@@ -25,10 +25,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::{Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey};
-use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, star_at};
+use hyperscale_types::{
+    Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction,
+};
+use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, running_at, star_at};
 use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
-use hyperscale_vm_types::{LegRole, LegShape, ProtocolHasher};
+use hyperscale_vm_types::{DeclaredWork, LegRole, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
 
@@ -188,6 +190,83 @@ impl Classified {
     #[must_use]
     pub const fn core(&self) -> &BTreeSet<ShardId> {
         &self.star.core
+    }
+
+    /// Whether `shard` runs each of the manifest's `nodes` nodes, in
+    /// node order.
+    ///
+    /// What a member bears, which is more than what its shard holds. A
+    /// shape that runs whole runs every node on every participant. One
+    /// that divides runs the nodes homed here, and every core node once
+    /// the core reaches here — so a multi-shard core replicates its
+    /// nodes onto each of its shards and each of them burns their
+    /// ceilings.
+    ///
+    /// The count is the caller's because [`Self::whole`] reads no
+    /// placement and so holds no node list; a frozen classification's
+    /// own is the same figure.
+    ///
+    /// Read for what a block reserves against its caps, so it covers
+    /// both members a mixed shard runs: the two sides land in one
+    /// block's budget. Answered for a shard the transaction's routing
+    /// reaches; a shard it does not reach runs nothing and is never
+    /// asked.
+    #[must_use]
+    pub fn runs_at(&self, shard: ShardId, nodes: usize) -> Vec<bool> {
+        if !self.decomposed() {
+            return vec![true; nodes];
+        }
+        let star = &self.star;
+        (0..u32::try_from(nodes).unwrap_or(u32::MAX))
+            .map(|node| running_at(&star.roles, &star.homes, &star.core, node).contains(&shard))
+            .collect()
+    }
+
+    /// What `tx` declares against `shard` under the placement this
+    /// classification froze: the shares of the owners the shard holds,
+    /// the terms of the nodes its members run, and what every
+    /// committing shard bears. What a block on that shard reserves
+    /// against its caps, and what its outcome attests.
+    ///
+    /// Off the classification rather than off placement alone, because a
+    /// shard runs more nodes than it holds: a shape that runs whole runs
+    /// all of them, and one that divides replicates its core onto every
+    /// core shard. Effects and footprint still follow placement — a cell
+    /// is excluded and written where it lives — so those shares sum to
+    /// the whole across a trie, while compute and the artifacts
+    /// instantiation reads sum past it by the replication, and by one
+    /// verification of the signatures per shard beyond the first.
+    ///
+    /// # Panics
+    ///
+    /// On a transaction that was never derived, as `Transaction::work`.
+    #[must_use]
+    pub fn local_work(&self, tx: &Transaction, shard: ShardId) -> DeclaredWork {
+        let here = self.runs_at(shard, tx.node_terms().len());
+        let with_nodes = here
+            .iter()
+            .zip(tx.node_terms())
+            .filter(|(runs, _)| **runs)
+            .fold(tx.everywhere(), |total, (_, term)| {
+                total.saturating_add(*term)
+            });
+        tx.shares()
+            .iter()
+            .filter(|share| self.trie.shard_for_prefix(share.owner) == shard)
+            .fold(with_nodes, |total, share| total.saturating_add(share.work))
+    }
+
+    /// What `shard` attests for `tx` under `table`: the price of
+    /// [`Self::local_work`], raised by the signed priority. What its
+    /// outcome carries and the beacon weighs its emission by; the payer
+    /// burns `Transaction::price`, the whole.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::local_work`].
+    #[must_use]
+    pub fn local_price(&self, tx: &Transaction, shard: ShardId, table: &PriceTable) -> Quanta {
+        table.price(&self.local_work(tx, shard), tx.body().priority_bp)
     }
 
     /// The value edges that cross, in `(producer, output)` order.
@@ -1091,6 +1170,59 @@ mod tests {
             );
             assert!(plan.legs.departure(1, 0).is_none());
             assert!(plan.legs.departure(3, 0).is_some());
+        }
+    }
+
+    /// What a shard runs is what its block reserves, and a multi-shard
+    /// core runs more than it holds: each of its shards runs every core
+    /// node, so each of them owes those nodes' ceilings.
+    ///
+    /// The same question the plan answers, asked without arrivals,
+    /// because a budget is read before a member is composed. The
+    /// falsifier is the node homed on the other core shard: a reading
+    /// off placement alone would leave it out of both budgets but in
+    /// both executions.
+    #[test]
+    fn a_core_shard_runs_every_core_node_and_reserves_each_of_them() {
+        let trie = ShardTrie::uniform(2);
+        let (leaf0, leaf1, leaf2) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let legs = vec![
+            leg(owner_at(0x11, 0), LegRole::Attesting, &[], 0),
+            leg(owner_at(0x11, 0), LegRole::Inbound, &[], 1),
+            leg(owner_at(0x12, 0), LegRole::Core, &[(1, 0)], 2),
+            leg(owner_at(0x13, 2), LegRole::Core, &[(2, 0)], 3),
+            leg(owner_at(0x14, 1), LegRole::Outbound, &[(3, 0)], 4),
+        ];
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
+        for shard in [leaf0, leaf2] {
+            assert_eq!(
+                classified.runs_at(shard, legs.len()),
+                vec![true, true, true, true, false],
+                "a core shard runs the core whole and never the delivery"
+            );
+        }
+        assert_eq!(
+            classified.runs_at(leaf1, legs.len()),
+            vec![false, false, false, false, true],
+            "the deliverer runs its own leg and nothing of the core"
+        );
+    }
+
+    /// A shape that runs whole runs every node on every participant, so
+    /// every participant reserves the whole of it. Nothing is divided,
+    /// so nothing about the core narrows what a member bears.
+    #[test]
+    fn a_shape_that_runs_whole_is_reserved_whole_everywhere() {
+        let legs = transfer();
+        let whole = Classified::whole();
+        assert!(!whole.decomposed());
+        for shard in [low(), high()] {
+            assert_eq!(whole.runs_at(shard, legs.len()), vec![true; legs.len()]);
         }
     }
 

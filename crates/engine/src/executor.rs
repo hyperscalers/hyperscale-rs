@@ -671,6 +671,7 @@ impl Executor {
         let legs = legs_of(&admitted.admitted);
         let DeclaredVector {
             shares,
+            node_terms,
             everywhere,
             event_bytes,
         } = declared_vector(
@@ -680,7 +681,7 @@ impl Executor {
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,
         );
-        let work = whole_work(&shares, everywhere);
+        let work = whole_work(&shares, &node_terms, everywhere);
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks. Unioning `per_shard`

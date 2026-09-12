@@ -657,7 +657,6 @@ impl Ledger {
     pub fn register_committed<'a>(
         &mut self,
         committed: CommittedAt,
-        trie: &ShardTrie,
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
@@ -665,8 +664,7 @@ impl Ledger {
                 figures: UnsettledTx::for_transaction(
                     tx,
                     committed,
-                    trie,
-                    self.local,
+                    classified.local_price(tx, self.local, &PriceTable::GENESIS),
                     &PriceTable::GENESIS,
                 ),
                 certified: false,
@@ -1628,7 +1626,7 @@ mod tests {
     /// Commit `tx` frozen as `classified`, which is what fixes the part
     /// this shard plays and every cell its entry asks about.
     fn commit_as(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) {
-        ledger.register_committed(committed_at(tx), &ShardTrie::uniform(1), [(tx, classified)]);
+        ledger.register_committed(committed_at(tx), [(tx, classified)]);
     }
 
     /// Where the fixtures commit `tx`: well inside its window, at a
@@ -1649,7 +1647,8 @@ mod tests {
         UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            charged: tx.local_price(&ShardTrie::uniform(1), LOCAL, &PriceTable::GENESIS),
+            charged: Classified::freeze(tx.legs(), tx.owners(), &ShardTrie::uniform(1))
+                .local_price(tx, LOCAL, &PriceTable::GENESIS),
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
@@ -1666,8 +1665,7 @@ mod tests {
         UnsettledTx::for_transaction(
             tx,
             committed_at(tx),
-            &ShardTrie::uniform(1),
-            LOCAL,
+            tx.price(&PriceTable::GENESIS),
             &PriceTable::GENESIS,
         )
         .charge

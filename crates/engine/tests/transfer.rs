@@ -1290,6 +1290,56 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     ));
 }
 
+/// A shard's share under a classification is the shares of the owners it
+/// holds, the terms of the nodes its members run, and what every shard
+/// bears. Over the shards of a trie the shares sum to the whole in
+/// footprint, past it in compute by what every shard repeats, and each
+/// carries the whole retention.
+#[test]
+fn local_shares_sum_to_the_whole_across_a_trie() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    assert_ne!(
+        near_shard, far_shard,
+        "the ends must sit apart for the shares to split"
+    );
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, TRANSFER_FEE),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let whole = tx.work();
+
+    let divided = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    let mine = divided.local_work(&tx, near_shard);
+    let theirs = divided.local_work(&tx, far_shard);
+
+    // Both shards verify the signatures and write the committed cell, so
+    // compute and writes sum past the whole by exactly one verification
+    // and one marker; footprint sums exactly, since a cell is excluded
+    // where it lives.
+    let verification = tx.body().signatures().compute;
+    assert_eq!(mine.compute + theirs.compute, whole.compute + verification);
+    assert_eq!(mine.footprint + theirs.footprint, whole.footprint);
+    assert_eq!(mine.retention, whole.retention);
+    assert_eq!(theirs.retention, whole.retention);
+    assert!(
+        mine.compute > theirs.compute,
+        "the payer's shard runs the sign-in and the withdraw"
+    );
+    assert!(
+        theirs.compute > verification,
+        "the recipient's shard runs the deposit beside its verification"
+    );
+
+    let one = ShardTrie::from_leaves([ShardId::ROOT]);
+    assert_eq!(
+        Classified::freeze(tx.legs(), tx.owners(), &one).local_work(&tx, ShardId::ROOT),
+        *whole,
+        "one shard holding everything bears the whole"
+    );
+}
+
 /// A transfer executed divided, end to end through the engine: the
 /// sender's shard runs the sign-in and the withdraw, escrows the value
 /// into the record cell the plan filed, and attests exactly that; the

@@ -36,6 +36,7 @@
 //! verdict as its peers.
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::Quanta;
 
 use crate::{
     ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
@@ -129,10 +130,14 @@ impl UnsettledTx {
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
-    /// deadline is the transaction's own, what `shard` attests is the
-    /// price of its share under `trie` — the placement its committing
-    /// block froze — the charge is the fee vault at the whole declared
-    /// price under `table`, and the commit is the block's.
+    /// deadline is the transaction's own, the charge is the fee vault at
+    /// the whole declared price under `table`, and the commit is the
+    /// block's.
+    ///
+    /// `charged` is what the attesting shard's own share came to, which
+    /// the caller reads off the classification its committing block
+    /// froze — the whole price is placement-free and derives here, the
+    /// share is not and cannot.
     ///
     /// # Panics
     ///
@@ -141,14 +146,13 @@ impl UnsettledTx {
     pub fn for_transaction(
         tx: &Transaction,
         committed: CommittedAt,
-        trie: &ShardTrie,
-        shard: ShardId,
+        charged: Quanta,
         table: &PriceTable,
     ) -> Self {
         Self {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
-            charged: tx.local_price(trie, shard, table),
+            charged,
             charge: AbortCharge {
                 vault: tx.fee_vault(),
                 amount: tx.price(table),
