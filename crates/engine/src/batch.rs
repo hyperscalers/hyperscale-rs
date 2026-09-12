@@ -133,9 +133,13 @@ pub struct TickTxInput<'a> {
     /// committing block's parent-QC weighted timestamp for a cross-shard
     /// leg.
     pub clock: WeightedTimestamp,
-    /// The price table the member's committing block anchored to,
-    /// identical on every participant for the reason the clock is: the
-    /// fee it settles rides a receipt they all derive.
+    /// The price table the block that committed this member named.
+    ///
+    /// This chain's own, not the clock's: the burn it settles is taken
+    /// by the shard holding the payer's vault and by no other, and that
+    /// shard's admission judged the signed ceiling against this same
+    /// table. A table read at the executing head instead would price one
+    /// transaction two ways across an epoch fold.
     pub prices: PriceTable,
     /// What this member runs: the transaction as its block froze it —
     /// carried, never re-derived, since a reshape landing between

@@ -780,6 +780,7 @@ impl ExecutionCoordinator {
                 verified,
                 member.reach().clone(),
                 block.ts,
+                classification.prices(),
                 member.classified().clone(),
             );
         }
@@ -1258,7 +1259,6 @@ impl ExecutionCoordinator {
         &mut self,
         tick_id: TickId,
         member: Admitted,
-        topology_schedule: &TopologySchedule,
         state: &mut TickState,
         ticked: &mut TickedBatch,
         requests: &mut Vec<CrossShardExecutionRequest>,
@@ -1276,15 +1276,16 @@ impl ExecutionCoordinator {
         // reservation its block took and settled the price, so this
         // one reserves nothing and issues nothing.
         let second_member = shape.as_ref().is_some_and(|(shape, _)| shape.is_second());
-        // The table the member's own anchor names — the payer bundle's
-        // for a remote-payer leg, this chain's committing block for
-        // everything else, which is the clock the request already
-        // carries. Read here rather than once for the tick, because a
-        // tick's members come from different blocks and the fee rides a
-        // receipt every participant of the transaction derives.
-        let prices = self
-            .classification_committee(topology_schedule, member.request.clock)
-            .prices();
+        // One table per member: the one the block that committed it
+        // named. Both figures a member is priced by are this chain's
+        // own — the share its outcome attests, which its abandonment
+        // would restate from the record its committing block froze, and
+        // the burn, which only the shard holding the payer's vault
+        // settles. Reading either at the tick's own head would price one
+        // transaction two ways across an epoch fold, and reading the
+        // burn at the member's clock would price it at a window its
+        // admission never judged the signed ceiling against.
+        let prices = member.committed_prices;
         let reach = member.membership_reach();
         state.admit(
             member.request.tx_hash,
@@ -1350,8 +1351,12 @@ impl ExecutionCoordinator {
                 member.request.tx_hash,
                 requirements_of(&delivering, body.legs()),
             );
-            self.candidates
-                .register_member(Arc::clone(body), delivering, member.request.clock);
+            self.candidates.register_member(
+                Arc::clone(body),
+                delivering,
+                member.request.clock,
+                member.committed_prices,
+            );
         }
         if let Some((_, body)) = &shape
             && member.request.runs.abortable()
@@ -1389,14 +1394,7 @@ impl ExecutionCoordinator {
             legs: BTreeSet::new(),
         };
         for member in admitted {
-            self.admit_member(
-                tick_id,
-                member,
-                topology_schedule,
-                &mut state,
-                &mut ticked,
-                &mut requests,
-            );
+            self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
