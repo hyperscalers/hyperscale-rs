@@ -334,7 +334,10 @@ mod tests {
             pool: StakePoolId::new(5),
             proposal: Some(ParamProposal {
                 params: NetworkParams {
-                    reshape_thresholds: ReshapeThresholds { split_bytes: 4_096 },
+                    reshape_thresholds: ReshapeThresholds {
+                        split_bytes: 4_096,
+                        split_fullness: u32::MAX,
+                    },
                     ..NetworkParams::default()
                 },
                 activate_at: Epoch::new(9),

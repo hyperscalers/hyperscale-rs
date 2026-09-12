@@ -1,7 +1,7 @@
 //! The shard's attested load, as a block header states it.
 
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::DeclaredWork;
+use hyperscale_vm_types::{BASIS_POINTS, DeclaredWork, FiveWay, Utilization};
 
 /// What a block attests about its shard's load: what the chain has
 /// consumed, what its blocks reserved, and the state it holds.
@@ -94,6 +94,117 @@ impl ShardLoad {
             used: self.used.saturating_add(used),
             substate_bytes,
         }
+    }
+}
+
+/// Epochs a shard's fullness mean remembers.
+///
+/// The time constant of the mean below, not a window: one epoch moves a
+/// row by an eighth of the distance to the reading, so a single busy
+/// epoch cannot trip a split and a shard that has been busy for an hour
+/// cannot avoid one. At the production epoch that is forty minutes to
+/// most of the way, which is the order a split should take — it costs a
+/// committee, a state handoff and a keyspace cut.
+pub const FULLNESS_EPOCHS: u32 = 8;
+
+/// The share of its block caps a shard's blocks have been spending, per
+/// dimension, in basis points.
+///
+/// A mean the beacon advances once per epoch from the same deltas the
+/// price controller reads, and the second thing that can make a shard
+/// too big: the controller's own reading is the network's mean, which by
+/// construction cannot see one hot shard among idle ones, so what
+/// answers a hotspot is capacity rather than a price every sender pays.
+///
+/// Per dimension, so a shard saturating disk while its compute idles is
+/// readable as exactly that — the reason the declared vector stays a
+/// vector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
+pub struct ShardFullness {
+    /// Fuel declared against fuel available.
+    pub compute: u32,
+    /// Read bytes declared against read bytes available.
+    pub read_bytes: u32,
+    /// Write bytes declared against write bytes available.
+    pub write_bytes: u32,
+    /// Footprint declared against footprint available.
+    pub footprint: u32,
+    /// Retained bytes declared against retained bytes available.
+    pub retention: u32,
+}
+
+impl ShardFullness {
+    /// A shard that has declared nothing against its caps.
+    ///
+    /// What a chain starts at, a split child included: a child inherits
+    /// state but not its parent's spending, so it earns its own split
+    /// over [`FULLNESS_EPOCHS`] rather than being born eligible for one.
+    pub const IDLE: Self = Self {
+        compute: 0,
+        read_bytes: 0,
+        write_bytes: 0,
+        footprint: 0,
+        retention: 0,
+    };
+
+    /// This mean advanced by one epoch's `reading`.
+    ///
+    /// Each row moves an [`FULLNESS_EPOCHS`]th of the way to what the
+    /// epoch declared. A dimension the epoch had no capacity in holds
+    /// where it is, for the reason the price controller holds a row:
+    /// there was no reading, and reading an outage as idleness would
+    /// walk a busy shard back under its threshold while it was down.
+    #[must_use]
+    pub fn folding(self, reading: &FiveWay) -> Self {
+        Self {
+            compute: fold_row(self.compute, reading.compute),
+            read_bytes: fold_row(self.read_bytes, reading.read_bytes),
+            write_bytes: fold_row(self.write_bytes, reading.write_bytes),
+            footprint: fold_row(self.footprint, reading.footprint),
+            retention: fold_row(self.retention, reading.retention),
+        }
+    }
+
+    /// The fullest dimension, which is the one a threshold is read
+    /// against: a shard is too busy when any one of its caps is the
+    /// thing binding it.
+    #[must_use]
+    pub const fn peak(&self) -> u32 {
+        let mut most = self.compute;
+        if self.read_bytes > most {
+            most = self.read_bytes;
+        }
+        if self.write_bytes > most {
+            most = self.write_bytes;
+        }
+        if self.footprint > most {
+            most = self.footprint;
+        }
+        if self.retention > most {
+            most = self.retention;
+        }
+        most
+    }
+}
+
+/// One row of the mean, moved an [`FULLNESS_EPOCHS`]th of the way to
+/// this epoch's ratio.
+fn fold_row(mean: u32, reading: Utilization) -> u32 {
+    let Utilization { used, capacity } = reading;
+    if capacity == 0 {
+        return mean;
+    }
+    // A block cannot declare past its own budget, so a figure that does
+    // is a defect rather than a reading and enters as a full epoch.
+    let ratio =
+        (used.saturating_mul(u128::from(BASIS_POINTS)) / capacity).min(u128::from(BASIS_POINTS));
+    let epochs = u64::from(FULLNESS_EPOCHS);
+    #[allow(clippy::cast_possible_truncation)] // both terms are under BASIS_POINTS
+    let ratio = ratio as u64;
+    let next = (u64::from(mean) * (epochs - 1) + ratio) / epochs;
+    #[allow(clippy::cast_possible_truncation)] // a mean of figures under BASIS_POINTS
+    {
+        next as u32
     }
 }
 

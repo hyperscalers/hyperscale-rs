@@ -2722,7 +2722,10 @@ mod tests {
 
         let deltas = HashMap::from([(block_hash, 7i64)]);
         let source = SubstateCountSource {
-            thresholds: ReshapeThresholds { split_bytes: 1_000 },
+            thresholds: ReshapeThresholds {
+                split_bytes: 1_000,
+                split_fullness: u32::MAX,
+            },
             frontier: (BlockHeight::GENESIS, 100),
             committed_height: BlockHeight::GENESIS,
             deltas: &deltas,

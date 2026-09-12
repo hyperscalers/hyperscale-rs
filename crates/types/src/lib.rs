@@ -178,7 +178,7 @@ pub use shard::limits::{
     ROUTE_PREFIX_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction,
     drain_admits_block, evidence_admits_block, sweep_admits_block,
 };
-pub use shard::load::ShardLoad;
+pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad};
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::proven_cells::ProvenCells;

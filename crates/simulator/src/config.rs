@@ -107,7 +107,10 @@ impl SimulatorConfig {
             beacon_chain_config: Some(BeaconChainConfig {
                 epoch_duration_ms: EPOCH_MS,
                 shard_size: committee,
-                reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+                reshape_thresholds: ReshapeThresholds {
+                    split_bytes: 0,
+                    split_fullness: u32::MAX,
+                },
                 ..BeaconChainConfig::default()
             }),
             ..Default::default()

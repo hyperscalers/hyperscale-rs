@@ -14,25 +14,48 @@ use hyperscale_hbor::Hbor;
 
 use crate::{Epoch, ShardId, ShardWitnessPayload};
 
-/// Substate-byte thresholds driving automatic shard reshaping.
+/// The thresholds driving automatic shard reshaping: what a shard holds
+/// and what its blocks have been spending.
 ///
-/// Ships disabled ([`Self::DISABLED`]) — the predicate can never fire —
-/// until a network explicitly configures a split threshold. The merge
-/// threshold is derived, not configured: at an eighth of the split
-/// threshold, a fresh child (≈ half the split threshold) is far from
-/// merge-eligible and a fresh merge (≤ a quarter of it) is far from
-/// split-eligible, so reshapes cannot oscillate.
+/// Two ways to be too big, because there are two ways to be. A shard
+/// holding more state than one committee should serve splits on
+/// [`split_bytes`](Self::split_bytes); one whose blocks have been
+/// running near their caps splits on
+/// [`split_fullness`](Self::split_fullness), whatever it holds. The
+/// second is the answer to a hot shard among idle ones, which the price
+/// table cannot see: the level moves on the network's mean, so capacity
+/// is what a hotspot is owed rather than a price every other sender
+/// pays.
+///
+/// Ships disabled ([`Self::DISABLED`]) — neither predicate can fire —
+/// until a network explicitly configures them. The merge threshold is
+/// derived, not configured: at an eighth of the split threshold, a fresh
+/// child (≈ half the split threshold) is far from merge-eligible and a
+/// fresh merge (≤ a quarter of it) is far from split-eligible, so
+/// reshapes cannot oscillate. Fullness has no merge side — a quiet shard
+/// merges on what it holds, and merging on idleness would retire a shard
+/// whose state still needs serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct ReshapeThresholds {
     /// Committed substate byte total at or above which a shard asserts a
-    /// split. `u64::MAX` disables reshaping entirely.
+    /// split. `u64::MAX` disables the byte predicate.
     pub split_bytes: u64,
+    /// The share of its block caps a shard's blocks may average, in
+    /// basis points, before it asserts a split. A figure past
+    /// [`BASIS_POINTS`](hyperscale_vm_types::BASIS_POINTS) disables the
+    /// fullness predicate.
+    ///
+    /// Read against the mean the beacon keeps per shard and per
+    /// dimension, so what trips it is sustained load in any one
+    /// dimension rather than a busy epoch in all of them.
+    pub split_fullness: u32,
 }
 
 impl ReshapeThresholds {
-    /// Reshaping disabled: neither trigger can ever fire.
+    /// Reshaping disabled: no predicate can ever fire.
     pub const DISABLED: Self = Self {
         split_bytes: u64::MAX,
+        split_fullness: u32::MAX,
     };
 
     /// Committed substate byte total below which a shard asserts a merge
@@ -121,7 +144,10 @@ mod tests {
 
     #[test]
     fn merge_threshold_is_an_eighth_of_split() {
-        let t = ReshapeThresholds { split_bytes: 8_000 };
+        let t = ReshapeThresholds {
+            split_bytes: 8_000,
+            split_fullness: u32::MAX,
+        };
         assert_eq!(t.merge_bytes(), 1_000);
     }
 

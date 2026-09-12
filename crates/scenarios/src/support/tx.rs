@@ -2458,6 +2458,9 @@ pub fn build_reshape_threshold_vote_tx(
             staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
                 b,
                 split_bytes,
+                // The fullness predicate off: this vote is about what a
+                // shard holds.
+                u64::from(NetworkParams::default().reshape_thresholds.split_fullness),
                 NetworkParams::default().impound_epochs,
                 // An even band: this vote is about the reshape
                 // threshold, so it leaves every price row where the

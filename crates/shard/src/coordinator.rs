@@ -2122,6 +2122,7 @@ impl ShardCoordinator {
         derive_reshape_trigger(
             self.local_shard,
             count,
+            topology_snapshot.fullness_of(self.local_shard),
             &thresholds,
             window,
             committee_anchor_epoch,
@@ -9418,7 +9419,10 @@ mod tests {
                 .as_ref()
                 .clone()
                 .with_params(NetworkParams {
-                    reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+                    reshape_thresholds: ReshapeThresholds {
+                        split_bytes: 0,
+                        split_fullness: u32::MAX,
+                    },
                     ..NetworkParams::default()
                 }),
         ));

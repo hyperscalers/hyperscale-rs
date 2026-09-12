@@ -98,7 +98,10 @@ mod tests {
     fn proposal(split_bytes: u64, activate_at: u64) -> ParamProposal {
         ParamProposal {
             params: NetworkParams {
-                reshape_thresholds: ReshapeThresholds { split_bytes },
+                reshape_thresholds: ReshapeThresholds {
+                    split_bytes,
+                    ..ReshapeThresholds::DISABLED
+                },
                 ..NetworkParams::default()
             },
             activate_at: Epoch::new(activate_at),

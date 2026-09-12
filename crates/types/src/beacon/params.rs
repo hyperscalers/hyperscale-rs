@@ -76,7 +76,9 @@ impl NetworkParams {
     /// A zero `split_bytes` makes every shard split on its first byte (an
     /// unbounded cascade up to `MAX_SHARDS`) and can never merge back, so
     /// it is rejected; `u64::MAX` (reshaping disabled) and any positive
-    /// threshold are accepted. A price row with a zero floor prices a
+    /// threshold are accepted. A zero `split_fullness` is rejected on the
+    /// same terms — an idle shard is already past it — while a figure
+    /// past `BASIS_POINTS` is the predicate voted off and is accepted. A price row with a zero floor prices a
     /// dimension at nothing, and one whose ceiling sits under its floor
     /// names no level at all, so both are rejected.
     ///
@@ -90,6 +92,9 @@ impl NetworkParams {
         }
         if self.impound_epochs < UNBONDING_WINDOW_EPOCHS {
             return Err(ParamBoundsError::ImpoundBelowUnbonding);
+        }
+        if self.reshape_thresholds.split_fullness == 0 {
+            return Err(ParamBoundsError::ZeroSplitFullness);
         }
         if !self.price_bounds.well_formed() {
             return Err(ParamBoundsError::PriceBoundsUnusable);
@@ -117,6 +122,11 @@ pub enum ParamBoundsError {
     /// on its first byte and never merge back.
     #[error("reshape split_bytes is zero; every shard would split unboundedly")]
     ZeroSplitThreshold,
+    /// `reshape_thresholds.split_fullness` is zero — a shard that has
+    /// declared nothing is already past it, so every shard would split
+    /// forever whatever it holds.
+    #[error("reshape split_fullness is zero; every shard would split unboundedly")]
+    ZeroSplitFullness,
     /// `impound_epochs` is below the unbonding window — a conviction
     /// would then be cheaper than a voluntary exit.
     #[error("impound_epochs is below the unbonding window")]
@@ -169,12 +179,18 @@ mod tests {
     #[test]
     fn seeds_reshape_thresholds_from_config() {
         let config = BeaconChainConfig {
-            reshape_thresholds: ReshapeThresholds { split_bytes: 9_000 },
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 9_000,
+                split_fullness: u32::MAX,
+            },
             ..BeaconChainConfig::default()
         };
         assert_eq!(
             NetworkParams::from_genesis(&config).reshape_thresholds,
-            ReshapeThresholds { split_bytes: 9_000 },
+            ReshapeThresholds {
+                split_bytes: 9_000,
+                split_fullness: u32::MAX,
+            },
         );
     }
 
@@ -189,7 +205,10 @@ mod tests {
     #[test]
     fn validate_rejects_zero_split_threshold() {
         let zero = NetworkParams {
-            reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 0,
+                split_fullness: u32::MAX,
+            },
             ..NetworkParams::default()
         };
         assert_eq!(zero.validate(), Err(ParamBoundsError::ZeroSplitThreshold));
@@ -198,7 +217,10 @@ mod tests {
         assert!(NetworkParams::default().validate().is_ok());
         assert!(
             NetworkParams {
-                reshape_thresholds: ReshapeThresholds { split_bytes: 1 },
+                reshape_thresholds: ReshapeThresholds {
+                    split_bytes: 1,
+                    split_fullness: u32::MAX,
+                },
                 ..NetworkParams::default()
             }
             .validate()
@@ -209,7 +231,10 @@ mod tests {
     #[test]
     fn hbor_round_trip() {
         let params = NetworkParams {
-            reshape_thresholds: ReshapeThresholds { split_bytes: 1_234 },
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 1_234,
+                split_fullness: u32::MAX,
+            },
             ..NetworkParams::default()
         };
         let bytes = hbor_to_vec(&params).unwrap();
@@ -223,7 +248,10 @@ mod tests {
                 pool: StakePoolId::new(3),
                 proposal: Some(ParamProposal {
                     params: NetworkParams {
-                        reshape_thresholds: ReshapeThresholds { split_bytes: 7_000 },
+                        reshape_thresholds: ReshapeThresholds {
+                            split_bytes: 7_000,
+                            split_fullness: u32::MAX,
+                        },
                         ..NetworkParams::default()
                     },
                     activate_at: Epoch::new(12),

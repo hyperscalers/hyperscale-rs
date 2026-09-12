@@ -39,8 +39,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, Hash,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardId, Stake, StakePoolId,
-    StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness, ShardId, Stake,
+    StakePoolId, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -733,6 +733,18 @@ pub struct BeaconState {
     /// `apply_epoch`. The freeze [`Self::next_params`] describes, for
     /// the same reason.
     pub next_prices: PriceTable,
+    /// The share of its block caps each live shard has been spending,
+    /// per dimension, as a mean over
+    /// [`FULLNESS_EPOCHS`](crate::FULLNESS_EPOCHS).
+    ///
+    /// Advanced at the fold from the same per-shard deltas the price
+    /// controller sums, and read by the shard's own reshape predicate:
+    /// the controller's reading is the network's mean, which cannot see
+    /// one hot shard among idle ones, so a shard that has been running
+    /// near its caps is owed capacity rather than a price every sender
+    /// pays. Keyed by live shard; a shard the fold retires leaves with
+    /// its entry, and one it creates starts idle.
+    pub fullness: BTreeMap<ShardId, ShardFullness>,
     /// Each stake pool's one active parameter-change vote — the proposal
     /// `(params, activate_at)` it backs. Folded from `ParamVote`
     /// witnesses (cast/replace/clear); a pool with no entry abstains.
@@ -1170,6 +1182,9 @@ struct WindowProjection {
     /// The price level for this window, frozen beside the params whose
     /// bounds hold it.
     prices: PriceTable,
+    /// The fullest dimension of each shard's spending mean, in basis
+    /// points, frozen beside the table it is read with.
+    fullness: BTreeMap<ShardId, u32>,
     /// The packages a block governed by this window may name.
     usable_packages: BTreeSet<Hash>,
     /// The retained seed window. Not frozen a window ahead like the
@@ -1193,6 +1208,7 @@ impl BeaconState {
             next_params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             next_prices: PriceTable::GENESIS,
+            fullness: BTreeMap::new(),
             param_votes: BTreeMap::new(),
             packages: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
@@ -1490,6 +1506,7 @@ impl BeaconState {
                 settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
                 prices: self.prices,
+                fullness: self.fullness_peaks(),
                 usable_packages: self.usable_packages(self.current_epoch),
                 seeds: self.seeds.clone(),
             },
@@ -1520,11 +1537,23 @@ impl BeaconState {
                 settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
                 prices: self.next_prices,
+                fullness: self.fullness_peaks(),
                 usable_packages: self.usable_packages(self.current_epoch.next()),
                 seeds: self.seeds.clone(),
             },
             network,
         )
+    }
+
+    /// The fullest dimension of each shard's mean, which is all its
+    /// reshape predicate reads: a shard is too busy when any one of its
+    /// caps is what binds it, so the window carries one figure per shard
+    /// rather than the vector behind it.
+    fn fullness_peaks(&self) -> BTreeMap<ShardId, u32> {
+        self.fullness
+            .iter()
+            .map(|(shard, mean)| (*shard, mean.peak()))
+            .collect()
     }
 
     /// Ready-filtered consensus subset of `committees`, resolved per
@@ -1769,6 +1798,7 @@ impl BeaconState {
             settled_window_floors,
             params,
             prices,
+            fullness,
             usable_packages,
             seeds,
         } = projection;
@@ -1836,6 +1866,7 @@ impl BeaconState {
         )
         .with_params(params)
         .with_prices(prices)
+        .with_fullness(fullness)
         .with_scheduled_terminals(scheduled_terminals)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
