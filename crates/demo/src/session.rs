@@ -8,7 +8,7 @@ use hyperscale_effects_bridge::account_address;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
     NetworkId, PrincipalAddr, Provisions, ReshapeThresholds, ShardId, SharedCertificates,
@@ -473,6 +473,7 @@ impl Session {
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
                     validity: validity_around(self.now),
+                    ceilings: Ceilings::Guessed,
                     message: self.nonce.to_le_bytes().to_vec(),
                 },
             )

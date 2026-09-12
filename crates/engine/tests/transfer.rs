@@ -23,7 +23,7 @@ use hyperscale_hbor::TypeShape;
 use hyperscale_storage::{
     Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
 };
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline,
     DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
@@ -241,6 +241,7 @@ const fn terms(max_fee: u128) -> Terms {
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(OFFER_MS),
         ),
+        ceilings: Ceilings::Guessed,
         message: Vec::new(),
     }
 }

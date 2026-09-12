@@ -17,7 +17,7 @@ use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::test_helpers::block_settling;
 use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, MAX_SUBINTENT_VALIDITY_RANGE,
     NetworkId, PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr,
@@ -62,6 +62,7 @@ const fn terms() -> Terms {
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(OFFER_MS),
         ),
+        ceilings: Ceilings::Guessed,
         message: Vec::new(),
     }
 }

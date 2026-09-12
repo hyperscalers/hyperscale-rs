@@ -48,20 +48,54 @@ pub fn default_gas_limits(nodes: usize) -> Vec<u64> {
     vec![share; nodes]
 }
 
+/// Where an envelope's compute ceilings came from.
+///
+/// Named rather than defaulted, because the two are not the same claim.
+/// A ceiling a preview measured is what the chain will meter the node
+/// against; a ceiling nobody measured is a number, and a transaction
+/// signed with one traps where the number was too small and reserves
+/// block space it never uses where it was too large. A caller that has
+/// not previewed says so here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ceilings {
+    /// What a preview measured, one per lowered node in node order —
+    /// its report's own figures, with whatever margin it was asked for.
+    Measured(Vec<u64>),
+    /// The deployment default split evenly over the manifest's nodes.
+    ///
+    /// For a caller with nothing to measure against: a load generator
+    /// sending one shape a million times, a fixture whose figures are
+    /// beside the point. A wallet spending someone's balance previews.
+    Guessed,
+}
+
+impl Ceilings {
+    /// The ceilings themselves, for a manifest of `nodes` lowered nodes.
+    #[must_use]
+    pub fn over(self, nodes: usize) -> Vec<u64> {
+        match self {
+            Self::Measured(ceilings) => ceilings,
+            Self::Guessed => default_gas_limits(nodes),
+        }
+    }
+}
+
 /// What a signer commits to beyond the manifest, in this workspace's
 /// vocabulary.
 ///
 /// The VM's own terms carry a validity window as plain milliseconds and
 /// the compute ceilings the caller chooses; this names the window with
-/// the clock type the rest of the workspace speaks and supplies the
-/// ceilings from [`default_gas_limits`], which is what makes it
-/// deployment binding rather than a second spelling of the same struct.
+/// the clock type the rest of the workspace speaks and asks for the
+/// ceilings as a [`Ceilings`], which is what makes it deployment
+/// binding rather than a second spelling of the same struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terms {
     /// The most the signer will pay to have this transaction carried.
     pub max_fee: u128,
     /// When the transaction may be included.
     pub validity: TimestampRange,
+    /// The compute ceilings the envelope signs.
+    pub ceilings: Ceilings,
     /// Content riding the signature and nothing else.
     ///
     /// A transaction's hash covers the whole signed envelope, so two
@@ -281,7 +315,7 @@ impl Client {
             self.network,
             signing::Terms {
                 max_fee: terms.max_fee,
-                gas_limits: default_gas_limits(tree.node_count()),
+                gas_limits: terms.ceilings.over(tree.node_count()),
                 priority_bp: 0,
                 validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
                 validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
@@ -316,7 +350,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_effects_bridge::genesis::account_artifact;
-    use hyperscale_types::test_utils::test_principal;
+    use hyperscale_types::Ed25519PrivateKey;
+    use hyperscale_types::test_utils::{test_principal, test_validity_range};
     use hyperscale_vm_effects::{
         Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit, package_hash,
     };
@@ -387,6 +422,57 @@ mod tests {
             &ProtocolHasher,
         )
         .expect("a built transfer admits");
+    }
+
+    /// What a wallet that previewed signs is what it measured, and what
+    /// a caller that did not say so: the two arms produce different
+    /// envelopes, and the measured one carries the report's own figures
+    /// node for node.
+    #[test]
+    fn a_signed_envelope_carries_the_ceilings_it_was_given() {
+        let client = Client::genesis(NETWORK);
+        let signer = Ed25519PrivateKey::from_bytes(&[0x31; 32]).expect("a fixture key");
+        let from = principal_of(&signer);
+        let terms = |ceilings| Terms {
+            max_fee: 1_000_000,
+            validity: test_validity_range(),
+            ceilings,
+            message: Vec::new(),
+        };
+
+        // A transfer lowers to three nodes, so a preview reporting three
+        // figures is what the envelope signs.
+        let measured = vec![1_234, 5_678, 9_012];
+        let previewed = client
+            .transfer(
+                &signer,
+                from,
+                test_principal(0x22),
+                100,
+                terms(Ceilings::Measured(measured.clone())),
+            )
+            .expect("a measured transfer builds");
+        assert_eq!(previewed.body().gas_limits, measured);
+
+        let guessed = client
+            .transfer(
+                &signer,
+                from,
+                test_principal(0x22),
+                100,
+                terms(Ceilings::Guessed),
+            )
+            .expect("an unmeasured transfer builds");
+        assert_eq!(
+            guessed.body().gas_limits,
+            default_gas_limits(measured.len()),
+            "a caller that did not preview signs the deployment default"
+        );
+        assert_ne!(
+            previewed.hash(),
+            guessed.hash(),
+            "the ceilings are signed content, so the two are two transactions"
+        );
     }
 
     #[test]
