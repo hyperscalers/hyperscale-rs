@@ -11,7 +11,7 @@
 
 use hyperscale_vm_types::{
     DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT,
-    MAX_SUBINTENTS, VERIFY_WEIGHT,
+    MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_SUBINTENTS, VERIFY_WEIGHT,
 };
 
 use crate::{Address, LocalKey, RoutePrefix, TxsInFlight};
@@ -424,22 +424,31 @@ pub const MAX_TX_FOOTPRINT: u64 = MAX_BLOCK_FOOTPRINT / 16;
 
 /// The most one transaction may declare in any dimension.
 ///
-/// Compute is held at derivation to [`MAX_GAS_LIMIT`] over the nodes,
-/// with the verification of every signature the envelope may bind on
-/// top; retention is bounded by the envelope's own caps, the write
-/// ceiling and the event term. Both are stated here so the one check
-/// covers the vector.
+/// Compute and retention are sums of their own parts rather than
+/// figures of their own, because the derivation builds them from those
+/// same parts: a cap written independently would drift the first time a
+/// term was added to one side and not the other, and the drift would
+/// read as a transaction the protocol refuses for declaring exactly
+/// what it is allowed to.
 pub const TX_CAPS: DeclaredWork = DeclaredWork {
     compute: MAX_GAS_LIMIT + MAX_TX_SIGNATURE_COMPUTE,
     read_bytes: MAX_TX_READ_BYTES,
     write_bytes: MAX_TX_WRITE_BYTES,
     footprint: MAX_TX_FOOTPRINT,
-    retention: MAX_ENVELOPE_BYTES as u64 + MAX_TX_WRITE_BYTES + MAX_EVENT_BYTES_PER_TX as u64,
+    retention: MAX_ENVELOPE_BYTES as u64
+        + MAX_TX_WRITE_BYTES
+        + MAX_TX_SIGNATURE_BYTES
+        + MAX_EVENT_BYTES_PER_TX as u64,
 };
 
 /// The most verifying one envelope's signatures can cost: the composer
 /// and every subintent at the slowest registered scheme.
 const MAX_TX_SIGNATURE_COMPUTE: u64 = (MAX_SUBINTENTS as u64 + 1) * 3 * VERIFY_WEIGHT;
+
+/// The auth material those same signatures carry, which retention holds
+/// beside the envelope that carries them.
+const MAX_TX_SIGNATURE_BYTES: u64 =
+    (MAX_SUBINTENTS as u64 + 1) * (MAX_KEY_BYTES as u64 + MAX_SIG_BYTES as u64);
 
 /// Whether a transaction declaring `work` is one a block may carry at
 /// all, whatever else it carries.

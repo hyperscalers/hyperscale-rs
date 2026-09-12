@@ -39,6 +39,18 @@ impl ShardResolver for TrieShardResolver<'_> {
 /// rather than an [`OwnerSet`](hyperscale_vm_kernel::OwnerSet): the
 /// kernel's set owns what it captures, which would clone the trie per
 /// transaction on a path that projects one receipt at a time.
+///
+/// The answer does not depend on *which* trie, only that `local_shard`
+/// is a leaf of it. A walk descends from the root and stops at the first
+/// leaf on the address's path, so a reshape elsewhere subdivides some
+/// other leaf's range and leaves this one's alone — every trie holding
+/// `local_shard` as a leaf sorts every address the same way. That is why
+/// a caller may hand this the trie it happens to hold rather than the
+/// one the content committed under: the only trie that would disagree is
+/// one where this shard has been cut, and past its terminal window a
+/// shard commits nothing for a projection to filter. Quantities without
+/// that invariance — a price level, which every fold moves for every
+/// shard — must be read at the anchor instead.
 pub fn owned_by(local_shard: ShardId, trie: &ShardTrie) -> impl Fn(Address) -> bool + Copy {
     move |owner| trie.shard_for_prefix(owner) == local_shard
 }
