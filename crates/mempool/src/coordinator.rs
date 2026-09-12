@@ -34,6 +34,7 @@
 //! period it falls back to a BFT-weighted fetch from the source committee,
 //! and drops entries past `RETENTION_HORIZON`.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,13 +149,15 @@ struct PoolEntry {
 ///
 /// Handles transaction lifecycle from submission to completion.
 ///
-/// The pool is a `BTreeMap` so hash order is the iteration order, which is
-/// also the order transactions are offered in: selection walks the pool
-/// once and filters, taking each entry the drain still has room for. There
-/// is no index beside it — eligibility is a property of the entry the walk
-/// is already holding, so a set maintained alongside would have to be
-/// invalidated by every commit, settlement and fence for a scan the pool's
-/// own bound already keeps small.
+/// The pool is a `BTreeMap` so hash order is the iteration order, and hash
+/// order is the order transactions are offered in: selection walks the
+/// pool once, filters, ranks what is left by the priority its sender
+/// burned, and takes each entry the drain and the caps still have room
+/// for. There is no index beside it — eligibility is a property of the
+/// entry the walk is already holding, so a set maintained alongside would
+/// have to be invalidated by every commit, settlement and fence for a scan
+/// the pool's own bound already keeps small, and the ranking is a sort of
+/// what the walk produced.
 pub struct MempoolCoordinator {
     /// Transaction pool sorted by hash (`BTreeMap` for ordered iteration).
     pool: BTreeMap<TxHash, PoolEntry>,
@@ -1021,30 +1024,49 @@ impl MempoolCoordinator {
         let room = max_count.min(usize::try_from(places).unwrap_or(usize::MAX));
 
         let min_dwell = self.config.min_dwell_time;
+        // Priority decides who is offered and hash decides the order
+        // they are offered in. The eligible entries are sorted rather
+        // than held in an index beside the pool, for the reason the pool
+        // holds none: the walk already visits every entry to judge
+        // eligibility, and a set maintained alongside would have to be
+        // invalidated by every commit, settlement and fence.
+        let mut candidates: Vec<(Reverse<u32>, TxHash, &PoolEntry)> = self
+            .pool
+            .iter()
+            .filter(|(hash, entry)| {
+                matches!(entry.status, TransactionStatus::Pending)
+                    && !self.parked_engagement.contains_key(*hash)
+                    && now.saturating_sub(entry.admitted_at) >= min_dwell
+            })
+            .map(|(hash, entry)| (Reverse(entry.tx.body().priority_bp), *hash, entry))
+            .collect();
+        candidates.sort_unstable_by_key(|(priority, hash, _)| (*priority, *hash));
+
         let mut filled = DeclaredWork::ZERO;
-        let mut selected = Vec::new();
-        for (_, entry) in self.pool.iter().filter(|(hash, entry)| {
-            matches!(entry.status, TransactionStatus::Pending)
-                && !self.parked_engagement.contains_key(*hash)
-                && now.saturating_sub(entry.admitted_at) >= min_dwell
-        }) {
+        let mut selected: Vec<(TxHash, Arc<Verified<Transaction>>)> = Vec::new();
+        for (_, hash, entry) in candidates {
             if selected.len() >= room {
                 break;
             }
-            // Hash order decides who is offered; the caps decide how far
-            // down the list that goes. A transaction too heavy for what
-            // is left in any dimension is passed over rather than ending
-            // selection — otherwise one outsized envelope would stall
-            // every lighter one behind it until the block cleared.
+            // The caps decide how far down the list the offer goes. A
+            // transaction too heavy for what is left in any dimension is
+            // passed over rather than ending selection — otherwise one
+            // outsized envelope would stall every lighter one behind it
+            // until the block cleared.
             let classified = Classified::freeze(entry.tx.legs(), entry.tx.owners(), trie);
             let next = filled.saturating_add(classified.local_work(&entry.tx, self.local_shard));
             if !budget_admits_block(&next) {
                 continue;
             }
             filled = next;
-            selected.push(Arc::clone(&entry.tx));
+            selected.push((hash, Arc::clone(&entry.tx)));
         }
-        selected
+        // Offered in hash order whatever anyone paid: a priority buys a
+        // place in the block and never a position in it, so the block a
+        // proposer builds is the block every voter checks the ordering
+        // of.
+        selected.sort_unstable_by_key(|(hash, _)| *hash);
+        selected.into_iter().map(|(_, tx)| tx).collect()
     }
 
     /// The number of transactions still awaiting inclusion, parked ones
@@ -1242,7 +1264,8 @@ mod tests {
     use hyperscale_types::test_utils::{
         TestCommittee, certify, install_stub_protocol_statics, make_finalization, make_live_block,
         stub_transaction, stub_transaction_declaring, test_prefix, test_principal,
-        test_transaction, test_transaction_with_prefixes, test_validity_range,
+        test_transaction, test_transaction_at_priority, test_transaction_with_prefixes,
+        test_validity_range,
     };
     use hyperscale_types::{Address, MAX_BLOCK_COMPUTE, PrincipalAddr, Verified, WitnessSources};
 
@@ -2246,6 +2269,69 @@ mod tests {
         // Not at limit: all TXs should be allowed
         let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO);
         assert_eq!(ready.len(), 2);
+    }
+
+    /// A priority buys a place in the block and never a position in it.
+    ///
+    /// With room for fewer than the pool holds, what is offered is the
+    /// transactions whose senders burned the higher multiplier — and
+    /// what they are offered in is hash order, which is the order every
+    /// voter checks.
+    #[test]
+    fn a_priority_selects_inclusion_and_never_order() {
+        let mut mempool = MempoolCoordinator::with_config(
+            ShardId::ROOT,
+            MempoolConfig {
+                min_dwell_time: Duration::ZERO,
+                ..MempoolConfig::default()
+            },
+        );
+        let topology_snapshot = make_test_topology();
+        let now = LocalTimestamp::from_millis(10_000);
+        for (seed, priority_bp) in [(1u8, 0u32), (2, 500), (3, 0), (4, 500)] {
+            let tx = test_transaction_at_priority(seed, priority_bp);
+            mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
+        }
+
+        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now);
+        assert_eq!(ready.len(), 2, "the room the caller named");
+        assert!(
+            ready.iter().all(|tx| tx.body().priority_bp == 500),
+            "the higher multipliers are the ones offered"
+        );
+        assert!(
+            ready[0].hash() < ready[1].hash(),
+            "and they are offered in hash order"
+        );
+    }
+
+    /// Equal priorities fall to hash, so a pool nobody outbid in is
+    /// offered exactly as it was before priority existed.
+    #[test]
+    fn equal_priorities_fall_to_hash() {
+        let mut mempool = MempoolCoordinator::with_config(
+            ShardId::ROOT,
+            MempoolConfig {
+                min_dwell_time: Duration::ZERO,
+                ..MempoolConfig::default()
+            },
+        );
+        let topology_snapshot = make_test_topology();
+        let now = LocalTimestamp::from_millis(10_000);
+        let mut hashes: Vec<TxHash> = Vec::new();
+        for seed in 1u8..=4 {
+            let tx = test_transaction_at_priority(seed, 250);
+            hashes.push(tx.hash());
+            mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
+        }
+        hashes.sort_unstable();
+
+        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now);
+        assert_eq!(
+            ready.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            hashes[..2],
+            "the lowest hashes, as they were offered before priority existed"
+        );
     }
 
     // =========================================================================

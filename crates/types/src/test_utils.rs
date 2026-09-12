@@ -96,6 +96,26 @@ pub fn test_transaction(seed: u8) -> Transaction {
     )
 }
 
+/// [`test_transaction`] signing `priority_bp` — the fixture for anything
+/// that ranks what a sender burned to be included sooner.
+///
+/// Re-signed rather than built apart, so the two differ in the one field
+/// under test and in the hash that follows it.
+///
+/// # Panics
+///
+/// As [`test_transaction`].
+#[must_use]
+pub fn test_transaction_at_priority(seed: u8, priority_bp: u32) -> Transaction {
+    let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
+    let mut vm = test_transaction(seed).body().clone();
+    vm.priority_bp = priority_bp;
+    let tx = Transaction::new(vm.sign(&key));
+    tx.try_derived(&StubVmStatics)
+        .expect("the fixture builds a tree the stub derivation routes");
+    tx
+}
+
 /// [`test_transaction`] reported as running `packages` — the fixture for
 /// anything gated on what code a transaction needs.
 #[must_use]
