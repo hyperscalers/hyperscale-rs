@@ -877,59 +877,6 @@ fn serial_and_parallel_scheduling_produce_identical_receipts() {
 /// A completed transfer burns its declared price from the payer's vault
 /// as part of the receipt's own writes, so the burn rides the attested
 /// `writes_root` and the sync-replayable work items.
-/// An attempt that applies nothing still attests the declaration it made,
-/// and a completed one attests strictly more.
-///
-/// This is the half of attested work that fuel alone misses. A shard that
-/// executes a leg it does not own can burn almost no fuel while holding the
-/// exclusivity its declaration claimed, so pricing on compute alone would
-/// under-pay exactly the participants cross-shard compensation exists for.
-/// Here the same shape is visible within one shard: the uncovered
-/// withdrawal never applies an effect, and its work is still positive
-/// because the declaration was admitted, routed, and locked regardless.
-#[test]
-fn an_unapplied_attempt_still_attests_its_declaration() {
-    let executor = executor(ExecutionMode::Serial);
-    let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        bob(),
-        1_000_000,
-    )));
-    let executed = execute(&executor, &[over]);
-    assert_eq!(executed.len(), 1);
-    assert!(
-        matches!(executed[0].consensus, ConsensusReceipt::Failed),
-        "an uncovered withdrawal must not apply"
-    );
-    let unapplied = executed[0].attested_work;
-    assert!(
-        unapplied > 0,
-        "an attempt that applied nothing still declared, routed, and locked"
-    );
-
-    // A completed transfer of the same shape attests the same declaration
-    // plus the compute it actually consumed.
-    let fine = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        bob(),
-        100,
-    )));
-    let executed = execute(&executor, &[fine]);
-    assert_eq!(executed.len(), 1);
-    assert!(
-        matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
-        "a covered transfer must apply"
-    );
-    assert!(
-        executed[0].attested_work > unapplied,
-        "a completed execution attests its compute on top of its declaration: \
-         completed = {}, unapplied = {unapplied}",
-        executed[0].attested_work,
-    );
-}
-
 #[test]
 fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let payer = fee_payer(7);
@@ -2077,10 +2024,6 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
         paid,
         encode_amount(1_000_000 - price).to_vec(),
         "the publisher paid the declaration's price"
-    );
-    assert!(
-        executed[0].attested_work > 0,
-        "judging the artifact is attested work"
     );
 }
 

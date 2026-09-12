@@ -285,7 +285,6 @@ struct Seat {
     fee_receipt: Option<StoredReceipt>,
     /// What this shard attests it did for the member, carried from
     /// execution onto the outcome it votes.
-    attested_work: u64,
     /// What the member's execution escrowed out, carried from execution
     /// onto the outcome it votes.
     escrowed: Vec<SubstateKey>,
@@ -322,7 +321,6 @@ impl Seat {
             result: None,
             receipt: None,
             fee_receipt: None,
-            attested_work: 0,
             escrowed: Vec::new(),
             crossing_targets: BTreeSet::new(),
             committed_cell: None,
@@ -632,13 +630,6 @@ impl TickState {
         }
     }
 
-    /// Record what this shard attested it did for a member.
-    pub fn record_attested_work(&mut self, tx_hash: TxHash, work: u64) {
-        if let Some(seat) = self.seats.get_mut(&tx_hash) {
-            seat.attested_work = work;
-        }
-    }
-
     /// Record what a member's execution escrowed out.
     pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<SubstateKey>) {
         if let Some(seat) = self.seats.get_mut(&tx_hash) {
@@ -845,8 +836,8 @@ impl TickState {
                     .committed_cell
                     .filter(|_| !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
                 let attested = match charge {
-                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, seat.attested_work),
-                    None => TxOutcome::attesting(*tx_hash, outcome, seat.attested_work),
+                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee),
+                    None => TxOutcome::new(*tx_hash, outcome),
                 };
                 // What the transaction was charged when its block
                 // committed it, and that the block took a place in the
@@ -1463,12 +1454,11 @@ mod tests {
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
                 vec![
-                    TxOutcome::attesting(
+                    TxOutcome::new(
                         member,
                         ExecutionOutcome::Succeeded {
                             receipt_hash: GlobalReceiptHash::ZERO,
                         },
-                        1,
                     )
                     .awaiting(counterparts),
                 ],

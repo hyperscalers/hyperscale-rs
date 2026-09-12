@@ -67,12 +67,11 @@ mod reservation_tests {
     use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash, TxOutcome};
 
     fn outcome(reserved: u128) -> TxOutcome {
-        TxOutcome::attesting(
+        TxOutcome::new(
             TxHash::from(Hash::from_bytes(b"tx")),
             ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-            7,
         )
         .reserving(reserved)
     }
@@ -91,23 +90,6 @@ mod reservation_tests {
             compute_global_receipt_root(&[outcome(100)]),
             compute_global_receipt_root(&[outcome(101)])
         );
-    }
-
-    /// The two work quantities are separate axes: one shard's share of
-    /// what a transaction cost, and what every shard agrees it reserved.
-    /// Folding them into one leaf position would let a difference in
-    /// either hide a difference in the other.
-    #[test]
-    fn cost_and_reservation_move_the_leaf_independently() {
-        let costed = TxOutcome::attesting(
-            TxHash::from(Hash::from_bytes(b"tx")),
-            ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            },
-            8,
-        )
-        .reserving(100);
-        assert_ne!(tx_outcome_leaf(&costed), tx_outcome_leaf(&outcome(100)));
     }
 }
 
@@ -171,7 +153,7 @@ mod tests {
     }
 
     fn base() -> TxOutcome {
-        TxOutcome::attesting(tx_hash(), ExecutionOutcome::Aborted, 7)
+        TxOutcome::new(tx_hash(), ExecutionOutcome::Aborted)
     }
 
     /// The list region is one byte string whatever the split between
@@ -218,29 +200,19 @@ mod tests {
         assert_eq!(forward.escrowed().len(), 2);
     }
 
-    /// `work` is folded into the leaf: outcomes identical but for their
-    /// attested work hash to different leaves, so a forged work fails
+    /// What a transaction was charged is folded into the leaf on the
+    /// outcomes that settle a fee receipt too, so a forged charge fails
     /// the receipt-root recompute every EC decode runs.
     #[test]
-    fn leaf_covers_attested_work() {
-        let outcome = |work| TxOutcome::attesting(tx_hash(), ExecutionOutcome::Aborted, work);
-        assert_ne!(
-            tx_outcome_leaf(&outcome(7)),
-            tx_outcome_leaf(&outcome(8)),
-            "work must be covered by the leaf"
-        );
-    }
-
-    /// The fee-receipt extension composes with the work fold — a forged
-    /// work is still caught on outcomes that settle a fee receipt.
-    #[test]
-    fn leaf_covers_attested_work_with_fee_receipt() {
+    fn leaf_covers_the_charge_on_a_fee_settling_outcome() {
         let fee = GlobalReceiptHash::from_raw(Hash::from_bytes(b"fee"));
-        let outcome = |work| TxOutcome::with_fee(tx_hash(), ExecutionOutcome::Failed, fee, work);
+        let outcome = |charged| {
+            TxOutcome::with_fee(tx_hash(), ExecutionOutcome::Failed, fee).reserving(charged)
+        };
         assert_ne!(
             tx_outcome_leaf(&outcome(7)),
             tx_outcome_leaf(&outcome(8)),
-            "work must be covered by the leaf on fee-settling outcomes"
+            "the charge must be covered by the leaf on fee-settling outcomes"
         );
     }
 }

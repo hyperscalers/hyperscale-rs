@@ -40,9 +40,6 @@ pub struct TickBatchOutcome {
     /// refuse. Held in reserve: an abort settles one of these in place of
     /// the discarded execution receipt.
     pub fee_receipts: Vec<StoredReceipt>,
-    /// What this shard attests it did per member, carried to the tick so
-    /// the outcomes it votes report it.
-    pub attested_work: Vec<(TxHash, u64)>,
 }
 
 /// How a node learned about the certifying QC that commits a given block.
