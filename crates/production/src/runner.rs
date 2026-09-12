@@ -1808,7 +1808,7 @@ mod tests {
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
             used: DeclaredWork::ZERO,
-            attested_work: 0,
+            cumulative_fees: 0,
             substate_bytes: 0,
             last_live_epoch: Epoch::GENESIS,
             consecutive_misses: 0,

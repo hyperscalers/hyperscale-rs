@@ -11,7 +11,7 @@ use hyperscale_vm_types::{BASIS_POINTS, DeclaredWork, FiveWay, Utilization};
 /// epoch, a joining node off the block it joined at — and every replica
 /// recomputes them before voting. The pair is deliberately two shapes:
 ///
-/// - [`cumulative_work`](Self::cumulative_work) is a **flow**, carried as a
+/// - [`cumulative_fees`](Self::cumulative_fees) is a **flow**, carried as a
 ///   running total over the chain's whole history. A consumer wanting one
 ///   epoch's consumption differences it against the total it last
 ///   recorded, which makes the quantity monotone and its application
@@ -29,24 +29,24 @@ use hyperscale_vm_types::{BASIS_POINTS, DeclaredWork, FiveWay, Utilization};
 ///   and a missed crossing simply leaves the value unrefreshed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct ShardLoad {
-    /// Work this chain has attested over its whole history, through the
-    /// certificates the block itself carries.
+    /// What this chain has charged over its whole history, in quanta,
+    /// through the certificates the block itself carries.
     ///
-    /// Priced by the engine's schedule, which combines the compute an
-    /// execution consumed with the footprint its declaration claimed —
-    /// so a participant that applied almost nothing still reports the
-    /// exclusivity it held. Consensus carries the one scalar and never
-    /// the ratio behind it.
+    /// The fee and not the fuel: a shard's emission weight is what the
+    /// network paid it, and the price is a pure function of signed
+    /// content — so the figure a header claims is one its committee
+    /// admitted the transactions behind, rather than one its own engine
+    /// reported about itself.
     ///
     /// Accumulation saturates rather than wrapping. Wrapping would break
     /// the monotonicity a differencing consumer relies on, and it has no
     /// honest reading: the epoch it straddles would come out as zero
     /// consumption or as the whole counter's width.
-    pub cumulative_work: u64,
+    pub cumulative_fees: u128,
     /// What this chain's blocks have reserved against their per-block
     /// caps over its whole history, dimension by dimension.
     ///
-    /// A flow like [`cumulative_work`](Self::cumulative_work) and for
+    /// A flow like [`cumulative_fees`](Self::cumulative_fees) and for
     /// the same reasons, but a vector rather than a scalar: the beacon
     /// moves each row of the price table by its own dimension's use, so
     /// a network saturating disk while compute idles has to be readable
@@ -77,20 +77,25 @@ impl ShardLoad {
     /// inherit state but not their predecessor's attested work — and a
     /// genesis block has no parent state to have a total behind.
     pub const ZERO: Self = Self {
-        cumulative_work: 0,
+        cumulative_fees: 0,
         used: DeclaredWork::ZERO,
         substate_bytes: None,
     };
 
-    /// This load advanced by `work` and `used`, and re-anchored on
+    /// This load advanced by `charged` and `used`, and re-anchored on
     /// `substate_bytes`.
     ///
     /// The successor relation the proposer applies and every verifier
     /// recomputes, so neither side can drift on the arithmetic.
     #[must_use]
-    pub const fn advance(self, work: u64, used: DeclaredWork, substate_bytes: Option<u64>) -> Self {
+    pub const fn advance(
+        self,
+        charged: u128,
+        used: DeclaredWork,
+        substate_bytes: Option<u64>,
+    ) -> Self {
         Self {
-            cumulative_work: self.cumulative_work.saturating_add(work),
+            cumulative_fees: self.cumulative_fees.saturating_add(charged),
             used: self.used.saturating_add(used),
             substate_bytes,
         }
@@ -227,20 +232,20 @@ mod tests {
     fn advance_accumulates_the_flows_and_replaces_the_byte_level() {
         let start = ShardLoad::ZERO;
         let next = start.advance(70, compute(7), Some(4_096));
-        assert_eq!(next.cumulative_work, 70);
+        assert_eq!(next.cumulative_fees, 70);
         assert_eq!(next.used.compute, 7);
         assert_eq!(next.substate_bytes, Some(4_096));
 
         // Both flows accumulate; the byte total is a level, so it
         // replaces.
         let later = next.advance(30, compute(3), Some(8_192));
-        assert_eq!(later.cumulative_work, 100);
+        assert_eq!(later.cumulative_fees, 100);
         assert_eq!(later.used.compute, 10);
         assert_eq!(later.substate_bytes, Some(8_192));
 
         // An unresolved byte total does not disturb either flow.
         let unresolved = later.advance(5, compute(1), None);
-        assert_eq!(unresolved.cumulative_work, 105);
+        assert_eq!(unresolved.cumulative_fees, 105);
         assert_eq!(unresolved.used.compute, 11);
         assert_eq!(unresolved.substate_bytes, None);
 
@@ -260,9 +265,9 @@ mod tests {
 
     #[test]
     fn saturating_accumulation_does_not_wrap() {
-        let brim = ShardLoad::ZERO.advance(u64::MAX, compute(u64::MAX), None);
+        let brim = ShardLoad::ZERO.advance(u128::MAX, compute(u64::MAX), None);
         let past = brim.advance(1_000, compute(1_000), None);
-        assert_eq!(past.cumulative_work, u64::MAX);
+        assert_eq!(past.cumulative_fees, u128::MAX);
         assert_eq!(past.used.compute, u64::MAX);
     }
 
@@ -271,7 +276,7 @@ mod tests {
         for load in [
             ShardLoad::ZERO,
             ShardLoad::ZERO.advance(1, compute(1), Some(0)),
-            ShardLoad::ZERO.advance(u64::MAX, compute(u64::MAX), Some(u64::MAX)),
+            ShardLoad::ZERO.advance(u128::MAX, compute(u64::MAX), Some(u64::MAX)),
         ] {
             let bytes = hbor_to_vec(&load).unwrap();
             assert_eq!(hbor_from_slice::<ShardLoad>(&bytes).unwrap(), load);

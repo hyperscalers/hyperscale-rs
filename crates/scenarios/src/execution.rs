@@ -763,20 +763,20 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
 
     // Wait for both shards to fold a crossing carrying a non-zero mark.
     let both_attested = |c: &_| {
-        recorded_gas(c, left).is_some_and(|g| g > 0)
-            && recorded_gas(c, right).is_some_and(|g| g > 0)
+        recorded_fees(c, left).is_some_and(|g| g > 0)
+            && recorded_fees(c, right).is_some_and(|g| g > 0)
     };
     assert!(
         c.run_until(epochs(24), both_attested),
         "attested work never reached the beacon: left = {:?}, right = {:?}",
-        recorded_gas(c, left),
-        recorded_gas(c, right),
+        recorded_fees(c, left),
+        recorded_fees(c, right),
     );
 
     // The counterpart burned no fee and still attested its work — without
     // this the emission weighting would pay it only the participation
     // floor, and cross-shard execution would be unfunded.
-    let counterpart_gas = recorded_gas(c, right).expect("counterpart record present");
+    let counterpart_gas = recorded_fees(c, right).expect("counterpart record present");
     assert!(
         counterpart_gas > 0,
         "the counterpart shard attested no work for a leg it executed"
@@ -825,10 +825,10 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
     // Settle any earlier traffic so the mark below moves only for the
     // failure this scenario submits.
     assert!(
-        c.run_until(epochs(4), |c| recorded_gas(c, shard).is_some()),
+        c.run_until(epochs(4), |c| recorded_fees(c, shard).is_some()),
         "the beacon never folded a crossing for the shard"
     );
-    let before = recorded_gas(c, shard).expect("a folded crossing");
+    let before = recorded_fees(c, shard).expect("a folded crossing");
     let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
     let mut charges = Charges::default();
 
@@ -848,7 +848,7 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
     // verdict produces no receipt, so the attestation must ride the
     // outcome itself for the mark to move.
     assert!(
-        c.run_until(epochs(24), |c| recorded_gas(c, shard)
+        c.run_until(epochs(24), |c| recorded_fees(c, shard)
             .is_some_and(|now| now > before)),
         "a failed attempt attested no work: mark stuck at {before}"
     );
@@ -856,9 +856,9 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
 
 /// The gas mark on `shard`'s boundary record, if the beacon has folded a
 /// crossing for it.
-fn recorded_gas<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
+fn recorded_fees<C: Cluster>(c: &C, shard: ShardId) -> Option<u128> {
     c.beacon_state()
-        .and_then(|state| state.boundaries.get(&shard).map(|b| b.attested_work))
+        .and_then(|state| state.boundaries.get(&shard).map(|b| b.cumulative_fees))
 }
 
 /// The stored-byte level on `shard`'s boundary record.

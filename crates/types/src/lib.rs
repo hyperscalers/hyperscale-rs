@@ -203,7 +203,7 @@ pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
     TerminalRef, VerifiedBlockAssembleError, WitnessSources, derive_block_transactions,
-    work_over_certificates,
+    fees_over_certificates,
 };
 pub use signing::{
     BeaconRevealMessage, BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage,
