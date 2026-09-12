@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{NetworkDefinition, NetworkId, ShardId, Transaction};
 use rand::{Rng, RngExt};
 
@@ -138,6 +138,7 @@ impl TransferWorkload {
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
                     validity: (self.validity_clock)(),
+                    ceilings: Ceilings::Guessed,
                     message: nonce.to_le_bytes().to_vec(),
                 },
             )

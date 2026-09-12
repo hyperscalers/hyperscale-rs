@@ -20,7 +20,7 @@ use hyperscale_engine::{
     genesis_writes,
 };
 use hyperscale_storage::Substates;
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
     MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, ShardId,
@@ -170,6 +170,7 @@ const fn terms(max_fee: u128) -> Terms {
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(OFFER_MS),
         ),
+        ceilings: Ceilings::Guessed,
         message: Vec::new(),
     }
 }

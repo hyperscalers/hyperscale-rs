@@ -17,7 +17,7 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::TypeShape;
-use hyperscale_transactions::{Client, Terms, default_gas_limits, principal_of};
+use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
     AccountSigner, BASIS_POINTS, ComponentAddr, ConsensusPublicKey, ConsensusSignature,
     Ed25519PrivateKey, EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE,
@@ -1238,6 +1238,7 @@ pub fn build_instantiate_tx(
         Terms {
             max_fee: MAX_FEE,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     ))
@@ -1334,6 +1335,7 @@ fn build_lottery_tx(
         Terms {
             max_fee: MAX_FEE,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     ))
@@ -1955,6 +1957,7 @@ fn build_venues_tx(
         Terms {
             max_fee: MAX_FEE,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     ))
@@ -2020,6 +2023,7 @@ pub fn build_instance_instantiate_tx(
         Terms {
             max_fee: MAX_FEE,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     ))
@@ -2327,6 +2331,7 @@ pub fn build_composed_tx(
         Terms {
             max_fee: 1_000,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     ))
@@ -2424,6 +2429,7 @@ fn envelope<S: AccountSigner>(
         Terms {
             max_fee: MAX_FEE,
             validity,
+            ceilings: Ceilings::Guessed,
             message: Vec::new(),
         },
     )

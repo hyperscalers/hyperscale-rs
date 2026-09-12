@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{NetworkDefinition, NetworkId, PrincipalAddr, ShardId, Transaction};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -671,6 +671,7 @@ impl PartitionWorkload {
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
                     validity: validity_range_for_now(),
+                    ceilings: Ceilings::Guessed,
                     message: nonce.to_le_bytes().to_vec(),
                 },
             )
