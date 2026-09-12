@@ -832,6 +832,12 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128)
     let Some(payer) = fee else {
         return;
     };
+    // The ceiling binds only where the price was never judged against
+    // it: a preview prices an envelope at whatever table its caller's
+    // head names, and answers what that would cost rather than refusing
+    // it. On the commit path admission has already refused a
+    // transaction whose price is past its ceiling, at the same table
+    // this burns under, so the two figures meet there.
     let burn = amount.min(payer.max_fee);
     if burn == 0 {
         return;
@@ -864,7 +870,8 @@ pub struct PayerFee {
     /// any burn reaches.
     pub max_fee: u128,
     /// The declared price — what every attempt owes, whatever refused
-    /// it, derived from signed content before anything runs.
+    /// it, derived from signed content and the committing block's table
+    /// before anything runs.
     pub price: u128,
     /// Whether a tick can abort this transaction after it executed —
     /// true for a cross-shard leg, which is the one shape whose effects

@@ -41,6 +41,14 @@ struct Candidate {
     /// committing block's however many ticks later the member runs: the
     /// transaction was admitted against that clock.
     committed_ts: WeightedTimestamp,
+    /// The table the committing block's own committee named, which
+    /// prices this shard's share of the transaction.
+    ///
+    /// Carried rather than resolved again at composition: the block that
+    /// committed the member is what froze its abandonment's figures, and
+    /// a member that reaches an engine has to attest what a member that
+    /// never does would have restated.
+    committed_prices: PriceTable,
     /// Counterpart shards whose engagement echo this shard, as the fee
     /// payer, still waits for. Empty for every other transaction.
     engagement_pending: BTreeSet<ShardId>,
@@ -121,6 +129,14 @@ pub struct Admitted {
     /// payer's leg whose counterparts never engaged runs and is attested
     /// `Aborted` regardless.
     pub admission: Admission,
+    /// The table the block that committed this member named.
+    ///
+    /// What its own share is priced at: the abandonment of a member that
+    /// never reaches an engine restates the figure its committing block
+    /// froze, so a member that does reach one attests the same figure.
+    /// The clock the request carries is the payer's and prices the burn;
+    /// this is this chain's and prices what it attests.
+    pub committed_prices: PriceTable,
 }
 
 impl Admitted {
@@ -152,11 +168,12 @@ impl TickCandidates {
         tx: Arc<Verified<Transaction>>,
         participating: BTreeSet<ShardId>,
         committed_ts: WeightedTimestamp,
+        committed_prices: PriceTable,
         classified: Classified,
     ) {
         let side = classified.first_side_at(self.local_shard);
         let member = Member::of(classified, self.local_shard, side, participating);
-        self.register_member(tx, member, committed_ts);
+        self.register_member(tx, member, committed_ts, committed_prices);
     }
 
     /// Record `member` of `tx` as a candidate, under the clock of the
@@ -172,11 +189,13 @@ impl TickCandidates {
         tx: Arc<Verified<Transaction>>,
         member: Member,
         committed_ts: WeightedTimestamp,
+        committed_prices: PriceTable,
     ) {
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
             member,
             committed_ts,
+            committed_prices,
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
         });
@@ -305,6 +324,7 @@ impl TickCandidates {
                 } else {
                     Admission::ExecutesAborted
                 },
+                committed_prices: candidate.committed_prices,
             });
             taken.push(tx_hash);
         }
@@ -402,7 +422,13 @@ mod tests {
 
     fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000), Classified::whole());
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL]),
+            ms(1_000),
+            PriceTable::GENESIS,
+            Classified::whole(),
+        );
         hash
     }
 
@@ -424,6 +450,39 @@ mod tests {
         assert!(candidates.is_empty(), "and leaves the pool with the tick");
     }
 
+    /// A member is composed under the table its committing block named,
+    /// however far the schedule has moved since.
+    ///
+    /// What a shard attests it charged is the figure its own block
+    /// froze — the one an abandonment of the same member would restate —
+    /// so the table travels with the candidate rather than being
+    /// resolved again where the tick composes.
+    #[test]
+    fn a_member_carries_the_table_its_committing_block_named() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let moved = PriceTable {
+            compute: PriceTable::GENESIS.compute * 2,
+            ..PriceTable::GENESIS
+        };
+        candidates.register(
+            tx(1),
+            BTreeSet::from([LOCAL]),
+            ms(1_000),
+            moved,
+            Classified::whole(),
+        );
+        let admitted = candidates.compose(
+            &ProvisioningTracker::new(),
+            &mut ProvisionalCells::default(),
+            ms(9_000),
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted[0].committed_prices, moved,
+            "the committing block's table, not the composing tick's"
+        );
+    }
+
     /// A cross-shard member waits for the provisions its counterparts owe
     /// it, and waiting costs it nothing but latency — it has said nothing.
     #[test]
@@ -436,6 +495,7 @@ mod tests {
             tx,
             BTreeSet::from([LOCAL, remote]),
             ms(1_000),
+            PriceTable::GENESIS,
             Classified::whole(),
         );
 
@@ -474,6 +534,7 @@ mod tests {
                 BTreeSet::from([LOCAL, remote]),
             ),
             ms(1_000),
+            PriceTable::GENESIS,
         );
         let issuing = local_only(&mut candidates, tx(7));
 
@@ -513,6 +574,7 @@ mod tests {
             tx,
             BTreeSet::from([LOCAL, remote]),
             ms(1_000),
+            PriceTable::GENESIS,
             Classified::whole(),
         );
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
@@ -541,6 +603,7 @@ mod tests {
             tx,
             BTreeSet::from([LOCAL, remote]),
             ms(1_000),
+            PriceTable::GENESIS,
             Classified::whole(),
         );
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
@@ -594,7 +657,13 @@ mod tests {
         let mut candidates = TickCandidates::new(local);
         let tx = tx(5);
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([local, venue]), ms(1_000), classified);
+        candidates.register(
+            tx,
+            BTreeSet::from([local, venue]),
+            ms(1_000),
+            PriceTable::GENESIS,
+            classified,
+        );
         let mut provisioning = ProvisioningTracker::new();
         provisioning.record_required(hash, BTreeSet::new());
 
@@ -642,7 +711,13 @@ mod tests {
         for seed in [1, 2] {
             let tx = contending(seed);
             provisioning.record_required(tx.hash(), BTreeSet::new());
-            whole.register(tx, participating.clone(), ms(1_000), Classified::whole());
+            whole.register(
+                tx,
+                participating.clone(),
+                ms(1_000),
+                PriceTable::GENESIS,
+                Classified::whole(),
+            );
         }
         let mut held = ProvisionalCells::default();
         let admitted = whole.compose(&provisioning, &mut held, ms(1_000));
@@ -655,7 +730,13 @@ mod tests {
         let mut divided = TickCandidates::new(venue);
         for seed in [1, 2] {
             let tx = contending(seed);
-            divided.register(tx, participating.clone(), ms(1_000), classified.clone());
+            divided.register(
+                tx,
+                participating.clone(),
+                ms(1_000),
+                PriceTable::GENESIS,
+                classified.clone(),
+            );
         }
         let mut held = ProvisionalCells::default();
         let admitted = divided.compose(&provisioning, &mut held, ms(1_000));
