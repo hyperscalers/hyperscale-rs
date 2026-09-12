@@ -70,16 +70,23 @@ pub type SharedCertificates = Arc<Vec<Arc<Verifiable<Finalization>>>>;
 /// Shared provision list — same rationale as [`SharedCertificates`].
 pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
 
-/// Gas a shard consumed across the ticks `certificates` settle.
+/// What a shard charged across the ticks `certificates` settle, in
+/// quanta.
 ///
-/// Free-standing so the proposer can price the certificates it selected
+/// Free-standing so the proposer can total the certificates it selected
 /// before the header those certificates go under exists, while
-/// [`Block::gas_consumed`] answers the same question for a built block.
-/// One derivation, so the two sides cannot drift.
+/// [`Block::charged`] answers the same question for a built block. One
+/// derivation, so the two sides cannot drift.
+///
+/// The fee and not the fuel: what a shard did for the network is what
+/// the network paid it to do, and the price is a pure function of signed
+/// content — so a proposer inflating its shard's emission weight has to
+/// inflate transactions its committee admitted and priced, rather than a
+/// figure its own engine reported.
 #[must_use]
-pub fn work_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u64 {
-    certificates.iter().fold(0u64, |sum, tick| {
-        sum.saturating_add(tick.as_unverified().attested_work())
+pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u128 {
+    certificates.iter().fold(0u128, |sum, tick| {
+        sum.saturating_add(tick.as_unverified().charged())
     })
 }
 
@@ -490,21 +497,22 @@ impl Block {
         Demands::of(self)
     }
 
-    /// Gas this shard consumed across the ticks the block settles.
+    /// What this shard charged across the ticks the block settles, in
+    /// quanta.
     ///
-    /// The increment behind the header's running gas total, and the reason
-    /// that total is checkable: a block's certificates carry their own
-    /// receipts and survive sealing, so the block that claims the total
-    /// also carries the evidence for its own contribution. Proposer and
-    /// verifier both read this, so neither can drift from the other.
+    /// The increment behind the header's running fee total, and the
+    /// reason that total is checkable: a block's certificates carry their
+    /// own receipts and survive sealing, so the block that claims the
+    /// total also carries the evidence for its own contribution. Proposer
+    /// and verifier both read this, so neither can drift from the other.
     ///
     /// Attribution follows settlement rather than execution — the only
     /// division derivable from one block's content. The running total is
-    /// unaffected; only which epoch a given transaction's gas falls into
+    /// unaffected; only which epoch a given transaction's fee falls into
     /// can shift by the settlement lag.
     #[must_use]
-    pub fn attested_work(&self) -> u64 {
-        work_over_certificates(self.certificates())
+    pub fn charged(&self) -> u128 {
+        fees_over_certificates(self.certificates())
     }
 
     /// Provisions. Non-empty only for `Live`; `Sealed` blocks have

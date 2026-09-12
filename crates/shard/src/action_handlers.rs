@@ -33,9 +33,9 @@ use hyperscale_types::{
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
     VrfProof, WeightedTimestamp, Window, WitnessSources, absorb_committed_cells,
-    commit_witness_window, derive_leaves, local_settled_tx_hashes,
+    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, vrf_output_from_proof, work_over_certificates,
+    signed_bytes, vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -374,7 +374,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // zero baseline; a voter that cannot resolve the parent abstains
     // from the load check on its side.
     let load = parent_load.unwrap_or(ShardLoad::ZERO).advance(
-        work_over_certificates(&certificates),
+        fees_over_certificates(&certificates),
         local_work_over(
             transactions.iter().map(|tx| &***tx),
             topology_snapshot.shard_trie(),

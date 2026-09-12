@@ -249,9 +249,8 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 }
 
 /// The header's running totals must be their parent's advanced by what
-/// this block carries: the attested one by the work its certificates
-/// report, the declared one by what its transactions reserve on this
-/// shard.
+/// this block carries: the fee total by what its certificates charged,
+/// the declared one by what its transactions reserve on this shard.
 ///
 /// `used` is the transactions section's own fold, handed back rather
 /// than summed a second time: what a header claims its blocks reserved
@@ -278,16 +277,16 @@ fn validate_block_work(
         );
         return Ok(());
     };
-    let expected = parent_load.advance(block.attested_work(), used, None);
+    let expected = parent_load.advance(block.charged(), used, None);
     let claimed = block.header().load();
-    if claimed.cumulative_work != expected.cumulative_work {
+    if claimed.cumulative_fees != expected.cumulative_fees {
         return Err(format!(
-            "header claims cumulative work {} but the parent's {} \
+            "header claims cumulative fees {} but the parent's {} \
              plus this block's {} is {}",
-            claimed.cumulative_work,
-            parent_load.cumulative_work,
-            block.attested_work(),
-            expected.cumulative_work,
+            claimed.cumulative_fees,
+            parent_load.cumulative_fees,
+            block.charged(),
+            expected.cumulative_fees,
         ));
     }
     if claimed.used != expected.used {
@@ -466,14 +465,15 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
-        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, Finalization,
-        Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
-        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
-        Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
+        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline,
+        ExecutionOutcome, Finalization, Hash, Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
+        TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1285,13 +1285,13 @@ mod tests {
         // The fixture carries no certificates and no transactions, so the
         // honest claim is the parent's totals unchanged.
         let honest = block_with_transactions(BlockHeight::new(1), Vec::new());
-        assert_eq!(honest.attested_work(), 0);
+        assert_eq!(honest.charged(), 0);
         assert_eq!(honest.header().load(), ShardLoad::ZERO);
 
         // Claiming zero against a parent that has consumed 500 understates,
         // and is refused just as an overstatement is.
         let err = validate_block_work(&honest, Some(parent), DeclaredWork::ZERO).unwrap_err();
-        assert!(err.contains("cumulative work"), "{err}");
+        assert!(err.contains("cumulative fees"), "{err}");
 
         // The declared total is held to the same rule, and on its own:
         // a parent that reserved something and a block that reserves
@@ -1305,6 +1305,45 @@ mod tests {
 
         // An unresolvable parent load abstains rather than rejecting.
         assert!(validate_block_work(&honest, None, DeclaredWork::ZERO).is_ok());
+    }
+
+    /// An abort is charged like anything else, so a block settling
+    /// nothing but aborts still advances its chain's fee total.
+    ///
+    /// The price is owed on every outcome — the network routed,
+    /// provisioned and ran a batch for the transaction whichever verdict
+    /// it reached — so an emission weight read off these totals must not
+    /// go to zero for a shard whose epoch went badly.
+    #[test]
+    fn a_block_of_nothing_but_aborts_still_advances_the_fee_total() {
+        let charged = 4_096u128;
+        let aborted = test_utils::finalization_of(
+            BlockHeight::new(1),
+            vec![
+                TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(b"one")),
+                    ExecutionOutcome::Failed,
+                )
+                .reserving(charged),
+                TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(b"two")),
+                    ExecutionOutcome::Failed,
+                )
+                .reserving(charged),
+            ],
+        );
+        let block = block_with_certificates(BlockHeight::new(1), vec![Arc::new(aborted)]);
+        assert_eq!(
+            block.charged(),
+            charged * 2,
+            "every outcome carries its charge, whatever it decided"
+        );
+
+        // The header has to claim exactly that, and nothing less.
+        let parent = ShardLoad::ZERO;
+        let err = validate_block_work(&block, Some(parent), DeclaredWork::ZERO)
+            .expect_err("the fixture header claims its parent's total unchanged");
+        assert!(err.contains("cumulative fees"), "{err}");
     }
 
     fn tx(seed: u8) -> Arc<Verifiable<Transaction>> {
