@@ -680,7 +680,8 @@ impl Executor {
             &routing,
             &legs,
             envelope_bytes(vm).map_err(|error| error.to_string())?,
-        );
+        )
+        .map_err(|refusal| refusal.to_string())?;
         let work = whole_work(&shares, &node_terms, everywhere);
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause

@@ -34,8 +34,8 @@ use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
-    LegShape, LocalKey, MAX_EVENT_BYTES_PER_TX, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId,
-    SubstateKey, read_bytes, write_bytes,
+    LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
+    TermsRefusal, admit_event_bounds, read_bytes, write_bytes,
 };
 
 use crate::ProtocolHasher;
@@ -126,14 +126,21 @@ const fn target_owner(target: &EffectTarget) -> Address {
 ///
 /// `envelope_bytes` is the envelope's own encoded length, the one term
 /// of retention no derivation of the tree can see.
-#[must_use]
+///
+/// # Errors
+///
+/// [`TermsRefusal::EventBytesSum`] where the methods the manifest calls
+/// may emit more between them than a receipt may carry. Refused here
+/// rather than held to the cap, because the sum is what retention
+/// prices and a figure clipped to the cap would price less than the
+/// frames may spend.
 pub fn declared_vector(
     packages: &PackageCache,
     vm: &TransactionEnvelope,
     routing: &RoutedTransaction,
     legs: &[LegShape],
     envelope_bytes: u64,
-) -> DeclaredVector {
+) -> Result<DeclaredVector, TermsRefusal> {
     let mut by_owner: BTreeMap<Address, DeclaredWork> = BTreeMap::new();
     let mut add = |owner: Address, term: DeclaredWork| {
         let share = by_owner.entry(owner).or_default();
@@ -236,27 +243,14 @@ pub fn declared_vector(
         &shares,
         envelope_bytes,
         vm.signatures(),
-        event_bytes_total(&event_bytes),
+        admit_event_bounds(&event_bytes)?,
     );
-    DeclaredVector {
+    Ok(DeclaredVector {
         shares,
         node_terms,
         everywhere,
         event_bytes,
-    }
-}
-
-/// What a transaction's calls may emit between them, in bytes.
-///
-/// Saturating at the receipt's own cap, which the transaction's
-/// admission holds the sum under, so the figure a block prices and the
-/// figure a receipt can carry are one.
-#[must_use]
-pub fn event_bytes_total(per_call: &[u32]) -> u64 {
-    per_call
-        .iter()
-        .fold(0u64, |total, bytes| total.saturating_add(u64::from(*bytes)))
-        .min(MAX_EVENT_BYTES_PER_TX as u64)
+    })
 }
 
 /// Whether the envelope's subintent signatures answer the tree it binds:
@@ -928,7 +922,8 @@ impl Derivation for BridgeStatics {
             node_terms,
             everywhere,
             ..
-        } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?);
+        } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?)
+            .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
         let work = whole_work(&shares, &node_terms, everywhere);
         Ok(Derived {
             effective_window,
@@ -1458,6 +1453,27 @@ mod tests {
         assert!(
             derived.work.retention >= envelope_bytes + derived.work.write_bytes + moving,
             "retention carries the envelope, the writes and each call's own event bound"
+        );
+        // The sum over the calls and nothing else: a second movement
+        // pair adds its own bound again, so what retention prices is
+        // what the frames may spend between them rather than one
+        // package's figure or the cap they are held under.
+        let twice = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 3, RES_X),
+        ]);
+        let wider_vm = envelope(&twice, &[]);
+        let twice = statics().derive(&wider_vm).expect("derives");
+        let wider_bytes = super::envelope_bytes(&wider_vm).expect("encodes");
+        assert_eq!(
+            twice.work.retention - derived.work.retention,
+            moving
+                + (twice.work.write_bytes - derived.work.write_bytes)
+                + (wider_bytes - envelope_bytes),
+            "the second pair adds its own event bound, its own writes and its own envelope"
         );
         // The fixture statics know the account package's metadata and
         // not its artifact, so nothing is read for it; a statics that
