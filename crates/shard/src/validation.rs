@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, LeafRoot, LocalTimestamp, MAX_ROUND_GAP,
-    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, LeafRoot, LocalTimestamp,
+    MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
     StateClaimsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
 };
 
@@ -248,14 +248,25 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
     verify_hash_sorted(block.transactions(), "transactions")
 }
 
-/// The header's running work total must be its parent's advanced by the
-/// work the block's own certificates report.
+/// The header's running totals must be their parent's advanced by what
+/// this block carries: the attested one by the work its certificates
+/// report, the declared one by what its transactions reserve on this
+/// shard.
 ///
-/// Pure over the block plus one scalar off the parent header, which is what
-/// keeps a shard's attested work honest without any storage read: a
+/// `used` is the transactions section's own fold, handed back rather
+/// than summed a second time: what a header claims its blocks reserved
+/// has to be the figure the block's caps admitted it against, and two
+/// spellings of the sum could differ.
+///
+/// Pure over the block plus one load off the parent header, which is what
+/// keeps a shard's figures honest without any storage read: a
 /// proposer inflating its shard's emission weight has to inflate receipts
 /// its committee already checked under `local_receipt_root`.
-fn validate_block_work(block: &Block, parent_load: Option<ShardLoad>) -> Result<(), String> {
+fn validate_block_work(
+    block: &Block,
+    parent_load: Option<ShardLoad>,
+    used: DeclaredWork,
+) -> Result<(), String> {
     // An unresolvable parent load is this node's own gap, not the block's,
     // so it abstains rather than rejecting: recovery reads the scalar off
     // the committed tip's stored header and a fresh start seeds `ZERO`, so
@@ -267,16 +278,23 @@ fn validate_block_work(block: &Block, parent_load: Option<ShardLoad>) -> Result<
         );
         return Ok(());
     };
-    let claimed = block.header().load().cumulative_work;
-    let expected = parent_load
-        .advance(block.attested_work(), None)
-        .cumulative_work;
-    if claimed != expected {
+    let expected = parent_load.advance(block.attested_work(), used, None);
+    let claimed = block.header().load();
+    if claimed.cumulative_work != expected.cumulative_work {
         return Err(format!(
-            "header claims cumulative work {claimed} but the parent's {} \
-             plus this block's {} is {expected}",
+            "header claims cumulative work {} but the parent's {} \
+             plus this block's {} is {}",
+            claimed.cumulative_work,
             parent_load.cumulative_work,
             block.attested_work(),
+            expected.cumulative_work,
+        ));
+    }
+    if claimed.used != expected.used {
+        return Err(format!(
+            "header claims the chain has reserved {:?} but the parent's \
+             {:?} plus this block's {used:?} is {:?}",
+            claimed.used, parent_load.used, expected.used,
         ));
     }
     Ok(())
@@ -299,16 +317,21 @@ pub fn validate_block_for_vote(
     if coasting {
         validate_coast_block_empty(block)?;
     }
-    validate_block_work(block, parent_load)?;
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_roots_commit_sections(block)?;
-    admit_sections(ctx, block)
+    // The sections first, because the load check reads what the
+    // transactions section folded rather than summing it again.
+    let budget = admit_sections(ctx, block)?;
+    validate_block_work(block, parent_load, budget)
 }
 
 /// Every section's items through its [`Section`](crate::admission::Section)
 /// predicate, in the order the folds depend on.
-pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<(), String> {
+///
+/// Returns what the block's transactions reserve on this shard, which
+/// the header's own claim is checked against.
+pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<DeclaredWork, String> {
     let mut provisions = ProvisionsFold::default();
     admit_all::<ProvisionsSection>(
         ctx,
@@ -331,7 +354,7 @@ pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<(), String> 
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
     let mut state_claims = StateClaimsFold::default();
     admit_all::<StateClaimsSection>(ctx, &mut state_claims, block.state_claims())?;
-    Ok(())
+    Ok(transactions.budget)
 }
 
 /// The header's abandonment root and state-claims root commit the
@@ -459,7 +482,7 @@ mod tests {
 
     /// Admit `block`'s sections against `against`.
     fn admit(against: &Against, block: &Block) -> Result<(), String> {
-        admit_sections(&against.ctx(), block)
+        admit_sections(&against.ctx(), block).map(|_| ())
     }
 
     /// Admission under the test committee, with nothing behind the parent.
@@ -1246,30 +1269,42 @@ mod tests {
         assert!(err.contains("over the section's budget"), "{err}");
     }
 
-    /// The running work total is a validity condition, not a hint: a header
-    /// claiming more than its parent's total plus its own certificates'
-    /// work is rejected, and the honest claim passes. A block with no
-    /// certificates consumes nothing, so it must repeat its parent's total
-    /// rather than reset.
+    /// The running totals are validity conditions, not hints: a header
+    /// claiming more than its parent's plus what this block carries is
+    /// rejected, and the honest claim passes. A block with no
+    /// certificates consumes nothing and one with no transactions
+    /// reserves nothing, so either must repeat its parent's total rather
+    /// than reset.
     #[test]
-    fn a_header_cannot_overstate_the_work_of_its_shard() {
-        let parent = ShardLoad::ZERO.advance(500, None);
-        // The fixture carries no certificates, so the honest claim is the
-        // parent's total unchanged.
+    fn a_header_cannot_overstate_the_load_of_its_shard() {
+        let reserved = DeclaredWork {
+            compute: 64,
+            ..DeclaredWork::ZERO
+        };
+        let parent = ShardLoad::ZERO.advance(500, reserved, None);
+        // The fixture carries no certificates and no transactions, so the
+        // honest claim is the parent's totals unchanged.
         let honest = block_with_transactions(BlockHeight::new(1), Vec::new());
         assert_eq!(honest.attested_work(), 0);
-        assert_eq!(honest.header().load().cumulative_work, 0);
+        assert_eq!(honest.header().load(), ShardLoad::ZERO);
 
         // Claiming zero against a parent that has consumed 500 understates,
         // and is refused just as an overstatement is.
-        let err = validate_block_work(&honest, Some(parent)).unwrap_err();
+        let err = validate_block_work(&honest, Some(parent), DeclaredWork::ZERO).unwrap_err();
         assert!(err.contains("cumulative work"), "{err}");
 
+        // The declared total is held to the same rule, and on its own:
+        // a parent that reserved something and a block that reserves
+        // nothing must still repeat the parent's vector.
+        let carried = ShardLoad::ZERO.advance(0, reserved, None);
+        let err = validate_block_work(&honest, Some(carried), DeclaredWork::ZERO).unwrap_err();
+        assert!(err.contains("has reserved"), "{err}");
+
         // The matching claim passes.
-        assert!(validate_block_work(&honest, Some(ShardLoad::ZERO)).is_ok());
+        assert!(validate_block_work(&honest, Some(ShardLoad::ZERO), DeclaredWork::ZERO).is_ok());
 
         // An unresolvable parent load abstains rather than rejecting.
-        assert!(validate_block_work(&honest, None).is_ok());
+        assert!(validate_block_work(&honest, None, DeclaredWork::ZERO).is_ok());
     }
 
     fn tx(seed: u8) -> Arc<Verifiable<Transaction>> {

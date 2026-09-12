@@ -594,11 +594,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::{
-        BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
-        HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR, PendingReshape, Randomness,
-        RecoveryCause, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake,
-        StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
-        WeightedTimestamp,
+        BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight,
+        DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR,
+        PendingReshape, Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId,
+        ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
+        ValidatorId, ValidatorStatus, WeightedTimestamp,
     };
 
     use super::{
@@ -1898,6 +1898,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: 0,
             last_live_epoch: Epoch::new(1),
@@ -1924,6 +1925,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: 0,
             last_live_epoch: Epoch::GENESIS,

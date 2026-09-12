@@ -101,11 +101,12 @@ pub use hyperscale_crypto::{
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, CallTarget, CollectionId,
-    ComponentAddr, Compose, DeclaredWork, EntryKey, EntryLeaf, InvalidAddress, LEAF_KEY_BYTES,
-    LocalKey, MAX_CELL_VALUE_LEN, MAX_GAS_LIMIT, Mode, ModeKind, Movement, NativeAddr, NotCallable,
-    OverDebit, PackageAddr, Presence, PriceTable, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES,
-    SWEEP_BUCKET_SHIFT, SchemeId, SettledCells, SettledEntries, SettledWrites, StateWrites,
-    SubstateKey, SweepBucket, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
+    ComponentAddr, Compose, DeclaredWork, EntryKey, EntryLeaf, FiveWay, InvalidAddress,
+    LEAF_KEY_BYTES, LocalKey, MAX_CELL_VALUE_LEN, MAX_GAS_LIMIT, Mode, ModeKind, Movement,
+    NativeAddr, NotCallable, OverDebit, PackageAddr, Presence, PriceBounds, PriceTable,
+    PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId, SettledCells,
+    SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket, Utilization, amount_cell,
+    compatible, encode_amount, entry_leaf_key, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,

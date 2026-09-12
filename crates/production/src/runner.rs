@@ -1792,7 +1792,7 @@ fn served_departed_shards(
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, Epoch, StateRoot, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, StateRoot, WeightedTimestamp,
     };
 
     use super::*;
@@ -1807,6 +1807,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
+            used: DeclaredWork::ZERO,
             attested_work: 0,
             substate_bytes: 0,
             last_live_epoch: Epoch::GENESIS,

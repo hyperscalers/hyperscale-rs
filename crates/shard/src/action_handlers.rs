@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
@@ -367,13 +367,21 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         .map(|fw| fw.as_unverified().tick_id().block_height())
         .fold(parent_settled_frontier, BlockHeight::max);
 
-    // The running gas total: the parent's advanced by what this block's
-    // certificates report. An unresolvable parent load falls back to a
+    // The running totals: the attested one advanced by what this block's
+    // certificates report, and the declared one by what its transactions
+    // reserve on this shard — the same figure the block's own caps
+    // admitted it against. An unresolvable parent load falls back to a
     // zero baseline; a voter that cannot resolve the parent abstains
     // from the load check on its side.
-    let load = parent_load
-        .unwrap_or(ShardLoad::ZERO)
-        .advance(work_over_certificates(&certificates), substate_bytes);
+    let load = parent_load.unwrap_or(ShardLoad::ZERO).advance(
+        work_over_certificates(&certificates),
+        local_work_over(
+            transactions.iter().map(|tx| &***tx),
+            topology_snapshot.shard_trie(),
+            local_shard,
+        ),
+        substate_bytes,
+    );
 
     // What departed shards left unresolved, committed so a verdict on it
     // outlives the settled set the records were read from.
