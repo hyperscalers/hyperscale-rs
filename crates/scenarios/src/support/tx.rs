@@ -19,11 +19,11 @@ use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
-    AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
-    EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
-    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
-    ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    AccountSigner, BASIS_POINTS, ComponentAddr, ConsensusPublicKey, ConsensusSignature,
+    Ed25519PrivateKey, EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE,
+    MIN_STAKE_FLOOR, MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr,
+    SchemeId, ShardId, ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange,
+    Transaction, TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
     ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
@@ -2459,6 +2459,11 @@ pub fn build_reshape_threshold_vote_tx(
                 b,
                 split_bytes,
                 NetworkParams::default().impound_epochs,
+                // An even band: this vote is about the reshape
+                // threshold, so it leaves every price row where the
+                // reference table put it.
+                u64::from(BASIS_POINTS),
+                u64::from(BASIS_POINTS),
                 activate_at.inner(),
             )
         })

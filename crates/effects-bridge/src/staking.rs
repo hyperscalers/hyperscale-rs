@@ -200,11 +200,15 @@ pub fn witness_from_event(
 /// recorded.
 ///
 /// A vote names the whole parameter set, because the tally buckets by it
-/// and two pools agree only if they agree on every row. So a governed
-/// row the pool's vocabulary does not carry is one a winning vote writes
-/// its seed value into — which is sound only while nothing else moves
-/// that row, and the literal below is what makes the compiler ask again
-/// the next time a row is added.
+/// and two pools agree only if they agree on every row — so every
+/// governed row is one the pool's vocabulary carries, and the literal
+/// below is what makes the compiler ask again the next time one is
+/// added.
+///
+/// The price band widens to the per-row interval here: a pool states how
+/// far a price may travel from the reference table and the bounds are
+/// that band applied to each row, so what the vote says is policy and
+/// what the rows are worth against each other stays measurement.
 const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
     ParamProposal {
         params: NetworkParams {
@@ -212,12 +216,29 @@ const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
                 split_bytes: vote.split_bytes,
             },
             impound_epochs: vote.impound_epochs,
-            // The pool's vote does not carry the price bounds, so it
-            // backs the seed interval. Nothing else moves them, so no
-            // vote overwrites a figure anyone chose.
-            price_bounds: PriceBounds::GENESIS,
+            price_bounds: PriceBounds::band(
+                basis_points(vote.price_floor_bp),
+                basis_points(vote.price_ceiling_bp),
+            ),
         },
         activate_at: Epoch::new(vote.activate_at),
+    }
+}
+
+/// A pool's basis-point figure, narrowed to what a band takes.
+///
+/// A figure past the width saturates rather than wrapping: the fold
+/// judges the resulting bounds on their own terms, and a wrapped one
+/// would read as a band nobody voted for rather than as an
+/// inadmissible one.
+const fn basis_points(stated: u64) -> u32 {
+    if stated > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        #[allow(clippy::cast_possible_truncation)] // guarded on the line above
+        {
+            stated as u32
+        }
     }
 }
 
@@ -432,13 +453,21 @@ mod tests {
     /// The governed parameters, in the order the package declares them.
     const SPLIT_BYTES: u64 = 9_000;
     const IMPOUND_EPOCHS: u64 = 30;
+    const FLOOR_BP: u64 = 5_000;
+    const CEILING_BP: u64 = 20_000;
     const ACTIVATE_AT: u64 = 12;
 
     fn cast_payload() -> Vec<u8> {
-        let mut payload = SPLIT_BYTES.to_le_bytes().to_vec();
-        payload.extend_from_slice(&IMPOUND_EPOCHS.to_le_bytes());
-        payload.extend_from_slice(&ACTIVATE_AT.to_le_bytes());
-        payload
+        [
+            SPLIT_BYTES,
+            IMPOUND_EPOCHS,
+            FLOOR_BP,
+            CEILING_BP,
+            ACTIVATE_AT,
+        ]
+        .iter()
+        .flat_map(|field| field.to_le_bytes())
+        .collect()
     }
 
     #[test]
@@ -459,12 +488,66 @@ mod tests {
                             split_bytes: SPLIT_BYTES
                         },
                         impound_epochs: IMPOUND_EPOCHS,
-                        price_bounds: PriceBounds::GENESIS,
+                        price_bounds: PriceBounds::band(
+                            basis_points(FLOOR_BP),
+                            basis_points(CEILING_BP),
+                        ),
                     },
                     activate_at: Epoch::new(ACTIVATE_AT),
                 }),
             })),
         );
+    }
+
+    /// The band a pool votes is what opens the controller: an even band
+    /// pins every row where the reference table put it, and a wider one
+    /// gives each row room to move on both sides.
+    ///
+    /// The rail end to end, since a chain is born pinned — without a
+    /// vote that widens an interval the controller has nothing to do.
+    #[test]
+    fn the_band_a_pool_votes_is_what_opens_the_controller() {
+        let (pools, instances, pool, _impostor) = world();
+        let bounds = |floor: u64, ceiling: u64| {
+            let payload = [SPLIT_BYTES, IMPOUND_EPOCHS, floor, ceiling, ACTIVATE_AT]
+                .iter()
+                .flat_map(|field| field.to_le_bytes())
+                .collect();
+            match witness_from_event(
+                &raw(pool, PARAM_VOTE_CAST, payload),
+                &pools,
+                &instances,
+                package(1),
+            ) {
+                Some(BeaconWitnessEvent::ParamVote(vote)) => {
+                    vote.proposal
+                        .expect("a cast backs a proposal")
+                        .params
+                        .price_bounds
+                }
+                other => panic!("a cast reads as a vote: {other:?}"),
+            }
+        };
+
+        let pinned = bounds(10_000, 10_000);
+        assert_eq!(pinned, PriceBounds::GENESIS);
+        assert_eq!(pinned.floor, pinned.ceiling, "a pinned row cannot move");
+
+        let open = bounds(5_000, 20_000);
+        assert!(open.well_formed());
+        assert!(open.floor.compute < open.ceiling.compute);
+        assert_eq!(
+            open.floor.retention,
+            PriceBounds::GENESIS.floor.retention / 2
+        );
+        assert_eq!(
+            open.ceiling.retention,
+            PriceBounds::GENESIS.ceiling.retention * 2
+        );
+
+        // A band the fold must never activate: a floor at nothing prices
+        // a dimension free, which `validate` is what refuses.
+        assert!(!bounds(0, 10_000).well_formed());
     }
 
     /// A pool backing nothing says so with nothing: an empty payload is
@@ -502,9 +585,10 @@ mod tests {
     #[test]
     fn a_vote_the_fold_will_reject_still_reads_as_a_vote() {
         let (pools, instances, pool, _impostor) = world();
-        let mut payload = 0u64.to_le_bytes().to_vec();
-        payload.extend_from_slice(&0u64.to_le_bytes());
-        payload.extend_from_slice(&0u64.to_le_bytes());
+        let payload = [0u64; 5]
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect();
         let Some(BeaconWitnessEvent::ParamVote(vote)) = witness_from_event(
             &raw(pool, PARAM_VOTE_CAST, payload),
             &pools,
