@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::PriceTable;
 
 use crate::beacon::constants::{HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
 use crate::beacon::genesis::BeaconChainConfig;
@@ -707,6 +708,22 @@ pub struct BeaconState {
     /// epoch's topology snapshot before any block resolves against it.
     /// Promoted into [`Self::params`] at the next `apply_epoch`.
     pub next_params: NetworkParams,
+    /// The price of each dimension in force this epoch, inside the
+    /// bounds [`Self::params`] carries.
+    ///
+    /// A level rather than a vote: the fold moves each row by that
+    /// dimension's utilization across the shards whose boundary
+    /// advanced, so capacity and demand set the price between them and
+    /// nobody has to name it. Frozen a window ahead like the committee
+    /// and promoted beside [`Self::params`], so a block's anchor names
+    /// one table and every participant of a cross-shard transaction
+    /// prices it the same.
+    pub prices: PriceTable,
+    /// The lookahead table governing the next epoch: what this epoch's
+    /// fold computed, promoted into [`Self::prices`] at the next
+    /// `apply_epoch`. The freeze [`Self::next_params`] describes, for
+    /// the same reason.
+    pub next_prices: PriceTable,
     /// Each stake pool's one active parameter-change vote — the proposal
     /// `(params, activate_at)` it backs. Folded from `ParamVote`
     /// witnesses (cast/replace/clear); a pool with no entry abstains.
@@ -1141,6 +1158,9 @@ struct WindowProjection {
     /// Governable params for this window: `params` (head) or `next_params`
     /// (lookahead). Frozen one epoch ahead like the committee.
     params: NetworkParams,
+    /// The price level for this window, frozen beside the params whose
+    /// bounds hold it.
+    prices: PriceTable,
     /// The packages a block governed by this window may name.
     usable_packages: BTreeSet<Hash>,
     /// The retained seed window. Not frozen a window ahead like the
@@ -1162,6 +1182,8 @@ impl BeaconState {
             chain_config,
             params: NetworkParams::default(),
             next_params: NetworkParams::default(),
+            prices: PriceTable::GENESIS,
+            next_prices: PriceTable::GENESIS,
             param_votes: BTreeMap::new(),
             packages: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
@@ -1458,6 +1480,7 @@ impl BeaconState {
                 scheduled_terminals: self.window.scheduled_terminals.clone(),
                 settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
+                prices: self.prices,
                 usable_packages: self.usable_packages(self.current_epoch),
                 seeds: self.seeds.clone(),
             },
@@ -1487,6 +1510,7 @@ impl BeaconState {
                 scheduled_terminals: live.scheduled_terminals,
                 settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
+                prices: self.next_prices,
                 usable_packages: self.usable_packages(self.current_epoch.next()),
                 seeds: self.seeds.clone(),
             },
@@ -1735,6 +1759,7 @@ impl BeaconState {
             scheduled_terminals,
             settled_window_floors,
             params,
+            prices,
             usable_packages,
             seeds,
         } = projection;
@@ -1801,6 +1826,7 @@ impl BeaconState {
             split_pending,
         )
         .with_params(params)
+        .with_prices(prices)
         .with_scheduled_terminals(scheduled_terminals)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())

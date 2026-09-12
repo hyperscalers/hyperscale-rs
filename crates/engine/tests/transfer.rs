@@ -461,6 +461,7 @@ fn execute_seeded(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env,
@@ -653,6 +654,7 @@ fn execute_batch_on(
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         // A round sealed under this grid records genesis, so the window
@@ -1171,6 +1173,7 @@ fn execute_on_shard(
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let trie = ShardTrie::uniform(1);
     let ctx = TickBatchContext {
+        prices: PriceTable::GENESIS,
         local_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1361,6 +1364,7 @@ fn a_transfer_executes_divided_on_both_shards() {
     let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
         let ctx = TickBatchContext {
+            prices: PriceTable::GENESIS,
             local_shard,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1456,6 +1460,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
+            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
@@ -1542,6 +1547,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
+            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
@@ -1643,6 +1649,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let issued = |store: &MapDb| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
+            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
@@ -1671,6 +1678,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let settle = |store: &MapDb, at: u64| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
+            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(at),
             env: TickEnvironment::unfolded(),
@@ -1773,6 +1781,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
     let run = |store: &MapDb, charged: bool| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
+            prices: PriceTable::GENESIS,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
@@ -1842,6 +1851,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
     let run = |local_shard: ShardId| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
         let ctx = TickBatchContext {
+            prices: PriceTable::GENESIS,
             local_shard,
             shard_trie: &trie,
             tick_ts: WeightedTimestamp::from_millis(1_000),
@@ -1918,6 +1928,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         .insert(Hash::from_bytes(b"an unresolved leg").into(), 950);
     let ctx = TickBatchContext {
         local_shard: near_shard,
+        prices: PriceTable::GENESIS,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
@@ -1932,6 +1943,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
     );
 
     let unheld = TickBatchContext {
+        prices: PriceTable::GENESIS,
         holds: &ProvisionalHolds::new(),
         ..ctx
     };
@@ -2027,7 +2039,7 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
     // Funded well above the burn: at the placeholder rate of one unit
     // per artifact byte, publishing the stdlib guest costs more than the
     // balances the transfer fixtures use.
-    let executed = execute_on(&[(payer, 1_000_000)], &executor, &[tx]);
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, std::slice::from_ref(&tx));
 
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -2053,14 +2065,18 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
         }],
         "the publish settles with its beacon fact"
     );
-    // The publisher paid: the vault carries the burn, and the fee is the
-    // only other thing a publish writes.
+    // The publisher paid what the table prices its declaration at — the
+    // artifact's bytes as writes and retention — and the fee is the only
+    // other thing a publish writes.
+    let price = tx
+        .price_under(executor.derivation().as_ref(), &PriceTable::GENESIS)
+        .expect("a publish derives");
     let paid = vault_cell(&settled(database_updates, &[(payer, 1_000_000)]), payer)
         .expect("the payer's vault was written");
     assert_eq!(
         paid,
-        encode_amount(1_000_000 - artifact.len() as u128).to_vec(),
-        "the publisher paid exactly what judging its artifact cost"
+        encode_amount(1_000_000 - price).to_vec(),
+        "the publisher paid the declaration's price"
     );
     assert!(
         executed[0].attested_work > 0,
@@ -2398,6 +2414,7 @@ fn preview_on(
         &snapshot_store,
         tx,
         &PreviewInputs {
+            prices: PriceTable::GENESIS,
             clock: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             grants,
@@ -2640,10 +2657,12 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     assert_eq!(change_for(&granted, bob()).credit, 100);
 }
 
-/// A publish previews too, and its price needs no state: judging an
-/// artifact costs one unit per byte, which is the whole answer.
+/// A publish previews too, and it prices through the table like
+/// anything else: its artifact is bytes written and retained, so the
+/// declared vector already says what it costs and no rule of its own is
+/// needed.
 #[test]
-fn a_preview_prices_a_publish_by_its_artifact() {
+fn a_preview_prices_a_publish_through_the_table() {
     let payer = fee_payer(7);
     let artifact = published_account_artifact();
     let executor = executor(ExecutionMode::Serial);
@@ -2656,12 +2675,23 @@ fn a_preview_prices_a_publish_by_its_artifact() {
     );
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
-    assert_eq!(report.fee, artifact.len() as u128);
-    let vault = change_for(&report, payer);
-    assert_eq!(
-        (vault.before, vault.after),
-        (1_000_000, 1_000_000 - artifact.len() as u128)
+    let quoted = tx
+        .price_under(executor.derivation().as_ref(), &PriceTable::GENESIS)
+        .expect("a publish derives");
+    assert_eq!(report.fee, quoted);
+    let work = tx
+        .try_derived(executor.derivation().as_ref())
+        .expect("a publish derives")
+        .work;
+    assert!(
+        work.write_bytes >= artifact.len() as u64
+            && work.retention >= artifact.len() as u64
+            && quoted > 0,
+        "the artifact's bytes are both written and retained, and the \
+         table charges for each"
     );
+    let vault = change_for(&report, payer);
+    assert_eq!((vault.before, vault.after), (1_000_000, 1_000_000 - quoted));
 
     // An artifact that is not a package is refused at admission, so it
     // never enters a block and costs its publisher nothing.

@@ -30,7 +30,7 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
     Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics, whole_work,
@@ -966,16 +966,6 @@ pub fn build_fee_receipt(
     project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus
 }
 
-/// What judging and storing one artifact costs, whatever the verdict:
-/// the shard reached it from these bytes before it knew the answer.
-///
-/// One unit per byte is a placeholder until measured baselines set the
-/// real rate, like every other number in the fee model.
-#[must_use]
-pub const fn publish_work(artifact: &[u8]) -> u64 {
-    artifact.len() as u64
-}
-
 /// Settle one publish: the artifact lands in its content-addressed cell
 /// under the publisher, and the fee burns from the publisher's vault.
 ///
@@ -994,8 +984,13 @@ fn assemble_published_tx(
     locality: &OwnerSet,
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
-    let work = publish_work(artifact);
-    let charged = fee.map_or(0, |payer| u128::from(work).min(payer.max_fee));
+    // What this shard did for it, as the local receipt reports it: the
+    // artifact is the whole of it, since nothing else runs.
+    let work = artifact.len() as u64;
+    // The declaration's price at the block's table, like any other
+    // transaction: a publish's artifact is bytes written and retained,
+    // and its two point writes are writes.
+    let charged = fee.map_or(0, |payer| payer.price);
 
     // Admission reached the whole verdict from these same bytes, so a
     // refusal here means the transaction bypassed admission — the same
@@ -1014,7 +1009,7 @@ fn assemble_published_tx(
                     .cells
                     .insert(package_key(publisher, package), Some(artifact.to_vec()));
             }
-            apply_fee_burn(&mut writes, fee, u128::from(work));
+            apply_fee_burn(&mut writes, fee, charged);
             let receipt_hash = GlobalReceipt::new(
                 true,
                 EventRoot::ZERO,
@@ -1517,7 +1512,7 @@ impl Executor {
                     PayerFee {
                         vault,
                         max_fee: vm.max_fee,
-                        price: tx.price(&PriceTable::GENESIS),
+                        price: tx.price(&ctx.prices),
                         abortable: shapes
                             .get(&tx.hash())
                             .is_some_and(|input| input.runs.abortable()),

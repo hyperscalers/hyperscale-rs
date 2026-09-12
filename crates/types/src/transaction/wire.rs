@@ -613,17 +613,6 @@ pub enum TransactionVerifyError {
     /// Static derivation refused the envelope.
     #[error(transparent)]
     Derivation(#[from] DerivationError),
-    /// The signed ceiling is below the declared price. The drain reserves
-    /// the whole declaration either way, so a ceiling short of it would
-    /// charge least for exactly the transactions that cost most; the
-    /// ceiling is a hold size the price must fit.
-    #[error("fee ceiling {max_fee} is below the declared price {price}")]
-    CeilingBelowPrice {
-        /// The ceiling the sender signed.
-        max_fee: u128,
-        /// The price the declaration derives to.
-        price: u128,
-    },
 }
 
 /// Construction asserts: the body decodes, the envelope names this
@@ -665,17 +654,10 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // signer-address binding; the signatures themselves verify here,
         // over the derived declaration hashes.
         let derived = self.try_derived(ctx.derivation)?;
-        // A publish is priced by its artifact and capped at the ceiling;
-        // only a call declares a price the ceiling has to cover.
-        if vm.artifact().is_none() {
-            let price = PriceTable::GENESIS.price(&derived.work, vm.priority_bp);
-            if price > vm.max_fee {
-                return Err(TransactionVerifyError::CeilingBelowPrice {
-                    max_fee: vm.max_fee,
-                    price,
-                });
-            }
-        }
+        // What the signed ceiling has to cover is not decided here: the
+        // price is the table's, the table is the anchor's, and a
+        // signature check holds no snapshot. Admission judges it where
+        // the window is resolved.
         for (index, (sig, subintent)) in vm
             .subintent_sigs
             .iter()

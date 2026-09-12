@@ -25,7 +25,7 @@ use hyperscale_types::{
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Deadline,
     DeferOn, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot, NetworkDefinition,
-    PreparedCommit, PriceTable, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
+    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
     ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
@@ -743,6 +743,7 @@ where
             successes,
             anchor,
             trie,
+            prices,
         } => {
             // A resolution names a transaction committed before it — a
             // record epochs after the commit, a finalization a tick or
@@ -786,12 +787,9 @@ where
                     && UnsettledTx::for_transaction(
                         tx,
                         entry.committed,
-                        Classified::freeze(tx.legs(), tx.owners(), &trie).local_price(
-                            tx,
-                            ctx.shard,
-                            &PriceTable::GENESIS,
-                        ),
-                        &PriceTable::GENESIS,
+                        Classified::freeze(tx.legs(), tx.owners(), &trie)
+                            .local_price(tx, ctx.shard, &prices),
+                        &prices,
                     ) == *entry;
                 Some(restated)
             })

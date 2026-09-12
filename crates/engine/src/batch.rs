@@ -19,7 +19,7 @@ use hyperscale_types::{
     Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
     TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_types::SeedWindow;
+use hyperscale_vm_types::{PriceTable, SeedWindow};
 
 use crate::legs::Runs;
 
@@ -94,6 +94,14 @@ pub struct TickBatchContext<'a> {
     pub local_shard: ShardId,
     /// The active shard partition.
     pub shard_trie: &'a ShardTrie,
+    /// What each dimension costs under the window the tick-starting
+    /// block anchored to.
+    ///
+    /// Off the anchor like the trie beside it, and for the same reason:
+    /// a fee read at the head would price a transaction straddling an
+    /// epoch boundary differently on its two shards, and the receipt
+    /// carrying it is one both derive.
+    pub prices: PriceTable,
     /// The tick-starting block's parent-QC weighted timestamp. For a
     /// single-shard batch this is the transaction clock of every member;
     /// cross-shard batches carry per-transaction clocks on their inputs.

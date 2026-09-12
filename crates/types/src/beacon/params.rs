@@ -21,6 +21,7 @@
 //! checked in the VM when stake pools land there, not at the beacon.
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::PriceBounds;
 use thiserror::Error;
 
 use crate::{
@@ -45,6 +46,15 @@ pub struct NetworkParams {
     /// conviction. Read at conviction time to stamp `lifts_at`; a
     /// later change never shortens an in-force impound.
     pub impound_epochs: u64,
+    /// How far each row of the price table may ever travel.
+    ///
+    /// Governance's half of the price: the level inside these is the
+    /// epoch controller's, moved by what the network declared, so a vote
+    /// fixes the interval and demand picks the point in it. Voted here
+    /// rather than computed because the interval is a policy question —
+    /// what the chain is willing to charge — where the point inside it
+    /// is an observation.
+    pub price_bounds: PriceBounds,
 }
 
 impl NetworkParams {
@@ -55,6 +65,7 @@ impl NetworkParams {
         Self {
             reshape_thresholds: config.reshape_thresholds,
             impound_epochs: config.impound_epochs,
+            price_bounds: PriceBounds::GENESIS,
         }
     }
 
@@ -65,7 +76,9 @@ impl NetworkParams {
     /// A zero `split_bytes` makes every shard split on its first byte (an
     /// unbounded cascade up to `MAX_SHARDS`) and can never merge back, so
     /// it is rejected; `u64::MAX` (reshaping disabled) and any positive
-    /// threshold are accepted.
+    /// threshold are accepted. A price row with a zero floor prices a
+    /// dimension at nothing, and one whose ceiling sits under its floor
+    /// names no level at all, so both are rejected.
     ///
     /// # Errors
     ///
@@ -78,6 +91,9 @@ impl NetworkParams {
         if self.impound_epochs < UNBONDING_WINDOW_EPOCHS {
             return Err(ParamBoundsError::ImpoundBelowUnbonding);
         }
+        if !self.price_bounds.well_formed() {
+            return Err(ParamBoundsError::PriceBoundsUnusable);
+        }
         Ok(())
     }
 }
@@ -89,6 +105,7 @@ impl Default for NetworkParams {
         Self {
             reshape_thresholds: ReshapeThresholds::default(),
             impound_epochs: IMPOUND_EPOCHS_DEFAULT,
+            price_bounds: PriceBounds::GENESIS,
         }
     }
 }
@@ -104,6 +121,10 @@ pub enum ParamBoundsError {
     /// would then be cheaper than a voluntary exit.
     #[error("impound_epochs is below the unbonding window")]
     ImpoundBelowUnbonding,
+    /// A price row has a zero floor or a ceiling under its floor — the
+    /// first makes a dimension free, the second names no level.
+    #[error("price bounds name no usable level for some dimension")]
+    PriceBoundsUnusable,
 }
 
 /// A proposed parameter change: the target [`NetworkParams`] and the

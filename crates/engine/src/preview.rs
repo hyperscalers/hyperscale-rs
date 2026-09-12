@@ -32,7 +32,7 @@ use hyperscale_vm_types::{Outcome, PriceTable, SubstateKey};
 use crate::batch::TickEnvironment;
 use crate::executor::{
     PayerFee, TargetAuthority, TickBaseline, abort_reason, batch_entry, materialize_declared,
-    protocol_hash, publish_work,
+    protocol_hash,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, PROTOCOL_RESOURCE};
@@ -76,6 +76,13 @@ pub struct PreviewInputs {
     pub env: TickEnvironment,
     /// What this run is granted.
     pub grants: PreviewGrants,
+    /// The table the quote is weighed at.
+    ///
+    /// A preview answers about a transaction nothing has committed yet,
+    /// so there is no anchor to resolve: the caller passes the head's
+    /// table, and a fold moving it between the quote and the commit is
+    /// what the signed ceiling absorbs.
+    pub prices: PriceTable,
 }
 
 /// How a previewed envelope ended.
@@ -248,7 +255,13 @@ impl Executor {
             let payer = PayerFee {
                 vault,
                 max_fee: vm.max_fee,
-                price: u128::from(publish_work(artifact)),
+                // A publish is priced through the table like anything
+                // else: its artifact is retention and its two point
+                // writes are writes, all of it in the declared vector.
+                price: match tx.price_under(self.derivation().as_ref(), &inputs.prices) {
+                    Ok(price) => price,
+                    Err(error) => return PreviewReport::refused(error.to_string()),
+                },
                 abortable: false,
             };
             return preview_publish(snapshot, artifact, payer, inputs.grants);
@@ -275,7 +288,7 @@ impl Executor {
             // The declaration's price, read off what prepared rather
             // than derived again: a preview under an assumed authority
             // admits what derivation would refuse.
-            price: PriceTable::GENESIS.price(&prepared.work, vm.priority_bp),
+            price: inputs.prices.price(&prepared.work, vm.priority_bp),
             // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.
@@ -363,17 +376,19 @@ fn preview_publish(
     if let Err(error) = admit_package(artifact) {
         return PreviewReport::refused(error.to_string());
     }
-    let work = publish_work(artifact);
     let mut base = TickBaseline::default();
     if let Some(value) = snapshot.cell(payer.vault) {
         base.cells.insert(payer.vault, value);
     }
-    let fee = u128::from(work).min(payer.max_fee);
+    let fee = payer.price.min(payer.max_fee);
     PreviewReport {
         outcome: PreviewOutcome::Completed,
         changes: resource_changes(&base, None, fee, payer.vault, grants),
         fee,
-        fuel: work,
+        // A publish invokes nothing, so nothing burns fuel; what it
+        // costs is the fee above, which prices its artifact as bytes
+        // retained and written rather than as anything executed.
+        fuel: 0,
         events: Vec::new(),
     }
 }

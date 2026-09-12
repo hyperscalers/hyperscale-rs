@@ -15,7 +15,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
     LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
     ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
@@ -960,6 +960,10 @@ pub enum Action {
         /// The trie of the anchor's window, which the body is classified
         /// against.
         trie: ShardTrie,
+        /// The table of the same window, which the name's restated price
+        /// is weighed at — the block's own, so a later fold never moves
+        /// a figure already recorded.
+        prices: PriceTable,
     },
 
     /// Build a complete block proposal.

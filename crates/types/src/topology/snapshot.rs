@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
@@ -188,6 +189,14 @@ pub struct TopologySnapshot {
     /// the same `reshape_thresholds` for a block off its weighted-time-bound
     /// snapshot rather than a live head value that skews across folds.
     params: NetworkParams,
+    /// The price of each dimension for this window, projected from
+    /// `BeaconState.prices` (head) or `next_prices` (lookahead) and
+    /// frozen on the same terms.
+    ///
+    /// The one place a fee is read from: a table reached for at the head
+    /// instead of at the block's anchor would price a straddling
+    /// transaction differently on its two shards, which is a fork.
+    prices: PriceTable,
     /// The seeds of the epochs still inside the retained window, each
     /// beside the roll that produced it — projected from `BeaconState`,
     /// which is where they are folded.
@@ -252,6 +261,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            prices: PriceTable::GENESIS,
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -301,6 +311,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            prices: PriceTable::GENESIS,
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -359,6 +370,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            prices: PriceTable::GENESIS,
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
@@ -453,11 +465,21 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            prices: PriceTable::GENESIS,
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
+    }
+
+    /// Override the window's price table. Defaults to
+    /// [`PriceTable::GENESIS`], which is what a fixture that never folds
+    /// an epoch resolves.
+    #[must_use]
+    pub const fn with_prices(mut self, prices: PriceTable) -> Self {
+        self.prices = prices;
+        self
     }
 
     /// Override the window's governable params. Defaults to
@@ -604,6 +626,17 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn params(&self) -> NetworkParams {
         self.params
+    }
+
+    /// The price table in force for this window.
+    ///
+    /// What every fee is weighed at, resolved through the snapshot the
+    /// block or tick already anchored: a price read off the head rather
+    /// than off the anchor forks a transaction that straddles the
+    /// boundary the table moved at.
+    #[must_use]
+    pub const fn prices(&self) -> PriceTable {
+        self.prices
     }
 
     /// Whether a block governed by this window may name `package`.
