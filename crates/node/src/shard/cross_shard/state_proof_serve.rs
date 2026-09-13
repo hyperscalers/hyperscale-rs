@@ -51,14 +51,20 @@ pub fn serve_state_proof_request<S: ShardStorage>(
 }
 
 /// Serve an inbound cells query: the point cells and collection
-/// intervals a declaration reaches, proven at a committed height.
+/// intervals a declaration reaches, at this shard's committed tip.
 ///
 /// What [`serve_state_proof_request`] does for named keys, in the terms
-/// a declaration is written in. Read off the base store at the requested
-/// version rather than off the committed tip's view, so the answer is
-/// the height's own and no pending descendant leaks into it, and refused
-/// on the same retention floor — `snapshot_at` below the floor is a
-/// panic, so `serves_at` is asked first and is not an optimization.
+/// a declaration is written in — and at an anchor this server picks
+/// rather than one the asker names, because the asker is assembling a
+/// preview and holds no view of this chain to name a height from. The
+/// certified header rides back with the answer so the proof is
+/// checkable: the asker verifies that header against this shard's
+/// committee, which it holds for every shard, and then the proof against
+/// the header's own root.
+///
+/// Read off the base store at the tip's version rather than through the
+/// committed tip's view, so no pending descendant this node happens to
+/// hold leaks into an answer about committed state.
 ///
 /// The proof covers the point keys asked, present or absent, and the
 /// entry leaves the intervals actually returned. It does not attest that
@@ -73,11 +79,14 @@ pub fn serve_cells_request<S: ShardStorage>(
     req: &GetCellsRequest,
 ) -> GetCellsResponse {
     let view = pending_chain.view_at_committed_tip();
-    if !view.serves_at(req.height) {
+    let height = view.base().committed_height();
+    // The header is what makes the answer checkable, so an anchor this
+    // node cannot produce one for is no answer at all.
+    let Some(anchor) = pending_chain.certified_header(height) else {
         record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
-    }
-    let at = view.base().snapshot_at(req.height);
+    };
+    let at = view.base().snapshot_at(height);
 
     let cells: Vec<(SubstateKey, Vec<u8>)> = req
         .keys
@@ -111,14 +120,14 @@ pub fn serve_cells_request<S: ShardStorage>(
         ranges.push(RangeAnswer { entries });
     }
 
-    generate_proof(view.as_ref(), &leaves, req.height).map_or_else(
+    generate_proof(view.as_ref(), &leaves, height).map_or_else(
         || {
             record_fetch_response_sent("cells", 0);
             GetCellsResponse::not_found()
         },
         |proof| {
             record_fetch_response_sent("cells", leaves.len());
-            GetCellsResponse::found(cells, ranges, proof)
+            GetCellsResponse::found(cells, ranges, proof, (*anchor).clone().into_inner())
         },
     )
 }
@@ -317,7 +326,6 @@ mod tests {
         let response = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
-                height,
                 Vec::new(),
                 vec![CellRange {
                     owner,
@@ -328,7 +336,16 @@ mod tests {
                 }],
             ),
         );
-        let proof = response.proof.expect("the height is held");
+        let proof = response.proof.expect("the tip is answerable");
+        let anchor = response
+            .anchor
+            .expect("an answer carries the header it stands on");
+        assert_eq!(
+            anchor.header().height(),
+            height,
+            "the server names the anchor it chose, which is the only thing that \
+             makes the proof checkable to an asker holding no view of this chain"
+        );
         let answered = &response.ranges[0].entries;
         assert_eq!(
             answered.iter().map(|(order, _)| *order).collect::<Vec<_>>(),

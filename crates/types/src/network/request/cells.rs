@@ -23,8 +23,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetCellsResponse;
 use crate::{
-    Address, BlockHeight, CollectionId, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage,
-    Request, SubstateKey,
+    Address, CollectionId, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage, Request, SubstateKey,
 };
 
 /// The most intervals one request may name.
@@ -55,12 +54,16 @@ pub struct CellRange {
     pub cap: u32,
 }
 
-/// The point cells and intervals to answer, and the committed height to
-/// answer them at.
+/// The point cells and intervals to answer.
+///
+/// No height: the server answers at its own committed tip and says
+/// which in the response, because the asker is a node assembling a
+/// preview and has no view of this shard's chain to name one from. One
+/// anchor per shard, chosen by whoever holds the state — a preview over
+/// several shards is a run over snapshots that were never simultaneous,
+/// which is the optimism it already declares.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetCellsRequest {
-    /// The committed height whose state root the proof reconstructs.
-    pub height: BlockHeight,
     /// Point cells to answer, present or absent.
     #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub keys: Vec<SubstateKey>,
@@ -70,14 +73,10 @@ pub struct GetCellsRequest {
 }
 
 impl GetCellsRequest {
-    /// A request for `keys` and `ranges` at `height`.
+    /// A request for `keys` and `ranges`.
     #[must_use]
-    pub const fn new(height: BlockHeight, keys: Vec<SubstateKey>, ranges: Vec<CellRange>) -> Self {
-        Self {
-            height,
-            keys,
-            ranges,
-        }
+    pub const fn new(keys: Vec<SubstateKey>, ranges: Vec<CellRange>) -> Self {
+        Self { keys, ranges }
     }
 }
 
@@ -109,7 +108,6 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetCellsRequest::new(
-            BlockHeight::new(42),
             vec![test_key(7)],
             vec![CellRange {
                 owner: test_prefix(3),

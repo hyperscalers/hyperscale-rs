@@ -19,7 +19,9 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{MerkleInclusionProof, MessageClass, NetworkMessage, SubstateKey};
+use crate::{
+    CertifiedBlockHeader, MerkleInclusionProof, MessageClass, NetworkMessage, SubstateKey,
+};
 
 /// The entries one requested interval holds at the height, ascending by
 /// order.
@@ -42,23 +44,34 @@ pub struct GetCellsResponse {
     pub ranges: Vec<RangeAnswer>,
     /// A multiproof over every leaf above — the point keys asked, present
     /// or absent, and the entry leaves the intervals returned — against
-    /// the height's root. `None` when this peer does not hold the JMT
-    /// version the height names.
+    /// `anchor`'s state root. `None` when this peer cannot answer at all.
     pub proof: Option<MerkleInclusionProof>,
+    /// The certified header the answer stands under: the anchor this
+    /// server chose, and the only thing that makes the proof checkable.
+    ///
+    /// The asker holds no view of this shard's chain, so it cannot name
+    /// a height and cannot look one up. What it *does* hold, for every
+    /// shard, is the committee — so it verifies this header's quorum
+    /// certificate against that committee and then the proof against
+    /// this header's root. A server that forges either is answering for
+    /// a chain its own committee never signed.
+    pub anchor: Option<Box<CertifiedBlockHeader>>,
 }
 
 impl GetCellsResponse {
     /// A served answer.
     #[must_use]
-    pub const fn found(
+    pub fn found(
         cells: Vec<(SubstateKey, Vec<u8>)>,
         ranges: Vec<RangeAnswer>,
         proof: MerkleInclusionProof,
+        anchor: CertifiedBlockHeader,
     ) -> Self {
         Self {
             cells,
             ranges,
             proof: Some(proof),
+            anchor: Some(Box::new(anchor)),
         }
     }
 
@@ -69,6 +82,7 @@ impl GetCellsResponse {
             cells: Vec::new(),
             ranges: Vec::new(),
             proof: None,
+            anchor: None,
         }
     }
 }
@@ -89,6 +103,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_key;
+    use crate::{BlockHeader, BlockHeaderParts, ChainOrigin, QuorumCertificate, ShardId};
 
     #[test]
     fn test_hbor_roundtrip() {
@@ -100,6 +115,10 @@ mod tests {
                     entries: vec![(0, vec![4, 5]), (9, vec![6])],
                 }],
                 MerkleInclusionProof::new(vec![1, 2, 3]),
+                CertifiedBlockHeader::new(
+                    BlockHeader::new(BlockHeaderParts::default()),
+                    QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::default()),
+                ),
             ),
         ] {
             let encoded = hbor_to_vec(&response).unwrap();
