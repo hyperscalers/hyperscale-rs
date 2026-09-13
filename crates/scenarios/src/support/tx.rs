@@ -2530,11 +2530,18 @@ pub struct ParamBallot {
     pub ceiling_bp: u32,
 }
 
-impl Default for ParamBallot {
-    /// The parameters a genesis cluster already runs under, so a ballot
-    /// that changes one field changes only that one.
-    fn default() -> Self {
-        let params = NetworkParams::default();
+impl ParamBallot {
+    /// The ballot that re-proposes `params` unchanged — what a caller
+    /// starts from to move one row.
+    ///
+    /// Read off the chain's live parameters and never off the type's
+    /// defaults: a cluster runs whatever its genesis config or an
+    /// earlier vote left, and a ballot seeded from the defaults would
+    /// carry a row nobody meant to move. The price band has no live
+    /// reading here because it is a band on the wire and rows in
+    /// storage, so it re-proposes the even one.
+    #[must_use]
+    pub const fn of(params: &NetworkParams) -> Self {
         Self {
             split_bytes: params.reshape_thresholds.split_bytes,
             split_fullness: params.reshape_thresholds.split_fullness,
@@ -2594,7 +2601,7 @@ pub fn build_reshape_threshold_vote_tx(
         operator,
         ParamBallot {
             split_bytes,
-            ..ParamBallot::default()
+            ..ParamBallot::of(&NetworkParams::default())
         },
         activate_at,
         validity,

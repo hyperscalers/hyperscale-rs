@@ -86,17 +86,15 @@ pub fn grow_to(c: &mut impl Cluster, target: u32) {
 pub fn vote_reshape_threshold(c: &mut impl Cluster, split_bytes: u64) {
     vote_params(
         c,
-        ParamBallot {
-            split_bytes,
-            ..ParamBallot::default()
-        },
+        |ballot| ballot.split_bytes = split_bytes,
         |params| params.reshape_thresholds.split_bytes == split_bytes,
         &format!("the reshape threshold to {split_bytes}"),
     );
 }
 
-/// Cast the founding pool's vote for `ballot` and wait until the fold
-/// applies it, as `applied` reads the live params.
+/// Cast the founding pool's vote for the chain's live parameters with
+/// `change` applied, and wait until the fold applies it, as `applied`
+/// reads them back.
 ///
 /// Re-submits each activation window until it lands. A single vote
 /// carries a fixed `VOTE_ACTIVATE_LEAD` lead and is dropped if its
@@ -111,12 +109,19 @@ pub fn vote_reshape_threshold(c: &mut impl Cluster, split_bytes: u64) {
 /// Panics if `applied` never reads true within budget.
 pub fn vote_params(
     c: &mut impl Cluster,
-    ballot: ParamBallot,
+    change: impl Fn(&mut ParamBallot),
     applied: impl Fn(&NetworkParams) -> bool,
     what: &str,
 ) {
     for _ in 1..=VOTE_ATTEMPTS {
         let current = beacon_epoch(c).expect("a beacon epoch is committed");
+        // Seeded from what the chain runs right now, so a caller that
+        // names one row proposes one change. A vote is a whole proposal
+        // and the tally buckets by the exact set, so a ballot built from
+        // anything else votes to reset every row it guessed at.
+        let live = c.beacon_state().expect("a committed beacon state").params;
+        let mut ballot = ParamBallot::of(&live);
+        change(&mut ballot);
         let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
         let vote = build_param_vote_tx(
             &pool_operator().0,

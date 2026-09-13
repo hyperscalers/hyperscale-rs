@@ -25,7 +25,7 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_delivery_cut_off_past_its_window_is_reclaimed,
+    a_band_vote_leaves_every_other_row_alone, a_delivery_cut_off_past_its_window_is_reclaimed,
     a_delivery_is_reclaimed_when_its_deliverer_splits,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
@@ -212,6 +212,20 @@ fn split_boundary_admits_an_uncommitted_precut_tx_sim() {
 // ─── Engine scenarios ───────────────────────────────────────────────
 // The single-shard catalogue on the engine: signed manifest graphs
 // through the live pipeline, receipts from the batch executor.
+
+/// A ballot about the price does not retune a reshape threshold.
+///
+/// On a cluster grown by an earlier vote, so its live `split_bytes` is
+/// something the type's defaults do not name.
+#[test]
+fn a_band_vote_leaves_every_other_row_alone_sim() {
+    let config = ScenarioConfig {
+        split_bytes: stdlib_flash_bytes() + 30_000,
+        ..cross_shard_config()
+    };
+    let mut cluster = SimCluster::with_grown_accounts(&config, 0xBA77, &genesis_accounts(1, 1));
+    a_band_vote_leaves_every_other_row_alone(&mut cluster);
+}
 
 /// A signed priority reaches the burn and the ledger closes over it.
 #[test]
