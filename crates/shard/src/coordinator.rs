@@ -6728,11 +6728,11 @@ mod tests {
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash,
         LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT,
-        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
-        settled_set_verdict, test_utils,
+        PriceTable, RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor,
+        ShardId, Signer, SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -11624,8 +11624,6 @@ mod tests {
         );
     }
 
-    /// The figures each name restates are checked off the committed body
-    /// by a delegated verification, whose three answers fold in
     /// A block whose anchor no retained window carries defers the check
     /// rather than answering it.
     ///
@@ -11662,6 +11660,63 @@ mod tests {
         );
     }
 
+    /// A name is restated at the window its own commit ran under, never
+    /// at the one carrying the record.
+    ///
+    /// A record is written when a deadline lapses, epochs after the
+    /// commit it names, and the table moves in between. Weighed at the
+    /// carrying window, every name whose commit predates a fold that
+    /// stepped a row restates wrongly — and a wrong figure refuses the
+    /// block, so the abandonment never commits and the drain place is
+    /// never released.
+    #[test]
+    fn a_name_is_restated_at_the_window_that_committed_it() {
+        let mut sched = make_terminating_schedule(4);
+        // The window carrying the record prices above the one the
+        // commit it names ran under.
+        let raised = PriceTable {
+            compute: PriceTable::GENESIS.compute * 2,
+            ..PriceTable::GENESIS
+        };
+        let ScheduleLookup::Committee(carrying) =
+            sched.lookup(WeightedTimestamp::from_millis(AFTER_CUT_MS))
+        else {
+            panic!("the carrying window is retained");
+        };
+        sched.insert(
+            Epoch::new(1),
+            Arc::new(TopologySnapshot::clone(carrying).with_prices(raised)),
+        );
+
+        let block = block_with_records(
+            AFTER_CUT_MS,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
+        );
+        let block_hash = block.hash();
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+
+        let [
+            Action::VerifyResolutions {
+                committed_windows, ..
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("the names go to the store: {actions:?}");
+        };
+        let stated = figures_of(b"tx").committed.anchor;
+        assert_eq!(
+            committed_windows[&stated].prices,
+            PriceTable::GENESIS,
+            "the name is weighed at the table its commit was charged at"
+        );
+    }
+
+    /// The figures each name restates are checked off the committed body
+    /// by a delegated verification, whose three answers fold in
     /// differently: exact verifies the check, wrong refuses the block, and
     /// unknown clears the check's in-flight mark — the block pending, the
     /// vote deferred, and the check dispatched again on the next re-drive.

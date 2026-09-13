@@ -124,6 +124,23 @@ pub struct UnsettledTx {
     pub reach: Vec<RoutePrefix>,
 }
 
+/// The window a name says committed it: what its figures were frozen
+/// against, and so what a restatement is checked against.
+///
+/// Both halves move, and neither moves backwards for a figure already
+/// owed. A record is written when a deadline lapses, which is epochs
+/// after the commit it names, so a checker reading its own window would
+/// weigh the share at a placement the transaction never ran under and
+/// the price at a table it was never charged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitWindow {
+    /// The placement the committing block froze the classification
+    /// under, which is what prices a shard's own share.
+    pub trie: ShardTrie,
+    /// The table that block charged at.
+    pub prices: PriceTable,
+}
+
 impl UnsettledTx {
     /// What abandoning `tx`, which this chain committed at `committed`,
     /// states.

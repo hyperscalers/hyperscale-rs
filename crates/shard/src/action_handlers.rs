@@ -751,7 +751,7 @@ where
             successes,
             anchor,
             trie,
-            prices,
+            committed_windows,
         } => {
             // A resolution names a transaction committed before it — a
             // record epochs after the commit, a finalization a tick or
@@ -791,13 +791,16 @@ where
             };
             let verdict = Resolutions::of(entries, |entry| {
                 let tx = held.get(&entry.tx_hash)?;
+                // The placement and the table its own commit ran under,
+                // which is where every figure it restates was frozen.
+                let at = committed_windows.get(&entry.committed.anchor)?;
                 let restated = committed_at(entry)?
                     && UnsettledTx::for_transaction(
                         tx,
                         entry.committed,
-                        Classified::freeze(tx.legs(), tx.owners(), &trie)
-                            .local_price(tx, ctx.shard, &prices),
-                        &prices,
+                        Classified::freeze(tx.legs(), tx.owners(), &at.trie)
+                            .local_price(tx, ctx.shard, &at.prices),
+                        &at.prices,
                     ) == *entry;
                 Some(restated)
             })
