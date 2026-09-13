@@ -36,11 +36,12 @@ use crate::support::query::{beacon_epoch, declared_price, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
-    build_securify_tx, build_stake_tx, build_transfer_paid_by, build_transfer_tx,
-    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on, native_pq_cast,
-    nullifier_race_cast, overdraw_cast, payment_request, payment_request_for, pool_at, recipient,
-    remote_delegator, securify_cast, sender, shared_recipient_cast, storm_artifact,
-    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
+    build_securify_tx, build_stake_tx, build_transfer_at_ceilings, build_transfer_paid_by,
+    build_transfer_tx, build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on,
+    native_pq_cast, nullifier_race_cast, overdraw_cast, payment_request, payment_request_for,
+    pool_at, recipient, remote_delegator, securify_cast, sender, shared_recipient_cast,
+    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
+    validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_folds, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -2004,6 +2005,73 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 }
 
 /// The reported change to `owner`'s native vault.
+/// A wallet signs what a preview measured, and the chain meters it
+/// against exactly that.
+///
+/// The whole point of previewing before composing: the ceilings a report
+/// fills carry the transfer, and the same transfer signed at half of
+/// them exhausts. Without the second half this proves only that a
+/// generous number works.
+///
+/// # Panics
+///
+/// Panics if the root shard does not serve a preview, or if either
+/// transfer does not reach a terminal status within budget.
+pub fn a_wallet_signs_the_ceilings_a_preview_measured(c: &mut impl Cluster) {
+    const AMOUNT: u128 = 100;
+    let (payer, from) = sender(0);
+    let to = recipient(0);
+    assert!(
+        await_height(c, ShardId::ROOT, 1, epochs(2)),
+        "root shard did not advance past genesis"
+    );
+
+    // Preview once, against a candidate whose own ceilings are beside
+    // the point: what a node spends does not depend on what it was
+    // allowed to spend, until it runs out.
+    let candidate = build_transfer_tx(&payer, from, to, AMOUNT, validity_around(c.now()));
+    let report = c
+        .preview(ShardId::ROOT, &candidate, PreviewGrants::default())
+        .expect("the root shard serves a preview");
+    assert_eq!(report.outcome, PreviewOutcome::Completed);
+    ceilings_cover_the_run(&report);
+
+    let mut charges = Charges::default();
+    let measured = build_transfer_at_ceilings(
+        &payer,
+        from,
+        to,
+        AMOUNT,
+        validity_around(c.now()),
+        report.ceilings.clone(),
+    );
+    let carried = charges.submit(c, measured);
+    let status = await_tx_terminal(c, carried, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the ceilings a preview measured carry the transfer; status = {status:?}"
+    );
+
+    // The same transfer at half of them: every node is metered against
+    // its own figure, so the one that needed the fuel is the one that
+    // runs out.
+    let halved: Vec<u64> = report.ceilings.iter().map(|node| node / 2).collect();
+    let starved =
+        build_transfer_at_ceilings(&payer, from, to, AMOUNT, validity_around(c.now()), halved);
+    let starved = charges.submit(c, starved);
+    let status = await_tx_terminal(c, starved, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Reject))
+        ),
+        "a wallet signing half of what the preview measured exhausts; status = {status:?}"
+    );
+}
+
 /// What a wallet came for: a ceiling per node it can sign, with room
 /// over what the run actually spent. A composer signing these signs a
 /// transaction the chain meters against the same figures.

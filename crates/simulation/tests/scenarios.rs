@@ -47,10 +47,11 @@ use hyperscale_scenarios::{
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    abort_converges, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_wallet_signs_the_ceilings_a_preview_measured, abort_converges,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -242,6 +243,12 @@ fn a_failed_attempt_still_attests_work_sim() {
 fn failure_charges_its_payer_sim() {
     let mut cluster = SimCluster::with_accounts(&liveness_config(), 42, &genesis_accounts(1, 1));
     failure_charges_its_payer(&mut cluster);
+}
+
+#[test]
+fn a_wallet_signs_the_ceilings_a_preview_measured_sim() {
+    let mut cluster = SimCluster::with_accounts(&liveness_config(), 42, &genesis_accounts(1, 1));
+    a_wallet_signs_the_ceilings_a_preview_measured(&mut cluster);
 }
 
 #[test]
