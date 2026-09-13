@@ -33,5 +33,9 @@ harness = false
 name = "range_read"
 harness = false
 
+[[bench]]
+name = "write_throughput"
+harness = false
+
 [lints]
 workspace = true
