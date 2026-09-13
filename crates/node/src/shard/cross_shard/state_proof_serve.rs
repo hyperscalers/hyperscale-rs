@@ -17,7 +17,8 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
-    EntryKey, MAX_CELLS_PER_QUERY, ProtocolHasher, ProvenCells, SubstateKey, entry_leaf_key,
+    EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, ProvenCells,
+    SubstateKey, entry_leaf_key,
 };
 
 /// Serve an inbound state-proof query from the committed chain.
@@ -102,11 +103,23 @@ pub fn serve_cells_request<S: ShardStorage>(
         return GetCellsResponse::not_found();
     }
 
+    // What the values weigh, which the leaf cap says nothing about: a
+    // leaf runs to the widest slot there is. Spent as the answer is
+    // built, since only the walk knows what the leaves hold.
+    let mut carried = 0usize;
+
     let cells: Vec<(SubstateKey, Vec<u8>)> = req
         .keys
         .iter()
         .filter_map(|key| at.cell(*key).map(|value| (*key, value)))
         .collect();
+    for (_, value) in &cells {
+        carried = carried.saturating_add(value.len());
+    }
+    if carried > MAX_CELLS_RESPONSE_BYTES {
+        record_fetch_response_sent("cells", 0);
+        return GetCellsResponse::not_found();
+    }
 
     // Every leaf the answer stands on, so one multiproof covers the
     // whole of it: the keys as asked — an absent one is proven absent —
@@ -121,6 +134,13 @@ pub fn serve_cells_request<S: ShardStorage>(
             range.hi,
             range.cap as usize,
         );
+        for (_, value) in &entries {
+            carried = carried.saturating_add(value.len());
+        }
+        if carried > MAX_CELLS_RESPONSE_BYTES {
+            record_fetch_response_sent("cells", 0);
+            return GetCellsResponse::not_found();
+        }
         leaves.extend(entries.iter().map(|(order, _)| {
             entry_leaf_key(
                 &ProtocolHasher,
@@ -382,6 +402,65 @@ mod tests {
         assert!(
             served.proof.is_some(),
             "a query inside the budget is answered as before"
+        );
+    }
+
+    /// The leaf cap bounds how many leaves an answer stands on and says
+    /// nothing about what they hold. A leaf runs to the widest slot
+    /// there is, so a query well inside the cap can still name more
+    /// bytes than the frame carries — and the transports drop an
+    /// oversize message rather than truncating it, so building one is
+    /// the whole walk and the whole proof for an answer nobody reads.
+    #[test]
+    fn an_answer_past_the_frame_is_refused_though_its_leaves_are_few() {
+        const OWNER_SEED: u8 = 0x13;
+        // Wide leaves, few of them: a count no leaf cap would stop.
+        const WIDTH: usize = 16 * 1024;
+        let count = MAX_CELLS_RESPONSE_BYTES / WIDTH + 1;
+        assert!(
+            (count as u64) < MAX_CELLS_PER_QUERY,
+            "the leaf cap must not be what refuses this, or it proves nothing"
+        );
+
+        let storage = Arc::new(SimShardStorage::default());
+        let written: Vec<(u128, Option<Vec<u8>>)> = (0..count as u128)
+            .map(|order| (order, Some(vec![0xAB; WIDTH])))
+            .collect();
+        commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
+        let chain = Arc::new(PendingChain::new(storage));
+        let key = entry_key(OWNER_SEED, 0);
+        let whole = |cap: u32| CellRange {
+            owner: key.owner,
+            collection: key.collection,
+            lo: 0,
+            hi: u128::MAX,
+            cap,
+        };
+
+        let refused = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(
+                Vec::new(),
+                vec![whole(u32::try_from(count).expect("a small count"))],
+            ),
+        );
+        assert!(
+            refused.proof.is_none(),
+            "an answer whose values outweigh the frame is refused, not built"
+        );
+
+        // And one leaf fewer is inside the budget and served, so what
+        // refuses above is the budget and not the shape of the query.
+        let served = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(
+                Vec::new(),
+                vec![whole(u32::try_from(count - 1).expect("a small count"))],
+            ),
+        );
+        assert!(
+            served.proof.is_some(),
+            "the same query one leaf lighter is answered"
         );
     }
 

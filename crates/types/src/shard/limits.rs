@@ -9,11 +9,13 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
+use hyperscale_jmt::MAX_PROOF_CLAIMS;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
     MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_SUBINTENTS, VERIFY_WEIGHT,
 };
 
+use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
 use crate::{Address, LocalKey, RoutePrefix, TxsInFlight};
 
 /// The largest message any transport carries, compressed.
@@ -243,13 +245,47 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 /// whatever the asker wrote and a server trusting it would walk whole
 /// collections and build a multiproof over every leaf in them.
 ///
-/// Sized at what a declaration could legitimately reach — one
-/// transaction's whole read budget spent on the narrowest leaf there
-/// is — so nothing a real preview asks for is refused, and a query past
-/// it is refused rather than truncated: a short answer would read back
-/// as a collection holding less than it does, and a preview is the one
-/// thing that must not be quietly wrong.
-pub const MAX_CELLS_PER_QUERY: u64 = MAX_TX_READ_BYTES / AMOUNT_CELL_BYTES as u64;
+/// Two ceilings meet here and the lower binds. What a declaration could
+/// legitimately reach is one transaction's whole read budget spent on
+/// the narrowest leaf there is. What an *answer* can carry is
+/// [`MAX_PROOF_CLAIMS`]: a multiproof over more leaves than that is
+/// refused by the asker's own decoder, so a query above it buys a walk
+/// whose proof can never be read, and refusing it early is the only
+/// arm that spends nothing.
+///
+/// A query past the bound is refused rather than truncated. A short
+/// answer would read back as a collection holding less than it does,
+/// and a preview is the one thing that must not be quietly wrong.
+pub const MAX_CELLS_PER_QUERY: u64 = {
+    let by_declaration = MAX_TX_READ_BYTES / AMOUNT_CELL_BYTES as u64;
+    let by_proof = MAX_PROOF_CLAIMS as u64;
+    if by_proof < by_declaration {
+        by_proof
+    } else {
+        by_declaration
+    }
+};
+
+/// The most bytes of cell and entry values one cells answer may carry.
+///
+/// [`MAX_CELLS_PER_QUERY`] bounds the leaves and says nothing about what
+/// they hold: a leaf runs to `MAX_SLOT_WIDTH`, so the leaf cap alone
+/// admits an answer two orders of magnitude past the frame that would
+/// have to carry it. The transports drop an oversize message rather
+/// than truncating it, so a server that could build one would do the
+/// whole walk and the proof for an answer nobody receives.
+///
+/// Spent across the whole answer and refused past, for the reason the
+/// leaf cap is.
+pub const MAX_CELLS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bytes a cells answer costs before its values: the multiproof over
+/// its leaves, and the certified header, framing and keys around it.
+const CELLS_ANSWER_FIXED_BYTES: usize = MAX_MERKLE_PROOF_LEN + 64 * 1024;
+
+/// INV-WIRE-2: a cells answer with its values at their budget and its
+/// proof at the decoder's cap still fits the frame that carries it.
+const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
 /// Hard cap on the state claims a block can carry.
 ///
