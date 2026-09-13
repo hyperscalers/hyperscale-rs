@@ -35,11 +35,13 @@ use std::time::Duration;
 use crossbeam::channel::bounded;
 use hyperscale_engine::{DeclaredReads, FetchedCells};
 use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_storage::entry_leaf_value;
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::network::response::GetCellsResponse;
+use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    CertifiedBlockHeader, EntryKey, ProtocolHasher, QcContext, ShardId, TopologySnapshot, Verified,
-    Verifier, Verify, entry_leaf_key,
+    BlockHeight, CertifiedBlockHeader, EntryKey, MerkleInclusionProof, ProtocolHasher, QcContext,
+    ShardId, StateRoot, SubstateKey, TopologySnapshot, Verified, Verifier, Verify, entry_leaf_key,
 };
 
 /// How long the whole gathering may take.
@@ -52,9 +54,15 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Check a served answer and fold what it attests into `into`.
 ///
-/// Returns whether the answer stood up. Everything it carries is
-/// dropped if any part of it fails, so a partial verification never
-/// contributes a cell.
+/// Returns whether the answer stood up. Nothing is kept unless all of it
+/// is: a partial verification contributes no cell.
+///
+/// The check is on the values, not merely on the keys. A multiproof
+/// attests a *value hash* per leaf, so a server that returns the key set
+/// it was asked for — which is the set that makes the proof
+/// reconstruct — can otherwise carry whatever bytes it likes under
+/// those keys. Every value is hashed and compared, the way a provisions
+/// bundle's carried entries are.
 fn absorb(
     shard: ShardId,
     ask: &DeclaredReads,
@@ -69,28 +77,78 @@ fn absorb(
     let Some(attested) = verify_anchor(shard, anchor, topology, verifier) else {
         return false;
     };
-    // Every leaf the answer stands on, rebuilt from what it returned —
-    // so the proof is checked against the keys this node derived and
-    // never against a list the server chose.
-    let mut leaves = ask.keys.clone();
-    for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
-        leaves.extend(answer.entries.iter().map(|(order, _)| {
-            entry_leaf_key(
-                &ProtocolHasher,
-                EntryKey {
-                    owner: range.owner,
-                    collection: range.collection,
-                    order: *order,
-                },
-            )
-        }));
-    }
-    if proof
-        .inclusions(attested.header().state_root(), shard, &leaves)
-        .is_err()
-    {
+    fold_attested(
+        shard,
+        ask,
+        response,
+        proof,
+        attested.header().state_root(),
+        attested.header().height(),
+        into,
+    )
+}
+
+/// Fold an answer whose anchor has already been verified, checking every
+/// value against what `root` attests for its leaf.
+///
+/// Split from [`absorb`] because this half is the one that decides
+/// whether a server can lie about *contents*, and it is checkable
+/// against a root without a committee in hand.
+fn fold_attested(
+    shard: ShardId,
+    ask: &DeclaredReads,
+    response: &GetCellsResponse,
+    proof: &MerkleInclusionProof,
+    root: StateRoot,
+    height: BlockHeight,
+    into: &mut FetchedCells,
+) -> bool {
+    // Positional, so a short answer is not a partial one: an interval
+    // the server dropped would otherwise go unasked-about, and the proof
+    // over the leaves that remain still reconstructs.
+    if response.ranges.len() != ask.ranges.len() {
         return false;
     }
+    // Every leaf the answer stands on, with the value claimed for it,
+    // rebuilt from what the server returned — so the proof is checked
+    // against keys this node derived and never against a list the
+    // server chose.
+    let served: BTreeMap<SubstateKey, &Vec<u8>> = response
+        .cells
+        .iter()
+        .map(|(key, value)| (*key, value))
+        .collect();
+    let mut leaves = Vec::with_capacity(ask.keys.len());
+    // What the leaf holds, which for an entry is not the bare value: an
+    // entry leaf carries its own collection and order beside it, so the
+    // ordered index is derivable from the leaves alone. Hashing the
+    // value would compare against a leaf nobody wrote.
+    let mut claimed: Vec<Option<Vec<u8>>> = Vec::with_capacity(ask.keys.len());
+    for key in &ask.keys {
+        leaves.push(*key);
+        claimed.push(served.get(key).map(|value| (*value).clone()));
+    }
+    for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
+        for (order, value) in &answer.entries {
+            let entry = EntryKey {
+                owner: range.owner,
+                collection: range.collection,
+                order: *order,
+            };
+            leaves.push(entry_leaf_key(&ProtocolHasher, entry));
+            claimed.push(Some(entry_leaf_value(&entry, value)));
+        }
+    }
+
+    let Ok(inclusions) = proof.inclusions(root, shard, &leaves) else {
+        return false;
+    };
+    for (claim, (_, inclusion)) in claimed.iter().zip(&inclusions) {
+        if claim.as_ref().map(|value| jmt_value_hash(value)) != inclusion.value_hash() {
+            return false;
+        }
+    }
+
     for (key, value) in &response.cells {
         into.cells.insert(*key, value.clone());
     }
@@ -100,7 +158,7 @@ fn absorb(
             .or_default()
             .extend(answer.entries.iter().cloned());
     }
-    into.anchors.insert(shard, attested.header().height());
+    into.anchors.insert(shard, height);
     true
 }
 
@@ -185,4 +243,135 @@ pub fn gather<N: Network>(
         }
     }
     fetched
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_storage::PendingChain;
+    use hyperscale_storage::test_helpers::{commit_writes, entry_key, make_settled_entries};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::network::request::CellRange;
+
+    use super::*;
+    use crate::shard::cross_shard::serve_cells_request;
+
+    const OWNER_SEED: u8 = 0x11;
+    const SHARD: ShardId = ShardId::ROOT;
+
+    /// A store of eight entries, and the root its only commit produced.
+    fn served(ask: &DeclaredReads) -> (GetCellsResponse, StateRoot) {
+        let storage = Arc::new(SimShardStorage::default());
+        let written: Vec<(u128, Option<Vec<u8>>)> = (0u128..8)
+            .map(|order| {
+                (
+                    order,
+                    Some(vec![u8::try_from(order).expect("eight entries"); 4]),
+                )
+            })
+            .collect();
+        let root = commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
+        let chain = Arc::new(PendingChain::new(storage));
+        let response = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(ask.keys.clone(), ask.ranges.clone()),
+        );
+        (response, root)
+    }
+
+    fn one_range() -> DeclaredReads {
+        let key = entry_key(OWNER_SEED, 0);
+        DeclaredReads {
+            keys: Vec::new(),
+            ranges: vec![CellRange {
+                owner: key.owner,
+                collection: key.collection,
+                lo: 0,
+                hi: u128::MAX,
+                cap: 4,
+            }],
+        }
+    }
+
+    /// A served answer folds in, and the same answer with one byte moved
+    /// does not.
+    ///
+    /// This is the whole of what verification buys. A multiproof attests
+    /// a value *hash* per leaf, so a server returning the key set it was
+    /// asked for — the set that makes the proof reconstruct — would
+    /// otherwise be free to carry any bytes it liked under those keys.
+    /// A preview is exactly the thing that must not be lied to: the
+    /// ceilings a wallet signs off it are the compute its declaration is
+    /// priced on, so a fabricated answer moves the payer's money.
+    #[test]
+    fn a_value_the_proof_does_not_attest_is_refused() {
+        let ask = one_range();
+        let (response, root) = served(&ask);
+        let proof = response.proof.clone().expect("the tip is answerable");
+
+        let mut into = FetchedCells::default();
+        assert!(
+            fold_attested(
+                SHARD,
+                &ask,
+                &response,
+                &proof,
+                root,
+                BlockHeight::new(1),
+                &mut into
+            ),
+            "the shard's own answer stands under its own root"
+        );
+        assert_eq!(into.entries.len(), 1, "and the entries it carried are kept");
+
+        let mut tampered = response.clone();
+        tampered.ranges[0].entries[0].1 = vec![0xFF; 4];
+        let mut nothing = FetchedCells::default();
+        assert!(
+            !fold_attested(
+                SHARD,
+                &ask,
+                &tampered,
+                &proof,
+                root,
+                BlockHeight::new(1),
+                &mut nothing
+            ),
+            "a value the root never attested is refused"
+        );
+        assert!(
+            nothing.cells.is_empty() && nothing.entries.is_empty() && nothing.anchors.is_empty(),
+            "and nothing of a refused answer is kept, so a partial \
+             verification contributes no cell"
+        );
+    }
+
+    /// An interval the server simply left out is refused rather than
+    /// read as an empty one.
+    ///
+    /// Positional, so a short answer would otherwise go unasked-about:
+    /// the proof over the remaining leaves still reconstructs, the shard
+    /// still lands in `anchors`, and the run reads the dropped interval
+    /// as a collection holding nothing.
+    #[test]
+    fn a_dropped_interval_is_refused() {
+        let ask = one_range();
+        let (response, root) = served(&ask);
+        let proof = response.proof.clone().expect("the tip is answerable");
+
+        let mut short = response;
+        short.ranges.clear();
+        let mut nothing = FetchedCells::default();
+        assert!(
+            !fold_attested(
+                SHARD,
+                &ask,
+                &short,
+                &proof,
+                root,
+                BlockHeight::new(1),
+                &mut nothing
+            ),
+            "an answer naming fewer intervals than were asked is not a partial answer"
+        );
+    }
 }
