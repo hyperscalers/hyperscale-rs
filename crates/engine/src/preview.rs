@@ -18,18 +18,20 @@
 //! previews truthfully only at a node holding every cell it touches —
 //! which is a question about the snapshot, not about the preview.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
-use hyperscale_types::{Event, Transaction, WeightedTimestamp};
-use hyperscale_vm_effects::ShardId;
+use hyperscale_types::{Event, ShardId, ShardTrie, Transaction, WeightedTimestamp};
+// The vm's own shard vocabulary, which a source's anchor is stated in;
+// the consensus `ShardId` above is what a trie routes to.
+use hyperscale_vm_effects::ShardId as SourceShard;
 use hyperscale_vm_kernel::{EnvInputs, OwnerSet, decode_amount};
 use hyperscale_vm_preview::{
     CellSource, Local, Report as PreviewRun, Slack, preview as preview_run,
 };
-use hyperscale_vm_types::{Outcome, PriceTable, SubstateKey};
+use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SubstateKey};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
@@ -78,6 +80,15 @@ pub struct PreviewInputs {
     pub env: TickEnvironment,
     /// What this run is granted.
     pub grants: PreviewGrants,
+    /// The shards this node can answer about, and the trie that routes
+    /// a declared cell to one.
+    ///
+    /// A preview reads committed state, and a node holds only its own
+    /// shards' — so a transaction declaring a cell elsewhere is one it
+    /// cannot answer about at all. Naming what it holds is what lets the
+    /// report say that, rather than run against absences a kernel reads
+    /// as empty cells and hand back a verdict the chain would not reach.
+    pub holds: Holds,
     /// The table the quote is weighed at.
     ///
     /// A preview answers about a transaction nothing has committed yet,
@@ -85,6 +96,31 @@ pub struct PreviewInputs {
     /// table, and a fold moving it between the quote and the commit is
     /// what the signed ceiling absorbs.
     pub prices: PriceTable,
+}
+
+/// What a node can answer a preview about: the shards whose committed
+/// state it holds, and the trie that says which shard a cell is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holds {
+    /// The routing in force, for resolving a declared cell's owner.
+    pub trie: ShardTrie,
+    /// The shards this node serves state for.
+    pub shards: BTreeSet<ShardId>,
+}
+
+impl Holds {
+    /// The shards `declared` reaches that this node does not hold.
+    fn missing(&self, declared: &EffectSet) -> BTreeSet<ShardId> {
+        declared
+            .iter()
+            .map(|effect| match effect.target {
+                EffectTarget::Point(key) => key.owner,
+                EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => owner,
+            })
+            .map(|owner| self.trie.shard_for_prefix(owner))
+            .filter(|shard| !self.shards.contains(shard))
+            .collect()
+    }
 }
 
 /// How a previewed envelope ended.
@@ -300,6 +336,18 @@ impl Executor {
             // does not arise.
             abortable: false,
         };
+        // A cell this node does not hold is not an empty cell, and a
+        // kernel cannot tell the two apart: it would read the absence,
+        // refuse the withdrawal over it, and the report would name a
+        // verdict the chain never reaches. So the shards are checked
+        // before the run rather than the run explaining itself after.
+        let missing = inputs.holds.missing(&prepared.declaration.set);
+        if !missing.is_empty() {
+            return PreviewReport::refused(format!(
+                "this node holds {:?} and the transaction reads cells on {missing:?}",
+                inputs.holds.shards
+            ));
+        }
         // A preview judges against committed state alone: it is not in
         // a tick, so no tick's reservation is in flight over the
         // baseline it reads, and total locality covers every cell the
@@ -343,7 +391,7 @@ impl Executor {
         // the anchor says is when it was read rather than who held it.
         let source: Arc<dyn CellSource> = Arc::new(Local::at(
             Arc::clone(&base),
-            ShardId(0),
+            SourceShard(0),
             inputs.clock.as_millis(),
         ));
         let report = preview_run(
