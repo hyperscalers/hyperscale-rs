@@ -1,4 +1,4 @@
-//! Shard assignment and write filtering for [`StateWrites`].
+//! Shard assignment and write filtering for [`StateWrites`](hyperscale_types::StateWrites).
 //!
 //! A substate key carries its owner prefix — the identity leaf's routing
 //! half — so shard assignment is a prefix walk over the shard trie and

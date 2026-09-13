@@ -265,7 +265,7 @@ pub struct ProvisionsContext<'a> {
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ProvisionsVerifyError {
     /// `proof` bytes are non-empty but did not decode as a JMT
-    /// [`MultiProof`].
+    /// [`MultiProof`](hyperscale_jmt::MultiProof).
     #[error("merkle proof bytes failed to decode")]
     MalformedProof,
     /// `proof` bytes are empty but the bundle carries entries.

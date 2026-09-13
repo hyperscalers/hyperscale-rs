@@ -114,7 +114,7 @@ impl ShardTrie {
     /// bits, no hashing — the prefix is the placement.
     ///
     /// # Panics
-    /// As [`Self::shard_for`].
+    /// As [`Self::shard_for_route`].
     #[must_use]
     pub fn shard_for_prefix(&self, prefix: impl Into<Address>) -> ShardId {
         self.shard_for_route(RoutePrefix::of(prefix.into()))

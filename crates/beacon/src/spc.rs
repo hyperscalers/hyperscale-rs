@@ -17,7 +17,7 @@
 //! cert constrains is what they're allowed to extend from.
 //!
 //! Pure verifiers, signers, and the indirect-cert aggregator live in
-//! [`hyperscale_types::beacon::spc`]; this module owns the stateful
+//! `hyperscale_types::beacon::spc`; this module owns the stateful
 //! FSM (inner-PC sub-machines, observed proposal-object table,
 //! per-view scheduling).
 

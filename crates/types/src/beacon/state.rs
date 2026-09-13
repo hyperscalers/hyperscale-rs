@@ -786,7 +786,7 @@ pub struct BeaconState {
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
     pub randomness: Randomness,
-    /// The seeds of the epochs still inside [`SEED_WINDOW_EPOCHS`], each
+    /// The seeds of the epochs still inside [`SEED_WINDOW_EPOCHS`](crate::SEED_WINDOW_EPOCHS), each
     /// beside the roll that produced it.
     ///
     /// `randomness` is the head of this: what a draw resolving against a
@@ -1506,7 +1506,7 @@ impl BeaconState {
     /// global validator set. Re-derived on every epoch commit and
     /// shared via `ArcSwap` with the `io_loop`.
     ///
-    /// All validators are assigned uniform [`VoteCount::new(1)`].
+    /// All validators are assigned uniform `VoteCount::new(1)`.
     #[must_use]
     pub fn derive_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
         self.derive_topology_from(
@@ -1624,7 +1624,7 @@ impl BeaconState {
 
     /// Each shard's applied witness watermark as `boundaries` stand right
     /// now — the value the next promotion freezes into
-    /// [`Self::witness_window_bases`], and what the lookahead snapshot
+    /// [`FrozenWindow::witness_bases`], and what the lookahead snapshot
     /// projects for the window it describes.
     #[must_use]
     pub fn live_witness_bases(&self) -> BTreeMap<ShardId, BeaconWitnessLeafCount> {
@@ -1636,7 +1636,7 @@ impl BeaconState {
 
     /// Shards with an admitted, not-yet-executed split as `pending_reshapes`
     /// stand right now — the value the next promotion freezes into
-    /// [`Self::split_pending_window`], and what the lookahead snapshot
+    /// [`FrozenWindow::split_pending`], and what the lookahead snapshot
     /// projects for the window it describes.
     #[must_use]
     pub fn live_split_pending(&self) -> BTreeSet<ShardId> {
@@ -1677,7 +1677,7 @@ impl BeaconState {
     /// gate passes, since an admitted reshape carries no cut yet.
     ///
     /// The value the next promotion freezes into
-    /// [`Self::terminal_epoch_window`], and what the lookahead snapshot
+    /// [`FrozenWindow::scheduled_terminals`], and what the lookahead snapshot
     /// projects — the two must agree, so both read this one source.
     #[must_use]
     pub fn live_scheduled_terminals(&self) -> BTreeMap<ShardId, Epoch> {
@@ -1709,7 +1709,7 @@ impl BeaconState {
     /// executed up to a full tick lifetime earlier. Sourced from
     /// `pending_reshapes` while the record lives and from the boundary
     /// stamp once the reshape executes (the coast). The value the next
-    /// promotion freezes into [`Self::settled_window_floors`], and what
+    /// promotion freezes into [`FrozenWindow::settled_window_floors`], and what
     /// the lookahead snapshot projects.
     #[must_use]
     pub fn live_settled_window_floors(&self) -> BTreeMap<ShardId, WeightedTimestamp> {
@@ -1747,7 +1747,7 @@ impl BeaconState {
 
     /// Each pending split's observer cohort (parent → observer → child
     /// sub-shard) as `pending_reshapes` stand right now — the value the
-    /// next promotion freezes into [`Self::reshape_observers_window`], and
+    /// next promotion freezes into [`FrozenWindow::reshape_observers`], and
     /// what the lookahead snapshot projects for the window it describes.
     #[must_use]
     pub fn live_reshape_observers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
@@ -1777,7 +1777,7 @@ impl BeaconState {
     /// Each pending merge's keepers keyed by the child each one runs
     /// (child → keeper → merging parent) as `pending_reshapes` stand right
     /// now — the value the next promotion freezes into
-    /// [`Self::reshape_keepers_window`]. One merge contributes both
+    /// [`FrozenWindow::reshape_keepers`]. One merge contributes both
     /// children's keeper sets.
     #[must_use]
     pub fn live_reshape_keepers(&self) -> BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {

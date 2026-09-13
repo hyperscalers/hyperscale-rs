@@ -78,7 +78,7 @@ where
     /// into the shard's vnodes, and drain the resulting setup output.
     ///
     /// Returns the block, its certified form, and the drained
-    /// [`StepOutput`](crate::shard::StepOutput). The caller commits the
+    /// [`StepOutput`]. The caller commits the
     /// certified block — production steps `BlockCommitted` inline, simulation
     /// schedules it after the network is wired — so this stops short of the
     /// commit, the one step the two runners can't share.

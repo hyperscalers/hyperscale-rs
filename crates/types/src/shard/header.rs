@@ -800,7 +800,7 @@ impl BlockHeader {
 /// Failure modes of [`BlockHeader`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BlockHeaderVerifyError {
-    /// The header's `parent_qc` is still in [`Verifiable::Unverified`]
+    /// The header's `parent_qc` is still in `Verifiable::Unverified`
     /// at the point verification is requested. Callers must verify the
     /// QC (via [`<QuorumCertificate as Verify>`](Verify) or by upgrading
     /// the wrapper) before attempting to verify the header.
@@ -816,7 +816,7 @@ pub enum BlockHeaderVerifyError {
 pub struct BlockHeaderParentQcMismatch;
 
 /// Construction asserts: the header's `parent_qc` carries a
-/// [`Verifiable::Verified`] marker — i.e. the parent QC has been
+/// `Verifiable::Verified` marker — i.e. the parent QC has been
 /// verified against its committee context. The header's `hash()` is
 /// derived from its content by definition, so there is no separately
 /// claimed hash to check.
@@ -824,7 +824,7 @@ pub struct BlockHeaderParentQcMismatch;
 /// Construction goes through one of three gates:
 ///
 /// - [`<BlockHeader as Verify>::verify`](Verify::verify) — checks that
-///   the embedded `parent_qc` is in [`Verifiable::Verified`].
+///   the embedded `parent_qc` is in `Verifiable::Verified`.
 /// - [`Verified::<BlockHeader>::with_verified_parent_qc`] — accepts an
 ///   external `Verified<QuorumCertificate>` witness and rebinds the
 ///   header's `parent_qc` field after a byte-equality check. Used at
@@ -848,7 +848,7 @@ impl Verify<()> for BlockHeader {
 impl Verified<BlockHeader> {
     /// Borrow the verified parent QC. Total by the
     /// [`Verified<BlockHeader>`] predicate, which requires
-    /// `parent_qc` to sit in [`Verifiable::Verified`].
+    /// `parent_qc` to sit in `Verifiable::Verified`.
     ///
     /// # Panics
     ///
@@ -867,12 +867,12 @@ impl Verified<BlockHeader> {
     /// pairing it with an externally-verified `parent_qc` witness.
     ///
     /// Wire-decoded headers always carry `parent_qc` in
-    /// [`Verifiable::Unverified`] even after the QC has been verified
+    /// `Verifiable::Unverified` even after the QC has been verified
     /// elsewhere (e.g. in a coordinator's verified-QC cache), because
     /// the marker can't be upgraded in place on a shared `Arc<Block>`.
     /// This constructor closes that gap: it byte-equality-checks the
     /// supplied verified QC against the header's claimed `parent_qc`,
-    /// rebinds the field to [`Verifiable::Verified`], and produces the
+    /// rebinds the field to `Verifiable::Verified`, and produces the
     /// typed verified header.
     ///
     /// Construction asserts:

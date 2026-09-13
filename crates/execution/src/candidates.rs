@@ -10,7 +10,7 @@
 //! What leaves is what the tick attests. Nothing here has an outcome:
 //! a candidate that cannot join a tick has said nothing and owes nothing,
 //! so it is free to wait as long as its own deadline allows, and the
-//! [`ledger`](crate::unresolved) is what ends that wait.
+//! `ledger` is what ends that wait.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

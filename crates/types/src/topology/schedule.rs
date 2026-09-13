@@ -745,7 +745,7 @@ impl TopologySchedule {
     /// next.
     ///
     /// All or nothing. A candidate whose boundary record is not yet
-    /// folded, or carries no [`TerminalRoots`] yet, takes the whole set
+    /// folded, or carries no [`TerminalRoots`](crate::TerminalRoots) yet, takes the whole set
     /// with it: a successor holding a *subset* of the chains it succeeds
     /// reads one predecessor's absence proof as the whole answer and
     /// admits what another predecessor committed, which is the replay
@@ -954,6 +954,8 @@ impl TopologySchedule {
     /// derive the same floor.
     ///
     /// [`termination_scheduled`]: Self::termination_scheduled
+    ///
+    /// [`RETENTION_HORIZON`]: crate::RETENTION_HORIZON
     #[must_use]
     pub fn settled_window_floor(
         &self,

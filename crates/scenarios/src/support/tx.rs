@@ -2547,6 +2547,8 @@ impl ParamBallot {
     /// other way today, and if something does there is no ballot that
     /// re-proposes them — which is the vote form's problem to answer,
     /// not a figure to guess here.
+    ///
+    /// [`PriceBounds::as_band`]: hyperscale_vm_types::PriceBounds::as_band
     #[must_use]
     pub fn of(params: &NetworkParams) -> Self {
         let (floor_bp, ceiling_bp) = params

@@ -10,9 +10,9 @@ use crate::{BlockVote, MessageClass, NetworkMessage, Verifiable};
 /// contains the voter identity and signature, making it self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BlockVoteNotification {
-    /// The block vote — wire bytes always land in [`Verifiable::Unverified`];
+    /// The block vote — wire bytes always land in `Verifiable::Unverified`;
     /// local-dispatched sends from a colocated voter preserve
-    /// [`Verifiable::Verified`].
+    /// `Verifiable::Verified`.
     pub vote: Verifiable<BlockVote>,
 }
 

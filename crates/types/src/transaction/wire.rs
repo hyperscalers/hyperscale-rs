@@ -501,6 +501,8 @@ impl Transaction {
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::routing`].
+    ///
+    /// [`ProtocolStatics::rule_admits`]: crate::ProtocolStatics::rule_admits
     #[must_use]
     pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>, clock_ms: u64) -> bool {
         protocol_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)

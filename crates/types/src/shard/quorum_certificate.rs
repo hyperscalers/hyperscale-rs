@@ -259,7 +259,7 @@ pub struct QcContext<'a> {
 pub enum QcVerifyError {
     /// The QC has no signers set in its bitfield. A QC with zero signers
     /// is rejected before any cryptographic work; the genesis QC bypasses
-    /// `verify` via [`VerifiedQuorumCertificate::genesis`].
+    /// `verify` via [`Verified::<QuorumCertificate>::genesis`](Verified::genesis).
     #[error("QC has no signers")]
     NoSigners,
     /// The aggregated signature did not validate against the aggregated

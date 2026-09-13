@@ -4,9 +4,11 @@
 //! points: public keys are compressed G1, signatures and VRF proofs
 //! compressed G2, aggregates the G2 sum of their inputs. Rogue-key
 //! safety for the unvalidated pubkey aggregation in
-//! [`Verifier::verify_aggregate_same_message`] rests on validator
+//! [`Verifier::verify_aggregate_same_message`][agg] rests on validator
 //! registration proving possession of every key (genesis keys are
 //! operator-trusted config).
+//!
+//! [agg]: hyperscale_crypto::Verifier::verify_aggregate_same_message
 
 pub mod bls12381;
 mod keys;

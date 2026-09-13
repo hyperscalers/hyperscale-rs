@@ -558,7 +558,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
     VerifyExecutionCertificateSignature {
         /// The execution certificate to verify. A
-        /// [`Verifiable::Verified`] wrapper short-circuits
+        /// `Verifiable::Verified` wrapper short-circuits
         /// verification.
         certificate: Verifiable<ExecutionCertificate>,
         /// Public keys of the signers (in committee order).
@@ -574,7 +574,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::FinalizationVerified` when complete.
     VerifyFinalization {
         /// The finalization whose every EC needs signature verification
-        /// before admission. A [`Verifiable::Verified`] wrapper
+        /// before admission. A `Verifiable::Verified` wrapper
         /// short-circuits verification.
         finalization: Arc<Verifiable<Finalization>>,
         /// Public keys for each EC, indexed parallel to
@@ -594,7 +594,7 @@ pub enum Action {
     VerifyQcSignature {
         /// The QC to verify (carries `shard_id` for self-contained
         /// verification). When the wrapper is already
-        /// [`Verifiable::Verified`] — e.g. the caller hit a cached
+        /// `Verifiable::Verified` — e.g. the caller hit a cached
         /// verified value — the handler short-circuits and emits the
         /// verified result without rerunning signature aggregation.
         qc: Verifiable<QuorumCertificate>,
@@ -1330,7 +1330,7 @@ pub enum Action {
     /// Request the runner to start (or raise the target of) remote-header
     /// sync for `source_shard`. The runner's `RemoteHeaderSync`
     /// emits range fetches and feeds verified headers back to
-    /// [`crate::ProtocolEvent::RemoteHeaderReceived`].
+    /// [`crate::ProtocolEvent::VerifiedRemoteHeaderReceived`].
     StartRemoteHeaderSync {
         /// Remote shard whose certified header chain we're catching up to.
         source_shard: ShardId,
@@ -1540,7 +1540,7 @@ pub enum Action {
     /// equivocation check.
     VerifyBeaconBlock {
         /// Block whose certs + embedded equivocation witnesses are
-        /// being verified. A [`Verifiable::Verified`] wrapper
+        /// being verified. A `Verifiable::Verified` wrapper
         /// short-circuits dispatch. Carried back through the result
         /// event so the coordinator doesn't have to stash it
         /// separately.
@@ -1588,7 +1588,7 @@ pub enum Action {
     /// returns to the state machine carrying the typed verified handle
     /// on success.
     VerifyRatifyVote {
-        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// Vote to verify. A `Verifiable::Verified` wrapper
         /// short-circuits dispatch.
         vote: Box<Verifiable<RatifyVote>>,
         /// Active validator pool used to look up the signer's pubkey.
@@ -1611,7 +1611,7 @@ pub enum Action {
     /// back.
     VerifyBeaconCandidate {
         /// Candidate whose cert + embedded equivocation witnesses are
-        /// being verified. A [`Verifiable::Verified`] wrapper
+        /// being verified. A `Verifiable::Verified` wrapper
         /// short-circuits dispatch.
         candidate: Arc<Verifiable<CandidateBeaconBlock>>,
         /// Beacon committee for the candidate's epoch, in positional
@@ -1631,7 +1631,7 @@ pub enum Action {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// Vote to verify. A `Verifiable::Verified` wrapper
         /// short-circuits verify dispatch.
         vote: Verifiable<PcVote1>,
         /// Beacon committee at `epoch`, positional order.
@@ -1645,7 +1645,7 @@ pub enum Action {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// Vote to verify. A `Verifiable::Verified` wrapper
         /// short-circuits verify dispatch; the embedded round-1 QC's
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote2>>,
@@ -1660,7 +1660,7 @@ pub enum Action {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// Vote to verify. A `Verifiable::Verified` wrapper
         /// short-circuits verify dispatch; the embedded round-2 QC's
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote3>>,
@@ -1676,7 +1676,7 @@ pub enum Action {
         epoch: Epoch,
         /// Sender of the `NewView` (carried back through the result event).
         from: ValidatorId,
-        /// Proposal object to verify. A [`Verifiable::Verified`]
+        /// Proposal object to verify. A `Verifiable::Verified`
         /// wrapper short-circuits the dispatch.
         proposal: Box<Verifiable<SpcProposalObject>>,
         /// Beacon committee at `epoch`, positional order.
@@ -1693,7 +1693,7 @@ pub enum Action {
         /// pipeline slot. `NewCommit` is self-authenticating via the
         /// embedded `proof`, so this label is dedup metadata only.
         from: ValidatorId,
-        /// New-commit message to verify. A [`Verifiable::Verified`]
+        /// New-commit message to verify. A `Verifiable::Verified`
         /// wrapper short-circuits dispatch; the embedded QC3 marker
         /// shortcuts its sub-check.
         msg: Box<Verifiable<SpcNewCommitMsg>>,
@@ -1706,7 +1706,7 @@ pub enum Action {
     VerifySpcEmptyView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Attestation to verify. A [`Verifiable::Verified`] wrapper
+        /// Attestation to verify. A `Verifiable::Verified` wrapper
         /// short-circuits dispatch.
         msg: Box<Verifiable<SpcEmptyViewMsg>>,
         /// Beacon committee at `epoch`, positional order.

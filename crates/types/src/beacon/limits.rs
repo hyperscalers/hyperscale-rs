@@ -13,7 +13,7 @@
 /// A beacon committee holds at most `chain_config.beacon_committee_size`
 /// members, so a committed-proposal list never exceeds this. Genesis
 /// validates `beacon_committee_size <= MAX_BEACON_COMMITTEE`. Tighter
-/// than the generic [`MAX_SIGNERS`](crate::MAX_SIGNERS) wire cap that
+/// than the generic [`MAX_SIGNERS`](crate::primitives::signer_bitfield::MAX_SIGNERS) wire cap that
 /// other signer collections use.
 pub const MAX_BEACON_COMMITTEE: usize = 128;
 

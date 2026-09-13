@@ -10,7 +10,7 @@ use crate::{MessageClass, NetworkMessage, ReadySignal};
 /// Recipients validate the signal (signature + window) and pool it
 /// locally; the next proposer drains dwell-eligible signals into the
 /// block's
-/// [`BlockManifest::ready_signals`](crate::BlockManifest::ready_signals).
+/// [`WitnessSources::ready_signals`](crate::WitnessSources::ready_signals).
 /// Beacon's `Ready` witness derives one entry per included signal.
 ///
 /// Fan-out is shard-committee-wide rather than proposer-only so a

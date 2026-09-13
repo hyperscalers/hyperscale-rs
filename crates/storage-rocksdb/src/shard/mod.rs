@@ -1,8 +1,8 @@
 //! Shard-side `RocksDB` backend — `RocksDbShardStorage`, JMT integration,
 //! per-shard column families, GC, and recovery flows.
 //!
-//! Top-level [`crate::typed_cf`](crate::typed_cf) and
-//! [`crate::config`](crate::config) host shared abstractions reused
+//! Top-level [`crate::typed_cf`] and
+//! [`crate::config`] host shared abstractions reused
 //! by the parallel beacon-side backend.
 
 pub(crate) mod blocks;

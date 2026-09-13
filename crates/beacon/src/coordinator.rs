@@ -1,7 +1,7 @@
 //! Top-level beacon FSM.
 //!
 //! [`BeaconCoordinator`] is the per-vnode state machine; it owns the
-//! committed [`BeaconState`], the [`SpcDriver`](crate::spc_driver::SpcDriver)
+//! committed [`BeaconState`], the [`SpcDriver`]
 //! consensus plane, and the wall-clock anchor that drives epoch-cadence
 //! timers.
 //!
@@ -1196,7 +1196,7 @@ impl BeaconCoordinator {
     /// view-1 input.
     ///
     /// Proposal payload:
-    /// - Per-shard boundary QCs from [`source_boundary_qcs`](Self::source_boundary_qcs),
+    /// - Per-shard boundary QCs from [`source_boundary_qcs`](crate::boundary::source_boundary_qcs),
     ///   each reported only for a shard whose witness chunk the proposer
     ///   can also supply (the witness-availability coupling).
     /// - Equivocations from [`drain_equivocations_for`](Self::drain_equivocations_for),
@@ -1564,6 +1564,8 @@ impl BeaconCoordinator {
     /// - signature verifies against the canonical
     ///   [`RatifyVoteMessage`](hyperscale_types::RatifyVoteMessage)
     ///   under the signer's pubkey.
+    ///
+    /// [`derive_active_pool`]: hyperscale_types::BeaconState::derive_active_pool
     pub fn on_unverified_ratify_vote_received(
         &mut self,
         vote: Arc<Verifiable<RatifyVote>>,
@@ -1809,7 +1811,7 @@ impl BeaconCoordinator {
     }
 
     /// A shard-witness chunk arrived. Resolve the anchor block's header
-    /// from the local [`ShardSourceTracker`](crate::ShardSourceTracker),
+    /// from the local [`ShardSourceTracker`],
     /// recompute the window root from the payloads plus the range proof,
     /// and admit the run whole. A chunk that fails any check is dropped
     /// silently; the fetch protocol retries on its own cadence.

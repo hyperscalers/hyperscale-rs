@@ -3,7 +3,7 @@
 //! One [`PcInstance`] drives one `(epoch, view)` of PC through three
 //! rounds of voting and emits effects the parent (SPC) drains into
 //! `BeaconCoordinator` actions. The vote / QC wire types and their
-//! verify / sign / build helpers live in [`hyperscale_types::beacon::pc`].
+//! verify / sign / build helpers live in `hyperscale_types::beacon::pc`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

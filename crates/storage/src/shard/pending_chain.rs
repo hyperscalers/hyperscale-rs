@@ -314,7 +314,9 @@ where
     /// dedup-horizon gate can short-circuit when the block carries no
     /// provisions. Persisted heights delegate to the base store's
     /// [`ShardChainReader::get_block_for_sync`], which returns
-    /// [`Block::Sealed`] paired with the manifest's hashes.
+    /// [`Block::Sealed`](hyperscale_types::Block::Sealed) paired with the manifest's hashes.
+    ///
+    /// [`Block::Live`]: hyperscale_types::Block::Live
     pub fn block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
         // Committed entry first; then a certified-but-uncommitted one —
         // the fetcher adopts the QC without committing on it, so the
@@ -745,7 +747,7 @@ type JmtNodeIndex = HashMap<JmtNodeKey, Arc<JmtNode>>;
 ///
 /// Built once per anchor by [`PendingChain::view_at`] and cached via an
 /// `Arc`. Implements [`Substates`], [`SubstateStore`],
-/// [`ShardChainWriter`], and `jmt::TreeReader` so it can substitute
+/// [`ShardChainWriter`](crate::ShardChainWriter), and `jmt::TreeReader` so it can substitute
 /// for the base storage in delegated action handlers.
 ///
 /// Once built the view is immutable — interior data is never mutated.

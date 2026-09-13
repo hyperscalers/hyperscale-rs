@@ -354,7 +354,7 @@ impl Verified<CertifiedBlock> {
     }
 
     /// Borrow the verified QC. Total by the [`Verified<CertifiedBlock>`]
-    /// predicate, which stores a [`Verifiable::Verified`] QC at
+    /// predicate, which stores a `Verifiable::Verified` QC at
     /// assembly time.
     ///
     /// # Panics
@@ -418,7 +418,7 @@ mod tests {
     };
 
     /// A [`CertifiedBlock`]'s HBOR encoding does not depend on whether its
-    /// QC is wrapped as [`Verifiable::Unverified`] or [`Verifiable::Verified`].
+    /// QC is wrapped as `Verifiable::Unverified` or `Verifiable::Verified`.
     /// This is the invariant that keeps wire bytes (and every merkle root or
     /// signature computed over them) stable across the field's type change
     /// from raw `QuorumCertificate` to `Verifiable<QuorumCertificate>`.

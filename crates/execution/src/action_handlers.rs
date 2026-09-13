@@ -7,6 +7,8 @@
 //! kept free of node/runner concerns so the dispatcher only handles
 //! event plumbing — sharing the handlers between production and
 //! simulation keeps execution behavior identical across both backends.
+//!
+//! [`SubstateView`]: hyperscale_storage::SubstateView
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

@@ -48,7 +48,7 @@ impl RocksDbShardStorage {
     /// so a crash mid-create never leaves a plausible-looking partial
     /// database. An existing database under `target` is kept as-is (a
     /// re-run after a crash must not clobber a store the flip may
-    /// already have opened); [`Self::adopt_split_child`] validates the
+    /// already have opened); [`Self::adopt_genesis`] validates the
     /// vintage either way.
     ///
     /// # Errors

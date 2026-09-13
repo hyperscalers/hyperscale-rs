@@ -1,7 +1,7 @@
 //! Async-verification bookkeeping for beacon-side crypto checks.
 //!
 //! Pure verifiers live alongside their wire types in
-//! [`hyperscale_types::beacon`]; this module owns the in-flight slot
+//! `hyperscale_types::beacon`; this module owns the in-flight slot
 //! pools the coordinator uses to dedup crypto-check dispatch.
 
 use std::collections::BTreeSet;

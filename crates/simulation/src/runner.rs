@@ -774,7 +774,7 @@ impl SimulationRunner {
     ///
     /// Walks each host, keeps those that carry `shard`, and collects every
     /// matching vnode's state machine. Use this — not host-indexed
-    /// [`Self::host`] — to assert over a committee after a split: a flip
+    /// [`Self::first_vnode_state`] — to assert over a committee after a split: a flip
     /// leaves the terminated parent vnodes lingering on their hosts under the
     /// parent shard, and a host seated cross-shard carries a second vnode that
     /// host-indexing hides.

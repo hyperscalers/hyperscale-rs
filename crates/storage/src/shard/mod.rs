@@ -1,10 +1,10 @@
 //! Shard-side storage abstractions: per-shard chain reader/writer,
 //! pending-chain overlay, substate plumbing.
 //!
-//! Sibling [`crate::beacon`](crate::beacon) hosts the parallel
+//! Sibling [`crate::beacon`] hosts the parallel
 //! beacon-chain storage tier — independent traits, independent
 //! backend impls, independent lifetime. Cross-cutting modules
-//! ([`crate::tree`](crate::tree), [`crate::lock_recover`](crate::lock_recover))
+//! ([`crate::tree`], [`crate::lock_recover`])
 //! live at crate root.
 
 pub mod boundary;

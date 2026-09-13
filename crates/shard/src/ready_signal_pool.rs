@@ -5,7 +5,7 @@
 //! their shard committee; each member admits the signal into this pool.
 //! At proposal time the local proposer drains dwell-eligible signals
 //! into the next block's
-//! [`BlockManifest::ready_signals`](hyperscale_types::BlockManifest::ready_signals);
+//! [`WitnessSources::ready_signals`](hyperscale_types::WitnessSources::ready_signals);
 //! beacon's `Ready` witness derives one entry per included signal.
 //!
 //! The pool is keyed by `validator_id` so a re-emission from the same
@@ -47,7 +47,9 @@ pub struct PendingReadySignal {
 /// Stored as a `BTreeMap` keyed by `ValidatorId` so drained signals
 /// come out in deterministic ascending order — matches the canonical
 /// ordering the leaf-derivation rule expects (see
-/// [`crate::beacon_witnesses::derive_leaves`]).
+/// [`prospective_parent_witness_leaves`][leaves]).
+///
+/// [leaves]: crate::beacon_witnesses::prospective_parent_witness_leaves
 #[derive(Debug, Default)]
 pub struct ReadySignalPool {
     pending: BTreeMap<ValidatorId, PendingReadySignal>,

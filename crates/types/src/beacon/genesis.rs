@@ -250,7 +250,7 @@ pub struct BeaconGenesisConfig {
     /// in so the input order is incidental.
     pub initial_beacon_committee: Vec<ValidatorId>,
     /// The initial shard committee, seated on the sole genesis shard
-    /// [`ShardId::ROOT`]. A chain always genesises with one shard and
+    /// [`ShardId::ROOT`](crate::ShardId::ROOT). A chain always genesises with one shard and
     /// splits later, so this is a single committee rather than a
     /// per-shard map. Members get `OnShard { ready: true,
     /// placed_at_epoch: GENESIS }` — presumed synced by construction at

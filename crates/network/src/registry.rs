@@ -944,7 +944,7 @@ mod tests {
         });
     }
 
-    /// A [`Verifiable::Verified`] value handed to [`HandlerRegistry::local_dispatch_gossip`]
+    /// A `Verifiable::Verified` value handed to [`HandlerRegistry::local_dispatch_gossip`]
     /// must arrive at the handler still in the `Verified` variant. This is the
     /// in-process fast path: colocated vnodes share a trust domain, so a
     /// producer that verified a payload before publishing must not have its
