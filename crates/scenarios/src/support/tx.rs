@@ -1368,6 +1368,39 @@ pub fn build_transfer_tx<S: AccountSigner>(
     Transaction::new(envelope(graph, payer, validity))
 }
 
+/// Build a transfer signing `ceilings` for its nodes.
+///
+/// What a wallet does with a preview's report: the figures it hands back
+/// are the ones the envelope signs, so the chain meters each node
+/// against what the run actually spent there.
+///
+/// # Panics
+///
+/// As [`build_transfer_tx`].
+#[must_use]
+pub fn build_transfer_at_ceilings<S: AccountSigner>(
+    payer: &S,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+    ceilings: Vec<u64>,
+) -> Transaction {
+    let graph = client()
+        .transfer_graph(principal_of(payer), from, to, amount)
+        .expect("the stdlib account answers a transfer");
+    Transaction::new(client().sign(
+        graph,
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            ceilings: Ceilings::Measured(ceilings),
+            message: Vec::new(),
+        },
+    ))
+}
+
 /// Build a transfer whose fee payer's account is not the signing key's
 /// own.
 ///
