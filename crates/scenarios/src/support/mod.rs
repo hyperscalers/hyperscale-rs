@@ -21,4 +21,4 @@ pub use budget::{Budget, epochs};
 pub use cluster::{Cluster, submission_shards};
 pub use config::ScenarioConfig;
 pub use faultable::{FaultHandle, FaultableCluster};
-pub use grow::{grow_to, vote_reshape_threshold};
+pub use grow::{grow_to, vote_params, vote_reshape_threshold};
