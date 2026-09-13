@@ -96,6 +96,14 @@ pub struct Terms {
     pub validity: TimestampRange,
     /// The compute ceilings the envelope signs.
     pub ceilings: Ceilings,
+    /// What the signer will pay over the table price to be included, in
+    /// basis points, burned like the rest of the fee.
+    ///
+    /// Buys a place in a block and never a position in one: a proposer
+    /// offers the entries that paid over those that did not, and then
+    /// orders whatever it offered by hash. So a priority answers
+    /// congestion and cannot be sold as sequencing.
+    pub priority_bp: u32,
     /// Content riding the signature and nothing else.
     ///
     /// A transaction's hash covers the whole signed envelope, so two
@@ -316,7 +324,7 @@ impl Client {
             signing::Terms {
                 max_fee: terms.max_fee,
                 gas_limits: terms.ceilings.over(tree.node_count()),
-                priority_bp: 0,
+                priority_bp: terms.priority_bp,
                 validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
                 validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
                 message: terms.message,
@@ -445,6 +453,7 @@ mod tests {
                     max_fee: 1_000_000,
                     validity: test_validity_range(),
                     ceilings: Ceilings::Guessed,
+                    priority_bp: 0,
                     message: Vec::new(),
                 },
             )
@@ -473,6 +482,7 @@ mod tests {
             max_fee: 1_000_000,
             validity: test_validity_range(),
             ceilings,
+            priority_bp: 0,
             message: Vec::new(),
         };
 

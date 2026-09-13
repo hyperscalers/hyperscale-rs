@@ -97,6 +97,7 @@ const fn terms(max_fee: u128) -> Terms {
             WeightedTimestamp::from_millis(OFFER_MS),
         ),
         ceilings: Ceilings::Guessed,
+        priority_bp: 0,
         message: Vec::new(),
     }
 }
