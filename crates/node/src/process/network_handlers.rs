@@ -789,7 +789,7 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
+        GetBlockRequest, GetCellsRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
         GetPackageArtifactsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
         GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
         GetTransactionsRequest, GetWitnessHistoryRequest,
@@ -804,10 +804,10 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        CommittedTxsCache, serve_committed_txs_request, serve_execution_certs_request,
-        serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
-        serve_relayed_state_proof_request, serve_remote_headers_request, serve_settled_txs_request,
-        serve_state_proof_request,
+        CommittedTxsCache, serve_cells_request, serve_committed_txs_request,
+        serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
+        serve_provision_request, serve_relayed_state_proof_request, serve_remote_headers_request,
+        serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1198,6 +1198,20 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetStateProofRequest>(shard, move |req| {
             serve_state_proof_request(&pending_chain, &req)
+        });
+
+    // ── cells.request → the cells a declaration reaches ───────────
+    //
+    // A node assembling a preview for a transaction whose declared
+    // cells live on shards it does not serve asks each of them for the
+    // points and intervals the declaration names. Checked against the
+    // root of a header the requester commit-proved, so any node of this
+    // shard may answer and none is trusted with the verdict.
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetCellsRequest>(shard, move |req| {
+            serve_cells_request(&pending_chain, &req)
         });
 
     // ── relayed_state_proof.request → a peer's copy of a proof ────

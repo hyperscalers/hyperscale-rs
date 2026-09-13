@@ -5,6 +5,7 @@
 pub mod beacon;
 
 mod block;
+mod cells;
 mod committed_txs;
 mod execution_cert;
 mod finalization;
@@ -20,6 +21,7 @@ mod transaction;
 mod witness_history;
 
 pub use block::GetBlockResponse;
+pub use cells::{GetCellsResponse, RangeAnswer};
 pub use committed_txs::{CommittedTxVerdict, GetCommittedTxsResponse};
 pub use execution_cert::GetExecutionCertsResponse;
 pub use finalization::GetFinalizationsResponse;
