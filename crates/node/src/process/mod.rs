@@ -15,11 +15,13 @@ mod tx_status;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 pub(crate) use canonical_txs::CanonicalTxs;
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Sender, bounded};
 use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
@@ -498,6 +500,48 @@ where
             // no pipeline to admit or gossip through.
             SubmitFanout::NoHostedShard
         }
+    }
+
+    /// Ask a hosted shard what `tx` would do, and wait up to `timeout`
+    /// for the answer.
+    ///
+    /// The shard asked is the payer's, which is where a preview is most
+    /// nearly whole: the fee vault is there, so the one cell no
+    /// declaration names is the one shard the answer always has. A
+    /// declaration reaching further is refused by name inside the
+    /// report, so a partial answer is never dressed as a complete one.
+    ///
+    /// `None` when this node hosts no shard that could answer, when the
+    /// driver is shutting down, or when it did not answer in time.
+    /// Blocking, and called from RPC worker threads: the driver answers
+    /// a preview inline from committed state, so the wait is a queue
+    /// wait and not a fetch.
+    #[must_use]
+    pub fn preview_transaction(
+        &self,
+        tx: &Transaction,
+        grants: PreviewGrants,
+        timeout: Duration,
+    ) -> Option<Box<PreviewReport>> {
+        let payer_shard = self
+            .topology_snapshot
+            .load()
+            .shard_trie()
+            .shard_for_prefix(tx.body().fee_payer);
+        let senders = self.shard_event_senders.load();
+        let sender = senders.get(&payer_shard)?;
+        let (reply_tx, reply_rx) = bounded(1);
+        sender
+            .send(HostEvent::shard(
+                payer_shard,
+                ShardScopedInput::Preview {
+                    tx: Box::new(tx.clone()),
+                    grants,
+                    reply: reply_tx,
+                },
+            ))
+            .ok()?;
+        reply_rx.recv_timeout(timeout).ok()
     }
 
     /// Fan a locally-submitted transaction out via

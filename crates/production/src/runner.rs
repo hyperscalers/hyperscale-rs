@@ -31,7 +31,9 @@ use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
-use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, genesis_package_facts};
+use hyperscale_engine::{
+    ExecutionMode, Executor, GenesisConfig, PreviewGrants, genesis_package_facts,
+};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths};
 use hyperscale_metrics_prometheus::install;
@@ -66,7 +68,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::rpc::state::{RpcPublishers, VnodeMempoolSnapshot};
+use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
 };
@@ -806,6 +808,30 @@ impl ProductionRunner {
         Arc::new(move |routable: Arc<Transaction>| process.submit_transaction(&routable))
     }
 
+    /// A closure that asks a hosted shard what a transaction would do.
+    ///
+    /// The RPC counterpart of [`Self::tx_submission_sender`], and its
+    /// opposite in every way that matters: it commits nothing, gossips
+    /// nothing, and blocks until the shard answers or the wait runs out.
+    /// Callers run it on a blocking worker for that reason.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `run()` has already consumed the host, as
+    /// [`Self::tx_submission_sender`] does and for the same reason.
+    #[must_use]
+    pub fn preview_sender(&self) -> PreviewSender {
+        let process = Arc::clone(
+            self.host
+                .as_ref()
+                .expect("host must exist for preview_sender")
+                .process(),
+        );
+        Arc::new(move |tx: &Transaction| {
+            process.preview_transaction(tx, PreviewGrants::default(), PREVIEW_TIMEOUT)
+        })
+    }
+
     /// Take the shutdown handle.
     ///
     /// Returns a handle that when dropped triggers graceful shutdown.
@@ -1333,6 +1359,14 @@ impl Drop for ProdTimerManager {
         }
     }
 }
+
+/// How long an RPC preview waits for a shard driver to answer.
+///
+/// A preview is answered inline from committed state, so the wait is a
+/// queue wait behind whatever the driver is already doing rather than a
+/// fetch. Generous enough to survive a busy step, short enough that a
+/// caller is told the node is busy rather than left holding a socket.
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);

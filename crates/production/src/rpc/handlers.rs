@@ -28,6 +28,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use hex::{decode as hex_decode, encode as hex_encode};
+use hyperscale_engine::PreviewOutcome;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_metrics::{
     record_transaction_rejected, record_tx_ingress_rejected_pending_limit,
@@ -37,10 +38,12 @@ use hyperscale_metrics_prometheus::encode_metrics;
 use hyperscale_types::{
     Hash, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
 };
+use tokio::task::spawn_blocking;
 
 use super::state::RpcState;
 use super::types::{
-    HealthResponse, NodeStatusResponse, ReadyResponse, ShardSyncStatus, SubmitTransactionRequest,
+    ErrorResponse, HealthResponse, NodeStatusResponse, PreviewTransactionRequest,
+    PreviewTransactionResponse, ReadyResponse, ShardSyncStatus, SubmitTransactionRequest,
     SubmitTransactionResponse, SyncStatusResponse, TransactionStatusResponse,
 };
 
@@ -144,6 +147,52 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 // ═══════════════════════════════════════════════════════════════════════════
 // Transaction Handlers
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Answer what `tx` would do against committed state, committing
+/// nothing.
+///
+/// The run is a blocking round trip to a shard driver, so it goes to a
+/// blocking worker rather than holding a tokio thread. A node that
+/// hosts no shard able to answer, or a driver that does not reply in
+/// time, is a `503`: the question is unanswerable here rather than
+/// malformed.
+///
+/// A declaration reaching a shard this node does not serve comes back
+/// `refused` with the shards named, not as an error — the node ran what
+/// it could and is saying what it could not see.
+pub async fn preview_transaction_handler(
+    State(state): State<RpcState>,
+    Json(request): Json<PreviewTransactionRequest>,
+) -> impl IntoResponse {
+    let transaction = match decode_transaction(&request.transaction_hex) {
+        Ok(tx) => tx,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let preview = state.preview_tx;
+    let Ok(Some(report)) = spawn_blocking(move || preview(&transaction)).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "no hosted shard answered the preview".to_owned(),
+                details: None,
+            }),
+        )
+            .into_response();
+    };
+    let (outcome, reason) = match &report.outcome {
+        PreviewOutcome::Completed => ("completed", None),
+        PreviewOutcome::Aborted { reason } => ("aborted", Some(reason.clone())),
+        PreviewOutcome::Refused { reason } => ("refused", Some(reason.clone())),
+    };
+    Json(PreviewTransactionResponse {
+        outcome: outcome.to_owned(),
+        reason,
+        fee: report.fee.to_string(),
+        fuel: report.fuel,
+        ceilings: report.ceilings.clone(),
+    })
+    .into_response()
+}
 
 /// Handler for `POST /api/v1/transactions` - submit transaction.
 ///
@@ -426,6 +475,7 @@ mod tests {
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
+            preview_tx: Arc::new(|_tx| None),
             start_time: Instant::now(),
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
@@ -665,6 +715,7 @@ mod tests {
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
+            preview_tx: Arc::new(|_tx| None),
             start_time: Instant::now(),
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
@@ -718,6 +769,7 @@ mod tests {
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
+            preview_tx: Arc::new(|_tx| None),
             start_time: Instant::now(),
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),

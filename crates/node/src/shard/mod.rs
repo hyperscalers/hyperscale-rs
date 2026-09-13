@@ -31,6 +31,7 @@ pub(crate) mod io;
 pub(crate) mod mempool;
 pub(crate) mod packages;
 pub(crate) mod phase_times;
+pub(crate) mod preview;
 pub(crate) mod verify;
 
 // The driver shell: dispatch, lifecycle, metrics, the generic
@@ -416,6 +417,9 @@ where
     fn dispatch_input(&mut self, input: ShardScopedInput) {
         match input {
             // ── Transaction validation pipeline ────────────────────────
+            ShardScopedInput::Preview { tx, grants, reply } => {
+                self.handle_preview(&tx, grants, &reply);
+            }
             ShardScopedInput::TransactionGossipReceived { tx } => {
                 self.handle_gossip_received_tx_for_validation(tx);
             }
