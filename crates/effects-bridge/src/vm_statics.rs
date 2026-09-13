@@ -146,6 +146,12 @@ pub fn declared_vector(
         let share = by_owner.entry(owner).or_default();
         *share = share.saturating_add(term);
     };
+    // What the writes leave behind, which is not what they cost: a
+    // written leaf carries `WRITE_LEAF_BYTES` of tree-path reads into
+    // the write dimension, and those touch nothing after the block.
+    // Accumulated beside the shares because retention is borne whole by
+    // every shard and so belongs to none of them.
+    let mut retained = 0u64;
 
     // The declaration's effects, each under its target's owner. The byte
     // dimensions are per target, since one leaf is read once and written
@@ -165,6 +171,7 @@ pub fn declared_vector(
                 ..DeclaredWork::ZERO
             },
         );
+        retained = retained.saturating_add(set.retained_bytes_of(&target));
     }
     for effect in set.iter() {
         add(
@@ -201,6 +208,9 @@ pub fn declared_vector(
                     ..DeclaredWork::ZERO
                 },
             );
+            retained = retained
+                .saturating_add(u64::from(CROSSING_CELL_BYTES))
+                .saturating_add(u64::from(MARKER_CELL_BYTES));
         }
     }
 
@@ -246,7 +256,7 @@ pub fn declared_vector(
         })
         .collect();
     let everywhere = everywhere(
-        &shares,
+        retained,
         envelope_bytes,
         vm.signatures(),
         admit_event_bounds(&event_bytes)?,
@@ -306,23 +316,28 @@ pub struct DeclaredVector {
 
 /// What every shard that commits a transaction bears whatever it holds:
 /// the verification of every signature, the committed cell it writes,
-/// and the retention every validator keeps — the envelope, every write,
-/// the auth material, and the events its packages may emit.
+/// and the retention every validator keeps — the envelope, what the
+/// writes leave behind, the auth material, and the events its packages
+/// may emit.
+///
+/// `retained` is what the declaration's writes keep, not what they cost.
+/// The write dimension carries `WRITE_LEAF_BYTES` of tree-path reads per
+/// leaf, and a validator retains none of them — this cap is derived as a
+/// share of what actually crosses the link and stays, so counting the
+/// reads here would hold a block to a quantity nobody stores.
 fn everywhere(
-    shares: &[OwnerShare],
+    retained: u64,
     envelope_bytes: u64,
     signatures: DeclaredWork,
     event_bytes: u64,
 ) -> DeclaredWork {
     let committed_cell = u64::from(MARKER_CELL_BYTES);
-    let written = shares.iter().fold(committed_cell, |total, share| {
-        total.saturating_add(share.work.write_bytes)
-    });
     DeclaredWork {
         compute: signatures.compute,
         write_bytes: committed_cell,
         retention: envelope_bytes
-            .saturating_add(written)
+            .saturating_add(retained)
+            .saturating_add(committed_cell)
             .saturating_add(signatures.retention)
             .saturating_add(event_bytes),
         ..DeclaredWork::ZERO
@@ -792,7 +807,9 @@ impl BridgeStatics {
                 ..DeclaredWork::ZERO
             },
         }];
-        let everywhere = everywhere(&shares, envelope_bytes(vm)?, vm.signatures(), 0);
+        // A publish keeps exactly what it writes: the artifact sits in
+        // the package cell and the vault holds its amount.
+        let everywhere = everywhere(written, envelope_bytes(vm)?, vm.signatures(), 0);
         let work = whole_work(&shares, &[], everywhere);
 
         Ok(Derived {
@@ -1438,9 +1455,17 @@ mod tests {
             vm.gas_limit_total() + vm.signatures().compute
         );
         assert!(
-            derived.work.retention
-                >= envelope_bytes + derived.work.write_bytes + vm.signatures().retention,
-            "retention carries the envelope, every write and the auth material"
+            derived.work.retention >= envelope_bytes + vm.signatures().retention,
+            "retention carries the envelope and the auth material"
+        );
+        assert!(
+            derived.work.retention < envelope_bytes + derived.work.write_bytes,
+            "and what the writes leave behind rather than what they cost: a \
+             transfer keeps a few dozen bytes in its vaults where writing \
+             them reads thousands off the tree path. {} against a write \
+             dimension of {}",
+            derived.work.retention,
+            derived.work.write_bytes
         );
         // Each call carries the bound its own method declares, so a
         // transfer's sign-in carries nothing and its withdraw and
@@ -1459,8 +1484,8 @@ mod tests {
         assert_eq!(signing_in, 0, "signing in emits nothing and pays nothing");
         assert!(moving > 0, "the movements bound what they may emit");
         assert!(
-            derived.work.retention >= envelope_bytes + derived.work.write_bytes + moving,
-            "retention carries the envelope, the writes and each call's own event bound"
+            derived.work.retention >= envelope_bytes + moving,
+            "retention carries the envelope and each call's own event bound"
         );
         // The sum over the calls and nothing else: a second movement
         // pair adds its own bound again, so what retention prices is
