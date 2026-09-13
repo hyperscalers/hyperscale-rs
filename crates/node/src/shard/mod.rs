@@ -192,7 +192,7 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
 /// timer owned by the host's shard-less follower pool — the runner's
 /// timer driver keys handles by `(Option<ShardId>, TimerId)`, and the
 /// firing path produces a [`ShardScopedInput`] envelope targeting the
-/// shard or a [`PoolScopedInput`](crate::event::PoolScopedInput)
+/// shard or a [`PoolScopedInput`]
 /// envelope for the pool.
 #[derive(Debug, Clone)]
 pub enum TimerOp {

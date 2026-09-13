@@ -10,7 +10,7 @@ use crate::Substates;
 /// A reader whose version was fixed when it was made.
 ///
 /// Every snapshot is one. A store is not, and neither is a
-/// [`crate::pending_chain::SubstateView`] read directly: both resolve
+/// [`crate::SubstateView`] read directly: both resolve
 /// against whatever has persisted by the time the read happens. The
 /// difference is invisible at a call site and decides the state root — a
 /// movement resolved against a baseline that moves with one validator's
@@ -59,7 +59,7 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
     ///
     /// - Base storage (`RocksDbShardStorage`, `SimShardStorage`): snapshots at the
     ///   current `jmt_height()`, i.e. the latest committed state.
-    /// - [`crate::pending_chain::SubstateView`]: snapshots at the view's
+    /// - [`crate::SubstateView`]: snapshots at the view's
     ///   bound anchor height, combining the overlay with a version-anchored
     ///   base read — deterministic across validators regardless of each
     ///   validator's persistence lag.
@@ -125,7 +125,7 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
 /// The returned snapshot reads substate values as of `version`. When
 /// `version` exceeds the persisted tip, the snapshot reads the current
 /// value directly — callers that need overlay coverage above the
-/// persisted tip must go through a [`crate::pending_chain::SubstateView`].
+/// persisted tip must go through a [`crate::SubstateView`].
 ///
 /// Two spellings of one read. [`Self::snapshot_held_at`] answers `None`
 /// for a height the store does not hold, and is what every reader of a

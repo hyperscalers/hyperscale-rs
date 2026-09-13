@@ -224,17 +224,17 @@ macro_rules! hash_newtype {
             /// Zero-valued hash of this kind (all bytes `0x00`).
             pub const ZERO: Self = Self($crate::Hash::ZERO);
 
-            /// Wrap a raw [`Hash`] as this kind.
+            /// Wrap a raw [`Hash`](struct@$crate::Hash) as this kind.
             pub const fn from_raw(raw: $crate::Hash) -> Self {
                 Self(raw)
             }
 
-            /// Unwrap into the underlying raw [`Hash`].
+            /// Unwrap into the underlying raw [`Hash`](struct@$crate::Hash).
             pub const fn into_raw(self) -> $crate::Hash {
                 self.0
             }
 
-            /// Borrow the underlying raw [`Hash`].
+            /// Borrow the underlying raw [`Hash`](struct@$crate::Hash).
             pub const fn as_raw(&self) -> &$crate::Hash {
                 &self.0
             }

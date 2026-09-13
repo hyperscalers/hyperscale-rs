@@ -9,7 +9,7 @@
 //! `BeaconState` glue (eligibility filters, state mutation) lives in
 //! `crate::state` and calls these primitives.
 //!
-//! [`BeaconState`]: crate::state::BeaconState
+//! [`BeaconState`]: hyperscale_types::BeaconState
 
 use blake3::Hasher;
 use hyperscale_types::{Epoch, ShardId, ValidatorId};

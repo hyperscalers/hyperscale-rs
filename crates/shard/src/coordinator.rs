@@ -1177,7 +1177,7 @@ impl ShardCoordinator {
     /// `tx_hashes` is the caller's candidate set — the mempool's pending
     /// transactions that open before the cut. Blocks awaiting a vote
     /// contribute their own pre-cut transactions on top: a vote deferred
-    /// by [`Self::precut_verdict`] resolves only once the query it waits
+    /// by the [`Precut`](crate::precut::Precut) gate resolves only once the query it waits
     /// on is issued, and nothing guarantees the block's transactions are
     /// also sitting in this node's pool.
     ///

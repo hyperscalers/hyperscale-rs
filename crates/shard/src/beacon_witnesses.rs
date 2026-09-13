@@ -1,7 +1,7 @@
 //! Per-shard beacon-witness accumulator + leaf-derivation rules.
 //!
 //! Single owner for everything around the shard's
-//! [`BeaconWitnessRoot`](hyperscale_types::BeaconWitnessRoot) commitment
+//! [`BeaconWitnessRoot`] commitment
 //! on each [`BlockHeader`](hyperscale_types::BlockHeader): the in-memory
 //! accumulator, the canonical leaf-derivation rule (receipts →
 //! `MissedProposal` → readiness → reshape trigger), and the

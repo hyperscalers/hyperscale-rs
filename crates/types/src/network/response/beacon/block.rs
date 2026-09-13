@@ -12,7 +12,7 @@ use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 /// Carries the committed block if the responder has it, otherwise
 /// `None` — the requester treats `None` as "this peer doesn't have it;
 /// try another." Wire decode lands the wrapper as
-/// [`Verifiable::Unverified`]; the requester verifies the cert before
+/// `Verifiable::Unverified`; the requester verifies the cert before
 /// applying.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetBeaconBlockResponse {

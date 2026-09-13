@@ -19,8 +19,8 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct CertifiedBlockHeaderGossip {
     /// The committed block header (header + QC). Wire bytes always land
-    /// in [`Verifiable::Unverified`]; local-dispatched broadcasts from a
-    /// colocated proposer preserve [`Verifiable::Verified`].
+    /// in `Verifiable::Unverified`; local-dispatched broadcasts from a
+    /// colocated proposer preserve `Verifiable::Verified`.
     pub certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,

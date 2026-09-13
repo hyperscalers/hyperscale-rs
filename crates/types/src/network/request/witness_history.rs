@@ -28,7 +28,7 @@ pub struct GetWitnessHistoryRequest {
     /// First leaf index of the requested page (0-based).
     pub start_index: u64,
     /// Requested hash cap for this page. The server clamps to
-    /// [`MAX_HASHES_PER_WITNESS_HISTORY`](crate::network::response::MAX_HASHES_PER_WITNESS_HISTORY);
+    /// [`MAX_WITNESSES_PER_FETCH`](crate::MAX_WITNESSES_PER_FETCH);
     /// `more` signals continuation.
     pub limit: u32,
 }

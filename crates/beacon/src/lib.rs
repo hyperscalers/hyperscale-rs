@@ -10,6 +10,8 @@
 //! successful `apply_epoch` it derives a fresh
 //! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
+//!
+//! [`BeaconCoordinator`]: crate::coordinator::BeaconCoordinator
 
 pub mod action_handlers;
 pub mod boundary;

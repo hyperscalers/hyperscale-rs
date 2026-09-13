@@ -2,7 +2,7 @@
 //! and the tree-store adapter that mirrors the `RocksDB` JMT semantics
 //! for deterministic simulation.
 //!
-//! Sibling [`crate::beacon`](crate::beacon) hosts the parallel
+//! Sibling [`crate::beacon`] hosts the parallel
 //! beacon-chain in-memory backend.
 
 pub(crate) mod boundary;

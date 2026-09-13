@@ -65,6 +65,8 @@ pub fn committed_crossings(
 
 /// Provision-tx roots map type as carried by [`BlockHeader`](crate::BlockHeader),
 /// which caps it at [`MAX_PROVISION_TARGET_SHARDS`] entries on the wire.
+///
+/// [`MAX_PROVISION_TARGET_SHARDS`]: crate::MAX_PROVISION_TARGET_SHARDS
 pub type ProvisionTxRootsMap = BTreeMap<ShardId, ProvisionTxRoot>;
 
 /// Failure modes of provision-tx-roots verification.

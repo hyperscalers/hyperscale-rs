@@ -253,7 +253,7 @@ fn flatten_work_items(writes: &SettledWrites) -> Vec<(SubstateKey, Option<Cow<'_
 /// `parent_version` is the version of the existing root (`None` for initial state).
 /// `new_version` is the version to stamp on new nodes (typically block height).
 ///
-/// Accepts multiple [`StateWrites`] — all are flattened directly into
+/// Accepts multiple [`SettledWrites`] — all are flattened directly into
 /// JMT work items without merging. Since transactions hold exclusive
 /// state locks, there are no key conflicts between them.
 ///

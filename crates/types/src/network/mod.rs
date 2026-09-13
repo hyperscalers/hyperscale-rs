@@ -1,6 +1,6 @@
 //! Network message traits and concrete wire types.
 //!
-//! [`MessageClass`], [`NetworkMessage`], [`Request`], and [`ShardMessage`]
+//! [`MessageClass`], [`NetworkMessage`], [`Request`], and [`GossipMessage`]
 //! mark types as network messages for serialization, routing, and `QoS`
 //! ordering. Concrete messages live in submodules grouped by transport
 //! semantics:

@@ -9,11 +9,13 @@
 //! of a later two-chain after a view change (INV-SHARD-4).
 //!
 //! Not itself evidence of misbehaviour. Consumers span the adversarial and
-//! the ordinary: [`ShardForkProof`](super::evidence::ShardForkProof) pairs
+//! the ordinary: [`ShardForkProof`] pairs
 //! two conflicting proofs into a fork accusation, remote-header
 //! consumption marks heights commit-proven, and a split child's follower
 //! establishes that the parent's terminal block committed before deriving
 //! its genesis from it.
+//!
+//! [`ShardForkProof`]: super::evidence::ShardForkProof
 
 use hyperscale_crypto::Verifier;
 use hyperscale_hbor::Hbor;
@@ -50,6 +52,10 @@ pub const MAX_COMMIT_PROOF_ANCESTRY: usize = 256;
 /// ([`ShardForkProof::verify_resolved`]) runs the signature work without the
 /// schedule in hand — the same emitter-resolves pattern the beacon-block
 /// verify action uses.
+///
+/// [`ShardForkProof::resolve_committees`]: super::evidence::ShardForkProof::resolve_committees
+///
+/// [`ShardForkProof::verify_resolved`]: super::evidence::ShardForkProof::verify_resolved
 #[derive(Debug, Clone)]
 pub struct ResolvedCommittee {
     /// Committee public keys, positionally aligned to the QC's signer
@@ -223,6 +229,10 @@ impl CommitProof {
     /// [`ShardForkProof::verify_resolved`] iterate QCs through this, so
     /// resolved committees always line up positionally with the QCs they
     /// verify.
+    ///
+    /// [`ShardForkProof::resolve_committees`]: super::evidence::ShardForkProof::resolve_committees
+    ///
+    /// [`ShardForkProof::verify_resolved`]: super::evidence::ShardForkProof::verify_resolved
     pub(crate) const fn qc_headers(&self) -> [&CertifiedBlockHeader; 2] {
         [&self.certified, &self.child]
     }
@@ -306,6 +316,8 @@ impl CommitProof {
     /// # Errors
     ///
     /// A [`CommitProofVerifyError`] naming the failing check.
+    ///
+    /// [`ShardForkProof`]: super::evidence::ShardForkProof
     pub fn verify_resolved(
         &self,
         verifier: &dyn Verifier,

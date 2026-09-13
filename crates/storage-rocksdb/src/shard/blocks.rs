@@ -306,7 +306,7 @@ impl RocksDbShardStorage {
         // 4. Reconstruct each Finalization from cert + stored receipts.
         //
         // The reconstructed ticks arrive at the Block as
-        // [`Verifiable::Unverified`]: the on-disk shape didn't carry the
+        // `Verifiable::Unverified`: the on-disk shape didn't carry the
         // marker, so the upstream verification claim isn't available here.
         // Downstream readers run the predicate when needed.
         let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
@@ -453,7 +453,7 @@ impl RocksDbShardStorage {
         // servable and the syncing peer must try a different source.
         //
         // Reconstructed ticks arrive at the Block as
-        // [`Verifiable::Unverified`] — see the sibling reader above for
+        // `Verifiable::Unverified` — see the sibling reader above for
         // rationale.
         let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
             .into_iter()

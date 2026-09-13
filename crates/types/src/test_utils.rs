@@ -979,7 +979,7 @@ pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
     }
 }
 
-/// A deterministic [`Derivation`](crate::Derivation) stub for consensus-crate
+/// A deterministic [`Derivation`] stub for consensus-crate
 /// tests.
 ///
 /// The envelope's tree is a leading read count followed by that many

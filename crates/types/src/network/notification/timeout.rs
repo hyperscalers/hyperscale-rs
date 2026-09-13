@@ -12,9 +12,9 @@ use crate::{MessageClass, NetworkMessage, Timeout, Verifiable};
 /// self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct TimeoutNotification {
-    /// The timeout — wire bytes always land in [`Verifiable::Unverified`];
+    /// The timeout — wire bytes always land in `Verifiable::Unverified`;
     /// local-dispatched sends from a colocated signer preserve
-    /// [`Verifiable::Verified`].
+    /// `Verifiable::Verified`.
     pub timeout: Verifiable<Timeout>,
 }
 

@@ -201,7 +201,7 @@ pub struct NodeConfig {
     /// Network this node is configured for. Bound into every
     /// signed consensus message to prevent cross-network replay.
     /// Parsed from a network name (`"mainnet"`, `"testnet"`,
-    /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`].
+    /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`](std::str::FromStr::from_str).
     #[serde(default = "default_network", with = "network_serde")]
     pub network: NetworkDefinition,
 

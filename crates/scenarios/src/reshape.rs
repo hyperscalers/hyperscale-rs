@@ -149,6 +149,8 @@ const PROBES_PER_EPOCH: u64 = 4;
 
 /// Upper bound on the train, and so on the funding
 /// [`probe_train_genesis_accounts`] has to cover.
+///
+/// [`probe_train_genesis_accounts`]: crate::support::tx::probe_train_genesis_accounts
 pub const MAX_REPLAY_PROBES: u32 = 48;
 
 /// Whether `shard` is seated and committing past its own genesis.
@@ -174,6 +176,8 @@ fn shard_live<C: Cluster>(c: &C, shard: ShardId) -> bool {
 /// Panics if any lifecycle stage misses its budget, if no probe survives
 /// to be a replay candidate (which would make the assertion vacuous), or
 /// if either child commits the replay.
+///
+/// [`probe_train_genesis_accounts`]: crate::support::tx::probe_train_genesis_accounts
 pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
@@ -381,6 +385,8 @@ const PRECUT_PROBE_LIFE: Duration = MAX_VALIDITY_RANGE.saturating_sub(Duration::
 /// Panics if any lifecycle stage misses its budget, if the train yields
 /// no candidate of either kind, if the stranded transaction reaches no
 /// outcome, or if the replay commits.
+///
+/// [`probe_train_genesis_accounts`]: crate::support::tx::probe_train_genesis_accounts
 pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
@@ -587,6 +593,8 @@ const POST_CUT_PROBE_LIFE: Duration = MAX_VALIDITY_RANGE.saturating_sub(Duration
 /// Panics if any lifecycle stage misses its budget, if the train yields no
 /// candidate of either kind, if the stranded transaction reaches no
 /// outcome on the reformed parent, or if the replay commits there.
+///
+/// [`probe_train_genesis_accounts`]: crate::support::tx::probe_train_genesis_accounts
 pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
 

@@ -52,7 +52,7 @@ struct Inner {
 /// Per-shard finalization store. See module docs for lifecycle.
 ///
 /// Stored values are [`Verifiable<Finalization>`] in the
-/// [`Verifiable::Verified`] variant. Holding the `Block::Live.certificates`
+/// `Verifiable::Verified` variant. Holding the `Block::Live.certificates`
 /// transport shape directly lets the proposal-build path source verifiable
 /// arcs without a per-extraction conversion; the typed-gate `insert` is
 /// the single place where the conversion (and body clone) happens.
@@ -90,8 +90,8 @@ impl FinalizationStore {
     }
 
     /// Record a newly-finalization under its `TickId`. Callers wrap
-    /// their upstream [`Verified<Finalization>`] into
-    /// [`Verifiable::Verified`] before insertion so the same `Arc` can be
+    /// their upstream [`Verified<Finalization>`](hyperscale_types::Verified) into
+    /// `Verifiable::Verified` before insertion so the same `Arc` can be
     /// shared with downstream `FinalizationsAdmitted` consumers without
     /// re-cloning. The store enforces — by virtue of its `Verifiable`
     /// argument type and the typed gates the caller went through to

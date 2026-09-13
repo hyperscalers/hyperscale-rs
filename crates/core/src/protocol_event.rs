@@ -214,7 +214,7 @@ pub enum ProtocolEvent {
         /// verifier succeeded, QC's signature aggregate cleared the quorum
         /// threshold, and `qc.block_hash == block.hash()`. State-root
         /// verification rides the parallel pipeline path (see the doc
-        /// on [`VerifiedBlock`](hyperscale_types::VerifiedBlock)).
+        /// on [`Verified<Block>`](hyperscale_types::Verified)).
         certified: Arc<Verified<CertifiedBlock>>,
     },
 
@@ -398,7 +398,7 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Received provisions from a source shard whose merkle proof still
     /// needs to be checked. Produced by the gossip handler (wire decode
-    /// always lands in [`Verifiable::Unverified`]) and by fetch-response
+    /// always lands in `Verifiable::Unverified`) and by fetch-response
     /// drains.
     ///
     /// All transactions share the same `(source_shard, block_height)`
@@ -411,7 +411,7 @@ pub enum ProtocolEvent {
     /// Received provisions whose merkle proof predicate already holds —
     /// produced only by the local-dispatch fast path when a colocated
     /// source-shard vnode emits a notification carrying
-    /// [`Verifiable::Verified`]. The recipient skips
+    /// `Verifiable::Verified`. The recipient skips
     /// [`Action::VerifyProvisions`] and admits directly.
     ///
     /// [`Action::VerifyProvisions`]: crate::Action::VerifyProvisions
@@ -537,7 +537,7 @@ pub enum ProtocolEvent {
     /// hooks this event by `tick_id`.
     ExecutionCertificatesReceived {
         /// Execution certificates to admit. Wire-decoded entries land
-        /// `Unverified`; a [`Verifiable::Verified`] entry short-circuits
+        /// `Unverified`; a `Verifiable::Verified` entry short-circuits
         /// verify dispatch at the coordinator.
         certificates: Vec<Verifiable<ExecutionCertificate>>,
     },
@@ -580,7 +580,7 @@ pub enum ProtocolEvent {
     /// continuation, not this event.
     FinalizationsReceived {
         /// Finalizations returned by the peer. Wire-decoded entries
-        /// land `Unverified`; a [`Verifiable::Verified`] entry
+        /// land `Unverified`; a `Verifiable::Verified` entry
         /// short-circuits verify dispatch at the coordinator.
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
     },
@@ -599,7 +599,7 @@ pub enum ProtocolEvent {
     FinalizationsAdmitted {
         /// Finalizations newly admitted on this admission call. Carried
         /// in the `Block::Live.certificates` transport shape — every
-        /// entry is in the [`Verifiable::Verified`] variant by virtue of
+        /// entry is in the `Verifiable::Verified` variant by virtue of
         /// the typed gates the emitter went through (`finalize`'s
         /// `seal`, or `admit_finalization`'s `Verify::verify`).
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
@@ -976,14 +976,13 @@ pub enum ProtocolEvent {
         range_proof: Vec<Hash>,
     },
 
-    /// Result of an [`Action::FetchBeaconProposal`] dispatch — carries a
+    /// Result of a beacon-proposal fetch dispatch — carries a
     /// proposal the peer returned. A responder that didn't hold the
     /// proposal yields no event: the fetch binding releases the slot for
     /// retry against another peer instead. Wire decode lands the wrapper
     /// as `Verifiable::Unverified`; locally-dispatched serves preserve the
     /// `Verified` marker.
     ///
-    /// [`Action::FetchBeaconProposal`]: crate::Action::FetchBeaconProposal
     BeaconProposalFetched {
         /// Epoch the fetched proposal targets.
         epoch: Epoch,
@@ -993,7 +992,7 @@ pub enum ProtocolEvent {
         proposal: Arc<Verifiable<BeaconProposal>>,
     },
 
-    /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The
+    /// Result of an [`Action::VerifyBeaconBlock`](crate::Action::VerifyBeaconBlock) dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into adoption without stashing during the verify
     /// round-trip.
@@ -1024,7 +1023,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote1`] dispatch. The verified
+    /// Result of an [`Action::VerifyPcVote1`](crate::Action::VerifyPcVote1) dispatch. The verified
     /// handle rides back so the coordinator can route it into the right
     /// view's inner PC sub-machine without stashing.
     PcVote1Verified {
@@ -1041,7 +1040,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote2`] dispatch.
+    /// Result of an [`Action::VerifyPcVote2`](crate::Action::VerifyPcVote2) dispatch.
     PcVote2Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1053,7 +1052,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote3`] dispatch.
+    /// Result of an [`Action::VerifyPcVote3`](crate::Action::VerifyPcVote3) dispatch.
     PcVote3Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1065,7 +1064,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewView`] dispatch.
+    /// Result of an [`Action::VerifySpcNewView`](crate::Action::VerifySpcNewView) dispatch.
     SpcNewViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1081,7 +1080,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
+    /// Result of an [`Action::VerifySpcNewCommit`](crate::Action::VerifySpcNewCommit) dispatch.
     SpcNewCommitVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1096,7 +1095,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
+    /// Result of an [`Action::VerifySpcEmptyView`](crate::Action::VerifySpcEmptyView) dispatch.
     SpcEmptyViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,

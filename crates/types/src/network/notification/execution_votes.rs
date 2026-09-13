@@ -15,8 +15,8 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ExecutionVotesNotification {
     /// The execution votes being sent. Wire bytes always land in
-    /// [`Verifiable::Unverified`]; local-dispatched sends from a
-    /// colocated voter preserve [`Verifiable::Verified`].
+    /// `Verifiable::Unverified`; local-dispatched sends from a
+    /// colocated voter preserve `Verifiable::Verified`.
     ///
     /// Bounded like the certificates they aggregate into: one per tick,
     /// and a tick partitions the block's transactions.

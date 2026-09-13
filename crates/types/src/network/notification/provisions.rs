@@ -17,9 +17,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ProvisionsNotification {
     /// The provisions bundle being sent (one bundle per target shard).
-    /// Wire bytes always land in [`Verifiable::Unverified`];
+    /// Wire bytes always land in `Verifiable::Unverified`;
     /// local-dispatched sends from a colocated proposer preserve
-    /// [`Verifiable::Verified`].
+    /// `Verifiable::Verified`.
     pub provisions: Arc<Verifiable<Provisions>>,
     /// The validator who sent this notification.
     pub sender: ValidatorId,

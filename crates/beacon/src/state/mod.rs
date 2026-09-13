@@ -4,7 +4,7 @@
 //! Data shapes and pure derived queries (`min_stake`,
 //! `effective_stake`, `derive_topology_snapshot`, …) live as inherent
 //! methods on `BeaconState` / `StakePool` in
-//! [`hyperscale_types::beacon::state`]. This module hosts only the
+//! `hyperscale_types::beacon::state`. This module hosts only the
 //! behavior that mutates state.
 //!
 //! Pipeline modules:

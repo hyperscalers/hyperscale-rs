@@ -12,7 +12,7 @@ use crate::{BeaconProposal, MessageClass, NetworkMessage, Verifiable};
 /// Carries the responder's pooled proposal if held, otherwise `None`
 /// — the requester treats `None` as "this peer doesn't have it; try
 /// another." Wire decode lands the wrapper as
-/// [`Verifiable::Unverified`]; locally-dispatched serves preserve the
+/// `Verifiable::Unverified`; locally-dispatched serves preserve the
 /// `Verified` marker.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetBeaconProposalResponse {

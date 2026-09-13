@@ -26,7 +26,7 @@ use crate::{
 /// Elements are wrapped in [`Verifiable`] so a locally-built block (whose
 /// txs were admission-validated through `MempoolCoordinator`) preserves
 /// the [`Verified<Transaction>`] marker through block
-/// construction; wire-decoded blocks land at [`Verifiable::Unverified`]
+/// construction; wire-decoded blocks land at `Verifiable::Unverified`
 /// because HBOR decode is a transparent passthrough into that variant.
 /// Same rationale as [`SharedCertificates`].
 pub type SharedTransactions = Arc<Vec<Arc<Verifiable<Transaction>>>>;
@@ -61,7 +61,7 @@ pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
 /// Elements are wrapped in [`Verifiable`] so an in-process upstream's
 /// [`Verified<Finalization>`] marker survives across block construction
 /// and downstream dispatch; wire-decoded blocks land at
-/// [`Verifiable::Unverified`] because HBOR decode is a transparent
+/// `Verifiable::Unverified` because HBOR decode is a transparent
 /// passthrough into that variant. Same rationale as
 /// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
 /// `Verifiable<QuorumCertificate>` for the same reason.
@@ -677,10 +677,10 @@ impl Block {
     }
 }
 
-/// Failure modes of [`VerifiedBlock`] composite assembly.
+/// Failure modes of [`Verified<Block>`](Verified) composite assembly.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum VerifiedBlockAssembleError {
-    /// The supplied [`VerifiedBlockHeader`] does not belong to `block`
+    /// The supplied [`Verified<BlockHeader>`](Verified) does not belong to `block`
     /// (the header's hash differs from `block.hash()`).
     #[error(
         "verified header does not match block: header.hash={header_hash:?} block.hash={block_hash:?}"
@@ -740,7 +740,7 @@ impl Verified<Block> {
     /// Borrow the verified parent QC. Total by the
     /// [`Verified<Block>`] predicate, which folds in
     /// [`Verified<BlockHeader>`]'s claim that `parent_qc` sits in
-    /// [`Verifiable::Verified`].
+    /// `Verifiable::Verified`.
     ///
     /// # Panics
     ///

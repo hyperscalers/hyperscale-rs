@@ -3,8 +3,8 @@
 //! A [`Verifiable<T>`] holds either the raw wire form `T` or a [`Verified<T>`]
 //! value carrying the type-level claim that `T`'s verification predicate has
 //! been checked. Its encoding is byte-identical to `T`; decoding always
-//! lands in [`Verifiable::Unverified`]. Verification produces
-//! [`Verifiable::Verified`] in place; the marker rides with the value through
+//! lands in `Verifiable::Unverified`. Verification produces
+//! `Verifiable::Verified` in place; the marker rides with the value through
 //! ordinary moves, clones, and local-dispatch handoffs.
 //!
 //! Read-only access to the inner `T` is via `Deref<Target = T>` (and the
@@ -21,8 +21,8 @@
 //!
 //! # `From` impls
 //!
-//! `From<T> for Verifiable<T>` produces [`Verifiable::Unverified`].
-//! `From<Verified<T>> for Verifiable<T>` produces [`Verifiable::Verified`].
+//! `From<T> for Verifiable<T>` produces `Verifiable::Unverified`.
+//! `From<Verified<T>> for Verifiable<T>` produces `Verifiable::Verified`.
 //! Both are generic and unambiguous: `T` and `Verified<T>` are distinct
 //! types, so the impls don't overlap.
 //!

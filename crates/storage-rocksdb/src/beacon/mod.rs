@@ -7,9 +7,9 @@
 //!
 //! The beacon instance is a separate `RocksDB` database from any
 //! per-shard one — different directory, disjoint CF set. Top-level
-//! [`crate::config`](crate::config) supplies the shared
+//! [`crate::config`] supplies the shared
 //! [`RocksDbConfig`](crate::RocksDbConfig); beacon doesn't reuse
-//! [`crate::typed_cf`](crate::typed_cf) because two CFs don't earn the
+//! [`crate::typed_cf`] because two CFs don't earn the
 //! parameterisation.
 
 pub(crate) mod chain_reader;

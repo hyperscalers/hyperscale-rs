@@ -30,6 +30,8 @@ use crate::sampling::draw_from_pool;
 /// [`pooled_validators`] filtering `state.validators` immediately
 /// above) is absent from `state.validators`. Structurally
 /// unreachable.
+///
+/// [`pooled_validators`]: hyperscale_types::BeaconState::pooled_validators
 pub fn pool_draw(state: &mut BeaconState, shard: ShardId) -> Option<ValidatorId> {
     let pool = state.pooled_validators();
     let chosen = draw_from_pool(

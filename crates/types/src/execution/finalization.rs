@@ -271,8 +271,8 @@ impl Finalization {
     /// Sorted by (`shard_id`, `tick_id`) for deterministic `receipt_hash`.
     ///
     /// Each EC rides as `Verifiable<ExecutionCertificate>`: wire-decoded
-    /// certificates land [`Verifiable::Unverified`]; locally assembled
-    /// ones carry the [`Verifiable::Verified`] marker from
+    /// certificates land `Verifiable::Unverified`; locally assembled
+    /// ones carry the `Verifiable::Verified` marker from
     /// [`Self::from_verified_ecs`].
     #[must_use]
     pub fn execution_certificates(&self) -> &[Arc<Verifiable<ExecutionCertificate>>] {
@@ -506,7 +506,7 @@ impl Finalization {
     }
 
     /// Build a `Finalization` from raw inputs. Each EC lands
-    /// [`Verifiable::Unverified`] — this is the constructor for wire
+    /// `Verifiable::Unverified` — this is the constructor for wire
     /// reconstruction and tests, where the ECs carry no verification
     /// marker. Locally aggregated ticks that already hold
     /// [`Verified<ExecutionCertificate>`]s use [`Self::from_verified_ecs`]
@@ -536,7 +536,7 @@ impl Finalization {
 
     /// Build a receiptless `Finalization` from execution certificates
     /// that have already cleared their per-EC signature predicate,
-    /// carrying the [`Verifiable::Verified`] marker on each. Receipts
+    /// carrying the `Verifiable::Verified` marker on each. Receipts
     /// arrive through [`Self::with_receipts`], which is what the caller
     /// needs the certificates to decide.
     ///
@@ -926,10 +926,8 @@ impl Verified<Finalization> {
     /// Trust source: every EC the tick carries was produced from a
     /// quorum of verified votes on this validator, so
     /// the predicate (per-EC signature verify against the matching committee)
-    /// holds by construction. Used at the [`TickState::into_finalization`]
+    /// holds by construction. Used at the `TickState::into_finalization`
     /// boundary.
-    ///
-    /// [`TickState::into_finalization`]: crate::TickState::into_finalization
     #[must_use]
     pub const fn seal(tick: Finalization) -> Self {
         // SAFETY: every EC in `tick.execution_certificates()` was
@@ -948,7 +946,7 @@ impl Verified<Finalization> {
     /// tick via the header's `certificate_root` and to each tick's
     /// receipt set via `local_receipt_root`. Honest signers ran the
     /// per-EC signature predicate before voting, so the predicate
-    /// [`<Finalization as Verify>::verify`] would run is
+    /// [`<Finalization as Verify>::verify`](Verify::verify) would run is
     /// BFT-transitively attested by that committee.
     ///
     /// Used at sync admission, where the QC chain replaces local

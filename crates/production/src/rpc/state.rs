@@ -159,6 +159,8 @@ impl Default for VnodeMempoolSnapshot {
 /// the network splits and merges, not a frozen genesis value. Multi-vnode
 /// hosts surface every hosted vnode; single-vnode hosts produce a one-element
 /// `vnodes` vec.
+///
+/// [`TopologySnapshot`]: hyperscale_types::TopologySnapshot
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatusState {
