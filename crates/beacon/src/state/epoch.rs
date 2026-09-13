@@ -4440,13 +4440,15 @@ mod tests {
             .map(|s| {
                 format!(
                     "{s:?} committee={:?} consensus={:?} witness_base={:?} \
-                     split_pending={} scheduled_terminal={:?} settled_floor={:?}",
+                     split_pending={} scheduled_terminal={:?} settled_floor={:?} \
+                     fullness={:?}",
                     snapshot.committee_for_shard(*s),
                     snapshot.consensus_committee_for_shard(*s),
                     snapshot.witness_base(*s),
                     snapshot.split_pending(*s),
                     snapshot.scheduled_terminal(*s),
                     snapshot.settled_window_floor(*s),
+                    snapshot.fullness_of(*s),
                 )
             })
             .collect();
@@ -4640,6 +4642,59 @@ mod tests {
         );
         assert_eq!(state.prices, moved, "the promotion installs it");
         assert_eq!(state.derive_topology_snapshot(net()).prices(), moved);
+    }
+
+    /// A window's fullness is the reading its promotion froze, not the
+    /// one the folds inside it go on to advance.
+    ///
+    /// The split predicate reads it off the snapshot, and the mean moves
+    /// every fold — so a proposer and a verifier a fold apart would
+    /// weigh one window's assertion against two figures and refuse each
+    /// other's blocks. Frozen for the reason the price level is.
+    #[test]
+    fn fullness_promotes_a_window_behind_the_fold() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+
+        // A mean the folds have climbed but no promotion has published:
+        // the head still reads what its window opened with.
+        state.fullness.insert(
+            shard,
+            ShardFullness {
+                compute: 7_000,
+                ..ShardFullness::IDLE
+            },
+        );
+        assert_eq!(
+            state.derive_topology_snapshot(net()).fullness_of(shard),
+            0,
+            "this window reads the fullness it opened with"
+        );
+        assert_eq!(
+            state
+                .derive_next_topology_snapshot(net())
+                .fullness_of(shard),
+            7_000,
+            "the next window carries what the folds since have read"
+        );
+
+        apply_epoch(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            ApplyEpochInput::Normal {
+                committed: &[],
+                shard_contributions: &BTreeMap::new(),
+            },
+        );
+        assert_eq!(state.window.fullness.get(&shard), Some(&7_000));
+        assert_eq!(
+            state.derive_topology_snapshot(net()).fullness_of(shard),
+            7_000,
+            "the promotion installs it"
+        );
     }
 
     /// The controller reads each dimension on its own and only from the
