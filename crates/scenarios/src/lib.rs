@@ -60,7 +60,8 @@ pub use faults::{
     partition_heals_at_exact_quorum,
 };
 pub use fees::{
-    a_priority_is_charged_over_the_table_price, a_vote_opens_the_band_and_the_level_moves,
+    a_band_vote_leaves_every_other_row_alone, a_priority_is_charged_over_the_table_price,
+    a_vote_opens_the_band_and_the_level_moves,
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;

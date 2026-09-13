@@ -13,12 +13,15 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{PriceBounds, PriceTable, TransactionDecision, TransactionStatus};
+use hyperscale_types::{
+    NetworkParams, PriceBounds, PriceTable, ReshapeThresholds, TransactionDecision,
+    TransactionStatus,
+};
 
 use crate::support::conservation::{Charges, probe_world};
 use crate::support::query::{beacon_epoch, declared_price};
 use crate::support::tx::{
-    ParamBallot, build_transfer_at_priority, build_transfer_tx, pool_operator, recipient, sender,
+    build_transfer_at_priority, build_transfer_tx, pool_operator, recipient, sender,
     validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
@@ -82,10 +85,9 @@ pub fn a_vote_opens_the_band_and_the_level_moves<C: Cluster>(c: &mut C) {
     let opened = PriceBounds::band(FLOOR_BP, CEILING_BP);
     vote_params(
         c,
-        ParamBallot {
-            floor_bp: FLOOR_BP,
-            ceiling_bp: CEILING_BP,
-            ..ParamBallot::default()
+        |ballot| {
+            ballot.floor_bp = FLOOR_BP;
+            ballot.ceiling_bp = CEILING_BP;
         },
         |params| params.price_bounds == opened,
         "the price band",
@@ -189,4 +191,59 @@ pub fn a_priority_is_charged_over_the_table_price<C: Cluster>(c: &mut C) {
     // The ledger closes against both declared prices together, which is
     // the burn agreeing with what the priority was quoted at.
     world.assert_settles_within(c, &charges, epochs(4), "a plain and a prioritised transfer");
+}
+
+/// A vote that moves the price band leaves every other governed row
+/// where it was.
+///
+/// One vote is one whole proposal and the tally buckets by the exact
+/// set, so a ballot is only ever a re-proposal of what the chain runs
+/// with one row changed. Seeded from anything else — the type's own
+/// defaults, say — a vote about the price would carry a reshape
+/// threshold nobody cast, and silently retune it on any cluster not
+/// already running the default.
+///
+/// # Panics
+///
+/// Panics if the band never activates, or if any other row moves with
+/// it.
+pub fn a_band_vote_leaves_every_other_row_alone<C: Cluster>(c: &mut C) {
+    assert!(
+        await_beacon_epoch(c, 1, epochs(6)),
+        "the beacon must fold before a ballot can reach it"
+    );
+    let before = live_params(c);
+    assert_ne!(
+        before.reshape_thresholds,
+        ReshapeThresholds::default(),
+        "this cluster has to run something other than the defaults for the \
+         claim to have teeth"
+    );
+
+    let opened = PriceBounds::band(FLOOR_BP, CEILING_BP);
+    vote_params(
+        c,
+        |ballot| {
+            ballot.floor_bp = FLOOR_BP;
+            ballot.ceiling_bp = CEILING_BP;
+        },
+        |params| params.price_bounds == opened,
+        "the price band",
+    );
+
+    let after = live_params(c);
+    assert_eq!(after.price_bounds, opened, "the row the ballot named moved");
+    assert_eq!(
+        after.reshape_thresholds, before.reshape_thresholds,
+        "and the reshape thresholds it did not name did not"
+    );
+    assert_eq!(
+        after.impound_epochs, before.impound_epochs,
+        "nor the impound window"
+    );
+}
+
+/// The live governed parameters.
+fn live_params<C: Cluster>(c: &C) -> NetworkParams {
+    c.beacon_state().expect("a committed beacon state").params
 }
