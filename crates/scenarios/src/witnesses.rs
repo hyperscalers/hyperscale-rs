@@ -469,8 +469,10 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
     // no parameter. The buyer's shard runs the leg presenting the badge
     // and the pool's shard is the core, so the two commit a hop apart
     // and the second is waited for.
+    let live = c.beacon_state().expect("a committed beacon state").params;
     let vote = build_reshape_threshold_vote_tx(
         &buyer_key,
+        &live,
         u64::MAX,
         Epoch::new(u64::MAX),
         validity_around(c.now()),
@@ -489,6 +491,7 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
     // The seller no longer holds the badge, and the gate says so.
     let stale = build_reshape_threshold_vote_tx(
         &seller,
+        &live,
         u64::MAX,
         Epoch::new(u64::MAX),
         validity_around(c.now()),

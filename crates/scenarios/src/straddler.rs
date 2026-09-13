@@ -233,13 +233,11 @@ pub fn cast_splitter_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
 /// Panics if the beacon serves no epoch yet.
 pub fn cast_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
     let current = beacon_epoch(c).expect("post-grow beacon epoch");
-    let epoch_ms = c
-        .beacon_state()
-        .expect("post-grow beacon state")
-        .chain_config
-        .epoch_duration_ms;
+    let state = c.beacon_state().expect("post-grow beacon state");
+    let epoch_ms = state.chain_config.epoch_duration_ms;
     let vote = build_reshape_threshold_vote_tx(
         &pool_operator().0,
+        &state.params,
         split_bytes,
         Epoch::new(current.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms)),
         validity_around(c.now()),
