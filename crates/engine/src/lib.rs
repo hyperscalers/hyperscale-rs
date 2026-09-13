@@ -48,6 +48,7 @@ pub use hyperscale_effects_bridge::{LocalCells, account_address};
 pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
-    Holds, PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange,
+    FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs, PreviewOutcome,
+    PreviewReport, ResourceChange,
 };
 pub use receipt::{CachedOutput, project_to_shard};

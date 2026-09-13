@@ -15,9 +15,9 @@ use hyperscale_engine::genesis::{
 use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, Holds, PROTOCOL_RESOURCE, PreviewGrants, PreviewInputs,
-    PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput,
-    genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE, PreviewGrants,
+    PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
+    TickEnvironment, TickTxInput, genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
 use hyperscale_storage::{
@@ -2366,10 +2366,58 @@ fn preview_on(
             holds: Holds {
                 trie: ShardTrie::single(),
                 shards: BTreeSet::from([ShardId::ROOT]),
+                fetched: FetchedCells::default(),
             },
             grants,
         },
     )
+}
+
+/// A shard a fan-out answered for is one the preview can speak for.
+///
+/// The companion to [`a_preview_refuses_what_this_node_cannot_see`]:
+/// the same node, the same half-held trie, and the same transaction —
+/// the only thing that changes is that the far shard was asked and
+/// replied. What that buys is the run, so the refusal naming a shard
+/// must stop firing.
+#[test]
+fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
+    let PreviewFixture { accounts, tx, .. } = preview_fixture();
+    let executor = executor(ExecutionMode::Serial);
+    let snapshot_store = MapDb::genesis(&accounts);
+    let trie = ShardTrie::uniform_from_count(2);
+    let held = ShardId::leaf(1, 1);
+    // Whatever the declaration reaches on the other half, a fan-out
+    // would have asked that shard and been answered at some committed
+    // height. Naming the height is what says so.
+    let mut fetched = FetchedCells::default();
+    fetched
+        .anchors
+        .insert(ShardId::leaf(1, 0), BlockHeight::new(4));
+
+    let report = executor.preview(
+        &snapshot_store,
+        &tx,
+        &PreviewInputs {
+            prices: PriceTable::GENESIS,
+            clock: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: Holds {
+                trie,
+                shards: BTreeSet::from([held]),
+                fetched,
+            },
+            grants: PreviewGrants::default(),
+        },
+    );
+    assert!(
+        !matches!(
+            &report.outcome,
+            PreviewOutcome::Refused { reason } if reason.contains("reads cells on")
+        ),
+        "a shard that answered is not a shard this node cannot see: {:?}",
+        report.outcome
+    );
 }
 
 /// A cell this node does not hold is not an empty cell.
@@ -2394,6 +2442,7 @@ fn a_preview_refuses_what_this_node_cannot_see() {
             holds: Holds {
                 trie: ShardTrie::uniform_from_count(2),
                 shards: BTreeSet::from([ShardId::leaf(1, 1)]),
+                fetched: FetchedCells::default(),
             },
             grants: PreviewGrants::default(),
         },
