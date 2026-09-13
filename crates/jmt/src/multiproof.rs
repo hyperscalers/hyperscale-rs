@@ -672,7 +672,7 @@ const TERM_LEAF_MISMATCH: u8 = 0x03;
 /// bytes; without this cap a peer crafting a tiny request can force a
 /// multi-GB pre-allocation. Real provision proofs cover at most a few
 /// thousand keys; `10_000` leaves comfortable headroom.
-const MAX_PROOF_CLAIMS: usize = 10_000;
+pub const MAX_PROOF_CLAIMS: usize = 10_000;
 
 /// Cap on sibling hashes in a single multiproof.
 ///

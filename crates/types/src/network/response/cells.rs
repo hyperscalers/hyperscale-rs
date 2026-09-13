@@ -18,10 +18,26 @@
 //! cannot be answered with is a value nobody wrote.
 
 use hyperscale_hbor::Hbor;
+use hyperscale_jmt::MAX_PROOF_CLAIMS;
 
+use crate::network::request::MAX_RANGES_PER_QUERY;
 use crate::{
-    CertifiedBlockHeader, MerkleInclusionProof, MessageClass, NetworkMessage, SubstateKey,
+    CertifiedBlockHeader, MAX_CELLS_PER_QUERY, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
+    MessageClass, NetworkMessage, SubstateKey,
 };
+
+/// The most entries one interval's answer may carry.
+///
+/// One interval may legitimately be the whole of what a request spends,
+/// so the per-answer bound is the request's own — which is the claim cap
+/// a multiproof decodes under, that being what binds
+/// [`MAX_CELLS_PER_QUERY`]. What keeps a peer from sending this many
+/// under every one of its answers is the frame.
+const MAX_ENTRIES_PER_ANSWER: usize = MAX_PROOF_CLAIMS;
+
+/// The per-answer bound is not below the whole request's, or an answer
+/// a server may build is one the asker refuses to decode.
+const _: () = assert!(MAX_CELLS_PER_QUERY <= MAX_ENTRIES_PER_ANSWER as u64);
 
 /// The entries one requested interval holds at the height, ascending by
 /// order.
@@ -29,6 +45,7 @@ use crate::{
 pub struct RangeAnswer {
     /// The entries found, `(order, value)`, ascending and no more than
     /// the interval's declared cap.
+    #[hbor(max = MAX_ENTRIES_PER_ANSWER)]
     pub entries: Vec<(u128, Vec<u8>)>,
 }
 
@@ -39,8 +56,10 @@ pub struct GetCellsResponse {
     /// The point cells that were present, in the request's own order of
     /// keys; a key the tree does not hold is absent from this and proven
     /// so by `proof`.
+    #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub cells: Vec<(SubstateKey, Vec<u8>)>,
     /// One answer per requested interval, positionally.
+    #[hbor(max = MAX_RANGES_PER_QUERY)]
     pub ranges: Vec<RangeAnswer>,
     /// A multiproof over every leaf above — the point keys asked, present
     /// or absent, and the entry leaves the intervals returned — against
