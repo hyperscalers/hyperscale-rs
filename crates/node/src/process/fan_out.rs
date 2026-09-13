@@ -149,8 +149,13 @@ fn fold_attested(
         }
     }
 
-    for (key, value) in &response.cells {
-        into.cells.insert(*key, value.clone());
+    // Keyed by what was asked, carrying what the root attested for it:
+    // a pair the server volunteered under some other key was never a
+    // leaf in `leaves` and so has nothing standing behind it.
+    for (key, value) in ask.keys.iter().zip(claimed) {
+        if let Some(value) = value {
+            into.cells.insert(*key, value);
+        }
     }
     for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
         into.entries
@@ -251,6 +256,7 @@ mod tests {
     use hyperscale_storage::test_helpers::{commit_writes, entry_key, make_settled_entries};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::CellRange;
+    use hyperscale_types::test_utils::test_key;
 
     use super::*;
     use crate::shard::cross_shard::serve_cells_request;
@@ -342,6 +348,44 @@ mod tests {
             nothing.cells.is_empty() && nothing.entries.is_empty() && nothing.anchors.is_empty(),
             "and nothing of a refused answer is kept, so a partial \
              verification contributes no cell"
+        );
+    }
+
+    /// A cell the server volunteered under a key nobody asked for is
+    /// not kept, even though the rest of the answer stands.
+    ///
+    /// A multiproof attests the leaves it was built over, and those are
+    /// the ones this node derived from its own declaration. A pair
+    /// carried under any other key is outside that set entirely — the
+    /// proof neither attests nor contradicts it — so the answer is
+    /// sound and the pair is still worthless. A server for one shard
+    /// would otherwise seed the run with whatever it liked for another.
+    #[test]
+    fn a_cell_nobody_asked_for_is_not_kept() {
+        let ask = one_range();
+        let (response, root) = served(&ask);
+        let proof = response.proof.clone().expect("the tip is answerable");
+
+        let mut volunteered = response;
+        volunteered.cells.push((test_key(0x5A), vec![0xAB; 8]));
+
+        let mut into = FetchedCells::default();
+        assert!(
+            fold_attested(
+                SHARD,
+                &ask,
+                &volunteered,
+                &proof,
+                root,
+                BlockHeight::new(1),
+                &mut into
+            ),
+            "the intervals that were asked for still stand under the root"
+        );
+        assert_eq!(into.entries.len(), 1, "so the answer's own content is kept");
+        assert!(
+            into.cells.is_empty(),
+            "and the volunteered cell is not, having no leaf behind it"
         );
     }
 
