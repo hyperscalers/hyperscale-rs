@@ -90,7 +90,7 @@ fn bench_write_throughput(c: &mut Criterion) {
     // half would be a cap on commits wearing a byte's units. Across two
     // orders of magnitude the fixed part shows as throughput climbing
     // with the batch.
-    const BATCHES: [usize; 4] = [256, 1_024, 4_096, 16_384];
+    const BATCHES: [usize; 6] = [1, 16, 256, 1_024, 4_096, 16_384];
 
     let dir = TempDir::new().expect("temp dir");
     let storage = stocked(&dir, TREE);
