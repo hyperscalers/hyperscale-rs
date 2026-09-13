@@ -1946,12 +1946,17 @@ fn a_two_recipient_fan_out_executes() {
 
 /// A signed publish of `artifact`, paid for by `seed`'s account.
 fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
+    signed_publish_under(seed, artifact, 1_000_000)
+}
+
+/// The same, under a ceiling the caller names.
+fn signed_publish_under(seed: u8, artifact: Vec<u8>, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let vm = TransactionEnvelope {
         body: TransactionBody::Publish(artifact),
         subintent_sigs: Vec::new(),
         fee_payer: account_address(&key.public_key().0),
-        max_fee: 1_000_000,
+        max_fee,
         gas_limits: vec![1_000_000],
         priority_bp: 0,
         validity_start_ms: 0,
@@ -2026,6 +2031,63 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
         paid,
         encode_amount(1_000_000 - price).to_vec(),
         "the publisher paid the declaration's price"
+    );
+}
+
+/// A publish priced past its signed ceiling reports the ceiling, and
+/// reports what it burned.
+///
+/// Admission refuses this at the table it read, but a block anchored the
+/// other side of a fold prices under its own — so the two figures can
+/// differ by the time the burn happens, and the ceiling is what the
+/// vault loses. A charge reported above it would claim emission weight
+/// for quanta nobody paid, `cumulative_fees` being the sum of what each
+/// block says it charged.
+#[test]
+fn a_publish_charges_no_more_than_the_ceiling_it_signed() {
+    let payer = fee_payer(7);
+    let executor = executor(ExecutionMode::Serial);
+    let artifact = published_account_artifact();
+
+    // The ceiling is derived from the price rather than pinned, so this
+    // keeps saying the same thing as the table moves under it.
+    let priced = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
+        7,
+        artifact.clone(),
+    )));
+    let price = priced
+        .price_under(executor.derivation().as_ref(), &PriceTable::GENESIS)
+        .expect("a publish derives");
+    let ceiling = price / 2;
+    assert!(
+        ceiling > 0 && ceiling < price,
+        "the fixture only says anything where the declaration outprices the \
+         ceiling: price {price}"
+    );
+
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_publish_under(7, artifact, ceiling),
+    ));
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, std::slice::from_ref(&tx));
+    let ConsensusReceipt::Succeeded {
+        writes: database_updates,
+        ..
+    } = &executed[0].consensus
+    else {
+        panic!("a publish must succeed: {:?}", executed[0].consensus);
+    };
+
+    let paid = vault_cell(&settled(database_updates, &[(payer, 1_000_000)]), payer)
+        .expect("the payer's vault was written");
+    assert_eq!(
+        paid,
+        encode_amount(1_000_000 - ceiling).to_vec(),
+        "the vault loses the ceiling, never the price above it"
+    );
+    assert_eq!(
+        executed[0].metadata.fee_summary.total_execution_cost,
+        Some(ceiling),
+        "and the receipt names the figure that moved beside it"
     );
 }
 
