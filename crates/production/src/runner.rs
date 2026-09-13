@@ -812,8 +812,9 @@ impl ProductionRunner {
     ///
     /// The RPC counterpart of [`Self::tx_submission_sender`], and its
     /// opposite in every way that matters: it commits nothing, gossips
-    /// nothing, and blocks until the shard answers or the wait runs out.
-    /// Callers run it on a blocking worker for that reason.
+    /// nothing, and runs the whole VM on the caller's own thread rather
+    /// than on a shard driver. Callers run it on a blocking worker for
+    /// that reason, and the driver never sees it.
     ///
     /// # Panics
     ///
@@ -827,9 +828,7 @@ impl ProductionRunner {
                 .expect("host must exist for preview_sender")
                 .process(),
         );
-        Arc::new(move |tx: &Transaction| {
-            process.preview_transaction(tx, PreviewGrants::default(), PREVIEW_TIMEOUT)
-        })
+        Arc::new(move |tx: &Transaction| process.preview_transaction(tx, PreviewGrants::default()))
     }
 
     /// Take the shutdown handle.
@@ -1359,14 +1358,6 @@ impl Drop for ProdTimerManager {
         }
     }
 }
-
-/// How long an RPC preview waits for a shard driver to answer.
-///
-/// A preview is answered inline from committed state, so the wait is a
-/// queue wait behind whatever the driver is already doing rather than a
-/// fetch. Generous enough to survive a busy step, short enough that a
-/// caller is told the node is busy rather than left holding a socket.
-const PREVIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
