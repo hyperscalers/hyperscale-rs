@@ -16,7 +16,9 @@ use hyperscale_types::network::request::{
     GetCellsRequest, GetRelayedStateProofRequest, GetStateProofRequest,
 };
 use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
-use hyperscale_types::{EntryKey, ProtocolHasher, ProvenCells, SubstateKey, entry_leaf_key};
+use hyperscale_types::{
+    EntryKey, MAX_CELLS_PER_QUERY, ProtocolHasher, ProvenCells, SubstateKey, entry_leaf_key,
+};
 
 /// Serve an inbound state-proof query from the committed chain.
 ///
@@ -87,6 +89,18 @@ pub fn serve_cells_request<S: ShardStorage>(
         return GetCellsResponse::not_found();
     };
     let at = view.base().snapshot_at(height);
+
+    // What the answer would cost before any of it is spent. Nothing
+    // here is signed — a preview asks before there is a transaction to
+    // sign — so the caps are the asker's word, and a query wider than
+    // any declaration could be is refused rather than walked.
+    let asked = req.ranges.iter().fold(req.keys.len() as u64, |sum, range| {
+        sum.saturating_add(u64::from(range.cap))
+    });
+    if asked > MAX_CELLS_PER_QUERY {
+        record_fetch_response_sent("cells", 0);
+        return GetCellsResponse::not_found();
+    }
 
     let cells: Vec<(SubstateKey, Vec<u8>)> = req
         .keys
@@ -303,6 +317,74 @@ mod tests {
     /// `serves_at` before they read, and
     /// `a_height_below_the_retention_floor_is_not_served` is that one
     /// statement.
+    /// A query asking for more leaves than any declaration could is
+    /// refused before the tree is walked.
+    ///
+    /// This request is asked on behalf of a transaction that does not
+    /// exist yet, so nothing in it is signed and `cap` is the asker's
+    /// word. Unbounded, a handful of intervals at `u32::MAX` over the
+    /// whole order space would have the server scan every collection it
+    /// holds and build a multiproof over every leaf, for a reply the
+    /// frame then discards.
+    #[test]
+    fn a_query_past_the_leaf_budget_is_refused() {
+        const OWNER_SEED: u8 = 0x11;
+        let storage = Arc::new(SimShardStorage::default());
+        let written: Vec<(u128, Option<Vec<u8>>)> = (0u128..8)
+            .map(|order| {
+                (
+                    order,
+                    Some(vec![u8::try_from(order).expect("eight entries"); 4]),
+                )
+            })
+            .collect();
+        commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
+        let chain = Arc::new(PendingChain::new(storage));
+        let key = entry_key(OWNER_SEED, 0);
+        let whole_space = |cap: u32| CellRange {
+            owner: key.owner,
+            collection: key.collection,
+            lo: 0,
+            hi: u128::MAX,
+            cap,
+        };
+
+        let refused = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(Vec::new(), vec![whole_space(u32::MAX)]),
+        );
+        assert!(
+            refused.proof.is_none(),
+            "an interval no declaration could have bought is not answered"
+        );
+
+        // The budget is spent across the whole request, not per
+        // interval: two halves of it asked separately would otherwise
+        // buy twice what one asks for.
+        let cap = u32::try_from(MAX_CELLS_PER_QUERY).expect("the budget fits a cap");
+        let split = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(
+                Vec::new(),
+                vec![whole_space(cap / 2 + 1), whole_space(cap / 2 + 1)],
+            ),
+        );
+        assert!(
+            split.proof.is_none(),
+            "two intervals summing past the budget are refused together"
+        );
+
+        // And what a declaration could have bought is still served.
+        let served = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(Vec::new(), vec![whole_space(cap)]),
+        );
+        assert!(
+            served.proof.is_some(),
+            "a query inside the budget is answered as before"
+        );
+    }
+
     #[test]
     fn an_interval_comes_back_proven_entry_by_entry() {
         const OWNER_SEED: u8 = 0x11;
