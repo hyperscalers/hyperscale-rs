@@ -29,5 +29,9 @@ tempfile.workspace = true
 name = "import_throughput"
 harness = false
 
+[[bench]]
+name = "range_read"
+harness = false
+
 [lints]
 workspace = true
