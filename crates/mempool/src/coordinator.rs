@@ -350,16 +350,24 @@ impl MempoolCoordinator {
         // decides admissibility is the table the block's own window
         // names, judged where the block is built. What this keeps out is
         // a transaction no block at the current level could carry, and
-        // what keeps it out is the same figure the boundary sweep reads.
-        let price = tx.price(&topology_snapshot.prices());
-        if price > tx.body().max_fee {
-            tracing::debug!(
-                tx_hash = ?hash,
-                price,
-                max_fee = tx.body().max_fee,
-                "Rejecting transaction whose ceiling the table has outgrown"
-            );
-            return None;
+        // what keeps it out is the same figure the boundary sweep reads
+        // — on the same shard the sweep reads it, the payer's, which is
+        // the only one whose admission judges the ceiling at all.
+        if topology_snapshot
+            .shard_trie()
+            .shard_for_prefix(tx.body().fee_payer)
+            == self.local_shard
+        {
+            let price = tx.price(&topology_snapshot.prices());
+            if price > tx.body().max_fee {
+                tracing::debug!(
+                    tx_hash = ?hash,
+                    price,
+                    max_fee = tx.body().max_fee,
+                    "Rejecting transaction whose ceiling the table has outgrown"
+                );
+                return None;
+            }
         }
 
         // Fork-fence quiesce: reject a tx touching a shard under a local
@@ -659,7 +667,7 @@ impl MempoolCoordinator {
 
         self.current_height = height;
         self.current_ts = block.header().parent_qc().weighted_timestamp();
-        self.cleanup_underpriced_pending(topology_snapshot.prices());
+        self.cleanup_underpriced_pending(topology_snapshot);
 
         // A gossip-timed fork fence holds until the attested recovery for
         // its shard completes — clearing on the fold would reopen admission
@@ -1242,17 +1250,31 @@ impl MempoolCoordinator {
     /// admissible again if the level comes back down, and admission
     /// judges them against the head each time.
     ///
+    /// By the shard holding the payer's vault and by no other, which is
+    /// where the ceiling is spent and the only shard whose admission
+    /// judges it. A counterpart applying this would evict what its own
+    /// blocks would carry: fees never move cross-shard, so a straddling
+    /// transaction the payer's shard admits needs a place in a
+    /// counterpart's block too, and a sweep that ran everywhere would
+    /// take it out of every pool on the network — with the filter in
+    /// [`Self::admit_internal`] refusing the gossip that would put it
+    /// back. Nothing forks, since no shard's verdict moves; the
+    /// transaction simply runs to its deadline unproposable.
+    ///
     /// Returns the number of entries dropped.
-    fn cleanup_underpriced_pending(&mut self, prices: PriceTable) -> usize {
+    fn cleanup_underpriced_pending(&mut self, snapshot: &TopologySnapshot) -> usize {
+        let prices = snapshot.prices();
         if prices == self.priced_at {
             return 0;
         }
         self.priced_at = prices;
+        let trie = snapshot.shard_trie();
         let dropped: Vec<TxHash> = self
             .pool
             .iter()
             .filter(|(_, entry)| {
                 matches!(entry.status, TransactionStatus::Pending)
+                    && trie.shard_for_prefix(entry.tx.body().fee_payer) == self.local_shard
                     && entry.tx.price(&prices) > entry.tx.body().max_fee
             })
             .map(|(hash, _)| *hash)
@@ -2462,6 +2484,77 @@ mod tests {
         assert!(
             mempool.has_transaction(&covered_hash),
             "and takes it back when the level comes down"
+        );
+    }
+
+    /// A shard that does not hold the payer's vault neither sweeps a
+    /// ceiling nor refuses one.
+    ///
+    /// The ceiling is judged where it is spent, so a counterpart has no
+    /// verdict to anticipate here — and one that swept anyway would take
+    /// a straddling transaction out of its own pool while the payer's
+    /// shard went on admitting it, leaving a transaction every shard
+    /// priced the same way and no shard could propose.
+    #[test]
+    fn a_counterpart_shard_keeps_a_ceiling_the_payer_shard_would_drop() {
+        let (local, payer_shard) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let topology_snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+        assert_eq!(
+            topology_snapshot
+                .shard_trie()
+                .shard_for_prefix(test_principal(0x80)),
+            payer_shard,
+            "the fixture's payer has to sit off the shard under test"
+        );
+
+        // Payer on one shard, every cell it touches on the other: the
+        // straddle is what makes the two shards disagree about who
+        // judges the ceiling.
+        let straddling =
+            test_transaction_with_prefixes(&[0x80], &[test_prefix(0x01)], &[test_prefix(0x02)]);
+        let hash = straddling.hash();
+        let now = LocalTimestamp::from_millis(10_000);
+
+        let mut mempool = MempoolCoordinator::new(local);
+        mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(straddling)), now);
+        assert!(mempool.has_transaction(&hash), "the counterpart pools it");
+
+        let raised = topology_snapshot.clone().with_prices(PriceTable {
+            compute: PriceTable::GENESIS.compute * 1_000_000,
+            ..PriceTable::GENESIS
+        });
+        let certified = certified_block_with_provisions(BlockHeight::new(6), local, &[]);
+        mempool.on_block_committed(&raised, &certified);
+        assert!(
+            mempool.has_transaction(&hash),
+            "a table the counterpart never judges the ceiling against drops nothing"
+        );
+
+        // And the filter agrees with the sweep, or gossip and the sweep
+        // would fight over the same entry.
+        let resubmitted =
+            test_transaction_with_prefixes(&[0x80], &[test_prefix(0x01)], &[test_prefix(0x02)]);
+        let mut fresh = MempoolCoordinator::new(local);
+        fresh.on_submit_transaction(&raised, Arc::new(verified(resubmitted)), now);
+        assert!(
+            fresh.has_transaction(&hash),
+            "and the same shard admits it at the same level"
+        );
+
+        // The payer's own shard is the one that does both.
+        let mut payer_pool = MempoolCoordinator::new(payer_shard);
+        payer_pool.on_submit_transaction(
+            &raised,
+            Arc::new(verified(test_transaction_with_prefixes(
+                &[0x80],
+                &[test_prefix(0x01)],
+                &[test_prefix(0x02)],
+            ))),
+            now,
+        );
+        assert!(
+            !payer_pool.has_transaction(&hash),
+            "where the ceiling is spent, the moved table keeps it out"
         );
     }
 
