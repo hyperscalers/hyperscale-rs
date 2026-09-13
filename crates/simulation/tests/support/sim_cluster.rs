@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
+use hyperscale_engine::{
+    FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
+};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
@@ -585,6 +587,7 @@ impl Cluster for SimCluster {
                 holds: Holds {
                     trie: topology.shard_trie().clone(),
                     shards: BTreeSet::from([shard]),
+                    fetched: FetchedCells::default(),
                 },
                 grants,
             },

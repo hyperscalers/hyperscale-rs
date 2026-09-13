@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
-use hyperscale_types::{Event, ShardId, ShardTrie, Transaction, WeightedTimestamp};
+use hyperscale_types::{
+    Address, BlockHeight, CollectionId, Event, ShardId, ShardTrie, Transaction, WeightedTimestamp,
+};
 // The vm's own shard vocabulary, which a source's anchor is stated in;
 // the consensus `ShardId` above is what a trie routes to.
 use hyperscale_vm_effects::ShardId as SourceShard;
@@ -99,17 +101,30 @@ pub struct PreviewInputs {
 }
 
 /// What a node can answer a preview about: the shards whose committed
-/// state it holds, and the trie that says which shard a cell is on.
+/// state it holds, the answers a fan-out gathered for the rest, and the
+/// trie that says which shard a cell is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holds {
     /// The routing in force, for resolving a declared cell's owner.
     pub trie: ShardTrie,
     /// The shards this node serves state for.
     pub shards: BTreeSet<ShardId>,
+    /// What was fetched from the shards it does not.
+    ///
+    /// Empty is the local-only preview: a declaration reaching past
+    /// `shards` is then refused by name, which is what a node with no
+    /// fan-out behind it can honestly say.
+    pub fetched: FetchedCells,
 }
 
 impl Holds {
-    /// The shards `declared` reaches that this node does not hold.
+    /// Whether a cell owned by `owner` is one this node reads itself.
+    fn serves(&self, owner: Address) -> bool {
+        self.shards.contains(&self.trie.shard_for_prefix(owner))
+    }
+
+    /// The shards `declared` reaches that neither this node holds nor a
+    /// fan-out answered for.
     fn missing(&self, declared: &EffectSet) -> BTreeSet<ShardId> {
         declared
             .iter()
@@ -118,8 +133,103 @@ impl Holds {
                 EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => owner,
             })
             .map(|owner| self.trie.shard_for_prefix(owner))
-            .filter(|shard| !self.shards.contains(shard))
+            .filter(|shard| {
+                !self.shards.contains(shard) && !self.fetched.anchors.contains_key(shard)
+            })
             .collect()
+    }
+}
+
+/// One collection's answered entries, ascending by order.
+pub type FetchedEntries = Vec<(u128, Vec<u8>)>;
+
+/// The committed state a fan-out gathered from shards this node does not
+/// serve, in the shape a run reads it.
+///
+/// A [`Substates`] rather than a bag the executor unpacks, so a remote
+/// cell and a local one materialize through the one call: what differs
+/// between them is which store answered, and nothing downstream of that
+/// needs to know.
+///
+/// Only shards named in `anchors` were answered. A shard absent from it
+/// was never asked or never replied, and [`Holds::missing`] refuses the
+/// preview by name rather than letting a kernel read the silence as an
+/// empty cell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FetchedCells {
+    /// Point cells that were present under their shard's proof.
+    pub cells: BTreeMap<SubstateKey, Vec<u8>>,
+    /// Entries per collection, ascending by order, as the serving shard
+    /// answered the declared interval.
+    pub entries: BTreeMap<(Address, CollectionId), FetchedEntries>,
+    /// The committed height each answering shard spoke at.
+    ///
+    /// One per shard and chosen by the server, so a preview over several
+    /// is a run over snapshots that were never simultaneous — which is
+    /// the optimism the report already declares, stated in heights.
+    pub anchors: BTreeMap<ShardId, BlockHeight>,
+}
+
+impl Substates for FetchedCells {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.cells.get(&key).cloned()
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> FetchedEntries {
+        self.entries
+            .get(&(owner, collection))
+            .into_iter()
+            .flatten()
+            .filter(|(order, _)| (lo..=hi).contains(order))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+/// The committed state a preview reads: this node's own where it serves
+/// the shard, and what a fan-out fetched where it does not.
+///
+/// The routing is by owner, which is what fixes a cell's shard, so the
+/// two halves can never both answer for one cell and a cell neither
+/// answers for was refused before the run.
+struct PreviewCells<'a> {
+    local: &'a (dyn Substates + Sync),
+    holds: &'a Holds,
+}
+
+impl Substates for PreviewCells<'_> {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        if self.holds.serves(key.owner) {
+            self.local.cell(key)
+        } else {
+            self.holds.fetched.cell(key)
+        }
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        if self.holds.serves(owner) {
+            self.local
+                .entries_in_range(owner, collection, lo, hi, limit)
+        } else {
+            self.holds
+                .fetched
+                .entries_in_range(owner, collection, lo, hi, limit)
+        }
     }
 }
 
@@ -353,15 +463,23 @@ impl Executor {
         // baseline it reads, and total locality covers every cell the
         // envelope touches.
         let mut base = TickBaseline::default();
+        // Local cells and fetched ones through the one call: which store
+        // answered is the routing's business and nothing below it.
+        let cells = PreviewCells {
+            local: snapshot,
+            holds: &inputs.holds,
+        };
         materialize_declared(
-            snapshot,
+            &cells,
             &prepared.declaration.set,
             &OwnerSet::whole(),
             &mut base,
         );
         // The fee vault is not a declared effect, and the report needs
-        // its committed amount to say what the charge would leave.
-        if let Some(value) = snapshot.cell(payer.vault) {
+        // its committed amount to say what the charge would leave. Read
+        // through the same routing: a composer paying out of an account
+        // on another shard is the ordinary cross-shard case.
+        if let Some(value) = cells.cell(payer.vault) {
             base.cells.insert(payer.vault, value);
         }
         let base = Arc::new(base);
@@ -459,5 +577,116 @@ fn preview_outcome(outcome: &Outcome) -> PreviewOutcome {
         aborted => PreviewOutcome::Aborted {
             reason: abort_reason(aborted),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{AddressClass, LocalKey};
+    use hyperscale_vm_types::{Effect, Mode};
+
+    use super::*;
+
+    const COLLECTION: CollectionId = CollectionId([0xEE; 16]);
+
+    fn owner(seed: u8) -> Address {
+        Address::new([seed; 31], AddressClass::Component)
+    }
+
+    fn point(seed: u8) -> SubstateKey {
+        SubstateKey {
+            owner: owner(seed),
+            local: LocalKey([seed; 16]),
+        }
+    }
+
+    /// A fan-out's answers read back as the store they stand in for:
+    /// a cell it carries, nothing for one it does not, and an interval
+    /// narrowed to what the caller asks of it.
+    #[test]
+    fn fetched_cells_answer_as_a_store() {
+        let mut fetched = FetchedCells::default();
+        fetched.cells.insert(point(1), vec![7]);
+        fetched.entries.insert(
+            (owner(2), COLLECTION),
+            (0u128..8)
+                .map(|order| (order, vec![u8::try_from(order).expect("eight entries")]))
+                .collect(),
+        );
+
+        assert_eq!(fetched.cell(point(1)), Some(vec![7]));
+        assert_eq!(
+            fetched.cell(point(9)),
+            None,
+            "a cell nobody fetched is not a cell the store holds"
+        );
+        assert_eq!(
+            fetched
+                .entries_in_range(owner(2), COLLECTION, 2, 5, 2)
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the interval is bounded by both the caller's window and its limit"
+        );
+        assert!(
+            fetched
+                .entries_in_range(owner(9), COLLECTION, 0, u128::MAX, 8)
+                .is_empty(),
+            "a collection nobody fetched is empty, and the shard's absence from \
+             `anchors` is what keeps that from being read as a verdict"
+        );
+    }
+
+    /// A shard a fan-out answered for is no longer missing; one it was
+    /// silent about still is, however many cells happen to be in hand.
+    #[test]
+    fn an_answered_shard_is_not_missing() {
+        let trie = ShardTrie::uniform_from_count(2);
+        let mut declared = EffectSet::new();
+        for seed in [0x00u8, 0xFF] {
+            declared
+                .insert_at_cap(Effect {
+                    target: EffectTarget::Point(point(seed)),
+                    mode: Mode::Read,
+                })
+                .unwrap();
+        }
+        let reached: BTreeSet<ShardId> = [owner(0x00), owner(0xFF)]
+            .iter()
+            .map(|o| trie.shard_for_prefix(*o))
+            .collect();
+        assert_eq!(
+            reached.len(),
+            2,
+            "the fixture has to straddle to have teeth"
+        );
+        let (held, remote) = {
+            let mut it = reached.iter();
+            (*it.next().unwrap(), *it.next().unwrap())
+        };
+
+        let local_only = Holds {
+            trie: trie.clone(),
+            shards: BTreeSet::from([held]),
+            fetched: FetchedCells::default(),
+        };
+        assert_eq!(
+            local_only.missing(&declared),
+            BTreeSet::from([remote]),
+            "with no fan-out behind it, the far shard is one this node cannot answer about"
+        );
+
+        let mut fetched = FetchedCells::default();
+        fetched.anchors.insert(remote, BlockHeight::new(9));
+        let fanned_out = Holds {
+            trie,
+            shards: BTreeSet::from([held]),
+            fetched,
+        };
+        assert!(
+            fanned_out.missing(&declared).is_empty(),
+            "a shard that answered is one the preview can speak for"
+        );
     }
 }
