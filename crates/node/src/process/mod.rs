@@ -26,6 +26,7 @@ use hyperscale_engine::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
+use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::{
     Address, Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule,
     Transaction, ValidatorId, Verifier,
@@ -35,6 +36,7 @@ pub use tx_status::TxStatusCache;
 
 use crate::beacon::BeaconCommitCoordinator;
 use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::cross_shard::serve_cells_request;
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 
@@ -504,7 +506,7 @@ where
         }
     }
 
-    /// Fan a locally-submitted transaction out via    /// Fan a locally-submitted transaction out via
+    /// Fan a locally-submitted transaction out via
     /// [`Self::shard_event_senders`] according to
     /// [`Self::compute_submit_fanout`].
     ///
@@ -634,16 +636,35 @@ where
         let schedule = self.topology_schedule();
         let executor = &self.dispatch_handles.executor;
 
-        // Every shard this node hosts reads itself; the rest are asked.
+        // The payer's shard reads itself, through the snapshot below;
+        // every other shard the declaration reaches is asked, including
+        // ones this node happens to host — those answer out of their own
+        // stores rather than over the wire, but they are still asked,
+        // because one snapshot answers for one shard and a cell on a
+        // co-hosted shard is not in it.
+        //
         // Derived before anything is fetched, because the declaration is
         // a pure function of signed content — so the fan-out gathers
         // exactly the set the run then reads.
-        let held: BTreeSet<ShardId> = handles.keys().copied().collect();
+        let reads_itself: BTreeSet<ShardId> = BTreeSet::from([payer_shard]);
+        let serve_locally = |shard: ShardId, request: &GetCellsRequest| {
+            handles
+                .get(&shard)
+                .map(|hosted| serve_cells_request(&hosted.pending_chain, request))
+        };
         let fetched = executor
-            .preview_reads(tx, topology.shard_trie(), &held)
+            .preview_reads(tx, topology.shard_trie(), &reads_itself)
             .map_or_else(
                 |_| FetchedCells::default(),
-                |asks| fan_out::gather(&asks, &topology, &*self.network, &*self.verifier),
+                |asks| {
+                    fan_out::gather(
+                        &asks,
+                        &topology,
+                        &*self.network,
+                        &*self.verifier,
+                        &serve_locally,
+                    )
+                },
             );
 
         Some(Box::new(executor.preview(
@@ -658,7 +679,7 @@ where
                 // unfetched cell is never read as an empty one.
                 holds: Holds {
                     trie: topology.shard_trie().clone(),
-                    shards: held,
+                    shards: reads_itself,
                     fetched,
                 },
                 grants,

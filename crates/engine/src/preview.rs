@@ -201,9 +201,15 @@ impl Executor {
 pub struct Holds {
     /// The routing in force, for resolving a declared cell's owner.
     pub trie: ShardTrie,
-    /// The shards this node serves state for.
+    /// The shards `local` answers for — which is however many shards
+    /// the caller's snapshot spans, and a snapshot spans one.
+    ///
+    /// Not the shards the node hosts: a node hosting several holds a
+    /// store apiece, and a cell on one of the others is as absent from
+    /// this snapshot as a cell on a stranger's. Those are gathered
+    /// like any other, from their own stores rather than over the wire.
     pub shards: BTreeSet<ShardId>,
-    /// What was fetched from the shards it does not.
+    /// What was gathered for the shards it does not.
     ///
     /// Empty is the local-only preview: a declaration reaching past
     /// `shards` is then refused by name, which is what a node with no
