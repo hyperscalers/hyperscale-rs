@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
+use hyperscale_types::network::request::CellRange;
 use hyperscale_types::{
     Address, BlockHeight, CollectionId, Event, ShardId, ShardTrie, Transaction, WeightedTimestamp,
 };
@@ -98,6 +99,99 @@ pub struct PreviewInputs {
     /// table, and a fold moving it between the quote and the commit is
     /// what the signed ceiling absorbs.
     pub prices: PriceTable,
+}
+
+/// What one shard is to be asked for on a preview's behalf.
+///
+/// The declaration's own vocabulary, split by who holds it: point cells
+/// by key, collection intervals by owner, collection and order window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredReads {
+    /// Point cells to answer, present or absent.
+    pub keys: Vec<SubstateKey>,
+    /// Collection intervals to answer, each at the cap the declaration
+    /// signed for.
+    pub ranges: Vec<CellRange>,
+}
+
+impl Executor {
+    /// What a preview of `tx` would have to fetch, per shard that holds
+    /// it, skipping the shards in `held` because the caller reads those
+    /// itself.
+    ///
+    /// What a fan-out needs before it can ask anyone anything. The
+    /// declaration is a pure function of signed content and published
+    /// metadata, so it is known before a single cell is fetched, and
+    /// what it names is the whole of what the run may touch.
+    ///
+    /// The same derivation [`Self::preview`] runs, so a fan-out gathers
+    /// exactly the set the run then reads: never a cell it does not
+    /// need, and never one short of what it does. An entry becomes its
+    /// width-one interval here, the same normalization the materializer
+    /// applies, so the two vocabulary walks stay parallel.
+    ///
+    /// # Errors
+    ///
+    /// The reason the preview would have refused with, for an envelope
+    /// that does not derive at all.
+    pub fn preview_reads(
+        &self,
+        tx: &Transaction,
+        trie: &ShardTrie,
+        held: &BTreeSet<ShardId>,
+    ) -> Result<BTreeMap<ShardId, DeclaredReads>, String> {
+        if tx.body().call_tree().is_none() {
+            // A publish writes its own two cells and reads nobody
+            // else's, so there is nothing to fan out for.
+            return Ok(BTreeMap::new());
+        }
+        let (prepared, _) = Self::prepare_admitting(
+            tx,
+            &self.records(),
+            &self.world.cache,
+            TargetAuthority::Assumed,
+        )?;
+        let mut by_shard: BTreeMap<ShardId, DeclaredReads> = BTreeMap::new();
+        for effect in prepared.declaration.set.iter() {
+            let owner = match effect.target {
+                EffectTarget::Point(key) => key.owner,
+                EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => owner,
+            };
+            let shard = trie.shard_for_prefix(owner);
+            if held.contains(&shard) {
+                continue;
+            }
+            let asks = by_shard.entry(shard).or_default();
+            match effect.target {
+                EffectTarget::Point(key) => asks.keys.push(key),
+                EffectTarget::Entry {
+                    owner,
+                    collection,
+                    order,
+                } => asks.ranges.push(CellRange {
+                    owner,
+                    collection,
+                    lo: order,
+                    hi: order,
+                    cap: 1,
+                }),
+                EffectTarget::Range {
+                    owner,
+                    collection,
+                    lo,
+                    hi,
+                    cap,
+                } => asks.ranges.push(CellRange {
+                    owner,
+                    collection,
+                    lo,
+                    hi,
+                    cap,
+                }),
+            }
+        }
+        Ok(by_shard)
+    }
 }
 
 /// What a node can answer a preview about: the shards whose committed

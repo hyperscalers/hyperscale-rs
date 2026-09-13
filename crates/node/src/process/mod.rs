@@ -9,11 +9,11 @@
 //! [`ShardLoop`]: crate::shard::ShardLoop
 
 mod canonical_txs;
+mod fan_out;
 mod network_handlers;
 mod tx_status;
 
-use std::collections::{BTreeMap, HashMap};
-use std::iter::once;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -504,66 +504,6 @@ where
         }
     }
 
-    /// What `tx` would do against a hosted shard's committed state.
-    ///
-    /// Answered on the calling thread and not on the shard driver's.
-    /// That is the whole shape of this: a preview is a full VM run, and
-    /// a maximal envelope is tens of milliseconds of it — against a
-    /// block cadence where the driver has a hundred and twenty-five to
-    /// execute in. Handing the driver an unauthenticated RPC's worth of
-    /// execution would let anyone reachable pace block production. It
-    /// needs no driver anyway: the run is a read of committed state,
-    /// the pending chain is already read concurrently by every inbound
-    /// request handler, and the handles a run wants are the ones the
-    /// dispatch pools hold.
-    ///
-    /// The shard is the payer's, which is where a preview is most nearly
-    /// whole: the fee vault is there, so the one cell no declaration
-    /// names is the one shard the answer always has. A declaration
-    /// reaching further is refused by name inside the report, never
-    /// answered from an absence.
-    ///
-    /// `None` when this node hosts no shard that could answer, or hosts
-    /// it but has committed nothing to answer from.
-    #[must_use]
-    pub fn preview_transaction(
-        &self,
-        tx: &Transaction,
-        grants: PreviewGrants,
-    ) -> Option<Box<PreviewReport>> {
-        let topology = self.topology_snapshot.load();
-        let payer_shard = topology.shard_trie().shard_for_prefix(tx.body().fee_payer);
-        let handles = self.dispatch_handles.per_shard.load();
-        let chain = &handles.get(&payer_shard)?.pending_chain;
-
-        let view = chain.view_at_committed_tip();
-        // The tip's own QC timestamp: a candidate has no committing
-        // block to take a clock from, and this node's freshest committed
-        // reading is the nearest thing that exists.
-        let clock = chain
-            .certified_header(view.base().committed_height())
-            .map(|header| header.qc().weighted_timestamp())?;
-        let schedule = self.topology_schedule();
-        Some(Box::new(self.dispatch_handles.executor.preview(
-            &view.snapshot(),
-            tx,
-            &PreviewInputs {
-                prices: topology.prices(),
-                clock,
-                env: TickEnvironment::governing(&topology, schedule.windows()),
-                // This shard's state and no other's. A declaration
-                // reaching further is refused by name, which is what a
-                // node with nothing fetching for it can say honestly.
-                holds: Holds {
-                    trie: topology.shard_trie().clone(),
-                    shards: once(payer_shard).collect(),
-                    fetched: FetchedCells::default(),
-                },
-                grants,
-            },
-        )))
-    }
-
     /// Fan a locally-submitted transaction out via    /// Fan a locally-submitted transaction out via
     /// [`Self::shard_event_senders`] according to
     /// [`Self::compute_submit_fanout`].
@@ -652,6 +592,80 @@ where
     N: Network,
     D: Dispatch,
 {
+    /// What `tx` would do against a hosted shard's committed state.
+    ///
+    /// Answered on the calling thread and not on the shard driver's.
+    /// That is the whole shape of this: a preview is a full VM run, and
+    /// a maximal envelope is tens of milliseconds of it — against a
+    /// block cadence where the driver has a hundred and twenty-five to
+    /// execute in. Handing the driver an unauthenticated RPC's worth of
+    /// execution would let anyone reachable pace block production. It
+    /// needs no driver anyway: the run is a read of committed state,
+    /// the pending chain is already read concurrently by every inbound
+    /// request handler, and the handles a run wants are the ones the
+    /// dispatch pools hold.
+    ///
+    /// The shard is the payer's, which is where a preview is most nearly
+    /// whole: the fee vault is there, so the one cell no declaration
+    /// names is the one shard the answer always has. A declaration
+    /// reaching further is refused by name inside the report, never
+    /// answered from an absence.
+    ///
+    /// `None` when this node hosts no shard that could answer, or hosts
+    /// it but has committed nothing to answer from.
+    #[must_use]
+    pub fn preview_transaction(
+        &self,
+        tx: &Transaction,
+        grants: PreviewGrants,
+    ) -> Option<Box<PreviewReport>> {
+        let topology = self.topology_snapshot.load();
+        let payer_shard = topology.shard_trie().shard_for_prefix(tx.body().fee_payer);
+        let handles = self.dispatch_handles.per_shard.load();
+        let chain = &handles.get(&payer_shard)?.pending_chain;
+
+        let view = chain.view_at_committed_tip();
+        // The tip's own QC timestamp: a candidate has no committing
+        // block to take a clock from, and this node's freshest committed
+        // reading is the nearest thing that exists.
+        let clock = chain
+            .certified_header(view.base().committed_height())
+            .map(|header| header.qc().weighted_timestamp())?;
+        let schedule = self.topology_schedule();
+        let executor = &self.dispatch_handles.executor;
+
+        // Every shard this node hosts reads itself; the rest are asked.
+        // Derived before anything is fetched, because the declaration is
+        // a pure function of signed content — so the fan-out gathers
+        // exactly the set the run then reads.
+        let held: BTreeSet<ShardId> = handles.keys().copied().collect();
+        let fetched = executor
+            .preview_reads(tx, topology.shard_trie(), &held)
+            .map_or_else(
+                |_| FetchedCells::default(),
+                |asks| fan_out::gather(&asks, &topology, &*self.network, &*self.verifier),
+            );
+
+        Some(Box::new(executor.preview(
+            &view.snapshot(),
+            tx,
+            &PreviewInputs {
+                prices: topology.prices(),
+                clock,
+                env: TickEnvironment::governing(&topology, schedule.windows()),
+                // What this node holds, plus whatever answered for the
+                // rest. A shard in neither is refused by name: an
+                // unfetched cell is never read as an empty one.
+                holds: Holds {
+                    trie: topology.shard_trie().clone(),
+                    shards: held,
+                    fetched,
+                },
+                grants,
+            },
+        )))
+    }
+
     /// Adopt the schedule folded at beacon `epoch`: publish its head
     /// through the lock-free `ArcSwap` so off-thread closures pick it up on
     /// their next `.load()`, and push it to the network adapter (which keys
