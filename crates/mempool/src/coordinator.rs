@@ -1039,6 +1039,20 @@ impl MempoolCoordinator {
     /// a block's transaction list. `trie` places each transaction's
     /// shares, so the caps are judged the way admission judges them.
     ///
+    /// `engaged` answers whether a cross-shard transaction's payer
+    /// evidence rides the proposal being built, which the pool cannot
+    /// see: [`Self::parked_engagement`] holds one until the evidence is
+    /// *observed*, where a proposer needs it in the bundle it is about
+    /// to send or already absorbed, and both readings live in the
+    /// coordinators the node owns. It enters here rather than filtering
+    /// the result because a transaction the proposer cannot carry has
+    /// still taken a place and a share of the budget by then, and
+    /// nothing refills behind it — so a shard acting as counterpart for
+    /// traffic whose bundles have not landed would offer a block far
+    /// under its own caps while eligible transactions sat unoffered.
+    /// Priority sharpens it: an unengaged transaction that paid takes
+    /// the place of a lighter one that could actually go.
+    ///
     /// # Performance
     ///
     /// `O(pool_size × log pool_size)`: every eligible entry is collected
@@ -1053,6 +1067,7 @@ impl MempoolCoordinator {
         in_flight: u64,
         trie: &ShardTrie,
         now: LocalTimestamp,
+        engaged: impl Fn(&Arc<Verified<Transaction>>) -> bool,
     ) -> Vec<Arc<Verified<Transaction>>> {
         // The drain is a count: a shard that is not settling admits
         // fewer until it does, and none at the budget.
@@ -1075,6 +1090,7 @@ impl MempoolCoordinator {
                 matches!(entry.status, TransactionStatus::Pending)
                     && !self.parked_engagement.contains_key(*hash)
                     && now.saturating_sub(entry.admitted_at) >= min_dwell
+                    && engaged(&entry.tx)
             })
             .map(|(hash, entry)| (Reverse(entry.tx.body().priority_bp), *hash, entry))
             .collect();
@@ -2045,7 +2061,7 @@ mod tests {
         assert!(!mempool.is_tombstoned(&tx_hash));
         assert!(
             mempool
-                .ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO)
+                .ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO, |_| true)
                 .is_empty(),
             "and is never offered again"
         );
@@ -2313,7 +2329,7 @@ mod tests {
         );
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), read_at);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), read_at, |_| true);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
@@ -2330,7 +2346,8 @@ mod tests {
         );
 
         // The drain the chain reports is already at the cap.
-        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO);
+        let ready =
+            mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO, |_| true);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"
@@ -2363,7 +2380,8 @@ mod tests {
         );
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO);
+        let ready =
+            mempool.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO, |_| true);
         assert_eq!(ready.len(), 2);
     }
 
@@ -2389,7 +2407,7 @@ mod tests {
             mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
         }
 
-        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now);
+        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now, |_| true);
         assert_eq!(ready.len(), 2, "the room the caller named");
         assert!(
             ready.iter().all(|tx| tx.body().priority_bp == 500),
@@ -2398,6 +2416,56 @@ mod tests {
         assert!(
             ready[0].hash() < ready[1].hash(),
             "and they are offered in hash order"
+        );
+    }
+
+    /// A transaction the proposer cannot carry yet takes no place and
+    /// no budget, however much it paid.
+    ///
+    /// The offer is what a block is built from and nothing refills
+    /// behind it, so an unengaged entry filtered after selection would
+    /// leave the block short by one — and a priority it paid would buy
+    /// it the place it then wasted, which is the extraction priority is
+    /// supposed not to sell.
+    #[test]
+    fn an_unengaged_transaction_costs_no_place() {
+        let mut mempool = MempoolCoordinator::with_config(
+            ShardId::ROOT,
+            MempoolConfig {
+                min_dwell_time: Duration::ZERO,
+                ..MempoolConfig::default()
+            },
+        );
+        let topology_snapshot = make_test_topology();
+        let now = LocalTimestamp::from_millis(10_000);
+        // The one that paid most is the one the proposer cannot carry.
+        let unengaged = test_transaction_at_priority(1, 5_000);
+        let unengaged_hash = unengaged.hash();
+        mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(unengaged)), now);
+        for seed in 2u8..=4 {
+            let tx = test_transaction_at_priority(seed, 0);
+            mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
+        }
+
+        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now, |tx| {
+            tx.hash() != unengaged_hash
+        });
+        assert_eq!(
+            ready.len(),
+            2,
+            "the room the caller named is filled with transactions it can carry"
+        );
+        assert!(
+            ready.iter().all(|tx| tx.hash() != unengaged_hash),
+            "and the one it cannot is not among them"
+        );
+
+        // Withheld by engagement and by nothing else: the same pool
+        // offers it first the moment its evidence lands.
+        let engaged = mempool.ready_transactions(2, 0, &ShardTrie::single(), now, |_| true);
+        assert!(
+            engaged.iter().any(|tx| tx.hash() == unengaged_hash),
+            "what it paid still buys the place once it can be carried"
         );
     }
 
@@ -2422,7 +2490,7 @@ mod tests {
         }
         hashes.sort_unstable();
 
-        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now);
+        let ready = mempool.ready_transactions(2, 0, &ShardTrie::single(), now, |_| true);
         assert_eq!(
             ready.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
             hashes[..2],
@@ -2468,7 +2536,7 @@ mod tests {
         );
         assert!(
             mempool
-                .ready_transactions(10, 0, &ShardTrie::single(), now)
+                .ready_transactions(10, 0, &ShardTrie::single(), now, |_| true)
                 .is_empty()
         );
 
@@ -2578,7 +2646,7 @@ mod tests {
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
 
-        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), now);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), now, |_| true);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
     }
 
@@ -2598,6 +2666,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(10_100),
+            |_| true,
         );
         assert_eq!(
             ready.len(),
@@ -2611,6 +2680,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(10_150),
+            |_| true,
         );
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
@@ -2630,7 +2700,7 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // Still at t=10s — dwell time not met
-        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), submitted_at);
+        let ready = mempool.ready_transactions(10, 0, &ShardTrie::single(), submitted_at, |_| true);
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
@@ -2639,6 +2709,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(10_300),
+            |_| true,
         );
         assert_eq!(
             ready.len(),
@@ -2652,6 +2723,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(10_500),
+            |_| true,
         );
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
@@ -2687,6 +2759,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(1_400),
+            |_| true,
         );
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
@@ -2696,6 +2769,7 @@ mod tests {
             0,
             &ShardTrie::single(),
             LocalTimestamp::from_millis(1_500),
+            |_| true,
         );
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }
@@ -3044,11 +3118,11 @@ mod tests {
         let now = LocalTimestamp::from_millis(1_000);
 
         // An idle chain offers everything the block can hold.
-        let idle = mempool.ready_transactions(10, 0, trie, now);
+        let idle = mempool.ready_transactions(10, 0, trie, now, |_| true);
         assert_eq!(idle.len(), 8, "an undrained budget selects freely");
 
         // Three places from the budget, only three are offered.
-        let squeezed = mempool.ready_transactions(10, MAX_UNSETTLED_TXS - 3, trie, now);
+        let squeezed = mempool.ready_transactions(10, MAX_UNSETTLED_TXS - 3, trie, now, |_| true);
         assert_eq!(
             squeezed.len(),
             3,
@@ -3058,7 +3132,7 @@ mod tests {
         // At the budget it offers nothing, whatever is pooled.
         assert!(
             mempool
-                .ready_transactions(10, MAX_UNSETTLED_TXS, trie, now)
+                .ready_transactions(10, MAX_UNSETTLED_TXS, trie, now, |_| true)
                 .is_empty(),
             "a shard at its budget admits nothing until the drain clears"
         );
@@ -3092,7 +3166,7 @@ mod tests {
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
-        let offered = mempool.ready_transactions(100, 0, trie, now);
+        let offered = mempool.ready_transactions(100, 0, trie, now, |_| true);
         let filled = offered.iter().fold(DeclaredWork::ZERO, |total, tx| {
             total.saturating_add(
                 Classified::freeze(tx.legs(), tx.owners(), trie).local_work(tx, ShardId::ROOT),
@@ -3112,7 +3186,7 @@ mod tests {
         let places = u64::try_from(offered.len()).expect("fits") + 1;
         assert_eq!(
             mempool
-                .ready_transactions(100, MAX_UNSETTLED_TXS - places, trie, now)
+                .ready_transactions(100, MAX_UNSETTLED_TXS - places, trie, now, |_| true)
                 .len(),
             offered.len()
         );
@@ -3140,7 +3214,8 @@ mod tests {
                     10,
                     0,
                     &ShardTrie::single(),
-                    LocalTimestamp::from_millis(1_000)
+                    LocalTimestamp::from_millis(1_000),
+                    |_| true
                 )
                 .is_empty()
         );
@@ -3161,6 +3236,7 @@ mod tests {
                 0,
                 &ShardTrie::single(),
                 LocalTimestamp::from_millis(1_000),
+                |_| true,
             )
             .iter()
             .map(|tx| tx.hash())
@@ -3182,6 +3258,7 @@ mod tests {
                 0,
                 &ShardTrie::single(),
                 LocalTimestamp::from_millis(1_000),
+                |_| true,
             )
             .iter()
             .map(|tx| tx.hash())
@@ -3214,6 +3291,7 @@ mod tests {
                 0,
                 &ShardTrie::single(),
                 LocalTimestamp::from_millis(1_000),
+                |_| true,
             )
             .iter()
             .map(|tx| tx.hash())

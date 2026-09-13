@@ -47,12 +47,6 @@ impl ShardParticipation {
         // The budget reads the chain, not a local claim set: the parent
         // header carries how many this shard still holds unsettled.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
-        let ready_txs = self.mempool_coordinator.ready_transactions(
-            max_txs,
-            in_flight.inner(),
-            sched.head().shard_trie(),
-            self.now,
-        );
         let finalizations = self.execution_coordinator.get_finalizations();
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read, and the proofs
@@ -71,11 +65,17 @@ impl ShardParticipation {
         // commit-proven payer header), so locks engage only on committed
         // payer evidence; a mis-paired inclusion is backstopped by the
         // dispatch gate's required-set check.
+        //
+        // Read inside selection, so a transaction waiting on its payer
+        // holds neither a place nor a share of the block's budget.
         let topology = sched.head();
-        let ready_txs = ready_txs
-            .into_iter()
-            .filter(|tx| self.engagement_held(tx, topology, &queued))
-            .collect();
+        let ready_txs = self.mempool_coordinator.ready_transactions(
+            max_txs,
+            in_flight.inner(),
+            topology.shard_trie(),
+            self.now,
+            |tx| self.engagement_held(tx, topology, &queued),
+        );
 
         // Provisions coordinator stores `Verified` internally; lift each
         // batch into the `Verifiable` transport shape so the marker
