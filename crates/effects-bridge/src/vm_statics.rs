@@ -35,7 +35,7 @@ use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
     LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
-    TermsRefusal, admit_event_bounds, read_bytes, write_bytes,
+    TermsRefusal, admit_event_bounds, read_bytes,
 };
 
 use crate::ProtocolHasher;
@@ -147,23 +147,29 @@ pub fn declared_vector(
         *share = share.saturating_add(term);
     };
 
-    // The declaration's effects, each under its target's owner. Reads
-    // are per target, since one leaf read once serves every mode
-    // declared on it; writes and footprint are per effect.
+    // The declaration's effects, each under its target's owner. The byte
+    // dimensions are per target, since one leaf is read once and written
+    // once however many modes a manifest declares on it; footprint is
+    // per effect, because it prices the exclusion each declared access
+    // asks for and two of them ask for more than one.
+    //
+    // The write figure comes off the set rather than being folded here,
+    // so this and the quote a wallet signs against read one rule.
     let set = &routing.declaration().set;
-    let mut read_targets = BTreeSet::new();
+    for target in set.targets() {
+        add(
+            target_owner(&target),
+            DeclaredWork {
+                read_bytes: read_bytes(&target, set.width_of(&target)),
+                write_bytes: set.write_bytes_of(&target),
+                ..DeclaredWork::ZERO
+            },
+        );
+    }
     for effect in set.iter() {
-        let width = set.width_of(&effect.target);
-        let read = if read_targets.insert(effect.target) {
-            read_bytes(&effect.target, width)
-        } else {
-            0
-        };
         add(
             target_owner(&effect.target),
             DeclaredWork {
-                read_bytes: read,
-                write_bytes: write_bytes(&effect.target, effect.mode, width),
                 footprint: effect_units(effect),
                 ..DeclaredWork::ZERO
             },
@@ -1015,7 +1021,9 @@ mod tests {
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
-    use hyperscale_vm_types::{CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr};
+    use hyperscale_vm_types::{
+        AMOUNT_CELL_BYTES, CollectionId, LegRole, MAX_GAS_LIMIT, ResourceAddr, WRITE_LEAF_BYTES,
+    };
 
     use super::*;
     use crate::records::record_address;
@@ -1506,6 +1514,49 @@ mod tests {
             "a wider declaration must not be cheaper: {:?} vs {:?}",
             wider.work,
             derived.work
+        );
+    }
+
+    /// A vault reached under two modes is one leaf written once.
+    ///
+    /// Alice paying Alice is the smallest shape that tells the rules
+    /// apart: the withdrawal reserves out of her vault and the deposit
+    /// credits into it, so one leaf carries two modes. Charging per mode
+    /// would price it as two leaves and leave the chain charging what
+    /// `EffectSet::write_bytes` — the figure a wallet is quoted against,
+    /// through preflight — does not, so a ceiling signed off the quote
+    /// would be refused at admission.
+    ///
+    /// Read as a difference rather than a constant: collapsing the two
+    /// accounts into one removes exactly one vault leaf and nothing
+    /// else.
+    #[test]
+    fn a_vault_paying_itself_is_one_leaf_and_not_two_charges() {
+        let plain = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let itself = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(composer_addr(), 1, RES_X),
+        ]);
+        let write_of = |tree| {
+            statics()
+                .derive(&envelope(tree, &[]))
+                .expect("derives")
+                .work
+                .write_bytes
+        };
+
+        let one_leaf = WRITE_LEAF_BYTES + AMOUNT_CELL_BYTES as u64;
+        assert_eq!(
+            write_of(&itself),
+            write_of(&plain) - one_leaf,
+            "one vault fewer, and the survivor still written once: {} against {}",
+            write_of(&itself),
+            write_of(&plain)
         );
     }
 
