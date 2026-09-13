@@ -390,7 +390,7 @@ impl Executor {
             Ok(metadata) => {
                 self.world.cache.publish(
                     package_hash(&ProtocolHasher, artifact),
-                    metadata,
+                    &metadata,
                     artifact.len() as u64,
                 );
                 self.backend.absorb_artifact(artifact);

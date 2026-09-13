@@ -162,7 +162,7 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
     for artifact in packages.artifacts() {
         cache.publish(
             package_hash(&ProtocolHasher, artifact),
-            admit_protocol_package(artifact).expect("a genesis artifact publishes as a package"),
+            &admit_protocol_package(artifact).expect("a genesis artifact publishes as a package"),
             artifact.len() as u64,
         );
     }
