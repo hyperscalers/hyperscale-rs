@@ -37,9 +37,11 @@ pub const MAX_RANGES_PER_QUERY: usize = MAX_PROOFS_PER_QUERY;
 /// One collection interval a declaration reaches, in the terms the
 /// declaration states it in.
 ///
-/// `cap` is the declaration's own, and it is signed — the transaction
-/// paid for `(cap + 1) × width` read bytes before this was asked — so
-/// the server needs no bound of its own beyond the frame.
+/// `cap` is the declaration's own, and it is the asker's word for it:
+/// a preview runs before there is a signed transaction, so nothing
+/// here attests that a payer bought `(cap + 1) × width` read bytes. The
+/// server spends [`MAX_CELLS_PER_QUERY`](crate::MAX_CELLS_PER_QUERY)
+/// across the whole request instead, and refuses one asking past it.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct CellRange {
     /// The collection's owner, which fixes the shard that answers.

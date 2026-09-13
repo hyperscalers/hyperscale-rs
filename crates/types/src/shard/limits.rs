@@ -10,8 +10,8 @@
 //! without reducing the protocol-wide load it has to keep up with.
 
 use hyperscale_vm_types::{
-    DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT,
-    MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_SUBINTENTS, VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
+    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_SUBINTENTS, VERIFY_WEIGHT,
 };
 
 use crate::{Address, LocalKey, RoutePrefix, TxsInFlight};
@@ -234,6 +234,22 @@ pub const MAX_PROOFS_PER_QUERY: usize = 256;
 /// for small-to-mid-shard topologies; widening the topology may require
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
+/// The most leaves one cells query may be answered over, keys and
+/// range entries together.
+///
+/// Every other bound on a declaration's reads is the transaction's, and
+/// this request carries no transaction: it is asked on a preview's
+/// behalf, before anything is signed, so a `CellRange`'s `cap` is
+/// whatever the asker wrote and a server trusting it would walk whole
+/// collections and build a multiproof over every leaf in them.
+///
+/// Sized at what a declaration could legitimately reach — one
+/// transaction's whole read budget spent on the narrowest leaf there
+/// is — so nothing a real preview asks for is refused, and a query past
+/// it is refused rather than truncated: a short answer would read back
+/// as a collection holding less than it does, and a preview is the one
+/// thing that must not be quietly wrong.
+pub const MAX_CELLS_PER_QUERY: u64 = MAX_TX_READ_BYTES / AMOUNT_CELL_BYTES as u64;
 
 /// Hard cap on the state claims a block can carry.
 ///
