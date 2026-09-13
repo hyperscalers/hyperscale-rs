@@ -14,7 +14,7 @@ use tokio::task::{JoinError, JoinHandle, spawn};
 use tracing::{error, info};
 
 use super::routes::create_router;
-use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TxSubmissionSender};
+use super::state::{MempoolSnapshot, NodeStatusState, PreviewSender, RpcState, TxSubmissionSender};
 use crate::status::SyncStatus;
 
 /// Errors from the RPC server.
@@ -119,11 +119,13 @@ impl RpcServer {
     ///
     /// * `config` - Server configuration
     /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to `IoLoop`
+    /// * `preview_tx` - Ask a hosted shard what a transaction would do, committing nothing
     /// * `tx_status` - Process-wide transaction status cache shared from the runner
     #[must_use]
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,
+        preview_tx: PreviewSender,
         tx_status: Arc<TxStatusCache>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
@@ -132,6 +134,7 @@ impl RpcServer {
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
+            preview_tx,
             start_time: Instant::now(),
             tx_status,
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
@@ -152,6 +155,7 @@ impl RpcServer {
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<ArcSwap<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
+        preview_tx: PreviewSender,
         tx_status: Arc<TxStatusCache>,
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
@@ -161,6 +165,7 @@ impl RpcServer {
             sync_status,
             node_status,
             tx_submission_tx,
+            preview_tx,
             start_time: Instant::now(),
             tx_status,
             mempool_snapshot,
@@ -231,7 +236,12 @@ mod tests {
     async fn test_server_creation() {
         let config = RpcServerConfig::default();
         let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-        let server = RpcServer::new(config, tx_submission_tx, Arc::new(TxStatusCache::new()));
+        let server = RpcServer::new(
+            config,
+            tx_submission_tx,
+            Arc::new(|_tx| None),
+            Arc::new(TxStatusCache::new()),
+        );
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));

@@ -135,6 +135,32 @@ pub struct TransactionStatusResponse {
 // Error Response
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// What a wallet asks before it signs.
+#[derive(Debug, Deserialize)]
+pub struct PreviewTransactionRequest {
+    /// The candidate envelope, hex-encoded, exactly as it would be
+    /// submitted.
+    pub transaction_hex: String,
+}
+
+/// What the run would do, and what to sign so it can.
+#[derive(Debug, Serialize)]
+pub struct PreviewTransactionResponse {
+    /// `completed`, `aborted` or `refused`.
+    pub outcome: String,
+    /// Why, when the outcome carries a reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// What the payer would burn, as a decimal string: a `u128` does not
+    /// survive a JSON number.
+    pub fee: String,
+    /// Fuel the run consumed, which the ceilings are the margin over.
+    pub fuel: u64,
+    /// The ceiling each node's run asks for, in node order — the vector
+    /// a composer signs into `gas_limits`, and the reason to ask at all.
+    pub ceilings: Vec<u64>,
+}
+
 /// Generic error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {

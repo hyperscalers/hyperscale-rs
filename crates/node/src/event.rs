@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 
+use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
+use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_network::RequestError;
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
@@ -125,6 +127,31 @@ pub enum ShardScopedInput {
     /// [`TimerOp::Set`]: crate::shard::TimerOp::Set
     /// [`TimerOp::Cancel`]: crate::shard::TimerOp::Cancel
     FetchTick,
+
+    /// A question about what a transaction would do, and the channel to
+    /// answer it on.
+    ///
+    /// The one input that expects a reply. Everything else a shard is
+    /// handed advances its state and is answered, if at all, by the
+    /// state moving; a preview changes nothing and exists only for what
+    /// it returns — so the asker's channel rides the question rather
+    /// than being looked up afterwards.
+    ///
+    /// Answered from committed state alone, so it is a read and a send
+    /// with no fetch behind it. A declaration reaching a shard this node
+    /// does not serve is refused by name inside the report, which is
+    /// what a node with no fan-out can honestly say about it.
+    Preview {
+        /// The candidate to run. Nothing commits it and nothing gossips
+        /// it; it is not admitted anywhere by being asked about.
+        tx: Box<Transaction>,
+        /// What the run is permitted beyond what a committed execution
+        /// would be.
+        grants: PreviewGrants,
+        /// Where the report goes. A closed channel means the asker gave
+        /// up first, and the report is dropped.
+        reply: Sender<Box<PreviewReport>>,
+    },
 
     /// Raw gossip-delivered transaction. `NodeHost` queues it for async
     /// validation; the validated form is surfaced as
@@ -438,6 +465,11 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
+            // A question nothing is waiting on the state for: answered
+            // from committed state, so it neither races an event nor is
+            // raced by one, and it goes behind the work that moves the
+            // chain.
+            Self::Preview { .. } => EventPriority::Internal,
             Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::PackageArtifactsFetched { .. }

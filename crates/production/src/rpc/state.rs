@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use hyperscale_engine::PreviewReport;
 use hyperscale_node::TxStatusCache;
 use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, TxsInFlight};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,14 @@ pub struct RpcPublishers {
 /// envelopes onto the relevant per-shard event channels.
 pub type TxSubmissionSender = Arc<dyn Fn(Arc<Transaction>) -> bool + Send + Sync + 'static>;
 
+/// Ask the runner what a transaction would do, without submitting it.
+///
+/// `None` when no hosted shard could answer or the driver did not answer in
+/// time. Blocking on a crossbeam reply, so handlers call it inside
+/// `spawn_blocking` rather than on a tokio worker.
+pub type PreviewSender =
+    Arc<dyn Fn(&Transaction) -> Option<Box<PreviewReport>> + Send + Sync + 'static>;
+
 /// Shared state for RPC handlers.
 #[derive(Clone)]
 pub struct RpcState {
@@ -44,6 +53,10 @@ pub struct RpcState {
     pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider.
     pub node_status: Arc<ArcSwap<NodeStatusState>>,
+    /// Ask a hosted shard what a transaction would do. Reads committed
+    /// state and commits nothing, so it neither admits the transaction
+    /// nor gossips it.
+    pub preview_tx: PreviewSender,
     /// Channel to submit transactions to the `IoLoop`.
     ///
     /// RPC-submitted transactions are sent as `Event::SubmitTransaction` directly
