@@ -13,17 +13,19 @@ mod network_handlers;
 mod tx_status;
 
 use std::collections::{BTreeMap, HashMap};
+use std::iter::once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 pub(crate) use canonical_txs::CanonicalTxs;
-use crossbeam::channel::{Sender, bounded};
+use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{PreviewGrants, PreviewReport};
+use hyperscale_engine::{
+    FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
+};
 use hyperscale_network::Network;
-use hyperscale_storage::{BeaconStorage, ShardStorage};
+use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
 use hyperscale_types::{
     Address, Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule,
     Transaction, ValidatorId, Verifier,
@@ -502,49 +504,67 @@ where
         }
     }
 
-    /// Ask a hosted shard what `tx` would do, and wait up to `timeout`
-    /// for the answer.
+    /// What `tx` would do against a hosted shard's committed state.
     ///
-    /// The shard asked is the payer's, which is where a preview is most
-    /// nearly whole: the fee vault is there, so the one cell no
-    /// declaration names is the one shard the answer always has. A
-    /// declaration reaching further is refused by name inside the
-    /// report, so a partial answer is never dressed as a complete one.
+    /// Answered on the calling thread and not on the shard driver's.
+    /// That is the whole shape of this: a preview is a full VM run, and
+    /// a maximal envelope is tens of milliseconds of it — against a
+    /// block cadence where the driver has a hundred and twenty-five to
+    /// execute in. Handing the driver an unauthenticated RPC's worth of
+    /// execution would let anyone reachable pace block production. It
+    /// needs no driver anyway: the run is a read of committed state,
+    /// the pending chain is already read concurrently by every inbound
+    /// request handler, and the handles a run wants are the ones the
+    /// dispatch pools hold.
     ///
-    /// `None` when this node hosts no shard that could answer, when the
-    /// driver is shutting down, or when it did not answer in time.
-    /// Blocking, and called from RPC worker threads: the driver answers
-    /// a preview inline from committed state, so the wait is a queue
-    /// wait and not a fetch.
+    /// The shard is the payer's, which is where a preview is most nearly
+    /// whole: the fee vault is there, so the one cell no declaration
+    /// names is the one shard the answer always has. A declaration
+    /// reaching further is refused by name inside the report, never
+    /// answered from an absence.
+    ///
+    /// `None` when this node hosts no shard that could answer, or hosts
+    /// it but has committed nothing to answer from.
     #[must_use]
     pub fn preview_transaction(
         &self,
         tx: &Transaction,
         grants: PreviewGrants,
-        timeout: Duration,
     ) -> Option<Box<PreviewReport>> {
-        let payer_shard = self
-            .topology_snapshot
-            .load()
-            .shard_trie()
-            .shard_for_prefix(tx.body().fee_payer);
-        let senders = self.shard_event_senders.load();
-        let sender = senders.get(&payer_shard)?;
-        let (reply_tx, reply_rx) = bounded(1);
-        sender
-            .send(HostEvent::shard(
-                payer_shard,
-                ShardScopedInput::Preview {
-                    tx: Box::new(tx.clone()),
-                    grants,
-                    reply: reply_tx,
+        let topology = self.topology_snapshot.load();
+        let payer_shard = topology.shard_trie().shard_for_prefix(tx.body().fee_payer);
+        let handles = self.dispatch_handles.per_shard.load();
+        let chain = &handles.get(&payer_shard)?.pending_chain;
+
+        let view = chain.view_at_committed_tip();
+        // The tip's own QC timestamp: a candidate has no committing
+        // block to take a clock from, and this node's freshest committed
+        // reading is the nearest thing that exists.
+        let clock = chain
+            .certified_header(view.base().committed_height())
+            .map(|header| header.qc().weighted_timestamp())?;
+        let schedule = self.topology_schedule();
+        Some(Box::new(self.dispatch_handles.executor.preview(
+            &view.snapshot(),
+            tx,
+            &PreviewInputs {
+                prices: topology.prices(),
+                clock,
+                env: TickEnvironment::governing(&topology, schedule.windows()),
+                // This shard's state and no other's. A declaration
+                // reaching further is refused by name, which is what a
+                // node with nothing fetching for it can say honestly.
+                holds: Holds {
+                    trie: topology.shard_trie().clone(),
+                    shards: once(payer_shard).collect(),
+                    fetched: FetchedCells::default(),
                 },
-            ))
-            .ok()?;
-        reply_rx.recv_timeout(timeout).ok()
+                grants,
+            },
+        )))
     }
 
-    /// Fan a locally-submitted transaction out via
+    /// Fan a locally-submitted transaction out via    /// Fan a locally-submitted transaction out via
     /// [`Self::shard_event_senders`] according to
     /// [`Self::compute_submit_fanout`].
     ///
