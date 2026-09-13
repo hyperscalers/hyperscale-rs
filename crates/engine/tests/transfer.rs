@@ -2831,6 +2831,42 @@ fn a_preview_refuses_what_admission_would_refuse() {
     assert!(report.changes.is_empty());
 }
 
+/// An envelope carrying no ceilings at all previews as refused.
+///
+/// The kernel reads an unset ceiling vector as every node unbounded,
+/// which is the in-crate fixture's reading. A preview answers for a
+/// body nobody signed for and nobody pays for, so it is the one caller
+/// that reaches the kernel without deriving — and an envelope that
+/// declares no compute is priced at none while running without limit.
+#[test]
+fn a_preview_refuses_an_envelope_that_signed_no_ceilings() {
+    let payer = fee_payer(7);
+    let executor = executor(ExecutionMode::Serial);
+    let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
+    let graph = client()
+        .transfer_graph(payer, payer, bob(), 100)
+        .expect("an account answers a transfer");
+    let mut vm = client().sign(graph, &key, terms(PREVIEW_CEILING));
+    vm.gas_limits.clear();
+    let tx = Transaction::new(vm);
+
+    let report = preview_on(
+        &[(payer, 1_000), (bob(), 50)],
+        &executor,
+        &tx,
+        PreviewGrants::default(),
+    );
+    let PreviewOutcome::Refused { reason } = &report.outcome else {
+        panic!(
+            "an envelope with no ceilings must refuse: {:?}",
+            report.outcome
+        );
+    };
+    assert!(reason.contains("manifest nodes"), "reason = {reason}");
+    assert_eq!(report.fee, 0);
+    assert!(report.changes.is_empty());
+}
+
 /// A preview holds a node to its target's authority like the chain does,
 /// and the grant is what a wallet reaches for when it wants an answer
 /// about an envelope its counterparties have not signed yet.

@@ -680,6 +680,13 @@ impl Executor {
         )
         .map_err(|error| format!("admission: {error}"))?;
         let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
+        // One signed ceiling per lowered node, summing under the bound.
+        // Held here and not only at derivation because a preview reaches
+        // the kernel without deriving: an envelope carrying no ceilings
+        // meters every node at `u64::MAX`, which is the in-crate
+        // fixture's reading and never an embedder's.
+        vm.admit_terms(routing.calls.len())
+            .map_err(|refusal| refusal.to_string())?;
         // The same vector derivation puts on the envelope, so a preview
         // reports what a block would charge without running the
         // derivation — which admits under the rule as the chain applies
