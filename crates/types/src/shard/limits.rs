@@ -372,9 +372,20 @@ pub const MAX_BLOCK_COMPUTE: u64 = 1_000_000_000;
 /// taken at a third of nominal.
 pub const MAX_BLOCK_READ_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The bytes one block's transactions may declare written between them:
-/// the window's share of leaf and tree writes, at the same discount.
-pub const MAX_BLOCK_WRITE_BYTES: u64 = 4 * 1024 * 1024;
+/// The bytes one block's transactions may declare written between them.
+///
+/// Counted in the units `write_bytes` is denominated in, which carry a
+/// per-leaf floor: a written leaf costs its path reads before any of its
+/// own bytes, so the quantity a block spends is leaves far more than it
+/// is bytes. At the floor, this window's share is about eight thousand
+/// leaves, and a block of tiny cells reaches the cap at roughly that
+/// many rather than at the hundreds of thousands a raw byte count would
+/// have admitted.
+///
+/// Raised fourfold when the floor landed, and not a loosening: the old
+/// figure counted a quantity nothing spends, so a block at it was
+/// seconds of write work against a 125 ms window.
+pub const MAX_BLOCK_WRITE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The footprint one block's transactions may declare between them.
 ///
