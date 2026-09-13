@@ -158,10 +158,11 @@ fn fold_attested(
         }
     }
     for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
-        into.entries
-            .entry((range.owner, range.collection))
-            .or_default()
-            .extend(answer.entries.iter().cloned());
+        into.merge_entries(
+            range.owner,
+            range.collection,
+            answer.entries.iter().cloned(),
+        );
     }
     into.anchors.insert(shard, height);
     true

@@ -2480,6 +2480,45 @@ fn a_fan_out_asks_for_what_the_refusal_would_have_named() {
     );
 }
 
+/// A cell a transaction reaches under two modes is one cell to fetch.
+///
+/// The declaration folds by target and carries the modes on it, so the
+/// flattened view names a target once per mode — the right reading for a
+/// price, which charges each access, and the wrong one for a fan-out,
+/// which fetches a leaf. Alice paying Alice is the smallest shape that
+/// tells them apart: the withdrawal reserves out of her vault and the
+/// deposit credits into it, so one cell carries `Reserve` and `Delta`.
+/// The same fold is behind every round trip — a swap handing back the
+/// resource it took, change returning to its payer.
+///
+/// Asking twice costs twice: two entries in the request, two leaves in
+/// the server's proof, and two spends against its query budget.
+#[test]
+fn a_cell_reached_under_two_modes_is_asked_for_once() {
+    let payer = fee_payer(7);
+    let accounts = vec![(payer, 1_000)];
+    let tx = signed_transfer_with_fee(7, payer, payer, 100, PREVIEW_CEILING);
+    let executor = executor(ExecutionMode::Serial);
+    let _ = MapDb::genesis(&accounts);
+    let trie = ShardTrie::uniform_from_count(2);
+
+    // Holding nothing, so every cell the declaration reaches is asked of
+    // whoever does hold it and the whole split is visible here.
+    let asks = executor
+        .preview_reads(&tx, &trie, &BTreeSet::new())
+        .expect("the self-transfer derives");
+    let keys: Vec<_> = asks.values().flat_map(|reads| reads.keys.clone()).collect();
+    let mut distinct = keys.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        keys.len(),
+        distinct.len(),
+        "the vault the transfer reserves out of and credits back into is \
+         one leaf, and the fan-out asks for it once: {keys:?}"
+    );
+}
+
 /// A shard a fan-out answered for is one the preview can speak for.
 ///
 /// The companion to [`a_preview_refuses_what_this_node_cannot_see`]:

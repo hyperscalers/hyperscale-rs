@@ -105,6 +105,10 @@ pub struct PreviewInputs {
 ///
 /// The declaration's own vocabulary, split by who holds it: point cells
 /// by key, collection intervals by owner, collection and order window.
+///
+/// One ask per declared target, however many modes reach it. A cell read
+/// and written is one leaf to fetch, and asking twice for it spends the
+/// server's query budget twice over to answer the same question.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeclaredReads {
     /// Point cells to answer, present or absent.
@@ -152,8 +156,8 @@ impl Executor {
             TargetAuthority::Assumed,
         )?;
         let mut by_shard: BTreeMap<ShardId, DeclaredReads> = BTreeMap::new();
-        for effect in prepared.declaration.set.iter() {
-            let owner = match effect.target {
+        for target in prepared.declaration.set.targets() {
+            let owner = match target {
                 EffectTarget::Point(key) => key.owner,
                 EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => owner,
             };
@@ -162,7 +166,7 @@ impl Executor {
                 continue;
             }
             let asks = by_shard.entry(shard).or_default();
-            match effect.target {
+            match target {
                 EffectTarget::Point(key) => asks.keys.push(key),
                 EffectTarget::Entry {
                     owner,
@@ -259,8 +263,8 @@ pub type FetchedEntries = Vec<(u128, Vec<u8>)>;
 pub struct FetchedCells {
     /// Point cells that were present under their shard's proof.
     pub cells: BTreeMap<SubstateKey, Vec<u8>>,
-    /// Entries per collection, ascending by order, as the serving shard
-    /// answered the declared interval.
+    /// Entries per collection, ascending by order and one to an order,
+    /// as the serving shard answered the declared intervals.
     pub entries: BTreeMap<(Address, CollectionId), FetchedEntries>,
     /// The committed height each answering shard spoke at.
     ///
@@ -268,6 +272,33 @@ pub struct FetchedCells {
     /// is a run over snapshots that were never simultaneous — which is
     /// the optimism the report already declares, stated in heights.
     pub anchors: BTreeMap<ShardId, BlockHeight>,
+}
+
+impl FetchedCells {
+    /// Fold one interval's answer into its collection, keeping the
+    /// entries ascending and one to an order.
+    ///
+    /// A collection is reached by as many declared targets as the
+    /// manifest names it in, and they all share this one bucket: an
+    /// entry and a range over the same collection are distinct targets,
+    /// and two ranges may overlap. Appending would leave the bucket
+    /// unsorted and doubled, which is the one property
+    /// [`entries_in_range`](Substates::entries_in_range) reads it for —
+    /// it filters and takes, and never sorts.
+    ///
+    /// Two answers to one order are two readings of one leaf under one
+    /// root, so keeping either is keeping what that root attested.
+    pub fn merge_entries(
+        &mut self,
+        owner: Address,
+        collection: CollectionId,
+        answered: impl IntoIterator<Item = (u128, Vec<u8>)>,
+    ) {
+        let entries = self.entries.entry((owner, collection)).or_default();
+        entries.extend(answered);
+        entries.sort_by_key(|(order, _)| *order);
+        entries.dedup_by_key(|(order, _)| *order);
+    }
 }
 
 impl Substates for FetchedCells {
@@ -735,6 +766,44 @@ mod tests {
                 .is_empty(),
             "a collection nobody fetched is empty, and the shard's absence from \
              `anchors` is what keeps that from being read as a verdict"
+        );
+    }
+
+    /// Several answers about one collection are one collection.
+    ///
+    /// An entry and a range over it are distinct declared targets that
+    /// share a bucket, and two ranges may overlap — so the fold merges.
+    /// Appending would leave the bucket out of order and doubled, and
+    /// `entries_in_range` filters and takes without ever sorting, so the
+    /// doubling reaches the run as entries the collection does not hold.
+    #[test]
+    fn answers_about_one_collection_merge_rather_than_stack() {
+        let mut fetched = FetchedCells::default();
+        // A range over [4, 6], then the entry at 1, then a second range
+        // overlapping the first: the order answers arrive in is the
+        // order the declaration named its targets, which is nobody's
+        // idea of ascending.
+        fetched.merge_entries(owner(2), COLLECTION, [(4u128, vec![4]), (6, vec![6])]);
+        fetched.merge_entries(owner(2), COLLECTION, [(1u128, vec![1])]);
+        fetched.merge_entries(owner(2), COLLECTION, [(4u128, vec![4]), (5, vec![5])]);
+
+        assert_eq!(
+            fetched.entries[&(owner(2), COLLECTION)]
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 5, 6],
+            "ascending, and one to an order"
+        );
+        assert_eq!(
+            fetched
+                .entries_in_range(owner(2), COLLECTION, 0, u128::MAX, 3)
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 5],
+            "so a limit takes the lowest three and not whichever three \
+             happened to be answered first"
         );
     }
 
