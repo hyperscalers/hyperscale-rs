@@ -688,6 +688,13 @@ pub struct FrozenWindow {
     /// carry; the applying fold consumes the keepers mid-fold, under the
     /// same argument as the observer cohort.
     pub reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
+    /// Each shard's fullest cap dimension as its mean stood at
+    /// promotion, before this epoch's fold advances it.
+    ///
+    /// Frozen for the reason the price table is: the split predicate
+    /// reads it, and a proposer and a verifier a fold apart would
+    /// otherwise weigh one window's assertion against two readings.
+    pub fullness: BTreeMap<ShardId, u32>,
 }
 
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
@@ -1515,7 +1522,7 @@ impl BeaconState {
                 settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
                 prices: self.prices,
-                fullness: self.fullness_peaks(),
+                fullness: self.window.fullness.clone(),
                 usable_packages: self.usable_packages(self.current_epoch),
                 seeds: self.seeds.clone(),
             },
@@ -1546,7 +1553,7 @@ impl BeaconState {
                 settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
                 prices: self.next_prices,
-                fullness: self.fullness_peaks(),
+                fullness: live.fullness,
                 usable_packages: self.usable_packages(self.current_epoch.next()),
                 seeds: self.seeds.clone(),
             },
@@ -1611,6 +1618,7 @@ impl BeaconState {
             settled_window_floors: self.live_settled_window_floors(),
             reshape_observers: self.live_reshape_observers(),
             reshape_keepers: self.live_reshape_keepers(),
+            fullness: self.fullness_peaks(),
         }
     }
 
