@@ -847,7 +847,7 @@ fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
 /// re-derived into each sibling's absolute. There is nothing cumulative
 /// to track and nothing to re-stamp: two transactions burning against
 /// one vault each record their own debit and settlement adds them.
-fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128) {
+fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>) {
     let Some(payer) = fee else {
         return;
     };
@@ -857,7 +857,7 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128)
     // it. On the commit path admission has already refused a
     // transaction whose price is past its ceiling, at the same table
     // this burns under, so the two figures meet there.
-    let burn = amount.min(payer.max_fee);
+    let burn = payer.burned();
     if burn == 0 {
         return;
     }
@@ -896,6 +896,27 @@ pub struct PayerFee {
     /// true for a cross-shard leg, which is the one shape whose effects
     /// are discarded after the engine completed them.
     pub abortable: bool,
+}
+
+impl PayerFee {
+    /// What the payer's vault actually loses, which is the one figure
+    /// any receipt may name.
+    ///
+    /// The price and the ceiling meet on the commit path, where
+    /// admission already refused a transaction priced past what it
+    /// signed for — but they meet at the table admission read, and a
+    /// block anchored the other side of a fold prices under its own. So
+    /// the ceiling binds here, and it binds in one place: a charge
+    /// reported above what was burned would claim emission weight for
+    /// quanta nobody paid.
+    #[must_use]
+    pub const fn burned(&self) -> u128 {
+        if self.price < self.max_fee {
+            self.price
+        } else {
+            self.max_fee
+        }
+    }
 }
 
 /// Whether an attempt's charge settles through a receipt of its own
@@ -1008,7 +1029,7 @@ fn assemble_published_tx(
     // The declaration's price at the block's table, like any other
     // transaction: a publish's artifact is bytes written and retained,
     // and its two point writes are writes.
-    let charged = fee.map_or(0, |payer| payer.price);
+    let charged = fee.map_or(0, |payer| payer.burned());
 
     // Admission reached the whole verdict from these same bytes, so a
     // refusal here means the transaction bypassed admission — the same
@@ -1027,7 +1048,7 @@ fn assemble_published_tx(
                     .cells
                     .insert(package_key(publisher, package), Some(artifact.to_vec()));
             }
-            apply_fee_burn(&mut writes, fee, charged);
+            apply_fee_burn(&mut writes, fee);
             let receipt_hash = GlobalReceipt::new(
                 true,
                 EventRoot::ZERO,
@@ -1173,7 +1194,7 @@ fn assemble_executed_tx(
     let BatchInputs { base, locality, .. } = inputs;
     let KernelOutput { receipt, job } = kernel;
     let tx_hash = vm_tx;
-    let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
+    let charged = fee.map_or(0, |payer| payer.burned());
     let fee_receipt = fee
         .filter(|payer| settled_apart(&receipt.outcome, *payer))
         .map(|payer| {
@@ -1182,7 +1203,7 @@ fn assemble_executed_tx(
                 ctx.shard_trie,
                 tx_hash,
                 payer.vault,
-                payer.price.min(payer.max_fee),
+                payer.burned(),
             )
         });
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
@@ -1553,7 +1574,7 @@ impl Executor {
                     fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
                         vault: payer.vault,
                         resource: *PROTOCOL_RESOURCE,
-                        amount: payer.price.min(payer.max_fee),
+                        amount: payer.burned(),
                     }),
                 )
             })
@@ -1665,7 +1686,7 @@ impl Executor {
                     // and dispatched it, and it settles the same price
                     // apart, as every attempt that applied no effects does.
                     let fee = fee_by_tx.get(&vm_tx).copied();
-                    let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
+                    let charged = fee.map_or(0, |payer| payer.burned());
                     let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));
                     let mut executed =
                         project_to_shard(&cached, vm_tx, ctx.local_shard, ctx.shard_trie);
