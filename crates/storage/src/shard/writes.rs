@@ -520,6 +520,39 @@ mod tests {
 
     use super::*;
 
+    /// The read and retention dimensions price an entry leaf at
+    /// `ENTRY_LEAF_BYTES` beside its value, and nothing in the type
+    /// system ties that figure to what the encoder writes — so it is
+    /// tied here. A leaf wider than the price is a page a declaration
+    /// underpays for; narrower, and a collection costs more than it is.
+    #[test]
+    fn an_entry_leaf_costs_what_the_dimension_prices_it() {
+        use hyperscale_types::{AddressClass, CollectionId, EntryKey};
+        use hyperscale_vm_types::{ENTRY_LEAF_BYTES, MAX_SLOT_WIDTH};
+
+        let key = EntryKey {
+            owner: Address::new([1; 31], AddressClass::Component),
+            collection: CollectionId([2; 16]),
+            order: 7,
+        };
+        for width in [0usize, 1, 127, 128, 4096, 16_383, MAX_SLOT_WIDTH as usize] {
+            let leaf = entry_leaf_value(&key, &vec![9u8; width]).len() as u64;
+            let priced = ENTRY_LEAF_BYTES + width as u64;
+            assert!(
+                leaf <= priced,
+                "an entry leaf at width {width} encodes to {leaf}, past the \
+                 {priced} the dimensions price it at"
+            );
+            // And the bound is a measurement, not a cushion: the value's
+            // own length prefix is the only thing that moves.
+            assert!(
+                priced - leaf <= 2,
+                "the bound is {} bytes over what width {width} encodes",
+                priced - leaf
+            );
+        }
+    }
+
     fn writes_for(owner: Address, value: u8) -> SettledWrites {
         SettledWrites::from_absolutes(BTreeMap::from([(
             SubstateKey {
