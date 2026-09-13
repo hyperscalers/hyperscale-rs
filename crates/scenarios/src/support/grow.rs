@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{BlockHeight, Epoch, ShardId};
+use hyperscale_types::{BlockHeight, Epoch, NetworkParams, ShardId};
 
 use super::query::beacon_epoch;
-use super::tx::{build_reshape_threshold_vote_tx, pool_operator, validity_around};
+use super::tx::{ParamBallot, build_param_vote_tx, pool_operator, validity_around};
 use super::{Budget, Cluster, epochs};
 
 /// Epochs of lead before the threshold vote activates — enough for the vote
@@ -84,28 +84,52 @@ pub fn grow_to(c: &mut impl Cluster, target: u32) {
 ///
 /// Panics if the threshold does not activate within budget.
 pub fn vote_reshape_threshold(c: &mut impl Cluster, split_bytes: u64) {
-    // Re-submit the vote each activation window until the beacon folds and
-    // applies it. A single vote carries a fixed `VOTE_ACTIVATE_LEAD` lead and is
-    // dropped if its witness folds at or after `activate_at`; at a long epoch
-    // that lead is only a few minutes of slack, so a fold delayed by a committee
-    // hiccup can miss it. Retrying past the miss with a fresh window keeps the
-    // step robust without widening the lead (which would just defer activation).
+    vote_params(
+        c,
+        ParamBallot {
+            split_bytes,
+            ..ParamBallot::default()
+        },
+        |params| params.reshape_thresholds.split_bytes == split_bytes,
+        &format!("the reshape threshold to {split_bytes}"),
+    );
+}
+
+/// Cast the founding pool's vote for `ballot` and wait until the fold
+/// applies it, as `applied` reads the live params.
+///
+/// Re-submits each activation window until it lands. A single vote
+/// carries a fixed `VOTE_ACTIVATE_LEAD` lead and is dropped if its
+/// witness folds at or after `activate_at`; at a long epoch that lead is
+/// only a few minutes of slack, so a fold delayed by a committee hiccup
+/// can miss it. Retrying past the miss with a fresh window keeps the
+/// step robust without widening the lead, which would only defer
+/// activation.
+///
+/// # Panics
+///
+/// Panics if `applied` never reads true within budget.
+pub fn vote_params(
+    c: &mut impl Cluster,
+    ballot: ParamBallot,
+    applied: impl Fn(&NetworkParams) -> bool,
+    what: &str,
+) {
     for _ in 1..=VOTE_ATTEMPTS {
         let current = beacon_epoch(c).expect("a beacon epoch is committed");
         let activate_at = Epoch::new(current.inner() + VOTE_ACTIVATE_LEAD);
-        let vote = build_reshape_threshold_vote_tx(
+        let vote = build_param_vote_tx(
             &pool_operator().0,
-            split_bytes,
+            ballot,
             activate_at,
             validity_around(c.now()),
         );
         c.submit(Arc::new(vote));
         if c.run_until(epochs(VOTE_WINDOW_EPOCHS), |c| {
-            c.beacon_state()
-                .is_some_and(|state| state.params.reshape_thresholds.split_bytes == split_bytes)
+            c.beacon_state().is_some_and(|state| applied(&state.params))
         }) {
             return;
         }
     }
-    panic!("the reshape threshold did not activate to {split_bytes} within budget");
+    panic!("{what} did not activate within budget");
 }

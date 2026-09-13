@@ -2468,21 +2468,51 @@ fn envelope<S: AccountSigner>(
     )
 }
 
-/// Cast the founding pool's vote to retune the reshape `split_bytes`,
-/// activating at `activate_at`.
+/// The whole proposal one vote carries.
+///
+/// Every governed parameter travels together: a vote *is* a proposal and
+/// the tally buckets by the exact set, so leaving a row out is voting to
+/// reset it. Defaulting to what genesis runs under is what lets a
+/// scenario name the one row it means to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamBallot {
+    /// Substate bytes past which a shard splits.
+    pub split_bytes: u64,
+    /// Cap share, in basis points, past which a shard splits on traffic.
+    pub split_fullness: u32,
+    /// Epochs a convicted pool's withdrawals stay frozen.
+    pub impound_epochs: u64,
+    /// The lowest each price row may reach, in basis points of the
+    /// reference table.
+    pub floor_bp: u32,
+    /// The highest each may reach, on the same terms.
+    pub ceiling_bp: u32,
+}
+
+impl Default for ParamBallot {
+    /// The parameters a genesis cluster already runs under, so a ballot
+    /// that changes one field changes only that one.
+    fn default() -> Self {
+        let params = NetworkParams::default();
+        Self {
+            split_bytes: params.reshape_thresholds.split_bytes,
+            split_fullness: params.reshape_thresholds.split_fullness,
+            impound_epochs: params.impound_epochs,
+            floor_bp: BASIS_POINTS,
+            ceiling_bp: BASIS_POINTS,
+        }
+    }
+}
+
+/// Cast the founding pool's vote for `ballot`, activating at
+/// `activate_at`.
 ///
 /// The founding pool holds every genesis validator's stake, so one vote
-/// is a majority. Raising `split_bytes` lifts the derived `merge_bytes`
-/// above a grown topology's children so they fall under the merge
-/// threshold.
-///
-/// Every governed parameter travels, not just the one being changed: a
-/// vote is a whole proposal, and the tally buckets by the exact pair, so
-/// a vote that omitted the others would be voting to reset them.
+/// is a majority.
 #[must_use]
-pub fn build_reshape_threshold_vote_tx(
+pub fn build_param_vote_tx(
     operator: &Ed25519PrivateKey,
-    split_bytes: u64,
+    ballot: ParamBallot,
     activate_at: Epoch,
     validity: TimestampRange,
 ) -> Transaction {
@@ -2496,21 +2526,38 @@ pub fn build_reshape_threshold_vote_tx(
         b.presenting(proof, |b| {
             staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
                 b,
-                split_bytes,
-                // The fullness predicate off: this vote is about what a
-                // shard holds.
-                u64::from(NetworkParams::default().reshape_thresholds.split_fullness),
-                NetworkParams::default().impound_epochs,
-                // An even band: this vote is about the reshape
-                // threshold, so it leaves every price row where the
-                // reference table put it.
-                u64::from(BASIS_POINTS),
-                u64::from(BASIS_POINTS),
+                ballot.split_bytes,
+                u64::from(ballot.split_fullness),
+                ballot.impound_epochs,
+                u64::from(ballot.floor_bp),
+                u64::from(ballot.ceiling_bp),
                 activate_at.inner(),
             )
         })
     });
     Transaction::new(envelope(graph, operator, validity))
+}
+
+/// Cast the founding pool's vote to retune the reshape `split_bytes`.
+///
+/// Raising `split_bytes` lifts the derived `merge_bytes` above a grown
+/// topology's children so they fall under the merge threshold.
+#[must_use]
+pub fn build_reshape_threshold_vote_tx(
+    operator: &Ed25519PrivateKey,
+    split_bytes: u64,
+    activate_at: Epoch,
+    validity: TimestampRange,
+) -> Transaction {
+    build_param_vote_tx(
+        operator,
+        ParamBallot {
+            split_bytes,
+            ..ParamBallot::default()
+        },
+        activate_at,
+        validity,
+    )
 }
 
 #[cfg(test)]
