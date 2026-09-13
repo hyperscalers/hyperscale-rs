@@ -349,9 +349,10 @@ impl Client {
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_effects_bridge::envelope_bytes;
     use hyperscale_effects_bridge::genesis::account_artifact;
-    use hyperscale_types::Ed25519PrivateKey;
     use hyperscale_types::test_utils::{test_principal, test_validity_range};
+    use hyperscale_types::{Ed25519PrivateKey, MAX_ENVELOPE_BYTES};
     use hyperscale_vm_effects::{
         Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit, package_hash,
     };
@@ -422,6 +423,41 @@ mod tests {
             &ProtocolHasher,
         )
         .expect("a built transfer admits");
+    }
+
+    /// What a real transfer weighs on the wire.
+    ///
+    /// The retention row prices the envelope every validator keeps, and
+    /// the block's retention cap is derived from a link budget — so what
+    /// one ordinary transaction actually costs that budget is a figure
+    /// worth knowing rather than inferring from the caps around it.
+    #[test]
+    fn a_transfer_weighs_what_it_weighs() {
+        let client = Client::genesis(NETWORK);
+        let signer = Ed25519PrivateKey::from_bytes(&[0x31; 32]).expect("a fixture key");
+        let transfer = client
+            .transfer(
+                &signer,
+                principal_of(&signer),
+                test_principal(0x22),
+                100,
+                Terms {
+                    max_fee: 1_000_000,
+                    validity: test_validity_range(),
+                    ceilings: Ceilings::Guessed,
+                    message: Vec::new(),
+                },
+            )
+            .expect("a transfer builds");
+        let encoded =
+            usize::try_from(envelope_bytes(transfer.body()).expect("an envelope encodes"))
+                .expect("an envelope's length fits a usize");
+        println!("transfer envelope: {encoded} bytes");
+        assert!(
+            encoded < MAX_ENVELOPE_BYTES / 64,
+            "an ordinary transfer weighs {encoded} bytes against a {MAX_ENVELOPE_BYTES} \
+             envelope bound: the bound has stopped being an adversary's"
+        );
     }
 
     /// What a wallet that previewed signs is what it measured, and what
