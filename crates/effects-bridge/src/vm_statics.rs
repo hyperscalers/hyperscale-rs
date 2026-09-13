@@ -1481,7 +1481,7 @@ mod tests {
         let with_artifact = statics();
         with_artifact.cache.publish(
             PackageHash(ProtocolHasher.hash(b"package", &[b"account"])),
-            account::metadata(),
+            &account::metadata(),
             12_345,
         );
         let priced = with_artifact.derive(&vm).expect("derives");

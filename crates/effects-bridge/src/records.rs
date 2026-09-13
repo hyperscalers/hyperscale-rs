@@ -548,11 +548,23 @@ impl InstanceCache {
 /// commit path.
 #[derive(Clone, Debug)]
 pub struct PackageCache {
-    metadata: Arc<ArcSwap<MetadataCache>>,
-    /// Each published artifact's length beside its metadata: what
-    /// derivation prices a node's instantiation at, since running a
-    /// node reads the package's artifact whole.
-    artifact_bytes: Arc<ArcSwap<BTreeMap<PackageHash, u64>>>,
+    published: Arc<ArcSwap<Published>>,
+}
+
+/// A package's metadata and its artifact's length, which are one fact.
+///
+/// Held under a single atom rather than side by side, because a
+/// derivation reads both and prices the node on what it finds: metadata
+/// without a length would price an instantiation at no bytes at all,
+/// and that figure reaches the header's `used`. One swap publishes
+/// both, so no reader can see half of a package.
+#[derive(Clone, Debug)]
+struct Published {
+    metadata: Arc<MetadataCache>,
+    /// Each published artifact's length: what derivation prices a
+    /// node's instantiation at, since running a node reads the
+    /// package's artifact whole.
+    artifact_bytes: BTreeMap<PackageHash, u64>,
 }
 
 impl PackageCache {
@@ -562,8 +574,10 @@ impl PackageCache {
     #[must_use]
     pub fn new(seed: MetadataCache) -> Self {
         Self {
-            metadata: Arc::new(ArcSwap::from_pointee(seed)),
-            artifact_bytes: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            published: Arc::new(ArcSwap::from_pointee(Published {
+                metadata: Arc::new(seed),
+                artifact_bytes: BTreeMap::new(),
+            })),
         }
     }
 
@@ -572,23 +586,20 @@ impl PackageCache {
     #[must_use]
     pub fn forked(&self) -> Self {
         Self {
-            metadata: Arc::new(ArcSwap::from_pointee((*self.load()).clone())),
-            artifact_bytes: Arc::new(ArcSwap::from_pointee(
-                (**self.artifact_bytes.load()).clone(),
-            )),
+            published: Arc::new(ArcSwap::from_pointee((**self.published.load()).clone())),
         }
     }
 
     /// The current published set.
     #[must_use]
     pub fn load(&self) -> Arc<MetadataCache> {
-        self.metadata.load_full()
+        Arc::clone(&self.published.load().metadata)
     }
 
     /// The length of `package`'s artifact, where this node has seen it.
     #[must_use]
     pub fn artifact_bytes(&self, package: PackageHash) -> Option<u64> {
-        self.artifact_bytes.load().get(&package).copied()
+        self.published.load().artifact_bytes.get(&package).copied()
     }
 
     /// Publish `metadata` under `package` unless it is already there,
@@ -603,19 +614,30 @@ impl PackageCache {
     /// Panics if the metadata fails the cache's publish check. Every
     /// caller feeds this from a committed artifact that already cleared
     /// admission, so a refusal here is a node defect, never an input.
-    pub fn publish(&self, package: PackageHash, metadata: PackageMetadata, bytes: u64) {
-        if !self.artifact_bytes.load().contains_key(&package) {
-            let mut lengths = (**self.artifact_bytes.load()).clone();
-            lengths.insert(package, bytes);
-            self.artifact_bytes.store(Arc::new(lengths));
-        }
-        if self.load().get(package).is_some() {
+    pub fn publish(&self, package: PackageHash, metadata: &PackageMetadata, bytes: u64) {
+        let current = self.published.load();
+        if current.artifact_bytes.contains_key(&package) && current.metadata.get(package).is_some()
+        {
             return;
         }
-        let mut next = (*self.load()).clone();
-        next.publish(package, metadata)
-            .expect("everything published here cleared the artifact gate");
-        self.metadata.store(Arc::new(next));
+        drop(current);
+        // Read-modify-write under a compare-and-swap, because two shard
+        // drivers on one node publish concurrently into this one cache:
+        // a plain store would drop whichever of two packages lost the
+        // race, and `artifact_bytes` fails open at zero where the
+        // metadata fails closed.
+        self.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.artifact_bytes.insert(package, bytes);
+            if next.metadata.get(package).is_none() {
+                let mut grown = (*next.metadata).clone();
+                grown
+                    .publish(package, metadata.clone())
+                    .expect("everything published here cleared the artifact gate");
+                next.metadata = Arc::new(grown);
+            }
+            Arc::new(next)
+        });
     }
 
     /// Publish the package a committed cell holds, if it holds one, and
@@ -635,7 +657,7 @@ impl PackageCache {
         let Ok(metadata) = admit_package(value) else {
             return false;
         };
-        self.publish(package, metadata, value.len() as u64);
+        self.publish(package, &metadata, value.len() as u64);
         true
     }
 }
@@ -646,6 +668,7 @@ mod tests {
 
     use hyperscale_hbor::to_vec as hbor_to_vec;
     use hyperscale_vm_effects::{Hash32, Value};
+    use hyperscale_vm_stdlib::account;
 
     use super::*;
 
@@ -671,6 +694,46 @@ mod tests {
         fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.inner.committed_cell(key)
+        }
+    }
+
+    /// Every package published concurrently keeps both halves.
+    ///
+    /// One cache serves a whole node, and a node runs a shard driver per
+    /// hosted shard — so two commits publishing different packages meet
+    /// here on different threads. A read-modify-write that is not
+    /// compare-and-swapped drops whichever lost, and a package whose
+    /// length went missing is priced at no read bytes at all: the
+    /// derivation still routes the call, so the node folds a different
+    /// `used` into its header than its committee does.
+    #[test]
+    fn concurrent_publishes_all_survive() {
+        const PACKAGES: u8 = 32;
+
+        let cache = PackageCache::new(MetadataCache::new());
+        let hashes: Vec<PackageHash> = (0..PACKAGES)
+            .map(|seed| PackageHash(ProtocolHasher.hash(b"package", &[&[seed]])))
+            .collect();
+
+        std::thread::scope(|scope| {
+            for (seed, package) in hashes.iter().enumerate() {
+                let cache = &cache;
+                scope.spawn(move || {
+                    cache.publish(*package, &account::metadata(), seed as u64 + 1);
+                });
+            }
+        });
+
+        for (seed, package) in hashes.iter().enumerate() {
+            assert!(
+                cache.load().get(*package).is_some(),
+                "every package's metadata is published"
+            );
+            assert_eq!(
+                cache.artifact_bytes(*package),
+                Some(seed as u64 + 1),
+                "and the length it was published with is beside it"
+            );
         }
     }
 
