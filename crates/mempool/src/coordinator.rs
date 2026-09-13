@@ -15,9 +15,11 @@
 //! # Backpressure
 //!
 //! Two limits gate proposal and ingress:
-//! - [`MAX_DRAIN_WORK`] (a protocol constant in `hyperscale-types`) caps the
-//!   work this shard's chain may owe unsettled at once, so a shard that is
-//!   not settling admits less until it does. Not operator-tunable: every
+//! - [`MAX_UNSETTLED_TXS`] (a protocol constant in `hyperscale-types`) caps
+//!   how many transactions this shard's chain may hold committed and
+//!   unsettled at once, so a shard that is not settling admits less until
+//!   it does. A count rather than a weight, because every block is already
+//!   capped per dimension on its own content. Not operator-tunable: every
 //!   replica has to price the same headroom off the same chain content, and
 //!   the figure selection reads comes from the parent header rather than
 //!   from local state.

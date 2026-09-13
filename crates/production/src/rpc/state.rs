@@ -126,12 +126,12 @@ pub struct VnodeMempoolSnapshot {
     /// When `true`, the pending transaction count exceeds the configured limit
     /// and new RPC submissions should be rejected with a backpressure response.
     pub at_pending_limit: bool,
-    /// Per-remote-shard unsettled work, from the latest verified block
-    /// headers. Used for cross-shard backpressure: reject transactions
-    /// targeting congested shards.
+    /// Per-remote-shard transactions in flight, from the latest verified
+    /// block headers. Used for cross-shard backpressure: reject
+    /// transactions targeting congested shards.
     pub remote_shard_in_flight: HashMap<ShardId, TxsInFlight>,
     /// Threshold for rejecting transactions due to remote shard congestion
-    /// (80% of [`hyperscale_types::MAX_DRAIN_WORK`]).
+    /// (80% of [`hyperscale_types::MAX_UNSETTLED_TXS`]).
     pub remote_congestion_threshold: TxsInFlight,
 }
 
