@@ -19,11 +19,11 @@ use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
 use hyperscale_types::{
-    AccountSigner, BASIS_POINTS, ComponentAddr, ConsensusPublicKey, ConsensusSignature,
-    Ed25519PrivateKey, EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE,
-    MIN_STAKE_FLOOR, MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr,
-    SchemeId, ShardId, ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange,
-    Transaction, TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
+    EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
+    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
+    ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
     ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
@@ -2537,17 +2537,28 @@ impl ParamBallot {
     /// Read off the chain's live parameters and never off the type's
     /// defaults: a cluster runs whatever its genesis config or an
     /// earlier vote left, and a ballot seeded from the defaults would
-    /// carry a row nobody meant to move. The price band has no live
-    /// reading here because it is a band on the wire and rows in
-    /// storage, so it re-proposes the even one.
+    /// carry a row nobody meant to move. The band is read back through
+    /// [`PriceBounds::as_band`] for the same reason the other three are
+    /// read at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the live bounds are not a band. Nothing sets them any
+    /// other way today, and if something does there is no ballot that
+    /// re-proposes them — which is the vote form's problem to answer,
+    /// not a figure to guess here.
     #[must_use]
-    pub const fn of(params: &NetworkParams) -> Self {
+    pub fn of(params: &NetworkParams) -> Self {
+        let (floor_bp, ceiling_bp) = params
+            .price_bounds
+            .as_band()
+            .expect("the live price bounds state no band, so no ballot re-proposes them unchanged");
         Self {
             split_bytes: params.reshape_thresholds.split_bytes,
             split_fullness: params.reshape_thresholds.split_fullness,
             impound_epochs: params.impound_epochs,
-            floor_bp: BASIS_POINTS,
-            ceiling_bp: BASIS_POINTS,
+            floor_bp,
+            ceiling_bp,
         }
     }
 }
@@ -2586,13 +2597,20 @@ pub fn build_param_vote_tx(
     Transaction::new(envelope(graph, operator, validity))
 }
 
-/// Cast the founding pool's vote to retune the reshape `split_bytes`.
+/// Cast the founding pool's vote to retune the reshape `split_bytes`,
+/// re-proposing `live` on every other row.
 ///
 /// Raising `split_bytes` lifts the derived `merge_bytes` above a grown
 /// topology's children so they fall under the merge threshold.
+///
+/// `live` is the caller's because this builds a vote without waiting on
+/// one, so there is no fold to read the parameters back from — and a
+/// seed guessed at rather than read moves every row the cluster does
+/// not run at its default.
 #[must_use]
 pub fn build_reshape_threshold_vote_tx(
     operator: &Ed25519PrivateKey,
+    live: &NetworkParams,
     split_bytes: u64,
     activate_at: Epoch,
     validity: TimestampRange,
@@ -2601,7 +2619,7 @@ pub fn build_reshape_threshold_vote_tx(
         operator,
         ParamBallot {
             split_bytes,
-            ..ParamBallot::of(&NetworkParams::default())
+            ..ParamBallot::of(live)
         },
         activate_at,
         validity,

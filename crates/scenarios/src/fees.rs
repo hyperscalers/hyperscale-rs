@@ -25,7 +25,7 @@ use crate::support::tx::{
     validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
-use crate::support::{Cluster, epochs, vote_params};
+use crate::support::{Cluster, epochs, vote_params, vote_reshape_threshold};
 
 /// An eighth and eight times the reference table: wide enough that the
 /// controller's own step — an eighth of a row per epoch — has somewhere
@@ -193,8 +193,7 @@ pub fn a_priority_is_charged_over_the_table_price<C: Cluster>(c: &mut C) {
     world.assert_settles_within(c, &charges, epochs(4), "a plain and a prioritised transfer");
 }
 
-/// A vote that moves the price band leaves every other governed row
-/// where it was.
+/// A vote moves the row it names and no other, in both directions.
 ///
 /// One vote is one whole proposal and the tally buckets by the exact
 /// set, so a ballot is only ever a re-proposal of what the chain runs
@@ -203,11 +202,17 @@ pub fn a_priority_is_charged_over_the_table_price<C: Cluster>(c: &mut C) {
 /// threshold nobody cast, and silently retune it on any cluster not
 /// already running the default.
 ///
+/// Both directions, because the two rows read back differently and only
+/// one of them used to: the thresholds are stored as they are voted,
+/// where the band is two figures on the wire and ten rows in storage.
+/// A ballot that could not state the live band back had to guess at it,
+/// so every vote about anything else shut the price interval.
+///
 /// # Panics
 ///
-/// Panics if the band never activates, or if any other row moves with
-/// it.
-pub fn a_band_vote_leaves_every_other_row_alone<C: Cluster>(c: &mut C) {
+/// Panics if either vote fails to activate, or if either moves a row it
+/// did not name.
+pub fn a_vote_moves_the_row_it_names_and_no_other<C: Cluster>(c: &mut C) {
     assert!(
         await_beacon_epoch(c, 1, epochs(6)),
         "the beacon must fold before a ballot can reach it"
@@ -240,6 +245,22 @@ pub fn a_band_vote_leaves_every_other_row_alone<C: Cluster>(c: &mut C) {
     assert_eq!(
         after.impound_epochs, before.impound_epochs,
         "nor the impound window"
+    );
+
+    // And back the other way, over the open band rather than the
+    // degenerate one: a threshold vote has to restate an interval it
+    // never names, which it can only do by reading the live one back.
+    let raised = before.reshape_thresholds.split_bytes + 1;
+    vote_reshape_threshold(c, raised);
+
+    let last = live_params(c);
+    assert_eq!(
+        last.reshape_thresholds.split_bytes, raised,
+        "the threshold the second ballot named moved"
+    );
+    assert_eq!(
+        last.price_bounds, opened,
+        "and the band it did not name survived it"
     );
 }
 
