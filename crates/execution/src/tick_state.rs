@@ -1156,10 +1156,10 @@ impl TickState {
     /// members still need a verdict from.
     ///
     /// **The projection is what makes each half account for itself.**
-    /// `tx_hashes`, `tx_count` and `declared_work` all read the local
+    /// `tx_hashes`, `tx_count` and `released` all read the local
     /// certificate, so projecting it to this half's members is what makes
     /// the half name exactly its own transactions and release exactly
-    /// their reservations — no new field, and the drain term stays
+    /// their places in the drain — no new field, and the drain term stays
     /// readable off the block. Both projections verify under the same
     /// signed root and signature as the copy they came from.
     ///
