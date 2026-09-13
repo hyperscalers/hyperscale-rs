@@ -59,7 +59,9 @@ pub use faults::{
     minority_fragment_rejoins_after_partition, partition_halts_and_heals,
     partition_heals_at_exact_quorum,
 };
-pub use fees::a_vote_opens_the_band_and_the_level_moves;
+pub use fees::{
+    a_priority_is_charged_over_the_table_price, a_vote_opens_the_band_and_the_level_moves,
+};
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
 pub use reshape::{

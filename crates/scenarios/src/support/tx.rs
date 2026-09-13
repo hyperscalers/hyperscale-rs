@@ -1239,6 +1239,7 @@ pub fn build_instantiate_tx(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -1336,6 +1337,7 @@ fn build_lottery_tx(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -1368,6 +1370,40 @@ pub fn build_transfer_tx<S: AccountSigner>(
     Transaction::new(envelope(graph, payer, validity))
 }
 
+/// Build a transfer signing `priority_bp` over the table price.
+///
+/// What a sender does when a shard is full: the figure is burned like
+/// the rest of the fee and buys a place in a block, never a position in
+/// one.
+///
+/// # Panics
+///
+/// As [`build_transfer_tx`].
+#[must_use]
+pub fn build_transfer_at_priority<S: AccountSigner>(
+    payer: &S,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+    priority_bp: u32,
+) -> Transaction {
+    let graph = client()
+        .transfer_graph(principal_of(payer), from, to, amount)
+        .expect("the stdlib account answers a transfer");
+    Transaction::new(client().sign(
+        graph,
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            ceilings: Ceilings::Guessed,
+            priority_bp,
+            message: Vec::new(),
+        },
+    ))
+}
+
 /// Build a transfer signing `ceilings` for its nodes.
 ///
 /// What a wallet does with a preview's report: the figures it hands back
@@ -1396,6 +1432,7 @@ pub fn build_transfer_at_ceilings<S: AccountSigner>(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Measured(ceilings),
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -1991,6 +2028,7 @@ fn build_venues_tx(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -2057,6 +2095,7 @@ pub fn build_instance_instantiate_tx(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -2365,6 +2404,7 @@ pub fn build_composed_tx(
             max_fee: 1_000,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     ))
@@ -2463,6 +2503,7 @@ fn envelope<S: AccountSigner>(
             max_fee: MAX_FEE,
             validity,
             ceilings: Ceilings::Guessed,
+            priority_bp: 0,
             message: Vec::new(),
         },
     )

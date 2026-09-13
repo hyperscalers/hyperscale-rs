@@ -34,7 +34,7 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
-    a_published_package_matures_before_it_runs,
+    a_priority_is_charged_over_the_table_price, a_published_package_matures_before_it_runs,
     a_record_is_decided_by_the_successor_when_its_issuer_splits,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
@@ -212,6 +212,14 @@ fn split_boundary_admits_an_uncommitted_precut_tx_sim() {
 // ─── Engine scenarios ───────────────────────────────────────────────
 // The single-shard catalogue on the engine: signed manifest graphs
 // through the live pipeline, receipts from the batch executor.
+
+/// A signed priority reaches the burn and the ledger closes over it.
+#[test]
+fn a_priority_is_charged_over_the_table_price_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&liveness_config(), 0xF33E, &genesis_accounts(1, 1));
+    a_priority_is_charged_over_the_table_price(&mut cluster);
+}
 
 #[test]
 fn single_transfer_sim() {

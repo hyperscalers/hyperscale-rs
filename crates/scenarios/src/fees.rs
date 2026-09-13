@@ -15,8 +15,12 @@ use std::sync::Arc;
 
 use hyperscale_types::{PriceBounds, PriceTable, TransactionDecision, TransactionStatus};
 
-use crate::support::query::beacon_epoch;
-use crate::support::tx::{ParamBallot, build_transfer_tx, pool_operator, validity_around};
+use crate::support::conservation::{Charges, probe_world};
+use crate::support::query::{beacon_epoch, declared_price};
+use crate::support::tx::{
+    ParamBallot, build_transfer_at_priority, build_transfer_tx, pool_operator, recipient, sender,
+    validity_around,
+};
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
 use crate::support::{Cluster, epochs, vote_params};
 
@@ -25,6 +29,10 @@ use crate::support::{Cluster, epochs, vote_params};
 /// to go in a handful of folds.
 const FLOOR_BP: u32 = 1_250;
 const CEILING_BP: u32 = 80_000;
+
+/// Half again over the table price: large enough that the charge cannot
+/// be confused with rounding, and inside `MAX_PRIORITY_BP`.
+const PRIORITY_BP: u32 = 5_000;
 
 /// A vote opens the band, the controller walks the level inside it, and
 /// the chain goes on pricing transactions at wherever it got to.
@@ -125,4 +133,60 @@ fn prices<C: Cluster>(c: &C) -> (PriceTable, PriceBounds) {
     c.beacon_state()
         .map(|state| (state.prices, state.params.price_bounds))
         .expect("a committed beacon state")
+}
+
+/// A signed priority is charged, burned, and conserved.
+///
+/// Half again over the table price, which is what
+/// [`PRIORITY_BP`]'s five thousand basis points name. What makes this an
+/// end-to-end claim rather than arithmetic is the conservation check:
+/// the world settles against the sum of the *declared* prices, so a
+/// chain that admitted the priority and then burned the plain figure
+/// leaves value unaccounted for and the assertion fires.
+///
+/// What a priority buys is a place in a block and never a position in
+/// one; the ordering half is the pool's, pinned where the selection is.
+///
+/// # Panics
+///
+/// Panics if either transfer fails to settle, if the priority is not
+/// priced over the plain figure, or if the world does not conserve.
+pub fn a_priority_is_charged_over_the_table_price<C: Cluster>(c: &mut C) {
+    let (payer, from) = sender(0);
+    let to = recipient(0);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
+
+    let plain = build_transfer_tx(&payer, from, to, 1, validity_around(c.now()));
+    let raised =
+        build_transfer_at_priority(&payer, from, to, 2, validity_around(c.now()), PRIORITY_BP);
+
+    // The prices the chain will charge, read before either is submitted:
+    // a pure function of signed content and the table at the head.
+    let plain_price = declared_price(c, &plain);
+    let raised_price = declared_price(c, &raised);
+    assert!(
+        raised_price > plain_price,
+        "a priority must cost more than the table price: {raised_price} against {plain_price}"
+    );
+
+    let plain_hash = charges.submit(c, plain);
+    let raised_hash = charges.submit(c, raised);
+    for (hash, what) in [
+        (plain_hash, "the plain transfer"),
+        (raised_hash, "the raised one"),
+    ] {
+        let status = await_tx_terminal(c, hash, epochs(8));
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "{what} must settle; status = {status:?}",
+        );
+    }
+
+    // The ledger closes against both declared prices together, which is
+    // the burn agreeing with what the priority was quoted at.
+    world.assert_settles_within(c, &charges, epochs(4), "a plain and a prioritised transfer");
 }

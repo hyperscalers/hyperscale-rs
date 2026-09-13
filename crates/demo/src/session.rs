@@ -474,6 +474,7 @@ impl Session {
                     max_fee: TRANSFER_MAX_FEE,
                     validity: validity_around(self.now),
                     ceilings: Ceilings::Guessed,
+                    priority_bp: 0,
                     message: self.nonce.to_le_bytes().to_vec(),
                 },
             )
