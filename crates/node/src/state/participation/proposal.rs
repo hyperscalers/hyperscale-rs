@@ -4,13 +4,14 @@
 //! proposals from the same triple — ready txs from mempool, finalizations
 //! from execution, queued provisions — so the gather logic lives once here.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_execution::Offers;
 use hyperscale_types::{
-    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, StateClaim, TopologySchedule,
-    TopologySnapshot, Transaction, Verifiable, Verified,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -69,12 +70,13 @@ impl ShardParticipation {
         // Read inside selection, so a transaction waiting on its payer
         // holds neither a place nor a share of the block's budget.
         let topology = sched.head();
+        let riding = Self::riding_this_proposal(&queued);
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
             in_flight.inner(),
             topology.shard_trie(),
             self.now,
-            |tx| self.engagement_held(tx, topology, &queued),
+            |tx| self.engagement_held(tx, topology, &riding),
         );
 
         // Provisions coordinator stores `Verified` internally; lift each
@@ -101,7 +103,7 @@ impl ShardParticipation {
         &self,
         tx: &Arc<Verified<Transaction>>,
         topology: &TopologySnapshot,
-        queued: &[Arc<Verified<Provisions>>],
+        riding: &HashSet<(ShardId, TxHash)>,
     ) -> bool {
         if topology.is_single_shard_transaction(tx.as_ref()) {
             return true;
@@ -113,13 +115,28 @@ impl ShardParticipation {
         let tx_hash = tx.hash();
         self.execution_coordinator
             .has_provisions_from(tx_hash, payer_shard)
-            || queued.iter().any(|bundle| {
-                bundle.source_shard() == payer_shard
-                    && bundle
-                        .transactions()
-                        .iter()
-                        .any(|entry| entry.tx_hash == tx_hash)
+            || riding.contains(&(payer_shard, tx_hash))
+    }
+
+    /// What the queued bundles name, as a set: `(payer shard, tx)` for
+    /// every transaction whose evidence would ride this proposal.
+    ///
+    /// Indexed once rather than rescanned, because selection asks the
+    /// question of every pending entry in the pool and the queue is
+    /// bounded only by what commit prunes — a scan per ask would be the
+    /// pool times the queue times each bundle's list, for a question
+    /// each bundle can answer once.
+    fn riding_this_proposal(queued: &[Arc<Verified<Provisions>>]) -> HashSet<(ShardId, TxHash)> {
+        queued
+            .iter()
+            .flat_map(|bundle| {
+                let source = bundle.source_shard();
+                bundle
+                    .transactions()
+                    .iter()
+                    .map(move |entry| (source, entry.tx_hash))
             })
+            .collect()
     }
 
     /// Shared proposal logic for the post-dispatch retry hook and the
