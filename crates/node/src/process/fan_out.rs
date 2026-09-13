@@ -200,6 +200,14 @@ fn verify_anchor(
 /// Ask each shard in `asks` for what it holds, and return what came
 /// back verified.
 ///
+/// `locally` answers for the shards this node serves itself, which are
+/// asked the same question in the same words and answered from their own
+/// stores. They go through the value check all the same: what the check
+/// establishes is that every cell stands under the root the report names
+/// for its shard, and that is as much worth knowing about this node's
+/// own answer as about a stranger's. The committee check is what they
+/// are spared — a node needs no quorum's word for a block it committed.
+///
 /// A shard that fails to answer, or answers with something that does not
 /// verify, is absent from the result's anchors — which is what makes the
 /// preview refuse by naming it rather than read its silence as an empty
@@ -209,13 +217,23 @@ pub fn gather<N: Network>(
     topology: &Arc<TopologySnapshot>,
     network: &N,
     verifier: &dyn Verifier,
+    locally: &dyn Fn(ShardId, &GetCellsRequest) -> Option<GetCellsResponse>,
 ) -> FetchedCells {
     let mut fetched = FetchedCells::default();
-    if asks.is_empty() {
+    let mut remote: BTreeMap<ShardId, &DeclaredReads> = BTreeMap::new();
+    for (shard, ask) in asks {
+        let request = GetCellsRequest::new(ask.keys.clone(), ask.ranges.clone());
+        if let Some(response) = locally(*shard, &request) {
+            absorb_own(*shard, ask, &response, &mut fetched);
+        } else {
+            remote.insert(*shard, ask);
+        }
+    }
+    if remote.is_empty() {
         return fetched;
     }
-    let (tx, rx) = bounded(asks.len());
-    for (shard, ask) in asks {
+    let (tx, rx) = bounded(remote.len());
+    for (shard, ask) in &remote {
         let shard = *shard;
         let tx = tx.clone();
         network.request(
@@ -239,30 +257,113 @@ pub fn gather<N: Network>(
     }
     drop(tx);
 
-    for _ in 0..asks.len() {
+    for _ in 0..remote.len() {
         let Ok((shard, response)) = rx.recv_timeout(GATHER_TIMEOUT) else {
             break;
         };
-        if let (Some(response), Some(ask)) = (response, asks.get(&shard)) {
+        if let (Some(response), Some(ask)) = (response, remote.get(&shard)) {
             absorb(shard, ask, &response, topology, verifier, &mut fetched);
         }
     }
     fetched
 }
 
+/// Fold this node's own answer for a shard it serves.
+///
+/// The anchor is a header this node committed, so its quorum
+/// certificate is one it already accepted and checking it again would
+/// establish nothing. Everything below that is the ordinary check.
+fn absorb_own(
+    shard: ShardId,
+    ask: &DeclaredReads,
+    response: &GetCellsResponse,
+    into: &mut FetchedCells,
+) -> bool {
+    let (Some(proof), Some(anchor)) = (&response.proof, &response.anchor) else {
+        return false;
+    };
+    fold_attested(
+        shard,
+        ask,
+        response,
+        proof,
+        anchor.header().state_root(),
+        anchor.header().height(),
+        into,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use hyperscale_storage::PendingChain;
-    use hyperscale_storage::test_helpers::{commit_writes, entry_key, make_settled_entries};
+    use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_network::{GossipHandler, NotificationHandler, RequestError, RequestHandler};
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
+    };
+    use hyperscale_storage::{PendingChain, Substates};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::CellRange;
-    use hyperscale_types::test_utils::test_key;
+    use hyperscale_types::test_utils::{TestCommittee, test_key};
+    use hyperscale_types::{
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
+        GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ValidatorId,
+        WitnessSources,
+    };
 
     use super::*;
     use crate::shard::cross_shard::serve_cells_request;
 
     const OWNER_SEED: u8 = 0x11;
     const SHARD: ShardId = ShardId::ROOT;
+
+    /// A network that refuses to be used, which is the assertion: a
+    /// shard answered from this node's own store is asked of nobody.
+    struct NoNetwork;
+
+    impl Network for NoNetwork {
+        fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _: ShardId, _: &M) {
+            unreachable!("nothing is broadcast")
+        }
+        fn broadcast_global<M: GossipMessage + 'static>(&self, _: &M) {
+            unreachable!("nothing is broadcast")
+        }
+        fn register_gossip_handler<M: GossipMessage + 'static>(&self, _: impl GossipHandler<M>) {}
+        fn register_host_gossip_handler<M: GossipMessage + 'static>(
+            &self,
+            _: impl Fn(M) + Send + Sync + 'static,
+        ) {
+        }
+        fn register_request_handler<R: Request + Send + 'static>(
+            &self,
+            _: ShardId,
+            _: impl RequestHandler<R>,
+        ) where
+            R::Response: Send + 'static,
+        {
+        }
+        fn notify<M: NetworkMessage + 'static>(&self, _: &[ValidatorId], _: &M) {
+            unreachable!("nothing is notified")
+        }
+        fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+            &self,
+            _: impl NotificationHandler<M>,
+        ) {
+        }
+        fn subscribe_shard(&self, _: ShardId) {}
+        fn unsubscribe_shard(&self, _: ShardId) {}
+        fn update_topology(&self, _: Arc<TopologySnapshot>) {}
+        fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
+        fn request<R: Request + Clone + 'static>(
+            &self,
+            shard: ShardId,
+            _: Option<ValidatorId>,
+            _: R,
+            _: Option<MessageClass>,
+            _: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
+        ) {
+            unreachable!("shard {shard:?} was answered from this node's own store")
+        }
+    }
 
     /// A store of eight entries, and the root its only commit produced.
     fn served(ask: &DeclaredReads) -> (GetCellsResponse, StateRoot) {
@@ -348,6 +449,89 @@ mod tests {
             nothing.cells.is_empty() && nothing.entries.is_empty() && nothing.anchors.is_empty(),
             "and nothing of a refused answer is kept, so a partial \
              verification contributes no cell"
+        );
+    }
+
+    /// A shard this node serves is gathered from its own store, and
+    /// nothing is asked of anybody.
+    ///
+    /// A node hosting several shards holds a store apiece, and the
+    /// snapshot a preview runs against spans one of them. The others
+    /// have to be gathered like any shard the node does not hold, or
+    /// their cells read back as absent — an absence a kernel cannot
+    /// tell from an empty cell, so the report would name a verdict the
+    /// chain never reaches.
+    #[test]
+    fn a_shard_this_node_serves_is_gathered_from_its_own_store() {
+        let ask = one_range();
+        let asks = BTreeMap::from([(SHARD, ask.clone())]);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+
+        let storage = Arc::new(SimShardStorage::default());
+        let written: Vec<(u128, Option<Vec<u8>>)> = (0u128..8)
+            .map(|order| {
+                (
+                    order,
+                    Some(vec![u8::try_from(order).expect("eight entries"); 4]),
+                )
+            })
+            .collect();
+        let root = commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
+        // A second block naming the root the first produced, since a
+        // served answer stands on the anchor's stated root and the
+        // block fixture above names none. Empty, so the root holds.
+        let tip = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                shard_id: SHARD,
+                height: BlockHeight::new(2),
+                state_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        commit_settled_at(
+            &*storage,
+            &make_test_certified(tip),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        let chain = Arc::new(PendingChain::new(storage));
+
+        let fetched = gather(
+            &asks,
+            &topology,
+            &NoNetwork,
+            &BlsVerifier,
+            &|shard, request| {
+                assert_eq!(shard, SHARD);
+                Some(serve_cells_request(&chain, request))
+            },
+        );
+
+        assert_eq!(
+            fetched.anchors.keys().copied().collect::<Vec<_>>(),
+            vec![SHARD],
+            "the shard stands in the anchors, so the preview does not refuse by naming it"
+        );
+        assert_eq!(
+            fetched
+                .entries_in_range(
+                    ask.ranges[0].owner,
+                    ask.ranges[0].collection,
+                    0,
+                    u128::MAX,
+                    8
+                )
+                .len(),
+            4,
+            "with the entries its own store holds, up to the cap the declaration named"
         );
     }
 
