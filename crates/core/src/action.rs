@@ -12,7 +12,7 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
+    CertifiedBlockHeader, CommitWindow, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
     LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
     PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
@@ -967,13 +967,15 @@ pub enum Action {
         /// The block's own anchor, which the lapse and the deadline are
         /// read against.
         anchor: WeightedTimestamp,
-        /// The trie of the anchor's window, which the body is classified
-        /// against.
+        /// The trie of the anchor's window, which a delivery's body is
+        /// classified against.
         trie: ShardTrie,
-        /// The table of the same window, which the name's restated price
-        /// is weighed at — the block's own, so a later fold never moves
-        /// a figure already recorded.
-        prices: PriceTable,
+        /// The window each name states its commit at, keyed by that
+        /// anchor: the placement and the table its figures were frozen
+        /// under, so a fold moving either never moves a figure already
+        /// owed. A name whose window this validator no longer retains
+        /// defers the whole check rather than being weighed at another.
+        committed_windows: BTreeMap<WeightedTimestamp, CommitWindow>,
     },
 
     /// Build a complete block proposal.

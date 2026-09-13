@@ -8,18 +8,18 @@
 //! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
-    ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
-    ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, SplitChildRoots, StateRoot,
-    SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash,
-    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
-    WeightedTimestamp,
+    ChainOrigin, CommitWindow, Demands, Finalization, LinkageError, LocalReceiptRoot,
+    QuorumCertificate, ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, SplitChildRoots,
+    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
+    TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1011,13 +1011,39 @@ impl VerificationPipeline {
             );
             return Vec::new();
         };
-        let (trie, prices) = (window.shard_trie().clone(), window.prices());
+        let trie = window.shard_trie().clone();
         let entries: Vec<UnsettledTx> = block
             .abandonment_records()
             .iter()
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
+        // Each name is restated against the window it says committed it,
+        // not against the one carrying the record: the figures were
+        // frozen there, and a record is written a deadline after the
+        // commit it names. A name whose window has aged out defers the
+        // block on the same terms the anchor's own absence does.
+        let mut committed_windows: BTreeMap<WeightedTimestamp, CommitWindow> = BTreeMap::new();
+        for stated in entries.iter().map(|entry| entry.committed.anchor) {
+            if committed_windows.contains_key(&stated) {
+                continue;
+            }
+            let Some(committed) = anchor_window(schedule, stated) else {
+                warn!(
+                    ?block_hash,
+                    ?stated,
+                    "Deferring resolutions verification — no retained window carries a name's commit"
+                );
+                return Vec::new();
+            };
+            committed_windows.insert(
+                stated,
+                CommitWindow {
+                    trie: committed.shard_trie().clone(),
+                    prices: committed.prices(),
+                },
+            );
+        }
         let deliveries = block.undecided_names();
         let successes = block.successes_decided_alone();
         debug!(
@@ -1035,7 +1061,7 @@ impl VerificationPipeline {
             successes,
             anchor,
             trie,
-            prices,
+            committed_windows,
         }]
     }
 
@@ -2265,7 +2291,7 @@ mod tests {
             parent_block_hash,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: BTreeMap::new(),
             txs_in_flight: TxsInFlight::new(u64::from(in_flight)),
             load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, substate_bytes),
             ..Default::default()
@@ -2329,7 +2355,7 @@ mod tests {
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: BTreeMap::new(),
             settled_tick_frontier: BlockHeight::new(frontier),
             ..Default::default()
         });
@@ -3043,7 +3069,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
             transaction_root: TransactionRoot::from_raw(Hash::from_bytes(b"forged-tx-root")),
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            provision_tx_roots: BTreeMap::new(),
             ..Default::default()
         });
         let block = Block::Live {
