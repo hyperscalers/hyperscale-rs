@@ -2373,6 +2373,51 @@ fn preview_on(
     )
 }
 
+/// A fan-out asks for exactly the shards the preview would otherwise
+/// refuse for, and for nothing the node reads itself.
+///
+/// The two have to agree or the feature does not work: what
+/// `preview_reads` gathers is what lifts `Holds::missing`, so a split
+/// that named one shard too few would fetch and still refuse, and one
+/// too many would ask a shard for cells the node already holds.
+#[test]
+fn a_fan_out_asks_for_what_the_refusal_would_have_named() {
+    let PreviewFixture { accounts, tx, .. } = preview_fixture();
+    let executor = executor(ExecutionMode::Serial);
+    let _ = MapDb::genesis(&accounts);
+    let trie = ShardTrie::uniform_from_count(2);
+    let (left, right) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+
+    // Holding everything, there is nobody to ask.
+    let whole = BTreeSet::from([left, right]);
+    assert!(
+        executor
+            .preview_reads(&tx, &trie, &whole)
+            .expect("the fixture derives")
+            .is_empty(),
+        "a node holding every shard the declaration reaches fetches nothing"
+    );
+
+    // Holding half, the asks are the other half and only that.
+    let half = BTreeSet::from([right]);
+    let asks = executor
+        .preview_reads(&tx, &trie, &half)
+        .expect("the fixture derives");
+    assert!(
+        !asks.is_empty(),
+        "the fixture has to straddle for this to have teeth"
+    );
+    assert!(
+        asks.keys().all(|shard| !half.contains(shard)),
+        "nothing the node reads itself is asked of anyone else"
+    );
+    assert!(
+        asks.values()
+            .all(|reads| !reads.keys.is_empty() || !reads.ranges.is_empty()),
+        "a shard named in the split is a shard with something to answer"
+    );
+}
+
 /// A shard a fan-out answered for is one the preview can speak for.
 ///
 /// The companion to [`a_preview_refuses_what_this_node_cannot_see`]:
