@@ -7,6 +7,7 @@
 //! JMT leaf key, so a shard owns a contiguous subtree of the global state tree.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::AddressClass;
@@ -53,7 +54,18 @@ impl From<Address> for RoutePrefix {
 /// infinite bit path from the root passes through exactly one leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardTrie {
-    leaves: BTreeSet<ShardId>,
+    /// Shared, so a clone is a reference count and not a walk of the
+    /// set.
+    ///
+    /// Placement is read far more often than it moves — a classification
+    /// keeps the trie it froze against, and one happens per transaction
+    /// per block on the proposal, validation and selection paths — so a
+    /// deep copy here costs every one of those a pass over every live
+    /// shard, which is a per-block price that grows with the shard count
+    /// the network added to make blocks cheaper. The two mutators take a
+    /// private copy through [`Arc::make_mut`], so a trie still behaves
+    /// as the owned value it reads as.
+    leaves: Arc<BTreeSet<ShardId>>,
 }
 
 impl ShardTrie {
@@ -61,7 +73,7 @@ impl ShardTrie {
     #[must_use]
     pub fn single() -> Self {
         Self {
-            leaves: BTreeSet::from([ShardId::ROOT]),
+            leaves: Arc::new(BTreeSet::from([ShardId::ROOT])),
         }
     }
 
@@ -70,7 +82,7 @@ impl ShardTrie {
     pub fn uniform(depth: u32) -> Self {
         let count = 1u64 << depth;
         Self {
-            leaves: (0..count).map(|p| ShardId::leaf(depth, p)).collect(),
+            leaves: Arc::new((0..count).map(|p| ShardId::leaf(depth, p)).collect()),
         }
     }
 
@@ -94,7 +106,7 @@ impl ShardTrie {
     #[must_use]
     pub fn from_leaves(leaves: impl IntoIterator<Item = ShardId>) -> Self {
         Self {
-            leaves: leaves.into_iter().collect(),
+            leaves: Arc::new(leaves.into_iter().collect()),
         }
     }
 
@@ -202,10 +214,11 @@ impl ShardTrie {
     /// # Panics
     /// Panics if `shard` is not a live leaf.
     pub fn split(&mut self, shard: ShardId) -> (ShardId, ShardId) {
-        assert!(self.leaves.remove(&shard), "split of non-leaf {shard:?}");
+        let leaves = Arc::make_mut(&mut self.leaves);
+        assert!(leaves.remove(&shard), "split of non-leaf {shard:?}");
         let (left, right) = shard.children();
-        self.leaves.insert(left);
-        self.leaves.insert(right);
+        leaves.insert(left);
+        leaves.insert(right);
         (left, right)
     }
 
@@ -219,10 +232,11 @@ impl ShardTrie {
             Some(right),
             "{left:?} and {right:?} are not siblings"
         );
-        assert!(self.leaves.remove(&left), "merge of non-leaf {left:?}");
-        assert!(self.leaves.remove(&right), "merge of non-leaf {right:?}");
+        let leaves = Arc::make_mut(&mut self.leaves);
+        assert!(leaves.remove(&left), "merge of non-leaf {left:?}");
+        assert!(leaves.remove(&right), "merge of non-leaf {right:?}");
         let parent = left.parent().expect("non-root leaf has a parent");
-        self.leaves.insert(parent);
+        leaves.insert(parent);
         parent
     }
 }
@@ -263,6 +277,33 @@ mod tests {
     fn uniform_from_count_requires_power_of_two() {
         assert_eq!(ShardTrie::uniform_from_count(4).len(), 4);
         assert_eq!(ShardTrie::uniform_from_count(1), ShardTrie::single());
+    }
+
+    /// A clone shares its leaves, and a mutator takes a private copy
+    /// before it touches them.
+    ///
+    /// The sharing is what keeps a classification cheap — one happens
+    /// per transaction per block, and a deep copy there costs a pass
+    /// over every live shard — so a clone that stopped sharing would be
+    /// a silent per-block regression proportional to the shard count.
+    /// The forking is what lets the trie still read as an owned value.
+    #[test]
+    fn a_clone_shares_its_leaves_until_one_side_moves_a_shard() {
+        let trie = ShardTrie::uniform(3);
+        let mut clone = trie.clone();
+        assert!(
+            Arc::ptr_eq(&trie.leaves, &clone.leaves),
+            "a clone shares the leaf set rather than copying it"
+        );
+
+        let leaf = trie.leaves().next().expect("a uniform trie has leaves");
+        clone.split(leaf);
+        assert!(
+            !Arc::ptr_eq(&trie.leaves, &clone.leaves),
+            "a split forks the set it shared"
+        );
+        assert_eq!(trie.len(), 8, "the original is untouched by the split");
+        assert_eq!(clone.len(), 9);
     }
 
     #[test]
