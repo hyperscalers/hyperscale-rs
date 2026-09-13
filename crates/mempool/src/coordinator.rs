@@ -1041,8 +1041,11 @@ impl MempoolCoordinator {
     ///
     /// # Performance
     ///
-    /// `O(pool_size)` in the worst case: the pool is walked in key order
-    /// and filtered, stopping at the count.
+    /// `O(pool_size × log pool_size)`: every eligible entry is collected
+    /// and ranked before any is taken, because the ranking is over the
+    /// whole eligible set and no prefix of it answers who paid most.
+    /// The fill that follows stops at the count, but the walk before it
+    /// cannot.
     #[must_use]
     pub fn ready_transactions(
         &self,
