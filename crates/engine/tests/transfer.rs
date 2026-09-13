@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
 use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PreviewGrants, PreviewInputs,
+    ExecutedTx, ExecutionMode, Executor, Holds, PROTOCOL_RESOURCE, PreviewGrants, PreviewInputs,
     PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput,
     genesis_writes,
 };
@@ -2361,9 +2361,49 @@ fn preview_on(
             prices: PriceTable::GENESIS,
             clock: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
+            // One shard, so nothing a transaction declares is off it.
+            holds: Holds {
+                trie: ShardTrie::single(),
+                shards: BTreeSet::from([ShardId::ROOT]),
+            },
             grants,
         },
     )
+}
+
+/// A cell this node does not hold is not an empty cell.
+///
+/// A kernel cannot tell the two apart — it reads the absence, refuses
+/// the withdrawal over it, and the report would name a verdict the
+/// chain never reaches. So a preview of a transaction reaching past what
+/// the node holds refuses, and says which shards it would have needed.
+#[test]
+fn a_preview_refuses_what_this_node_cannot_see() {
+    let PreviewFixture { accounts, tx, .. } = preview_fixture();
+    let executor = executor(ExecutionMode::Serial);
+    let snapshot_store = MapDb::genesis(&accounts);
+    // A two-shard trie the node holds only half of.
+    let report = executor.preview(
+        &snapshot_store,
+        &tx,
+        &PreviewInputs {
+            prices: PriceTable::GENESIS,
+            clock: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: Holds {
+                trie: ShardTrie::uniform_from_count(2),
+                shards: BTreeSet::from([ShardId::leaf(1, 1)]),
+            },
+            grants: PreviewGrants::default(),
+        },
+    );
+    match report.outcome {
+        PreviewOutcome::Refused { reason } => assert!(
+            reason.contains("reads cells on"),
+            "the refusal names what it would have needed: {reason}"
+        ),
+        other => panic!("a preview over state this node lacks must refuse: {other:?}"),
+    }
 }
 
 /// The reported change to `owner`'s native vault.

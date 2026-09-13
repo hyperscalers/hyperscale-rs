@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
+use hyperscale_engine::{Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
@@ -579,6 +579,13 @@ impl Cluster for SimCluster {
                 prices: topology.prices(),
                 clock: tip.qc().weighted_timestamp(),
                 env: TickEnvironment::governing(&topology, windows),
+                // The host answering holds this shard's state and no
+                // other's, which is what a preview of a transaction
+                // reaching further has to say rather than guess at.
+                holds: Holds {
+                    trie: topology.shard_trie().clone(),
+                    shards: BTreeSet::from([shard]),
+                },
                 grants,
             },
         ))
