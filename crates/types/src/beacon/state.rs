@@ -340,6 +340,15 @@ pub struct ShardBoundary {
     /// crossing's, it is one epoch's declared consumption — the
     /// numerator of the utilization the fold steps the table on.
     pub used: DeclaredWork,
+    /// How many blocks the shard's chain has committed over its whole
+    /// history, as of the boundary header.
+    ///
+    /// The denominator to [`used`](Self::used)'s numerator, and the one
+    /// count either may be read against: both restart at the chain's own
+    /// genesis, where the [`height`](Self::height) line is inherited
+    /// across a reshape. Differencing the heights of a split child's two
+    /// records would charge it every block its parent ever produced.
+    pub blocks: u64,
     /// Committed substate byte total behind the boundary header's parent
     /// state — a level, not a running total, so a crossing whose header
     /// resolved no total (the halt-recovery case) leaves the recorded value
@@ -2175,6 +2184,7 @@ mod tests {
         let genesis_shard = ShardId::leaf(1, 1);
         let pending = |creation: Epoch| ShardBoundary {
             used: DeclaredWork::ZERO,
+            blocks: 0,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,
@@ -2245,6 +2255,7 @@ mod tests {
         let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
         let boundary = |misses: u32| ShardBoundary {
             used: DeclaredWork::ZERO,
+            blocks: 0,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
             height: BlockHeight::new(5),
@@ -2554,6 +2565,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,

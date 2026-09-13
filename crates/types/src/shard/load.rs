@@ -58,6 +58,17 @@ pub struct ShardLoad {
     /// `BLOCK_CAPS` capped and what every replica recomputes before
     /// voting.
     pub used: DeclaredWork,
+    /// How many blocks this chain has committed over its whole history.
+    ///
+    /// The other half of the utilization ratio, carried for the reason
+    /// [`used`](Self::used) is: a consumer differencing two of these
+    /// records must reach the capacity those blocks had without walking
+    /// the chain. Taken from here and never from the height delta,
+    /// because a height line is inherited across a reshape — a split
+    /// child continues its parent's — while this count and `used` both
+    /// restart at a chain's own genesis, so only these two share an
+    /// origin and only their ratio means anything.
+    pub blocks: u64,
     /// Committed substate byte total behind the block's parent state —
     /// the same quantity the reshape predicate evaluates.
     ///
@@ -79,11 +90,12 @@ impl ShardLoad {
     pub const ZERO: Self = Self {
         cumulative_fees: 0,
         used: DeclaredWork::ZERO,
+        blocks: 0,
         substate_bytes: None,
     };
 
-    /// This load advanced by `charged` and `used`, and re-anchored on
-    /// `substate_bytes`.
+    /// This load advanced by one block declaring `charged` and `used`,
+    /// and re-anchored on `substate_bytes`.
     ///
     /// The successor relation the proposer applies and every verifier
     /// recomputes, so neither side can drift on the arithmetic.
@@ -97,6 +109,7 @@ impl ShardLoad {
         Self {
             cumulative_fees: self.cumulative_fees.saturating_add(charged),
             used: self.used.saturating_add(used),
+            blocks: self.blocks.saturating_add(1),
             substate_bytes,
         }
     }

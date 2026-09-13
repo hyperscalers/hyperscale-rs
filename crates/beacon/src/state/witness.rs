@@ -2194,6 +2194,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits") + 1,
