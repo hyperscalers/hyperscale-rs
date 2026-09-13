@@ -157,6 +157,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
                     used: DeclaredWork::ZERO,
+                    blocks: 0,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,

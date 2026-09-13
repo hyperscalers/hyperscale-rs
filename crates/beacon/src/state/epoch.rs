@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BLOCK_CAPS, BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash,
-    BlockHeader, BlockHeight, CertifiedBeaconBlock, CompletedRecovery, DeclaredWork, Epoch,
-    EpochWindows, FiveWay, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
+    BlockHeader, CertifiedBeaconBlock, CompletedRecovery, DeclaredWork, Epoch, EpochWindows,
+    FiveWay, KeptSeat, NetworkDefinition, ObserverSeat, PendingReshape, QcContext,
     QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS, RecoveryCause, RevealChain, ShardBoundary,
     ShardEpochContribution, ShardFullness, ShardId, SlotEffects, TerminalRef, TopologySnapshot,
     TransitionCause, Utilization, ValidatorId, ValidatorStatus, Verifier, Verify,
@@ -131,17 +131,24 @@ fn network_reading(readings: &BTreeMap<ShardId, FiveWay>) -> FiveWay {
 /// nothing this epoch has no reading, and one taken as idle would walk
 /// the network's price down through an outage and a hot shard's own
 /// fullness down through a stall.
+///
+/// Both halves of every ratio come off the boundary's own counters, which
+/// restart together at a chain's genesis. Counting the blocks by the
+/// height delta instead would credit a freshly seeded split child with
+/// every block its parent ever produced — a whole chain's history of
+/// empty capacity against one epoch's use, which reads as an idle
+/// network and walks every row down at the fold that seeds it.
 fn shard_utilization(
     state: &BeaconState,
-    before: &BTreeMap<ShardId, (DeclaredWork, BlockHeight)>,
+    before: &BTreeMap<ShardId, (DeclaredWork, u64)>,
 ) -> BTreeMap<ShardId, FiveWay> {
     let mut readings = BTreeMap::new();
     for (shard, record) in &state.boundaries {
-        let (used_before, height_before) = before
+        let (used_before, blocks_before) = before
             .get(shard)
             .copied()
-            .unwrap_or((DeclaredWork::ZERO, BlockHeight::GENESIS));
-        let blocks = u128::from(record.height.inner().saturating_sub(height_before.inner()));
+            .unwrap_or((DeclaredWork::ZERO, 0));
+        let blocks = u128::from(record.blocks.saturating_sub(blocks_before));
         if blocks == 0 {
             continue;
         }
@@ -303,11 +310,12 @@ pub fn apply_epoch(
     // The declared half, snapshotted the same way and for the same
     // reason: what the epoch's blocks reserved is the movement of each
     // record's vector across this fold, and what they could have
-    // reserved is the caps times the blocks between the two marks.
-    let load_marks_before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+    // reserved is the caps times the blocks between the two marks — the
+    // chain's own count of them, which resets with the vector.
+    let load_marks_before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
         .boundaries
         .iter()
-        .map(|(shard, record)| (*shard, (record.used, record.height)))
+        .map(|(shard, record)| (*shard, (record.used, record.blocks)))
         .collect();
     let (mut witness, reveals) = if let ApplyEpochInput::Normal {
         committed,
@@ -1043,6 +1051,7 @@ fn record_boundaries(
                 witness_base: header.beacon_witness_base(),
                 cumulative_fees: header.load().cumulative_fees,
                 used: header.load().used,
+                blocks: header.load().blocks,
                 // A level: an unresolved claim carries the previous value
                 // forward instead of reading as "the shard emptied".
                 substate_bytes: header.load().substate_bytes.unwrap_or(prior_substate_bytes),
@@ -1296,6 +1305,7 @@ fn seed_split_children(
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
@@ -1408,6 +1418,7 @@ fn compose_merge_parent(
             witness_base: BeaconWitnessLeafCount::ZERO,
             cumulative_fees: 0,
             used: DeclaredWork::ZERO,
+            blocks: 0,
             substate_bytes: 0,
             last_live_epoch: epoch,
             consecutive_misses: 0,
@@ -1937,6 +1948,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -1996,6 +2008,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -2392,6 +2405,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -2490,6 +2504,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -2567,6 +2582,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -3165,6 +3181,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -3187,6 +3204,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
                     used: DeclaredWork::ZERO,
+                    blocks: 0,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3701,6 +3719,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -3725,6 +3744,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
                     used: DeclaredWork::ZERO,
+                    blocks: 0,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3896,6 +3916,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
                     used: DeclaredWork::ZERO,
+                    blocks: 0,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
@@ -3918,6 +3939,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
@@ -4315,6 +4337,7 @@ mod tests {
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 cumulative_fees: 0,
                 used: DeclaredWork::ZERO,
+                blocks: 0,
                 substate_bytes: 0,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
@@ -4544,6 +4567,7 @@ mod tests {
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
                     used: DeclaredWork::ZERO,
+                    blocks: 0,
                     substate_bytes: 0,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,
@@ -4641,10 +4665,10 @@ mod tests {
             compute: BLOCK_CAPS.compute * blocks,
             ..DeclaredWork::ZERO
         };
-        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+        let before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
             .boundaries
             .iter()
-            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .map(|(shard, record)| (*shard, (record.used, record.blocks)))
             .collect();
         state.boundaries.insert(live, load_boundary(full, blocks));
 
@@ -4705,10 +4729,10 @@ mod tests {
                 .boundaries
                 .insert(shard, load_boundary(DeclaredWork::ZERO, 0));
         }
-        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+        let before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
             .boundaries
             .iter()
-            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .map(|(shard, record)| (*shard, (record.used, record.blocks)))
             .collect();
         // The hot shard spends its whole compute budget; the idle one
         // produces the same blocks and declares nothing.
@@ -4786,10 +4810,10 @@ mod tests {
             ..DeclaredWork::ZERO
         };
         state.boundaries.insert(parent, load_boundary(spent, 9));
-        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+        let before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
             .boundaries
             .iter()
-            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .map(|(shard, record)| (*shard, (record.used, record.blocks)))
             .collect();
 
         // After it: the parent is gone and the child holds a count of
@@ -4799,9 +4823,11 @@ mod tests {
             ..DeclaredWork::ZERO
         };
         state.boundaries.remove(&parent);
+        // Seeded the way `seed_split_children` seeds it: the height line
+        // continues the parent's, the block count starts at zero.
         state
             .boundaries
-            .insert(child, load_boundary(halfway, blocks));
+            .insert(child, load_boundary_at(halfway, blocks, 9 + blocks));
 
         let reading = network_reading(&shard_utilization(&state, &before));
         assert_eq!(
@@ -4820,6 +4846,72 @@ mod tests {
         );
     }
 
+    /// A split on a long-running chain does not drag the network's
+    /// reading down with it.
+    ///
+    /// The child's height line continues its parent's, so on a mature
+    /// chain it is seeded millions of blocks up while its own count
+    /// stands at zero. Read by height that is millions of blocks of
+    /// empty capacity entering one epoch's reading, which swamps every
+    /// shard that actually produced and steps every row down at the
+    /// fold that seeds it — on the epoch a saturated network most needs
+    /// the price to rise. Read by the chain's own count it is what it
+    /// is: a chain that has produced nothing yet.
+    #[test]
+    fn a_split_on_a_mature_chain_leaves_the_reading_to_the_shards_that_produced() {
+        let busy = ShardId::leaf(1, 0);
+        let parent = ShardId::leaf(1, 1);
+        let child = ShardId::leaf(2, 2);
+        let mature = 1_000_000u64;
+        let blocks = 300u64;
+        let mut state = single_pool_state(4);
+
+        state
+            .boundaries
+            .insert(busy, load_boundary(DeclaredWork::ZERO, mature));
+        state
+            .boundaries
+            .insert(parent, load_boundary(DeclaredWork::ZERO, mature));
+        // The child's placeholder, before its genesis is seeded.
+        state
+            .boundaries
+            .insert(child, load_boundary(DeclaredWork::ZERO, 0));
+        let before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
+            .boundaries
+            .iter()
+            .map(|(shard, record)| (*shard, (record.used, record.blocks)))
+            .collect();
+
+        // The fold: the busy shard fills every block it produced, the
+        // parent terminates, and the child is seeded at the parent's
+        // terminal height with a count of its own at zero.
+        let saturated = DeclaredWork {
+            compute: BLOCK_CAPS.compute * blocks,
+            ..DeclaredWork::ZERO
+        };
+        state
+            .boundaries
+            .insert(busy, load_boundary(saturated, mature + blocks));
+        state.boundaries.remove(&parent);
+        state
+            .boundaries
+            .insert(child, load_boundary_at(DeclaredWork::ZERO, 0, mature + 1));
+
+        let reading = network_reading(&shard_utilization(&state, &before));
+        assert_eq!(
+            (reading.compute.used, reading.compute.capacity),
+            (
+                u128::from(saturated.compute),
+                u128::from(BLOCK_CAPS.compute) * u128::from(blocks)
+            ),
+            "the seeded child has produced nothing and weighs nothing"
+        );
+        assert!(
+            PriceTable::GENESIS.stepped(&reading, &widened()).compute > PriceTable::GENESIS.compute,
+            "a saturated epoch raises the row it saturated, split or no split"
+        );
+    }
+
     /// A network where nothing advanced has no reading at all, so every
     /// row holds rather than walking down through an outage.
     #[test]
@@ -4828,10 +4920,10 @@ mod tests {
         state
             .boundaries
             .insert(ShardId::leaf(1, 0), load_boundary(DeclaredWork::ZERO, 7));
-        let before: BTreeMap<ShardId, (DeclaredWork, BlockHeight)> = state
+        let before: BTreeMap<ShardId, (DeclaredWork, u64)> = state
             .boundaries
             .iter()
-            .map(|(shard, record)| (*shard, (record.used, record.height)))
+            .map(|(shard, record)| (*shard, (record.used, record.blocks)))
             .collect();
 
         let reading = network_reading(&shard_utilization(&state, &before));
@@ -4919,12 +5011,22 @@ mod tests {
         }
     }
 
-    /// A boundary record at `height` whose chain has reserved `used`.
-    fn load_boundary(used: DeclaredWork, height: u64) -> ShardBoundary {
+    /// A boundary for a chain born at network genesis, which is every
+    /// chain in these tests unless one says otherwise: its height line
+    /// and its own block count are the same number.
+    fn load_boundary(used: DeclaredWork, blocks: u64) -> ShardBoundary {
+        load_boundary_at(used, blocks, blocks)
+    }
+
+    /// A boundary for a chain whose height line it inherited — a split
+    /// child or a merged parent, which continues its predecessor's
+    /// heights while counting its own blocks from zero.
+    fn load_boundary_at(used: DeclaredWork, blocks: u64, height: u64) -> ShardBoundary {
         ShardBoundary {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::new(height),
+            blocks,
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
