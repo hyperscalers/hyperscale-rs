@@ -30,7 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::bounded;
 use hyperscale_engine::{DeclaredReads, FetchedCells};
@@ -257,8 +257,12 @@ pub fn gather<N: Network>(
     }
     drop(tx);
 
+    // One deadline for the gathering, not one per answer: the shards are
+    // asked together and waited on together, so a peer that never calls
+    // back costs the caller the ceiling once however many were asked.
+    let deadline = Instant::now() + GATHER_TIMEOUT;
     for _ in 0..remote.len() {
-        let Ok((shard, response)) = rx.recv_timeout(GATHER_TIMEOUT) else {
+        let Ok((shard, response)) = rx.recv_deadline(deadline) else {
             break;
         };
         if let (Some(response), Some(ask)) = (response, remote.get(&shard)) {
