@@ -42,8 +42,8 @@ pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
 #[cfg(feature = "test-utils")]
 pub use executor::AllCodeRuns;
 pub use executor::{
-    CodeAvailability, Executor, artifact_package, build_fee_receipt, instance_of_record,
-    protocol_hash,
+    CodeAvailability, CodeUnavailable, Executor, artifact_package, build_fee_receipt,
+    instance_of_record, protocol_hash,
 };
 pub use genesis::{
     GenesisConfig, PROTOCOL_RESOURCE, World, genesis_package_facts, genesis_world, genesis_writes,

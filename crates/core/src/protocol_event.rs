@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use hyperscale_engine::TickEnvironment;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
@@ -23,6 +24,8 @@ use hyperscale_types::{
     Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, Verifiable, VerificationKind,
     Verified, WeightedTimestamp,
 };
+
+use crate::action::CrossShardExecutionRequest;
 
 /// What one tick's batch produced.
 #[derive(Debug, Clone)]
@@ -489,6 +492,26 @@ pub enum ProtocolEvent {
         tick: BlockHeight,
         /// What the batch produced, fanned back to the tick that ran it.
         outcome: TickBatchOutcome,
+    },
+
+    /// A dispatched tick found this node unable to run a package one of
+    /// its members names, so it produced nothing and comes back whole.
+    ///
+    /// Machine-local: the batch attested nothing, and the tick is still
+    /// the one its committee composed. It returns to the dispatch head
+    /// and waits there, the same wait a tick composed for code this node
+    /// has not fetched already takes.
+    ExecutionBatchUnavailable {
+        /// The tick that came back unrun.
+        tick: BlockHeight,
+        /// Its anchor, carried back so the retry runs the same tick.
+        tick_ts: WeightedTimestamp,
+        /// Its environment, likewise.
+        env: TickEnvironment,
+        /// Its members, likewise.
+        requests: Vec<CrossShardExecutionRequest>,
+        /// The package this node could not run.
+        package: Hash,
     },
 
     /// Received an execution vote whose signature has already been

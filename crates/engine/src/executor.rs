@@ -42,12 +42,12 @@ use hyperscale_vm_effects::{
     package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
-    ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
+    Baseline, BatchError, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job,
+    LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget, EntryKey,
-    Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
+    AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
+    EntryKey, Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::{Availability, EngineBackend};
@@ -259,6 +259,22 @@ pub struct Executor {
     pub(crate) backend: EngineBackend,
     pub(crate) mode: ExecutionMode,
     derivation: Arc<BridgeStatics>,
+}
+
+/// This node could not run a package a tick's member named.
+///
+/// Machine-local, so nothing about the transaction is decided by it: the
+/// batch produced no receipts and attested nothing. What the embedder
+/// owes it is the code and another attempt at the same tick — which is
+/// still the tick its committee composed, whenever it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeUnavailable {
+    /// The transaction whose invocation found the environment wanting.
+    pub tx: TxHash,
+    /// The package whose code this node could not run.
+    pub package: Hash,
+    /// The class the backend reported.
+    pub reason: AbortReason,
 }
 
 /// Whether this node can run the code a tick's members name.
@@ -1401,9 +1417,9 @@ impl Executor {
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
         inputs: &[TickTxInput<'_>],
-    ) -> Vec<ExecutedTx> {
+    ) -> Result<Vec<ExecutedTx>, CodeUnavailable> {
         if inputs.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let members: Vec<BatchMember> = inputs
             .iter()
@@ -1626,14 +1642,30 @@ impl Executor {
         let walk = ManifestWalk {
             backend: &self.backend,
         };
-        let outcome = execute_batch(
+        let outcome = match execute_batch(
             Arc::clone(&base) as Arc<dyn Baseline>,
             &batch,
             &walk,
             protocol_hash,
             self.mode,
-        )
-        .unwrap_or_else(|error| panic!("BFT CRITICAL: VM batch execution failed: {error}"));
+        ) {
+            Ok(outcome) => outcome,
+            // The one machine-local refusal the kernel raises. Every
+            // other batch error is a defect in what the committee
+            // composed, which every replica reaches alike.
+            Err(BatchError::Unavailable {
+                tx,
+                package,
+                reason,
+            }) => {
+                return Err(CodeUnavailable {
+                    tx,
+                    package: Hash::from(package.0),
+                    reason,
+                });
+            }
+            Err(error) => panic!("BFT CRITICAL: VM batch execution failed: {error}"),
+        };
 
         // Fold receipts into per-transaction absolute updates in
         // canonical order, then check the folded end state against the
@@ -1714,7 +1746,7 @@ impl Executor {
         }
 
         // Reassemble in input order.
-        members
+        Ok(members
             .iter()
             .map(|member| {
                 let vm_tx = member.tx_hash;
@@ -1746,7 +1778,7 @@ impl Executor {
                     executed
                 })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -1758,19 +1790,25 @@ impl Executor {
     /// The unit is the batch: the whole of it goes to the
     /// deterministic-parallel executor at once, which returns one
     /// [`ExecutedTx`] per input transaction, in input order.
-    #[must_use]
+    ///
     /// `prices` is stated rather than read off the context, because a
     /// table is a fact about the block that committed a member and a
     /// context spans a tick: one reachable from here would be one a
     /// caller could take off its own head, which prices a transaction
     /// differently on two shards.
+    ///
+    /// # Errors
+    ///
+    /// [`CodeUnavailable`] where this node cannot run a package a member
+    /// names. Nothing is attested, so the batch is the caller's to run
+    /// again once it holds the code.
     pub fn execute_batch(
         &self,
         ctx: &TickBatchContext<'_>,
         prices: PriceTable,
         snapshot: &(dyn Substates + Sync),
         transactions: &[Arc<Verified<Transaction>>],
-    ) -> Vec<ExecutedTx> {
+    ) -> Result<Vec<ExecutedTx>, CodeUnavailable> {
         // Every member runs whole on its own shard and reads the
         // context's own clock: one block committed them all, so one
         // epoch seals them all — and one table prices them all.
@@ -1796,13 +1834,16 @@ impl Executor {
     /// Batch composition is consensus input: conflict grouping and the
     /// fold run over the whole tick, so every replica must compose the
     /// same members in the same tick.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::execute_batch`].
     pub fn execute_tick_batch(
         &self,
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
         inputs: &[TickTxInput<'_>],
-    ) -> Vec<ExecutedTx> {
+    ) -> Result<Vec<ExecutedTx>, CodeUnavailable> {
         self.run_batch(ctx, snapshot, inputs)
     }
 }

@@ -153,12 +153,14 @@ fn run_tick(
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    let executed = executor.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &storage.snapshot(),
-        std::slice::from_ref(&verified),
-    );
+    let executed = executor
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &storage.snapshot(),
+            std::slice::from_ref(&verified),
+        )
+        .expect("the harness engine holds every package it runs");
 
     let before = storage.state_root();
     // Execution and fee receipts both, as the tick stores them: a failed
