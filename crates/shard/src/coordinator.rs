@@ -11680,6 +11680,59 @@ mod tests {
         );
     }
 
+    /// A name whose commit window the schedule has evicted still
+    /// dispatches the check.
+    ///
+    /// The window a name states is not the one carrying the record: a
+    /// record is written when a deadline lapses, and the entry behind it
+    /// outlives that by as long as its counterpart stays silent, which
+    /// nothing bounds. So the schedule drops the window while the name
+    /// is still live, and a check that resolved the pair from the
+    /// schedule took no mark and emitted no action — the block pending
+    /// for good, its record never committed, its drain place never
+    /// released. The pair is read off the committed beacon chain in the
+    /// handler instead, so eviction decides nothing here.
+    #[test]
+    fn a_name_whose_window_was_evicted_still_dispatches_its_check() {
+        let mut sched = make_terminating_schedule(4);
+        // The window carrying the record is retained; the one that froze
+        // the name's figures is not.
+        sched.evict_below(Epoch::new(1));
+        assert!(
+            sched
+                .at(WeightedTimestamp::from_millis(AFTER_CUT_MS))
+                .is_some(),
+            "the block's own anchor must still resolve, or this tests the wrong miss",
+        );
+        let stated = figures_of(b"tx").committed.committee_anchor;
+        assert!(
+            matches!(sched.lookup(stated), ScheduleLookup::Evicted),
+            "and the name's own window must be gone",
+        );
+
+        let block = block_with_records(
+            AFTER_CUT_MS,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
+        );
+        let block_hash = block.hash();
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+
+        assert!(
+            matches!(actions.as_slice(), [Action::VerifyResolutions { .. }]),
+            "the names go to the store whatever the schedule still carries: {actions:?}",
+        );
+        assert!(
+            coord
+                .verification
+                .is_root_in_flight(block_hash, VerificationKind::Resolutions),
+            "and the mark is taken, so the block is waiting on an answer rather than a re-drive",
+        );
+    }
+
     /// The figures each name restates are checked off the committed body
     /// by a delegated verification, whose three answers fold in
     /// differently: exact verifies the check, wrong refuses the block, and
