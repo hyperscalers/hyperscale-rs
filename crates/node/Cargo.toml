@@ -28,6 +28,7 @@ tracing.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+hyperscale-engine = { workspace = true, features = ["test-utils"] }
 hyperscale-crypto-bls.workspace = true
 hyperscale-hbor.workspace = true
 hyperscale-dispatch-sync.workspace = true

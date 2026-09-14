@@ -16,6 +16,7 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_engine::AllCodeRuns;
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
@@ -73,6 +74,7 @@ impl TestNodeBuilder {
         let node = NodeStateMachine::new(
             me,
             Arc::new(StubVmStatics),
+            Arc::new(AllCodeRuns),
             local_shard,
             &ShardConsensusConfig::default(),
             &RecoveredState::default(),

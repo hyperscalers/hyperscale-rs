@@ -508,6 +508,7 @@ impl SimulationRunner {
                 vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
                     verifier: Arc::clone(&verifier),
                     derivation: executor.derivation(),
+                    code: Arc::clone(&executor) as _,
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,

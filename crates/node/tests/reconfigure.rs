@@ -14,7 +14,7 @@ use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::{ExecutionMode, Executor};
+use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
@@ -133,6 +133,7 @@ impl Fixture {
         let state = NodeStateMachine::new(
             me,
             Arc::new(StubVmStatics),
+            Arc::new(AllCodeRuns),
             shard,
             &ShardConsensusConfig::default(),
             &RecoveredState::default(),

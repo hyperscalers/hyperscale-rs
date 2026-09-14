@@ -28,8 +28,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
-use hyperscale_engine::ExecutedTx;
 use hyperscale_engine::sharding::writes_root;
+use hyperscale_engine::{AllCodeRuns, ExecutedTx};
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
@@ -269,7 +269,11 @@ impl ExecutionSim {
         let base = Arc::new(StubBase::default());
         let snapshot = Arc::new(committee.topology_snapshot(num_shards));
         Self {
-            coord: ExecutionCoordinator::new(ValidatorId::new(0), local_shard),
+            coord: ExecutionCoordinator::new(
+                ValidatorId::new(0),
+                local_shard,
+                Arc::new(AllCodeRuns),
+            ),
             topology: TopologySchedule::single(Arc::clone(&snapshot)),
             snapshot,
             chain: Arc::new(TickChain::new(Arc::clone(&base))),
@@ -529,6 +533,7 @@ impl ExecutionSim {
         self.coord = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             self.local_shard,
+            Arc::new(AllCodeRuns),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),

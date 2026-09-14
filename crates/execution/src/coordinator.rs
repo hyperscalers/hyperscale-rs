@@ -50,7 +50,7 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
-use hyperscale_engine::{TickEnvironment, build_fee_receipt};
+use hyperscale_engine::{CodeAvailability, TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_reclaim_admitted, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
@@ -164,13 +164,14 @@ struct PendingTick {
 }
 
 impl PendingTick {
-    /// Whether any member runs code drawn from `missing`.
-    fn runs_any_of(&self, missing: &BTreeSet<Hash>) -> bool {
-        self.requests.iter().any(|request| {
+    /// Whether every package this tick's members run resolves on this
+    /// node.
+    fn runnable(&self, code: &dyn CodeAvailability) -> bool {
+        self.requests.iter().all(|request| {
             request
                 .transaction
                 .as_ref()
-                .is_some_and(|body| body.packages().iter().any(|p| missing.contains(p)))
+                .is_none_or(|body| body.packages().iter().all(|package| code.can_run(*package)))
         })
     }
 }
@@ -296,17 +297,16 @@ pub struct ExecutionCoordinator {
     /// outstanding.
     tick_in_flight: bool,
 
-    /// Packages the beacon registers that this node does not hold the
-    /// bytes for, replaced wholesale at each beacon commit.
+    /// What this node can run, asked where a tick dispatches.
     ///
-    /// A queued tick whose members run one of them waits at the dispatch
-    /// head until the fetch lands. It cannot be consulted where the tick
+    /// A queued tick whose members run code this node cannot resolve
+    /// waits at the dispatch head. It cannot be consulted where the tick
     /// is composed: membership is what the committee's votes are cast
     /// over, so it has to be a function of committed chain state alone,
     /// and a node's holdings are not that. Dispatch is where the
     /// difference is local — the tick still answers for exactly the
     /// members it was composed with, whenever it runs.
-    missing_packages: BTreeSet<Hash>,
+    code: Arc<dyn CodeAvailability>,
 
     /// The highest tick whose output is on the tick chain. A resolution
     /// is emitted only once its tick's tick has appended, so a commit
@@ -455,10 +455,11 @@ impl ExecutionCoordinator {
     /// stores across every coordinator in the shard; for a recovered chain,
     /// it also seeds the frontier from storage.
     #[must_use]
-    pub fn new(me: ValidatorId, local_shard: ShardId) -> Self {
+    pub fn new(me: ValidatorId, local_shard: ShardId, code: Arc<dyn CodeAvailability>) -> Self {
         Self::with_shared_stores(
             me,
             local_shard,
+            code,
             &RecoveredState::default(),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
@@ -494,6 +495,7 @@ impl ExecutionCoordinator {
     pub fn with_shared_stores(
         me: ValidatorId,
         local_shard: ShardId,
+        code: Arc<dyn CodeAvailability>,
         recovered: &RecoveredState,
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
@@ -537,7 +539,7 @@ impl ExecutionCoordinator {
             committed_ts: committed_block_anchor_wt,
             committed_committee_anchor_wt,
             pending_ticks: VecDeque::new(),
-            missing_packages: BTreeSet::new(),
+            code,
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -1583,39 +1585,6 @@ impl ExecutionCoordinator {
 
         completions.sort_by_key(|a| a.tick_id);
         completions
-    }
-
-    /// Replace the set of registered packages this node lacks with the
-    /// latest beacon reconciliation, releasing the dispatch head if what
-    /// held it is no longer missing.
-    ///
-    /// Replaced wholesale rather than merged, so a package that arrived
-    /// by any route — a fetch, this shard's own commit, a boot reseed —
-    /// leaves the set at the next commit without anyone reporting it.
-    pub fn on_missing_packages_updated(&mut self, packages: Vec<Hash>) -> Vec<Action> {
-        let missing: BTreeSet<Hash> = packages.into_iter().collect();
-        if missing == self.missing_packages {
-            return Vec::new();
-        }
-        self.missing_packages = missing;
-        self.dispatch_next_tick()
-    }
-
-    /// Drop installed packages from the missing set and release the
-    /// dispatch head if they were what held it.
-    ///
-    /// Reported once the engine holds the code, not once the bytes
-    /// arrive: what the head waits on is the ability to run, and
-    /// installation is where that is acquired.
-    pub fn on_packages_acquired(&mut self, packages: &[Hash]) -> Vec<Action> {
-        let held = self.missing_packages.len();
-        for package in packages {
-            self.missing_packages.remove(package);
-        }
-        if self.missing_packages.len() == held {
-            return Vec::new();
-        }
-        self.dispatch_next_tick()
     }
 
     /// Absorb a completed batch: route receipts and per-member outcomes
@@ -3282,7 +3251,13 @@ impl ExecutionCoordinator {
         // execution stops here until the bytes land — the trade a
         // withheld artifact is meant to draw, liveness rather than a
         // fork.
-        if head.runs_any_of(&self.missing_packages) {
+        //
+        // Asked of the engine rather than read off a set kept in step
+        // with it. A set has to be seeded, and a shard seated mid-epoch
+        // is handed ticks before anything has seeded it; asking leaves
+        // nothing to seed. The next commit composes and dispatches
+        // again, which is what retries a tick held here.
+        if !head.runnable(self.code.as_ref()) {
             tracing::debug!(
                 shard = %self.local_shard,
                 tick = %head.tick,
@@ -4008,6 +3983,7 @@ mod tests {
     }
 
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
@@ -4126,16 +4102,37 @@ mod tests {
         signers
     }
 
+    /// Code this node can run, minus whatever a test withholds.
+    #[derive(Default)]
+    struct TestCode(Mutex<BTreeSet<Hash>>);
+
+    impl TestCode {
+        fn withholding(package: Hash) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(BTreeSet::from([package]))))
+        }
+
+        /// Let the withheld package resolve, as a landed fetch does.
+        fn release(&self, package: Hash) {
+            self.0.lock().expect("test code lock").remove(&package);
+        }
+    }
+
+    impl CodeAvailability for TestCode {
+        fn can_run(&self, package: Hash) -> bool {
+            !self.0.lock().expect("test code lock").contains(&package)
+        }
+    }
+
     fn make_test_state() -> ExecutionCoordinator {
         make_test_state_for(ValidatorId::new(0))
     }
 
     fn make_test_state_for(me: ValidatorId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(me, ShardId::ROOT)
+        ExecutionCoordinator::new(me, ShardId::ROOT, Arc::new(TestCode::default()))
     }
 
     fn make_test_state_for_shard(me: ValidatorId, local_shard: ShardId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(me, local_shard)
+        ExecutionCoordinator::new(me, local_shard, Arc::new(TestCode::default()))
     }
 
     fn make_live_block(
@@ -4208,13 +4205,17 @@ mod tests {
     /// the engine's no-code refusal while every replica holding the bytes
     /// settled it. So the tick is composed either way and held here, and
     /// what dispatches when the fetch lands is the tick composed now.
+    ///
+    /// Nothing reports the shortfall beforehand: the coordinator is
+    /// asked, which is all a shard seated mid-epoch and handed a tick
+    /// has to go on.
     #[test]
     fn a_tick_waits_at_the_dispatch_head_for_code_this_node_lacks() {
-        let mut state = make_test_state();
-        let topology_schedule = make_test_topology();
-
         let package = Hash::from_bytes(b"a package this node has not fetched");
-        state.on_missing_packages_updated(vec![package]);
+        let code = TestCode::withholding(package);
+        let mut state =
+            ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT, Arc::clone(&code) as _);
+        let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[package]);
         let tx_hash = tx.hash();
@@ -4237,8 +4238,18 @@ mod tests {
             "the tick is composed regardless — only its dispatch waits"
         );
 
-        // The fetch lands and the held tick goes, unchanged.
-        let released = state.on_packages_acquired(&[package]);
+        // The fetch lands. Nothing reports it: the next commit composes
+        // and dispatches as every commit does, and finds the head ready.
+        code.release(package);
+        let released = state.on_block_committed(
+            &topology_schedule,
+            &certify(make_live_block(
+                BlockHeight::new(2),
+                2000,
+                ValidatorId::new(0),
+                vec![],
+            )),
+        );
         let dispatched: Vec<&TxHash> = released
             .iter()
             .filter_map(|action| match action {
@@ -4251,17 +4262,19 @@ mod tests {
         assert_eq!(
             dispatched,
             vec![&tx_hash],
-            "acquiring the package releases exactly the tick that waited on it"
+            "the commit after the code lands releases exactly the tick that waited on it"
         );
     }
 
     /// A package nothing in the queued tick runs never holds it.
     #[test]
     fn an_unrelated_missing_package_holds_no_tick() {
-        let mut state = make_test_state();
+        let mut state = ExecutionCoordinator::new(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            TestCode::withholding(Hash::from_bytes(b"someone else's code")),
+        );
         let topology_schedule = make_test_topology();
-
-        state.on_missing_packages_updated(vec![Hash::from_bytes(b"someone else's code")]);
 
         let tx = test_transaction_running(1, &[Hash::from_bytes(b"code this node holds")]);
         let block = make_live_block(
@@ -6473,6 +6486,7 @@ mod tests {
         let mut state = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &RecoveredState {
                 committed_height: BlockHeight::new(5),
                 committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
@@ -7133,6 +7147,7 @@ mod tests {
         let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
@@ -7187,6 +7202,7 @@ mod tests {
         let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
@@ -7261,6 +7277,7 @@ mod tests {
         let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
@@ -7335,6 +7352,7 @@ mod tests {
         let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
@@ -7410,6 +7428,7 @@ mod tests {
         let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
+            Arc::new(TestCode::default()),
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),

@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
@@ -95,6 +96,7 @@ impl NodeStateMachine {
     pub fn new(
         me: ValidatorId,
         derivation: Arc<dyn Derivation>,
+        code: Arc<dyn CodeAvailability>,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
         recovered: &RecoveredState,
@@ -114,6 +116,7 @@ impl NodeStateMachine {
             shard: Some(ShardParticipation::new(
                 verifier,
                 derivation,
+                code,
                 me,
                 local_shard,
                 shard_config,
@@ -426,9 +429,7 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Execution ────────────────────────────────────────────────
-            evt @ (ProtocolEvent::MissingPackagesUpdated { .. }
-            | ProtocolEvent::PackagesAcquired { .. }
-            | ProtocolEvent::ExecutionBatchCompleted { .. }
+            evt @ (ProtocolEvent::ExecutionBatchCompleted { .. }
             | ProtocolEvent::VerifiedExecutionVoteReceived { .. }
             | ProtocolEvent::UnverifiedExecutionVoteReceived { .. }
             | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }

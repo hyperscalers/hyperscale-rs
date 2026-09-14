@@ -43,6 +43,9 @@ hyperscale-vm-runtime.workspace = true
 # The reference interpreter only ships on wasm32, so nothing in a native
 # run would notice it rejecting the artifact's metadata section — and the
 # first thing to notice would be the browser build.
+[features]
+test-utils = []
+
 [dev-dependencies]
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true

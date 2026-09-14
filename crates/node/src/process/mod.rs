@@ -22,7 +22,8 @@ pub(crate) use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{
-    FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
+    CodeAvailability, FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport,
+    TickEnvironment,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
@@ -380,6 +381,13 @@ where
     #[must_use]
     pub fn derivation(&self) -> Arc<dyn Derivation> {
         self.dispatch_handles.executor.derivation()
+    }
+
+    /// This node's code availability, held by the same engine — what a
+    /// vnode seated at runtime holds its tick dispatch to.
+    #[must_use]
+    pub fn code(&self) -> Arc<dyn CodeAvailability> {
+        Arc::clone(&self.dispatch_handles.executor) as Arc<dyn CodeAvailability>
     }
 
     /// Process-wide transaction status cache, shared with external RPC

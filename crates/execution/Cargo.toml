@@ -18,6 +18,7 @@ papaya.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hyperscale-engine = { workspace = true, features = ["test-utils"] }
 hyperscale-crypto-bls.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true

@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
+use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
@@ -63,6 +64,9 @@ pub struct SeatVnodeGroup<'a> {
     /// What this node derives envelopes through — its own caches, held
     /// by its own engine.
     pub derivation: Arc<dyn Derivation>,
+    /// Whether this node can run a package's code — the same engine's
+    /// answer, asked at tick dispatch.
+    pub code: Arc<dyn CodeAvailability>,
     /// Host beacon storage; the group's coordinators resume from its
     /// committed tip.
     pub beacon_storage: &'a dyn BeaconStorage,
@@ -170,6 +174,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
             let state = NodeStateMachine::new(
                 validator,
                 Arc::clone(&args.derivation),
+                Arc::clone(&args.code),
                 args.shard,
                 args.shard_config,
                 args.recovered,

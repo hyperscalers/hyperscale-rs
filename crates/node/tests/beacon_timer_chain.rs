@@ -19,7 +19,7 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::{ExecutionMode, Executor};
+use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
@@ -132,6 +132,7 @@ impl Fixture {
             vec![(self.committee.validator_id(idx), self.committee.signer(idx))];
         seat_vnode_group(SeatVnodeGroup {
             derivation: Arc::new(StubVmStatics),
+            code: Arc::new(AllCodeRuns),
             verifier: Arc::new(BlsVerifier),
             beacon_storage: self.beacon_storage.as_ref(),
             beacon_network: NetworkDefinition::simulator(),

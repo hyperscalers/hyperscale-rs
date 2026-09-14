@@ -17,6 +17,26 @@ use std::sync::{Arc, Condvar, Mutex};
 use arc_swap::ArcSwap;
 use hyperscale_vm_effects::PackageHash;
 
+/// Whether this node can run a package's code.
+///
+/// The one question the dispatch hold and the invoke path both turn on,
+/// so the two cannot answer differently about the same package.
+/// [`Self::Runnable`] is monotone — the settled map is append-only and
+/// first write wins — so a hold released on it cannot find the answer
+/// changed by the time the invoke resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// Built and resolvable now.
+    Runnable,
+    /// A build refused these bytes. It resolves to no code, and it
+    /// resolves there on every replica, so what a call to it reaches is
+    /// the same everywhere.
+    Refused,
+    /// Not judged, or judged and still building. Machine-local, and the
+    /// only answer a fetch can change.
+    Absent,
+}
+
 /// The build verdict for guest code by content address, growable while
 /// invocations run.
 ///
@@ -96,21 +116,34 @@ impl<C> PackageSlots<C> {
         self.done.notify_all();
     }
 
-    /// Whether `package` resolves without waiting, in-flight work
-    /// excluded. A refused build qualifies: it resolves to no code, and
-    /// it resolves there on every replica.
-    fn is_settled(&self, package: PackageHash) -> bool {
-        self.settled.load().contains_key(&package)
+    /// Whether this node can run `package`'s code, without waiting out
+    /// a build in flight.
+    ///
+    /// Lock-free, because a caller that must not block is exactly the
+    /// caller this answers: a package still building is absent from the
+    /// settled map, and [`Availability::Absent`] is the answer such a
+    /// caller wants for it.
+    fn availability(&self, package: PackageHash) -> Availability {
+        match self.settled.load().get(&package) {
+            Some(Some(_)) => Availability::Runnable,
+            Some(None) => Availability::Refused,
+            None => Availability::Absent,
+        }
     }
 
-    /// Whether `package`'s verdict is settled or its build is in flight
-    /// — the probe that keeps a prefetch from re-requesting bytes the
-    /// backend has already judged.
-    fn is_known(&self, package: PackageHash) -> bool {
-        if self.is_settled(package) {
-            return true;
+    /// Whether `package`'s bytes are worth asking for: this backend has
+    /// neither judged them nor begun to.
+    ///
+    /// A different question from [`Self::availability`], about a
+    /// different object — that one is code this node can run, this one
+    /// is bytes it holds. A refused build holds the bytes and cannot run
+    /// them, and asking again would only refuse them again.
+    fn wanted(&self, package: PackageHash) -> bool {
+        if self.settled.load().contains_key(&package) {
+            return false;
         }
-        self.pending
+        !self
+            .pending
             .lock()
             .expect("package slots lock poisoned")
             .contains(&package)
@@ -137,7 +170,7 @@ mod native {
     use hyperscale_vm_types::AbortReason;
     use wasmtime::{Engine, InstancePre, Linker, Module, Store};
 
-    use super::PackageSlots;
+    use super::{Availability, PackageSlots};
     use crate::genesis::GenesisPackages;
 
     /// One package's runnable form: the instrumented module the meter
@@ -229,17 +262,16 @@ mod native {
             move |artifact: &[u8]| queue(&slots, &compile, artifact)
         }
 
-        /// Whether `package`'s code resolves without waiting — landed or
-        /// refused.
+        /// Whether this node can run `package`'s code now.
         #[must_use]
-        pub fn code_settled(&self, package: PackageHash) -> bool {
-            self.slots.is_settled(package)
+        pub fn code_availability(&self, package: PackageHash) -> Availability {
+            self.slots.availability(package)
         }
 
-        /// Whether `package`'s code is judged or being built.
+        /// Whether `package`'s artifact is worth asking a peer for.
         #[must_use]
-        pub fn code_known(&self, package: PackageHash) -> bool {
-            self.slots.is_known(package)
+        pub fn artifact_wanted(&self, package: PackageHash) -> bool {
+            self.slots.wanted(package)
         }
     }
 
@@ -380,7 +412,7 @@ mod reference {
     use hyperscale_vm_runtime::admit;
     use hyperscale_vm_types::AbortReason;
 
-    use super::PackageSlots;
+    use super::{Availability, PackageSlots};
     use crate::genesis::GenesisPackages;
 
     /// The decoded guests under the reference interpreter.
@@ -430,17 +462,16 @@ mod reference {
             move |artifact: &[u8]| absorb_into(&slots, artifact)
         }
 
-        /// Whether `package`'s code resolves without waiting — landed or
-        /// refused.
+        /// Whether this node can run `package`'s code now.
         #[must_use]
-        pub fn code_settled(&self, package: PackageHash) -> bool {
-            self.slots.is_settled(package)
+        pub fn code_availability(&self, package: PackageHash) -> Availability {
+            self.slots.availability(package)
         }
 
-        /// Whether `package`'s code is judged or being built.
+        /// Whether `package`'s artifact is worth asking a peer for.
         #[must_use]
-        pub fn code_known(&self, package: PackageHash) -> bool {
-            self.slots.is_known(package)
+        pub fn artifact_wanted(&self, package: PackageHash) -> bool {
+            self.slots.wanted(package)
         }
     }
 

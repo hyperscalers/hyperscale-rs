@@ -25,6 +25,7 @@ mod transactions;
 
 use std::sync::Arc;
 
+use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
@@ -116,6 +117,7 @@ impl ShardParticipation {
     pub(in crate::state) fn new(
         verifier: Arc<dyn Verifier>,
         derivation: Arc<dyn Derivation>,
+        code: Arc<dyn CodeAvailability>,
         me: ValidatorId,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
@@ -148,6 +150,7 @@ impl ShardParticipation {
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             me,
             local_shard,
+            code,
             recovered,
             exec_cert_store,
             finalization_store,
