@@ -655,10 +655,12 @@ impl Ledger {
     /// own validity window, and re-registering one must not move the
     /// deadline it was admitted under.
     ///
-    /// `prices` is the committing block's own table, so what a record
-    /// restates is what the block that committed the transaction
-    /// charged — a later fold moving the table never moves a figure
-    /// already owed.
+    /// `prices` is the table the committing block's committee anchor
+    /// names — the one admission judged its ceiling at — so what a
+    /// record restates is what the block that committed the transaction
+    /// charged, and a later fold moving the table never moves a figure
+    /// already owed. `committed.committee_anchor` states which that was,
+    /// so a verifier holding no entry resolves the same window.
     pub fn register_committed<'a>(
         &mut self,
         committed: CommittedAt,
@@ -1638,12 +1640,14 @@ mod tests {
     /// Where the fixtures commit `tx`: well inside its window, at a
     /// height of no consequence.
     fn committed_at(tx: &Arc<Verifiable<Transaction>>) -> CommittedAt {
+        let anchor = tx
+            .validity_range()
+            .end_timestamp_exclusive
+            .minus(Duration::from_secs(100));
         CommittedAt {
             height: BlockHeight::new(1),
-            anchor: tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .minus(Duration::from_secs(100)),
+            anchor,
+            committee_anchor: anchor,
         }
     }
 

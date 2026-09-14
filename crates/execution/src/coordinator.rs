@@ -749,6 +749,7 @@ impl ExecutionCoordinator {
             CommittedAt {
                 height: block.height,
                 anchor: block.ts,
+                committee_anchor: self.committed_committee_anchor_wt,
             },
             &classification.prices(),
             members
@@ -3981,6 +3982,7 @@ mod tests {
         CommittedAt {
             height: BlockHeight::new(1),
             anchor: WeightedTimestamp::ZERO,
+            committee_anchor: WeightedTimestamp::ZERO,
         }
     }
 

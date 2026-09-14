@@ -737,6 +737,7 @@ mod tests {
                 committed: CommittedAt {
                     height: BlockHeight::new(1),
                     anchor: WeightedTimestamp::from_millis(500),
+                    committee_anchor: WeightedTimestamp::from_millis(500),
                 },
                 reach: Vec::new(),
             }],

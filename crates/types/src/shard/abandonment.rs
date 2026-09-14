@@ -44,20 +44,26 @@ use crate::{
     TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
-/// Where a chain committed a transaction: the block, and the anchor it
-/// carried.
+/// Where a chain committed a transaction: the block, the anchor it was
+/// admitted against, and the anchor it derived under.
 ///
-/// The anchor is what the block was admitted against — its parent
-/// QC's weighted timestamp — and so the instant its trie is read at:
-/// the trie that classified the transaction, routed its crossings, and
-/// named which shards were party to it. The height is where a replica
-/// reads that anchor off its own chain.
+/// A block carries two instants and they straddle an epoch cut once per
+/// window, so a name that means to restate what its commit owed has to
+/// say which it means. `anchor` is the block's own — its parent QC's
+/// weighted timestamp — which dates the commit and orders it against a
+/// departure's cut. `committee_anchor` is the anchor its *parent*
+/// carried, since a block's committee keys on its parent: the trie that
+/// classified the transaction and routed its crossings, and the table
+/// that priced it. The height is where a replica reads both off its own
+/// chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct CommittedAt {
     /// The block that carried the transaction.
     pub height: BlockHeight,
     /// The anchor that block was admitted against.
     pub anchor: WeightedTimestamp,
+    /// The anchor its classification and its price were frozen at.
+    pub committee_anchor: WeightedTimestamp,
 }
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -490,6 +496,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(u64::from(seed)),
                 anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
+                committee_anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
             },
             reach: vec![RoutePrefix::of(Address::new(
                 [seed; 31],
@@ -593,6 +600,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(7),
                 anchor: WeightedTimestamp::from_millis(1_000),
+                committee_anchor: WeightedTimestamp::from_millis(1_000),
             },
             ..tx(1)
         };

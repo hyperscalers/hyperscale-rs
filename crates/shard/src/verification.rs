@@ -1018,13 +1018,16 @@ impl VerificationPipeline {
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
-        // Each name is restated against the window it says committed it,
-        // not against the one carrying the record: the figures were
-        // frozen there, and a record is written a deadline after the
-        // commit it names. A name whose window has aged out defers the
-        // block on the same terms the anchor's own absence does.
+        // Each name is restated against the window it says froze it, not
+        // against the one carrying the record: the figures were frozen
+        // there, and a record is written a deadline after the commit it
+        // names. The committee anchor and not the block's own, because
+        // that is the one admission judged the ceiling at and the one
+        // the ledger priced under — the two straddle an epoch cut once
+        // per window. A name whose window has aged out defers the block
+        // on the same terms the anchor's own absence does.
         let mut committed_windows: BTreeMap<WeightedTimestamp, CommitWindow> = BTreeMap::new();
-        for stated in entries.iter().map(|entry| entry.committed.anchor) {
+        for stated in entries.iter().map(|entry| entry.committed.committee_anchor) {
             if committed_windows.contains_key(&stated) {
                 continue;
             }
