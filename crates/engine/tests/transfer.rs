@@ -2480,6 +2480,45 @@ fn a_fan_out_asks_for_what_the_refusal_would_have_named() {
     );
 }
 
+/// The fee payer's vault is fetched though no declaration names it.
+///
+/// The charge reads it and the report says what the charge would leave,
+/// so a preview that asked nobody for it reports a payer holding zero —
+/// for a cell this node proved nothing about. A publish is the shape
+/// with nothing else to fan out for: it writes its own two cells and
+/// reads no declared state at all, so the vault is the whole of its
+/// split and an empty one would mean the report was guessing.
+#[test]
+fn a_fan_out_asks_for_the_fee_payers_vault() {
+    let payer = fee_payer(7);
+    let tx = signed_publish(7, account_artifact().to_vec());
+    let executor = executor(ExecutionMode::Serial);
+    let _ = MapDb::genesis(&[(payer, 1_000)]);
+    let trie = ShardTrie::uniform_from_count(2);
+    let vault = vault_key(payer, *PROTOCOL_RESOURCE);
+
+    let asks = executor
+        .preview_reads(&tx, &trie, &BTreeSet::new())
+        .expect("a publish needs no derivation to name its payer");
+    let keys: Vec<_> = asks.values().flat_map(|reads| reads.keys.clone()).collect();
+    assert_eq!(
+        keys,
+        vec![vault],
+        "the payer's vault is asked for, and it is the whole of the ask"
+    );
+
+    // And a node that holds it asks nobody, the same rule the declared
+    // cells answer to.
+    let home = trie.shard_for_prefix(vault.owner);
+    assert!(
+        executor
+            .preview_reads(&tx, &trie, &BTreeSet::from([home]))
+            .expect("a publish needs no derivation to name its payer")
+            .is_empty(),
+        "a node holding the payer's shard fetches nothing"
+    );
+}
+
 /// A cell a transaction reaches under two modes is one cell to fetch.
 ///
 /// The declaration folds by target and carries the modes on it, so the
