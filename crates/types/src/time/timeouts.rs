@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::{ARTIFACT_GRACE_MS, CROSSING_GRACE_MS};
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS, CROSSING_GRACE_MS};
 
 use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
 
@@ -83,22 +83,28 @@ const _: () = assert!(
 );
 
 /// The VM keys and values each sweepable family by an expiry it derives
-/// from the family alone, and this is where the two spellings are held
-/// together. Two graces, so two asserts: the default, and the one
-/// exception.
+/// from the family alone, and this is where the spellings are held
+/// together. A grace each, so an assert each.
 ///
-/// The default is the bound every transaction-derived artifact already
-/// answers to. A nullifier's floor is the last transaction that could
-/// have bound the subintent, admitted before the intent's window ends
-/// and terminated one [`MAX_FINALIZATION_DELAY`] later; a committed
-/// cell's is `Window::Core`, which opens at the deadline and runs one
-/// [`MAX_VALIDITY_RANGE`] on, and the cell is swept exactly where that
-/// window closes — earlier and an absence inside it would be a swept
-/// cell read as a shard that never committed. `RETENTION_HORIZON` is
-/// both.
+/// A nullifier's floor is the last transaction that could have bound the
+/// subintent, admitted before the intent's window ends and terminated
+/// one [`MAX_FINALIZATION_DELAY`] later, which is `RETENTION_HORIZON`.
 const _: () = assert!(
     RETENTION_HORIZON.as_secs() * 1_000 == ARTIFACT_GRACE_MS,
     "an artifact lives its signed window plus the retention horizon",
+);
+
+/// A committed cell's floor is `Window::Core`, which opens at the
+/// deadline and runs two [`MAX_VALIDITY_RANGE`]s on — one for the
+/// refusal that retracts the cell, one for a leg to read the absence it
+/// leaves — and the cell is swept exactly where that window closes.
+/// Shorter and an absence inside the window would be a swept cell read
+/// as a shard that never committed, which licenses taking back a
+/// crossing the core may have taken.
+const _: () = assert!(
+    (MAX_FINALIZATION_DELAY.as_secs() + MAX_VALIDITY_RANGE.as_secs() * 2) * 1_000
+        == COMMITTED_GRACE_MS,
+    "a committed cell lives to the close of the window its absence answers in",
 );
 
 /// The exception is the crossing, whose cells are swept where the claim
