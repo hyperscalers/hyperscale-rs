@@ -22,8 +22,8 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Deadline, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId,
-    SeedLookup, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    AccountSigner, Address, BlockHeight, Deadline, Epoch, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
+    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -2228,47 +2228,40 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a previewed transfer");
 }
 
-/// A published package runs only once the chain says it may — and when
-/// it runs, it runs on nodes that never committed its publish.
+/// A freshly published package runs on nodes that never committed its
+/// publish.
 ///
-/// A publish commits on its publisher's shard, where the code then lives
-/// alone; every other node has to fetch it, and it learns to on the
-/// beacon fact the publish raises. The maturity window is the time that
-/// fetch is given. Holding a transaction out of a block until the window
-/// closes is what turns "does this node hold the code" from a race into
-/// a fact about the chain.
+/// A publish commits on two shards — the one obliged to keep the
+/// artifact and the one holding the payer's vault — and every other node
+/// has to acquire the code before it can run a call to it. Nothing about
+/// the chain says when that has happened, and nothing needs to: an
+/// envelope naming code a node cannot resolve waits at that node's door
+/// while the fetch runs, rather than being refused. So the call settles
+/// whenever the acquisition does, and settling is what says the code
+/// reached the nodes that never held it.
 ///
-/// The probe is a deposit into an instance of the freshly published
-/// package, offered at each of the three moments the rule distinguishes:
-/// before the beacon has registered the package, after it has but inside
-/// the window, and after the window. Only the last is committed, and its
-/// settling is what says the code reached the nodes that never held it —
-/// every shard the transaction touches runs the whole of it.
+/// The probe is an instantiation of the freshly published package,
+/// offered immediately — no window, no wait, nothing between the publish
+/// settling and the call. What it tests is that the deferral carries it:
+/// a node that refused instead would refuse on every replica, and the
+/// artifact would arrive with nothing left to admit.
 ///
 /// What a simulated cluster puts under test is the compiled half. The
 /// process has one metadata cache however many hosts it stands up, so
-/// every host here can route a call the moment the publish commits;
-/// only the code is per host, and only the fetch supplies it. So the
-/// two earlier moments are held by the registry rule alone, which is
-/// the guarantee being probed — a node's own holdings never enter it.
+/// every host here can route a call the moment the publish commits; only
+/// the code is per host, and only the fetch supplies it.
 ///
 /// # Panics
 ///
-/// Panics if the publish does not settle, if a call before the window
-/// closes reaches a decision, or if a call after it does not.
-pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
-    // One component per probe: a seal is a one-way door, so a probe that
-    // is held and later settles must not be the door the next one needs
-    // open.
-    const UNREGISTERED_SALT: u8 = 9;
-    const EARLY_SALT: u8 = 10;
-    const LATE_SALT: u8 = 11;
+/// Panics if the publish does not settle, if the package cell never
+/// reaches state, or if the call that follows it does not settle.
+pub fn a_published_package_runs_where_it_was_never_committed(c: &mut impl Cluster) {
+    const CALLER_SALT: u8 = 11;
 
     let publishers = storm_publishers();
     let (key, publisher) = &publishers[0];
     let artifact = storm_artifact(4_242);
     let package = package_hash(&ProtocolHasher, &artifact);
-    let registered = Hash::from(package.0);
     let cell = package_key(package);
 
     let world = World::open(c, *PROTOCOL_RESOURCE, [publisher.address()], []);
@@ -2284,84 +2277,33 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
         "the publish did not accept; status = {status:?}"
     );
     let in_state = c.run_until(epochs(2), |c| {
-        c.substate(ShardId::leaf(1, 0), cell.owner, cell.local.0)
+        c.substate(owning_shard(c, cell.owner), cell.owner, cell.local.0)
             .is_some()
     });
-    assert!(in_state, "the package cell never reached persisted state");
-
-    // Before the beacon has heard of it at all. A rule that refused only
-    // the registered and immature would have to let this through on an
-    // argument about who holds what metadata — true of a real network,
-    // and unavailable to any node as a local check. The rule refuses it
-    // for the one reason every node can check alike: the registry does
-    // not list it.
-    let unregistered =
-        build_instance_instantiate_tx(key, &artifact, UNREGISTERED_SALT, validity_around(c.now()));
-    let unregistered_hash = charges.submit(c, unregistered);
-    // Judged at every step rather than sampled at the end: the call and
-    // the registration can land in one window, and a check that reads
-    // the status once cannot tell which came first.
-    c.run_until(epochs(8), |c| {
-        let listed = c
-            .beacon_state()
-            .is_some_and(|state| state.packages.contains_key(&registered));
-        if !listed {
-            let held = c.tx_status(unregistered_hash);
-            assert!(
-                !held.as_ref().is_some_and(TransactionStatus::is_final),
-                "a call was decided before the beacon registered its package: {held:?}"
-            );
-        }
-        listed
-    });
     assert!(
-        c.beacon_state()
-            .is_some_and(|state| state.packages.contains_key(&registered)),
-        "the beacon never registered the publish"
+        in_state,
+        "the artifact never reached the state of the shard obliged to keep it"
     );
 
-    // Registered, still inside the window. Every honest proposer filters
-    // it and every honest voter would refuse it, so it waits — which is
-    // the whole of the guarantee, since a transaction committed here
-    // could be handed to a node whose fetch had not landed.
-    let early = build_instance_instantiate_tx(key, &artifact, EARLY_SALT, validity_around(c.now()));
-    let early_hash = charges.submit(c, early);
-    // Judged at every step, on the terms the registration check is.
-    c.run_until(epochs(8), |c| {
-        let matured = c.beacon_state().is_some_and(|state| {
-            state
-                .packages
-                .get(&registered)
-                .is_some_and(|fact| fact.usable_in(state.current_epoch))
-        });
-        if !matured {
-            let held = c.tx_status(early_hash);
-            assert!(
-                !held.as_ref().is_some_and(TransactionStatus::is_final),
-                "a call was decided while its package was still maturing: {held:?}"
-            );
-        }
-        matured
-    });
-
-    // Past the window. The same call settles now, and settling it means
-    // the code reached the nodes that never committed the publish —
-    // every shard the transaction touches runs the whole of it.
-    let late = build_instance_instantiate_tx(key, &artifact, LATE_SALT, validity_around(c.now()));
-    let late_hash = charges.submit(c, late);
-    let status = await_tx_terminal(c, late_hash, epochs(24));
+    // Straight into a call, with nothing waiting for a window that no
+    // longer exists. Every node the call reaches either holds the code
+    // or fetches it and admits the envelope afterwards.
+    let instantiate =
+        build_instance_instantiate_tx(key, &artifact, CALLER_SALT, validity_around(c.now()));
+    let instantiate_hash = charges.submit(c, instantiate);
+    let status = await_tx_terminal(c, instantiate_hash, epochs(24));
     assert!(
         matches!(
             status,
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
-        "a matured package's call did not settle; status = {status:?}"
+        "a call to freshly published code did not settle; status = {status:?}"
     );
     world.assert_settles_within(
         c,
         &charges,
         epochs(4),
-        "a publish and the calls that waited on it",
+        "a publish and the call that waited on it",
     );
 }
 

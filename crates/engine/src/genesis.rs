@@ -19,16 +19,16 @@ use hyperscale_effects_bridge::vm_statics::config_key;
 pub use hyperscale_effects_bridge::{PROTOCOL_RESOURCE, draw_key, vault_key};
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 use hyperscale_hbor::{Hash32, to_vec};
-use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
+use hyperscale_types::{EntryKey, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Declaration, DeclaredAccess, IssuanceGrant, Issued, ResourceKind, holdings_collection,
     instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_kernel::{EnvInputs, KernelSession, MemoryStore, OverlayStore, OwnerSet};
 use hyperscale_vm_stdlib::{package_writes, staking};
-use hyperscale_vm_types::{Address, Effect, EffectSet, EffectTarget, Mode, Moves, Outcome, TxHash};
+use hyperscale_vm_types::{Effect, EffectSet, EffectTarget, Mode, Moves, Outcome, TxHash};
 
-use crate::executor::{artifact_package, protocol_hash};
+use crate::executor::protocol_hash;
 
 /// Configuration for genesis bootstrapping.
 #[derive(Debug, Clone, Default)]
@@ -267,24 +267,6 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
         .expect("kernel-produced movements compose")
         .resolve(&mut |_| None)
         .expect("an opening balance lands on nothing")
-}
-
-/// The packages the chain is born running, as the beacon registry holds
-/// them: `(content address, the prefix their bytes sit under)`.
-///
-/// Genesis seeds these so the block-validity rule can ask one question of
-/// every package a transaction names. They are usable from the genesis
-/// epoch and no node ever fetches them, because every node compiles them
-/// at boot — the publisher is what the registry keys fetching on, and it
-/// is never consulted for these.
-#[must_use]
-pub fn genesis_package_facts(packages: &GenesisPackages) -> Vec<(Hash, Address)> {
-    let publisher = Address::from(genesis_publisher(&ProtocolHasher));
-    packages
-        .artifacts()
-        .iter()
-        .map(|artifact| (artifact_package(artifact), publisher))
-        .collect()
 }
 
 #[cfg(test)]

@@ -185,10 +185,6 @@ where
                 // StartBeaconBlockSync fetches from current+1, and so
                 // serial sync unblocks the next epoch's fetch.
                 beacon::on_admitted(self, epoch);
-                // Reconcile the global package registry: anything the
-                // engine does not hold starts fetching now, ahead of any
-                // transaction that would need it.
-                self.reconcile_packages(&state);
                 push_protocol_event(
                     self.event_sender(),
                     self.shard,

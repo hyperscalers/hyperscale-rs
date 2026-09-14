@@ -3,12 +3,14 @@
 use hyperscale_types::Hash;
 
 /// Fetched-package persistence beside the beacon chain: artifacts this
-/// node pulled on a beacon package fact, so a restart re-learns foreign
-/// code without refetching the world.
+/// node pulled to run something that named them, so a restart re-learns
+/// foreign code without refetching the world.
 ///
-/// A cache over the beacon registry, never an authority — the package
-/// cells on their owning shards are; content addressing makes every copy
-/// equal. Defaults are the empty cache, for stores that never fetch.
+/// A cache and never an authority — the cell under each artifact's own
+/// address is that, on whichever shard holds that prefix; content
+/// addressing makes every copy equal, which is what lets this one be
+/// pruned and refetched freely. Defaults are the empty cache, for stores
+/// that never fetch.
 pub trait FetchedPackageStore {
     /// Persist one fetched artifact under its content address.
     fn store_fetched_package(&self, package: Hash, artifact: &[u8]) {

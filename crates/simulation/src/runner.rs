@@ -15,7 +15,7 @@ use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, genesis_package_facts};
+use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
@@ -447,12 +447,7 @@ impl SimulationRunner {
         // as `Pooled`; the seated ROOT validators, capped at the beacon
         // committee size, form the genesis beacon committee.
         let beacon_network = genesis_validators.network.clone();
-        let boot = build_genesis(
-            &genesis_validators,
-            chain_config,
-            &network_config.pools,
-            &genesis_package_facts(&network_config.packages),
-        );
+        let boot = build_genesis(&genesis_validators, chain_config, &network_config.pools);
         let mut pools = network_config.pools.clone();
         seed_founding_members(&boot.state, &mut pools);
         let beacon_config_hash = boot.config_hash;

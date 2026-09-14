@@ -546,7 +546,6 @@ mod tests {
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_undecided_finalization,
         stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
-        test_transaction_running,
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CommittedAt, CommittedTxsRoot, Hash, MAX_SUBINTENTS,
@@ -904,29 +903,13 @@ mod tests {
         CommitDedupIndex::new()
     }
 
-    /// A window whose registry lists nothing.
-    ///
-    /// It holds back everything that names a package and nothing that
-    /// does not, which is what every case here but the package ones
-    /// wants: their transactions run no code.
+    /// The window every case here selects against.
     fn window_listing_no_packages() -> TopologySnapshot {
         TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
             ValidatorSet::new(Vec::new()),
         )
-    }
-
-    /// The same window with `packages` listed as runnable.
-    fn window_listing(packages: &[Hash]) -> TopologySnapshot {
-        window_listing_no_packages().with_usable_packages(packages.iter().copied().collect())
-    }
-
-    fn tx_running(seed: u8, packages: &[Hash]) -> Arc<Verified<Transaction>> {
-        install_stub_protocol_statics();
-        Arc::new(Verified::<Transaction>::from_persisted(
-            test_transaction_running(seed, packages),
-        ))
     }
 
     /// A successor of one chain that has answered nothing, so no pre-cut
@@ -1302,72 +1285,5 @@ mod tests {
             &[tx],
         );
         assert!(selected.is_empty());
-    }
-
-    /// A proposer offers only what its own voters would accept, and the
-    /// package rule is one of the things they ask. A transaction naming a
-    /// package the window does not list is left out; one naming a listed
-    /// package goes in.
-    ///
-    /// Stated as the permission, so the two ways a package can fail to be
-    /// runnable here — registered but still maturing, and never
-    /// registered at all — are refused by the same test.
-    #[test]
-    fn a_tx_naming_a_package_the_window_does_not_list_is_left_out() {
-        let listed = Hash::from_bytes(b"a package past its window");
-        let unlisted = Hash::from_bytes(b"a package still inside one");
-        let anchor = ts(1_000);
-
-        let runnable = tx_running(1, &[listed]);
-        let held = tx_running(2, &[unlisted]);
-        let selected = select_transactions(
-            &against(
-                window_listing(&[listed]),
-                anchor,
-                WeightedTimestamp::ZERO,
-                HashSet::new(),
-                empty_dedup_index(),
-            )
-            .ctx(),
-            &Prefilter {
-                precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
-            },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
-            &[Arc::clone(&runnable), held],
-        );
-
-        assert_eq!(
-            selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
-            vec![runnable.hash()],
-            "only the transaction whose packages the window lists is offered"
-        );
-    }
-
-    /// One unlisted package is enough, however many the transaction runs.
-    #[test]
-    fn one_unlisted_package_holds_back_a_tx_that_names_others_too() {
-        let listed = Hash::from_bytes(b"code the window lists");
-        let unlisted = Hash::from_bytes(b"code it does not");
-        let selected = select_transactions(
-            &against(
-                window_listing(&[listed]),
-                ts(1_000),
-                WeightedTimestamp::ZERO,
-                HashSet::new(),
-                empty_dedup_index(),
-            )
-            .ctx(),
-            &Prefilter {
-                precut: &refuses_precut(),
-                late_deliveries: &HashSet::new(),
-            },
-            &mut TransactionsFold::beside(&ProvisionsFold::default()),
-            &[tx_running(3, &[listed, unlisted])],
-        );
-        assert!(
-            selected.is_empty(),
-            "a transaction is offered only when every package it runs is listed"
-        );
     }
 }

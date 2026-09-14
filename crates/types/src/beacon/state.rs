@@ -38,10 +38,9 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey,
-    Epoch, Hash, NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness,
-    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, TerminalRoots, ValidatorId,
-    WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness, ShardId, ShardTrie,
+    Stake, StakePoolId, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -80,41 +79,6 @@ pub struct PoolConviction {
     /// `impound_epochs` governance parameter as it stood at conviction.
     /// Later governance changes never shorten an in-force impound.
     pub lifts_at: Epoch,
-}
-/// Epochs a registered package waits before a transaction may name it.
-///
-/// The window is what every node fetches the artifact's bytes in. Two
-/// rather than one because a package registered moments before an epoch
-/// cut would otherwise mature moments later: at two, the shortest wait
-/// any package can draw is still a whole epoch.
-pub const PACKAGE_MATURITY_EPOCHS: u64 = 2;
-
-/// One published package, as the beacon registers it: the fact every
-/// node prefetches the artifact's bytes on.
-///
-/// The publisher locates the bytes — the package cell sits under its
-/// prefix, and the owning shard at any later moment follows from the
-/// current trie — so the fact stays valid across reshapes without
-/// naming a shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
-pub struct PackageFact {
-    /// The prefix the package cell sits under.
-    pub publisher: Address,
-    /// First epoch a transaction may name this package.
-    ///
-    /// [`PACKAGE_MATURITY_EPOCHS`] past the registration for a published
-    /// package, and the genesis epoch for the packages the chain is born
-    /// running. Held on the fact rather than recomputed, so the two
-    /// answer the same question through one field.
-    pub usable_from: Epoch,
-}
-
-impl PackageFact {
-    /// Whether a block governed by `epoch` may name this package.
-    #[must_use]
-    pub const fn usable_in(&self, epoch: Epoch) -> bool {
-        epoch.inner() >= self.usable_from.inner()
-    }
 }
 
 /// Aggregate stake-pool record.
@@ -777,12 +741,6 @@ pub struct BeaconState {
     pub validators: BTreeMap<ValidatorId, ValidatorRecord>,
     /// Per-id stake pools.
     pub pools: BTreeMap<StakePoolId, StakePool>,
-    /// The global package registry: every published artifact's content
-    /// address, folded from `PackagePublished` witnesses. The fact every
-    /// node prefetches a package's bytes on, and the registry a restart
-    /// or snap-synced joiner reconciles its artifact stores against —
-    /// the leaf is transport, this map is the durable record.
-    pub packages: BTreeMap<Hash, PackageFact>,
     /// Running beacon randomness — BLAKE3 mix of the prior value with
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
@@ -1202,8 +1160,6 @@ struct WindowProjection {
     /// The fullest dimension of each shard's spending mean, in basis
     /// points, frozen beside the table it is read with.
     fullness: BTreeMap<ShardId, u32>,
-    /// The packages a block governed by this window may name.
-    usable_packages: BTreeSet<Hash>,
     /// The retained seed window. Not frozen a window ahead like the
     /// committee: a seed is a fact about an epoch that has already
     /// closed, so the head and lookahead projections carry the same ring.
@@ -1227,7 +1183,6 @@ impl BeaconState {
             next_prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
             param_votes: BTreeMap::new(),
-            packages: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),
@@ -1543,7 +1498,6 @@ impl BeaconState {
                 params: self.params,
                 prices: self.prices,
                 fullness: self.window.fullness.clone(),
-                usable_packages: self.usable_packages(self.current_epoch),
                 seeds: self.seeds.clone(),
             },
             network,
@@ -1574,7 +1528,6 @@ impl BeaconState {
                 params: self.next_params,
                 prices: self.next_prices,
                 fullness: live.fullness,
-                usable_packages: self.usable_packages(self.current_epoch.next()),
                 seeds: self.seeds.clone(),
             },
             network,
@@ -1836,7 +1789,6 @@ impl BeaconState {
             params,
             prices,
             fullness,
-            usable_packages,
             seeds,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
@@ -1909,27 +1861,7 @@ impl BeaconState {
         .with_advanced(self.advanced.iter().copied().collect())
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_completed_recoveries(self.completed_recoveries.clone())
-        .with_usable_packages(usable_packages)
         .with_seeds(seeds)
-    }
-
-    /// The packages a block governed by `epoch` may name: registered and
-    /// past their maturity window, plus the genesis packages the registry
-    /// is seeded with.
-    ///
-    /// Stated as the permission rather than the refusal, which is what
-    /// makes the rule answerable from the registry alone. Its complement
-    /// — immature, or never published at all — would otherwise have to be
-    /// judged by an argument about which nodes happen to hold which
-    /// metadata, and an invariant that needs that argument is one nobody
-    /// can check locally.
-    #[must_use]
-    pub fn usable_packages(&self, epoch: Epoch) -> BTreeSet<Hash> {
-        self.packages
-            .iter()
-            .filter(|(_, fact)| fact.usable_in(epoch))
-            .map(|(package, _)| *package)
-            .collect()
     }
 
     /// Active-duty validator pool: the [`Self::beacon_eligible`] serving
@@ -2078,9 +2010,7 @@ mod tests {
     use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
-    use crate::{
-        EpochSeed, Hash, JailReason, PrincipalAddr, SeedLookup, SeedSource, TopologySnapshot,
-    };
+    use crate::{EpochSeed, Hash, JailReason, SeedLookup, SeedSource, TopologySnapshot};
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
@@ -2758,66 +2688,5 @@ mod tests {
         state.miss_counters.insert(ValidatorId::new(7), 12);
         assert_eq!(state.miss_counters.get(&ValidatorId::new(5)), Some(&3));
         assert_eq!(state.miss_counters.get(&ValidatorId::new(7)), Some(&12));
-    }
-
-    /// A package registered in epoch `N` carries `usable_from = N + 2`,
-    /// so it is held back for the whole of `N` and `N + 1`. The shortest
-    /// wait it can draw — registration in the last instant of `N` — is
-    /// still the whole of `N + 1`, which is the window every node
-    /// fetches its bytes in.
-    #[test]
-    fn a_registered_package_matures_two_epochs_on() {
-        let registered_at = Epoch::new(4);
-        let fact = PackageFact {
-            publisher: Address::from(PrincipalAddr::new([7u8; 31])),
-            usable_from: registered_at.saturating_add(PACKAGE_MATURITY_EPOCHS),
-        };
-        assert!(!fact.usable_in(Epoch::new(4)), "not in its own epoch");
-        assert!(!fact.usable_in(Epoch::new(5)), "not in the next one");
-        assert!(fact.usable_in(Epoch::new(6)), "runs two epochs on");
-        assert!(fact.usable_in(Epoch::new(600)), "and every epoch after");
-
-        // A package the chain is born running waits for nothing: genesis
-        // seeds it, and every node compiles it at boot.
-        let born = PackageFact {
-            publisher: Address::from(PrincipalAddr::new([8u8; 31])),
-            usable_from: Epoch::GENESIS,
-        };
-        assert!(born.usable_in(Epoch::GENESIS), "runs from the first epoch");
-    }
-
-    /// The projection names what a block may run. A package still inside
-    /// its window is absent, and so is one nobody ever registered — the
-    /// two are refused alike, which is what spares the rule an argument
-    /// about which nodes hold which metadata.
-    #[test]
-    fn only_the_usable_project_into_the_window() {
-        let mut state = empty_state();
-        let young = Hash::from_bytes(b"young");
-        let old = Hash::from_bytes(b"old");
-        let unpublished = Hash::from_bytes(b"unpublished");
-        state.packages.insert(
-            young,
-            PackageFact {
-                publisher: Address::from(PrincipalAddr::new([1u8; 31])),
-                usable_from: Epoch::new(11),
-            },
-        );
-        state.packages.insert(
-            old,
-            PackageFact {
-                publisher: Address::from(PrincipalAddr::new([2u8; 31])),
-                usable_from: Epoch::new(3),
-            },
-        );
-
-        let usable = state.usable_packages(Epoch::new(10));
-        assert!(usable.contains(&old), "long since matured");
-        assert!(!usable.contains(&young), "still inside its window");
-        assert!(!usable.contains(&unpublished), "never registered at all");
-        assert!(
-            state.usable_packages(Epoch::new(11)).contains(&young),
-            "and it joins the set as its window closes"
-        );
     }
 }

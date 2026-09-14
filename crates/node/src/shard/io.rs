@@ -69,8 +69,8 @@ pub struct ShardIo<S: ShardStorage> {
     /// leaves) the beacon coordinator drives for this shard.
     pub(crate) beacon_fetch: BeaconFetchState,
 
-    /// Package artifact acquisition: the fetch reconciling the beacon's
-    /// package registry against what the engine holds.
+    /// Package artifact acquisition: the fetch for code an envelope
+    /// names and this node cannot resolve.
     pub(crate) packages: PackagesState,
     pub(crate) instances: InstancesState,
 

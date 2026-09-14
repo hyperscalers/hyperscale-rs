@@ -13,10 +13,10 @@ use blake3::Hasher;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
-    Address, BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, EpochWindows,
-    GenesisConfigHash, Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition,
-    PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, ReshapeThresholds, SHARD_CAPACITY,
-    SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat, ValidatorId,
+    BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash, Hash,
+    IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
+    ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat,
+    ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -256,16 +256,6 @@ pub struct BeaconGenesisConfig {
     /// placed_at_epoch: GENESIS }` — presumed synced by construction at
     /// chain bootstrap.
     pub initial_shard_committee: Vec<ValidatorId>,
-    /// The packages the chain is born running, as the registry holds
-    /// them: `(content address, the prefix their bytes sit under)`.
-    ///
-    /// Seeded rather than derived because the beacon cannot compile an
-    /// artifact to learn its address, and the block-validity rule has to
-    /// answer for every package a transaction names — including the ones
-    /// no publish ever registered. They are usable from the genesis
-    /// epoch and no node ever fetches them, because every node compiles
-    /// them at boot.
-    pub genesis_packages: Vec<(Hash, Address)>,
     /// Seed for the very first epoch's randomness. Mixed straight into
     /// `state.randomness`; subsequent slots roll it through accepted
     /// VRF outputs.
@@ -331,7 +321,6 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
-            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {

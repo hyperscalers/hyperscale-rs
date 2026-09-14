@@ -117,7 +117,6 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
     // The genesis ROOT committee holds every validator.
     let initial_shard_committee: Vec<_> = (0..n).map(|i| committee.validator_id(i)).collect();
     let config = BeaconGenesisConfig {
-        genesis_packages: Vec::new(),
         chain_config: BeaconChainConfig::default(),
         initial_validators,
         initial_pools,

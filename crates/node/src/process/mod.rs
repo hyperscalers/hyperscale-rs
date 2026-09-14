@@ -786,12 +786,10 @@ pub enum SubmitFanout {
     /// The envelope's derivation refuses, so it names no shards to fan
     /// out to and there is nothing to gossip it on.
     ///
-    /// Not necessarily the envelope's fault: derivation reads the
-    /// package metadata this node holds, so a call to code the node has
-    /// not installed refuses here and derives fine everywhere that has
-    /// it. The maturity window is what makes that gap a startup
-    /// condition rather than a standing one — a submission caught inside
-    /// it is dropped and has to be offered again.
+    /// A genuine refusal, not a gap: an envelope naming code this node
+    /// has not installed reports [`Self::WantsRecords`] instead and
+    /// waits for the fetch. What reaches here is inadmissible on terms
+    /// every node agrees on.
     Underivable,
 }
 

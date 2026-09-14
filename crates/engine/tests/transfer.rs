@@ -25,12 +25,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline,
-    DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
-    EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable,
-    PrincipalAddr, ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot,
-    StateWrites, SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
-    TxHash, Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
+    BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline, DeclaredRange,
+    Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
+    GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
+    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
+    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
+    Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
@@ -2063,16 +2063,12 @@ fn a_publish_writes_the_artifact_under_its_own_address() {
         Some(artifact.as_slice()),
         "the artifact lands whole in its content-addressed cell"
     );
-    // The publish is a beacon fact: one witness, from the shard owning
-    // the publisher's prefix, carrying the content address the world
-    // prefetches on.
-    assert_eq!(
-        beacon_witness_events.as_slice(),
-        &[BeaconWitnessEvent::PackagePublished {
-            package: Hash::from(package_hash(&ProtocolHasher, &artifact).0),
-            publisher: payer.address(),
-        }],
-        "the publish settles with its beacon fact"
+    // A publish raises nothing globally: the cell's key follows from the
+    // artifact's own address, which is the whole of what a node needs to
+    // ask for it.
+    assert!(
+        beacon_witness_events.is_empty(),
+        "a publish is a fact about a shard's state, not about the beacon"
     );
     // The publisher paid what the table prices its declaration at — the
     // artifact's bytes as writes and retention — and the fee is the only
@@ -2398,7 +2394,7 @@ fn published_metadata() -> PackageMetadata {
 
 fn await_code_runnable(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while executor.package_code_availability(package) != Availability::Runnable {
+    while executor.package_standing(package) != Availability::Runnable {
         assert!(
             std::time::Instant::now() < deadline,
             "the package's code never became resolvable"
@@ -2417,7 +2413,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     assert_eq!(
-        executor.package_code_availability(package),
+        executor.package_standing(package),
         Availability::Absent,
         "the code is unknown before its block commits"
     );
@@ -2430,7 +2426,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
     };
     assert_eq!(
-        executor.package_code_availability(package),
+        executor.package_standing(package),
         Availability::Absent,
         "execution alone compiles nothing"
     );

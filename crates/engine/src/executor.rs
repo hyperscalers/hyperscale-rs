@@ -277,24 +277,35 @@ pub struct CodeUnavailable {
     pub reason: AbortReason,
 }
 
-/// Whether this node can run the code a tick's members name.
+/// Whether this node holds the code a tick's members name.
 ///
 /// A local readiness question, never an input to a committed value: what
 /// it gates is *when* a tick dispatches, not what the tick is or what it
 /// decides. The answer is monotone, so a tick released on it cannot find
 /// the code gone by the time it runs.
 ///
+/// True of a build still in flight as well as one that landed. The
+/// invocation waits a build out — that wait is what keeps two replicas
+/// from answering differently about one package — so holding a tick for
+/// it would trade a bounded wait on the execution thread for one whose
+/// length is a background compile's, and make when a tick runs a
+/// question about this machine's load.
+///
 /// Asked where the dispatch decision is made, rather than pushed there
 /// as a set: a set has to be seeded, and a shard seated mid-epoch has
 /// nobody to seed it.
 pub trait CodeAvailability: Send + Sync {
-    /// Whether `package`'s code resolves on this node now.
+    /// Whether `package`'s code is in this node's hands, built or
+    /// building.
     fn can_run(&self, package: Hash) -> bool;
 }
 
 impl CodeAvailability for Executor {
     fn can_run(&self, package: Hash) -> bool {
-        self.package_code_availability(PackageHash(package.as_hash32())) == Availability::Runnable
+        matches!(
+            self.package_standing(PackageHash(package.as_hash32())),
+            Availability::Runnable | Availability::Building
+        )
     }
 }
 
@@ -456,18 +467,17 @@ impl Executor {
         }
     }
 
-    /// Whether this node can run `package`'s code.
+    /// Where `package` stands on this node.
     #[must_use]
-    pub fn package_code_availability(&self, package: PackageHash) -> Availability {
-        self.backend.code_availability(package)
+    pub fn package_standing(&self, package: PackageHash) -> Availability {
+        self.backend.code_standing(package)
     }
 
-    /// Whether the artifact behind `package` — named by the workspace
-    /// hash the beacon registry carries — is worth fetching.
+    /// Whether the artifact behind `package` is worth asking a peer for:
+    /// this node holds none of its bytes.
     #[must_use]
     pub fn needs_artifact(&self, package: Hash) -> bool {
-        self.backend
-            .artifact_wanted(PackageHash(package.as_hash32()))
+        self.package_standing(PackageHash(package.as_hash32())) == Availability::Absent
     }
 
     /// The cell a package's artifact is kept in — where a node serving
@@ -1133,24 +1143,15 @@ fn assemble_published_tx(
                 writes_root(&writes),
             )
             .receipt_hash();
-            // The publish becomes a beacon fact: paired with the
-            // publisher as emitter, so the shard owning the publisher's
-            // prefix is the one whose witness stream carries it, exactly
-            // once — the one prefix a publish names that its signer
-            // chose.
-            let witnesses = vec![(
-                publisher.address(),
-                BeaconWitnessEvent::PackagePublished {
-                    package: Hash::from(package.0),
-                    publisher: publisher.address(),
-                },
-            )];
+            // The publish raises no beacon fact. Nothing global answers
+            // for a package: its key follows from its content address,
+            // which is the whole of what a node needs to ask for it.
             CachedOutput::succeeded(
                 writes,
                 receipt_hash,
                 vm_metadata(charged, None),
                 Vec::new(),
-                witnesses,
+                Vec::new(),
                 Vec::new(),
             )
         },
