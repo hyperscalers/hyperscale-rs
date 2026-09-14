@@ -29,6 +29,7 @@ serde.workspace = true
 
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-dispatch-sync.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }

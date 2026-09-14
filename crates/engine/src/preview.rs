@@ -310,6 +310,20 @@ pub struct FetchedCells {
 }
 
 impl FetchedCells {
+    /// Fold another gathering's answers into this one.
+    ///
+    /// One shard's worth at a time, because verification decides a
+    /// peer's verdict and so has to finish before the answer is handed
+    /// back — what arrives here has already been checked against the
+    /// root its shard attested.
+    pub fn absorb_from(&mut self, other: Self) {
+        self.cells.extend(other.cells);
+        for ((owner, collection), entries) in other.entries {
+            self.merge_entries(owner, collection, entries);
+        }
+        self.anchors.extend(other.anchors);
+    }
+
     /// Fold one interval's answer into its collection, keeping the
     /// entries ascending and one to an order.
     ///
