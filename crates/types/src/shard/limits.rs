@@ -256,6 +256,12 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 /// A query past the bound is refused rather than truncated. A short
 /// answer would read back as a collection holding less than it does,
 /// and a preview is the one thing that must not be quietly wrong.
+/// The leaves alone: the siblings a proof of them needs are roughly this
+/// times the tree's depth, which moves with the tree and so cannot be
+/// bounded here. `generate_proof` holds the built proof to
+/// `MAX_PROOF_SIBLINGS` instead, and a query whose proof would run past
+/// it is answered as unprovable rather than with bytes the asker's own
+/// decoder refuses.
 pub const MAX_CELLS_PER_QUERY: u64 = {
     let by_declaration = MAX_TX_READ_BYTES / AMOUNT_CELL_BYTES as u64;
     let by_proof = MAX_PROOF_CLAIMS as u64;

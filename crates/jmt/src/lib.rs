@@ -34,7 +34,8 @@ pub mod tree;
 
 pub use hasher::{Blake3Hasher, EMPTY_HASH, Hash, Hasher};
 pub use multiproof::{
-    ClaimTermination, DecodeError, MAX_PROOF_CLAIMS, MultiProof, ProofClaim, ProofError,
+    ClaimTermination, DecodeError, MAX_PROOF_CLAIMS, MAX_PROOF_SIBLINGS, MultiProof, ProofClaim,
+    ProofError,
 };
 pub use node::{
     Child, ChildKind, InternalNode, KEY_BITS, KEY_BYTES, Key, LeafNode, LeafValue, NibblePath,
