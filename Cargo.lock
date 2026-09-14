@@ -2382,6 +2382,7 @@ dependencies = [
  "hyperscale-dispatch-sync",
  "hyperscale-engine",
  "hyperscale-execution",
+ "hyperscale-hbor",
  "hyperscale-jmt",
  "hyperscale-mempool",
  "hyperscale-metrics",

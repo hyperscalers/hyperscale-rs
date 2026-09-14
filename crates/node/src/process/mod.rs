@@ -661,7 +661,7 @@ where
                         &asks,
                         &topology,
                         &*self.network,
-                        &*self.verifier,
+                        &self.verifier,
                         &serve_locally,
                     )
                 },

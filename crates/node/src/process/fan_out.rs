@@ -225,7 +225,7 @@ pub fn gather<N: Network>(
     asks: &BTreeMap<ShardId, DeclaredReads>,
     topology: &Arc<TopologySnapshot>,
     network: &N,
-    verifier: &dyn Verifier,
+    verifier: &Arc<dyn Verifier>,
     locally: &dyn Fn(ShardId, &GetCellsRequest) -> Option<GetCellsResponse>,
 ) -> FetchedCells {
     let mut fetched = FetchedCells::default();
@@ -245,18 +245,27 @@ pub fn gather<N: Network>(
     for (shard, ask) in &remote {
         let shard = *shard;
         let tx = tx.clone();
+        let ask = (*ask).clone();
+        let topology = Arc::clone(topology);
+        let verifier = Arc::clone(verifier);
         network.request(
             shard,
             None,
             GetCellsRequest::new(ask.keys.clone(), ask.ranges.clone()),
             None,
             Box::new(move |result| {
-                let served = result.is_ok();
-                let _ = tx.send((shard, result.ok()));
-                // A verdict about the peer, not about the preview: a
-                // peer that could not serve is deprioritized for the
-                // next asker, which is what the health tracker is for.
-                if served {
+                // Verified here rather than on the gathering thread,
+                // because the verdict is consumed the moment this
+                // returns: a peer whose proof does not stand has served
+                // nothing, and saying otherwise leaves it preferred for
+                // the next asker and stops the request rotating to
+                // anyone else. What a shard is worth is what verified.
+                let mut one = FetchedCells::default();
+                let answered = result.is_ok_and(|response| {
+                    absorb(shard, &ask, &response, &topology, &*verifier, &mut one)
+                });
+                let _ = tx.send(answered.then_some(one));
+                if answered {
                     ResponseVerdict::Accept
                 } else {
                     ResponseVerdict::Reject
@@ -271,11 +280,11 @@ pub fn gather<N: Network>(
     // back costs the caller the ceiling once however many were asked.
     let deadline = Instant::now() + GATHER_TIMEOUT;
     for _ in 0..remote.len() {
-        let Ok((shard, response)) = rx.recv_deadline(deadline) else {
+        let Ok(answered) = rx.recv_deadline(deadline) else {
             break;
         };
-        if let (Some(response), Some(ask)) = (response, remote.get(&shard)) {
-            absorb(shard, ask, &response, topology, verifier, &mut fetched);
+        if let Some(one) = answered {
+            fetched.absorb_from(one);
         }
     }
     fetched
@@ -309,6 +318,7 @@ fn absorb_own(
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestError, RequestHandler};
     use hyperscale_storage::test_helpers::{
         commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
@@ -410,6 +420,97 @@ mod tests {
                 cap: 4,
             }],
         }
+    }
+
+    /// A network that answers every request with `response` and keeps
+    /// the verdict the caller returned about the peer.
+    ///
+    /// Round-tripped through the codec rather than downcast, because
+    /// `R::Response` is not `'static` and both sides are `Hbor`.
+    struct Answering {
+        response: GetCellsResponse,
+        verdict: std::sync::Mutex<Option<ResponseVerdict>>,
+    }
+
+    impl Network for Answering {
+        fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _: ShardId, _: &M) {}
+        fn broadcast_global<M: GossipMessage + 'static>(&self, _: &M) {}
+        fn register_gossip_handler<M: GossipMessage + 'static>(&self, _: impl GossipHandler<M>) {}
+        fn register_host_gossip_handler<M: GossipMessage + 'static>(
+            &self,
+            _: impl Fn(M) + Send + Sync + 'static,
+        ) {
+        }
+        fn register_request_handler<R: Request + Send + 'static>(
+            &self,
+            _: ShardId,
+            _: impl RequestHandler<R>,
+        ) where
+            R::Response: Send + 'static,
+        {
+        }
+        fn notify<M: NetworkMessage + 'static>(&self, _: &[ValidatorId], _: &M) {}
+        fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+            &self,
+            _: impl NotificationHandler<M>,
+        ) {
+        }
+        fn subscribe_shard(&self, _: ShardId) {}
+        fn unsubscribe_shard(&self, _: ShardId) {}
+        fn update_topology(&self, _: Arc<TopologySnapshot>) {}
+        fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
+        fn request<R: Request + Clone + 'static>(
+            &self,
+            _: ShardId,
+            _: Option<ValidatorId>,
+            _: R,
+            _: Option<MessageClass>,
+            on_response: Box<
+                dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send,
+            >,
+        ) {
+            let bytes = hbor_to_vec(&self.response).expect("the fixture answer encodes");
+            let answer =
+                hbor_from_slice::<R::Response>(&bytes).expect("the fixture only asks for cells");
+            *self.verdict.lock().expect("no other thread holds it") = Some(on_response(Ok(answer)));
+        }
+    }
+
+    /// A peer whose answer does not verify is told so, and a peer whose
+    /// answer does is not.
+    ///
+    /// The verdict is what the health tracker ranks the next asker's
+    /// peers by, and it is consumed the moment the callback returns — so
+    /// deciding it on whether the bytes *decoded* rewards a committee
+    /// member that answers every ask with a fabricated proof: it keeps a
+    /// perfect score, stays preferred, and the request never rotates to
+    /// anyone who would answer honestly.
+    #[test]
+    fn a_peer_whose_proof_does_not_stand_is_rejected() {
+        let ask = one_range();
+        let (mut tampered, _) = served(&ask);
+        let asks = BTreeMap::from([(SHARD, ask)]);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        tampered.ranges[0].entries[0].1 = vec![0xFF; 4];
+        let lying = Answering {
+            response: tampered,
+            verdict: std::sync::Mutex::new(None),
+        };
+        let fetched = gather(&asks, &topology, &lying, &verifier, &|_, _| None);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "a shard that did not verify is absent, so the preview refuses by naming it"
+        );
+        assert!(
+            matches!(
+                *lying.verdict.lock().expect("no other thread holds it"),
+                Some(ResponseVerdict::Reject)
+            ),
+            "and the peer is told its answer was worth nothing"
+        );
     }
 
     /// A served answer folds in, and the same answer with one byte moved
@@ -521,7 +622,7 @@ mod tests {
             &asks,
             &topology,
             &NoNetwork,
-            &BlsVerifier,
+            &(Arc::new(BlsVerifier) as Arc<dyn Verifier>),
             &|shard, request| {
                 assert_eq!(shard, SHARD);
                 Some(serve_cells_request(&chain, request))
