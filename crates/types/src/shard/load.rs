@@ -206,7 +206,9 @@ impl ShardFullness {
 }
 
 /// One row of the mean, moved an [`FULLNESS_EPOCHS`]th of the way to
-/// this epoch's ratio.
+/// this epoch's ratio, and never by less than a basis point while the
+/// two differ at all — so a sustained reading is reached rather than
+/// approached.
 fn fold_row(mean: u32, reading: Utilization) -> u32 {
     let Utilization { used, capacity } = reading;
     if capacity == 0 {
@@ -216,13 +218,18 @@ fn fold_row(mean: u32, reading: Utilization) -> u32 {
     // is a defect rather than a reading and enters as a full epoch.
     let ratio =
         (used.saturating_mul(u128::from(BASIS_POINTS)) / capacity).min(u128::from(BASIS_POINTS));
-    let epochs = u64::from(FULLNESS_EPOCHS);
-    #[allow(clippy::cast_possible_truncation)] // both terms are under BASIS_POINTS
-    let ratio = ratio as u64;
-    let next = (u64::from(mean) * (epochs - 1) + ratio) / epochs;
-    #[allow(clippy::cast_possible_truncation)] // a mean of figures under BASIS_POINTS
-    {
-        next as u32
+    #[allow(clippy::cast_possible_truncation)] // clamped to BASIS_POINTS above
+    let ratio = ratio as u32;
+    // Toward the reading, and never by less than a basis point while
+    // any distance is left. Taking the floor of the eighth instead
+    // leaves the last seven basis points unreachable — a permanently
+    // saturated shard converges to 9993 and stops — so a threshold
+    // voted anywhere above that could never be met, and every lower one
+    // sits seven basis points above what was voted.
+    if ratio >= mean {
+        mean + (ratio - mean).div_ceil(FULLNESS_EPOCHS)
+    } else {
+        mean - (mean - ratio).div_ceil(FULLNESS_EPOCHS)
     }
 }
 
@@ -239,6 +246,50 @@ mod tests {
             compute,
             ..DeclaredWork::ZERO
         }
+    }
+
+    /// A sustained reading is reached, not approached.
+    ///
+    /// The mean moves an eighth of the way each epoch, and an eighth of
+    /// a distance under eight rounds to nothing. Truncating there
+    /// strands the mean seven basis points short of whatever it is
+    /// converging on: a permanently saturated shard would sit at 9,993
+    /// forever, so a `split_fullness` voted at the top of the enabled
+    /// range — full saturation, the figure the doc describes — could
+    /// never be met, and every lower threshold would sit seven basis
+    /// points above what was voted.
+    #[test]
+    fn a_sustained_reading_is_reached_rather_than_approached() {
+        let saturated = Utilization {
+            used: 1_000,
+            capacity: 1_000,
+        };
+        let mut mean = 0;
+        for _ in 0..256 {
+            mean = fold_row(mean, saturated);
+        }
+        assert_eq!(
+            mean, BASIS_POINTS,
+            "a shard at its caps forever reads as at its caps"
+        );
+
+        // And down the same way, from the top to an idle chain.
+        let idle = Utilization {
+            used: 0,
+            capacity: 1_000,
+        };
+        for _ in 0..256 {
+            mean = fold_row(mean, idle);
+        }
+        assert_eq!(mean, 0, "and one declaring nothing reads as idle");
+
+        // The eighth still governs the distance, so one busy epoch
+        // cannot carry a mean to a threshold on its own.
+        assert_eq!(
+            fold_row(0, saturated),
+            BASIS_POINTS / FULLNESS_EPOCHS,
+            "one epoch moves an eighth of the way and no further"
+        );
     }
 
     #[test]
