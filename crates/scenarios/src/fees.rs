@@ -27,10 +27,12 @@ use crate::support::tx::{
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
 use crate::support::{Cluster, epochs, vote_params, vote_reshape_threshold};
 
-/// An eighth and eight times the reference table: wide enough that the
-/// controller's own step — an eighth of a row per epoch — has somewhere
-/// to go in a handful of folds.
-const FLOOR_BP: u32 = 1_250;
+/// Four fifths and eight times the reference table: wide enough that
+/// the controller's own step — an eighth of a row per epoch — has
+/// somewhere to go, and a floor an idle network reaches in a handful of
+/// folds. A floor far below the level only ever reads as "above the
+/// floor", which every level is.
+const FLOOR_BP: u32 = 8_000;
 const CEILING_BP: u32 = 80_000;
 
 /// Half again over the table price: large enough that the charge cannot
@@ -75,11 +77,18 @@ pub fn a_vote_opens_the_band_and_the_level_moves<C: Cluster>(c: &mut C) {
     // And folds go by without moving it, which is the half of the claim
     // a constant cannot make: the level is pinned by the interval and
     // not by nothing having happened yet.
+    let before = beacon_epoch(c);
     assert!(
         !c.run_until(epochs(4), |c| prices(c).0 != PriceTable::GENESIS),
         "a pinned interval must hold the level through folds that would \
          otherwise step it; level = {:?}",
         prices(c).0,
+    );
+    assert!(
+        beacon_epoch(c) > before,
+        "and the run has to have spanned a fold, or the level held for \
+         want of anything happening: {before:?} to {:?}",
+        beacon_epoch(c),
     );
 
     let opened = PriceBounds::band(FLOOR_BP, CEILING_BP);
@@ -103,14 +112,25 @@ pub fn a_vote_opens_the_band_and_the_level_moves<C: Cluster>(c: &mut C) {
         prices(c).0,
     );
 
+    // And it comes to rest on the floor rather than travelling through
+    // it. An idle network drives the row down at every fold, so a level
+    // that stops stopped because the interval held it — which is the
+    // claim, and one no reading taken while the row is still far above
+    // the floor can make.
+    assert!(
+        c.run_until(epochs(8), |c| prices(c).0.compute == opened.floor.compute),
+        "the row must walk down to the floor the ballot named; level = {:?}",
+        prices(c).0,
+    );
+    assert!(
+        !c.run_until(epochs(4), |c| prices(c).0.compute != opened.floor.compute),
+        "and hold there through folds that would otherwise step it past; \
+         level = {:?}",
+        prices(c).0,
+    );
+
     let (moved, bounds) = prices(c);
     assert_eq!(bounds, opened, "the band is the one the ballot named");
-    assert!(
-        moved.compute >= bounds.floor.compute,
-        "the controller stays inside the interval: {} under a floor of {}",
-        moved.compute,
-        bounds.floor.compute,
-    );
 
     // And the chain still prices: a transfer admitted against the moved
     // table settles like any other.
