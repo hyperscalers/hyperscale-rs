@@ -38,9 +38,10 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, Hash,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness, ShardId, Stake,
-    StakePoolId, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
+    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey,
+    Epoch, Hash, NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardFullness,
+    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, TerminalRoots, ValidatorId,
+    WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -1496,6 +1497,25 @@ impl BeaconState {
             .collect()
     }
 
+    /// The placement and the table this state's window priced under.
+    ///
+    /// The two halves of a [`TopologySnapshot`] a restatement is checked
+    /// against, without the committees, seeds and projections around
+    /// them. A reader resolving a window the schedule has evicted takes
+    /// this off the epoch's stored state, so it costs a trie walk over
+    /// the live shards rather than a snapshot derivation.
+    ///
+    /// Both halves are what [`Self::derive_topology_snapshot`] hands the
+    /// snapshot for the same state, which is the property the test
+    /// beside it pins.
+    #[must_use]
+    pub fn commit_window(&self) -> CommitWindow {
+        CommitWindow {
+            trie: ShardTrie::from_leaves(self.shard_committees.keys().copied()),
+            prices: self.prices,
+        }
+    }
+
     /// Derive the immutable [`TopologySnapshot`] for the window this
     /// state governs — the **active** committee (`shard_committees`)
     /// with the promotion-frozen consensus subset
@@ -2074,6 +2094,43 @@ mod tests {
 
     fn empty_state() -> BeaconState {
         BeaconState::empty(BeaconChainConfig::default())
+    }
+
+    /// The pair a restatement is checked against is the pair the
+    /// snapshot carries. A reader that resolves an evicted window off
+    /// the epoch's stored state and one that resolves a retained window
+    /// off the schedule weigh the same share at the same table, so the
+    /// two derivations are held to each other here.
+    #[test]
+    fn the_commit_window_is_the_snapshot_halves() {
+        let mut state = empty_state();
+        state.prices = PriceTable {
+            compute: 7,
+            ..PriceTable::GENESIS
+        };
+        let member = ValidatorId::new(1);
+        state.validators.insert(
+            member,
+            validator_record(member.inner(), 0, ValidatorStatus::Pooled),
+        );
+        for shard in [
+            ShardId::leaf(1, 0),
+            ShardId::leaf(2, 2),
+            ShardId::leaf(2, 3),
+        ] {
+            state.shard_committees.insert(
+                shard,
+                ShardCommittee {
+                    members: vec![member],
+                },
+            );
+        }
+
+        let snapshot = state.derive_topology_snapshot(NetworkDefinition::simulator());
+        let window = state.commit_window();
+
+        assert_eq!(window.trie, *snapshot.shard_trie());
+        assert_eq!(window.prices, snapshot.prices());
     }
 
     /// Both projections carry the ring the fold built, so a consumer

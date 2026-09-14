@@ -11,7 +11,8 @@ use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::Executor;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage, TickChain,
+    BeaconChainReader, JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore,
+    ShardStorage, TickChain,
 };
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, Epoch, PreparedCommit, ShardId, Signer,
@@ -55,6 +56,11 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// the same persist-before-sign contract as `vote_registers`, for
     /// the ratify-vote sign handler.
     pub ratify_registers: &'a dyn RatifyRegisterStore,
+    /// The committed beacon chain, for handlers resolving a window the
+    /// live schedule no longer carries. The schedule is a cache over
+    /// this store, which holds one state per epoch contiguously from
+    /// genesis, so a miss there is a read here rather than a verdict.
+    pub beacon_chain: &'a dyn BeaconChainReader,
     /// Network handle for broadcast/notify/request actions.
     pub network: &'a Arc<N>,
     /// Local validator's signing identity. Used by handlers that sign

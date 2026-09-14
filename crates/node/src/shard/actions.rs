@@ -878,6 +878,7 @@ where
                 tick_chain: &shard_handles.tick_chain,
                 vote_registers: shard_handles.storage.as_ref(),
                 ratify_registers: handles.beacon_storage.as_ref(),
+                beacon_chain: handles.beacon_storage.as_ref(),
                 network: &handles.network,
                 signer: &signer,
                 verifier: verifier.as_ref(),

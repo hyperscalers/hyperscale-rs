@@ -12,7 +12,7 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, CommitWindow, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
     LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
     PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
@@ -970,12 +970,11 @@ pub enum Action {
         /// The trie of the anchor's window, which a delivery's body is
         /// classified against.
         trie: ShardTrie,
-        /// The window each name states its commit at, keyed by that
-        /// anchor: the placement and the table its figures were frozen
-        /// under, so a fold moving either never moves a figure already
-        /// owed. A name whose window this validator no longer retains
-        /// defers the whole check rather than being weighed at another.
-        committed_windows: BTreeMap<WeightedTimestamp, CommitWindow>,
+        /// The epoch grid, which places each name's stated commit anchor
+        /// in the window that froze its figures. Carried rather than
+        /// read off the store because it is a property of the chain
+        /// config and not of any one window.
+        windows: EpochWindows,
     },
 
     /// Build a complete block proposal.

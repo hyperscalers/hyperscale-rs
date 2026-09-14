@@ -425,6 +425,29 @@ pub struct ExecutionCoordinator {
     local_shard: ShardId,
 }
 
+/// The window `wt` falls in, or the head where the schedule names none.
+///
+/// What prices. A table is a property of the window and not of any
+/// shard's place in it, so this takes the plain lookup rather than the
+/// shard-clamped one a classification does. A split child replaying
+/// content its parent committed asks about an anchor before its own
+/// cut, where the clamp finds no committee for the child and answers
+/// the head — charging inherited content at a table it was never priced
+/// under, while the shard-side verifier resolves the window and
+/// refuses.
+///
+/// The fallback is left for a window this node has not folded, which a
+/// committing block's own timestamp is not: its committee had to
+/// resolve for the block to be verified at all.
+fn pricing_window(
+    topology_schedule: &TopologySchedule,
+    wt: WeightedTimestamp,
+) -> &TopologySnapshot {
+    topology_schedule
+        .at(wt)
+        .map_or_else(|| topology_schedule.head().as_ref(), AsRef::as_ref)
+}
+
 impl ExecutionCoordinator {
     /// Create a new execution state machine with its own fresh stores and a
     /// genesis commit frontier. For hosts running multiple same-shard
@@ -1402,9 +1425,7 @@ impl ExecutionCoordinator {
         // The tick's own anchor prices what the tick itself composes:
         // a settlement is committed by the block being built, not by an
         // earlier one, so there is one table for all of them.
-        let tick_prices = self
-            .classification_committee(topology_schedule, block.ts)
-            .prices();
+        let tick_prices = pricing_window(topology_schedule, block.ts).prices();
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_inherited(
