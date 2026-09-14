@@ -1173,6 +1173,60 @@ fn cast_late_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64, lead: u64) 
     panic!("the late threshold vote never reached the chain");
 }
 
+/// A venue sealed on a freshly formed split child runs.
+///
+/// The committee seated at a cut has run nothing: every artifact it
+/// needs is one it has to acquire, and a seal offered to it names code
+/// none of its members has ever compiled. Nothing about the chain says
+/// when that code arrives, so the seal waits at each node's door until
+/// its own fetch lands, and the tick that runs it waits at the dispatch
+/// head until its own build does.
+///
+/// The inverse of what every other reshape scenario here does. Those
+/// seal before the cut so the child inherits the code with the keyspace;
+/// this one seals after, which is the case a node with no code and no
+/// way to ask for it could not survive.
+///
+/// # Panics
+///
+/// Panics if the grown topology does not settle, if the split does not
+/// run, if the venue misses its budget standing up on the child, or if a
+/// swap through it does not settle.
+pub fn a_venue_sealed_on_a_fresh_split_child_runs<C: Cluster>(c: &mut C) {
+    // Let the grow's own split run first, so the venue is offered to a
+    // committee that came up at the cut rather than one that inherited
+    // anything.
+    let (left, right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
+        "the grow's own split must have run before the venue is sealed",
+    );
+
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, left, &mut taken);
+    let (caller_key, caller) = grind_onto(LATE_TRADER_SHARD, &mut taken);
+
+    let swap = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = swap.hash();
+    c.submit(Arc::new(swap));
+    let status = await_tx_terminal(c, hash, epochs(24));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a swap through a venue sealed on a fresh child did not settle; status = {status:?}",
+    );
+}
+
 /// A record naming a commit from before its departure was ever voted
 /// still resolves the window that priced it.
 ///

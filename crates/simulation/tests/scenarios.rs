@@ -49,12 +49,12 @@ use hyperscale_scenarios::{
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    a_vote_moves_the_row_it_names_and_no_other, a_vote_opens_the_band_and_the_level_moves,
-    a_wallet_signs_the_ceilings_a_preview_measured, abort_converges,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
+    a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
+    abort_converges, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -1373,6 +1373,14 @@ fn late_departing_route_cluster() -> SimCluster {
         &late_departing_route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// The case a node with no code and no way to ask for it could not
+/// survive: a seal offered to a committee that came up at a cut.
+#[test]
+fn a_venue_sealed_on_a_fresh_split_child_runs_sim() {
+    let mut cluster = late_departing_route_cluster();
+    a_venue_sealed_on_a_fresh_split_child_runs(&mut cluster);
 }
 
 #[test]
