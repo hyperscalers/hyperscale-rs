@@ -18,14 +18,14 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt, Hash,
-    MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, OwnerShare, ProtocolStatics, Routing,
-    TimestampRange, TransactionEnvelope, WeightedTimestamp, whole_work,
+    ArtifactTerm, DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt,
+    Hash, MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, OwnerShare, ProtocolStatics,
+    Routing, TimestampRange, TransactionEnvelope, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
     AdmittedTree, CROSSING_CELL_BYTES, ChainRecords, Claim, CrossingSite, EnvelopeTree,
-    IntentHeader, MARKER_CELL_BYTES, ManifestHash, PackageHash, PrefixShardResolver,
+    IntentHeader, MARKER_CELL_BYTES, ManifestHash, NodeCall, PackageHash, PrefixShardResolver,
     Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key, effect_units, legs_of,
     package_hash, package_key as canonical_package_key, principal_address, protocol_resource,
     route_tree,
@@ -109,6 +109,32 @@ const fn target_owner(target: &EffectTarget) -> Address {
         EffectTarget::Point(key) => key.owner,
         EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => *owner,
     }
+}
+
+/// One artifact read per distinct package `calls` names, carrying the
+/// nodes that call it.
+///
+/// A shard adds a term for a package it instantiates, whichever of that
+/// package's nodes brought it there. Attributing the read to one node
+/// instead leaves a shard running only the manifest's later nodes
+/// reserving nothing for an artifact it still loads — and the read is
+/// the artifact's, so a shard running two nodes of one package pays it
+/// once.
+fn artifact_terms(packages: &PackageCache, calls: &[NodeCall]) -> Vec<ArtifactTerm> {
+    let mut by_package: BTreeMap<PackageHash, Vec<u32>> = BTreeMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        by_package
+            .entry(call.package)
+            .or_default()
+            .push(u32::try_from(index).unwrap_or(u32::MAX));
+    }
+    by_package
+        .into_iter()
+        .map(|(package, nodes)| ArtifactTerm {
+            read_bytes: packages.artifact_bytes(package).unwrap_or(0),
+            nodes,
+        })
+        .collect()
 }
 
 /// What a call transaction declares, by the owner prefix each term
@@ -217,26 +243,17 @@ pub fn declared_vector(
         }
     }
 
-    // Each node's ceiling, and each distinct package's artifact once,
-    // under the first node that runs it. Per node rather than under the
-    // node's owner: a core shard runs every core node whatever it holds,
-    // so what a node may consume is owed wherever it runs and an owner
-    // prefix cannot say where that is.
-    let mut seen = BTreeSet::new();
-    let node_terms: Vec<DeclaredWork> = routing
-        .calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| DeclaredWork {
+    // Each node's ceiling. Per node rather than under the node's owner:
+    // a core shard runs every core node whatever it holds, so what a
+    // node may consume is owed wherever it runs and an owner prefix
+    // cannot say where that is.
+    let node_terms: Vec<DeclaredWork> = (0..routing.calls.len())
+        .map(|index| DeclaredWork {
             compute: vm.gas_limits.get(index).copied().unwrap_or(0),
-            read_bytes: if seen.insert(call.package) {
-                packages.artifact_bytes(call.package).unwrap_or(0)
-            } else {
-                0
-            },
             ..DeclaredWork::ZERO
         })
         .collect();
+    let artifacts = artifact_terms(packages, &routing.calls);
 
     let shares: Vec<OwnerShare> = by_owner
         .into_iter()
@@ -267,6 +284,7 @@ pub fn declared_vector(
     Ok(DeclaredVector {
         shares,
         node_terms,
+        artifacts,
         everywhere,
         event_bytes,
     })
@@ -310,6 +328,9 @@ pub struct DeclaredVector {
     pub shares: Vec<OwnerShare>,
     /// What each manifest node bears, in node order.
     pub node_terms: Vec<DeclaredWork>,
+    /// One term per distinct package the manifest calls, with the nodes
+    /// that call it.
+    pub artifacts: Vec<ArtifactTerm>,
     /// What every shard committing the transaction bears whatever it
     /// holds.
     pub everywhere: DeclaredWork,
@@ -823,7 +844,7 @@ impl BridgeStatics {
         // A publish keeps exactly what it writes: the artifact sits in
         // the package cell and the vault holds its amount.
         let everywhere = everywhere(retained, envelope_bytes(vm)?, vm.signatures(), 0);
-        let work = whole_work(&shares, &[], everywhere);
+        let work = whole_work(&shares, &[], &[], everywhere);
 
         Ok(Derived {
             // A publish carries no tree, so nothing narrows the window
@@ -832,8 +853,11 @@ impl BridgeStatics {
             work,
             shares,
             // No node to divide the ceiling by: a publish invokes
-            // nothing, and what it costs is its publisher's alone.
+            // nothing, and what it costs is its publisher's alone. Nor
+            // any package to instantiate — its artifact is bytes written
+            // and retained, which the shares above already carry.
             node_terms: Vec::new(),
+            artifacts: Vec::new(),
             everywhere,
             // No manifest, so nothing to divide, nothing crossing, and no
             // subintent bound; the publisher pays and signs.
@@ -956,16 +980,18 @@ impl Derivation for BridgeStatics {
         let DeclaredVector {
             shares,
             node_terms,
+            artifacts,
             everywhere,
             ..
         } = declared_vector(&self.cache, vm, &routing, &legs, envelope_bytes(vm)?)
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
-        let work = whole_work(&shares, &node_terms, everywhere);
+        let work = whole_work(&shares, &node_terms, &artifacts, everywhere);
         Ok(Derived {
             effective_window,
             work,
             shares,
             node_terms,
+            artifacts,
             everywhere,
             legs,
             nullifiers: admitted
@@ -1314,7 +1340,12 @@ mod tests {
         );
         assert_eq!(
             derived.work,
-            whole_work(&derived.shares, &derived.node_terms, derived.everywhere),
+            whole_work(
+                &derived.shares,
+                &derived.node_terms,
+                &derived.artifacts,
+                derived.everywhere,
+            ),
             "the whole is the shares and the nodes plus what every shard bears"
         );
         assert_eq!(

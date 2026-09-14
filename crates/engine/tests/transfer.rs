@@ -1287,6 +1287,38 @@ fn local_shares_sum_to_the_whole_across_a_trie() {
         *whole,
         "one shard holding everything bears the whole"
     );
+
+    // A package's artifact is read by every shard that instantiates it,
+    // and once by each however many of its nodes that shard runs. Borne
+    // by one node instead, a shard running only the manifest's later
+    // nodes reserves nothing for code it still loads.
+    let artifacts = tx.artifacts();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "the transfer calls one package: {artifacts:?}"
+    );
+    let artifact = artifacts[0].read_bytes;
+    assert!(artifact > 0, "the fixture publishes the account's artifact");
+    assert!(
+        mine.read_bytes >= artifact && theirs.read_bytes >= artifact,
+        "each end reserves the artifact it instantiates: {} and {} against {artifact}",
+        mine.read_bytes,
+        theirs.read_bytes,
+    );
+
+    // And a classification that read no placement bears the whole
+    // wherever it is asked. Standing in a single-leaf trie for "no
+    // placement" answers that only at the root and drops every owner
+    // share anywhere else, which is a price missing its whole footprint.
+    let unplaced = Classified::whole();
+    for shard in [ShardId::ROOT, near_shard, far_shard] {
+        assert_eq!(
+            unplaced.local_work(&tx, shard),
+            *whole,
+            "a shape that runs whole bears the whole on {shard:?}"
+        );
+    }
 }
 
 /// A transfer executed divided, end to end through the engine: the

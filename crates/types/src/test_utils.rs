@@ -1088,6 +1088,7 @@ impl Derivation for StubVmStatics {
             // shard bears the whole of it.
             shares: Vec::new(),
             node_terms: Vec::new(),
+            artifacts: Vec::new(),
             everywhere: work,
             // A stub derives no manifest, so it has no legs to divide;
             // its payer is the one party its routing declares.

@@ -103,6 +103,7 @@ impl Derivation for ReservingStatics {
             work,
             shares: Vec::new(),
             node_terms: Vec::new(),
+            artifacts: Vec::new(),
             everywhere: work,
             legs: Vec::new(),
             nullifiers: Vec::new(),

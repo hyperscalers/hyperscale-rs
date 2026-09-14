@@ -81,7 +81,7 @@ pub fn divided_requirements(
 ) -> BTreeSet<Requirement> {
     let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
     let core = classified.core();
-    let trie = classified.trie();
+
     if side == Side::Issuing && core.contains(&local) {
         requirements.extend(
             core.iter()
@@ -96,13 +96,15 @@ pub fn divided_requirements(
     // component the transaction calls, which is where the records it
     // cannot read itself arrive. A principal has no record to read, so a
     // transaction reaching only accounts waits on nobody here.
-    requirements.extend(
-        legs.iter()
-            .filter(|leg| leg.target.class() == AddressClass::Component)
-            .map(|leg| trie.shard_for_prefix(leg.target))
-            .filter(|&shard| shard != local)
-            .map(Requirement::CommittedState),
-    );
+    if let Some(trie) = classified.placement() {
+        requirements.extend(
+            legs.iter()
+                .filter(|leg| leg.target.class() == AddressClass::Component)
+                .map(|leg| trie.shard_for_prefix(leg.target))
+                .filter(|&shard| shard != local)
+                .map(Requirement::CommittedState),
+        );
+    }
     // A member waits only on the arrivals its own side's legs consume:
     // the issuing side on what feeds its core share, the delivering side
     // on what the core returned. An inbound leg consumes nothing that
