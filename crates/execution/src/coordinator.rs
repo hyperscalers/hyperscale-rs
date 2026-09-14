@@ -8042,6 +8042,85 @@ mod tests {
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
     }
 
+    /// Commit a block on `HOME` carrying `finalization`, the way this
+    /// shard's own writes reach its chain.
+    fn commit_finalizing(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        height: u64,
+        ts_ms: u64,
+        finalization: Finalization,
+    ) -> Vec<Action> {
+        let Block::Live {
+            header,
+            transactions,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(height),
+            ts_ms,
+            ValidatorId::new(0),
+            vec![],
+        )
+        else {
+            unreachable!("a live block")
+        };
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates: Arc::new(vec![Arc::new(Verifiable::from(finalization))]),
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+        };
+        state.on_block_committed(schedule, &test_certify(block, ts_ms))
+    }
+
+    /// A record the ledger disposed of is let go at the commit that
+    /// took its leaf away.
+    ///
+    /// The scan at startup is only the set's first term. A record the
+    /// entry path settled would otherwise be held with no leaf behind
+    /// it, and a disposal composed over a cell nothing can read is
+    /// refused — which strands every other record in the member with
+    /// it. The other term, a record entering at the commit that writes
+    /// it, turns on the bytes a record is judged by and is covered where
+    /// the real answers are installed.
+    #[test]
+    fn a_record_is_let_go_at_the_commit_that_deletes_its_leaf() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let (record_key, _, cell) = held_record(0x6A, 400_000);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        commit_finalizing(
+            &mut state,
+            &schedule,
+            1,
+            1_000,
+            make_finalization_leaving(
+                BlockHeight::new(1),
+                cell.tx,
+                StateWrites {
+                    cells: BTreeMap::from([(record_key, None)]),
+                    ..StateWrites::default()
+                },
+            ),
+        );
+        assert!(
+            state.counterparts.held.is_empty(),
+            "the leaf is gone, so nothing here still owes for it",
+        );
+    }
+
     /// Commit a block on `HOME` carrying `records`, the way a departure
     /// reaches this chain.
     fn commit_recording(
@@ -9024,11 +9103,13 @@ mod tests {
             &present_keys,
             &[claim],
         );
-        assert!(
+        assert_eq!(
             state_proof_fetches(&opened)
                 .iter()
                 .any(|(_, keys)| keys.contains(&claim)),
-            "the seat asks whoever holds the claim's prefix"
+            !owed_here,
+            "the shard asks whoever holds the claim's prefix, and asks only \
+             where no entry of its own is already asking",
         );
         let actions = commit_carrying(&mut state, &schedule, 1, read_at.as_millis(), vec![bundle]);
         actions.iter().find_map(|action| match action {

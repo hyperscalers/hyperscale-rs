@@ -18,6 +18,7 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_probe_answered, record_reclaim_probe_pending,
 };
+use hyperscale_storage::is_record_cell;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, ExecutionCertificate, Inclusion, MAX_PROPOSAL_EVIDENCE_BYTES,
@@ -333,6 +334,7 @@ impl Counterparts {
             record_rebuilt_record_entry();
         }
         self.cover_recorded(block);
+        self.fold_record_writes(block);
         self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
         let unanswerable = self.ledger.prune(now);
@@ -496,8 +498,15 @@ impl Counterparts {
         // whoever holds the claim's prefix now. Nothing is asked of a
         // claim this shard holds itself — the tick reads that cell
         // directly — and nothing is asked twice at one header.
+        //
+        // Nothing is asked for a record an entry here settles, either:
+        // the entry asks its own questions under the transaction's name,
+        // and a second question about the same cell buys a proof the
+        // chain already carries and a certificate it has already
+        // fetched. The two ask where they each dispose.
+        let ledger = &self.ledger;
         for record in self.held.values_mut() {
-            if record.answer.is_some() {
+            if record.answer.is_some() || ledger.settles_records(record.cell.tx) {
                 continue;
             }
             let claim = record.cell.consumer_claim;
@@ -749,6 +758,45 @@ impl Counterparts {
         for record in block.abandonment_records() {
             for tx_hash in record.tx_hashes() {
                 self.mirror.cover(tx_hash);
+            }
+        }
+    }
+
+    /// Follow the record cells this block's finalizations write and
+    /// delete, so what is held is what the leaves hold.
+    ///
+    /// The set the leaf path composes from has to be the leaf set, and
+    /// a scan at startup is only its first term. A crossing issued after
+    /// it would otherwise never be held at all, and a record the ledger
+    /// disposed of would be held after its leaf was gone — and a
+    /// disposal composed over a cell nothing can read is refused, which
+    /// strands the rest of its member with it.
+    ///
+    /// Read off this shard's own finalizations, which is where its
+    /// writes are stated, so every replica at one frontier folds the
+    /// same set from the same blocks. A leaf that does not decode is one
+    /// no disposal could be composed from, as at the scan.
+    fn fold_record_writes(&mut self, block: &Block) {
+        for finalization in block.certificates().iter() {
+            for receipt in finalization.as_unverified().receipts() {
+                let Some(writes) = receipt.consensus.writes() else {
+                    continue;
+                };
+                for (key, value) in &writes.cells {
+                    match value {
+                        Some(bytes) if is_record_cell(*key, bytes) => {
+                            if let Some(cell) = CrossingCell::from_bytes(bytes) {
+                                self.held
+                                    .entry(*key)
+                                    .or_insert_with(|| HeldRecord::of(cell));
+                            }
+                        }
+                        None => {
+                            self.held.remove(key);
+                        }
+                        Some(_) => {}
+                    }
+                }
             }
         }
     }
