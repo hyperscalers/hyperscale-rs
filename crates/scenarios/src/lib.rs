@@ -90,9 +90,10 @@ pub use route_reshape::{
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    departing_caller_ballast, departing_route_genesis_accounts, departing_venue_ballast,
-    departing_venue_split_bytes, late_departing_route_genesis_accounts,
-    merge_train_genesis_accounts, merging_caller_genesis_accounts, split_train_genesis_accounts,
+    a_venue_sealed_on_a_fresh_split_child_runs, departing_caller_ballast,
+    departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
+    late_departing_route_genesis_accounts, merge_train_genesis_accounts,
+    merging_caller_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_is_reclaimed_when_its_deliverer_splits,
