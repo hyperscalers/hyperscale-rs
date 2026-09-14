@@ -18,7 +18,7 @@ use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec
 use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable};
 use thiserror::Error;
 
-use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
+use crate::transaction::vm::{ArtifactTerm, Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
     Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey,
     MAX_ENVELOPE_BYTES, NetworkId, OwnerShare, PrincipalAddr, Routing, ShardId, ShardTrie,
@@ -185,6 +185,17 @@ impl Transaction {
     #[must_use]
     pub fn node_terms(&self) -> &[DeclaredWork] {
         &self.derived().node_terms
+    }
+
+    /// One term per distinct package this transaction's manifest calls,
+    /// with the nodes that call it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn artifacts(&self) -> &[ArtifactTerm] {
+        &self.derived().artifacts
     }
 
     /// What every shard committing this transaction bears whatever it
@@ -766,6 +777,7 @@ mod tests {
                 work: DeclaredWork::ZERO,
                 shares: Vec::new(),
                 node_terms: Vec::new(),
+                artifacts: Vec::new(),
                 everywhere: DeclaredWork::ZERO,
                 legs: Vec::new(),
                 nullifiers: Vec::new(),

@@ -38,6 +38,34 @@ use crate::sharding::TrieShardResolver;
 /// the protocol's shard identifiers.
 pub type CrossingEdge = StarEdge<ShardId>;
 
+/// Where a classification resolves an owner.
+///
+/// Two states rather than a trie that stands in for both, because the
+/// question `local_work` and `judges_for` ask is "is this owner mine",
+/// and a classification with no placement behind it answers yes to all
+/// of them. A single-leaf trie answers that only for
+/// [`ShardId::ROOT`](hyperscale_types::ShardId::ROOT) and answers `no`
+/// everywhere else, which is the whole share silently dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Placement {
+    /// Read against a trie: an owner is `shard`'s when the trie routes
+    /// its prefix there.
+    Read(Arc<ShardTrie>),
+    /// No placement read, so every owner is the asker's: the shape runs
+    /// whole wherever it runs.
+    Whole,
+}
+
+impl Placement {
+    /// Whether `shard` holds `owner` under this placement.
+    fn holds(&self, owner: Address, shard: ShardId) -> bool {
+        match self {
+            Self::Read(trie) => trie.shard_for_prefix(owner) == shard,
+            Self::Whole => true,
+        }
+    }
+}
+
 /// The classification frozen onto a transaction when its block
 /// committed: the star its shape implies under the trie the block
 /// committed under, and which of its shards deliver.
@@ -52,9 +80,9 @@ pub type CrossingEdge = StarEdge<ShardId>;
 /// with no placement to freeze against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Classified {
-    /// The trie the classification was read against, and the one every
-    /// plan built from it resolves an owner through.
-    trie: Arc<ShardTrie>,
+    /// Where the classification resolves an owner, and whether it read a
+    /// placement at all.
+    placement: Placement,
     /// The star: whether the shape divides, each node's settled role and
     /// home, the core set, and every edge that crosses.
     star: Star<ShardId>,
@@ -107,6 +135,7 @@ impl Classified {
     #[must_use]
     pub fn freeze(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Self {
         let trie = Arc::new(trie.clone());
+        let placement = Placement::Read(Arc::clone(&trie));
         let star = star_at(
             legs,
             owners,
@@ -124,7 +153,7 @@ impl Classified {
             (BTreeSet::new(), BTreeSet::new())
         };
         Self {
-            trie,
+            placement,
             star,
             delivering,
             mixed,
@@ -133,19 +162,26 @@ impl Classified {
 
     /// The whole shape on every participant, with no placement read.
     #[must_use]
-    pub fn whole() -> Self {
+    pub const fn whole() -> Self {
         Self {
-            trie: Arc::new(ShardTrie::single()),
+            placement: Placement::Whole,
             star: Star::whole(),
             delivering: BTreeSet::new(),
             mixed: BTreeSet::new(),
         }
     }
 
-    /// The trie this classification was read against.
+    /// The trie this classification was read against, where it read one.
+    ///
+    /// `None` from [`Self::whole`], which answers for a participant that
+    /// runs everything — so a caller asking which owners are elsewhere
+    /// has its answer without a trie: none of them are.
     #[must_use]
-    pub fn trie(&self) -> &ShardTrie {
-        &self.trie
+    pub fn placement(&self) -> Option<&ShardTrie> {
+        match &self.placement {
+            Placement::Read(trie) => Some(trie),
+            Placement::Whole => None,
+        }
     }
 
     /// Whether `shard` only delivers for this transaction: it sits
@@ -250,10 +286,29 @@ impl Classified {
             .fold(tx.everywhere(), |total, (_, term)| {
                 total.saturating_add(*term)
             });
+        // One artifact read per package this shard instantiates, however
+        // many of that package's nodes it runs — and none for a package
+        // it runs no node of.
+        let with_artifacts = tx.artifacts().iter().fold(with_nodes, |total, artifact| {
+            if artifact
+                .nodes
+                .iter()
+                .any(|node| here.get(*node as usize).copied().unwrap_or(false))
+            {
+                total.saturating_add(DeclaredWork {
+                    read_bytes: artifact.read_bytes,
+                    ..DeclaredWork::ZERO
+                })
+            } else {
+                total
+            }
+        });
         tx.shares()
             .iter()
-            .filter(|share| self.trie.shard_for_prefix(share.owner) == shard)
-            .fold(with_nodes, |total, share| total.saturating_add(share.work))
+            .filter(|share| self.placement.holds(share.owner, shard))
+            .fold(with_artifacts, |total, share| {
+                total.saturating_add(share.work)
+            })
     }
 
     /// What `shard` attests for `tx` under `table`: the price of
@@ -416,7 +471,12 @@ impl Classified {
     /// What `local` judges: the core set if it is in it, itself
     /// otherwise.
     fn judges_for(&self, local: ShardId) -> OwnerSet {
-        let trie = Arc::clone(&self.trie);
+        let Placement::Read(trie) = &self.placement else {
+            // Nothing was placed, so nothing is elsewhere: a participant
+            // running the whole shape judges every owner in it.
+            return OwnerSet::whole();
+        };
+        let trie = Arc::clone(trie);
         if self.star.core.contains(&local) {
             let core = self.star.core.clone();
             OwnerSet::of(move |owner| core.contains(&trie.shard_for_prefix(owner)))

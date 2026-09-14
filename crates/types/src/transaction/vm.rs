@@ -309,6 +309,11 @@ pub struct Derived {
     /// publish, which invokes nothing and carries its ceiling in its
     /// publisher's share.
     pub node_terms: Vec<DeclaredWork>,
+    /// One term per distinct package the manifest calls, with the nodes
+    /// that call it. What a shard adds for each package it instantiates.
+    ///
+    /// Empty for a publish, which invokes nothing.
+    pub artifacts: Vec<ArtifactTerm>,
     /// What every shard that commits the transaction bears whatever it
     /// holds: the committed cell it writes, and the whole retention,
     /// since every validator keeps the envelope and its receipt.
@@ -355,14 +360,41 @@ pub struct OwnerShare {
 pub fn whole_work(
     shares: &[OwnerShare],
     node_terms: &[DeclaredWork],
+    artifacts: &[ArtifactTerm],
     everywhere: DeclaredWork,
 ) -> DeclaredWork {
     let with_nodes = node_terms
         .iter()
         .fold(everywhere, |total, term| total.saturating_add(*term));
-    shares
-        .iter()
-        .fold(with_nodes, |total, share| total.saturating_add(share.work))
+    // Each artifact once, however many nodes call it and however many
+    // shards instantiate it: the composer chooses neither, so the price
+    // must not depend on either.
+    let with_artifacts = artifacts.iter().fold(with_nodes, |total, artifact| {
+        total.saturating_add(DeclaredWork {
+            read_bytes: artifact.read_bytes,
+            ..DeclaredWork::ZERO
+        })
+    });
+    shares.iter().fold(with_artifacts, |total, share| {
+        total.saturating_add(share.work)
+    })
+}
+
+/// What instantiating one package the manifest calls reads, and which of
+/// its nodes call it.
+///
+/// The read is the artifact's and not any one node's: a shard pays it
+/// once however many of the manifest's nodes it runs out of that
+/// package, and every shard that instantiates the package pays it.
+/// Riding on a single node's term instead lets a shard running only the
+/// manifest's later nodes reserve nothing for an artifact it still
+/// loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactTerm {
+    /// What reading the artifact's bytes costs, once.
+    pub read_bytes: u64,
+    /// The manifest nodes this package's code runs, ascending.
+    pub nodes: Vec<u32>,
 }
 
 /// Why a derivation did not answer.
