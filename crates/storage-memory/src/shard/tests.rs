@@ -127,13 +127,17 @@ fn historical_reads_respect_retention() {
 #[test]
 fn witness_window_retention_and_recovery() {
     let storage = SimShardStorage::default();
-    test_witness_window_retention_and_recovery(&storage, || storage.load_recovered_state());
+    test_witness_window_retention_and_recovery(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let storage = SimShardStorage::default();
-    test_registers_are_monotone_and_recoverable(&storage, || storage.load_recovered_state());
+    test_registers_are_monotone_and_recoverable(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn safe_vote_registers_ignore_a_stale_chain_incarnation() {
     test_registers_ignore_a_stale_chain_incarnation(
         &storage,
         |origin| storage.consensus.write().unwrap().chain_origin = origin,
-        || storage.load_recovered_state(),
+        || storage.load_recovered_state(ShardId::ROOT),
     );
 }
 
@@ -375,7 +379,7 @@ fn a_leg_entry_holds_the_floor_to_its_horizon() {
 fn recovery_carries_the_tip_drain_total() {
     let storage = SimShardStorage::default();
     test_helpers::test_recovery_carries_the_tip_drain_total(&storage, || {
-        storage.load_recovered_state()
+        storage.load_recovered_state(ShardId::ROOT)
     });
 }
 
@@ -383,7 +387,7 @@ fn recovery_carries_the_tip_drain_total() {
 fn a_committed_bundle_outlives_the_sealing_of_its_block() {
     let storage = SimShardStorage::default();
     test_helpers::test_committed_bundle_outlives_sealing(&storage, || {
-        storage.load_recovered_state()
+        storage.load_recovered_state(ShardId::ROOT)
     });
 }
 
@@ -391,7 +395,7 @@ fn a_committed_bundle_outlives_the_sealing_of_its_block() {
 fn a_retained_bundle_drops_below_the_history_floor() {
     let storage = SimShardStorage::default();
     test_helpers::test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
-        storage.load_recovered_state()
+        storage.load_recovered_state(ShardId::ROOT)
     });
 }
 
@@ -547,7 +551,7 @@ fn test_genesis_skips_history_entries() {
 fn safe_vote_registers_recover_their_justification() {
     let storage = SimShardStorage::default();
     test_helpers::test_registers_recover_their_justification(&storage, || {
-        storage.load_recovered_state()
+        storage.load_recovered_state(ShardId::ROOT)
     });
 }
 

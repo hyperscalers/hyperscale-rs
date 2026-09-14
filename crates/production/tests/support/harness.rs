@@ -375,7 +375,7 @@ impl Harness {
     /// `shard`.
     pub fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
         let store = self.store_for(shard)?;
-        Some(store.load_recovered_state().chain_origin.anchor_wt)
+        Some(store.load_recovered_state(shard).chain_origin.anchor_wt)
     }
 
     /// The work `shard`'s committed tip leaves owing against the drain,

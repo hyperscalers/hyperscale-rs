@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{
-    DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore, replay_window,
+    BoundaryStore, DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore, replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
-    Provisions, SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
+    Provisions, SafeVoteRegisters, ShardId, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, SafeVoteRegistersCf};
@@ -22,7 +22,12 @@ impl RocksDbShardStorage {
     ///
     /// This should be called on startup before creating the state machine.
     /// Returns `RecoveredState::default()` for a fresh database.
-    pub fn load_recovered_state(&self) -> RecoveredState {
+    ///
+    /// `shard` is the shard this store is resumed as, which narrows the
+    /// escrow records to the ones it owns: a split child's cell column
+    /// is a superset of its own leaves until the sibling's are
+    /// compacted out of it.
+    pub fn load_recovered_state(&self, shard: ShardId) -> RecoveredState {
         let start = std::time::Instant::now();
         let (committed_height, committed_hash, latest_qc) = self.get_chain_metadata();
 
@@ -108,9 +113,7 @@ impl RocksDbShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
-            // Filled only by a reshape adoption, where a store inherits a
-            // prefix whole; an ordinary resume folds its own chain.
-            inherited_records: Vec::new(),
+            escrow_records: self.escrow_records(shard),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
     }

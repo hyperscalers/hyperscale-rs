@@ -603,7 +603,9 @@ mod tests {
             leaves,
         );
         assert_eq!(
-            fresh.load_recovered_state().beacon_witness_leaf_hashes,
+            fresh
+                .load_recovered_state(ShardId::ROOT)
+                .beacon_witness_leaf_hashes,
             expected_hashes,
         );
     }

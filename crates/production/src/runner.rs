@@ -508,7 +508,7 @@ impl ProductionRunnerBuilder {
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
         let mut vnode_inits: Vec<VnodeInit> = Vec::new();
         for (shard, shard_vnodes) in &seated_by_shard {
-            let recovered = storages[shard].load_recovered_state();
+            let recovered = storages[shard].load_recovered_state(*shard);
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
                 verifier: Arc::new(BlsVerifier),
                 derivation: executor.derivation(),

@@ -64,14 +64,14 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     // A cloned store carrying the predecessor's blocks composes nothing
     // twice on top of this: the replay walk stops at this chain's own
     // origin, so it never reaches a block the predecessor committed.
-    let inherited_records = storage.escrow_records(shard);
+    let escrow_records = storage.escrow_records(shard);
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),
         origin,
         substate_bytes,
         predecessors,
-        inherited_records,
+        escrow_records,
     )
 }
 
@@ -86,7 +86,7 @@ fn verified_recovered_state(
     origin: ChainOrigin,
     substate_bytes: u64,
     predecessors: Vec<PredecessorTerminal>,
-    inherited_records: Vec<(SubstateKey, Vec<u8>)>,
+    escrow_records: Vec<(SubstateKey, Vec<u8>)>,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
@@ -97,7 +97,7 @@ fn verified_recovered_state(
         substate_bytes,
         chain_origin: origin,
         predecessors,
-        inherited_records,
+        escrow_records,
         ..RecoveredState::default()
     })
 }

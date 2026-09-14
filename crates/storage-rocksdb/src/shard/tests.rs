@@ -141,7 +141,9 @@ fn historical_reads_respect_retention() {
 #[test]
 fn witness_window_retention_and_recovery() {
     let (_dir, storage) = open_fresh();
-    test_witness_window_retention_and_recovery(&storage, || storage.load_recovered_state());
+    test_witness_window_retention_and_recovery(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
@@ -220,7 +222,10 @@ fn recovered_state_carries_substate_bytes() {
         commit_writes(&storage, &make_settled_writes(h, 1, vec![1]));
     }
 
-    assert_eq!(storage.load_recovered_state().substate_bytes, 3);
+    assert_eq!(
+        storage.load_recovered_state(ShardId::ROOT).substate_bytes,
+        3
+    );
 }
 
 #[test]
@@ -236,7 +241,7 @@ fn test_recovery_resumes_at_correct_height() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let recovered = storage.load_recovered_state();
+        let recovered = storage.load_recovered_state(ShardId::ROOT);
 
         assert_eq!(recovered.committed_height, BlockHeight::new(50));
         assert_eq!(
@@ -288,7 +293,7 @@ fn test_recovery_with_qc() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let recovered = storage.load_recovered_state();
+        let recovered = storage.load_recovered_state(ShardId::ROOT);
 
         assert_eq!(recovered.committed_height, BlockHeight::new(100));
         assert_eq!(recovered.committed_hash, Some(expected_hash));
@@ -319,7 +324,7 @@ fn test_recovery_seeds_committed_anchor_from_parent_qc() {
     }
 
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let recovered = storage.load_recovered_state();
+    let recovered = storage.load_recovered_state(ShardId::ROOT);
 
     // The anchor is the committed tip's *parent* QC weighted timestamp (the
     // genesis QC's zero here), read back from the tip's stored header — not the
@@ -359,7 +364,7 @@ fn test_recovery_seeds_committee_anchor_from_the_header_below_the_tip() {
     }
 
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let recovered = storage.load_recovered_state();
+    let recovered = storage.load_recovered_state(ShardId::ROOT);
 
     // A block's committee keys on its parent, so the committee that signed the
     // tip anchors one height below it. Recovering only the tip's own anchor
@@ -380,7 +385,7 @@ fn test_empty_state_on_fresh_database() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let recovered = storage.load_recovered_state();
+    let recovered = storage.load_recovered_state(ShardId::ROOT);
 
     assert_eq!(recovered.committed_height, BlockHeight::new(0));
     assert!(recovered.committed_hash.is_none());
@@ -996,13 +1001,17 @@ fn test_genesis_skips_history_entries() {
 fn safe_vote_registers_recover_their_justification() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_registers_recover_their_justification(&storage, || storage.load_recovered_state());
+    test_registers_recover_their_justification(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let (_dir, storage) = open_fresh();
-    test_registers_are_monotone_and_recoverable(&storage, || storage.load_recovered_state());
+    test_registers_are_monotone_and_recoverable(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
@@ -1015,7 +1024,7 @@ fn safe_vote_registers_ignore_a_stale_chain_incarnation() {
             write_chain_origin(&mut batch, origin);
             storage.db.write(batch).unwrap();
         },
-        || storage.load_recovered_state(),
+        || storage.load_recovered_state(ShardId::ROOT),
     );
 }
 
@@ -1035,7 +1044,7 @@ fn safe_vote_registers_survive_reopen() {
 
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(reopened.safe_vote_registers(v1), Some(registers(3, 5)));
-    let recovered = reopened.load_recovered_state();
+    let recovered = reopened.load_recovered_state(ShardId::ROOT);
     assert_eq!(
         recovered.safe_vote_registers.get(&v1),
         Some(&registers(3, 5))
@@ -1068,14 +1077,18 @@ fn safe_vote_registers_writes_are_monotone_across_a_reopen() {
 fn recovery_carries_the_tip_drain_total() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_recovery_carries_the_tip_drain_total(&storage, || storage.load_recovered_state());
+    test_recovery_carries_the_tip_drain_total(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 #[test]
 fn a_committed_bundle_outlives_the_sealing_of_its_block() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_committed_bundle_outlives_sealing(&storage, || storage.load_recovered_state());
+    test_committed_bundle_outlives_sealing(&storage, || {
+        storage.load_recovered_state(ShardId::ROOT)
+    });
 }
 
 /// Storing the bodies is only worth anything if they outlive the process
@@ -1104,7 +1117,7 @@ fn a_committed_bundle_survives_a_reopen() {
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(
         reopened
-            .load_recovered_state()
+            .load_recovered_state(ShardId::ROOT)
             .retained_provisions
             .iter()
             .map(|bundle| bundle.hash())
@@ -1118,7 +1131,7 @@ fn a_retained_bundle_drops_below_the_history_floor() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
-        storage.load_recovered_state()
+        storage.load_recovered_state(ShardId::ROOT)
     });
 }
 

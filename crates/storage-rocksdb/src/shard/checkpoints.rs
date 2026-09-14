@@ -895,7 +895,9 @@ mod tests {
     fn escrow_records_are_read_off_the_state() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_escrow_records_are_read_off_the_state(&storage);
+        test_escrow_records_are_read_off_the_state(&storage, |shard| {
+            storage.load_recovered_state(shard)
+        });
     }
 
     #[test]

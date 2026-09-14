@@ -118,7 +118,7 @@ impl SimulationRunner {
         validators: &[ValidatorId],
         storage: SimShardStorage,
     ) -> JoinKind {
-        let recovered = storage.load_recovered_state();
+        let recovered = storage.load_recovered_state(shard);
         let (recovered, kind) = if recovered.committed_height > BlockHeight::GENESIS {
             let committed_height = recovered.committed_height;
             (recovered, JoinKind::Retained { committed_height })
@@ -263,7 +263,8 @@ impl SimulationRunner {
                         // starts again from an empty store against the anchor
                         // that has since advanced.
                         .filter(|storage| {
-                            storage.load_recovered_state().committed_height > BlockHeight::GENESIS
+                            storage.load_recovered_state(shard).committed_height
+                                > BlockHeight::GENESIS
                         })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);

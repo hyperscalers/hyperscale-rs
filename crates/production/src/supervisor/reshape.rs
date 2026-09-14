@@ -260,7 +260,7 @@ impl ShardSupervisor {
                 // would lack the global engine nodes (the transaction tracker,
                 // the consensus manager) every transaction reads.
                 engine_bootstrap.replicate_into(storage.as_ref());
-                let recovered = storage.load_recovered_state();
+                let recovered = storage.load_recovered_state(shard);
                 Ok((storage, recovered))
             })();
             // Send failure means the runner is shutting down.
@@ -310,7 +310,7 @@ impl ShardSupervisor {
                     .checkpoint_into(&dir)
                     .map_err(|e| format!("child checkpoint: {e}"))?;
                 let storage = factory(child)?;
-                let recovered = storage.load_recovered_state();
+                let recovered = storage.load_recovered_state(child);
                 Ok((storage, recovered))
             })();
             // Send failure means the runner is shutting down.

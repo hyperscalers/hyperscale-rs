@@ -84,7 +84,8 @@ impl Budget {
     }
 }
 
-/// An inherited escrow record, and where its one question stands.
+/// An escrow record this shard holds, and where its one question
+/// stands.
 ///
 /// One question, to one shard: is the claim cell this record names
 /// present? So the bookkeeping is one height rather than a probe —
@@ -92,7 +93,7 @@ impl Budget {
 /// sequence, and no record to compose, because the answer is a reading
 /// and a reading is block content already.
 #[derive(Debug, Clone)]
-pub struct Inherited {
+pub struct HeldRecord {
     /// The record leaf, which carries the claim key, the issuing
     /// transaction and the expiry every window is read off.
     pub cell: CrossingCell,
@@ -104,10 +105,10 @@ pub struct Inherited {
     pub answer: Option<Inclusion>,
 }
 
-impl Inherited {
-    /// The record as it arrives at a seat: undisposed, unasked.
+impl HeldRecord {
+    /// The record as the leaves give it: undisposed, unasked.
     #[must_use]
-    pub const fn seated(cell: CrossingCell) -> Self {
+    pub const fn of(cell: CrossingCell) -> Self {
         Self {
             cell,
             asked_at: None,
@@ -124,13 +125,12 @@ impl Inherited {
     }
 }
 
-/// Whether any undisposed inherited record is still waiting on `key`.
+/// Whether any undisposed record is still waiting on `key`.
 ///
-/// Read off the keys rather than off a name, because an inherited
-/// record names no transaction this chain committed.
-fn awaited_by(inherited: &BTreeMap<SubstateKey, Inherited>, key: SubstateKey) -> bool {
-    inherited
-        .values()
+/// Read off the keys rather than off a name, because a record's issuing
+/// transaction need not be one this chain committed.
+fn awaited_by(held: &BTreeMap<SubstateKey, HeldRecord>, key: SubstateKey) -> bool {
+    held.values()
         .any(|record| record.answer.is_none() && record.cell.consumer_claim == key)
 }
 
@@ -215,18 +215,18 @@ pub struct Counterparts {
     /// committed height compose the same records.
     fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
 
-    /// The escrow records this shard inherited with a prefix, each still
+    /// The escrow records this shard holds under its prefix, each still
     /// undisposed, by cell key.
     ///
-    /// A seat's store arrives holding value its predecessors escrowed
-    /// and nothing else names it: its ledger begins empty, no body
-    /// arrives with the leaves, and the chains that issued the crossings
-    /// have ended, so no counterpart record will ever be composed about
-    /// them. What is left is the claim cell each record names, and the
-    /// leaf carries every term needed to ask about it. Held here rather
-    /// than beside the tick machine because the question is a
-    /// counterpart's to answer, like every other question in this file.
-    pub(crate) inherited: BTreeMap<SubstateKey, Inherited>,
+    /// Read from the leaves whatever brought the store here. A seat's
+    /// ledger begins empty and a restart replays only a window, so for
+    /// records older than either there is no entry to name them — and
+    /// the leaf carries every term needed to ask about one: the claim
+    /// cell, the issuing transaction, and the expiry every window is
+    /// read off. Held here rather than beside the tick machine because
+    /// the question is a counterpart's to answer, like every other
+    /// question in this file.
+    pub(crate) held: BTreeMap<SubstateKey, HeldRecord>,
     /// The questions this validator has put to counterparts, by the
     /// shard asked and the cell: the header each was asked at, and
     /// whether the fetch returned. A probe lives while its question is
@@ -251,16 +251,16 @@ impl Counterparts {
             proven_anchors,
             proven_cells,
             fetched: BTreeMap::new(),
-            inherited: BTreeMap::new(),
+            held: BTreeMap::new(),
             probes: BTreeMap::new(),
         }
     }
 
-    /// As [`Self::new`], holding the escrow records a reshape seat
-    /// imported with its prefix. A leaf that does not decode is one no
+    /// As [`Self::new`], holding the escrow records the store gives for
+    /// this shard's prefix. A leaf that does not decode is one no
     /// disposal could be composed from, so it is dropped rather than
     /// held.
-    pub fn seated(
+    pub fn holding(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
         proven_cells: Arc<ProvenCells>,
@@ -268,10 +268,10 @@ impl Counterparts {
         records: &[(SubstateKey, Vec<u8>)],
     ) -> Self {
         let mut counterparts = Self::new(local_shard, proven_anchors, proven_cells, mirror);
-        counterparts.inherited = records
+        counterparts.held = records
             .iter()
             .filter_map(|(key, value)| {
-                Some((*key, Inherited::seated(CrossingCell::from_bytes(value)?)))
+                Some((*key, HeldRecord::of(CrossingCell::from_bytes(value)?)))
             })
             .collect();
         counterparts
@@ -470,11 +470,11 @@ impl Counterparts {
             );
             wanted.entry(anchor).or_default().push(key);
         }
-        // The records this shard inherited ask one question each, of
+        // The records this shard holds ask one question each, of
         // whoever holds the claim's prefix now. Nothing is asked of a
         // claim this shard holds itself — the tick reads that cell
         // directly — and nothing is asked twice at one header.
-        for record in self.inherited.values_mut() {
+        for record in self.held.values_mut() {
             if record.answer.is_some() {
                 continue;
             }
@@ -585,13 +585,13 @@ impl Counterparts {
                 record_reclaim_probe_pending();
             }
         }
-        // An inherited record names no transaction, so what it wants is
-        // read off the keys.
+        // A held record names no transaction of this chain's, so what
+        // it wants is read off the keys.
         answering.extend(
             inclusions
                 .iter()
                 .map(|(key, _)| *key)
-                .filter(|key| awaited_by(&self.inherited, *key)),
+                .filter(|key| awaited_by(&self.held, *key)),
         );
         if answering.is_empty() {
             return;
@@ -631,12 +631,12 @@ impl Counterparts {
         let mut actions = Vec::new();
         for claim in block.state_claims() {
             actions.extend(self.fold_cells(claim, &questions));
-            self.fold_inherited(claim, trie);
+            self.fold_held(claim, trie);
         }
         actions
     }
 
-    /// Read a committed proof against the claims the inherited records
+    /// Read a committed proof against the claims the held records
     /// are waiting on.
     ///
     /// Judged by the same per-word rule the ledger's cells are: a
@@ -646,8 +646,8 @@ impl Counterparts {
     /// which for a record whose consumer's role the leaf does not name
     /// is the lapse — past it no core of any arity can still commit, so
     /// the silence is final.
-    fn fold_inherited(&mut self, stated: &StateClaim, trie: &ShardTrie) {
-        for record in self.inherited.values_mut() {
+    fn fold_held(&mut self, stated: &StateClaim, trie: &ShardTrie) {
+        for record in self.held.values_mut() {
             if record.answer.is_some() {
                 continue;
             }
@@ -802,16 +802,13 @@ impl Counterparts {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an
-        // inherited record whose claim it speaks to. The second has no
+        // held record whose claim it speaks to. The second has no
         // transaction here at all, which is why the keys are read rather
         // than the names.
-        let inherited = &self.inherited;
+        let held = &self.held;
         self.fetched.retain(|claim, answered| {
             answered.iter().any(|tx_hash| unresolved.contains(*tx_hash))
-                || claim
-                    .cells
-                    .iter()
-                    .any(|(key, _)| awaited_by(inherited, *key))
+                || claim.cells.iter().any(|(key, _)| awaited_by(held, *key))
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
