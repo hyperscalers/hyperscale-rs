@@ -36,6 +36,7 @@ use hyperscale_scenarios::{
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_priority_is_charged_over_the_table_price, a_published_package_matures_before_it_runs,
     a_record_is_decided_by_the_successor_when_its_issuer_splits,
+    a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
@@ -64,12 +65,12 @@ use hyperscale_scenarios::{
     halted_shard_straddler_atomic, hot_recipient, hot_venue_clears_swaps,
     hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
-    livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
-    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    merge_train_genesis_accounts, merging_caller_genesis_accounts,
-    minority_fragment_rejoins_after_partition, multi_vnode_progress,
-    nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
-    partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
+    late_departing_route_genesis_accounts, livelock_resolves_promptly, liveness_baseline,
+    merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
+    merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
+    merging_caller_genesis_accounts, minority_fragment_rejoins_after_partition,
+    multi_vnode_progress, nullifier_race_admits_exactly_one, participant_count_sweep,
+    partition_halts_and_heals, partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
@@ -1354,6 +1355,29 @@ fn a_swap_committed_after_the_venues_cut_is_disposed_once_sim() {
 fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     let mut cluster = departing_route_cluster();
     cluster.run_faultable(a_route_into_a_departing_venue_releases_the_survivors_hold);
+}
+
+/// [`departing_route_cluster`] with the split threshold above every leaf
+/// the grow reaches, so the only departure after it is the one the
+/// scenario votes for.
+fn late_departing_route_cluster() -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 18,
+            split_bytes: 300_000,
+            ..cross_shard_config()
+        },
+        42,
+        &late_departing_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+#[test]
+fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_route_committed_before_its_departure_was_voted_still_resolves);
 }
 
 /// The route topology grown to four shards on dedicated pool hosts, with
