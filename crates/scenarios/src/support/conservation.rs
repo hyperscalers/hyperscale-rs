@@ -217,8 +217,23 @@ impl Charges {
 
     /// What the recorded transactions that were charged burned between
     /// them.
+    ///
+    /// # Panics
+    ///
+    /// On a cluster whose price band is open. The figure is read once
+    /// the verdict is in, which is epochs after submission, and it
+    /// prices against the head table — while the chain charged at the
+    /// window its committing block anchored. Those are one table only
+    /// while the level cannot move, so a conservation check spanning a
+    /// fold would report its own arithmetic as stranded value.
     #[must_use]
     pub fn burned<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        let bounds = c.beacon_state().map(|state| state.params.price_bounds);
+        assert!(
+            bounds.is_none_or(|band| band.floor == band.ceiling),
+            "conservation prices at the head table and cannot span a \
+             price band: {bounds:?}"
+        );
         self.owed
             .iter()
             .filter(|(hash, _)| self.is_charged(c, **hash))
