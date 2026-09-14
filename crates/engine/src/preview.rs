@@ -144,18 +144,42 @@ impl Executor {
         trie: &ShardTrie,
         held: &BTreeSet<ShardId>,
     ) -> Result<BTreeMap<ShardId, DeclaredReads>, String> {
-        if tx.body().call_tree().is_none() {
-            // A publish writes its own two cells and reads nobody
-            // else's, so there is nothing to fan out for.
-            return Ok(BTreeMap::new());
+        let mut by_shard: BTreeMap<ShardId, DeclaredReads> = BTreeMap::new();
+        // A publish writes its own two cells and reads nobody else's, so
+        // its fee vault below is the whole of what it fans out for.
+        if tx.body().call_tree().is_some() {
+            self.declared_reads(tx, trie, held, &mut by_shard)?;
         }
+        // The fee payer's vault, which the charge reads and no
+        // declaration names. Added once: a payer spending its own vault
+        // already named it, and asking twice buys two leaves of one
+        // shard's proof and two spends of its query budget.
+        let vault = vault_key(tx.body().fee_payer, *PROTOCOL_RESOURCE);
+        let shard = trie.shard_for_prefix(vault.owner);
+        if !held.contains(&shard) {
+            let asks = by_shard.entry(shard).or_default();
+            if !asks.keys.contains(&vault) {
+                asks.keys.push(vault);
+            }
+        }
+        Ok(by_shard)
+    }
+
+    /// What the declaration alone reaches, bucketed by the shard that
+    /// holds it.
+    fn declared_reads(
+        &self,
+        tx: &Transaction,
+        trie: &ShardTrie,
+        held: &BTreeSet<ShardId>,
+        by_shard: &mut BTreeMap<ShardId, DeclaredReads>,
+    ) -> Result<(), String> {
         let (prepared, _) = Self::prepare_admitting(
             tx,
             &self.records(),
             &self.world.cache,
             TargetAuthority::Assumed,
         )?;
-        let mut by_shard: BTreeMap<ShardId, DeclaredReads> = BTreeMap::new();
         for target in prepared.declaration.set.targets() {
             let owner = match target {
                 EffectTarget::Point(key) => key.owner,
@@ -194,7 +218,7 @@ impl Executor {
                 }),
             }
         }
-        Ok(by_shard)
+        Ok(())
     }
 }
 
@@ -227,19 +251,30 @@ impl Holds {
         self.shards.contains(&self.trie.shard_for_prefix(owner))
     }
 
-    /// The shards `declared` reaches that neither this node holds nor a
-    /// fan-out answered for.
-    fn missing(&self, declared: &EffectSet) -> BTreeSet<ShardId> {
+    /// The shard `owner`'s cells live on, if neither this node nor a
+    /// fan-out can answer for it.
+    fn unanswered(&self, owner: Address) -> Option<ShardId> {
+        let shard = self.trie.shard_for_prefix(owner);
+        (!self.shards.contains(&shard) && !self.fetched.anchors.contains_key(&shard))
+            .then_some(shard)
+    }
+
+    /// The shards `declared` and the fee payer's vault reach that
+    /// neither this node holds nor a fan-out answered for.
+    ///
+    /// The vault beside the declaration because the charge reads it and
+    /// no declaration names it: a composer paying out of an account on
+    /// another shard is the ordinary cross-shard case, and a cell nobody
+    /// was asked for is not an empty cell.
+    fn missing(&self, declared: &EffectSet, payer: Address) -> BTreeSet<ShardId> {
         declared
             .iter()
             .map(|effect| match effect.target {
                 EffectTarget::Point(key) => key.owner,
                 EffectTarget::Entry { owner, .. } | EffectTarget::Range { owner, .. } => owner,
             })
-            .map(|owner| self.trie.shard_for_prefix(owner))
-            .filter(|shard| {
-                !self.shards.contains(shard) && !self.fetched.anchors.contains_key(shard)
-            })
+            .chain(std::iter::once(payer))
+            .filter_map(|owner| self.unanswered(owner))
             .collect()
     }
 }
@@ -534,7 +569,23 @@ impl Executor {
         // envelope derivation refuses — the exact envelope a preview
         // exists to give an answer about.
         let vault = vault_key(vm.fee_payer, *PROTOCOL_RESOURCE);
+        // Local cells and fetched ones through the one call: which store
+        // answered is the routing's business and nothing below it.
+        let cells = PreviewCells {
+            local: snapshot,
+            holds: &inputs.holds,
+        };
         if let Some(artifact) = vm.artifact() {
+            // The report says what the charge would leave, which is a
+            // reading of the payer's vault. A node that cannot answer
+            // for it names the shard rather than reporting a cell it
+            // asked nobody about.
+            if let Some(shard) = inputs.holds.unanswered(vault.owner) {
+                return PreviewReport::refused(format!(
+                    "this node holds {:?} and the fee payer's vault is on {shard:?}",
+                    inputs.holds.shards
+                ));
+            }
             let payer = PayerFee {
                 vault,
                 max_fee: vm.max_fee,
@@ -547,7 +598,7 @@ impl Executor {
                 },
                 abortable: false,
             };
-            return preview_publish(snapshot, artifact, payer, inputs.grants);
+            return preview_publish(&cells, artifact, payer, inputs.grants);
         }
 
         let authority = if inputs.grants.assume_target_auth {
@@ -582,7 +633,7 @@ impl Executor {
         // refuse the withdrawal over it, and the report would name a
         // verdict the chain never reaches. So the shards are checked
         // before the run rather than the run explaining itself after.
-        let missing = inputs.holds.missing(&prepared.declaration.set);
+        let missing = inputs.holds.missing(&prepared.declaration.set, vault.owner);
         if !missing.is_empty() {
             return PreviewReport::refused(format!(
                 "this node holds {:?} and the transaction reads cells on {missing:?}",
@@ -594,12 +645,6 @@ impl Executor {
         // baseline it reads, and total locality covers every cell the
         // envelope touches.
         let mut base = TickBaseline::default();
-        // Local cells and fetched ones through the one call: which store
-        // answered is the routing's business and nothing below it.
-        let cells = PreviewCells {
-            local: snapshot,
-            holds: &inputs.holds,
-        };
         materialize_declared(
             &cells,
             &prepared.declaration.set,
@@ -840,21 +885,38 @@ mod tests {
             shards: BTreeSet::from([held]),
             fetched: FetchedCells::default(),
         };
+        let on = |shard| {
+            [owner(0x00), owner(0xFF)]
+                .into_iter()
+                .find(|o| trie.shard_for_prefix(*o) == shard)
+                .expect("one of the fixture's two owners is on each shard")
+        };
         assert_eq!(
-            local_only.missing(&declared),
+            local_only.missing(&declared, on(held)),
             BTreeSet::from([remote]),
             "with no fan-out behind it, the far shard is one this node cannot answer about"
+        );
+
+        // And the fee payer's vault answers to the same rule though no
+        // declaration names it: a sponsored transfer whose manifest is
+        // entirely local still reads a cell on the payer's own shard,
+        // and a cell nobody was asked for is not an empty cell.
+        assert_eq!(
+            local_only.missing(&EffectSet::new(), on(remote)),
+            BTreeSet::from([remote]),
+            "a payer this node cannot answer for refuses the preview \
+             rather than reading its vault as zero"
         );
 
         let mut fetched = FetchedCells::default();
         fetched.anchors.insert(remote, BlockHeight::new(9));
         let fanned_out = Holds {
-            trie,
+            trie: trie.clone(),
             shards: BTreeSet::from([held]),
             fetched,
         };
         assert!(
-            fanned_out.missing(&declared).is_empty(),
+            fanned_out.missing(&declared, on(held)).is_empty(),
             "a shard that answered is one the preview can speak for"
         );
     }
