@@ -17,7 +17,7 @@ use crate::{
     ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeclaredKey, Derivation,
     DerivationError, Derived, EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, ShardLoad,
     SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubintentSig, TickHalf, TickId,
     TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
     TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
@@ -341,6 +341,12 @@ pub fn make_live_block(
         proposer,
         timestamp: ProposerTimestamp::from_millis(timestamp_ms),
         provision_tx_roots: std::collections::BTreeMap::new(),
+        // A chain contiguous from genesis: one committed block per
+        // height, none of which carried anything.
+        load: ShardLoad {
+            blocks: height.inner(),
+            ..ShardLoad::ZERO
+        },
         ..Default::default()
     });
     let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions

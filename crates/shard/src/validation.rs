@@ -250,7 +250,8 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 
 /// The header's running totals must be their parent's advanced by what
 /// this block carries: the fee total by what its certificates charged,
-/// the declared one by what its transactions reserve on this shard.
+/// the declared one by what its transactions reserve on this shard, and
+/// the block count by one.
 ///
 /// `used` is the transactions section's own fold, handed back rather
 /// than summed a second time: what a header claims its blocks reserved
@@ -294,6 +295,19 @@ fn validate_block_work(
             "header claims the chain has reserved {:?} but the parent's \
              {:?} plus this block's {used:?} is {:?}",
             claimed.used, parent_load.used, expected.used,
+        ));
+    }
+    // The count is the denominator `used` is read against: the beacon
+    // differences two of these records to reach the capacity those
+    // blocks had, and both the price controller and the fullness mean
+    // divide by it. Left unchecked, a proposer freezing its own counter
+    // reads as saturated forever and one inflating it drags the
+    // network-wide ratio toward zero.
+    if claimed.blocks != expected.blocks {
+        return Err(format!(
+            "header claims the chain has committed {} blocks but the \
+             parent's {} plus this one is {}",
+            claimed.blocks, parent_load.blocks, expected.blocks,
         ));
     }
     Ok(())
@@ -542,6 +556,12 @@ mod tests {
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round: Round::new(0),
             provision_tx_roots: std::collections::BTreeMap::new(),
+            // A chain contiguous from genesis: one committed block per
+            // height, none of which carried anything.
+            load: ShardLoad {
+                blocks: height.inner(),
+                ..ShardLoad::ZERO
+            },
             ..Default::default()
         })
     }
@@ -961,6 +981,29 @@ mod tests {
     // validate_transaction_ordering
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// An otherwise empty block whose header claims `load`.
+    fn block_claiming(height: BlockHeight, load: ShardLoad) -> Block {
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height,
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                proposer: ValidatorId::new(height.inner() % 4),
+                timestamp: ProposerTimestamp::from_millis(100_000),
+                round: Round::new(0),
+                provision_tx_roots: std::collections::BTreeMap::new(),
+                load,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
+        }
+    }
+
     fn block_with_transactions(
         height: BlockHeight,
         transactions: Vec<Arc<Verifiable<Transaction>>>,
@@ -1283,10 +1326,13 @@ mod tests {
         };
         let parent = ShardLoad::ZERO.advance(500, reserved, None);
         // The fixture carries no certificates and no transactions, so the
-        // honest claim is the parent's totals unchanged.
+        // honest claim is an empty chain's totals with the count at one.
         let honest = block_with_transactions(BlockHeight::new(1), Vec::new());
         assert_eq!(honest.charged(), 0);
-        assert_eq!(honest.header().load(), ShardLoad::ZERO);
+        assert_eq!(
+            honest.header().load(),
+            ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None)
+        );
 
         // Claiming zero against a parent that has consumed 500 understates,
         // and is refused just as an overstatement is.
@@ -1305,6 +1351,43 @@ mod tests {
 
         // An unresolvable parent load abstains rather than rejecting.
         assert!(validate_block_work(&honest, None, DeclaredWork::ZERO).is_ok());
+    }
+
+    /// The block count is held to the same rule as the totals it is the
+    /// denominator of.
+    ///
+    /// The beacon differences two of these records to reach the capacity
+    /// those blocks had, so a count a proposer chose freely is a
+    /// utilization it chose freely: frozen, the shard reads as saturated
+    /// however little it carried; inflated, it drags the network-wide
+    /// ratio every price row steps on toward zero.
+    #[test]
+    fn a_header_cannot_choose_the_count_its_utilization_divides_by() {
+        let parent = ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None);
+
+        // Frozen at the parent's, so an epoch of blocks differences to no
+        // capacity at all.
+        let frozen = block_claiming(BlockHeight::new(2), parent);
+        let err = validate_block_work(&frozen, Some(parent), DeclaredWork::ZERO).unwrap_err();
+        assert!(err.contains("has committed"), "{err}");
+
+        // And inflated, which is the same freedom pointed the other way.
+        let inflated = block_claiming(
+            BlockHeight::new(2),
+            ShardLoad {
+                blocks: 1_000_000,
+                ..parent
+            },
+        );
+        let err = validate_block_work(&inflated, Some(parent), DeclaredWork::ZERO).unwrap_err();
+        assert!(err.contains("has committed"), "{err}");
+
+        // One on from the parent is the only claim that passes.
+        let honest = block_claiming(
+            BlockHeight::new(2),
+            parent.advance(0, DeclaredWork::ZERO, None),
+        );
+        assert!(validate_block_work(&honest, Some(parent), DeclaredWork::ZERO).is_ok());
     }
 
     /// An abort is charged like anything else, so a block settling
