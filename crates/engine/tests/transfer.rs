@@ -2220,9 +2220,49 @@ fn derivation_tells_a_gap_from_a_refusal() {
         .try_derived(engine.derivation().as_ref())
         .expect_err("nothing answers for it yet");
     assert_eq!(
-        error.unresolved(),
-        [unsealed.address()],
+        error.unresolved().map(|wanted| wanted.instances.as_slice()),
+        Some([unsealed.address()].as_slice()),
         "the record a fetch would ask for: {error}"
+    );
+
+    // The second link of the same chain. This node holds the record —
+    // the envelope carries it — and does not hold the code it names, so
+    // derivation names the package rather than refusing. The two are
+    // reported in turn and not together: a record is what says which
+    // package a target runs, so what is missing behind one is only
+    // knowable once it is in hand.
+    let protocol = Executor::with_genesis(&[], &GenesisPackages::protocol(), ExecutionMode::Serial);
+    let mut b = GraphBuilder::new();
+    let [] = b.call(unsealed, "draw", (64u64,));
+    let graph = b.build().expect("every output is consumed");
+    let carried = Transaction::new(client().sign_tree(
+        &EnvelopeTree {
+            root: IntentDecl {
+                header: HEADER,
+                graph,
+                sockets: Vec::new(),
+            },
+            root_bindings: Vec::new(),
+            subintents: Vec::new(),
+            instances: vec![meta],
+            resources: Vec::new(),
+        },
+        Vec::new(),
+        &key,
+        terms(TRANSFER_FEE),
+    ));
+    let error = carried
+        .try_derived(protocol.derivation().as_ref())
+        .expect_err("a node holding no fixture code cannot say what this declares");
+    let wanted = error.unresolved().expect("a gap, not a refusal");
+    assert!(
+        wanted.instances.is_empty(),
+        "the carried record answers for the target: {error}"
+    );
+    assert_eq!(
+        wanted.packages,
+        [Hash::from(lottery_package_hash(&ProtocolHasher).0)],
+        "the package a fetch would ask for: {error}"
     );
 
     // A refusal, by contrast, names nothing to fetch: the account
@@ -2251,7 +2291,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
         .try_derived(engine.derivation().as_ref())
         .expect_err("a deposit takes a bucket");
     assert!(
-        error.unresolved().is_empty(),
+        error.unresolved().is_none(),
         "a refusal names nothing to fetch: {error}"
     );
 }
@@ -3210,8 +3250,10 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         .try_derived(executor.derivation().as_ref())
         .expect_err("an unresolved instance target does not derive");
     assert_eq!(
-        refusal.unresolved(),
-        [component.address()],
+        refusal
+            .unresolved()
+            .map(|wanted| wanted.instances.as_slice()),
+        Some([component.address()].as_slice()),
         "the record this node would need, named: {refusal}"
     );
 

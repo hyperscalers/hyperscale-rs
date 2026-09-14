@@ -503,8 +503,11 @@ where
             ShardScopedInput::PackageArtifactsFetched { artifacts } => {
                 self.handle_package_artifacts_fetched(artifacts);
             }
-            ShardScopedInput::InstanceRecordsWanted { wanted } => {
-                self.defer_for_instance_records(wanted);
+            ShardScopedInput::PackagesInstalled { packages } => {
+                self.handle_packages_installed(&packages);
+            }
+            ShardScopedInput::RecordsWanted { wanted } => {
+                self.defer_for_records(wanted);
             }
             ShardScopedInput::InstanceRecordsFetched { records } => {
                 self.handle_instance_records_fetched(records);

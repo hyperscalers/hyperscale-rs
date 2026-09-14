@@ -175,6 +175,34 @@ where
             }
         }
         drop(snapshot);
+        self.request_artifacts(by_shard);
+    }
+
+    /// Ask for the artifacts an envelope's derivation named and this
+    /// node cannot resolve.
+    ///
+    /// The demand-driven half of the same acquisition the registry walk
+    /// prefetches: a package reaches a node either because the chain
+    /// registered it or because something asked to run it, and both ask
+    /// the shard the content address picks.
+    pub(crate) fn fetch_wanted_packages(&mut self, packages: Vec<Hash>) {
+        let executor = Arc::clone(&self.process.dispatch_handles.executor);
+        let snapshot = self.process.topology_snapshot.load();
+        let mut by_shard: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
+        for package in packages {
+            if executor.needs_artifact(package) {
+                by_shard
+                    .entry(snapshot.shard_trie().shard_for_prefix(custodian(package)))
+                    .or_default()
+                    .push(package);
+            }
+        }
+        drop(snapshot);
+        self.request_artifacts(by_shard);
+    }
+
+    /// Drive one artifact fetch per shard asked.
+    fn request_artifacts(&mut self, by_shard: BTreeMap<ShardId, Vec<Hash>>) {
         for (shard, ids) in by_shard {
             self.drive_fetch::<PackageArtifactBinding>(FetchInput::Request {
                 ids,
@@ -206,6 +234,9 @@ where
     pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: Vec<(Hash, Vec<u8>)>) {
         let ids: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
         let handles = Arc::clone(&self.process.dispatch_handles);
+        let events = self.event_sender().clone();
+        let shard = self.shard;
+        let installed = ids.clone();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
@@ -218,7 +249,27 @@ where
                         .beacon_storage
                         .store_fetched_package(package, &artifact);
                 }
+                // From inside the install: an envelope waiting on this
+                // package derives on the strength of this, and the
+                // metadata has to be seated before that is true.
+                push_shard_input(
+                    &events,
+                    shard,
+                    ShardScopedInput::PackagesInstalled {
+                        packages: installed,
+                    },
+                );
             });
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
+    }
+
+    /// Offer the envelopes that were waiting on `packages` again.
+    ///
+    /// Runs on the loop, like the record seating it mirrors: what
+    /// follows is the re-admission, which has to see the cache the
+    /// install just grew.
+    pub(crate) fn handle_packages_installed(&mut self, packages: &[Hash]) {
+        let arrived: Vec<Address> = packages.iter().copied().map(custodian).collect();
+        self.release_deferred(&arrived);
     }
 }

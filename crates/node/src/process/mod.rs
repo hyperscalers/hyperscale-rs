@@ -29,8 +29,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::{
-    Address, Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule,
-    Transaction, ValidatorId, Verifier,
+    Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule, Transaction,
+    Unresolved, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -473,11 +473,11 @@ where
             // node has not seen, and the same envelope derives wherever
             // they landed, so it waits on a hosted shard while the fetch
             // runs instead of being dropped at the door.
-            let instances = error.unresolved().to_vec();
-            if !instances.is_empty()
+            let wanted = error.unresolved().cloned().unwrap_or_default();
+            if !wanted.is_empty()
                 && let Some(host) = self.shard_event_senders.load().keys().copied().next()
             {
-                return SubmitFanout::WantsRecords { host, instances };
+                return SubmitFanout::WantsRecords { host, wanted };
             }
             tracing::warn!(
                 reason = %error,
@@ -575,15 +575,15 @@ where
                 tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
                 ok = false;
             }
-            SubmitFanout::WantsRecords { host, instances } => {
+            SubmitFanout::WantsRecords { host, wanted } => {
                 let env = HostEvent::shard(
                     host,
-                    ShardScopedInput::InstanceRecordsWanted {
-                        wanted: vec![DeferredTransaction {
-                            tx: Arc::clone(tx),
-                            instances,
-                            origin: DeferredOrigin::Submission,
-                        }],
+                    ShardScopedInput::RecordsWanted {
+                        wanted: vec![DeferredTransaction::new(
+                            Arc::clone(tx),
+                            wanted,
+                            DeferredOrigin::Submission,
+                        )],
                     },
                 );
                 if self.shard_sender(host).send(env).is_err() {
@@ -780,8 +780,8 @@ pub enum SubmitFanout {
     WantsRecords {
         /// A hosted shard to hold the envelope and run the fetch.
         host: ShardId,
-        /// The component addresses its derivation could not resolve.
-        instances: Vec<Address>,
+        /// What its derivation could not resolve.
+        wanted: Unresolved,
     },
     /// The envelope's derivation refuses, so it names no shards to fan
     /// out to and there is nothing to gossip it on.
