@@ -680,7 +680,14 @@ pub const MAX_PROOF_CLAIMS: usize = 10_000;
 /// the worst case, far fewer in practice once shared prefixes dedup).
 /// `100_000` is ~10× the claim cap and bounds the pre-allocation at a
 /// few MB.
-const MAX_PROOF_SIBLINGS: usize = 100_000;
+///
+/// A bound on the *proof* and not on the claims behind it: the count is
+/// roughly `claims × log(leaves)`, so it moves with the tree and no cap
+/// on the asking side can stand in for it. Public because the side that
+/// builds a proof has to hold it to the same figure the side that reads
+/// one does — a proof over this is one the asker's decoder throws away,
+/// and building it anyway spends the walk for nothing.
+pub const MAX_PROOF_SIBLINGS: usize = 100_000;
 
 /// Errors produced by [`MultiProof::decode`].
 #[derive(Debug, thiserror::Error)]
