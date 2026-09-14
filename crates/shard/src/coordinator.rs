@@ -6726,13 +6726,13 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash,
-        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        PriceTable, RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor,
-        ShardId, Signer, SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
+        BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline,
+        DeclaredWork, Epoch, Hash, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        NetworkDefinition, NetworkParams, PriceTable, RoutePrefix, SettledSetVerdict, SettledTxSet,
+        SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
+        TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
+        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, WeightedTimestamp, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -7769,6 +7769,12 @@ mod tests {
             proposer: ValidatorId::new(height.inner() % 4),
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round,
+            // A chain contiguous from genesis: one committed block per
+            // height, none of which carried anything.
+            load: ShardLoad {
+                blocks: height.inner(),
+                ..ShardLoad::ZERO
+            },
             ..Default::default()
         })
     }
@@ -7836,6 +7842,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -7927,6 +7934,9 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::from_bytes(
                 &[u8::try_from(round % 251).unwrap(); 32],
             )),
+            // An empty block over a chain that has committed nothing:
+            // the totals stand and the count moves on by one.
+            load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None),
             ..Default::default()
         });
         Block::Live {
@@ -8265,6 +8275,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -8334,6 +8345,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -8420,6 +8432,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -8516,6 +8529,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -8565,6 +8579,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -9156,6 +9171,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -9516,6 +9532,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -9559,6 +9576,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -9654,6 +9672,7 @@ mod tests {
                 provision_root: __h.provision_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
+                load: __h.load(),
                 ..Default::default()
             })
         };
@@ -12181,6 +12200,11 @@ mod tests {
             proposer: ValidatorId::new(1),
             timestamp: ProposerTimestamp::from_millis(1500),
             round: Round::new(1),
+            // The first block of a chain that has committed nothing.
+            load: ShardLoad {
+                blocks: 1,
+                ..ShardLoad::ZERO
+            },
             ..Default::default()
         });
         Block::Live {
