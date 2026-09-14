@@ -20,7 +20,7 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
     ArtifactTerm, DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt,
     Hash, MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, OwnerShare, ProtocolStatics,
-    Routing, TimestampRange, TransactionEnvelope, WeightedTimestamp, whole_work,
+    Routing, TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
@@ -759,13 +759,13 @@ impl BridgeStatics {
 /// holding each one's seal can answer for it. Collected whole, in the
 /// order the flattened manifest names them, so the answer is stable
 /// wherever it is computed.
-fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Vec<Address> {
-    let carried: BTreeSet<Address> = tree
+fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Unresolved {
+    let carried: BTreeMap<Address, PackageHash> = tree
         .instances
         .iter()
-        .map(|meta| meta.address(&ProtocolHasher).address())
+        .map(|meta| (meta.address(&ProtocolHasher).address(), meta.package))
         .collect();
-    let mut missing = Vec::new();
+    let mut wanted = Unresolved::default();
     let graphs = std::iter::once(&tree.root.graph).chain(
         tree.subintents
             .iter()
@@ -773,14 +773,27 @@ fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Vec<Addr
     );
     for node in graphs.flat_map(|graph| &graph.nodes) {
         let address = node.target.address();
-        if chain.instance(node.target).is_some() || carried.contains(&address) {
+        // The record first, and the package only through it: a target
+        // this node holds no record for says nothing about which code it
+        // runs, so there is nothing to ask for behind it yet.
+        let Some(package) = chain
+            .instance(node.target)
+            .map(|meta| meta.package)
+            .or_else(|| carried.get(&address).copied())
+        else {
+            if !wanted.instances.contains(&address) {
+                wanted.instances.push(address);
+            }
             continue;
-        }
-        if !missing.contains(&address) {
-            missing.push(address);
+        };
+        let package = Hash::from(package.0);
+        if chain.package(PackageHash(package.as_hash32())).is_none()
+            && !wanted.packages.contains(&package)
+        {
+            wanted.packages.push(package);
         }
     }
-    missing
+    wanted
 }
 
 impl BridgeStatics {

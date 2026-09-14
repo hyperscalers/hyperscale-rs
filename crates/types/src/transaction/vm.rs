@@ -411,23 +411,59 @@ pub enum DerivationError {
     /// The envelope is inadmissible, on terms every node agrees on.
     #[error("derivation refused the envelope: {0}")]
     Refused(String),
-    /// Component records this node holds none of, so it cannot say what
-    /// the envelope declares. Not a verdict: the addresses are what a
-    /// fetch asks its owning shard for, and derivation answers once they
-    /// are seated.
-    #[error("derivation wants records this node has not seen: {0:?}")]
-    Unresolved(Vec<Address>),
+    /// What this node holds none of, so it cannot say what the envelope
+    /// declares. Not a verdict: each name is what a fetch asks its
+    /// owning shard for, and derivation answers once they are seated.
+    #[error("derivation wants what this node has not seen: {0:?}")]
+    Unresolved(Unresolved),
 }
 
 impl DerivationError {
-    /// The records this node would need before derivation could answer,
-    /// empty for a refusal.
+    /// What this node would need before derivation could answer, or
+    /// `None` for a refusal.
     #[must_use]
-    pub fn unresolved(&self) -> &[Address] {
+    pub const fn unresolved(&self) -> Option<&Unresolved> {
         match self {
-            Self::Refused(_) => &[],
-            Self::Unresolved(addresses) => addresses,
+            Self::Refused(_) => None,
+            Self::Unresolved(wanted) => Some(wanted),
         }
+    }
+}
+
+/// What a derivation is waiting on, in the two forms a fetch asks for.
+///
+/// Both links of the chain a call resolves through: the record that says
+/// which package a target runs, and the package itself. A gap in the
+/// first is reported alone — the record is what names the package, so
+/// what is missing behind it cannot be known until the record lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unresolved {
+    /// Component addresses this node holds no record for.
+    pub instances: Vec<Address>,
+    /// Content addresses this node holds no package metadata for.
+    pub packages: Vec<Hash>,
+}
+
+impl Unresolved {
+    /// Whether the derivation wants nothing — the case that is not a gap
+    /// at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.instances.is_empty() && self.packages.is_empty()
+    }
+
+    /// Every name it waits on as an address: a component by its own, a
+    /// package by the one its content address derives.
+    ///
+    /// What a wait is indexed by, so an envelope held for a record and
+    /// one held for code are released by the same arrival path.
+    #[must_use]
+    pub fn awaited(&self, package_address: impl Fn(Hash) -> Address) -> Vec<Address> {
+        self.instances
+            .iter()
+            .copied()
+            .chain(self.packages.iter().copied().map(package_address))
+            .collect()
     }
 }
 

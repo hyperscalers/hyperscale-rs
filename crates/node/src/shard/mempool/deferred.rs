@@ -8,15 +8,17 @@
 //! would arrive with nothing left to admit.
 //!
 //! So the envelope waits here while the fetch runs, indexed by what it
-//! is waiting for, and is offered to validation again when those records
-//! land. Re-admission needs nothing undone: a derivation memoizes only
+//! is waiting for, and is offered to validation again when that lands.
+//! A record and a package are indexed alike: each is named by an
+//! address, so one arrival path releases both. Re-admission needs nothing undone: a derivation memoizes only
 //! its successes, so the second attempt reads the registry the fetch just
 //! grew.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use hyperscale_types::{Address, MAX_TXS_PER_BLOCK, Transaction, TxHash};
+use hyperscale_engine::Executor;
+use hyperscale_types::{Address, MAX_TXS_PER_BLOCK, Transaction, TxHash, Unresolved};
 
 /// How many envelopes one shard holds back at once.
 ///
@@ -41,15 +43,35 @@ pub enum DeferredOrigin {
     Submission,
 }
 
-/// An envelope this node cannot yet derive, and the records it needs.
+/// An envelope this node cannot yet derive, and what it needs.
 #[derive(Debug, Clone)]
 pub struct DeferredTransaction {
     /// The envelope, unverified — nothing about it has been judged.
     pub tx: Arc<Transaction>,
-    /// The component addresses its derivation could not resolve.
-    pub instances: Vec<Address>,
+    /// What its derivation could not resolve, in the forms a fetch asks
+    /// for.
+    pub wanted: Unresolved,
+    /// Every name above as an address, which is what the wait is indexed
+    /// by: a component by its own, a package by the one its content
+    /// address derives.
+    pub awaited: Vec<Address>,
     /// Where it came from.
     pub origin: DeferredOrigin,
+}
+
+impl DeferredTransaction {
+    /// Hold `tx` for `wanted`, indexing the wait by the addresses that
+    /// name it.
+    #[must_use]
+    pub fn new(tx: Arc<Transaction>, wanted: Unresolved, origin: DeferredOrigin) -> Self {
+        let awaited = wanted.awaited(|package| Executor::package_artifact_key(package).owner);
+        Self {
+            tx,
+            wanted,
+            awaited,
+            origin,
+        }
+    }
 }
 
 /// Envelopes waiting on records, indexed by the records they wait on.
@@ -92,8 +114,8 @@ impl DeferredForRecords {
         {
             self.order.push_back(hash);
         }
-        for instance in deferred.instances {
-            let queue = self.waiting.entry(instance).or_default();
+        for awaited in deferred.awaited {
+            let queue = self.waiting.entry(awaited).or_default();
             if !queue.contains(&hash) {
                 queue.push(hash);
             }
@@ -130,14 +152,14 @@ impl DeferredForRecords {
 
     /// Take the envelopes `arrived` releases.
     ///
-    /// An envelope waiting on several records is released by the first
-    /// of them: re-admission is what discovers whether the rest are
-    /// there, and it holds itself back again naming what is still
-    /// missing.
+    /// An envelope waiting on several names is released by the first of
+    /// them: re-admission is what discovers whether the rest are there,
+    /// and it holds itself back again naming what is still missing —
+    /// including the packages a record it just learned points at.
     pub fn release(&mut self, arrived: &[Address]) -> Vec<(Arc<Transaction>, DeferredOrigin)> {
         let mut released = Vec::new();
-        for instance in arrived {
-            let Some(hashes) = self.waiting.remove(instance) else {
+        for name in arrived {
+            let Some(hashes) = self.waiting.remove(name) else {
                 continue;
             };
             for hash in hashes {
@@ -210,11 +232,14 @@ mod tests {
     }
 
     fn deferred(tx: Arc<Transaction>, instances: Vec<Address>) -> DeferredTransaction {
-        DeferredTransaction {
+        DeferredTransaction::new(
             tx,
-            instances,
-            origin: DeferredOrigin::Validation,
-        }
+            Unresolved {
+                instances,
+                packages: Vec::new(),
+            },
+            DeferredOrigin::Validation,
+        )
     }
 
     /// The bound covers the index, not just the queue.

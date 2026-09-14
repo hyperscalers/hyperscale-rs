@@ -26,7 +26,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST,
 };
-use hyperscale_types::{Address, LocalTimestamp, MessageClass, ShardId, TxHash, ValidatorId};
+use hyperscale_types::{Address, Hash, LocalTimestamp, MessageClass, ShardId, TxHash, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
@@ -148,20 +148,32 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Hold `wanted` back and ask the shard owning each component's
-    /// prefix for the records they are waiting on.
+    /// Hold `wanted` back and ask for what each envelope's derivation
+    /// could not resolve: a component's record from the shard owning its
+    /// prefix, a package's artifact from the shard obliged to keep it.
     ///
     /// The envelopes wait rather than being dropped because the gap is
     /// this node's, not theirs: every node that could propose one has
     /// the same gap, so dropping them all would leave the arriving
     /// record with nothing to admit.
-    pub(crate) fn defer_for_instance_records(&mut self, wanted: Vec<DeferredTransaction>) {
+    ///
+    /// A record and the code it names are asked for in turn, not
+    /// together: the record is what says which package a target runs, so
+    /// what is missing behind one is only knowable once it lands. An
+    /// envelope wanting both comes back here after the first arrival.
+    pub(crate) fn defer_for_records(&mut self, wanted: Vec<DeferredTransaction>) {
         let mut evicted: Vec<TxHash> = Vec::new();
         let mut instances: Vec<Address> = Vec::new();
+        let mut packages: Vec<Hash> = Vec::new();
         for deferred in wanted {
-            for instance in &deferred.instances {
+            for instance in &deferred.wanted.instances {
                 if !instances.contains(instance) {
                     instances.push(*instance);
+                }
+            }
+            for package in &deferred.wanted.packages {
+                if !packages.contains(package) {
+                    packages.push(*package);
                 }
             }
             // Held under the same dedup guard a queued envelope is, so a
@@ -178,6 +190,7 @@ where
         // that has to find the dedup guard clear.
         self.handle_transaction_validations_failed(&evicted);
         self.fetch_instance_records(instances);
+        self.fetch_wanted_packages(packages);
     }
 
     /// Ask the shard owning each component's prefix for its record.
@@ -222,7 +235,17 @@ where
             executor.install_instance(instance, &record);
         }
         self.drive_fetch::<InstanceRecordBinding>(FetchInput::Admitted { ids: ids.clone() });
-        for (tx, origin) in self.io.mempool.deferred_records.release(&ids) {
+        self.release_deferred(&ids);
+    }
+
+    /// Offer every envelope `arrived` releases back to the door it came
+    /// in by.
+    ///
+    /// A record and a package release alike: each is named by an
+    /// address, and what an envelope was waiting on says nothing about
+    /// how it re-enters.
+    pub(crate) fn release_deferred(&mut self, arrived: &[Address]) {
+        for (tx, origin) in self.io.mempool.deferred_records.release(arrived) {
             match origin {
                 DeferredOrigin::Validation => self.queue_validation(tx),
                 // Back through the fan-out it never got: its source

@@ -157,12 +157,24 @@ pub enum ShardScopedInput {
         artifacts: Vec<(Hash, Vec<u8>)>,
     },
 
-    /// Envelopes a derivation could not resolve, each beside the
-    /// component records it wanted, so the fetch can ask the shards
-    /// owning them and the envelopes can wait for the answer.
-    InstanceRecordsWanted {
+    /// Envelopes a derivation could not resolve, each beside what it
+    /// wanted — component records, package artifacts, or both — so the
+    /// fetch can ask the shards owning them and the envelopes can wait
+    /// for the answer.
+    RecordsWanted {
         /// What is waiting, and what each is waiting for.
         wanted: Vec<DeferredTransaction>,
+    },
+
+    /// Package artifacts this node has finished installing, so the
+    /// metadata a derivation reads is there to be read.
+    ///
+    /// Reported from inside the install rather than beside it: an
+    /// envelope held for want of this package derives on the strength of
+    /// this, and the cache has to hold the metadata before that is true.
+    PackagesInstalled {
+        /// The installed packages, by content address.
+        packages: Vec<Hash>,
     },
 
     /// Instance records delivered by the fetch protocol, already
@@ -441,8 +453,9 @@ impl ShardScopedInput {
             Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
+            | Self::PackagesInstalled { .. }
             | Self::InstanceRecordsFetched { .. }
-            | Self::InstanceRecordsWanted { .. } => EventPriority::Network,
+            | Self::RecordsWanted { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. }
             | Self::ShardVoteEquivocationGossipReceived { .. } => EventPriority::Network,
