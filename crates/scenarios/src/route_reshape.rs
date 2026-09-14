@@ -36,9 +36,10 @@ use crate::support::query::{
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, ParamBallot, STRADDLER_SPLITTER,
-    STRADDLER_SURVIVOR, build_param_vote_tx, build_route_tx, build_swap_tx, build_transfer_tx,
-    fixture_flash_bytes, merge_survivor_ballast_accounts, merge_train_setup, pool_operator,
-    quarter_ballast_over, split_ballast_accounts_over, split_train_setup, validity_around,
+    STRADDLER_SURVIVOR, ballast_to, build_param_vote_tx, build_route_tx, build_swap_tx,
+    build_transfer_tx, fixture_flash_bytes, fixture_merge_survivor_ballast, merge_train_setup,
+    pool_operator, quarter_ballast_over, split_ballast_accounts_over, split_train_setup,
+    validity_around,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
@@ -865,7 +866,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
 /// merges is the callers', and the venue's shard never reshapes.
 #[must_use]
 pub fn merging_caller_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = merge_survivor_ballast_accounts();
+    let mut accounts = fixture_merge_survivor_ballast();
     accounts.extend(venue_genesis_accounts_on(
         MERGE_STRADDLER_SURVIVOR,
         &[MERGE_STRADDLER_LEFT],
@@ -1076,29 +1077,38 @@ const LATE_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
 /// pair collapses and nothing else moves.
 const LATE_SPLIT_BYTES: u64 = 1_200_000;
 
-/// Ballast the departing venue's sibling carries, sized over the
-/// `merge_bytes` the cluster's own threshold derives and well under
-/// [`LATE_SPLIT_BYTES`], so it neither asserts a merge nor follows its
-/// sibling out.
-const LATE_SIBLING_BALLAST_BYTES: u64 = 24_000;
+/// The floor [`LATE_SPLIT_BYTES`] derives: an eighth of it, which every
+/// quarter of this scenario is placed on one side of.
+const LATE_MERGE_FLOOR: u64 = LATE_SPLIT_BYTES / 8;
+
+/// Headroom either side of [`LATE_MERGE_FLOOR`], so a quarter's exact
+/// draw from the genesis flash never decides which side it lands on.
+const LATE_FLOOR_MARGIN: u64 = 30_000;
+
+/// What each quarter that must outlive the merge carries: clear of the
+/// floor on its own, so it neither asserts a merge with its sibling nor
+/// leaves the venue standing on it.
+const LATE_SURVIVING_QUARTER_BYTES: u64 = LATE_MERGE_FLOOR + LATE_FLOOR_MARGIN;
+
+/// What the merging parent carries, shared between the two children the
+/// vote collapses: enough under twice the floor that each child sits
+/// below it however the flash and the ballast divide between them.
+const LATE_MERGING_PARENT_BYTES: u64 = (LATE_MERGE_FLOOR - LATE_FLOOR_MARGIN) * 2;
 
 /// Genesis funding for
 /// [`a_route_committed_before_its_departure_was_voted_still_resolves`].
 ///
-/// The ballast stays on `leaf(2, 0)` so the grow reaches the same
-/// topology the late fixture is placed against; the venues and the
-/// trader move to the quarters that survive it.
+/// Every quarter is placed against the floor the late vote derives: the
+/// parent whose children collapse sits under it once halved, and the two
+/// that outlive the merge sit over it. Each target counts the genesis
+/// flash the quarter already drew, which is a hash's answer rather than
+/// a figure any of them controls.
 #[must_use]
 pub fn late_departing_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut accounts = quarter_ballast_over(FIRST_VENUE_SHARD, fixture_flash_bytes());
-    // The departing venue's sibling has to clear the derived
-    // `merge_bytes`, or it asserts a merge on their shared parent for the
-    // whole run — and a parent with any pending reshape bars the split
-    // this scenario votes for.
-    accounts.extend(quarter_ballast_over(
-        LATE_TRADER_SHARD,
-        LATE_SIBLING_BALLAST_BYTES,
-    ));
+    let mut accounts = ballast_to(LATE_MERGED_PARENT, 4, LATE_MERGING_PARENT_BYTES);
+    for surviving in [LATE_SURVIVOR_VENUE, LATE_TRADER_SHARD] {
+        accounts.extend(ballast_to(surviving, 4, LATE_SURVIVING_QUARTER_BYTES));
+    }
     let mut taken = Vec::new();
     accounts.push((
         grind_onto(LATE_DEPARTING_VENUE, &mut taken).1,

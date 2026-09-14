@@ -14,13 +14,13 @@ use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, fixture_flash_bytes, genesis_accounts, halt_straddler_setup,
-    insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
-    native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
-    participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
-    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
-    split_issuer_straddler_setup, split_straddler_setup, staking_genesis_accounts,
-    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
+    cross_shard_genesis_accounts, fixture_merge_split_bytes, genesis_accounts,
+    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
+    merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
+    overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
+    remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
+    shared_recipient_genesis_accounts, split_issuer_straddler_setup, split_straddler_setup,
+    staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
     unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
@@ -1536,12 +1536,13 @@ fn merge_straddler_atomic_sim() {
     merge_straddler_atomic(&mut cluster);
 }
 
-/// The merge-straddler topology sized around the fixture flash, so the
-/// venue's packages are on it: the callers sit on the merge-left child,
-/// which pairs with its sibling from the grow alone.
+/// The merge-straddler topology sized around where the fixture flash
+/// actually lands: the callers sit on the merge-left child, which pairs
+/// with its sibling from the grow alone, and the floor clears whichever
+/// of the two drew the heavier share of the artifacts.
 fn merging_caller_config() -> ScenarioConfig {
     ScenarioConfig {
-        split_bytes: fixture_flash_bytes() + 18_000,
+        split_bytes: fixture_merge_split_bytes(),
         ..merge_straddler_config()
     }
 }

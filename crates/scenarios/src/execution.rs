@@ -32,7 +32,7 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::{beacon_epoch, declared_price, vault_balance};
+use crate::support::query::{beacon_epoch, declared_price, owning_shard, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
@@ -2269,7 +2269,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     let artifact = storm_artifact(4_242);
     let package = package_hash(&ProtocolHasher, &artifact);
     let registered = Hash::from(package.0);
-    let cell = package_key(*publisher, package);
+    let cell = package_key(package);
 
     let world = World::open(c, *PROTOCOL_RESOURCE, [publisher.address()], []);
     let mut charges = Charges::default();
@@ -2405,16 +2405,18 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
     let mut charges = Charges::default();
     let mut submitted: Vec<(TxHash, ShardId)> = Vec::new();
     let mut cells: Vec<(ShardId, Address, [u8; 16])> = Vec::new();
-    for (index, (key, publisher)) in (0u16..).zip(publishers.iter()) {
+    for (index, (key, _)) in (0u16..).zip(publishers.iter()) {
         for nonce in 0..PER_PUBLISHER {
             // Distinct per publisher as well as per nonce, so the two
             // shards never race to publish one content address.
             let artifact = storm_artifact(nonce + index * 1_000);
-            let cell = package_key(*publisher, package_hash(&ProtocolHasher, &artifact));
+            let cell = package_key(package_hash(&ProtocolHasher, &artifact));
             let tx = build_publish_tx(key, artifact, validity);
-            let shard = shards[usize::from(index)];
-            cells.push((shard, cell.owner, cell.local.0));
-            submitted.push((charges.submit(c, tx), shard));
+            // The cell lands where its own address falls, which is not
+            // where its publisher sits: the storm is read on the shard
+            // obliged to keep each artifact.
+            cells.push((owning_shard(c, cell.owner), cell.owner, cell.local.0));
+            submitted.push((charges.submit(c, tx), shards[usize::from(index)]));
         }
     }
     assert_eq!(

@@ -455,11 +455,11 @@ pub fn config_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, CONFIG, &[])
 }
 
-/// Where `publisher`'s copy of the package addressed by `package` lives:
-/// the vocabulary's own derivation, bound to the protocol hasher.
+/// Where the package addressed by `package` lives: the vocabulary's own
+/// derivation, bound to the protocol hasher.
 #[must_use]
-pub fn package_key(publisher: impl Into<Address>, package: PackageHash) -> SubstateKey {
-    canonical_package_key(&ProtocolHasher, publisher, package)
+pub fn package_key(package: PackageHash) -> SubstateKey {
+    canonical_package_key(&ProtocolHasher, package)
 }
 
 /// The principal address `public_key` opens under `scheme`, or `None` if
@@ -787,6 +787,11 @@ impl BridgeStatics {
     /// A publish's routing: an exclusive write on the package cell, and
     /// one on the publisher's fee vault.
     ///
+    /// The two sit under different owners — the package under its own
+    /// content address, the vault under the payer — so a publish reaches
+    /// whichever shard is obliged to keep the artifact as well as the
+    /// one holding the fee.
+    ///
     /// The vault is declared even though no signature asks for it. A
     /// completed transaction burns its fee there, and declaring it is
     /// what makes two publishes by one payer conflict — without it they
@@ -813,7 +818,7 @@ impl BridgeStatics {
 
         let publisher = vm.fee_payer;
         let package = package_hash(&ProtocolHasher, artifact);
-        let cell = package_key(publisher, package);
+        let cell = package_key(package);
         let vault = vault_key(publisher, *PROTOCOL_RESOURCE);
         let mut write_keys = vec![DeclaredKey::Cell(cell), DeclaredKey::Cell(vault)];
         write_keys.sort_unstable();
@@ -822,25 +827,36 @@ impl BridgeStatics {
         // A publish never reaches the kernel, so it declares no effects
         // to price. Its vector stands in as the two exclusive point
         // writes it claims — the package cell, written whole with the
-        // artifact, and the vault the fee burns from — under the
-        // publisher, with its one ceiling and its signature.
+        // artifact, and the vault the fee burns from — each under the
+        // owner whose prefix carries it, with its one ceiling and its
+        // signature.
         //
         // Two leaves and not one sum: each carries its own tree path, so
         // what they cost is `written_leaf` twice where what they keep is
         // their bytes added.
         let artifact_bytes = artifact.len() as u64;
         let retained = artifact_bytes.saturating_add(AMOUNT_CELL_BYTES as u64);
-        let written =
-            written_leaf(artifact_bytes).saturating_add(written_leaf(AMOUNT_CELL_BYTES as u64));
-        let shares = vec![OwnerShare {
-            owner: publisher.address(),
-            work: DeclaredWork {
-                compute: vm.gas_limit_total(),
-                write_bytes: written,
-                footprint: point_write_units().saturating_mul(write_keys.len() as u64),
-                ..DeclaredWork::ZERO
+        let point_write = point_write_units();
+        let mut shares = vec![
+            OwnerShare {
+                owner: cell.owner,
+                work: DeclaredWork {
+                    write_bytes: written_leaf(artifact_bytes),
+                    footprint: point_write,
+                    ..DeclaredWork::ZERO
+                },
             },
-        }];
+            OwnerShare {
+                owner: publisher.address(),
+                work: DeclaredWork {
+                    compute: vm.gas_limit_total(),
+                    write_bytes: written_leaf(AMOUNT_CELL_BYTES as u64),
+                    footprint: point_write,
+                    ..DeclaredWork::ZERO
+                },
+            },
+        ];
+        shares.sort_unstable_by_key(|share| share.owner);
         // A publish keeps exactly what it writes: the artifact sits in
         // the package cell and the vault holds its amount.
         let everywhere = everywhere(retained, envelope_bytes(vm)?, vm.signatures(), 0);
@@ -871,7 +887,15 @@ impl BridgeStatics {
             signer,
             routing: Routing {
                 read_prefixes: Vec::new(),
-                write_prefixes: vec![publisher.address()],
+                // Both owners: the artifact's cell sits under its own
+                // address, so the shard obliged to keep it is a party to
+                // the publish beside the one holding the vault.
+                write_prefixes: {
+                    let mut written = vec![publisher.address(), cell.owner];
+                    written.sort_unstable();
+                    written.dedup();
+                    written
+                },
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
                 declared_modes: write_keys
