@@ -4,7 +4,7 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
@@ -12,8 +12,8 @@ use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
+    BeaconChainReader, JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore,
+    SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
 };
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
@@ -23,12 +23,12 @@ use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
-    CertifiedHeaderVerifyError, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Deadline,
-    DeferOn, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot, NetworkDefinition,
-    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
-    ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
+    CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
+    Deadline, DeferOn, Derivation, Epoch, EpochWindows, Finalization, Hash, LocalReceiptRoot,
+    NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round,
+    ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
@@ -485,6 +485,41 @@ fn check_completed<T, E: std::fmt::Display>(
     }
 }
 
+/// The placement and the table each name's own commit ran under, by the
+/// epoch that froze them.
+///
+/// Keyed on the committee anchor and not on the block's own, because
+/// that is the one admission judged the ceiling at and the one the
+/// ledger priced under — a block's two anchors straddle an epoch cut
+/// once per window, and a record is written a deadline after the commit
+/// it names, so neither is reliably the window carrying the record.
+///
+/// Read off the committed beacon chain rather than the live schedule. A
+/// name outlives the window that froze it for as long as its counterpart
+/// stays silent, which no retention bound reaches; the chain holds one
+/// state per epoch contiguously from genesis, so every validator
+/// resolves the same pair for the same anchor however far back it sits.
+///
+/// An epoch the chain does not hold is one above this node's fold. Its
+/// names are left out, and the check that misses one waits on the terms
+/// an unheld body already sets.
+fn commit_windows_for(
+    chain: &dyn BeaconChainReader,
+    windows: EpochWindows,
+    entries: &[UnsettledTx],
+) -> HashMap<Epoch, CommitWindow> {
+    let mut resolved: HashMap<Epoch, CommitWindow> = HashMap::new();
+    for stated in entries.iter().map(|entry| entry.committed.committee_anchor) {
+        let epoch = windows.epoch_for(stated);
+        if let hash_map::Entry::Vacant(slot) = resolved.entry(epoch)
+            && let Some(state) = chain.get_state_by_epoch(epoch)
+        {
+            slot.insert(state.commit_window());
+        }
+    }
+    resolved
+}
+
 fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
@@ -751,7 +786,7 @@ where
             successes,
             anchor,
             trie,
-            committed_windows,
+            windows,
         } => {
             // A resolution names a transaction committed before it — a
             // record epochs after the commit, a finalization a tick or
@@ -789,11 +824,13 @@ where
                             == entry.committed.anchor,
                 )
             };
+            let committed_windows = commit_windows_for(ctx.beacon_chain, windows, &entries);
             let verdict = Resolutions::of(entries, |entry| {
                 let tx = held.get(&entry.tx_hash)?;
-                // The placement and the table its own commit ran under,
-                // which is where every figure it restates was frozen.
-                let at = committed_windows.get(&entry.committed.committee_anchor)?;
+                // A window above this node's fold is one to wait for, on
+                // the terms an unheld body already sets.
+                let at =
+                    committed_windows.get(&windows.epoch_for(entry.committed.committee_anchor))?;
                 let restated = committed_at(entry)?
                     && UnsettledTx::for_transaction(
                         tx,
@@ -1504,14 +1541,160 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+        install_stub_protocol_statics, stub_abort_charge, stub_transaction, test_prefix,
+        test_principal,
     };
     use hyperscale_types::{
-        CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
+        BeaconBlockHash, BeaconChainConfig, BeaconState, CertificateRoot, CertifiedBeaconBlock,
+        CommittedAt, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
+        ShardCommittee, Signer, StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
     };
 
     use super::*;
+
+    /// A beacon chain that answers for the epochs it was given and for
+    /// nothing else — the reads `commit_windows_for` takes, without the
+    /// blocks a real commit would pair them with.
+    struct Folded(HashMap<Epoch, Arc<BeaconState>>);
+
+    impl Folded {
+        fn to(epochs: &[(u64, u64)]) -> Self {
+            Self(
+                epochs
+                    .iter()
+                    .map(|(epoch, compute)| {
+                        let mut state = BeaconState::empty(BeaconChainConfig::default());
+                        state.prices = PriceTable {
+                            compute: *compute,
+                            ..PriceTable::GENESIS
+                        };
+                        state.shard_committees.insert(
+                            ShardId::ROOT,
+                            ShardCommittee {
+                                members: vec![ValidatorId::new(1)],
+                            },
+                        );
+                        (Epoch::new(*epoch), Arc::new(state))
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl BeaconChainReader for Folded {
+        fn get_state_by_epoch(&self, epoch: Epoch) -> Option<Arc<BeaconState>> {
+            self.0.get(&epoch).map(Arc::clone)
+        }
+
+        fn get_beacon_block_by_epoch(
+            &self,
+            _epoch: Epoch,
+        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+            None
+        }
+
+        fn get_beacon_block_by_hash(
+            &self,
+            _hash: BeaconBlockHash,
+        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+            None
+        }
+
+        fn latest_committed_epoch(&self) -> Option<Epoch> {
+            self.0.keys().copied().max()
+        }
+
+        fn latest_committed(
+            &self,
+        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+            None
+        }
+    }
+
+    /// One name, committed at `committee_anchor` with its block's own
+    /// anchor at `anchor`.
+    fn named_at(committee_anchor: u64, anchor: u64) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
+            charged: 5,
+            charge: stub_abort_charge(5),
+            committed: CommittedAt {
+                height: BlockHeight::new(1),
+                anchor: WeightedTimestamp::from_millis(anchor),
+                committee_anchor: WeightedTimestamp::from_millis(committee_anchor),
+            },
+            reach: Vec::new(),
+        }
+    }
+
+    /// A name is weighed at the window its own commit ran under, never
+    /// at the one carrying the record.
+    ///
+    /// A record is written when a deadline lapses, epochs after the
+    /// commit it names, and the table moves in between. Weighed at the
+    /// carrying window, every name whose commit predates a fold that
+    /// stepped a row restates wrongly — and a wrong figure refuses the
+    /// block, so the abandonment never commits and the drain place is
+    /// never released.
+    #[test]
+    fn a_name_is_weighed_at_the_window_that_committed_it() {
+        let windows = EpochWindows::new(1_000);
+        let chain = Folded::to(&[(0, 1), (1, 2)]);
+
+        let resolved = commit_windows_for(&chain, windows, &[named_at(500, 500)]);
+
+        assert_eq!(
+            resolved[&Epoch::new(0)].prices.compute,
+            1,
+            "the table its commit was charged at"
+        );
+        assert!(
+            !resolved.contains_key(&Epoch::new(1)),
+            "and never the one the record is carried in"
+        );
+    }
+
+    /// A name whose commit straddles an epoch cut is weighed at the
+    /// anchor that froze its figures, not at the one that dated it.
+    ///
+    /// Every block carries two anchors, and for the first block of a
+    /// window they fall either side of the cut. Admission judged the
+    /// ceiling at the committee's and the ledger priced the entry there,
+    /// so only that one names the table the figures were frozen against.
+    #[test]
+    fn a_name_committed_across_a_cut_is_weighed_where_it_was_frozen() {
+        let windows = EpochWindows::new(1_000);
+        let chain = Folded::to(&[(0, 1), (1, 2)]);
+
+        // The first block of the later window: its own anchor sits in
+        // that window, the anchor its parent carried in the earlier one.
+        let resolved = commit_windows_for(&chain, windows, &[named_at(900, 1_100)]);
+
+        assert_eq!(
+            resolved[&Epoch::new(0)].prices.compute,
+            1,
+            "the committee anchor's window is the one that froze the figures"
+        );
+        assert!(
+            !resolved.contains_key(&Epoch::new(1)),
+            "and never the window its own anchor opens"
+        );
+    }
+
+    /// A window above this node's fold leaves its name out rather than
+    /// standing something else in for it. The check that misses one
+    /// answers `Unknown`, which defers the block; a stand-in would weigh
+    /// the share at a placement the transaction never ran under.
+    #[test]
+    fn an_unfolded_epoch_resolves_no_window() {
+        let windows = EpochWindows::new(1_000);
+        let chain = Folded::to(&[(0, 1)]);
+
+        let resolved = commit_windows_for(&chain, windows, &[named_at(5_000, 5_000)]);
+
+        assert!(resolved.is_empty());
+    }
 
     fn shard() -> ShardId {
         ShardId::ROOT

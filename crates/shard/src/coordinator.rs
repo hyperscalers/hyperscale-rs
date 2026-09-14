@@ -6728,7 +6728,7 @@ mod tests {
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, CommittedTxsRoot, ConsensusSignature, Deadline,
         DeclaredWork, Epoch, Hash, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, PriceTable, RoutePrefix, SettledSetVerdict, SettledTxSet,
+        NetworkDefinition, NetworkParams, RoutePrefix, SettledSetVerdict, SettledTxSet,
         SettledTxsRoot, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
         TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
         TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -11677,132 +11677,6 @@ mod tests {
                 .verification
                 .is_root_in_flight(block_hash, VerificationKind::Resolutions),
             "and the mark is left for the re-drive to take",
-        );
-    }
-
-    /// A name is restated at the window its own commit ran under, never
-    /// at the one carrying the record.
-    ///
-    /// A record is written when a deadline lapses, epochs after the
-    /// commit it names, and the table moves in between. Weighed at the
-    /// carrying window, every name whose commit predates a fold that
-    /// stepped a row restates wrongly — and a wrong figure refuses the
-    /// block, so the abandonment never commits and the drain place is
-    /// never released.
-    #[test]
-    fn a_name_is_restated_at_the_window_that_committed_it() {
-        let mut sched = make_terminating_schedule(4);
-        // The window carrying the record prices above the one the
-        // commit it names ran under.
-        let raised = PriceTable {
-            compute: PriceTable::GENESIS.compute * 2,
-            ..PriceTable::GENESIS
-        };
-        let ScheduleLookup::Committee(carrying) =
-            sched.lookup(WeightedTimestamp::from_millis(AFTER_CUT_MS))
-        else {
-            panic!("the carrying window is retained");
-        };
-        sched.insert(
-            Epoch::new(1),
-            Arc::new(TopologySnapshot::clone(carrying).with_prices(raised)),
-        );
-
-        let block = block_with_records(
-            AFTER_CUT_MS,
-            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
-        );
-        let block_hash = block.hash();
-        let mut coord = fence_coordinator();
-        install_complete_block(&mut coord, &block);
-        let actions = coord
-            .verification
-            .initiate_resolutions_verification(block_hash, &block, &sched);
-
-        let [
-            Action::VerifyResolutions {
-                committed_windows, ..
-            },
-        ] = actions.as_slice()
-        else {
-            panic!("the names go to the store: {actions:?}");
-        };
-        let stated = figures_of(b"tx").committed.committee_anchor;
-        assert_eq!(
-            committed_windows[&stated].prices,
-            PriceTable::GENESIS,
-            "the name is weighed at the table its commit was charged at"
-        );
-    }
-
-    /// A name whose commit straddles an epoch cut is restated at the
-    /// anchor that froze its figures, not at the one that dated it.
-    ///
-    /// Every block carries two anchors, and for the first block of a
-    /// window they fall either side of the cut. Admission judged the
-    /// ceiling at the committee's and the ledger priced the entry
-    /// there, so only that one names the table the figures were frozen
-    /// against. Weighed at the block's own, a name committed across a
-    /// fold reads a table it was never charged at, and a wrong figure
-    /// refuses the block for every voter including the proposer that
-    /// offered it.
-    #[test]
-    fn a_name_committed_across_a_cut_is_restated_where_it_was_frozen() {
-        let mut sched = make_terminating_schedule(4);
-        // The window the commit's own anchor opens prices above the one
-        // its committee anchor sits in, so the two name two tables.
-        let raised = PriceTable {
-            compute: PriceTable::GENESIS.compute * 2,
-            ..PriceTable::GENESIS
-        };
-        let ScheduleLookup::Committee(later) =
-            sched.lookup(WeightedTimestamp::from_millis(AFTER_CUT_MS))
-        else {
-            panic!("the later window is retained");
-        };
-        sched.insert(
-            Epoch::new(1),
-            Arc::new(TopologySnapshot::clone(later).with_prices(raised)),
-        );
-
-        // The first block of the later window: its own anchor sits in
-        // that window, the anchor its parent carried in the earlier one.
-        let mut figures = figures_of(b"tx");
-        figures.committed.committee_anchor = WeightedTimestamp::from_millis(ROOT_CUT_MS - 100);
-        figures.committed.anchor = WeightedTimestamp::from_millis(ROOT_CUT_MS + 100);
-        let record = AbandonmentRecord::new(
-            ShardId::ROOT,
-            WeightedTimestamp::from_millis(ROOT_CUT_MS),
-            [figures.clone()],
-        );
-
-        let block = block_with_records(AFTER_CUT_MS, vec![record]);
-        let block_hash = block.hash();
-        let mut coord = fence_coordinator();
-        install_complete_block(&mut coord, &block);
-        let actions = coord
-            .verification
-            .initiate_resolutions_verification(block_hash, &block, &sched);
-
-        let [
-            Action::VerifyResolutions {
-                committed_windows, ..
-            },
-        ] = actions.as_slice()
-        else {
-            panic!("the names go to the store: {actions:?}");
-        };
-        let frozen = committed_windows
-            .get(&figures.committed.committee_anchor)
-            .expect("the window resolved is the one that froze the figures");
-        assert_eq!(
-            frozen.prices,
-            PriceTable::GENESIS,
-            "the name is weighed at the table its figures were frozen at"
-        );
-        assert!(
-            !committed_windows.contains_key(&figures.committed.anchor),
-            "and never at the window its own anchor opens"
         );
     }
 

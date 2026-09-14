@@ -8,18 +8,18 @@
 //! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
-    ChainOrigin, CommitWindow, Demands, Finalization, LinkageError, LocalReceiptRoot,
-    QuorumCertificate, ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, SplitChildRoots,
-    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
-    TxHash, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp,
+    ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
+    ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, SplitChildRoots, StateRoot,
+    SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash,
+    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1018,35 +1018,6 @@ impl VerificationPipeline {
             .flat_map(AbandonmentRecord::unsettled)
             .cloned()
             .collect();
-        // Each name is restated against the window it says froze it, not
-        // against the one carrying the record: the figures were frozen
-        // there, and a record is written a deadline after the commit it
-        // names. The committee anchor and not the block's own, because
-        // that is the one admission judged the ceiling at and the one
-        // the ledger priced under — the two straddle an epoch cut once
-        // per window. A name whose window has aged out defers the block
-        // on the same terms the anchor's own absence does.
-        let mut committed_windows: BTreeMap<WeightedTimestamp, CommitWindow> = BTreeMap::new();
-        for stated in entries.iter().map(|entry| entry.committed.committee_anchor) {
-            if committed_windows.contains_key(&stated) {
-                continue;
-            }
-            let Some(committed) = anchor_window(schedule, stated) else {
-                warn!(
-                    ?block_hash,
-                    ?stated,
-                    "Deferring resolutions verification — no retained window carries a name's commit"
-                );
-                return Vec::new();
-            };
-            committed_windows.insert(
-                stated,
-                CommitWindow {
-                    trie: committed.shard_trie().clone(),
-                    prices: committed.prices(),
-                },
-            );
-        }
         let deliveries = block.undecided_names();
         let successes = block.successes_decided_alone();
         debug!(
@@ -1064,7 +1035,7 @@ impl VerificationPipeline {
             successes,
             anchor,
             trie,
-            committed_windows,
+            windows: schedule.windows(),
         }]
     }
 
@@ -2208,6 +2179,8 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_awaiting, make_leg_finalization,
         make_settling_finalization, test_transaction,
