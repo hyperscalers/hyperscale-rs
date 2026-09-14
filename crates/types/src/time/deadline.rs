@@ -133,9 +133,18 @@ pub enum Window {
     /// Where a core's committed cell being absent proves the core never
     /// took the transaction — never included it, or included it and
     /// refused, which retracts the cell: from the deadline, since
-    /// before it the core may still commit, to the cell's own sweep one
-    /// [`MAX_VALIDITY_RANGE`] on, past which a proof is a true proof of
+    /// before it the core may still commit, to the cell's own sweep two
+    /// [`MAX_VALIDITY_RANGE`]s on, past which a proof is a true proof of
     /// a cell that was present.
+    ///
+    /// Two ranges, and they are not one span counted twice. A core may
+    /// abandon anywhere inside the one range its abandonment is
+    /// admissible in, and the refusal that retracts the cell lands
+    /// wherever it does; reading the absence that leaves is a probe at
+    /// a counterpart's own anchor, which needs a range of its own. One
+    /// range for both makes a refusal at the end of it unreadable, and
+    /// every crossing that fed the core strands on a cell nobody can
+    /// prove absent.
     Core,
     /// Where a delivery's claim cell being absent proves the crossing
     /// lapsed: from the delivery window's close plus
@@ -160,7 +169,7 @@ impl Window {
                 let validity_end = deadline.validity_end();
                 validity_end..validity_end.plus(MAX_VALIDITY_RANGE)
             }
-            Self::Core => at..at.plus(MAX_VALIDITY_RANGE),
+            Self::Core => at..at.plus(MAX_VALIDITY_RANGE * 2),
             Self::LegEntry => at..at.plus(CLAIM_WINDOW),
             Self::Lapse => at.plus(MAX_VALIDITY_RANGE)..at.plus(CLAIM_WINDOW),
         }
@@ -306,7 +315,7 @@ impl Probed {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_vm_types::{ARTIFACT_GRACE_MS, CROSSING_GRACE_MS};
+    use hyperscale_vm_types::{COMMITTED_GRACE_MS, CROSSING_GRACE_MS};
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
     use crate::{
@@ -367,18 +376,53 @@ mod tests {
     /// about, and the two families are sized apart: the core window is
     /// one validity range wide, and the lapse runs from the same offset
     /// to a sweep the crossing family sets far later.
+    /// A refusal at the last moment a core may abandon in is still
+    /// readable, and stays so for a range past it.
+    ///
+    /// The abandonment window and the window an absence answers in were
+    /// the same span, so a core abandoning at the end of its own left a
+    /// retraction no leg could prove — and every crossing that fed it
+    /// stranded on a cell nobody could read absent.
+    #[test]
+    fn an_absence_answers_a_range_past_the_last_moment_a_core_may_refuse() {
+        let deadline = Deadline::of(ms(60_000));
+        // An abandonment is admissible for one range from the deadline,
+        // so this is the last anchor a retraction can land at.
+        let last_refusal = deadline.at().plus(MAX_VALIDITY_RANGE);
+        assert!(
+            Probed::Core.absence_answers_at(last_refusal, deadline),
+            "a retraction left at the last moment is one a leg can read",
+        );
+        assert!(
+            Probed::Core.absence_answers_at(
+                last_refusal
+                    .plus(MAX_VALIDITY_RANGE)
+                    .minus(Duration::from_millis(1)),
+                deadline,
+            ),
+            "and stays readable for a range past it",
+        );
+        assert!(
+            !Probed::Core.absence_answers_at(last_refusal.plus(MAX_VALIDITY_RANGE), deadline),
+            "and no longer, which is where the cell sweeps",
+        );
+    }
+
     #[test]
     fn an_absence_licenses_nothing_once_the_cell_it_asks_about_may_be_swept() {
         let validity_end = ms(60_000);
         let deadline = Deadline::of(validity_end);
         let core = Window::Core.of(deadline);
-        assert_eq!(core.end, validity_end.plus(RETENTION_HORIZON));
         assert_eq!(
             core.end,
-            validity_end.plus(Duration::from_millis(ARTIFACT_GRACE_MS)),
+            validity_end.plus(Duration::from_millis(COMMITTED_GRACE_MS)),
             "which is where the committed cell it asks about is swept",
         );
-        assert_eq!(core.end.elapsed_since(core.start), MAX_VALIDITY_RANGE);
+        assert_eq!(
+            core.end.elapsed_since(core.start),
+            MAX_VALIDITY_RANGE * 2,
+            "one range for the refusal to land in, one to read the absence it leaves",
+        );
         assert!(
             Probed::Core.absence_answers_at(core.end.minus(Duration::from_millis(1)), deadline)
         );

@@ -850,7 +850,7 @@ mod tests {
         use hyperscale_hbor::from_slice;
         use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
         use hyperscale_vm_effects::Marker;
-        use hyperscale_vm_types::ARTIFACT_GRACE_MS;
+        use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
         install_stub_protocol_statics();
         let shard = ShardId::leaf(1, 1);
@@ -863,7 +863,7 @@ mod tests {
             assert_eq!(decoded.tx, tx.hash());
             assert_eq!(
                 decoded.expiry_ms,
-                tx.validity_range().end_timestamp_exclusive.as_millis() + ARTIFACT_GRACE_MS
+                tx.validity_range().end_timestamp_exclusive.as_millis() + COMMITTED_GRACE_MS
             );
         }
         assert_eq!(
