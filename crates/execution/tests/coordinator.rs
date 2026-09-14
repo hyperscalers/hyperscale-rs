@@ -7,12 +7,13 @@
 
 use std::sync::Arc;
 
+use hyperscale_engine::AllCodeRuns;
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{FinalizationHash, Hash, ShardId, TopologySchedule, TxHash, ValidatorId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
-    ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT)
+    ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT, Arc::new(AllCodeRuns))
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {

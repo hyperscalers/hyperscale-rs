@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Executor;
+use hyperscale_engine::{CodeAvailability, Executor};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
@@ -521,6 +521,12 @@ where
     #[must_use]
     pub fn derivation(&self) -> Arc<dyn Derivation> {
         self.process.derivation()
+    }
+
+    /// This host's code availability, held by the same engine.
+    #[must_use]
+    pub fn code(&self) -> Arc<dyn CodeAvailability> {
+        self.process.code()
     }
 
     /// Look up the latest merged status for a transaction.

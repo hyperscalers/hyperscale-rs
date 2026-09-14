@@ -37,9 +37,13 @@ pub mod legs;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
+pub use backend::Availability;
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
+#[cfg(feature = "test-utils")]
+pub use executor::AllCodeRuns;
 pub use executor::{
-    Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash,
+    CodeAvailability, Executor, artifact_package, build_fee_receipt, instance_of_record,
+    protocol_hash,
 };
 pub use genesis::{
     GenesisConfig, PROTOCOL_RESOURCE, World, genesis_package_facts, genesis_world, genesis_writes,

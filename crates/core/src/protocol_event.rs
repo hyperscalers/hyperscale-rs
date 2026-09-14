@@ -1139,22 +1139,6 @@ pub enum ProtocolEvent {
         /// Epoch that was persisted.
         epoch: Epoch,
     },
-
-    /// The beacon's package registry reconciled against this node's
-    /// holdings at a beacon commit: every registered package whose bytes
-    /// the node cannot yet run. Replaces the dispatch hold's set
-    /// wholesale, so a stale entry cannot outlive the next commit.
-    MissingPackagesUpdated {
-        /// The packages still missing, by content address.
-        packages: Vec<Hash>,
-    },
-
-    /// Fetched package artifacts were verified and installed into the
-    /// engine; the named packages leave the dispatch hold's set.
-    PackagesAcquired {
-        /// The installed packages, by content address.
-        packages: Vec<Hash>,
-    },
 }
 
 impl ProtocolEvent {

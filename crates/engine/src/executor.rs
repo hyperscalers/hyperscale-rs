@@ -50,7 +50,7 @@ use hyperscale_vm_types::{
     Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
 };
 
-use crate::backend::EngineBackend;
+use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::legs::{Licence, Member, Runs};
 use crate::records::BatchRecords;
@@ -261,6 +261,42 @@ pub struct Executor {
     derivation: Arc<BridgeStatics>,
 }
 
+/// Whether this node can run the code a tick's members name.
+///
+/// A local readiness question, never an input to a committed value: what
+/// it gates is *when* a tick dispatches, not what the tick is or what it
+/// decides. The answer is monotone, so a tick released on it cannot find
+/// the code gone by the time it runs.
+///
+/// Asked where the dispatch decision is made, rather than pushed there
+/// as a set: a set has to be seeded, and a shard seated mid-epoch has
+/// nobody to seed it.
+pub trait CodeAvailability: Send + Sync {
+    /// Whether `package`'s code resolves on this node now.
+    fn can_run(&self, package: Hash) -> bool;
+}
+
+impl CodeAvailability for Executor {
+    fn can_run(&self, package: Hash) -> bool {
+        self.package_code_availability(PackageHash(package.as_hash32())) == Availability::Runnable
+    }
+}
+
+/// A [`CodeAvailability`] that answers for every package.
+///
+/// For a harness standing a coordinator up with no engine behind it. A
+/// node that acquires code answers from its engine, which is the only
+/// answer that can hold a tick.
+#[cfg(feature = "test-utils")]
+pub struct AllCodeRuns;
+
+#[cfg(feature = "test-utils")]
+impl CodeAvailability for AllCodeRuns {
+    fn can_run(&self, _package: Hash) -> bool {
+        true
+    }
+}
+
 impl Executor {
     /// Build the engine, its derivation, and the process-wide protocol
     /// answers (first installation wins, so co-hosted nodes sharing one
@@ -404,18 +440,18 @@ impl Executor {
         }
     }
 
-    /// Whether `package`'s code resolves without waiting — built, or
-    /// refused by a build every replica refuses alike.
+    /// Whether this node can run `package`'s code.
     #[must_use]
-    pub fn package_code_settled(&self, package: PackageHash) -> bool {
-        self.backend.code_settled(package)
+    pub fn package_code_availability(&self, package: PackageHash) -> Availability {
+        self.backend.code_availability(package)
     }
 
     /// Whether the artifact behind `package` — named by the workspace
-    /// hash the beacon registry carries — is judged or being built.
+    /// hash the beacon registry carries — is worth fetching.
     #[must_use]
-    pub fn package_known(&self, package: Hash) -> bool {
-        self.backend.code_known(PackageHash(package.as_hash32()))
+    pub fn needs_artifact(&self, package: Hash) -> bool {
+        self.backend
+            .artifact_wanted(PackageHash(package.as_hash32()))
     }
 
     /// The cell a component's record is sealed into — where a node

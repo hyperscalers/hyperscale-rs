@@ -15,8 +15,8 @@ use hyperscale_engine::genesis::{
 use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE, PreviewGrants,
-    PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
+    Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
+    PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
     TickEnvironment, TickTxInput, genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
@@ -2333,9 +2333,9 @@ fn published_metadata() -> PackageMetadata {
     metadata
 }
 
-fn await_code_settled(executor: &Executor, package: PackageHash) {
+fn await_code_runnable(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while !executor.package_code_settled(package) {
+    while executor.package_code_availability(package) != Availability::Runnable {
         assert!(
             std::time::Instant::now() < deadline,
             "the package's code never became resolvable"
@@ -2353,8 +2353,9 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     naming(&mut metadata, "compiled");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
-    assert!(
-        !executor.package_code_settled(package),
+    assert_eq!(
+        executor.package_code_availability(package),
+        Availability::Absent,
         "the code is unknown before its block commits"
     );
 
@@ -2365,8 +2366,9 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
     };
-    assert!(
-        !executor.package_code_settled(package),
+    assert_eq!(
+        executor.package_code_availability(package),
+        Availability::Absent,
         "execution alone compiles nothing"
     );
 
@@ -2374,7 +2376,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     // the artifact to the compile worker: the code is on its way from
     // the commit, not from the first call that needs it.
     absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
-    await_code_settled(&executor, package);
+    await_code_runnable(&executor, package);
 }
 
 #[test]
@@ -2394,7 +2396,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
         Some(&metadata),
         "the reseeded artifact's metadata is routable"
     );
-    await_code_settled(&executor, package);
+    await_code_runnable(&executor, package);
 
     // Junk in the index is refused, not trusted: the cells are the
     // authority and the index is derived.
@@ -2407,7 +2409,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     naming(&mut metadata, "after the refusal");
     let next = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     executor.install_artifact(&next);
-    await_code_settled(&executor, package_hash(&ProtocolHasher, &next));
+    await_code_runnable(&executor, package_hash(&ProtocolHasher, &next));
 }
 
 #[test]
