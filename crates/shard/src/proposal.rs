@@ -608,6 +608,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::ZERO,
+                committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: vec![RoutePrefix::of(Address::new(
                 [0x00; 31],

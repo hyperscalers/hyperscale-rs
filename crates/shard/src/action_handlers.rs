@@ -793,7 +793,7 @@ where
                 let tx = held.get(&entry.tx_hash)?;
                 // The placement and the table its own commit ran under,
                 // which is where every figure it restates was frozen.
-                let at = committed_windows.get(&entry.committed.anchor)?;
+                let at = committed_windows.get(&entry.committed.committee_anchor)?;
                 let restated = committed_at(entry)?
                     && UnsettledTx::for_transaction(
                         tx,
