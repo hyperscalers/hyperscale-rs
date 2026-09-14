@@ -35,7 +35,7 @@ use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
     LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
-    TermsRefusal, admit_event_bounds, read_bytes,
+    TermsRefusal, admit_event_bounds, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -185,7 +185,10 @@ pub fn declared_vector(
 
     // Every value edge's record under its producer and claim under its
     // consumer, at the kernel's own widths, whether or not the edge
-    // crosses at any placement.
+    // crosses at any placement. Each is a leaf like any the declaration
+    // names, so each is priced through `written_leaf` — the tree path an
+    // update reads is what it costs whether a body declared the cell or
+    // the kernel writes it unasked.
     let point_write = point_write_units();
     for consumer in legs {
         for edge in &consumer.edges {
@@ -195,7 +198,7 @@ pub fn declared_vector(
             add(
                 producer.target,
                 DeclaredWork {
-                    write_bytes: u64::from(CROSSING_CELL_BYTES),
+                    write_bytes: written_leaf(u64::from(CROSSING_CELL_BYTES)),
                     footprint: point_write,
                     ..DeclaredWork::ZERO
                 },
@@ -203,7 +206,7 @@ pub fn declared_vector(
             add(
                 consumer.target,
                 DeclaredWork {
-                    write_bytes: u64::from(MARKER_CELL_BYTES),
+                    write_bytes: written_leaf(u64::from(MARKER_CELL_BYTES)),
                     footprint: point_write,
                     ..DeclaredWork::ZERO
                 },
@@ -331,10 +334,13 @@ fn everywhere(
     signatures: DeclaredWork,
     event_bytes: u64,
 ) -> DeclaredWork {
+    // One leaf, written by the shard rather than declared by a body, and
+    // priced as one: what it keeps is its own bytes, what it costs is
+    // those over the tree path the update reads.
     let committed_cell = u64::from(MARKER_CELL_BYTES);
     DeclaredWork {
         compute: signatures.compute,
-        write_bytes: committed_cell,
+        write_bytes: written_leaf(committed_cell),
         retention: envelope_bytes
             .saturating_add(retained)
             .saturating_add(committed_cell)
@@ -797,7 +803,14 @@ impl BridgeStatics {
         // writes it claims — the package cell, written whole with the
         // artifact, and the vault the fee burns from — under the
         // publisher, with its one ceiling and its signature.
-        let written = (artifact.len() as u64).saturating_add(AMOUNT_CELL_BYTES as u64);
+        //
+        // Two leaves and not one sum: each carries its own tree path, so
+        // what they cost is `written_leaf` twice where what they keep is
+        // their bytes added.
+        let artifact_bytes = artifact.len() as u64;
+        let retained = artifact_bytes.saturating_add(AMOUNT_CELL_BYTES as u64);
+        let written =
+            written_leaf(artifact_bytes).saturating_add(written_leaf(AMOUNT_CELL_BYTES as u64));
         let shares = vec![OwnerShare {
             owner: publisher.address(),
             work: DeclaredWork {
@@ -809,7 +822,7 @@ impl BridgeStatics {
         }];
         // A publish keeps exactly what it writes: the artifact sits in
         // the package cell and the vault holds its amount.
-        let everywhere = everywhere(written, envelope_bytes(vm)?, vm.signatures(), 0);
+        let everywhere = everywhere(retained, envelope_bytes(vm)?, vm.signatures(), 0);
         let work = whole_work(&shares, &[], everywhere);
 
         Ok(Derived {
@@ -1501,12 +1514,15 @@ mod tests {
         let wider_vm = envelope(&twice, &[]);
         let twice = statics().derive(&wider_vm).expect("derives");
         let wider_bytes = super::envelope_bytes(&wider_vm).expect("encodes");
+        // Against what the second pair's leaves KEEP — its edge's record
+        // and claim at their own widths — and not against what they cost
+        // to write, which carries a per-leaf floor retention never sees.
         assert_eq!(
             twice.work.retention - derived.work.retention,
             moving
-                + (twice.work.write_bytes - derived.work.write_bytes)
+                + u64::from(CROSSING_CELL_BYTES + MARKER_CELL_BYTES)
                 + (wider_bytes - envelope_bytes),
-            "the second pair adds its own event bound, its own writes and its own envelope"
+            "the second pair adds its own event bound, the cells its edge keeps, and its own envelope"
         );
         // The fixture statics know the account package's metadata and
         // not its artifact, so nothing is read for it; a statics that
@@ -1582,6 +1598,51 @@ mod tests {
             "one vault fewer, and the survivor still written once: {} against {}",
             write_of(&itself),
             write_of(&plain)
+        );
+    }
+
+    /// A leaf the chain writes costs what a leaf a body declares costs.
+    ///
+    /// The committed cell is the one every shard writes for every
+    /// transaction whatever it holds, so pricing it at its width alone
+    /// would leave a full block spending most of its real write budget
+    /// outside the cap that is supposed to bound it — the cap is derived
+    /// in leaves, and this is a leaf.
+    ///
+    /// Read against the width rather than as a constant: what the pin is
+    /// about is the floor being there, and the floor is the difference.
+    #[test]
+    fn a_leaf_the_chain_writes_carries_the_floor_a_declared_leaf_does() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
+        assert_eq!(
+            derived.everywhere.write_bytes,
+            WRITE_LEAF_BYTES + u64::from(MARKER_CELL_BYTES),
+            "the committed cell is one leaf written, not {MARKER_CELL_BYTES} bytes of value"
+        );
+
+        // And the floor stays out of what is kept: dropping one vault
+        // leaf takes the floor off the write dimension and only the
+        // leaf's own bytes off retention.
+        let itself = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(composer_addr(), 1, RES_X),
+        ]);
+        let fewer = statics().derive(&envelope(&itself, &[])).expect("derives");
+        assert_eq!(
+            derived.work.write_bytes - fewer.work.write_bytes,
+            WRITE_LEAF_BYTES + AMOUNT_CELL_BYTES as u64,
+            "a leaf costs its path and its bytes"
+        );
+        assert_eq!(
+            derived.work.retention - fewer.work.retention,
+            AMOUNT_CELL_BYTES as u64,
+            "and keeps only its bytes"
         );
     }
 
