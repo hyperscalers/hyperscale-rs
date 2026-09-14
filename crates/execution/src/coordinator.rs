@@ -20,8 +20,8 @@
 //!   core's output has crossed back.
 //! - **Settling.** No node at all: a reclaim taking back a crossing
 //!   nobody claimed, a retirement deleting records whose claims
-//!   committed, or an inherited record a reshape seat decides from the
-//!   leaf alone.
+//!   committed, or a record this shard holds and decides from the leaf
+//!   alone.
 //!
 //! # How a tick settles
 //!
@@ -243,8 +243,8 @@ pub struct ExecutionMemoryStats {
     pub unproven_ecs: usize,
 }
 
-/// The name a housekeeping member over inherited records takes on the
-/// chain that inherited them.
+/// The name a housekeeping member over held records takes on the chain
+/// disposing of them.
 ///
 /// Derived from the transaction that issued the crossings and the record
 /// cells being settled, so every replica at one frontier reaches the same
@@ -252,9 +252,9 @@ pub struct ExecutionMemoryStats {
 /// transaction's own hash: that transaction belongs to a chain that has
 /// ended, this one never committed it, and a receipt naming it would be a
 /// verdict this chain has no standing to reach.
-fn inherited_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
+fn disposal_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
     let keys: Vec<Vec<u8>> = records.iter().map(|key| key.to_bytes().to_vec()).collect();
-    let mut parts: Vec<&[u8]> = vec![b"hyperscale.inherited.records", &issued_by.0.0];
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.record.disposal", &issued_by.0.0];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
 }
@@ -529,12 +529,12 @@ impl ExecutionCoordinator {
             None => recovered.committee_anchor_wt(),
         };
         Self {
-            counterparts: Counterparts::seated(
+            counterparts: Counterparts::holding(
                 local_shard,
                 proven_anchors,
                 proven_cells,
                 mirror,
-                &recovered.inherited_records,
+                &recovered.escrow_records,
             ),
             finalized,
             committed_height,
@@ -1092,13 +1092,14 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Admit into the tick being composed the records this shard
-    /// inherited with a prefix whose claim it can now read.
+    /// Admit into the tick being composed the records this shard holds
+    /// whose claim it can now read.
     ///
     /// One member per issuing transaction, under a name of this chain's
-    /// own ([`inherited_member_name`]) rather than the transaction's.
-    /// The transaction was decided on a chain that has ended, and this
-    /// one never committed it: naming it here would put a second verdict
+    /// own ([`disposal_member_name`]) rather than the transaction's. A
+    /// record older than what this chain replays is one no entry here
+    /// names, and its transaction may have been decided on a chain that
+    /// has ended: naming it here would put a second verdict
     /// on a transaction nothing local can speak for, and would offer the
     /// chain a resolution its own pre-cut rule exists to refuse. What
     /// this shard does decide is the housekeeping itself, which is
@@ -1122,7 +1123,7 @@ impl ExecutionCoordinator {
     /// The lapse is the later of the two and is honest for both — and
     /// past it no core shard of any arity can still commit, so the
     /// silence is final however wide the core was.
-    fn admit_inherited(
+    fn admit_record_disposals(
         &mut self,
         topology_schedule: &TopologySchedule,
         tick_id: TickId,
@@ -1131,7 +1132,7 @@ impl ExecutionCoordinator {
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
-        if self.counterparts.inherited.is_empty() {
+        if self.counterparts.held.is_empty() {
             return;
         }
         let Some(committee) = topology_schedule.at(tick_ts) else {
@@ -1143,7 +1144,17 @@ impl ExecutionCoordinator {
         // same way settle together and a record still waiting holds
         // nothing back.
         let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
-        for (key, record) in &self.counterparts.inherited {
+        for (key, record) in &self.counterparts.held {
+            // A transaction the ledger still holds an entry for is the
+            // ledger's to settle: its reclaim and its retirement compose
+            // from the same leaves under the transaction's own name, and
+            // two members over one record would leave the second reading
+            // a cell the first deleted. The leaf is what answers once no
+            // entry does — which is every record older than what this
+            // chain replays, and every one whose entry has been pruned.
+            if self.counterparts.ledger.contains(record.cell.tx) {
+                continue;
+            }
             let claim = record.cell.consumer_claim;
             let licence = if trie.shard_for_prefix(claim.owner) == local_shard {
                 // This shard holds the cell, so the engine reads it
@@ -1170,12 +1181,12 @@ impl ExecutionCoordinator {
             due.entry((record.cell.tx, licence)).or_default().push(*key);
         }
         for ((issued_by, licence), records) in due {
-            let tx_hash = inherited_member_name(issued_by, &records);
+            let tx_hash = disposal_member_name(issued_by, &records);
             // Taken once: the credit deletes the cell, so a second
             // member over the same record would read nothing and the
             // records would be stranded behind a refusal.
             for key in &records {
-                self.counterparts.inherited.remove(key);
+                self.counterparts.held.remove(key);
             }
             record_reclaim_admitted();
             // No body reached this shard: the chain that issued the
@@ -1432,7 +1443,7 @@ impl ExecutionCoordinator {
         let tick_prices = pricing_window(topology_schedule, block.ts).prices();
         self.admit_reclaims(tick_id, block.ts, tick_prices, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, tick_prices, &mut state, &mut requests);
-        self.admit_inherited(
+        self.admit_record_disposals(
             topology_schedule,
             tick_id,
             block.ts,
@@ -4045,7 +4056,7 @@ mod tests {
     use hyperscale_vm_types::{ResourceAddr, Seeded};
 
     use super::*;
-    use crate::counterparts::Inherited;
+    use crate::counterparts::HeldRecord;
     use crate::ledger::Part;
 
     fn make_test_topology() -> TopologySchedule {
@@ -8886,9 +8897,9 @@ mod tests {
         );
     }
 
-    /// An escrow record a seat inherited: the leaf a predecessor left,
-    /// naming a claim cell that sits on `PEER`.
-    fn inherited_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+    /// An escrow record this shard holds: a leaf naming a claim cell
+    /// that sits on `PEER`.
+    fn held_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -8924,14 +8935,26 @@ mod tests {
         (record_key, claim, cell)
     }
 
-    /// What a seat holding one inherited record dispatches, once a block
-    /// carries a proof of its claim.
-    fn inherited_settlement(present: bool) -> Option<Runs> {
+    /// What a shard holding one record dispatches, once a block carries
+    /// a proof of its claim. `owed_here` registers the issuing
+    /// transaction in the ledger, which is the shard's other way of
+    /// reaching the same leaves.
+    fn held_settlement(present: bool, owed_here: bool) -> Option<Runs> {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
         // Past the lapse, which is where an absence answers.
         let expiry_ms = 400_000;
-        let (record_key, claim, cell) = inherited_record(0x6A, expiry_ms);
+        let (record_key, claim, cell) = held_record(0x6A, expiry_ms);
+        if owed_here {
+            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+                Verified::new_unchecked_for_test(straddling_transaction(1)),
+            ));
+            state.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                [(&transaction, &Classified::whole())],
+            );
+        }
         let deadline = Deadline::from_expiry(expiry_ms);
         let read_at = Window::Lapse
             .of(deadline)
@@ -8939,8 +8962,8 @@ mod tests {
             .plus(Duration::from_secs(1));
         state
             .counterparts
-            .inherited
-            .insert(record_key, Inherited::seated(cell));
+            .held
+            .insert(record_key, HeldRecord::of(cell));
 
         // The claim sits on PEER, so the seat asks rather than reads.
         state.committed_ts = read_at;
@@ -8969,18 +8992,18 @@ mod tests {
         })
     }
 
-    /// A record inherited with a prefix whose claim routes elsewhere is
-    /// decided against that claim, proved.
+    /// A held record whose claim routes elsewhere is decided against
+    /// that claim, proved.
     ///
     /// Present, the consumer holds the crossing and the record is
     /// deleted; absent past the lapse, nobody took it and the value goes
-    /// back. Before this a seat skipped such a record on every tick
-    /// forever: the value stood on its prefix with nothing naming it.
+    /// back. Without this a shard skips such a record on every tick
+    /// forever: the value stands on its prefix with nothing naming it.
     #[test]
-    fn a_seat_decides_an_inherited_record_against_a_proof_of_its_claim() {
+    fn a_held_record_is_decided_against_a_proof_of_its_claim() {
         assert!(
             matches!(
-                inherited_settlement(true),
+                held_settlement(true, false),
                 Some(Runs::Settle {
                     on: Licence::Claimed,
                     ..
@@ -8990,13 +9013,32 @@ mod tests {
         );
         assert!(
             matches!(
-                inherited_settlement(false),
+                held_settlement(false, false),
                 Some(Runs::Settle {
                     on: Licence::Unclaimed,
                     ..
                 })
             ),
             "and proved absent past the lapse takes the crossing back"
+        );
+    }
+
+    /// A record whose issuing transaction the ledger still holds is the
+    /// ledger's to settle, not the leaf's.
+    ///
+    /// Both paths compose from the same leaves, so two members over one
+    /// record would leave the second reading a cell the first deleted.
+    /// The leaf answers once no entry does, which is every record older
+    /// than what this chain replays.
+    #[test]
+    fn a_record_the_ledger_still_owes_for_is_left_to_the_ledger() {
+        assert!(
+            held_settlement(false, true).is_none(),
+            "an entry here settles its own records",
+        );
+        assert!(
+            held_settlement(false, false).is_some(),
+            "and the leaf answers where no entry does",
         );
     }
 

@@ -534,7 +534,7 @@ impl ShardCoordinatorSim {
     /// the replica and re-signing a consumed round.
     pub fn crash_and_restart(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
-        let recovered = self.storages[idx].load_recovered_state();
+        let recovered = self.storages[idx].load_recovered_state(ShardId::ROOT);
         let mut coord = ShardCoordinator::new(
             Arc::new(BlsVerifier),
             replica,

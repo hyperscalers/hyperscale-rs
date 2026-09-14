@@ -1491,17 +1491,29 @@ where
 ///
 /// Read off the state rather than an index, which is why it does not
 /// matter how the cells arrived — a commit here, an import at a reshape
-/// successor's adoption. The one caller is that adoption, whose ledger
-/// begins empty while the value its predecessors escrowed rides the
-/// prefix in.
+/// successor's adoption — nor how the store was reached. `recovered`
+/// answers as a restart does, and answers with the same set: a node
+/// resuming a store owes exactly what a node that never stopped owes,
+/// or the two compose different ticks.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_escrow_records_are_read_off_the_state<S>(storage: &S)
-where
+pub fn test_escrow_records_are_read_off_the_state<S>(
+    storage: &S,
+    recovered: impl Fn(ShardId) -> RecoveredState,
+) where
     S: BoundaryStore + TestStore,
 {
+    let owed = |shard: ShardId| {
+        let scanned = storage.escrow_records(shard);
+        assert_eq!(
+            recovered(shard).escrow_records,
+            scanned,
+            "a resumed store owes what a running one does",
+        );
+        scanned
+    };
     install_stub_protocol_statics();
     // The left half of the keyspace. `state_key` fills all thirty-one
     // body bytes with its owner seed, so a seed under 0x80 sits here and
@@ -1511,13 +1523,13 @@ where
         commit_writes(storage, writes);
     };
     assert!(
-        storage.escrow_records(shard).is_empty(),
+        owed(shard).is_empty(),
         "a store holding nothing owes nothing",
     );
 
     commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
     assert!(
-        storage.escrow_records(shard).is_empty(),
+        owed(shard).is_empty(),
         "an ordinary cell is not a record, wherever it sits",
     );
 
@@ -1528,13 +1540,13 @@ where
         (sibling, Some(stub_record_cell(8))),
     ])));
     assert_eq!(
-        storage.escrow_records(shard),
+        owed(shard),
         vec![(record, stub_record_cell(7))],
         "a record reads back with the bytes a reclaim composes from, and a \
          record under the sibling's prefix is not this shard's to owe",
     );
     assert_eq!(
-        storage.escrow_records(ShardId::leaf(1, 1)),
+        owed(ShardId::leaf(1, 1)),
         vec![(sibling, stub_record_cell(8))],
         "and the sibling's own scan answers with its own",
     );
@@ -1543,7 +1555,7 @@ where
         record, None,
     )])));
     assert!(
-        storage.escrow_records(shard).is_empty(),
+        owed(shard).is_empty(),
         "a record taken back is no longer owed",
     );
 }

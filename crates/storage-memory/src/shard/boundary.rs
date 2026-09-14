@@ -418,12 +418,14 @@ mod tests {
         test_boundary_import_roundtrip(&storage, &fresh);
     }
 
-    /// A store answers for the escrow records its state holds, which is
-    /// what a merge successor's adoption reads its obligations off.
+    /// A store answers for the escrow records its state holds, and
+    /// answers the same whether it is running or resumed.
     #[test]
     fn escrow_records_are_read_off_the_state() {
         let storage = SimShardStorage::default();
-        test_escrow_records_are_read_off_the_state(&storage);
+        test_escrow_records_are_read_off_the_state(&storage, |shard| {
+            storage.load_recovered_state(shard)
+        });
     }
 
     #[test]

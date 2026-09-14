@@ -158,24 +158,24 @@ pub struct RecoveredState {
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 
-    /// The escrow records this store inherited with a prefix it adopted
-    /// whole, and their committed bytes, for the cells that are still
-    /// live.
+    /// The escrow records this store holds under the shard's prefix,
+    /// with their committed bytes.
     ///
-    /// A successor's ledger is a fold over its own chain, which begins
-    /// empty, while the value its predecessors escrowed rides the prefix
-    /// into it. Nothing else names those records: the entry that would
-    /// is the predecessor's ledger's, a fold over a chain the successor
-    /// never replays, and the cell is outside every sweep's reach. So
-    /// the adoption writes down what it imported, from the leaves it
-    /// wrote — the same argument the sweep index's rebuild makes, and
-    /// the same authority.
+    /// Value this shard owes an answer for, read from the leaves that
+    /// hold it and from nothing else. Nothing else can name them: the
+    /// entry that would is a fold over a chain a successor never
+    /// replays and a restart replays only a window of, and the cell is
+    /// outside every sweep's reach. The state is the authority, and it
+    /// is what every node holding the prefix has — which is what makes
+    /// the set a function of committed content rather than of how a
+    /// node got here.
     ///
-    /// Empty everywhere but a reshape successor's adoption. An ordinary
-    /// snap-sync joins a chain whose members hold the ledger, and a
-    /// joiner deriving obligations they do not would compose a tick they
-    /// cannot sign.
-    pub inherited_records: Vec<(SubstateKey, Vec<u8>)>,
+    /// Read the same way however the store was reached: adopted whole
+    /// at a reshape seat, resumed after a restart, or imported by
+    /// snap-sync. A set seeded by an event one node witnessed and
+    /// another did not is a set two replicas compose different ticks
+    /// from.
+    pub escrow_records: Vec<(SubstateKey, Vec<u8>)>,
 
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
@@ -255,7 +255,7 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
-            inherited_records: Vec::new(),
+            escrow_records: Vec::new(),
             voted_blocks: Vec::new(),
         }
     }

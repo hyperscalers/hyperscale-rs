@@ -15,12 +15,12 @@ use hyperscale_jmt::NibblePath;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    DedupWindow, GenesisCommit, ImportProgress, RecoveredState, SafeVoteRegisterStore,
-    SubstateStore, Substates, replay_window,
+    BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
+    SafeVoteRegisterStore, SubstateStore, Substates, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
-    SubstateKey, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, ShardId,
+    StateRoot, SubstateKey, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -131,11 +131,16 @@ impl SimShardStorage {
     /// reads back at genesis with `jmt_root` pinned to the empty
     /// root.
     ///
+    /// `shard` is the shard this store is resumed as, which narrows the
+    /// escrow records to the ones it owns: a split child's cell column
+    /// is a superset of its own leaves until the sibling's are
+    /// compacted out of it.
+    ///
     /// # Panics
     ///
     /// Panics if an internal `RwLock` is poisoned.
     #[must_use]
-    pub fn load_recovered_state(&self) -> RecoveredState {
+    pub fn load_recovered_state(&self, shard: ShardId) -> RecoveredState {
         let c = read_or_recover(&self.consensus);
         let committed_height = c.committed_height;
         let committed_hash = c.committed_hash;
@@ -219,9 +224,7 @@ impl SimShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers,
-            // Filled only by a reshape adoption, where a store inherits a
-            // prefix whole; an ordinary resume folds its own chain.
-            inherited_records: Vec::new(),
+            escrow_records: self.escrow_records(shard),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
     }

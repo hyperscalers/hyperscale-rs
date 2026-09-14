@@ -237,7 +237,7 @@ mod tests {
             .unwrap();
         assert_eq!(adopted, root);
 
-        let recovered = store.load_recovered_state();
+        let recovered = store.load_recovered_state(ShardId::ROOT);
         assert_eq!(recovered.committed_height, BlockHeight::new(10));
         assert_eq!(recovered.committed_hash, Some(genesis.hash()));
         assert_eq!(recovered.jmt_root, Some(root));
@@ -412,7 +412,7 @@ mod tests {
             assert_ne!(root, StateRoot::ZERO);
             roots.push(root);
 
-            let recovered = child.load_recovered_state();
+            let recovered = child.load_recovered_state(child_of(side));
             assert_eq!(recovered.committed_height, BlockHeight::new(10));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert_eq!(recovered.chain_origin, origin_at_10());

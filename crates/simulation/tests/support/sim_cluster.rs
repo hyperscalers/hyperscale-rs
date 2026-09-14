@@ -617,7 +617,7 @@ impl Cluster for SimCluster {
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .max_by_key(|store| ShardChainReader::committed_height(*store))
-            .map(|store| store.load_recovered_state().chain_origin.anchor_wt)
+            .map(|store| store.load_recovered_state(shard).chain_origin.anchor_wt)
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {

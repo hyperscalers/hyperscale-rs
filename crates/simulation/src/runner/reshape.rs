@@ -222,7 +222,7 @@ impl SimulationRunner {
     fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) {
         let storage = SimShardStorage::new(shard_prefix_path(shard));
         replicate_engine_bootstrap(&storage, &self.genesis_config());
-        let recovered = storage.load_recovered_state();
+        let recovered = storage.load_recovered_state(shard);
         self.reshape_stores.insert(
             (host, shard),
             PreparedStore {
@@ -256,7 +256,7 @@ impl SimulationRunner {
             .shard_io(parent)
             .storage()
             .clone_for_split_child(shard_prefix_path(child));
-        let recovered = storage.load_recovered_state();
+        let recovered = storage.load_recovered_state(child);
         self.reshape_stores.insert(
             (host, child),
             PreparedStore {

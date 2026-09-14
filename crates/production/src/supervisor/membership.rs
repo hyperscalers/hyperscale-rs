@@ -101,7 +101,7 @@ impl ShardSupervisor {
         let vnodes = vnodes.to_vec();
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(shard).map(|storage| {
-                let recovered = storage.load_recovered_state();
+                let recovered = storage.load_recovered_state(shard);
                 // A brand-new store (no commits, no imported JMT) gets
                 // the engine bootstrap before the snap-sync import or
                 // the from-genesis replay populates it.
