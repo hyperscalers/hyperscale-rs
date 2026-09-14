@@ -28,12 +28,18 @@ use hyperscale_vm_effects::PackageHash;
 pub enum Availability {
     /// Built and resolvable now.
     Runnable,
+    /// The bytes are in hand and their build is in flight. An invocation
+    /// arriving now waits the build out rather than answering
+    /// differently from a replica whose build already landed, so this is
+    /// as good as [`Self::Runnable`] to anything that may wait — and
+    /// what keeps whether a tick runs from turning on when a background
+    /// compile happened to finish.
+    Building,
     /// A build refused these bytes. It resolves to no code, and it
     /// resolves there on every replica, so what a call to it reaches is
     /// the same everywhere.
     Refused,
-    /// Not judged, or judged and still building. Machine-local, and the
-    /// only answer a fetch can change.
+    /// No bytes. Machine-local, and the only answer a fetch can change.
     Absent,
 }
 
@@ -116,37 +122,31 @@ impl<C> PackageSlots<C> {
         self.done.notify_all();
     }
 
-    /// Whether this node can run `package`'s code, without waiting out
-    /// a build in flight.
+    /// Where `package` stands on this node, without waiting for
+    /// anything.
     ///
-    /// Lock-free, because a caller that must not block is exactly the
-    /// caller this answers: a package still building is absent from the
-    /// settled map, and [`Availability::Absent`] is the answer such a
-    /// caller wants for it.
+    /// The one question asked of these slots. A settled verdict answers
+    /// lock-free, which is every call but the ones racing a build; only
+    /// an unsettled package pays for the pending set, and what it buys
+    /// is telling bytes in hand from bytes never fetched.
     fn availability(&self, package: PackageHash) -> Availability {
-        match self.settled.load().get(&package) {
-            Some(Some(_)) => Availability::Runnable,
-            Some(None) => Availability::Refused,
-            None => Availability::Absent,
+        if let Some(verdict) = self.settled.load().get(&package) {
+            return if verdict.is_some() {
+                Availability::Runnable
+            } else {
+                Availability::Refused
+            };
         }
-    }
-
-    /// Whether `package`'s bytes are worth asking for: this backend has
-    /// neither judged them nor begun to.
-    ///
-    /// A different question from [`Self::availability`], about a
-    /// different object — that one is code this node can run, this one
-    /// is bytes it holds. A refused build holds the bytes and cannot run
-    /// them, and asking again would only refuse them again.
-    fn wanted(&self, package: PackageHash) -> bool {
-        if self.settled.load().contains_key(&package) {
-            return false;
-        }
-        !self
+        if self
             .pending
             .lock()
             .expect("package slots lock poisoned")
             .contains(&package)
+        {
+            Availability::Building
+        } else {
+            Availability::Absent
+        }
     }
 }
 
@@ -262,16 +262,10 @@ mod native {
             move |artifact: &[u8]| queue(&slots, &compile, artifact)
         }
 
-        /// Whether this node can run `package`'s code now.
+        /// Where `package` stands on this node.
         #[must_use]
-        pub fn code_availability(&self, package: PackageHash) -> Availability {
+        pub fn code_standing(&self, package: PackageHash) -> Availability {
             self.slots.availability(package)
-        }
-
-        /// Whether `package`'s artifact is worth asking a peer for.
-        #[must_use]
-        pub fn artifact_wanted(&self, package: PackageHash) -> bool {
-            self.slots.wanted(package)
         }
     }
 
@@ -462,16 +456,10 @@ mod reference {
             move |artifact: &[u8]| absorb_into(&slots, artifact)
         }
 
-        /// Whether this node can run `package`'s code now.
+        /// Where `package` stands on this node.
         #[must_use]
-        pub fn code_availability(&self, package: PackageHash) -> Availability {
+        pub fn code_standing(&self, package: PackageHash) -> Availability {
             self.slots.availability(package)
-        }
-
-        /// Whether `package`'s artifact is worth asking a peer for.
-        #[must_use]
-        pub fn artifact_wanted(&self, package: PackageHash) -> bool {
-            self.slots.wanted(package)
         }
     }
 

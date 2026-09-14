@@ -34,7 +34,8 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
-    a_priority_is_charged_over_the_table_price, a_published_package_matures_before_it_runs,
+    a_priority_is_charged_over_the_table_price,
+    a_published_package_runs_where_it_was_never_committed,
     a_record_is_decided_by_the_successor_when_its_issuer_splits,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
@@ -339,10 +340,10 @@ fn a_payer_cannot_spend_one_balance_twice_sim() {
 }
 
 #[test]
-fn a_published_package_matures_before_it_runs_sim() {
+fn a_published_package_runs_where_it_was_never_committed_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &storm_genesis_accounts());
-    a_published_package_matures_before_it_runs(&mut cluster);
+    a_published_package_runs_where_it_was_never_committed(&mut cluster);
 }
 
 #[test]

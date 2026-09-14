@@ -13,8 +13,8 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds, Round,
-    SeedLookup, SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction,
+    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SeedLookup,
+    SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction,
     ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
@@ -215,14 +215,6 @@ pub struct TopologySnapshot {
     /// epoch would otherwise pin that epoch's whole committee to answer
     /// a question thirty-two bytes settle.
     seeds: SeedRing,
-    /// The packages a block governed by this window may name, projected
-    /// from `BeaconState.packages`: registered and past their maturity
-    /// window, plus the genesis packages the registry is seeded with. A
-    /// transaction naming anything else is refused a block, because the
-    /// window is what every node fetches an artifact in and clearing it
-    /// is what makes running the code a fact about the chain rather than
-    /// a race between one node's fetch and another's.
-    usable_packages: BTreeSet<Hash>,
     validator_pubkeys: HashMap<ValidatorId, ConsensusPublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -272,7 +264,6 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
-            usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -323,7 +314,6 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
-            usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
@@ -383,7 +373,6 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
-            usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -479,7 +468,6 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             prices: PriceTable::GENESIS,
             fullness: BTreeMap::new(),
-            usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -512,17 +500,6 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn with_params(mut self, params: NetworkParams) -> Self {
         self.params = params;
-        self
-    }
-
-    /// Set the packages this window may name (see
-    /// [`Self::package_usable`]). Defaults empty, which refuses every
-    /// package — only a snapshot projected from a beacon state carries
-    /// the registry that answers this, and only that snapshot governs a
-    /// vote.
-    #[must_use]
-    pub fn with_usable_packages(mut self, packages: BTreeSet<Hash>) -> Self {
-        self.usable_packages = packages;
         self
     }
 
@@ -671,26 +648,6 @@ impl TopologySnapshot {
     #[must_use]
     pub fn fullness_of(&self, shard: ShardId) -> u32 {
         self.fullness.get(&shard).copied().unwrap_or(0)
-    }
-
-    /// Whether a block governed by this window may name `package`.
-    #[must_use]
-    pub fn package_usable(&self, package: &Hash) -> bool {
-        self.usable_packages.contains(package)
-    }
-
-    /// The first package `tx` names that this window may not, if it names
-    /// one.
-    ///
-    /// The proposer asks this of what it selects and the voter asks it
-    /// of what it receives, so a proposer never offers a block its own
-    /// committee would refuse.
-    #[must_use]
-    pub fn unusable_package_of(&self, tx: &Transaction) -> Option<Hash> {
-        tx.packages()
-            .iter()
-            .find(|package| !self.usable_packages.contains(package))
-            .copied()
     }
 
     /// Substate-byte reshape thresholds in force for this window.

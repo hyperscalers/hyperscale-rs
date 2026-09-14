@@ -5,11 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PACKAGE_MATURITY_EPOCHS, PackageFact,
-    PendingReshape, PendingWithdrawal, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS,
-    ShardId, ShardTrie, ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord,
-    ValidatorStatus, Verifier, validator_possession_proof_verify, verify_shard_vote_equivocation,
-    verify_vote_equivocation,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
+    RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitnessPayload, Stake,
+    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
+    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -681,24 +680,6 @@ pub(super) fn apply_shard_payload(
             }
             None
         }
-        ShardWitnessPayload::PackagePublished { package, publisher } => {
-            // The publisher locates the fact's bytes, so the fact is
-            // held to the shard that owns the publisher's prefix — a
-            // committee cannot register a publish for a prefix it does
-            // not serve. First registration wins: the address is a
-            // content address, so a second registration could only
-            // restate it.
-            if ShardTrie::shard_owns_prefix(source_shard, *publisher) {
-                state
-                    .packages
-                    .entry(*package)
-                    .or_insert_with(|| PackageFact {
-                        publisher: *publisher,
-                        usable_from: state.current_epoch.saturating_add(PACKAGE_MATURITY_EPOCHS),
-                    });
-            }
-            None
-        }
     }
 }
 
@@ -849,7 +830,6 @@ pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_types::{Address, AddressClass, ConsensusSignature, Signer, signed_bytes};
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
@@ -858,6 +838,7 @@ mod tests {
         Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
         Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
+    use hyperscale_types::{ConsensusSignature, Signer, signed_bytes};
 
     use super::*;
     use crate::rules::contribution_chunk_valid;
@@ -3032,29 +3013,5 @@ mod tests {
             &split_payload(shards[0]),
         );
         assert!(state.pending_reshapes.is_empty());
-    }
-
-    /// The publish fact registers only from the shard that owns the
-    /// publisher's prefix, and first registration wins.
-    #[test]
-    fn a_publish_fact_registers_once_from_the_owning_shard() {
-        let owner = ShardId::leaf(1, 0);
-        let foreign = ShardId::leaf(1, 1);
-        let mut state = reshape_state(&[owner, foreign], 4);
-        // Top bit 0 puts the publisher under leaf(1, 0).
-        let publisher = Address::new([0x00; 31], AddressClass::Principal);
-        let package = Hash::from_hash_bytes(&[0x44; 32]);
-        let fact = ShardWitnessPayload::PackagePublished { package, publisher };
-
-        // A shard that does not own the prefix registers nothing.
-        apply_shard_payload(&BlsVerifier, &mut state, &net(), foreign, &fact);
-        assert!(state.packages.is_empty());
-
-        apply_shard_payload(&BlsVerifier, &mut state, &net(), owner, &fact);
-        assert_eq!(state.packages[&package].publisher, publisher);
-
-        // Re-registration restates the content address: first wins.
-        apply_shard_payload(&BlsVerifier, &mut state, &net(), owner, &fact);
-        assert_eq!(state.packages.len(), 1);
     }
 }

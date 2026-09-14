@@ -256,17 +256,16 @@ impl<'p> Section for TransactionsSection<'p> {
     type Item = Transaction;
     type Fold = TransactionsFold<'p>;
 
-    /// A transaction the chain does not already carry, naming packages
-    /// this window can run, engaged by its payer bundle where its payer
-    /// is elsewhere, under its own ceilings in every dimension, and
-    /// fitting the block's sweepable-cell cap and its per-dimension caps
-    /// over the share this shard bears.
+    /// A transaction the chain does not already carry, engaged by its
+    /// payer bundle where its payer is elsewhere, under its own ceilings
+    /// in every dimension, and fitting the block's sweepable-cell cap
+    /// and its per-dimension caps over the share this shard bears.
     ///
-    /// The package rule is stated as the permission rather than the
-    /// refusal: every package a transaction names must be registered
-    /// past its maturity window or born with the chain, so by the time
-    /// a transaction can run, the code it runs is code the whole
-    /// committee holds. Engagement demands the transaction commit proof
+    /// Nothing here asks about the code a transaction runs. A node that
+    /// cannot resolve a package never derives the transaction at all, so
+    /// it never reaches this gate — and one that did derive it holds the
+    /// metadata, which is what admission reads. Engagement demands the
+    /// transaction commit proof
     /// — the payer bundle — ride in the same block or a committed one,
     /// which closes the Byzantine-proposer path to engaging counterpart
     /// locks before the payer shard commits. The sweep cap bounds how
@@ -285,11 +284,6 @@ impl<'p> Section for TransactionsSection<'p> {
         if ctx.dedup.contains_tx(&tx_hash) {
             return Err(format!(
                 "transaction {tx_hash} already committed within its validity window"
-            ));
-        }
-        if let Some(package) = ctx.snapshot.unusable_package_of(tx) {
-            return Err(format!(
-                "transaction {tx_hash} names package {package}, which this window cannot run"
             ));
         }
         let trie = ctx.snapshot.shard_trie();

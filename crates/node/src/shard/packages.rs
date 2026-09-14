@@ -1,15 +1,19 @@
-//! Package artifact acquisition: the fetch that makes the beacon's
-//! package registry locally runnable.
+//! Package artifact acquisition: the fetch that makes code an envelope
+//! names locally runnable.
 //!
-//! Every beacon commit reconciles the global registry against what the
-//! engine holds; anything missing is fetched from the shard owning its
-//! publisher's prefix, verified by hashing the returned bytes, installed
-//! into the engine, and persisted beside the beacon store so a restart
-//! reconciles instead of refetching the world.
+//! An artifact's cell sits under its own content address, so a node that
+//! can name a package knows which shard is obliged to keep it and needs
+//! nothing global to ask. What it asks for is what something asked it to
+//! run: a derivation that could not resolve the code names it, the bytes
+//! come back, are verified by hashing them, and are installed into the
+//! engine and persisted beside the beacon store so a restart re-learns
+//! them instead of refetching the world.
 //!
-//! Acquisition is pure prefetch and says nothing about what may execute:
-//! a package's maturity window is what decides that, and it is a fact
-//! about the beacon registry rather than about this node's holdings.
+//! Acquisition says nothing about what may execute. An envelope naming
+//! code this node cannot resolve waits at the door rather than being
+//! refused, and a committed tick whose code has not compiled waits at
+//! the dispatch head — both local answers, neither a fact about the
+//! chain.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
 };
-use hyperscale_types::{Address, BeaconState, Hash, MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{Address, Hash, MessageClass, ShardId, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
@@ -150,41 +154,11 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Reconcile the beacon's package registry against what the engine
-    /// holds, fetching anything missing from the shard obliged to keep
-    /// it.
-    ///
-    /// Which shard that is follows from the content address alone: the
-    /// artifact's cell sits under its own address, so a node asking for
-    /// a package it can name needs nothing else to know who to ask.
-    ///
-    /// Runs on every beacon commit and tolerates arbitrary staleness:
-    /// content addressing makes every enqueue idempotent, and a newly
-    /// seated or restarted node catches the whole backlog on its first
-    /// commit.
-    pub(crate) fn reconcile_packages(&mut self, state: &BeaconState) {
-        let executor = Arc::clone(&self.process.dispatch_handles.executor);
-        let snapshot = self.process.topology_snapshot.load();
-        let mut by_shard: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
-        for package in state.packages.keys() {
-            if executor.needs_artifact(*package) {
-                by_shard
-                    .entry(snapshot.shard_trie().shard_for_prefix(custodian(*package)))
-                    .or_default()
-                    .push(*package);
-            }
-        }
-        drop(snapshot);
-        self.request_artifacts(by_shard);
-    }
-
     /// Ask for the artifacts an envelope's derivation named and this
     /// node cannot resolve.
     ///
-    /// The demand-driven half of the same acquisition the registry walk
-    /// prefetches: a package reaches a node either because the chain
-    /// registered it or because something asked to run it, and both ask
-    /// the shard the content address picks.
+    /// A package reaches a node because something asked to run it, and
+    /// which shard to ask follows from the content address alone.
     pub(crate) fn fetch_wanted_packages(&mut self, packages: Vec<Hash>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let snapshot = self.process.topology_snapshot.load();
@@ -223,8 +197,8 @@ where
     /// this would otherwise run on drives vnode state machines and
     /// consensus timers, and nothing here is on the path of a verdict:
     /// the bytes were verified against their content address before this
-    /// was ever posted, and the maturity window means no transaction
-    /// naming the package can reach a tick for another two epochs.
+    /// was ever posted, and what waits on them waits at a door of this
+    /// node's own.
     ///
     /// The engine is the node's, not the shard's, so a host carrying
     /// several shards can be handed one artifact once per shard that

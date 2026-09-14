@@ -117,6 +117,11 @@ where
         let tx_hash = tx.hash();
         self.io.mempool.pending_validation.remove(&tx_hash);
         let submitted_locally = self.io.mempool.locally_submitted.remove(&tx_hash);
+        // The earliest this node can know it will be asked to run this
+        // code. Deriving the envelope needed the metadata and nothing
+        // more, so a node holding that and not the compiled artifact
+        // reaches here with no gap to report and a tick to run later.
+        self.fetch_wanted_packages(tx.packages().to_vec());
         self.dispatch_event(ProtocolEvent::TransactionValidated {
             tx,
             submitted_locally,

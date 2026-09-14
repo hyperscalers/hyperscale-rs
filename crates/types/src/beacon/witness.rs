@@ -14,8 +14,8 @@
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
-    Address, BlockHeight, ConsensusPublicKey, ConsensusSignature, Epoch, Hash, ParamVote, Round,
-    ShardId, Stake, StakePoolId, ValidatorId,
+    BlockHeight, ConsensusPublicKey, ConsensusSignature, Epoch, Hash, ParamVote, Round, ShardId,
+    Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -184,20 +184,6 @@ pub enum ShardWitnessPayload {
         /// or the child a merge keeper runs).
         child: ShardId,
     },
-    /// A package's artifact settled into its content-addressed cell on
-    /// the emitting shard. The fold registers it globally, which is what
-    /// every other node prefetches the bytes on.
-    ///
-    /// The publisher is explicit rather than implied by the emitting
-    /// shard, so the fold can hold the fact to the shard that owns the
-    /// publisher's prefix — a committee cannot assert a publish for a
-    /// prefix it does not serve.
-    PackagePublished {
-        /// The artifact's content address.
-        package: Hash,
-        /// The prefix the package cell sits under.
-        publisher: Address,
-    },
 }
 
 impl ShardWitnessPayload {
@@ -276,13 +262,6 @@ pub enum BeaconWitnessEvent {
     },
     /// Mirrors [`ShardWitnessPayload::ParamVote`].
     ParamVote(ParamVote),
-    /// Mirrors [`ShardWitnessPayload::PackagePublished`].
-    PackagePublished {
-        /// The artifact's content address.
-        package: Hash,
-        /// The prefix the package cell sits under.
-        publisher: Address,
-    },
 }
 
 impl From<BeaconWitnessEvent> for ShardWitnessPayload {
@@ -314,9 +293,6 @@ impl From<BeaconWitnessEvent> for ShardWitnessPayload {
             },
             BeaconWitnessEvent::Unjail { pool_id, id } => Self::Unjail { pool_id, id },
             BeaconWitnessEvent::ParamVote(vote) => Self::ParamVote(vote),
-            BeaconWitnessEvent::PackagePublished { package, publisher } => {
-                Self::PackagePublished { package, publisher }
-            }
         }
     }
 }
@@ -326,7 +302,6 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::AddressClass;
 
     fn sample_param_vote() -> ParamVote {
         use crate::{Epoch, NetworkParams, ParamProposal, ReshapeThresholds};
@@ -392,10 +367,6 @@ mod tests {
                 child: ShardId::leaf(2, 0b01),
             },
             ShardWitnessPayload::ParamVote(sample_param_vote()),
-            ShardWitnessPayload::PackagePublished {
-                package: Hash::from_hash_bytes(&[0x77; 32]),
-                publisher: Address::new([0x88; 31], AddressClass::Component),
-            },
         ];
         for p in payloads {
             let bytes = hbor_to_vec(&p).unwrap();
@@ -436,10 +407,6 @@ mod tests {
                 pool: StakePoolId::new(5),
                 proposal: None,
             }),
-            BeaconWitnessEvent::PackagePublished {
-                package: Hash::from_hash_bytes(&[0x77; 32]),
-                publisher: Address::new([0x88; 31], AddressClass::Component),
-            },
         ];
         for e in events {
             let bytes = hbor_to_vec(&e).unwrap();

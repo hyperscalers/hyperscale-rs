@@ -56,7 +56,7 @@ use hyperscale_engine::{Executor, LocalCells};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
-    Block, CertifiedBlock, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
+    Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
     TransactionStatus, TxHash, Verified,
 };
 pub use io::ShardIo;
@@ -559,6 +559,23 @@ where
     /// Every same-shard vnode independently applies the event at the
     /// shard's cached `now` and produces its own signed actions.
     pub(crate) fn dispatch_event(&mut self, event: ProtocolEvent) {
+        // A block this node commits is one it must run, so the code its
+        // members name is wanted here. Admission asked for whatever it
+        // could not derive; this asks for what it derived and cannot yet
+        // run — a node holding the metadata but not the compiled code,
+        // and a node that synced past the admission that would have
+        // asked, both reach a committed member the same way.
+        if let ProtocolEvent::BlockCommitted { certified } = &event {
+            let wanted: Vec<Hash> = certified
+                .block()
+                .transactions()
+                .iter()
+                .flat_map(|tx| tx.packages().iter().copied())
+                .collect();
+            if !wanted.is_empty() {
+                self.fetch_wanted_packages(wanted);
+            }
+        }
         let count = self.vnodes.len();
         if count == 0 {
             return;

@@ -65,7 +65,6 @@ fn fixture() -> Fixture {
         })
         .collect();
     let config = BeaconGenesisConfig {
-        genesis_packages: Vec::new(),
         chain_config: BeaconChainConfig::default(),
         initial_validators,
         initial_pools: vec![GenesisPool {
