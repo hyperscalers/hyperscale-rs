@@ -103,6 +103,17 @@ pub struct HeldRecord {
     /// What a committed claim read of the cell, once one has read it:
     /// present at any anchor, absent only past the lapse.
     pub answer: Option<Inclusion>,
+    /// Whether a committed abandonment record says the chain that was
+    /// to consume this crossing can never settle the transaction that
+    /// issued it.
+    ///
+    /// The one licence a record takes from something other than its own
+    /// claim, and the one that reaches a record no entry names: a
+    /// departure is written into the chain, so it answers whenever it
+    /// lands rather than only while the transaction is still owed an
+    /// outcome here. A transaction nothing settled was never accepted,
+    /// so nothing claimed any crossing it issued.
+    pub departed: bool,
 }
 
 impl HeldRecord {
@@ -113,7 +124,17 @@ impl HeldRecord {
             cell,
             asked_at: None,
             answer: None,
+            departed: false,
         }
+    }
+
+    /// Whether the crossing this record holds can never be claimed, so
+    /// the value is the producer's to take back: a departure says so
+    /// outright, and so does the claim read absent inside the window an
+    /// absence means something in.
+    #[must_use]
+    pub const fn unclaimable(&self) -> bool {
+        self.departed || matches!(self.answer, Some(Inclusion::Absent))
     }
 
     /// The deadline every window this record is read against derives
@@ -312,6 +333,7 @@ impl Counterparts {
             record_rebuilt_record_entry();
         }
         self.cover_recorded(block);
+        self.cover_held(block);
         self.stamp_departures(topology_schedule, now);
         let unanswerable = self.ledger.prune(now);
         actions.extend(self.release_answered_fetches(trie));
@@ -728,6 +750,36 @@ impl Counterparts {
             for tx_hash in record.tx_hashes() {
                 self.mirror.cover(tx_hash);
             }
+        }
+    }
+
+    /// Mark the records this block's departures have licensed a reclaim
+    /// of: those whose issuing transaction a record names unsettled.
+    ///
+    /// Every record the transaction issued here, not only one crossing
+    /// into the departed shard. A record establishes the transaction was
+    /// never settled anywhere, and a crossing is claimed only where the
+    /// transaction was accepted — so none of them was.
+    ///
+    /// The same evidence the ledger takes as `departed_by`, read where
+    /// the record is rather than where the entry was. An entry is gone
+    /// one [`CLAIM_WINDOW`](hyperscale_types::CLAIM_WINDOW) past the
+    /// deadline and a departure can land later than that; the leaf is
+    /// still here, and it is what the disposal is composed from.
+    fn cover_held(&mut self, block: &Block) {
+        if self.held.is_empty() {
+            return;
+        }
+        let named: BTreeSet<TxHash> = block
+            .abandonment_records()
+            .iter()
+            .flat_map(AbandonmentRecord::tx_hashes)
+            .collect();
+        if named.is_empty() {
+            return;
+        }
+        for record in self.held.values_mut() {
+            record.departed = record.departed || named.contains(&record.cell.tx);
         }
     }
 

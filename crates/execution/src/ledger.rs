@@ -880,6 +880,24 @@ impl Ledger {
         self.owed.contains_key(&tx_hash)
     }
 
+    /// Whether an entry here will compose the disposal of the records
+    /// `tx_hash` issued on this shard, so the leaves are not the leaf
+    /// path's to settle beside it.
+    ///
+    /// The entries that keep a classification are exactly those: a leg
+    /// and a remainder settle what they issued, and a core member
+    /// becomes a remainder at its own verdict. A whole entry keeps
+    /// none — including one a record reconstructed, which carries the
+    /// figures an abandonment restates and nothing a settlement is
+    /// composed from. That entry gives the verdict and the reservation
+    /// back; the leaves are answered for where they are.
+    #[must_use]
+    pub fn settles_records(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.part.kept().is_some())
+    }
+
     /// Every leg entry no tick has taken the records of yet, with what
     /// it holds.
     ///
