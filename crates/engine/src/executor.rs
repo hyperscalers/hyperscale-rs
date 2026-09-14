@@ -470,6 +470,19 @@ impl Executor {
             .artifact_wanted(PackageHash(package.as_hash32()))
     }
 
+    /// The cell a package's artifact is kept in — where a node serving
+    /// an artifact fetch reads, and what the content address alone
+    /// names.
+    ///
+    /// Like a component's record and for the same reason: the key
+    /// derives from the name, so a request naming a package is a request
+    /// naming a key and the shard owning that prefix is the one obliged
+    /// to answer.
+    #[must_use]
+    pub fn package_artifact_key(package: Hash) -> SubstateKey {
+        package_key(PackageHash(package.as_hash32()))
+    }
+
     /// The cell a component's record is sealed into — where a node
     /// serving a record fetch reads, and what the address alone names.
     ///
@@ -1068,13 +1081,16 @@ pub fn build_fee_receipt(
     project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus
 }
 
-/// Settle one publish: the artifact lands in its content-addressed cell
-/// under the publisher, and the fee burns from the publisher's vault.
+/// Settle one publish: the artifact lands in the cell its content
+/// address names, and the fee burns from the publisher's vault.
+///
+/// The two sit under different owners, so a publish reaches two shards
+/// and each writes the half its locality covers.
 ///
 /// A publish never enters the kernel — there is no manifest to run — so
 /// it settles outside the batch fold rather than inside it. That is
-/// sound because a publish declares exactly two keys, its own package
-/// cell and its own fee vault, and both are exclusive: no sibling in the
+/// sound because a publish declares exactly two keys, the package cell
+/// and its own fee vault, and both are exclusive: no sibling in the
 /// block can be touching either, so there are no earlier burns to layer
 /// on and nothing for the kernel differential to check.
 fn assemble_published_tx(
@@ -1099,16 +1115,17 @@ fn assemble_published_tx(
     let cached = refusal.as_ref().map_or_else(
         || {
             let mut writes = StateWrites::default();
-            if locality.covers(publisher) {
-                let package = package_hash(&ProtocolHasher, artifact);
+            let package = package_hash(&ProtocolHasher, artifact);
+            let cell = package_key(package);
+            if locality.covers(cell.owner) {
                 // Content-addressed, so republishing the same artifact
                 // writes the same bytes to the same cell: idempotent by
                 // construction rather than by a first-write-wins branch.
-                writes
-                    .cells
-                    .insert(package_key(publisher, package), Some(artifact.to_vec()));
+                writes.cells.insert(cell, Some(artifact.to_vec()));
             }
-            apply_fee_burn(&mut writes, fee);
+            if locality.covers(publisher.address()) {
+                apply_fee_burn(&mut writes, fee);
+            }
             let receipt_hash = GlobalReceipt::new(
                 true,
                 EventRoot::ZERO,
@@ -1118,9 +1135,9 @@ fn assemble_published_tx(
             .receipt_hash();
             // The publish becomes a beacon fact: paired with the
             // publisher as emitter, so the shard owning the publisher's
-            // prefix — the one that keeps the cell — is the one whose
-            // witness stream carries it, exactly once.
-            let package = package_hash(&ProtocolHasher, artifact);
+            // prefix is the one whose witness stream carries it, exactly
+            // once — the one prefix a publish names that its signer
+            // chose.
             let witnesses = vec![(
                 publisher.address(),
                 BeaconWitnessEvent::PackagePublished {

@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::{GenesisPackages, genesis_world_with_pools};
-use hyperscale_effects_bridge::vm_statics::principal_for;
+use hyperscale_effects_bridge::vm_statics::{package_key, principal_for};
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{
     OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
@@ -107,10 +107,11 @@ pub const STRADDLER_COUNT: usize = 8;
 /// sibling pair never merges. Straddler payers live here; their cross-shard
 /// ticks name the terminating merge-left child.
 ///
-/// The surviving pair is the half the genesis package flash lands under,
-/// so the flash only reinforces the ordering this scenario needs: a shard
-/// the merge floor must sit *below* is the one that carries
-/// [`stdlib_flash_bytes`] it does not control.
+/// The protocol's own artifacts land here, so a network seeded with
+/// those alone finds the flash reinforcing the ordering it needs. One
+/// seeded with the fixtures beside them does not — those spread across
+/// every quarter — and brackets its floor through
+/// [`fixture_merge_floor`] instead.
 pub const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 2);
 
 /// The merge-left child — `leaf(2, 0)`.
@@ -123,6 +124,40 @@ pub const MERGE_STRADDLER_LEFT: ShardId = ShardId::leaf(2, 0);
 /// The merge-right child — `leaf(2, 1)`, the lightest quarter, which merges with
 /// [`MERGE_STRADDLER_LEFT`] into their parent `leaf(1, 0)`.
 pub const MERGE_STRADDLER_RIGHT: ShardId = ShardId::leaf(2, 1);
+
+/// Headroom between a merging pair's committed bytes and the floor that
+/// collapses it, and again between that floor and the surviving pair.
+///
+/// One figure for both sides, so the bracket a merge scenario needs is
+/// stated once: the merging quarters sit this far below the floor and
+/// the surviving quarters this far above it.
+const MERGE_FLOOR_MARGIN: u64 = 18_000;
+
+/// The merge floor a fixture-seeded four-quarter topology brackets its
+/// pairs against: clear of the heavier merging quarter's flash.
+#[must_use]
+pub fn fixture_merge_floor() -> u64 {
+    flash_bytes_on(MERGE_STRADDLER_LEFT, 4)
+        .max(flash_bytes_on(MERGE_STRADDLER_RIGHT, 4))
+        .saturating_add(MERGE_FLOOR_MARGIN)
+}
+
+/// The split threshold whose derived eighth is [`fixture_merge_floor`].
+#[must_use]
+pub fn fixture_merge_split_bytes() -> u64 {
+    fixture_merge_floor().saturating_mul(8)
+}
+
+/// Ballast lifting both surviving quarters clear of
+/// [`fixture_merge_floor`], so neither asserts a merge of its own while
+/// the lighter pair collapses.
+#[must_use]
+pub fn fixture_merge_survivor_ballast() -> Vec<(PrincipalAddr, u128)> {
+    let target = fixture_merge_floor().saturating_add(MERGE_FLOOR_MARGIN);
+    let mut accounts = ballast_to(MERGE_STRADDLER_SURVIVOR, 4, target);
+    accounts.extend(ballast_to(ShardId::leaf(2, 3), 4, target));
+    accounts
+}
 
 /// Ballast accounts funded into each surviving quarter (`leaf(2, 2)` and
 /// `leaf(2, 3)`), lifting the pair above `merge_bytes` so neither emits an
@@ -394,8 +429,7 @@ pub fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
 }
 
 /// The genesis flash of a network born running the fixture packages
-/// beside the protocol's: every artifact, written whole under the
-/// publisher's single prefix.
+/// beside the protocol's: every artifact, summed.
 #[must_use]
 pub fn fixture_flash_bytes() -> u64 {
     GenesisPackages::with_fixtures()
@@ -403,6 +437,48 @@ pub fn fixture_flash_bytes() -> u64 {
         .iter()
         .map(|artifact| artifact.len() as u64)
         .sum()
+}
+
+/// The genesis flash landing on `shard` under a `num_shards`-wide
+/// uniform partition.
+///
+/// A package cell sits under its own content address, so the flash is
+/// spread across the trie rather than pooled under whoever published it.
+/// A scenario bracketing a reshape floor reads what each shard actually
+/// drew: which shard carries which artifact is a hash's answer, and one
+/// that assumes a single prefix holds the lot is calibrated against an
+/// accident.
+#[must_use]
+pub fn flash_bytes_on(shard: ShardId, num_shards: u64) -> u64 {
+    let trie = ShardTrie::uniform_from_count(num_shards);
+    GenesisPackages::with_fixtures()
+        .artifacts()
+        .iter()
+        .filter(|artifact| {
+            let package = package_hash(&ProtocolHasher, artifact);
+            trie.shard_for_prefix(package_key(package).owner) == shard
+        })
+        .map(|artifact| artifact.len() as u64)
+        .sum()
+}
+
+/// Ballast lifting `shard` to `target` committed bytes, counting the
+/// genesis flash it already carries.
+///
+/// What a scenario wants of a quarter is a side of a floor, not a
+/// funding figure — so it states the side and this covers whatever the
+/// flash left to make up.
+///
+/// # Panics
+///
+/// Panics if the ballast count does not fit `usize`.
+#[must_use]
+pub fn ballast_to(shard: ShardId, num_shards: u64, target: u64) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    let owed = target.saturating_sub(flash_bytes_on(shard, num_shards));
+    let bulk = usize::try_from(owed.div_ceil(BALLAST_CELL_BYTES)).expect("ballast fits usize");
+    ballast(shard, num_shards, bulk, &mut accounts);
+    accounts
 }
 
 /// The genesis funding and transfers for a train into a shard across its

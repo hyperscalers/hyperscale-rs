@@ -17,13 +17,13 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_engine::artifact_package;
+use hyperscale_engine::{Executor, artifact_package};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
 };
-use hyperscale_types::{BeaconState, Hash, MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{Address, BeaconState, Hash, MessageClass, ShardId, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
@@ -31,6 +31,13 @@ use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_i
 
 /// Per-package artifact fetch keyed by content address.
 pub type PackageArtifactFetch = Fetch<Hash>;
+
+/// The prefix a package's artifact is kept under: the cell's own owner,
+/// which its content address derives. The shard holding that prefix is
+/// the one obliged to answer for it.
+fn custodian(package: Hash) -> Address {
+    Executor::package_artifact_key(package).owner
+}
 
 /// Per-shard package-acquisition state: the artifact fetch instance.
 pub struct PackagesState {
@@ -144,8 +151,12 @@ where
     D: Dispatch,
 {
     /// Reconcile the beacon's package registry against what the engine
-    /// holds, fetching anything missing from the shard that owns its
-    /// publisher's prefix.
+    /// holds, fetching anything missing from the shard obliged to keep
+    /// it.
+    ///
+    /// Which shard that is follows from the content address alone: the
+    /// artifact's cell sits under its own address, so a node asking for
+    /// a package it can name needs nothing else to know who to ask.
     ///
     /// Runs on every beacon commit and tolerates arbitrary staleness:
     /// content addressing makes every enqueue idempotent, and a newly
@@ -155,10 +166,10 @@ where
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let snapshot = self.process.topology_snapshot.load();
         let mut by_shard: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
-        for (package, fact) in &state.packages {
+        for package in state.packages.keys() {
             if executor.needs_artifact(*package) {
                 by_shard
-                    .entry(snapshot.shard_trie().shard_for_prefix(fact.publisher))
+                    .entry(snapshot.shard_trie().shard_for_prefix(custodian(*package)))
                     .or_default()
                     .push(*package);
             }

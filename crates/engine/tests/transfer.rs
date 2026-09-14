@@ -2030,18 +2030,14 @@ fn signed_publish_under(seed: u8, artifact: Vec<u8>, max_fee: u128) -> Transacti
     Transaction::new(vm)
 }
 
-/// The raw update a batch made to a package's cell under `publisher`.
-fn package_cell(
-    writes: &StateWrites,
-    publisher: impl Into<Address>,
-    artifact: &[u8],
-) -> Option<Vec<u8>> {
-    let key = package_key(publisher, package_hash(&ProtocolHasher, artifact));
+/// The raw update a batch made to an artifact's own package cell.
+fn package_cell(writes: &StateWrites, artifact: &[u8]) -> Option<Vec<u8>> {
+    let key = package_key(package_hash(&ProtocolHasher, artifact));
     writes.cells.get(&key).cloned().flatten()
 }
 
 #[test]
-fn a_publish_writes_the_artifact_under_its_publisher() {
+fn a_publish_writes_the_artifact_under_its_own_address() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
     let artifact = published_account_artifact();
@@ -2063,7 +2059,7 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
         panic!("a publish must succeed: {:?}", executed[0].consensus);
     };
     assert_eq!(
-        package_cell(database_updates, payer, &artifact).as_deref(),
+        package_cell(database_updates, &artifact).as_deref(),
         Some(artifact.as_slice()),
         "the artifact lands whole in its content-addressed cell"
     );
@@ -2463,9 +2459,17 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
         "an artifact stored anywhere but its own address is not a package"
     );
 
-    // The same bytes at the key their own hash builds. Published.
-    let cell = package_key(publisher, package);
+    // The right local key under the wrong owner: the cell's owner is the
+    // package's address, so a publisher's own prefix cannot carry it.
+    let cell = package_key(package);
     cache.absorb_cell(publisher, cell.local.0, &artifact);
+    assert!(
+        cache.load().get(package).is_none(),
+        "an artifact under any owner but its own address is not a package"
+    );
+
+    // The same bytes at the whole key their own hash builds. Published.
+    cache.absorb_cell(cell.owner, cell.local.0, &artifact);
     assert_eq!(cache.load().get(package), Some(&metadata));
 }
 

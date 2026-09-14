@@ -51,7 +51,8 @@ pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Optio
         return None;
     }
     let package = package_hash(&ProtocolHasher, value);
-    (package_key(owner, package).local.0 == local).then_some(package)
+    let key = package_key(package);
+    (key.owner == owner && key.local.0 == local).then_some(package)
 }
 
 /// The four bytes every wasm artifact opens with.
