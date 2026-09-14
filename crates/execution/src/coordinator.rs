@@ -1145,35 +1145,43 @@ impl ExecutionCoordinator {
         // nothing back.
         let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
         for (key, record) in &self.counterparts.held {
-            // A transaction the ledger still holds an entry for is the
-            // ledger's to settle: its reclaim and its retirement compose
-            // from the same leaves under the transaction's own name, and
-            // two members over one record would leave the second reading
-            // a cell the first deleted. The leaf is what answers once no
-            // entry does — which is every record older than what this
-            // chain replays, and every one whose entry has been pruned.
-            if self.counterparts.ledger.contains(record.cell.tx) {
+            // An entry that settles its own records is the one to do
+            // it: its reclaim and its retirement compose from the same
+            // leaves under the transaction's own name, and two members
+            // over one record would leave the second reading a cell the
+            // first deleted. The leaf answers where no such entry does —
+            // every record older than what this chain replays, every one
+            // whose entry has been pruned, and every one an abandonment
+            // record reconstructed an entry for that keeps no
+            // classification to settle from.
+            if self.counterparts.ledger.settles_records(record.cell.tx) {
                 continue;
             }
             let claim = record.cell.consumer_claim;
-            let licence = if trie.shard_for_prefix(claim.owner) == local_shard {
+            let licence = if matches!(record.answer, Some(Inclusion::Present(_))) {
+                // A claim proved present is the consumer holding the
+                // crossing, and a presence is bounded by no window. It
+                // answers over every other reading here: taking back
+                // value a consumer demonstrably has is the one mistake
+                // this cannot make.
+                Some(Licence::Claimed)
+            } else if trie.shard_for_prefix(claim.owner) == local_shard
+                && Window::Lapse.of(record.deadline()).contains(&tick_ts)
+            {
                 // This shard holds the cell, so the engine reads it
                 // against its own snapshot — the same licence, answered
-                // without a fetch.
-                Window::Lapse
-                    .of(record.deadline())
-                    .contains(&tick_ts)
-                    .then_some(Licence::OwnLeaf)
+                // without a fetch, and the cell itself is the closest
+                // evidence there is while the window it answers in
+                // stands.
+                Some(Licence::OwnLeaf)
+            } else if record.unclaimable() {
+                // A departure says the chain that was to consume this
+                // crossing can never settle what issued it, and a claim
+                // read absent inside its window says nobody took it.
+                // Either way the value goes back.
+                Some(Licence::Unclaimed)
             } else {
-                // The cell is elsewhere, and what decides it is the
-                // claim a block carried: present, the consumer holds
-                // the crossing and the record is deleted; absent past
-                // the lapse, nobody took it and the value goes back.
-                match record.answer {
-                    Some(Inclusion::Present(_)) => Some(Licence::Claimed),
-                    Some(Inclusion::Absent) => Some(Licence::Unclaimed),
-                    None => None,
-                }
+                None
             };
             let Some(licence) = licence else {
                 continue;
@@ -8034,6 +8042,45 @@ mod tests {
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
     }
 
+    /// Commit a block on `HOME` carrying `records`, the way a departure
+    /// reaches this chain.
+    fn commit_recording(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        height: u64,
+        ts_ms: u64,
+        records: Vec<AbandonmentRecord>,
+    ) -> Vec<Action> {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            state_claims,
+            witness_sources,
+            ..
+        } = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(height),
+            ts_ms,
+            ValidatorId::new(0),
+            vec![],
+        )
+        else {
+            unreachable!("a live block")
+        };
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records: Arc::new(records),
+            state_claims,
+            witness_sources,
+        };
+        state.on_block_committed(schedule, &test_certify(block, ts_ms))
+    }
+
     /// The part a leg plays, with the cells a fixture names for it.
     /// What the chain read of `key` on `shard` for `tx_hash`, as the
     /// ledger holds it.
@@ -8952,7 +8999,7 @@ mod tests {
             state.counterparts.ledger.register_committed(
                 test_committed(),
                 &PriceTable::GENESIS,
-                [(&transaction, &Classified::whole())],
+                [(&transaction, &leg_classified())],
             );
         }
         let deadline = Deadline::from_expiry(expiry_ms);
@@ -9020,6 +9067,73 @@ mod tests {
                 })
             ),
             "and proved absent past the lapse takes the crossing back"
+        );
+    }
+
+    /// A record no entry names is reclaimed on the departure the chain
+    /// writes down, however long after its leg entry went.
+    ///
+    /// The case the leg's own clock cannot reach: a cut lands past
+    /// `CLAIM_WINDOW`, the entry has been pruned and the claim cell
+    /// swept, so neither a reading nor an entry is left. The record is,
+    /// and the departure is evidence the chain carries for as long as
+    /// the block does.
+    #[test]
+    fn a_departure_reclaims_a_record_no_entry_names() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let expiry_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6A, expiry_ms);
+        state
+            .counterparts
+            .held
+            .insert(record_key, HeldRecord::of(cell));
+
+        // Past the end of the window the entry stood in, which is where
+        // the claim cell sweeps too.
+        let past = Window::LegEntry
+            .of(Deadline::from_expiry(expiry_ms))
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let actions = commit_recording(
+            &mut state,
+            &schedule,
+            1,
+            past.as_millis(),
+            vec![AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(
+                    &transaction,
+                    test_committed(),
+                    transaction.price(&PriceTable::GENESIS),
+                    &PriceTable::GENESIS,
+                )],
+            )],
+        );
+        let runs = actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(
+                runs,
+                Some(Runs::Settle {
+                    on: Licence::Unclaimed,
+                    ..
+                })
+            ),
+            "the departure takes the crossing back; dispatched {runs:?}",
+        );
+        assert!(
+            state.counterparts.held.is_empty(),
+            "and the record is taken once",
         );
     }
 
