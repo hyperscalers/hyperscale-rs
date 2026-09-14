@@ -175,11 +175,19 @@ fn verify_anchor(
     topology: &TopologySnapshot,
     verifier: &dyn Verifier,
 ) -> Option<Verified<CertifiedBlockHeader>> {
+    // Positionally, because the QC selects its signers by index into
+    // this vector: a member the snapshot cannot resolve would shift
+    // every key above it and reject a genuine quorum as a forged one.
+    // The committee-resolving sites a shard runs on its own behalf
+    // panic on a miss, which is right where the miss is a `BeaconState`
+    // invariant break; here the question is about a remote shard on a
+    // path a stranger drives, so an unresolvable committee refuses the
+    // anchor rather than bringing the node down.
     let keys: Vec<_> = topology
         .consensus_committee_for_shard(shard)
         .iter()
-        .filter_map(|validator| topology.public_key(*validator))
-        .collect();
+        .map(|validator| topology.public_key(*validator))
+        .collect::<Option<Vec<_>>>()?;
     if keys.is_empty() {
         return None;
     }
