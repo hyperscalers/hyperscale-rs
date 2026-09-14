@@ -13,13 +13,14 @@
 //! shard keeps clearing from admission through the cut and from the
 //! successor after it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
-    TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp,
-    Window,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId,
+    SubstateKey, TimestampRange, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    WeightedTimestamp, Window,
 };
 
 use crate::reshape::split_lifecycle;
@@ -30,14 +31,14 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, clock, epoch_duration_ms, held, held_at, merge_keeper_count,
-    scheduled_terminal_epoch, split_admitted,
+    anchored_genesis_height, beacon_epoch, clock, epoch_duration_ms, held, held_at,
+    merge_keeper_count, scheduled_terminal_epoch, split_admitted,
 };
 use crate::support::tx::{
-    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER, STRADDLER_SURVIVOR,
-    build_route_tx, build_swap_tx, build_transfer_tx, fixture_flash_bytes,
-    merge_survivor_ballast_accounts, merge_train_setup, quarter_ballast_over,
-    split_ballast_accounts_over, split_train_setup, validity_around,
+    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, ParamBallot, STRADDLER_SPLITTER,
+    STRADDLER_SURVIVOR, build_param_vote_tx, build_route_tx, build_swap_tx, build_transfer_tx,
+    fixture_flash_bytes, merge_survivor_ballast_accounts, merge_train_setup, pool_operator,
+    quarter_ballast_over, split_ballast_accounts_over, split_train_setup, validity_around,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
@@ -1048,6 +1049,252 @@ fn await_departed<C: Cluster>(c: &mut C) {
         await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
         "both splitter children must be served within budget",
     );
+}
+
+/// The venue whose shard the late vote takes away — one half of the
+/// pair the grow's own split leaves behind, which the vote collapses
+/// back into their parent.
+///
+/// The departure is a merge rather than a split because a split draws a
+/// fresh cohort from the pool and the grow leaves the pool empty, while
+/// a merge's keepers come from the committees the halves already hold.
+const LATE_DEPARTING_VENUE: ShardId = ShardId::leaf(3, 0);
+
+/// The parent the departing pair collapses into.
+const LATE_MERGED_PARENT: ShardId = ShardId::leaf(2, 0);
+
+/// The venue that outlives it: heavy enough to stay clear of the derived
+/// `merge_bytes` the vote raises.
+const LATE_SURVIVOR_VENUE: ShardId = ShardId::leaf(2, 2);
+
+/// Where the trader sits.
+const LATE_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
+
+/// The threshold the late vote installs. Raised rather than lowered: the
+/// derived `merge_bytes` is an eighth of it, and the figure puts that
+/// eighth above the departing pair and below the surviving venue, so one
+/// pair collapses and nothing else moves.
+const LATE_SPLIT_BYTES: u64 = 1_200_000;
+
+/// Ballast the departing venue's sibling carries, sized over the
+/// `merge_bytes` the cluster's own threshold derives and well under
+/// [`LATE_SPLIT_BYTES`], so it neither asserts a merge nor follows its
+/// sibling out.
+const LATE_SIBLING_BALLAST_BYTES: u64 = 24_000;
+
+/// Genesis funding for
+/// [`a_route_committed_before_its_departure_was_voted_still_resolves`].
+///
+/// The ballast stays on `leaf(2, 0)` so the grow reaches the same
+/// topology the late fixture is placed against; the venues and the
+/// trader move to the quarters that survive it.
+#[must_use]
+pub fn late_departing_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = quarter_ballast_over(FIRST_VENUE_SHARD, fixture_flash_bytes());
+    // The departing venue's sibling has to clear the derived
+    // `merge_bytes`, or it asserts a merge on their shared parent for the
+    // whole run — and a parent with any pending reshape bars the split
+    // this scenario votes for.
+    accounts.extend(quarter_ballast_over(
+        LATE_TRADER_SHARD,
+        LATE_SIBLING_BALLAST_BYTES,
+    ));
+    let mut taken = Vec::new();
+    accounts.push((
+        grind_onto(LATE_DEPARTING_VENUE, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((
+        grind_onto(LATE_SURVIVOR_VENUE, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((grind_onto(LATE_TRADER_SHARD, &mut taken).1, SWAPPER_FUNDING));
+    accounts
+}
+
+/// Epochs of lead the late threshold vote carries, so it is cast while
+/// the venues can still hear each other and takes effect only once the
+/// route it is meant to outlive has long committed.
+const LATE_VOTE_LEAD_EPOCHS: u64 = 16;
+
+/// Attempts [`cast_late_threshold_vote`] makes before giving up.
+const LATE_VOTE_ATTEMPTS: u32 = 4;
+
+/// Cast the founding pool's vote to retune `split_bytes`, activating
+/// `lead` epochs out rather than as soon as the fold allows, and hold
+/// until the proposal is on the chain.
+///
+/// The standard helper waits for the change to *apply*, which is no use
+/// where the point is to keep it pending across everything that happens
+/// between. Registration is what has to be confirmed here: past this the
+/// venues stop hearing each other and no further vote could land.
+///
+/// # Panics
+///
+/// Panics if the proposal never reaches `param_votes` within budget.
+fn cast_late_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64, lead: u64) -> Epoch {
+    for _ in 0..LATE_VOTE_ATTEMPTS {
+        let current = beacon_epoch(c).expect("a grown cluster has a beacon epoch");
+        let live = c
+            .beacon_state()
+            .expect("a grown cluster has beacon state")
+            .params;
+        let mut ballot = ParamBallot::of(&live);
+        ballot.split_bytes = split_bytes;
+        let activate_at = Epoch::new(current.inner() + lead);
+        let vote = build_param_vote_tx(
+            &pool_operator().0,
+            ballot,
+            activate_at,
+            validity_around(c.now()),
+        );
+        c.submit(Arc::new(vote));
+        if c.run_until(epochs(6), |c| {
+            c.beacon_state().is_some_and(|state| {
+                state.param_votes.values().any(|proposal| {
+                    proposal.activate_at == activate_at
+                        && proposal.params.reshape_thresholds.split_bytes == split_bytes
+                })
+            })
+        }) {
+            return activate_at;
+        }
+    }
+    panic!("the late threshold vote never reached the chain");
+}
+
+/// A record naming a commit from before its departure was ever voted
+/// still resolves the window that priced it.
+///
+/// Every other reshape scenario takes its departure from the grow, which
+/// admits one before any scenario code runs — so the commit always falls
+/// inside the floor that admission pins, and the window the record names
+/// is always still retained. Here the grow's own split is allowed to run
+/// first, the route commits against quarters that survive it, and only
+/// then does a vote schedule the departure. The commit is left on the far
+/// side of every floor the schedule derives, while its entry lives on:
+/// nothing bounds how long a certified entry waits for a silent
+/// counterpart.
+///
+/// # Panics
+///
+/// Panics if the grown topology does not settle, if the late split is not
+/// admitted where it was voted, or if the survivor's hold or the trader's
+/// input does not come back.
+pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    // The departing venue is sealed while its shard's parent still holds
+    // the keyspace, so the child inherits it at the cut. A venue sealed
+    // on a child after the fact would ask its freshly seated committee
+    // for code none of them has ever run.
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+
+    // The grow leaves one split already admitted. Let it run: the pair it
+    // forms is what the vote later collapses, and the floor its own
+    // admission pins expires before the route commits rather than after.
+    let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
+        "the grow's own split must have run before the route commits",
+    );
+
+    let staying = stand_up_venue(c, survivor, &mut taken);
+    let (key, trader) = grind_onto(LATE_TRADER_SHARD, &mut taken);
+    let reserves = [
+        reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE),
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
+    ];
+    let protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+
+    // A vote crosses both venue shards, so it has to be cast while they
+    // can still hear each other — but it carries an activation far
+    // enough out that the departure it schedules lands well after the
+    // route has committed. That gap is the whole scenario.
+    let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
+
+    let cut = [
+        isolate_ec_intake(c, departing, survivor),
+        isolate_ec_intake(c, survivor, departing),
+    ];
+    let baseline = c
+        .committed_txs_in_flight(survivor)
+        .expect("the survivor must serve a committed tip before the route");
+    let mut charges = Charges::default();
+    let tx = build_route_tx(
+        &key,
+        trader,
+        (&leaving.meta, &staying.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(departing, hash).0.is_some()),
+        "both shards must commit the route while both are live",
+    );
+    let engaged = c
+        .committed_txs_in_flight(survivor)
+        .expect("the survivor must serve a committed tip once it holds the route");
+    assert!(
+        engaged > baseline,
+        "the route must engage a hold against the survivor's drain; baseline = {baseline:?}, \
+         engaged = {engaged:?}",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the trader's leg must pay before the core is asked anything",
+    );
+
+    // The activation carries the run past the floor the grow's own split
+    // pinned and past the horizon the commit's window would otherwise
+    // have been kept under, so the departure it schedules leaves the
+    // route's commit on the far side of every floor.
+    assert!(
+        c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
+            .params
+            .reshape_thresholds
+            .split_bytes
+            == LATE_SPLIT_BYTES)),
+        "the late vote must activate at {activates_at:?}",
+    );
+    assert!(
+        await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
+        "the activated threshold must pair the departing venue's shard with its sibling",
+    );
+
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
+        "the merged parent must be served within budget",
+    );
+
+    assert!(
+        c.run_until(epochs(32), |c| c.committed_txs_in_flight(survivor)
+            == Some(baseline)),
+        "the survivor's hold must return to its baseline once the departed venue's settled set \
+         has answered a record naming a commit from before the vote; holds {:?} against \
+         {baseline:?}",
+        c.committed_txs_in_flight(survivor),
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    for shard in [departing, survivor] {
+        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
+        assert!(
+            fate != Some(TransactionDecision::Accept),
+            "a venue settled a route its counterpart never certified; {shard} reached {fate:?}",
+        );
+    }
+    c.clear_drops();
+    let _ = protocol_resource;
 }
 
 /// A route through a departing venue releases the surviving venue's
