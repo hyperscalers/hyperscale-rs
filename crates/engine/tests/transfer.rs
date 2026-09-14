@@ -469,7 +469,9 @@ fn execute_seeded(
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, PriceTable::GENESIS, store, transactions)
+    executor
+        .execute_batch(&ctx, PriceTable::GENESIS, store, transactions)
+        .expect("the harness engine holds every package it runs")
 }
 
 /// The settled round a draw wrote, if any.
@@ -664,7 +666,9 @@ fn execute_batch_on(
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, PriceTable::GENESIS, snapshot_store, transactions)
+    executor
+        .execute_batch(&ctx, PriceTable::GENESIS, snapshot_store, transactions)
+        .expect("the harness engine holds every package it runs")
 }
 
 /// A receipt's writes as they settle onto `accounts`.
@@ -1127,7 +1131,9 @@ fn execute_on_shard(
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, PriceTable::GENESIS, &snapshot_store, transactions)
+    executor
+        .execute_batch(&ctx, PriceTable::GENESIS, &snapshot_store, transactions)
+        .expect("the harness engine holds every package it runs")
 }
 
 fn events_of(executed: &ExecutedTx) -> Vec<(Address, u32)> {
@@ -1365,6 +1371,7 @@ fn a_transfer_executes_divided_on_both_shards() {
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .expect("the harness engine holds every package it runs")
             .remove(0)
     };
 
@@ -1452,7 +1459,10 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
             runs,
             arrivals: &[],
         };
-        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+        executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
     };
 
     let sent = run(
@@ -1539,7 +1549,10 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
             runs,
             arrivals: &[],
         };
-        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+        executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
     };
 
     let sent = run(
@@ -1648,7 +1661,10 @@ fn an_inherited_record_decides_itself_against_its_claim() {
             )),
             arrivals: &[],
         };
-        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+        executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
     };
 
     // The housekeeping half: no body, and a clock inside the window an
@@ -1675,7 +1691,10 @@ fn an_inherited_record_decides_itself_against_its_claim() {
             },
             arrivals: &[],
         };
-        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+        executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
     };
 
     let mut unclaimed = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
@@ -1779,7 +1798,10 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             },
             arrivals: &[],
         };
-        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+        executor
+            .execute_tick_batch(&ctx, store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
     };
 
     let owed = run(&store, false);
@@ -1851,6 +1873,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .expect("the harness engine holds every package it runs")
             .remove(0)
     };
     let (sender_side, recipient_side) = (run(near_shard), run(far_shard));
@@ -1912,12 +1935,14 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         holds: &holds,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
-    let executed = executor.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &snapshot_store,
-        std::slice::from_ref(&tx),
-    );
+    let executed = executor
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &snapshot_store,
+            std::slice::from_ref(&tx),
+        )
+        .expect("the harness engine holds every package it runs");
     assert!(
         matches!(executed[0].consensus, ConsensusReceipt::Failed),
         "a reservation the hold leaves uncovered must fail its leg: {:?}",
@@ -1928,7 +1953,9 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         holds: &ProvisionalHolds::new(),
         ..ctx
     };
-    let executed = executor.execute_batch(&unheld, PriceTable::GENESIS, &snapshot_store, &[tx]);
+    let executed = executor
+        .execute_batch(&unheld, PriceTable::GENESIS, &snapshot_store, &[tx])
+        .expect("the harness engine holds every package it runs");
     assert!(
         matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
         "with nothing held the same transfer completes: {:?}",
@@ -2848,12 +2875,14 @@ fn a_members_fee_follows_the_table_it_carries() {
             env: sealed_env(0x5E),
             holds: &ProvisionalHolds::new(),
         };
-        let executed = executor.execute_batch(
-            &ctx,
-            prices,
-            &MapDb::genesis(&funded),
-            std::slice::from_ref(&tx),
-        );
+        let executed = executor
+            .execute_batch(
+                &ctx,
+                prices,
+                &MapDb::genesis(&funded),
+                std::slice::from_ref(&tx),
+            )
+            .expect("the harness engine holds every package it runs");
         let ConsensusReceipt::Succeeded {
             writes: database_updates,
             ..

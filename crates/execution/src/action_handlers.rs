@@ -296,9 +296,28 @@ where
                     arrivals: &r.arrivals,
                 })
                 .collect();
-            let executed = ctx
+            let executed = match ctx
                 .executor
-                .execute_tick_batch(&tick_ctx, &view_snap, &inputs);
+                .execute_tick_batch(&tick_ctx, &view_snap, &inputs)
+            {
+                Ok(executed) => executed,
+                // Nothing ran and nothing was attested, so the tick is
+                // still whole. It goes back to the dispatch head rather
+                // than taking the shard down with it.
+                Err(unavailable) => {
+                    // The members travel back with the tick, so the
+                    // borrow the inputs hold on them ends here.
+                    drop(inputs);
+                    ctx.notify_protocol(ProtocolEvent::ExecutionBatchUnavailable {
+                        tick,
+                        tick_ts,
+                        env: tick_ctx.env,
+                        requests,
+                        package: unavailable.package,
+                    });
+                    return;
+                }
+            };
             record_execution_latency(start.elapsed().as_secs_f64());
 
             let tick_id = TickId::new(ctx.shard, tick);

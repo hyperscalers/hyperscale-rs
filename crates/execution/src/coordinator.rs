@@ -51,7 +51,9 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{CodeAvailability, TickEnvironment, build_fee_receipt};
-use hyperscale_metrics::{record_reclaim_admitted, record_unresolvable_tx};
+use hyperscale_metrics::{
+    record_batch_unavailable, record_reclaim_admitted, record_unresolvable_tx,
+};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
@@ -1585,6 +1587,40 @@ impl ExecutionCoordinator {
 
         completions.sort_by_key(|a| a.tick_id);
         completions
+    }
+
+    /// Take back a tick this node could not run and put it at the
+    /// dispatch head.
+    ///
+    /// The batch attested nothing, so nothing of the tick is spent: it
+    /// goes back whole and waits exactly as a tick composed for code
+    /// this node has not fetched waits. What releases it is the same
+    /// thing — the engine answering for the package — and what retries
+    /// it is the next commit, which composes and dispatches as every
+    /// commit does.
+    pub fn on_execution_batch_unavailable(
+        &mut self,
+        tick: BlockHeight,
+        tick_ts: WeightedTimestamp,
+        env: TickEnvironment,
+        requests: Vec<CrossShardExecutionRequest>,
+        package: Hash,
+    ) -> Vec<Action> {
+        tracing::error!(
+            shard = %self.local_shard,
+            %tick,
+            ?package,
+            "Execution stalled: this node cannot run code a committed tick names"
+        );
+        record_batch_unavailable();
+        self.tick_in_flight = false;
+        self.pending_ticks.push_front(PendingTick {
+            tick,
+            tick_ts,
+            env,
+            requests,
+        });
+        Vec::new()
     }
 
     /// Absorb a completed batch: route receipts and per-member outcomes
@@ -4263,6 +4299,77 @@ mod tests {
             dispatched,
             vec![&tx_hash],
             "the commit after the code lands releases exactly the tick that waited on it"
+        );
+    }
+
+    /// A tick this node could not run comes back whole and runs again.
+    ///
+    /// The batch attested nothing, so nothing of the tick is spent. What
+    /// returns to the dispatch head is the tick its committee composed,
+    /// and the commit after it dispatches exactly that.
+    #[test]
+    fn a_tick_the_engine_could_not_run_is_dispatched_again() {
+        let mut state = make_test_state();
+        let topology_schedule = make_test_topology();
+
+        let package = Hash::from_bytes(b"code this node holds");
+        let tx = test_transaction_running(1, &[package]);
+        let tx_hash = tx.hash();
+        let actions = state.on_block_committed(
+            &topology_schedule,
+            &certify(make_live_block(
+                BlockHeight::new(1),
+                1000,
+                ValidatorId::new(0),
+                vec![Arc::new(tx)],
+            )),
+        );
+        let Some(Action::ExecuteTransactions {
+            tick,
+            tick_ts,
+            env,
+            requests,
+        }) = actions
+            .into_iter()
+            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        else {
+            panic!("a tick running code this node holds must dispatch");
+        };
+
+        // The environment refuses it. No receipt exists to attest, so
+        // the tick is handed back rather than priced.
+        let held = state.on_execution_batch_unavailable(tick, tick_ts, env, requests, package);
+        assert!(
+            held.is_empty(),
+            "a tick handed back waits; it does not re-run on the spot"
+        );
+
+        let again = state.on_block_committed(
+            &topology_schedule,
+            &certify(make_live_block(
+                BlockHeight::new(2),
+                2000,
+                ValidatorId::new(0),
+                vec![],
+            )),
+        );
+        let dispatched: Vec<TxHash> = again
+            .iter()
+            .filter_map(|action| match action {
+                Action::ExecuteTransactions {
+                    tick: dispatched_tick,
+                    requests,
+                    ..
+                } if *dispatched_tick == tick => Some(requests),
+                _ => None,
+            })
+            .flatten()
+            .map(|request| request.tx_hash)
+            .collect();
+        assert_eq!(
+            dispatched,
+            vec![tx_hash],
+            "the commit after the refusal dispatches the tick that came back, whole"
         );
     }
 

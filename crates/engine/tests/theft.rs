@@ -125,12 +125,14 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    executor.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &store,
-        std::slice::from_ref(&verified),
-    )
+    executor
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&verified),
+        )
+        .expect("the harness engine holds every package it runs")
 }
 
 /// A receipt's writes as they settle onto `accounts`.

@@ -238,12 +238,14 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    executor.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &store,
-        std::slice::from_ref(&verified),
-    )
+    executor
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&verified),
+        )
+        .expect("the harness engine holds every package it runs")
 }
 
 fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
@@ -299,8 +301,9 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
-    let executed =
-        executor.execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx));
+    let executed = executor
+        .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
+        .expect("the harness engine holds every package it runs");
     absorb(&mut store, &executed[0], &executor);
 
     let staking = package_hash(&ProtocolHasher, staking_artifact());
@@ -372,12 +375,14 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
     let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
-    let sealed = holder.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &store,
-        std::slice::from_ref(&seal),
-    );
+    let sealed = holder
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&seal),
+        )
+        .expect("the harness engine holds every package it runs");
     absorb(&mut store, &sealed[0], &holder);
 
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
@@ -397,18 +402,22 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
     let call = Arc::new(Verified::<Transaction>::from_persisted(raw));
-    let by_holder = holder.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &store,
-        std::slice::from_ref(&call),
-    );
-    let by_reader = reader.execute_batch(
-        &ctx,
-        PriceTable::GENESIS,
-        &store,
-        std::slice::from_ref(&call),
-    );
+    let by_holder = holder
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&call),
+        )
+        .expect("the harness engine holds every package it runs");
+    let by_reader = reader
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&call),
+        )
+        .expect("the harness engine holds every package it runs");
 
     // Stated before the comparison, so a pair of matching refusals
     // cannot pass for agreement.
@@ -504,8 +513,9 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
-    let executed =
-        executor.execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx));
+    let executed = executor
+        .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
+        .expect("the harness engine holds every package it runs");
     absorb(&mut store, &executed[0], &executor);
 
     let (genesis_cells, genesis_entries) = genesis_writes(

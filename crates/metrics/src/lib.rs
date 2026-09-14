@@ -355,6 +355,15 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// is what puts it back in step with them.
     fn record_rebuilt_record_entry(&self) {}
 
+    /// Record a dispatched tick this node could not run, for want of a
+    /// package's code.
+    ///
+    /// The shard's execution stops at that tick until the code lands, so
+    /// any rate here is a stalled replica. One replica counting these
+    /// where its peers count none is one whose acquisition has fallen
+    /// behind; every replica counting them is code nobody can serve.
+    fn record_batch_unavailable(&self) {}
+
     /// Record a counterpart cell a committed proof answered for, as
     /// `present` or absent — the fold every replica of a shard reaches
     /// at the same height.
@@ -839,6 +848,12 @@ pub fn record_unresolvable_tx(cause: &str) {
 #[inline]
 pub fn record_rebuilt_record_entry() {
     recorder().record_rebuilt_record_entry();
+}
+
+/// Record a dispatched tick this node could not run for want of code.
+#[inline]
+pub fn record_batch_unavailable() {
+    recorder().record_batch_unavailable();
 }
 
 /// Record a counterpart cell a committed proof answered for.

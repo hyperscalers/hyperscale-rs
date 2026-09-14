@@ -109,6 +109,15 @@ impl ShardParticipation {
                 );
                 actions
             }
+            ProtocolEvent::ExecutionBatchUnavailable {
+                tick,
+                tick_ts,
+                env,
+                requests,
+                package,
+            } => self
+                .execution_coordinator
+                .on_execution_batch_unavailable(tick, tick_ts, env, requests, package),
             _ => unreachable!("non-execution event routed to handle_execution"),
         }
     }
