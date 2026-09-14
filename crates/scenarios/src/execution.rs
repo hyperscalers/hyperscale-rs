@@ -2004,7 +2004,6 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
     );
 }
 
-/// The reported change to `owner`'s native vault.
 /// A wallet signs what a preview measured, and the chain meters it
 /// against exactly that.
 ///
@@ -2088,6 +2087,7 @@ fn ceilings_cover_the_run(report: &PreviewReport) {
     );
 }
 
+/// The reported change to `owner`'s native vault.
 fn preview_change(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
     let owner = owner.into();
     let vault = vault_key(owner, *PROTOCOL_RESOURCE);
