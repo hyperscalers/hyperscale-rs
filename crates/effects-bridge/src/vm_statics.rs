@@ -279,7 +279,7 @@ pub fn declared_vector(
         retained,
         envelope_bytes,
         vm.signatures(),
-        admit_event_bounds(&event_bytes)?,
+        admit_event_bounds(&event_bytes, routing.calls.len())?,
     );
     Ok(DeclaredVector {
         shares,

@@ -275,7 +275,11 @@ pub fn derive_reshape_trigger(
     let kind = if substate_bytes >= thresholds.split_bytes || fullness >= thresholds.split_fullness
     {
         ReshapeTrigger::Split { epoch }
-    } else if substate_bytes < thresholds.merge_bytes() {
+    } else if substate_bytes < thresholds.merge_bytes() && fullness < thresholds.merge_fullness() {
+        // Both, because a merge answers to both: a shard small enough on
+        // bytes and busy enough on traffic would fold into a parent that
+        // starts idle, carries the sum of what its children carried, and
+        // cannot assert a split back until its own mean catches up.
         ReshapeTrigger::Merge { epoch }
     } else {
         return None;
@@ -758,11 +762,25 @@ mod tests {
             derive_reshape_trigger(child, 50, 7_499, &thresholds, &[], Epoch::GENESIS),
             None
         );
+        // But a shard that busy does not merge either: a merge answers
+        // to both dimensions, and one folding at three quarters of its
+        // caps lands in a parent that starts idle and carries the sum.
         assert_eq!(
             derive_reshape_trigger(child, 0, 7_499, &thresholds, &[], Epoch::GENESIS),
+            None
+        );
+        // Quiet as well as small is what merges — under the split
+        // threshold's eighth, the dampener the bytes answer to.
+        assert_eq!(
+            derive_reshape_trigger(child, 0, 936, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Merge {
                 epoch: Epoch::GENESIS
             }),
+        );
+        assert_eq!(
+            derive_reshape_trigger(child, 0, 937, &thresholds, &[], Epoch::GENESIS),
+            None,
+            "and an eighth exactly is already too busy to fold"
         );
         // And a shard whose pools voted the predicate off never trips it,
         // however full it runs.

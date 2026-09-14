@@ -11,6 +11,7 @@
 //! fact. The beacon folds the witness and schedules the reshape.
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::BASIS_POINTS;
 
 use crate::{Epoch, ShardId, ShardWitnessPayload};
 
@@ -67,6 +68,31 @@ impl ReshapeThresholds {
             0
         } else {
             self.split_bytes / 8
+        }
+    }
+
+    /// The share of its caps a shard's blocks must be under to assert a
+    /// merge, on the terms [`merge_bytes`](Self::merge_bytes) states:
+    /// the split threshold's eighth, so a shard does not merge at the
+    /// load it would split at and oscillate.
+    ///
+    /// The whole range where the fullness predicate is disabled — a
+    /// shard nobody measures traffic on merges on its bytes alone,
+    /// which is what the byte predicate meant before there was a second
+    /// one.
+    ///
+    /// Read beside the bytes and not instead of them: a merged parent
+    /// starts at [`ShardFullness::IDLE`](crate::ShardFullness::IDLE), so
+    /// it cannot assert a split back for `FULLNESS_EPOCHS` however hot
+    /// it runs — and a compute-bound workload over a small account set
+    /// is exactly the shape that is busy enough to matter and small
+    /// enough to qualify on bytes.
+    #[must_use]
+    pub const fn merge_fullness(&self) -> u32 {
+        if self.split_fullness > BASIS_POINTS {
+            u32::MAX
+        } else {
+            self.split_fullness / 8
         }
     }
 }
