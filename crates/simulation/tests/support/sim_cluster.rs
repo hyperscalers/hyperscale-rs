@@ -432,6 +432,41 @@ impl SimCluster {
         FaultHandle::new(move || handle.fired())
     }
 
+    /// Make `host` notify peers of `type_id` with what `rewrite` returns.
+    ///
+    /// Sim-only for the same reason [`Self::rewrite_responses`] is. The
+    /// closure is invoked once per recipient, so a stateful one equivocates
+    /// across peers — the seam every vote, timeout and ready signal travels
+    /// on.
+    pub fn rewrite_notifications(
+        &mut self,
+        host: usize,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> FaultHandle {
+        let handle =
+            self.runner
+                .network_mut()
+                .rewrite_notifications(host_index(host), type_id, rewrite);
+        FaultHandle::new(move || handle.fired())
+    }
+
+    /// Make `host` broadcast `type_id` with what `rewrite` returns.
+    ///
+    /// Sim-only, invoked once per recipient, as above.
+    pub fn rewrite_gossip(
+        &mut self,
+        host: usize,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> FaultHandle {
+        let handle = self
+            .runner
+            .network_mut()
+            .rewrite_gossip(host_index(host), type_id, rewrite);
+        FaultHandle::new(move || handle.fired())
+    }
+
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
         let kind = self.runner.restart_shard(host_index(host), shard);
         assert!(

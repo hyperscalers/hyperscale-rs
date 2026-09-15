@@ -629,11 +629,72 @@ impl SimulatedNetwork {
         type_id: &'static str,
         rewrite: Rewrite,
     ) -> RuleHandle {
+        self.rewrite_outbound(host, type_id, Tier::Response, rewrite)
+    }
+
+    /// Install a rewrite over the notifications `host` unicasts for `type_id`.
+    ///
+    /// The closure is invoked once per recipient, so a stateful one
+    /// equivocates — sending different bytes to different peers. That is the
+    /// seam every vote, timeout and ready signal travels on, none of which a
+    /// response rewrite can reach.
+    pub fn rewrite_notifications(
+        &mut self,
+        host: NodeIndex,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
+        self.rewrite_outbound(host, type_id, Tier::Notification, rewrite)
+    }
+
+    /// Install a rewrite over the gossip `host` broadcasts for `type_id`.
+    ///
+    /// Also invoked once per recipient. Dedup keys on the honest message id,
+    /// so each recipient still admits exactly one of the diverging copies.
+    pub fn rewrite_gossip(
+        &mut self,
+        host: NodeIndex,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
+        self.rewrite_outbound(host, type_id, Tier::Gossip, rewrite)
+    }
+
+    /// The bytes `sender` actually delivers to `recipient`, after any rewrite
+    /// installed on it. Called per recipient at each delivery seam, so a
+    /// stateful rewrite equivocates.
+    fn rewritten(
+        &self,
+        sender: NodeIndex,
+        recipient: NodeIndex,
+        type_id: &'static str,
+        tier: Tier,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        self.faults.rewrite(
+            &MessageContext {
+                sender: HostId(sender),
+                recipient: HostId(recipient),
+                type_id,
+                tier,
+            },
+            payload,
+            payload.to_vec(),
+        )
+    }
+
+    fn rewrite_outbound(
+        &mut self,
+        host: NodeIndex,
+        type_id: &'static str,
+        tier: Tier,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
         self.faults.install_rewrite(
             &DropSpec {
                 type_id: Some(type_id),
                 from: Some(HostId(host)),
-                tier: Some(Tier::Response),
+                tier: Some(tier),
                 ..DropSpec::default()
             },
             rewrite,
@@ -1299,6 +1360,13 @@ impl SimulatedNetwork {
                             stats.messages_dropped_fault += 1;
                             continue;
                         }
+                        // The sender's own bytes, before any rewrite installed
+                        // on it: a byzantine sender is one that notifies
+                        // wrongly, which is the one thing a drop rule cannot
+                        // model. Rewriting inside the recipient loop is what
+                        // lets one sender equivocate across its peers.
+                        let payload =
+                            self.rewritten(sender, to, type_id, Tier::Notification, &payload);
                         stats.messages_sent += 1;
                         if let Some(ref analyzer) = self.traffic_analyzer {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
@@ -1320,7 +1388,7 @@ impl SimulatedNetwork {
                                 sequence: self.notification_sequence,
                                 target_node: to,
                                 message_type: type_id,
-                                payload: payload.clone(),
+                                payload,
                             }));
                     }
                 }
@@ -1372,25 +1440,7 @@ impl SimulatedNetwork {
 
         let message_type = entry.message_type;
 
-        // Compute content-based message ID for dedup, matching production
-        // gossipsub's message_id_fn: hash(data || topic). Wire bytes
-        // (compressed) are the data; the topic is the message type and
-        // the shard it is published to, since a shard-scoped type has one
-        // topic per shard and a host serving two of them is owed the
-        // same batch once on each — a transaction touching both shards
-        // is published to both, and the second copy is what the other
-        // shard's loop admits from.
-        let msg_id = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            entry.data.hash(&mut hasher);
-            message_type.hash(&mut hasher);
-            match entry.target {
-                BroadcastTarget::Shard(shard) => shard.hash(&mut hasher),
-                BroadcastTarget::Global => (),
-            }
-            hasher.finish()
-        };
+        let msg_id = gossip_message_id(&entry);
 
         for to in peers {
             if to == from {
@@ -1426,6 +1476,11 @@ impl SimulatedNetwork {
                         stats.messages_dropped_fault += 1;
                         continue;
                     }
+                    // As on the notification tier: a byzantine broadcaster
+                    // publishes different bytes to different peers, and the
+                    // gossipsub dedup above keys on the honest message id, so
+                    // each recipient still admits exactly one of them.
+                    let payload = self.rewritten(from, to, message_type, Tier::Gossip, &payload);
                     stats.messages_sent += 1;
                     if let Some(ref analyzer) = self.traffic_analyzer {
                         analyzer.record_message(
@@ -1456,7 +1511,7 @@ impl SimulatedNetwork {
                         sequence: self.gossip_sequence,
                         target_node: to,
                         message_type,
-                        payload: payload.clone(),
+                        payload,
                         shard,
                     }));
                 }
@@ -1596,6 +1651,26 @@ impl SimulatedNetwork {
         .flatten()
         .min()
     }
+}
+
+/// The content-based message id gossipsub dedups on, matching production's
+/// `message_id_fn`: hash(data || topic).
+///
+/// Wire bytes (compressed) are the data; the topic is the message type and the
+/// shard it is published to, since a shard-scoped type has one topic per shard
+/// and a host serving two of them is owed the same batch once on each — a
+/// transaction touching both shards is published to both, and the second copy
+/// is what the other shard's loop admits from.
+fn gossip_message_id(entry: &OutboxEntry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entry.data.hash(&mut hasher);
+    entry.message_type.hash(&mut hasher);
+    match entry.target {
+        BroadcastTarget::Shard(shard) => shard.hash(&mut hasher),
+        BroadcastTarget::Global => (),
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -2498,6 +2573,119 @@ mod tests {
         let payloads = handlers[1].payloads();
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0], original_payload);
+    }
+
+    #[test]
+    fn a_notification_rewrite_equivocates_across_recipients() {
+        // The tier every vote, timeout and ready signal travels on. Without a
+        // rewrite here a byzantine sender can only be made silent, and a drop
+        // exercises the fetch fallback rather than the content check.
+        use hyperscale_network::registry::RawNotificationHandler;
+        const TYPE: &str = "test.notification";
+
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let received: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
+            .map(|i| {
+                let handler = RecordingHandler::new();
+                let adapter = network.create_adapter(i);
+                let sink = handler.clone();
+                let raw: Arc<RawNotificationHandler> = Arc::new(move |payload: Vec<u8>| {
+                    sink.received.lock().unwrap().push(payload);
+                });
+                adapter.registry.register_raw_notification(TYPE, raw);
+                handler
+            })
+            .collect();
+
+        let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&nth);
+        let handle = network.rewrite_notifications(
+            0,
+            TYPE,
+            Arc::new(move |_asked: &[u8], bytes: &[u8]| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut out = bytes.to_vec();
+                out.extend_from_slice(format!("-{n}").as_bytes());
+                out
+            }),
+        );
+
+        network.accept_notifications(
+            0,
+            Duration::ZERO,
+            vec![PendingNotification {
+                recipients: (1..4).map(ValidatorId::new).collect(),
+                type_id: TYPE,
+                class: MessageClass::Bulk,
+                data: compression::compress(b"vote"),
+            }],
+            &mut rng,
+        );
+        network.flush_notifications(FAR_FUTURE);
+
+        assert_eq!(handle.fired(), 3, "one rewrite per recipient");
+        for (n, h) in received[1..4].iter().enumerate() {
+            let got = h.payloads();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0], format!("vote-{n}").as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_gossip_rewrite_equivocates_across_recipients() {
+        // The rewrite runs inside the recipient loop, so a stateful closure
+        // sends different bytes to each peer while the dedup above still keys
+        // on the one honest message id.
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&nth);
+        let handle = network.rewrite_gossip(
+            0,
+            "test.gossip",
+            Arc::new(move |_asked: &[u8], bytes: &[u8]| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut out = bytes.to_vec();
+                out.extend_from_slice(format!("-{n}").as_bytes());
+                out
+            }),
+        );
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(
+            handle.fired(),
+            3,
+            "one rewrite per recipient, sender excluded"
+        );
+        let delivered: Vec<Vec<u8>> = handlers[1..]
+            .iter()
+            .map(|h| h.payloads().first().unwrap().clone())
+            .collect();
+        assert_eq!(delivered.len(), 3);
+        for (n, got) in delivered.iter().enumerate() {
+            assert_eq!(got, format!("test gossip payload-{n}").as_bytes());
+        }
     }
 
     #[test]

@@ -35,10 +35,11 @@ pub enum Tier {
     Notification,
     /// Outbound request leg of a request/response RPC.
     Request,
-    /// Inbound response leg of a request/response RPC. No transport gates the
-    /// response leg today — both harnesses model response-direction loss through
-    /// the request leg and packet loss — so this tier is part of the vocabulary
-    /// but never consulted at a live delivery seam.
+    /// Inbound response leg of a request/response RPC. No transport *drops* on
+    /// this tier — both harnesses model response-direction loss through the
+    /// request leg and packet loss — so a [`Decision`] is never asked for here.
+    /// A rewrite rule is: answering wrongly is the one fault a drop rule cannot
+    /// express, and it is the response leg that carries the answer.
     Response,
 }
 
