@@ -719,6 +719,13 @@ impl VerificationPipeline {
                         Some((_, BeaconWitnessDefer::ParentRevealChain)) => {
                             "deferred(parent_reveal_chain)"
                         }
+                        // Parked on beacon progress rather than on a shard
+                        // ancestor, so it has no defer entry. Reporting it
+                        // as never started names the wrong stall: during a
+                        // beacon lag this is the whole explanation.
+                        None if self.beacon_witness_awaiting_committee.contains(&block_hash) => {
+                            "awaiting_committee"
+                        }
                         None => "NOT_STARTED",
                     },
                     _ => "NOT_STARTED",
